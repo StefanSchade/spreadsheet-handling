@@ -1,6 +1,52 @@
 #!/usr/bin/env python3
 
-import argparse, json, pandas as pd, os
+import argparse, json, pandas as pd, os, xlsxwriter
+
+def write_excel_no_index(df, out_path, sheet_name="Daten"):
+    """
+    Schreibt einen DataFrame mit MultiIndex-Spalten OHNE Indexspalte.
+    Schreibt die Headerzeilen manuell, danach nur die Werte.
+    """
+    levels = df.columns.nlevels
+    tuples = list(df.columns)  # Liste von Tupeln, z.B. ('kunde','adresse','strasse')
+
+    wb  = xlsxwriter.Workbook(out_path)
+    ws  = wb.add_worksheet(sheet_name)
+
+    fmt_header = wb.add_format({"bold": True, "text_wrap": False, "align": "left", "valign": "bottom", "border": 0})
+    fmt_cell   = wb.add_format({"text_wrap": False})
+
+    # Header schreiben (levels Zeilen)
+    for lvl in range(levels):
+        for col, tup in enumerate(tuples):
+            val = tup[lvl] if lvl < len(tup) else ""
+            ws.write(lvl, col, "" if val is None else str(val), fmt_header)
+
+    # Daten schreiben (ohne Indexspalte)
+    for r, (_, row) in enumerate(df.iterrows(), start=levels):
+        for c, val in enumerate(row.tolist()):
+            ws.write(r, c, "" if val is None else val, fmt_cell)
+
+    # Komfort: Freeze Panes unter dem Header
+    ws.freeze_panes(levels, 0)
+
+    # Simple Auto-Width
+    col_widths = [0]*len(tuples)
+    # nimm Header + Daten als Basis
+    for c, tup in enumerate(tuples):
+        for lvl in range(levels):
+            s = str(tup[lvl]) if lvl < len(tup) and tup[lvl] is not None else ""
+            col_widths[c] = max(col_widths[c], len(s))
+    for r, (_, row) in enumerate(df.iterrows(), start=levels):
+        for c, val in enumerate(row.tolist()):
+            s = "" if val is None else str(val)
+            col_widths[c] = max(col_widths[c], len(s))
+
+    for c, w in enumerate(col_widths):
+        ws.set_column(c, c, min(max(8, w + 2), 60))  # 8..60
+
+    wb.close()
+
 
 def flatten(obj, parent=None, sep="."):
     items = {}
@@ -48,18 +94,11 @@ def main():
     mi = pd.MultiIndex.from_tuples(tuples)
     df = pd.DataFrame([{c: r.get(c, "") for c in all_cols} for r in flat_rows])
     df.columns = mi
-    
+       
     out = args.output
     if not out.lower().endswith(".xlsx"):
-        out = os.path.splitext(out)[0] + ".xlsx"
-    
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        try:
-            # bevorzugt ohne Index (kann bei MultiIndex-Spalten scheitern)
-            df.to_excel(writer, index=False, header=True, sheet_name="Daten")
-        except NotImplementedError:
-            # Fallback: mit Index schreiben (funktioniert zuverlässig)
-            df.to_excel(writer, index=True, header=True, sheet_name="Daten")
+        out = out.rsplit(".", 1)[0] + ".xlsx"
+    write_excel_no_index(df, out, sheet_name="Daten")
     print(f"Wrote {out}")
     
 
