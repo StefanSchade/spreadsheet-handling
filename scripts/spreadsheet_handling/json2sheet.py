@@ -24,8 +24,16 @@ def main():
     data = json.load(open(args.input, "r", encoding="utf-8"))
     rows = data if isinstance(data, list) else [data]
     flat_rows = [flatten(r) for r in rows]
+    
+    # First-seen order, stabil über alle Ebenen
+    all_cols = []
+    seen = set()
+    for r in flat_rows:
+        for k in r.keys():  # dict() behält Einfügereihenfolge
+            if k not in seen:
+                seen.add(k)
+                all_cols.append(k)
 
-    all_cols = sorted(set(k for r in flat_rows for k in r.keys()))
     tuples = []
     for path in all_cols:
         segs = path.split(".")
