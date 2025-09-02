@@ -5,6 +5,7 @@ SCRIPTS := $(ROOT)scripts
 VENV := $(ROOT).venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
+REQ := scripts/spreadsheet_handling/requirements.txt
 
 run: venv deps
 	$(SCRIPTS)/start_conversion.sh
@@ -20,7 +21,7 @@ venv:
 	@test -d $(VENV) || python3 -m venv $(VENV)
 
 deps: venv
-	$(PIP) install -r $(ROOT)requirements.txt
+	$(PIP) install -r $(REQ)
 
 freeze:
 	$(PIP) freeze > $(ROOT)requirements.txt
