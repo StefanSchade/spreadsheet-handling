@@ -33,14 +33,14 @@ make deps-dev
 
 Run a roundtrip conversion:
 
-```json
+```bash
 # JSON → spreadsheet
 json2sheet scripts/spreadsheet_handling/examples/roundtrip_start.json \
     -o scripts/spreadsheet_handling/tmp/tmp.xlsx \
     --levels 3
 ```
 
-```json
+```bash
 # spreadsheet → JSON
 sheet2json scripts/spreadsheet_handling/tmp/tmp.xlsx \
     -o scripts/spreadsheet_handling/tmp/tmp.json \
