@@ -53,4 +53,4 @@ freeze-dev:
 snapshot:
 	$(PIP) freeze > $(REQ_DEV)
 	mkdir -p $(TARGET)
-	$(ROOT)scripts/repo_snapshot.sh $(ROOT) $(TARGET)/repo.txt
+	$(ROOT)scripts/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/repo.txt
