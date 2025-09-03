@@ -5,6 +5,7 @@ from spreadsheet_handling.core.df_build import build_df_from_records
 from spreadsheet_handling.core.refs import add_helper_columns
 from spreadsheet_handling.io_backends.excel_xlsxwriter import ExcelBackend 
 from spreadsheet_handling.io_backends.csv_backend import CSVBackend
+from spreadsheet_handling.io_backends.ods_backend import ODSBackend
 
 ap = argparse.ArgumentParser()
 ap.add_argument("input_json")
@@ -26,6 +27,8 @@ df = build_df_from_records(records, levels=args.levels)
 
 if args.backend == "excel":
     backend = ExcelBackend()
+elif args.backend == "ods":
+    backend = ODSBackend()
 else:
     backend = CSVBackend()
 

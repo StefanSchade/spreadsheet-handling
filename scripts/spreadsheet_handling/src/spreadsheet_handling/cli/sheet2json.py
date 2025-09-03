@@ -13,6 +13,8 @@ args = ap.parse_args()
 
 if args.backend == "excel":
     backend = ExcelBackend()
+elif args.backend =="ods":
+    backend = ODSBackend()
 else:
     backend = CSVBackend()
 
