@@ -2,7 +2,7 @@
 from typing import Optional
 import pandas as pd
 
-class SpreadsheetBackend:
+class BackendBase:
     def write(self, df: pd.DataFrame, path: str, sheet_name: str = "Daten") -> None:
         raise NotImplementedError
 

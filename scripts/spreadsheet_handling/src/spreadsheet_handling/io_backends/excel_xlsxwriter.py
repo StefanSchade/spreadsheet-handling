@@ -1,8 +1,8 @@
 # io_backends/excel_xlsxwriter.py
 import pandas as pd, xlsxwriter
-from .base import SpreadsheetBackend
+from .base import BackendBase
 
-class ExcelBackend(SpreadsheetBackend):
+class ExcelBackend(BackendBase):
     def write(self, df: pd.DataFrame, path: str, sheet_name: str = "Daten") -> None:
         # Custom-Writer: MultiHeader OHNE Indexspalte
         levels = df.columns.nlevels
