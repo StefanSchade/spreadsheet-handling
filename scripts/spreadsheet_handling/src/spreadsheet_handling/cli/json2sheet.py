@@ -3,7 +3,8 @@ import json, argparse
 from spreadsheet_handling.core.flatten import flatten_json
 from spreadsheet_handling.core.df_build import build_df_from_records
 from spreadsheet_handling.core.refs import add_helper_columns
-from spreadsheet_handling.io_backends.excel_xlsxwriter import ExcelBackend  # oder via config wählen
+from spreadsheet_handling.io_backends.excel_xlsxwriter import ExcelBackend 
+from spreadsheet_handling.io_backends.csv_backend import CSVBackend
 
 ap = argparse.ArgumentParser()
 ap.add_argument("input_json")
@@ -23,6 +24,10 @@ records = [flatten_json(r) for r in rows]
 
 df = build_df_from_records(records, levels=args.levels)
 
-backend = ExcelBackend()  # später switch nach args.backend
+if args.backend == "excel":
+    backend = ExcelBackend()
+else:
+    backend = CSVBackend()
+
 backend.write(df, args.output, sheet_name="Daten")
 
