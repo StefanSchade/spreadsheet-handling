@@ -1,12 +1,12 @@
-.PHONY: run clean venv deps deps-dev test freeze freeze-dev
+.PHONY: run clean venv deps deps-dev test freeze freeze-devi snapshot
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+TARGET := $(ROOT)build
 SCRIPTS := $(ROOT)scripts
 PKGDIR := $(SCRIPTS)/spreadsheet_handling
 VENV := $(ROOT).venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
-
 REQ := $(PKGDIR)/requirements.txt
 REQ_DEV := $(PKGDIR)/requirements-dev.txt
 
@@ -26,6 +26,7 @@ test: venv deps-dev
 
 clean:
 	rm -rf $(PKGDIR)/tmp
+	find $(TARGET) -type d -prune -exec rm -rf {} || true +
 	find $(ROOT) -type d -name '__pycache__' -prune -exec rm -rf {} +
 	find $(ROOT) -type d -name '.pytest_cache' -prune -exec rm -rf {} +
 	find $(ROOT) -name '.~lock.*#' -delete
@@ -49,3 +50,7 @@ freeze:
 freeze-dev:
 	$(PIP) freeze > $(REQ_DEV)
 
+snapshot:
+	$(PIP) freeze > $(REQ_DEV)
+	mkdir -p $(TARGET)
+	$(ROOT)scripts/repo_snapshot.sh $(ROOT) $(TARGET)/repo.txt
