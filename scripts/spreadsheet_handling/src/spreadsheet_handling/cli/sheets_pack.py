@@ -9,15 +9,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import pandas as pd
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
-
+from spreadsheet_handling.core.fk import (
+    build_registry,
+    build_id_label_maps,
+    detect_fk_columns,
+    apply_fk_helpers,
+    assert_no_parentheses_in_columns,
+    normalize_sheet_key,
+)
 
 DEFAULTS: Dict[str, Any] = {
     "levels": 3,
-    "backend": "xlsx",  # xlsx|csv
+    "backend": "xlsx",      # xlsx|csv
+    "id_field": "id",       # ID-Feld in Zielblättern
+    "label_field": "name",  # menschenlesbares Label
+    "helper_prefix": "_",
+    "detect_fk": True,
 }
 
 
@@ -170,6 +182,24 @@ def run_pack(cfg: Dict[str, Any]) -> None:
             df = pd.DataFrame(records)
             df = _ensure_multiindex(df, levels)
             frames[name] = df
+
+    # --- Validierung: keine Klammern in Spalten; Sheet-Key-Registry bauen ---
+    for sheet_name, df in frames.items():
+        assert_no_parentheses_in_columns(df, sheet_name)
+
+    registry = build_registry(frames, defaults)
+    id_maps = build_id_label_maps(frames, registry)
+
+    if bool(defaults.get("detect_fk", True)):
+        helper_prefix = str(defaults.get("helper_prefix", "_"))
+        for sheet_name, df in list(frames.items()):
+            fk_defs = detect_fk_columns(df, registry, helper_prefix=helper_prefix)
+            if not fk_defs:
+                continue
+            levels = int(defaults.get("levels", DEFAULTS["levels"]))
+            frames[sheet_name] = apply_fk_helpers(
+                df, fk_defs, id_maps, levels=levels, helper_prefix=helper_prefix
+            )
 
     out = cfg.get("workbook")
     if not out:

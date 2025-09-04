@@ -53,18 +53,24 @@ def _read_csv_folder(folder: Path, levels: int) -> Dict[str, pd.DataFrame]:
 
 # ---------- Core ----------
 
-
-def _rows_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
+def _rows_from_df(df: pd.DataFrame, helper_prefix: str = "_") -> List[Dict[str, Any]]:
     """
-    Reduziert MultiIndex-Header auf ihre erste Ebene und gibt eine Liste von Dicts zurück.
+    Reduziert MultiIndex-Header auf erste Ebene, wirft Helper-Spalten (Prefix) weg,
+    und gibt Records für JSON zurück.
     """
     first_level = [t[0] for t in df.columns.to_list()]
     df_simple = df.copy()
     df_simple.columns = first_level
-    # None statt NaN für JSON
+
+    keep_cols = []
+    for c in df_simple.columns:
+        if isinstance(c, str) and c.startswith(helper_prefix):
+            continue
+        keep_cols.append(c)
+    df_simple = df_simple[keep_cols]
+
     records = df_simple.where(pd.notnull(df_simple), None).to_dict(orient="records")
     return records
-
 
 def run_unpack(workbook: Path, out_dir: Path, levels: int, backend: str) -> None:
     if backend == "xlsx":
