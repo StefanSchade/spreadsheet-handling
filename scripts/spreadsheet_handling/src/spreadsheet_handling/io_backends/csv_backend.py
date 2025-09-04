@@ -2,6 +2,7 @@ from __future__ import annotations
 import pandas as pd
 from .base import BackendBase
 
+
 class CSVBackend(BackendBase):
     """
     Sehr einfache CSV-Implementierung:
@@ -12,7 +13,6 @@ class CSVBackend(BackendBase):
     """
 
     def write(self, df: pd.DataFrame, path: str, sheet_name: str = "Daten") -> None:
-        levels = len(df.columns.levels) if isinstance(df.columns, pd.MultiIndex) else 1
         if not isinstance(df.columns, pd.MultiIndex):
             # in ein 1-level MultiIndex heben, damit Logik konsistent ist
             df = df.copy()
@@ -21,7 +21,9 @@ class CSVBackend(BackendBase):
         # Header-Zeilen vorbereiten
         header_rows = []
         for lvl in range(df.columns.nlevels):
-            header_rows.append([str(col[lvl]) if col[lvl] is not None else "" for col in df.columns])
+            header_rows.append(
+                [str(col[lvl]) if col[lvl] is not None else "" for col in df.columns]
+            )
 
         # DataFrame-Zeilen als Strings
         body_rows = df.astype(object).where(pd.notnull(df), "").values.tolist()
@@ -62,4 +64,3 @@ def _escape_csv_cell(v) -> str:
     if any(ch in s for ch in [",", '"', "\n", "\r"]):
         s = '"' + s.replace('"', '""') + '"'
     return s
-

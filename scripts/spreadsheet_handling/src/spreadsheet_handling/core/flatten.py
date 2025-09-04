@@ -1,10 +1,11 @@
-# core/flatten.py
+import json
 from collections import OrderedDict
+
 
 def flatten_json(obj, parent=None, sep=".") -> OrderedDict[str, str]:
     out = OrderedDict()
     if isinstance(obj, dict):
-        for k, v in obj.items():          # bewahrt JSON-Key-Order
+        for k, v in obj.items():  # bewahrt JSON-Key-Order
             key = k if parent is None else f"{parent}{sep}{k}"
             out.update(flatten_json(v, key, sep))
     elif isinstance(obj, list):
@@ -13,4 +14,3 @@ def flatten_json(obj, parent=None, sep=".") -> OrderedDict[str, str]:
     else:
         out[parent] = obj
     return out
-
