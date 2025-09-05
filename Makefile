@@ -1,4 +1,5 @@
 .PHONY: help run clean venv deps deps-dev test freeze freeze-dev snapshot format lint syntax ci
+.PHONY: test-verbose test-lastfailed test-one
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET := $(ROOT)build
@@ -78,3 +79,13 @@ syntax:
 	$(PYTHON) -m compileall -q scripts/spreadsheet_handling
 
 ci: syntax lint test
+
+test-verbose:
+	SHEETS_LOG=INFO $(PYTEST) -vv -s -o log_cli=true -o log_cli_level=INFO scripts/spreadsheet_handling/tests
+
+test-lastfailed:
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv -o log_cli=true -o log_cli_level=DEBUG scripts/spreadsheet_handling/tests
+
+# usage: make test-one TESTPATTERN="fk_helpers"
+test-one:
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" -o log_cli=true -o log_cli_level=DEBUG scripts/spreadsheet_handling/tests

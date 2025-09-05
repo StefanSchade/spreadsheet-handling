@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import pandas as pd
-import logging
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,7 +22,9 @@ from spreadsheet_handling.core.fk import (
     assert_no_parentheses_in_columns,
 )
 
-logging.basicConfig(level=logging.INFO)  # am Datei-Anfang einmal
+from spreadsheet_handling.logging_utils import setup_logging, get_logger
+
+log = get_logger("pack")
 
 DEFAULTS: Dict[str, Any] = {
     "levels": 3,
@@ -169,6 +170,8 @@ def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
 
 def run_pack(cfg: Dict[str, Any]) -> None:
     defaults = cfg.get("defaults", {})
+    log.debug("run_pack defaults=%s", defaults)
+
     levels = int(defaults.get("levels", DEFAULTS["levels"]))
     backend = (defaults.get("backend") or DEFAULTS["backend"]).lower()
 
@@ -189,6 +192,8 @@ def run_pack(cfg: Dict[str, Any]) -> None:
             df = pd.DataFrame(records)
             df = _ensure_multiindex(df, levels)
             frames[name] = df
+            
+    log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
 
     # --- Validierung: keine Klammern in Spalten; Sheet-Key-Registry bauen ---
     for sheet_name, df in frames.items():
@@ -196,10 +201,11 @@ def run_pack(cfg: Dict[str, Any]) -> None:
 
     registry = build_registry(frames, defaults)
     id_maps = build_id_label_maps(frames, registry)
-
-    logging.info("FK registry: %s", registry)
+    log.debug("registry=%s", registry)
     for sk, m in id_maps.items():
-        logging.info("Map[%s]: %d keys (sample: %s)", sk, len(m), list(m.items())[:3])
+        if m:
+            sample = list(m.items())[:2]
+            log.debug("id_map[%s]: %d keys, sample=%s", sk, len(m), sample)
 
     if bool(defaults.get("detect_fk", True)):
         helper_prefix = str(defaults.get("helper_prefix", "_"))
@@ -225,7 +231,7 @@ def run_pack(cfg: Dict[str, Any]) -> None:
         if out_path.suffix:
             out_path = out_path.parent / out_path.stem
         _write_csv_folder(out_path, frames)
-        print(f"[pack] CSV-Ordner geschrieben: {out_path}")
+        log.info("[pack] wrote %s backend to %s", backend, out_path)
     else:
         raise SystemExit(f"Unbekannter Backend-Typ: {backend}")
 
@@ -240,16 +246,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="YAML-Konfiguration")
     p.add_argument("--levels", type=int, default=None, help="Header-Levels (default 3)")
     p.add_argument("--backend", choices=["xlsx", "csv"], help="xlsx (default) oder csv")
+    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Logger-Level (default WARNING)")
     return p
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
+    setup_logging(args.log_level)
     cfg = _load_config(args)
     run_pack(cfg)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

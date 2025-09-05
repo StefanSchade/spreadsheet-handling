@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-
+from spreadsheet_handling.logging_utils import setup_logging, get_logger
+log = get_logger("unpack")
 
 DEFAULT_LEVELS = 3
 
@@ -103,12 +104,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--backend", choices=["xlsx", "csv"], default="xlsx", help="xlsx (default) oder csv"
     )
+    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Logger-Level (default WARNING)")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
+    setup_logging(args.log_level if hasattr(args, "log_level") else None)
 
     workbook_path = Path(args.workbook)
     backend = args.backend
@@ -122,6 +125,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         raise SystemExit(f"Unbekannter Backend-Typ: {backend}")
 
+    log.info("[unpack] writing JSON to %s", args.output)
     run_unpack(workbook_path, Path(args.output), args.levels, backend)
     return 0
 
