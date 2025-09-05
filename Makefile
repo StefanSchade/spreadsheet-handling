@@ -1,5 +1,5 @@
 .PHONY: help run clean venv deps deps-dev test freeze freeze-dev snapshot format lint syntax ci
-.PHONY: test-verbose test-lastfailed test-one
+.PHONY: test-verbose test-lastfailed test-one test-node test-file coverage coverage-html
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET := $(ROOT)build
@@ -89,3 +89,22 @@ test-lastfailed:
 # usage: make test-one TESTPATTERN="fk_helpers"
 test-one:
 	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" -o log_cli=true -o log_cli_level=DEBUG scripts/spreadsheet_handling/tests
+
+# usage: make test-file FILE=scripts/spreadsheet_handling/tests/test_fk_helpers_pack.py
+test-file:
+	$(PYTEST) -vv -o log_cli=true -o log_cli_level=DEBUG $(FILE)
+
+# usage: 
+test-node:
+	$(PYTEST) -vv -o log_cli=true -o log_cli_level=DEBUG $(NODE)
+
+coverage:
+	$(PYTEST) --cov=scripts/spreadsheet_handling/src/spreadsheet_handling \
+	          --cov-report=term-missing \
+	          scripts/spreadsheet_handling/tests
+
+coverage-html:
+	$(PYTEST) --cov=scripts/spreadsheet_handling/src/spreadsheet_handling \
+	          --cov-report=html \
+	          scripts/spreadsheet_handling/tests
+	@echo "Open HTML report: file://$(ROOT)htmlcov/index.html"

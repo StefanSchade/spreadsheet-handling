@@ -14,15 +14,9 @@ import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from spreadsheet_handling.core.fk import (
-    build_registry,
-    build_id_label_maps,
-    detect_fk_columns,
-    apply_fk_helpers,
-    assert_no_parentheses_in_columns,
-)
-
 from spreadsheet_handling.logging_utils import setup_logging, get_logger
+from spreadsheet_handling.core.fk import assert_no_parentheses_in_columns
+from spreadsheet_handling.engine.orchestrator import Engine
 
 log = get_logger("pack")
 
@@ -195,28 +189,10 @@ def run_pack(cfg: Dict[str, Any]) -> None:
             
     log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
 
-    # --- Validierung: keine Klammern in Spalten; Sheet-Key-Registry bauen ---
     for sheet_name, df in frames.items():
         assert_no_parentheses_in_columns(df, sheet_name)
-
-    registry = build_registry(frames, defaults)
-    id_maps = build_id_label_maps(frames, registry)
-    log.debug("registry=%s", registry)
-    for sk, m in id_maps.items():
-        if m:
-            sample = list(m.items())[:2]
-            log.debug("id_map[%s]: %d keys, sample=%s", sk, len(m), sample)
-
-    if bool(defaults.get("detect_fk", True)):
-        helper_prefix = str(defaults.get("helper_prefix", "_"))
-        for sheet_name, df in list(frames.items()):
-            fk_defs = detect_fk_columns(df, registry, helper_prefix=helper_prefix)
-            if not fk_defs:
-                continue
-            levels = int(defaults.get("levels", DEFAULTS["levels"]))
-            frames[sheet_name] = apply_fk_helpers(
-                df, fk_defs, id_maps, levels=levels, helper_prefix=helper_prefix
-            )
+    engine = Engine(defaults)
+    frames = engine.apply_fks(frames)
 
     out = cfg.get("workbook")
     if not out:
