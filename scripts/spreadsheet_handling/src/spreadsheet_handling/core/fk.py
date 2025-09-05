@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import re
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple
 import pandas as pd
 
 
@@ -9,10 +8,22 @@ FK_PATTERN = re.compile(r"^(?P<id_field>[^_]+)_\((?P<sheet_key>[^)]+)\)$")
 
 
 class FKDef(NamedTuple):
-    fk_column: str           # z. B. "id_(Guten_Morgen)"
-    id_field: str            # z. B. "id" oder "Schluessel"
-    target_sheet_key: str    # z. B. "Guten_Morgen"
-    helper_column: str       # z. B. "_Guten_Morgen_name"
+    fk_column: str  # z. B. "id_(Guten_Morgen)"
+    id_field: str  # z. B. "id" oder "Schluessel"
+    target_sheet_key: str  # z. B. "Guten_Morgen"
+    helper_column: str  # z. B. "_Guten_Morgen_name"
+
+
+def _norm_id(v) -> str | None:
+    """Normalisiert IDs auf String-Schlüssel; NaN/None -> None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return str(v)
 
 
 def normalize_sheet_key(name: str) -> str:
@@ -41,10 +52,11 @@ def assert_no_parentheses_in_columns(df: pd.DataFrame, sheet_name: str) -> None:
         raise ValueError(
             f"Spalten mit Klammern in Blatt {sheet_name!r} nicht erlaubt (außer FK-Spalten): {bad}"
         )
- 
 
-def build_registry(frames: Dict[str, pd.DataFrame],
-                   defaults: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+
+def build_registry(
+    frames: Dict[str, pd.DataFrame], defaults: Dict[str, Any]
+) -> Dict[str, Dict[str, Any]]:
     """
     Registry pro Sheet:
     {
@@ -72,9 +84,26 @@ def _first_level_columns(df: pd.DataFrame) -> List[str]:
     return [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]
 
 
-def detect_fk_columns(df: pd.DataFrame,
-                      registry: Dict[str, Dict[str, Any]],
-                      helper_prefix: str = "_") -> List[FKDef]:
+def _series_from_first_level(df: pd.DataFrame, first_level_name: str) -> pd.Series:
+    """
+    Liefert eine Series für die Spalte, die auf Level-0 'first_level_name' trägt,
+    unabhängig davon, ob df.columns ein MultiIndex ist.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        sub = df.xs(first_level_name, axis=1, level=0)  # schneidet Level-0 heraus
+        # xs kann Series oder DataFrame zurückgeben; wenn DF, die erste Spalte nehmen
+        if isinstance(sub, pd.DataFrame):
+            if sub.shape[1] == 0:
+                raise KeyError(f"Spalte {first_level_name!r} nicht gefunden.")
+            return sub.iloc[:, 0]
+        return sub  # Series
+    # kein MultiIndex
+    return df[first_level_name]
+
+
+def detect_fk_columns(
+    df: pd.DataFrame, registry: Dict[str, Dict[str, Any]], helper_prefix: str = "_"
+) -> List[FKDef]:
     """
     Findet Spalten wie 'id_(Guten_Morgen)' bzw. 'Schluessel_(Guten_Morgen)'.
     Prüft, dass target_sheet existiert und (strikt) dass id_field zum Zielblatt passt.
@@ -99,13 +128,17 @@ def detect_fk_columns(df: pd.DataFrame,
             # (alternativ: akzeptieren & trotzdem target_id_field verwenden)
             continue
         helper_col = f"{helper_prefix}{sheet_key}_name"
-        fks.append(FKDef(fk_column=c, id_field=id_field,
-                         target_sheet_key=sheet_key, helper_column=helper_col))
+        fks.append(
+            FKDef(
+                fk_column=c, id_field=id_field, target_sheet_key=sheet_key, helper_column=helper_col
+            )
+        )
     return fks
 
 
-def build_id_label_maps(frames: Dict[str, pd.DataFrame],
-                        registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[Any, Any]]:
+def build_id_label_maps(
+    frames: Dict[str, pd.DataFrame], registry: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[Any, Any]]:
     """
     Für jedes Sheet eine Map: {id_value -> label_value}.
     Nimmt id_field & label_field aus Registry. Fehlende Felder -> leere Map.
@@ -120,21 +153,25 @@ def build_id_label_maps(frames: Dict[str, pd.DataFrame],
         if id_field not in cols or label_field not in cols:
             maps[sheet_key] = {}
             continue
-        id_series = df[id_field]
-        label_series = df[label_field]
-        # robust gegen NaN
+        id_series = _series_from_first_level(df, id_field)
+        label_series = _series_from_first_level(df, label_field)
+        # robust gegen keys mit NaN oder Typunterschieden
         m: Dict[Any, Any] = {}
         for i, v in zip(id_series.tolist(), label_series.tolist()):
-            m[i] = v
+            key = _norm_id(i)
+            if key is not None:
+                m[key] = v
         maps[sheet_key] = m
     return maps
 
 
-def apply_fk_helpers(df: pd.DataFrame,
-                     fk_defs: List[FKDef],
-                     id_label_maps: Dict[str, Dict[Any, Any]],
-                     levels: int,
-                     helper_prefix: str = "_") -> pd.DataFrame:
+def apply_fk_helpers(
+    df: pd.DataFrame,
+    fk_defs: List[FKDef],
+    id_label_maps: Dict[str, Dict[Any, Any]],
+    levels: int,
+    helper_prefix: str = "_",
+) -> pd.DataFrame:
     """
     Fügt zu jedem FK eine Helper-Spalte (Prefix '_') hinzu:
     Wert = Label aus Zielblatt (via ID). MultiIndex wird berücksichtigt.
@@ -152,12 +189,17 @@ def apply_fk_helpers(df: pd.DataFrame,
             continue
         label_map = id_label_maps.get(fk.target_sheet_key, {})
         # Spalte berechnen
+
+        # >>> FIX: FK-Werte als Series aus Level-0 holen (nicht DataFrame!)
+        fk_series = _series_from_first_level(new_df, fk.fk_column)
+        raw_ids = fk_series.tolist()
+        # Robustere Lookup-Strategie: exakter Key, sonst String-Fallback
         values = []
-        for raw_id in new_df[fk.fk_column].tolist():
-            values.append(label_map.get(raw_id))
-        # als neue Spalte mit MultiIndex-Tiefe 'levels' anhängen
+        for rid in raw_ids:
+            lbl = label_map.get(_norm_id(rid))
+            values.append(lbl)
+
         col_tuple = (fk.helper_column,) + ("",) * (levels - 1)
         new_df[col_tuple] = values
 
     return new_df
-

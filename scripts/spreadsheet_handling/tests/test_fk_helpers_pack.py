@@ -58,4 +58,3 @@ def test_fk_helper_is_added_in_csv(tmp_path: Path):
     assert "_Guten_Morgen_name" in df.columns
     assert df.loc[0, "_Guten_Morgen_name"] == "Alpha"
     assert df.loc[1, "_Guten_Morgen_name"] == "Beta"
-

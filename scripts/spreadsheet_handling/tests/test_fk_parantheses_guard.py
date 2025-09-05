@@ -39,4 +39,3 @@ def test_parentheses_in_non_fk_column_are_rejected(tmp_path: Path):
     with pytest.raises(ValueError) as excinfo:
         run_pack(cfg)
     assert "nicht erlaubt" in str(excinfo.value)
-

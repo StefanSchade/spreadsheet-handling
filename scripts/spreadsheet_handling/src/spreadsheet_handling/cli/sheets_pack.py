@@ -20,13 +20,12 @@ from spreadsheet_handling.core.fk import (
     detect_fk_columns,
     apply_fk_helpers,
     assert_no_parentheses_in_columns,
-    normalize_sheet_key,
 )
 
 DEFAULTS: Dict[str, Any] = {
     "levels": 3,
-    "backend": "xlsx",      # xlsx|csv
-    "id_field": "id",       # ID-Feld in Zielblättern
+    "backend": "xlsx",  # xlsx|csv
+    "id_field": "id",  # ID-Feld in Zielblättern
     "label_field": "name",  # menschenlesbares Label
     "helper_prefix": "_",
     "detect_fk": True,
@@ -136,6 +135,7 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
 
 # ---------- Writer ----------
 
+
 def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
     """
     Excel: MultiIndex-Spalten robust schreiben, indem wir die Spalten
@@ -149,6 +149,7 @@ def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
                 # nur die erste Ebene verwenden (Level 0)
                 df_out.columns = [t[0] for t in df_out.columns.to_list()]
             df_out.to_excel(xw, sheet_name=sheet, index=False)
+
 
 def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
