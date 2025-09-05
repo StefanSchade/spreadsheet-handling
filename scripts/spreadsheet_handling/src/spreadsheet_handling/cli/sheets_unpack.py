@@ -38,14 +38,15 @@ def _read_xlsx(workbook: Path, levels: int) -> Dict[str, pd.DataFrame]:
 
 def _read_csv_folder(folder: Path, levels: int) -> Dict[str, pd.DataFrame]:
     """
-    Liest einen Ordner mit {sheet}.csv, evtl. mehrzeilige Header.
+    Liest einen Ordner mit {sheet}.csv, erwartet EINE Headerzeile (flattened)
+    und hebt die Spalten zurück in einen MultiIndex mit 'levels' Ebenen.
     """
-    header = list(range(levels)) if levels > 1 else 0
     out: Dict[str, pd.DataFrame] = {}
     for p in sorted(folder.glob("*.csv")):
-        df = pd.read_csv(p, header=header, encoding="utf-8")
-        if not isinstance(df.columns, pd.MultiIndex):
-            df.columns = pd.MultiIndex.from_tuples([(c,) for c in df.columns])
+        df = pd.read_csv(p, header=0, encoding="utf-8")
+        cols = list(df.columns)
+        tuples = [(c,) + ("",) * (levels - 1) for c in cols]
+        df.columns = pd.MultiIndex.from_tuples(tuples)
         out[p.stem] = df
     if not out:
         raise SystemExit(f"Keine *.csv in {folder} gefunden.")

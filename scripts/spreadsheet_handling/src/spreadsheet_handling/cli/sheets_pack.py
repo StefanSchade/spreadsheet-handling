@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import pandas as pd
+import logging
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,8 @@ from spreadsheet_handling.core.fk import (
     apply_fk_helpers,
     assert_no_parentheses_in_columns,
 )
+
+logging.basicConfig(level=logging.INFO)  # am Datei-Anfang einmal
 
 DEFAULTS: Dict[str, Any] = {
     "levels": 3,
@@ -154,8 +157,11 @@ def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
 def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for sheet, df in frames.items():
-        (out_dir / f"{sheet}.csv").write_text("", encoding="utf-8")  # ensure file exists/owned
-        df.to_csv(out_dir / f"{sheet}.csv", index=False, encoding="utf-8")
+        df_out = df.copy()
+        if isinstance(df_out.columns, pd.MultiIndex):
+            # Nur Level-0 in die CSV-Headerzeile schreiben
+            df_out.columns = [t[0] for t in df_out.columns.to_list()]
+        df_out.to_csv(out_dir / f"{sheet}.csv", index=False, encoding="utf-8")
 
 
 # ---------- Core ----------
@@ -190,6 +196,10 @@ def run_pack(cfg: Dict[str, Any]) -> None:
 
     registry = build_registry(frames, defaults)
     id_maps = build_id_label_maps(frames, registry)
+
+    logging.info("FK registry: %s", registry)
+    for sk, m in id_maps.items():
+        logging.info("Map[%s]: %d keys (sample: %s)", sk, len(m), list(m.items())[:3])
 
     if bool(defaults.get("detect_fk", True)):
         helper_prefix = str(defaults.get("helper_prefix", "_"))
