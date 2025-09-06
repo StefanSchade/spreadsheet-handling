@@ -207,7 +207,6 @@ def _write_workbook(cfg: Dict[str, Any], frames: Dict[str, pd.DataFrame]) -> Non
 
 # ---------- Orchestrator (Library Entry) ----------
 
-
 def run_pack(
     cfg: Dict[str, Any],
     *,
@@ -216,34 +215,43 @@ def run_pack(
 ) -> None:
     """
     Orchestriert: Frames laden -> validieren -> FK-Helpers -> schreiben.
-    Validierungsmodi können explizit übergeben werden; fehlen sie, werden
-    sie aus cfg['defaults']['validate'] gelesen (oder 'warn').
+
+    Die Validierungsmodi werden priorisiert:
+      1) explizite Funktionsargumente
+      2) cfg['defaults']['validate'] (Schlüssel: 'missing_fk', 'duplicate_ids')
+      3) Fallback 'warn'
     """
-    defaults = cfg.get("defaults", {})
+    defaults: Dict[str, Any] = cfg.get("defaults", {}) or {}
     log.debug("run_pack defaults=%s", defaults)
 
     # 1) Frames laden
-    frames = _load_frames_from_jsons(cfg)
+    frames: Dict[str, pd.DataFrame] = _load_frames_from_jsons(cfg)
+    log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
 
-    # 2) Vorab-Checks (Klammern in Headern vermeiden)
+    # 2) Header-Guards (keine Klammern)
     for sheet_name, df in frames.items():
         assert_no_parentheses_in_columns(df, sheet_name)
 
-    # 3) Engine
+    # 3) Engine initialisieren
     engine = Engine(defaults)
 
-    # Validierungsmodi bestimmen (CLI > cfg.validate > 'warn')
-    vcfg = defaults.get("validate", {}) or {}
-    mmode = mode_missing_fk or vcfg.get("missing_fk") or "warn"
-    dmode = mode_duplicate_ids or vcfg.get("duplicate_ids") or "warn"
+    # 3a) Validierungsmodi bestimmen (CLI/Funktionsargs > defaults.validate > 'warn')
+    vcfg = (defaults.get("validate") or {})
+    mmode = mode_missing_fk if mode_missing_fk is not None else vcfg.get("missing_fk", "warn")
+    dmode = (
+        mode_duplicate_ids
+        if mode_duplicate_ids is not None
+        else vcfg.get("duplicate_ids", "warn")
+    )
 
-    # 3a) Validate
-    engine.validate(frames, mode_missing_fk=mmode, mode_duplicate_ids=dmode)
+    # 3b) Validieren (wir loggen den Report in DEBUG, raisen je nach Modus in Engine.validate)
+    report = engine.validate(frames, mode_missing_fk=mmode, mode_duplicate_ids=dmode)
+    log.debug("validate report=%s", report)
 
-    # 3b) FK-Helpers anwenden
+    # 3c) FK-Helper-Spalten anwenden (nur wenn detect_fk=True)
     frames = engine.apply_fks(frames)
 
-    # 4) Schreiben
+    # 4) Schreiben (xlsx/csv/…)
     _write_workbook(cfg, frames)
 
 
