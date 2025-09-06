@@ -2,6 +2,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, NamedTuple
 import pandas as pd
+# Neu: zentrale Indexing-Helpers verwenden
+from .indexing import has_level0 as _has_level0, level0_series as _series_from_first_level
 
 
 FK_PATTERN = re.compile(r"^(?P<id_field>[^_]+)_\((?P<sheet_key>[^)]+)\)$")
@@ -82,24 +84,6 @@ def build_registry(
 
 def _first_level_columns(df: pd.DataFrame) -> List[str]:
     return [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]
-
-
-def _series_from_first_level(df: pd.DataFrame, first_level_name: str) -> pd.Series:
-    """
-    Liefert eine Series für die Spalte, die auf Level-0 'first_level_name' trägt,
-    unabhängig davon, ob df.columns ein MultiIndex ist.
-    """
-    if isinstance(df.columns, pd.MultiIndex):
-        sub = df.xs(first_level_name, axis=1, level=0)  # schneidet Level-0 heraus
-        # xs kann Series oder DataFrame zurückgeben; wenn DF, die erste Spalte nehmen
-        if isinstance(sub, pd.DataFrame):
-            if sub.shape[1] == 0:
-                raise KeyError(f"Spalte {first_level_name!r} nicht gefunden.")
-            return sub.iloc[:, 0]
-        return sub  # Series
-    # kein MultiIndex
-    return df[first_level_name]
-
 
 def detect_fk_columns(
     df: pd.DataFrame, registry: Dict[str, Dict[str, Any]], helper_prefix: str = "_"
