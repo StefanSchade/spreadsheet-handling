@@ -164,7 +164,9 @@ def build_id_label_maps(
         maps[sheet_key] = m
     return maps
 
+
 # in scripts/spreadsheet_handling/src/spreadsheet_handling/core/fk.py
+
 
 def apply_fk_helpers(
     df: pd.DataFrame,
@@ -182,7 +184,7 @@ def apply_fk_helpers(
     for fk in fk_defs:
         # --- FKDef ODER dict robust unterstützen ---
         if isinstance(fk, dict):
-            fk_col = fk["column"]                               # z.B. "id_(A)"
+            fk_col = fk["column"]  # z.B. "id_(A)"
             target_key = fk.get("target_key") or fk.get("target_sheet_key")
             helper_col = f"{helper_prefix}{target_key}_name"
         else:
@@ -212,4 +214,3 @@ def apply_fk_helpers(
         new_df[col_tuple] = values
 
     return new_df
-

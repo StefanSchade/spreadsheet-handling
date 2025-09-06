@@ -10,7 +10,13 @@ def test_missing_fk_warn():
         "A": pd.DataFrame([{"id": 1, "name": "Alpha"}]),
         "B": pd.DataFrame([{"id_(A)": 1}, {"id_(A)": 99}]),
     }
-    defaults = {"id_field": "id", "label_field": "name", "helper_prefix": "_", "levels": 3, "detect_fk": True}
+    defaults = {
+        "id_field": "id",
+        "label_field": "name",
+        "helper_prefix": "_",
+        "levels": 3,
+        "detect_fk": True,
+    }
     eng = Engine(defaults)
 
     # darf NICHT raisen in warn
@@ -26,10 +32,15 @@ def test_missing_fk_fail():
         "A": pd.DataFrame([{"id": 1, "name": "Alpha"}]),
         "B": pd.DataFrame([{"id_(A)": 1}, {"id_(A)": 99}]),
     }
-    defaults = {"id_field": "id", "label_field": "name", "helper_prefix": "_", "levels": 3, "detect_fk": True}
+    defaults = {
+        "id_field": "id",
+        "label_field": "name",
+        "helper_prefix": "_",
+        "levels": 3,
+        "detect_fk": True,
+    }
     eng = Engine(defaults)
 
     with pytest.raises(ValueError) as exc:
         eng.validate(frames, mode_missing_fk="fail", mode_duplicate_ids="ignore")
     assert "missing" in str(exc.value).lower()
-

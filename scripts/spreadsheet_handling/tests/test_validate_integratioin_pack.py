@@ -38,4 +38,3 @@ def test_pack_fails_on_missing_fk(tmp_path: Path):
 
     with pytest.raises(ValueError):
         run_pack(cfg)
-

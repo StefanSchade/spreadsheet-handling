@@ -206,6 +206,7 @@ def _write_workbook(cfg: Dict[str, Any], frames: Dict[str, pd.DataFrame]) -> Non
 
 # ---------- Orchestrator (Library Entry) ----------
 
+
 def run_pack(
     cfg: Dict[str, Any],
     *,
@@ -235,12 +236,10 @@ def run_pack(
     engine = Engine(defaults)
 
     # 3a) Validierungsmodi bestimmen (CLI/Funktionsargs > defaults.validate > 'warn')
-    vcfg = (defaults.get("validate") or {})
+    vcfg = defaults.get("validate") or {}
     mmode = mode_missing_fk if mode_missing_fk is not None else vcfg.get("missing_fk", "warn")
     dmode = (
-        mode_duplicate_ids
-        if mode_duplicate_ids is not None
-        else vcfg.get("duplicate_ids", "warn")
+        mode_duplicate_ids if mode_duplicate_ids is not None else vcfg.get("duplicate_ids", "warn")
     )
 
     # 3b) Validieren (wir loggen den Report in DEBUG, raisen je nach Modus in Engine.validate)
