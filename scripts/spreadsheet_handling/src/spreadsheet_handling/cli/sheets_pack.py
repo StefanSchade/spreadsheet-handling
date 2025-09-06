@@ -153,7 +153,6 @@ def _load_frames_from_jsons(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
             df = pd.DataFrame(records)
             frames[name] = _ensure_multiindex(df, levels)
 
-    log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
     return frames
 
 

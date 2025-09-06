@@ -164,6 +164,7 @@ def build_id_label_maps(
         maps[sheet_key] = m
     return maps
 
+# in scripts/spreadsheet_handling/src/spreadsheet_handling/core/fk.py
 
 def apply_fk_helpers(
     df: pd.DataFrame,
@@ -172,34 +173,43 @@ def apply_fk_helpers(
     levels: int,
     helper_prefix: str = "_",
 ) -> pd.DataFrame:
-    """
-    Fügt zu jedem FK eine Helper-Spalte (Prefix '_') hinzu:
-    Wert = Label aus Zielblatt (via ID). MultiIndex wird berücksichtigt.
-    """
     if not fk_defs:
         return df
 
-    # existierende first-level Namen
     first_cols = _first_level_columns(df)
     new_df = df.copy()
 
     for fk in fk_defs:
-        if fk.helper_column in first_cols:
-            # nicht duplizieren
-            continue
-        label_map = id_label_maps.get(fk.target_sheet_key, {})
-        # Spalte berechnen
+        # --- FKDef ODER dict robust unterstützen ---
+        if isinstance(fk, dict):
+            fk_col = fk["column"]                               # z.B. "id_(A)"
+            target_key = fk.get("target_key") or fk.get("target_sheet_key")
+            helper_col = f"{helper_prefix}{target_key}_name"
+        else:
+            fk_col = fk.fk_column
+            target_key = fk.target_sheet_key
+            helper_col = fk.helper_column
+        # -------------------------------------------
 
-        # >>> FIX: FK-Werte als Series aus Level-0 holen (nicht DataFrame!)
-        fk_series = _series_from_first_level(new_df, fk.fk_column)
+        # nicht duplizieren
+        if helper_col in first_cols:
+            continue
+
+        label_map = id_label_maps.get(target_key, {})
+
+        # FK-Werte aus Level-0 holen (nicht DataFrame!)
+        fk_series = _series_from_first_level(new_df, fk_col)
         raw_ids = fk_series.tolist()
-        # Robustere Lookup-Strategie: exakter Key, sonst String-Fallback
+
+        # robustes Lookup mit Normalisierung
         values = []
         for rid in raw_ids:
             lbl = label_map.get(_norm_id(rid))
             values.append(lbl)
 
-        col_tuple = (fk.helper_column,) + ("",) * (levels - 1)
+        # neue Spalte als MultiIndex-Tuple gleicher Länge
+        col_tuple = (helper_col,) + ("",) * (levels - 1)
         new_df[col_tuple] = values
 
     return new_df
+

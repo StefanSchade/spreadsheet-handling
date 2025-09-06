@@ -46,100 +46,84 @@ class Engine:
     # Public API
     # ---------------------
 
-    def validate(
-        self,
-        frames: Dict[str, pd.DataFrame],
-        *,
-        mode_missing_fk: str = "warn",
-        mode_duplicate_ids: str = "fail",
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Validiert:
-          - Duplicate IDs pro Zielblatt (ID-Feld aus Registry)
-          - Missing FKs in Quellblättern (Spalten wie '<id_field>_(TargetKey)')
+# in scripts/spreadsheet_handling/src/spreadsheet_handling/engine/orchestrator.py
 
-        modes: 'ignore' | 'warn' | 'fail'
-        Rückgabe: report = {'duplicate_ids': {sheet:[ids...]}, 'missing_fk': {sheet:{col:[ids...]}}}
-        """
-        # Guards + Grundlagen
-        for sheet_name, df in frames.items():
-            assert_no_parentheses_in_columns(df, sheet_name)
+from typing import Dict, Any, List, Tuple
+...
+def validate(
+    self,
+    frames: Dict[str, pd.DataFrame],
+    *,
+    mode_missing_fk: str = "warn",       # "ignore" | "warn" | "fail"
+    mode_duplicate_ids: str = "warn",
+) -> Dict[str, Any]:
+    registry = build_registry(frames, self.defaults)
+    id_maps = build_id_label_maps(frames, registry)
 
-        registry = build_registry(frames, self.defaults)
-        id_maps = build_id_label_maps(frames, registry)
+    log.debug("validate(): registry=%s", registry)
+    for sk, m in id_maps.items():
+        if m:
+            sample = list(m.items())[:2]
+            log.debug("validate(): id_map[%s]: %d keys, sample=%s", sk, len(m), sample)
 
-        log.debug("validate(): registry=%s", registry)
-        for sk, mapping in id_maps.items():
-            if mapping:
-                sample = list(mapping.items())[:2]
-                log.debug(
-                    "validate(): id_map[%s]: %d keys, sample=%s",
-                    sk,
-                    len(mapping),
-                    sample,
-                )
+    report: Dict[str, Any] = {"duplicate_ids": {}, "missing_fk": {}}
 
-        report: Dict[str, Dict[str, Any]] = {"duplicate_ids": {}, "missing_fk": {}}
+    # --- Duplicate IDs ---
+    dup_by_sheet: Dict[str, List[str]] = {}
+    for sheet_name, df in frames.items():
+        key = _sheet_key(sheet_name)  # so wie in deinen Helpers/Gebrauch
+        id_field = registry[key]["id_field"]
+        if id_field in df.columns:
+            # dupe detection mit str()-Normalisierung
+            vals = df[id_field].astype("string")
+            dups = vals[vals.duplicated(keep="last")].unique().tolist()
+            if dups:
+                dup_by_sheet[sheet_name] = [str(x) for x in dups]
 
-        # --- Duplicate IDs pro Zielblatt
-        for sk, meta in registry.items():
-            sheet_name = meta["sheet_name"]
-            id_field = meta.get("id_field", "id")
-            df = frames.get(sheet_name)
-            if df is None or id_field not in df.columns:
-                continue
+    if dup_by_sheet:
+        if mode_duplicate_ids == "fail":
+            raise ValueError(f"duplicate IDs: {dup_by_sheet}")
+        elif mode_duplicate_ids == "warn":
+            log.warning("duplicate IDs: %s", dup_by_sheet)
+        report["duplicate_ids"] = dup_by_sheet
 
-            ser = df[id_field].map(_norm_id)
-            # Duplikate nur auf nicht-leeren IDs
-            dup_mask = ser.notna() & ser.duplicated(keep=False)
-            if bool(dup_mask.any()):
-                dups: List[str] = sorted({ser.iloc[i] for i in ser[dup_mask].index})  # type: ignore[index]
-                report["duplicate_ids"][sheet_name] = dups
+    # --- Missing FKs ---
+    missing_by_sheet: Dict[str, List[Dict[str, Any]]] = {}
+    for sheet_name, df in frames.items():
+        key = _sheet_key(sheet_name)
+        fk_defs = detect_fk_columns(df, registry, helper_prefix=str(self.defaults.get("helper_prefix", "_")))
 
-        # --- Missing FKs pro Quellblatt
-        helper_prefix = str(self.defaults.get("helper_prefix", "_"))
-        for src_sheet, df in frames.items():
-            # Für jedes Ziel aus Registry eine mögliche FK-Spalte prüfen:
-            for sk, meta in registry.items():
-                target_id = meta.get("id_field", "id")
-                # Spaltenname nach unserer Konvention, z.B. "id_(A)" oder "Schluessel_(Guten_Morgen)"
-                col = f"{target_id}_({sk})"
-                if col not in df.columns:
-                    continue
+        # Wir wollen mit dicts & FKDef arbeiten können
+        for fk in fk_defs:
+            if isinstance(fk, dict):
+                col_name = fk["column"]
+                target_key = fk["target_key"]
+            else:
+                col_name = fk.column
+                target_key = fk.target_key
 
-                id_map = id_maps.get(sk, {})  # bekannte Ziel-IDs als Strings
-                missing: List[str] = []
-                for raw in df[col].tolist():
-                    norm = _norm_id(raw)
-                    if norm is None:  # leere FK sind erlaubt
-                        continue
-                    if norm not in id_map:
-                        missing.append(norm)
+            target_map = id_maps.get(target_key, {})
+            if col_name in df.columns:
+                vals = df[col_name].astype("string")
+                # Nicht-null Werte, die NICHT im Ziel vorkommen
+                missing_vals = sorted({str(v) for v in vals.dropna().unique() if str(v) not in target_map})
+                if missing_vals:
+                    missing_by_sheet.setdefault(sheet_name, []).append(
+                        {"column": col_name, "missing_values": missing_vals}
+                    )
 
-                if missing:
-                    # structure: report['missing_fk'][src_sheet][col] = [...]
-                    if src_sheet not in report["missing_fk"]:
-                        report["missing_fk"][src_sheet] = {}
-                    report["missing_fk"][src_sheet][col] = sorted(set(missing))
+    if missing_by_sheet:
+        if mode_missing_fk == "fail":
+            raise ValueError(f"missing FKs: {missing_by_sheet}")
+        elif mode_missing_fk == "warn":
+            # fürs Log lieber kompaktes Format
+            compact = {s: {iss["column"]: iss["missing_values"] for iss in issues}
+                       for s, issues in missing_by_sheet.items()}
+            log.warning("missing FKs: %s", compact)
+        report["missing_fk"] = missing_by_sheet
 
-        # --- Reaktionen gemäß Modes
-        # duplicates
-        if report["duplicate_ids"]:
-            msg = f"duplicate IDs: {report['duplicate_ids']}"
-            if mode_duplicate_ids == "fail":
-                raise ValueError(msg)
-            elif mode_duplicate_ids == "warn":
-                log.warning("validate(): %s", msg)
+    return report
 
-        # missing fk
-        if report["missing_fk"]:
-            msg = f"missing FKs: {report['missing_fk']}"
-            if mode_missing_fk == "fail":
-                raise ValueError(msg)
-            elif mode_missing_fk == "warn":
-                log.warning("validate(): %s", msg)
-
-        return report
 
     def apply_fks(self, frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
