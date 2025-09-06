@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pack (Phase 1):
+Pack (Phase 1+2a/2b):
 - Mehrere JSON-Quellen -> ein Workbook (XLSX) oder ein CSV-Ordner.
-- Noch keine FK-/Helper-/Formel-Logik.
+- FK-Helper-Spalten (Engine.apply_fks) und Validierung (Engine.validate).
 """
 from __future__ import annotations
 
 import argparse
 import json
-import pandas as pd
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from spreadsheet_handling.logging_utils import setup_logging, get_logger
+import pandas as pd
+
 from spreadsheet_handling.core.fk import assert_no_parentheses_in_columns
 from spreadsheet_handling.engine.orchestrator import Engine
+from spreadsheet_handling.logging_utils import setup_logging, get_logger
 
 log = get_logger("pack")
 
@@ -39,7 +39,6 @@ def _ensure_multiindex(df: pd.DataFrame, levels: int) -> pd.DataFrame:
     Wenn flache Spaltennamen vorliegen, wird die erste Ebene belegt und der Rest mit "" aufgefüllt.
     """
     if isinstance(df.columns, pd.MultiIndex):
-        # ggf. auf die gewünschte Level-Anzahl auffüllen
         if df.columns.nlevels < levels:
             new_tuples = []
             for tpl in df.columns.to_list():
@@ -80,7 +79,7 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
     Schema (v1):
     {
       workbook: str,
-      defaults: {levels:int, backend:str},
+      defaults: {levels:int, backend:str, ...},
       sheets: [ {name:str, json:str} | {json:str(dir)} ]
     }
     """
@@ -131,6 +130,33 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
     return cfg
 
 
+# ---------- Frame-Lader ----------
+
+
+def _load_frames_from_jsons(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    """Konvertiert alle in cfg angegebenen JSON-Quellen in DataFrames (mit MultiIndex-Spalten)."""
+    defaults = cfg.get("defaults", {})
+    levels = int(defaults.get("levels", DEFAULTS["levels"]))
+
+    frames: Dict[str, pd.DataFrame] = {}
+    for sheet_cfg in cfg.get("sheets", []):
+        src = Path(sheet_cfg["json"])  # Datei ODER Verzeichnis
+        if src.is_dir():
+            # Erzeuge je Datei ein Blatt (Name=Stem)
+            for p in sorted(src.glob("*.json")):
+                records = _read_json_records(p)
+                df = pd.DataFrame(records)
+                frames[p.stem] = _ensure_multiindex(df, levels)
+        else:
+            name = sheet_cfg.get("name") or src.stem
+            records = _read_json_records(src)
+            df = pd.DataFrame(records)
+            frames[name] = _ensure_multiindex(df, levels)
+
+    log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
+    return frames
+
+
 # ---------- Writer ----------
 
 
@@ -147,6 +173,7 @@ def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
                 # nur die erste Ebene verwenden (Level 0)
                 df_out.columns = [t[0] for t in df_out.columns.to_list()]
             df_out.to_excel(xw, sheet_name=sheet, index=False)
+    print(f"[pack] XLSX geschrieben: {workbook_path}")
 
 
 def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
@@ -157,59 +184,67 @@ def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
             # Nur Level-0 in die CSV-Headerzeile schreiben
             df_out.columns = [t[0] for t in df_out.columns.to_list()]
         df_out.to_csv(out_dir / f"{sheet}.csv", index=False, encoding="utf-8")
+    print(f"[pack] CSV-Ordner geschrieben: {out_dir}")
 
 
-# ---------- Core ----------
-
-
-def run_pack(cfg: Dict[str, Any]) -> None:
-    defaults = cfg.get("defaults", {})
-    log.debug("run_pack defaults=%s", defaults)
-
-    levels = int(defaults.get("levels", DEFAULTS["levels"]))
-    backend = (defaults.get("backend") or DEFAULTS["backend"]).lower()
-
-    frames: Dict[str, pd.DataFrame] = {}
-
-    for sheet_cfg in cfg.get("sheets", []):
-        src = Path(sheet_cfg["json"])  # Datei ODER Verzeichnis
-        if src.is_dir():
-            # Erzeuge je Datei ein Blatt (Name=Stem)
-            for p in sorted(src.glob("*.json")):
-                records = _read_json_records(p)
-                df = pd.DataFrame(records)
-                df = _ensure_multiindex(df, levels)
-                frames[p.stem] = df
-        else:
-            name = sheet_cfg.get("name") or src.stem
-            records = _read_json_records(src)
-            df = pd.DataFrame(records)
-            df = _ensure_multiindex(df, levels)
-            frames[name] = df
-            
-    log.info("loaded %d sheet(s): %s", len(frames), list(frames.keys()))
-
-    for sheet_name, df in frames.items():
-        assert_no_parentheses_in_columns(df, sheet_name)
-    engine = Engine(defaults)
-    frames = engine.apply_fks(frames)
-
+def _write_workbook(cfg: Dict[str, Any], frames: Dict[str, pd.DataFrame]) -> None:
     out = cfg.get("workbook")
     if not out:
         raise SystemExit("Output-Pfad `workbook` fehlt.")
     out_path = Path(out)
 
+    backend = (cfg.get("defaults", {}).get("backend") or DEFAULTS["backend"]).lower()
     if backend == "xlsx":
         _write_xlsx(out_path, frames)
-        print(f"[pack] XLSX geschrieben: {out_path.with_suffix('.xlsx')}")
     elif backend == "csv":
         # out kann Datei- oder Ordnername sein -> immer zu Ordner normalisieren
         if out_path.suffix:
             out_path = out_path.parent / out_path.stem
         _write_csv_folder(out_path, frames)
-        log.info("[pack] wrote %s backend to %s", backend, out_path)
     else:
         raise SystemExit(f"Unbekannter Backend-Typ: {backend}")
+
+
+# ---------- Orchestrator (Library Entry) ----------
+
+
+def run_pack(
+    cfg: Dict[str, Any],
+    *,
+    mode_missing_fk: str | None = None,
+    mode_duplicate_ids: str | None = None,
+) -> None:
+    """
+    Orchestriert: Frames laden -> validieren -> FK-Helpers -> schreiben.
+    Validierungsmodi können explizit übergeben werden; fehlen sie, werden
+    sie aus cfg['defaults']['validate'] gelesen (oder 'warn').
+    """
+    defaults = cfg.get("defaults", {})
+    log.debug("run_pack defaults=%s", defaults)
+
+    # 1) Frames laden
+    frames = _load_frames_from_jsons(cfg)
+
+    # 2) Vorab-Checks (Klammern in Headern vermeiden)
+    for sheet_name, df in frames.items():
+        assert_no_parentheses_in_columns(df, sheet_name)
+
+    # 3) Engine
+    engine = Engine(defaults)
+
+    # Validierungsmodi bestimmen (CLI > cfg.validate > 'warn')
+    vcfg = defaults.get("validate", {}) or {}
+    mmode = mode_missing_fk or vcfg.get("missing_fk") or "warn"
+    dmode = mode_duplicate_ids or vcfg.get("duplicate_ids") or "warn"
+
+    # 3a) Validate
+    engine.validate(frames, mode_missing_fk=mmode, mode_duplicate_ids=dmode)
+
+    # 3b) FK-Helpers anwenden
+    frames = engine.apply_fks(frames)
+
+    # 4) Schreiben
+    _write_workbook(cfg, frames)
 
 
 # ---------- CLI ----------
@@ -222,16 +257,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="YAML-Konfiguration")
     p.add_argument("--levels", type=int, default=None, help="Header-Levels (default 3)")
     p.add_argument("--backend", choices=["xlsx", "csv"], help="xlsx (default) oder csv")
-    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Logger-Level (default WARNING)")
+    p.add_argument(
+        "--missing-fk",
+        choices=["ignore", "warn", "fail"],
+        help="Validation mode for missing foreign keys (default: warn).",
+    )
+    p.add_argument(
+        "--duplicate-ids",
+        choices=["ignore", "warn", "fail"],
+        help="Validation mode for duplicate IDs (default: warn).",
+    )
+    p.add_argument(
+        "--fail-on-missing-fk", action="store_true", help="Shortcut for --missing-fk=fail"
+    )
+    p.add_argument(
+        "--fail-on-duplicate-ids", action="store_true", help="Shortcut for --duplicate-ids=fail"
+    )
+    p.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logger-Level (default WARNING)",
+    )
     return p
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
     setup_logging(args.log_level)
+
     cfg = _load_config(args)
-    run_pack(cfg)
+
+    # Validierungsmodi ermitteln (Priorität: CLI > defaults.validate > 'warn')
+    defaults = cfg.get("defaults", {})
+    vcfg = defaults.get("validate", {}) or {}
+    mode_missing = (
+        args.missing_fk
+        or ("fail" if args.fail_on_missing_fk else None)
+        or vcfg.get("missing_fk")
+        or "warn"
+    )
+    mode_dup = (
+        args.duplicate_ids
+        or ("fail" if args.fail_on_duplicate_ids else None)
+        or vcfg.get("duplicate_ids")
+        or "warn"
+    )
+
+    run_pack(
+        cfg,
+        mode_missing_fk=mode_missing,
+        mode_duplicate_ids=mode_dup,
+    )
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

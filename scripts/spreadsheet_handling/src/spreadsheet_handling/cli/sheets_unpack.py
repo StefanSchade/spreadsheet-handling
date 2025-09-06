@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from spreadsheet_handling.logging_utils import setup_logging, get_logger
+
 log = get_logger("unpack")
 
 DEFAULT_LEVELS = 3
@@ -104,7 +105,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--backend", choices=["xlsx", "csv"], default="xlsx", help="xlsx (default) oder csv"
     )
-    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Logger-Level (default WARNING)")
+    p.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logger-Level (default WARNING)",
+    )
     return p
 
 
