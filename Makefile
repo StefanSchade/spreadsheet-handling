@@ -19,23 +19,24 @@ STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 
+PYPROJECT    := $(PKGDIR)/pyproject.toml  # trigger for reinstalls
+
 # pytest logging options for debug runs
 LOG_OPTS  ?= -o log_cli=true -o log_cli_level=DEBUG
 
 # =========================
 # Phony targets
 # =========================
-.PHONY: help setup reset-deps clean venv deps deps-dev \
+.PHONY: help setup reset-deps clean venv \
         test test-verbose test-lastfailed test-one test-file test-node \
-        format lint syntax ci coverage coverage-html run snapshot
+        format lint syntax ci coverage coverage-html run snapshot doctor
 
 # =========================
 # Help (auto)
 # =========================
 help: ## Show this help
 	@echo "Available targets:"
-	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | \
-		sed -E 's/:.*?## /: /' | sort
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | sed -E 's/:.*?## /: /' | sort
 
 # =========================
 # Environment & dependencies
@@ -43,14 +44,16 @@ help: ## Show this help
 venv: ## Create .venv if missing
 	@test -d $(VENV) || python3 -m venv $(VENV)
 
-$(DEPS_STAMP): venv ## Install runtime deps + package (editable)
+# Runtime deps + editable install of the package
+$(DEPS_STAMP): $(PYPROJECT) | venv  ## Install runtime deps + package (editable)
 	$(PIP) install -e $(PKGDIR)
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEPS_STAMP)
 
 deps: $(DEPS_STAMP) ## Ensure runtime deps installed
 
-$(DEV_STAMP): $(DEPS_STAMP) ## Install dev tools (from extras 'dev')
+# Dev tools (ruff/black/pytest/pytest-cov/pyyaml) via extras
+$(DEV_STAMP): $(DEPS_STAMP) $(PYPROJECT) ## Install dev tools (extras 'dev')
 	$(PIP) install -e $(PKGDIR)[dev]
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEV_STAMP)
@@ -69,6 +72,14 @@ clean: ## Remove caches and build artifacts
 	find $(ROOT) -type d -name '.pytest_cache' -prune -exec rm -rf {} +
 	find $(PKGDIR) -maxdepth 1 -type d -name '*.egg-info' -prune -exec rm -rf {} +
 	find $(ROOT) -name '.~lock.*#' -delete
+
+clean-stamps: ## Remove dependency stamps (forces re-install on next run)
+	rm -rf $(STAMP_DIR)
+
+clean-venv: clean-stamps ## Remove the virtualenv entirely
+	rm -rf $(VENV)
+
+distclean: clean clean-venv ## Deep clean: build artifacts + venv
 
 # =========================
 # Quality
@@ -109,11 +120,10 @@ test-file: deps-dev ## Run a single test file (set FILE=...)
 test-node: deps-dev ## Run a single test node (set NODE=file::test)
 	$(PYTEST) -vv $(LOG_OPTS) $(NODE)
 
-# ========================
+# =========================
 # Snapshot
-# ========================
-
-snapshot:
+# =========================
+snapshot: ## Repo snapshot under build/
 	mkdir -p $(TARGET)
 	$(ROOT)scripts/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/repo.txt
 
@@ -127,13 +137,13 @@ coverage: deps-dev ## Coverage in terminal (with missing lines)
 		--cov-report=term-missing \
 		scripts/spreadsheet_handling/tests
 
-coverage-html: deps-dev ## Coverage as HTML report (htmlcov/)
+coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 	mkdir -p $(COV_HTML_DIR)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
 		--cov=scripts/spreadsheet_handling/src/spreadsheet_handling \
 		--cov-report=html:$(COV_HTML_DIR) \
 		scripts/spreadsheet_handling/tests
-	@echo "Open HTML report: file://$(COV_HTML_DIR)htmlcov/index.html"
+	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # =========================
 # Demo run
@@ -148,3 +158,12 @@ run: deps ## Demo: roundtrip on example
 	  -o $(PKGDIR)/tmp/tmp.json \
 	  --levels 3
 
+# =========================
+# Diagnose
+# =========================
+doctor: ## Show env + stamps (kleines Diagnose-Target)
+	@echo "VENV:      $(VENV)  (exists? $$([ -d $(VENV) ] && echo yes || echo no))"
+	@echo "STAMP_DIR: $(STAMP_DIR)"
+	@echo "DEPS:      $(DEPS_STAMP)  (exists? $$([ -f $(DEPS_STAMP) ] && echo yes || echo no))"
+	@echo "DEV:       $(DEV_STAMP)   (exists? $$([ -f $(DEV_STAMP) ] && echo yes || echo no))"
+	@echo "PYPROJECT: $(PYPROJECT)"
