@@ -287,7 +287,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
     setup_logging(args.log_level)
