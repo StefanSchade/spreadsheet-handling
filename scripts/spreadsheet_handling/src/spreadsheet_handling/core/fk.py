@@ -2,8 +2,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, NamedTuple
 import pandas as pd
+
 # Neu: zentrale Indexing-Helpers verwenden
-from .indexing import has_level0 as _has_level0, level0_series as _series_from_first_level
+from .indexing import level0_series as _series_from_first_level
 
 
 FK_PATTERN = re.compile(r"^(?P<id_field>[^_]+)_\((?P<sheet_key>[^)]+)\)$")
@@ -84,6 +85,7 @@ def build_registry(
 
 def _first_level_columns(df: pd.DataFrame) -> List[str]:
     return [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]
+
 
 def detect_fk_columns(
     df: pd.DataFrame, registry: Dict[str, Dict[str, Any]], helper_prefix: str = "_"

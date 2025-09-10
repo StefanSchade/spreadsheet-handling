@@ -10,4 +10,3 @@ except PackageNotFoundError:
     __version__ = "0.0.dev"
 
 __all__ = ["__version__", "Engine", "pack"]
-

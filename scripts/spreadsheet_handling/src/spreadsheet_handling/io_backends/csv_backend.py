@@ -2,11 +2,13 @@ from __future__ import annotations
 import pandas as pd
 from .base import BackendBase
 
+
 def _escape_csv_cell(v) -> str:
     s = "" if v is None else str(v)
     if any(ch in s for ch in [",", '"', "\n", "\r"]):
         s = '"' + s.replace('"', '""') + '"'
     return s
+
 
 class CSVBackend(BackendBase):
     """
@@ -35,20 +37,39 @@ class CSVBackend(BackendBase):
             for row in body_rows:
                 f.write(",".join(_escape_csv_cell(v) for v in row) + "\n")
 
-    def read(self, path: str, header_levels: int, sheet_name: str = "Daten") -> pd.DataFrame:
-        raw = pd.read_csv(path, header=None, dtype=str, keep_default_na=False, na_values=[])
-        if header_levels <= 0:
-            df = raw
-            df.columns = [f"col{i}" for i in range(len(df.columns))]
-            return df
-
-        header_part = raw.iloc[:header_levels, :]
-        body_part = raw.iloc[header_levels:, :]
-
-        tuples = list(zip(*[header_part.iloc[i].tolist() for i in range(header_levels)]))
-        clean_tuples = tuple(tuple(x if x != "nan" else "" for x in t) for t in tuples)
-
-        columns = pd.MultiIndex.from_tuples(clean_tuples)
-        df = pd.DataFrame(body_part.values, columns=columns)
+   # optional: options tolerieren
+    def read(
+        self,
+        path: str,
+        header_levels: int,
+        sheet_name: str | None = None,
+        options: BackendOptions | None = None,
+    ) -> pd.DataFrame:
+        hdr = list(range(header_levels)) if header_levels and header_levels > 0 else 0
+        df = pd.read_csv(
+            path,
+            header=hdr,
+            dtype=str,
+            keep_default_na=False,
+            na_values=[],
+        )
         return df
-
+    
+    # Neu: Multi-Sheet aus Ordner
+    def read_multi(
+        self,
+        path: str,
+        header_levels: int,
+        options: BackendOptions | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        folder = Path(path)
+        out: dict[str, pd.DataFrame] = {}
+        for p in sorted(folder.glob("*.csv")):
+            df = pd.read_csv(p, header=0, encoding="utf-8")
+            tuples = [(c,) + ("",) * (header_levels - 1) for c in list(df.columns)]
+            df = df.copy()
+            df.columns = pd.MultiIndex.from_tuples(tuples)
+            out[p.stem] = df
+        if not out:
+            raise FileNotFoundError(f"Keine *.csv in {folder} gefunden.")
+        return out

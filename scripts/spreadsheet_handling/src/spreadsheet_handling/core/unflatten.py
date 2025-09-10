@@ -52,3 +52,5 @@ def df_to_objects(df: pd.DataFrame) -> list[dict]:
         if obj:
             out.append(obj)
     return out
+
+

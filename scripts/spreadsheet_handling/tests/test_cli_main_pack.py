@@ -31,4 +31,3 @@ def test_cli_main_pack_csv(tmp_path: Path):
     # Erwartete Dateien (lowercase, weil von Dateinamen abgeleitet)
     names = {p.name for p in out_dir.glob("*.csv")}
     assert {"guten_morgen.csv", "bestellungen.csv"} <= names
-

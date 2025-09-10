@@ -10,10 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Sequence
 
 import pandas as pd
 from spreadsheet_handling.logging_utils import setup_logging, get_logger
+from spreadsheet_handling.io_backends import make_backend, JSONBackend
 
 log = get_logger("unpack")
 
@@ -79,18 +80,10 @@ def _rows_from_df(df: pd.DataFrame, helper_prefix: str = "_") -> List[Dict[str, 
 
 
 def run_unpack(workbook: Path, out_dir: Path, levels: int, backend: str) -> None:
-    if backend == "xlsx":
-        frames = _read_xlsx(workbook, levels)
-    elif backend == "csv":
-        frames = _read_csv_folder(workbook, levels)
-    else:
-        raise SystemExit(f"Unbekannter Backend-Typ: {backend}")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for sheet, df in frames.items():
-        records = _rows_from_df(df)
-        with (out_dir / f"{sheet}.json").open("w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
+    src = make_backend(backend)
+    frames = src.read_multi(str(workbook), header_levels=levels)
+    out = JSONBackend()
+    out.write_multi(frames, str(out_dir))
     print(f"[unpack] JSONs geschrieben nach: {out_dir}")
 
 
@@ -113,7 +106,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[List[str]] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
     setup_logging(args.log_level if hasattr(args, "log_level") else None)

@@ -5,9 +5,7 @@ from spreadsheet_handling.core.indexing import level0_series
 
 def test_apply_fks_adds_helper_column(tmp_path):
     frames = {
-        "Guten Morgen": pd.DataFrame(
-            [{"id": 1, "name": "Alpha"}, {"id": 2, "name": "Beta"}]
-        ),
+        "Guten Morgen": pd.DataFrame([{"id": 1, "name": "Alpha"}, {"id": 2, "name": "Beta"}]),
         "Bestellungen": pd.DataFrame(
             [
                 {"bestellnr": "B-1", "id_(Guten_Morgen)": 1},
@@ -35,8 +33,10 @@ def test_apply_fks_adds_helper_column(tmp_path):
     if isinstance(dfq.columns, pd.MultiIndex):
         lvl0 = list(dfq.columns.get_level_values(0))
     else:
+
         def col0(c):
             return c[0] if isinstance(c, tuple) and len(c) > 0 else c
+
         lvl0 = [col0(c) for c in dfq.columns]
 
     helper_cols0 = [c for c in lvl0 if isinstance(c, str) and c.startswith("_")]
@@ -45,4 +45,3 @@ def test_apply_fks_adds_helper_column(tmp_path):
     # Werte prüfen – robust via level0_series (funktioniert bei MI und Tuple-Namen)
     s = level0_series(dfq, helper_cols0[0])
     assert s.tolist() == ["Alpha", "Beta"]
-

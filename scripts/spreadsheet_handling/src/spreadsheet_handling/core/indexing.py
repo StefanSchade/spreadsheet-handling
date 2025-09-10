@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import Optional
 import pandas as pd
 
-import pandas as pd
-from typing import Optional
 
 def _find_tuple_col(columns: pd.Index, level0_name: str) -> Optional[tuple]:
     """
@@ -44,4 +42,3 @@ def level0_series(df: pd.DataFrame, first_level_name: str) -> pd.Series:
     if tup is not None:
         return df[tup]
     raise KeyError(first_level_name)
-

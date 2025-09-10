@@ -15,6 +15,7 @@ log = logging.getLogger("sheets.engine")
 
 # ---------- kleine Utils --------------------------------------------------------
 
+
 def _sheet_key(name: str) -> str:
     # Stabiler Schlüssel für Sheet-Namen (für FK-Referenzen etc.)
     return str(name).replace(" ", "_")
@@ -30,10 +31,11 @@ def _norm_id(v: Any) -> str | None:
 
 # ---------- (weiterhin exportiert, auch wenn intern nicht mehr benutzt) ---------
 
+
 @dataclass
 class ValidationReport:
-    duplicate_ids: Dict[str, int]              # sheet_key -> Anzahl doppelter IDs
-    missing_fks: Dict[Tuple[str, str], int]    # (sheet_key, fk_column) -> Anzahl fehlender
+    duplicate_ids: Dict[str, int]  # sheet_key -> Anzahl doppelter IDs
+    missing_fks: Dict[Tuple[str, str], int]  # (sheet_key, fk_column) -> Anzahl fehlender
     ok: bool
 
     def has_duplicates(self) -> bool:
@@ -44,6 +46,7 @@ class ValidationReport:
 
 
 # ---------- Engine ---------------------------------------------------------------
+
 
 class Engine:
     """
@@ -114,8 +117,8 @@ class Engine:
         self,
         frames: Dict[str, pd.DataFrame],
         *,
-        mode_missing_fk: str = "warn",      # 'ignore' | 'warn' | 'fail'
-        mode_duplicate_ids: str = "warn",   # 'ignore' | 'warn' | 'fail'
+        mode_missing_fk: str = "warn",  # 'ignore' | 'warn' | 'fail'
+        mode_duplicate_ids: str = "warn",  # 'ignore' | 'warn' | 'fail'
     ) -> Dict[str, Any]:
         """
         Prüft (1) doppelte IDs in Zielsheets und (2) fehlende FK-Referenzen.
@@ -169,7 +172,9 @@ class Engine:
                         target_key = fk.get("target_key") or fk.get("target_sheet_key")
                     else:
                         col = getattr(fk, "fk_column", None) or getattr(fk, "column", None)
-                        target_key = getattr(fk, "target_sheet_key", None) or getattr(fk, "target_key", None)
+                        target_key = getattr(fk, "target_sheet_key", None) or getattr(
+                            fk, "target_key", None
+                        )
                     if not col or not target_key:
                         continue
 
@@ -234,4 +239,3 @@ class Engine:
     # Alias (für eventuelle Altaufrufe)
     def apply_fk_helpers(self, frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         return self.apply_fks(frames)
-
