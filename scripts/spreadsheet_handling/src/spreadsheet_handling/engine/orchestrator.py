@@ -117,22 +117,16 @@ class Engine:
         self,
         frames: Dict[str, pd.DataFrame],
         *,
-        mode_missing_fk: str = "warn",  # 'ignore' | 'warn' | 'fail'
+        mode_missing_fk: str = "warn",     # 'ignore' | 'warn' | 'fail'
         mode_duplicate_ids: str = "warn",  # 'ignore' | 'warn' | 'fail'
     ) -> Dict[str, Any]:
         """
         Prüft (1) doppelte IDs in Zielsheets und (2) fehlende FK-Referenzen.
-
-        Rückgabe (von Tests erwartet):
-        {
-          "duplicate_ids": { "<SheetName>": ["<dup_id>", ...], ... },  # nur, wenn es Duplikate gibt
-          "missing_fk": { "<SheetName>": [ {"column": "...", "missing_values": ["..."]}, ... ], ... }
-        }
         """
         reg = self._build_registry(frames)
         id_maps = self._build_id_label_maps(frames, reg)
 
-        # 1) Doppelte IDs je Zielsheet (nur, wenn id_field vorhanden)
+        # 1) Doppelte IDs je Zielsheet
         dups_by_sheet: Dict[str, List[str]] = {}
         for skey, meta in reg.items():
             sheet_name = meta["sheet_name"]
@@ -154,9 +148,11 @@ class Engine:
                 log.error(msg)
                 raise ValueError(msg)
             elif mode_duplicate_ids == "warn":
-                log.warning(msg)
+                # dynamisches Level: Error wenn fail, sonst Warning
+                level = logging.ERROR if mode_duplicate_ids == "fail" else logging.WARNING
+                log.log(level, msg)
 
-        # 2) Fehlende FK-Referenzen je Quellsheet (detailliert pro Spalte)
+        # 2) Fehlende FK-Referenzen
         missing_by_sheet: Dict[str, List[Dict[str, Any]]] = {}
         if self.detect_fk:
             helper_prefix = str(self.defaults.get("helper_prefix", "_"))
@@ -166,7 +162,6 @@ class Engine:
                     continue
 
                 for fk in fk_defs:
-                    # flexibel, ob dataclass oder dict
                     if isinstance(fk, dict):
                         col = fk.get("column")
                         target_key = fk.get("target_key") or fk.get("target_sheet_key")
@@ -179,7 +174,7 @@ class Engine:
                         continue
 
                     if col not in df.columns:
-                        continue  # defensive
+                        continue
 
                     vals = level0_series(df, col).astype("string")
                     target_map = id_maps.get(target_key, {})
@@ -193,19 +188,20 @@ class Engine:
 
         if missing_by_sheet:
             if mode_missing_fk == "fail":
-                # Enthält 'missing' (Tests prüfen darauf)
                 raise ValueError(f"missing FK references: {missing_by_sheet}")
             elif mode_missing_fk == "warn":
-                # kompakter fürs Log
                 compact = {
                     s: {iss["column"]: iss["missing_values"] for iss in issues}
                     for s, issues in missing_by_sheet.items()
                 }
-                log.warning("missing FK references: %s", compact)
+                # dynamisches Level: Error wenn fail, sonst Warning
+                level = logging.ERROR if mode_missing_fk == "fail" else logging.WARNING
+                log.log(level, "missing FK references: %s", compact)
 
         report: Dict[str, Any] = {"duplicate_ids": dups_by_sheet, "missing_fk": missing_by_sheet}
         log.debug("validate report=%s", report)
         return report
+
 
     # -- FK-Helper ----------------------------------------------------------------
 

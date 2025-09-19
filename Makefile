@@ -45,7 +45,7 @@ venv: ## Create .venv if missing
 	@test -d $(VENV) || python3 -m venv $(VENV)
 
 # Runtime deps + editable install of the package
-$(DEPS_STAMP): $(PYPROJECT) | venv  ## Install runtime deps + package (editable)
+$(DEPS_STAMP): | venv ## $(PYPROJECT) removed as a workaround for wsl - call make reset-deps in case of change
 	$(PIP) install -e $(PKGDIR)
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEPS_STAMP)
@@ -53,12 +53,12 @@ $(DEPS_STAMP): $(PYPROJECT) | venv  ## Install runtime deps + package (editable)
 deps: $(DEPS_STAMP) ## Ensure runtime deps installed
 
 # Dev tools (ruff/black/pytest/pytest-cov/pyyaml) via extras
-$(DEV_STAMP): $(DEPS_STAMP) $(PYPROJECT) ## Install dev tools (extras 'dev')
+$(DEV_STAMP): $(DEPS_STAMP)  ## $(PYPROJECT) removed as a workaround for wsl - call make reset-deps in case of change
 	$(PIP) install -e $(PKGDIR)[dev]
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEV_STAMP)
 
-deps-dev: $(DEV_STAMP) ## Ensure dev deps installed
+deps-dev: venv $(DEV_STAMP) ## Ensure dev deps installed
 
 setup: deps-dev ## One-shot: create venv + install runtime & dev deps
 
@@ -102,7 +102,7 @@ ci: syntax lint test ## Run syntax + lint + tests
 test: deps-dev ## Run full test suite (quiet)
 	$(PYTEST) scripts/spreadsheet_handling/tests -q
 
-test-verbose: deps-dev ## Verbose tests with inline logs
+test-verbose: setup ## Verbose tests with inline logs
 	SHEETS_LOG=INFO $(PYTEST) -vv -s $(LOG_OPTS) scripts/spreadsheet_handling/tests
 
 test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
