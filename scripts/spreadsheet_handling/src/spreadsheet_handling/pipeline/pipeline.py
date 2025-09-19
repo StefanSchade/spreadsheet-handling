@@ -196,6 +196,41 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         steps.append(bound)
     return steps
 
+# --- YAML convenience (optional) ------------------------------------------------
+try:
+    import yaml  # from pyyaml
+except Exception:  # pragma: no cover
+    yaml = None
+
+def build_steps_from_yaml(path: str) -> list[BoundStep]:
+    """
+    Load a pipeline spec from YAML (expects top-level key 'pipeline': [ ... ]).
+    Example YAML:
+      pipeline:
+        - step: validate
+          mode_duplicate_ids: warn
+          mode_missing_fk: warn
+          defaults:
+            id_field: id
+            label_field: name
+            detect_fk: true
+            helper_prefix: "_"
+        - step: apply_fks
+          defaults:
+            id_field: id
+            label_field: name
+        - step: drop_helpers
+          prefix: "_"
+    """
+    if yaml is None:
+        raise RuntimeError("PyYAML not installed; install with [dev] or add pyyaml to deps.")
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    specs = cfg.get("pipeline")
+    if not isinstance(specs, list):
+        raise ValueError(f"YAML missing 'pipeline' list: {path}")
+    return build_steps_from_config(specs)
+
 
 # ======================================================================================
 # Beispiel (nur Doku/Kommentar)

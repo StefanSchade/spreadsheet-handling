@@ -17,6 +17,8 @@ import pandas as pd
 from spreadsheet_handling.core.fk import assert_no_parentheses_in_columns
 from spreadsheet_handling.engine.orchestrator import Engine
 from spreadsheet_handling.logging_utils import setup_logging, get_logger
+from spreadsheet_handling.pipeline.pipeline import run_pipeline, build_steps_from_config
+
 
 log = get_logger("pack")
 
