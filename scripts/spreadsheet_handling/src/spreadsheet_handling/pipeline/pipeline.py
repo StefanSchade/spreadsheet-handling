@@ -164,35 +164,59 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "drop_helpers": make_drop_helpers_step,
 }
 
-
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
     """
-    Baut eine Step-Liste aus einer Konfiguration wie:
-      [
-        {"step": "validate", "mode_duplicate_ids": "warn", "mode_missing_fk": "fail", "defaults": {...}},
-        {"step": "apply_fks", "defaults": {...}},
-        {"step": "drop_helpers", "prefix": "_"}
-      ]
+    Build steps from a config list like:
+      - step: validate
+        mode_duplicate_ids: warn
+        ...
+      - step: my_project.steps:make_extract_subset_step
+        table: Orders
+        columns: [id, date]
+    Supported 'step' values:
+      1) registry key (see REGISTRY)
+      2) dotted path in the form '<module>:<factory_function>'
     """
+    import importlib
+
+    def resolve_factory(step_id: str) -> Callable[..., BoundStep] | None:
+        # 1) registry
+        factory = REGISTRY.get(step_id)
+        if factory:
+            return factory
+        # 2) dotted path "<module>:<factory>"
+        if ":" in step_id:
+            mod_name, func_name = step_id.split(":", 1)
+            mod = importlib.import_module(mod_name)
+            factory = getattr(mod, func_name, None)
+            if factory is None:
+                raise AttributeError(f"Factory '{func_name}' not found in module '{mod_name}'")
+            return factory
+        return None
+
     steps: list[BoundStep] = []
     for raw in step_specs:
         spec = dict(raw)  # defensive copy
-        step_name = spec.pop("step", None)
-        if not step_name:
+        step_id = spec.pop("step", None)
+        if not step_id:
             raise ValueError(f"Step spec missing 'step': {raw}")
-        factory = REGISTRY.get(step_name)
+
+        factory = resolve_factory(step_id)
         if not factory:
-            raise KeyError(f"Unknown step '{step_name}'. Known: {list(REGISTRY)}")
-        # Optionaler eigener Anzeigename
-        name = spec.pop("name", step_name)
-        # Viele Factories haben 'name' als kw-arg – falls nicht, ignorieren wir das via **spec
+            raise KeyError(f"Unknown step '{step_id}'. Known registry keys: {list(REGISTRY)}")
+
+        # optional explicit display name
+        name = spec.pop("name", None)
+
         try:
-            bound = factory(name=name, **spec)  # type: ignore[arg-type]
+            bound = factory(name=name, **spec) if name is not None else factory(**spec)  # type: ignore[arg-type]
         except TypeError:
-            # Falls 'name' nicht akzeptiert wird, ohne name erneut aufrufen
-            bound = factory(**spec)  # type: ignore[arg-type]
-            # aber trotzdem Name setzen
-            bound = BoundStep(name=name, config=bound.config, fn=bound.fn)
+            # Factory might not accept 'name' – retry without it and wrap
+            if name is not None:
+                tmp = factory(**spec)  # type: ignore[arg-type]
+                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
+            else:
+                raise
         steps.append(bound)
     return steps
 
@@ -230,7 +254,6 @@ def build_steps_from_yaml(path: str) -> list[BoundStep]:
     if not isinstance(specs, list):
         raise ValueError(f"YAML missing 'pipeline' list: {path}")
     return build_steps_from_config(specs)
-
 
 # ======================================================================================
 # Beispiel (nur Doku/Kommentar)
