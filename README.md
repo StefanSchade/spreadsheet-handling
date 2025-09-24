@@ -1,109 +1,55 @@
-# spreadsheet-handling
+# Spreadsheet Handling
 
-JSON ↔ spreadsheet converter with multi-level headers.  
-This package lets you roundtrip nested JSON structures into tabular form (Excel/CSV/ODS) for human editing, and back into JSON for storage or version control.
+**Spreadsheet Handling** is a Python toolkit for packing/unpacking and orchestrating tabular data.  
+It converts between JSON, CSV, and Excel (XLSX/ODS) while preserving relationships such as foreign keys, indexes, and hierarchies.  
+The goal is to make complex spreadsheet models easier to validate, transform, and round-trip into structured formats.
 
 ---
 
 ## Features
 
-- Convert JSON with nested objects into spreadsheets with **multi-level headers**.
-- Support for multiple backends:
-  - Excel (`xlsxwriter` / `openpyxl`)
-  - CSV (planned)
-  - ODS (planned, via `odfpy`)
-- Roundtrip support (spreadsheet → JSON → spreadsheet).
-- Helper columns for **human-friendly editing** (e.g. showing IDs alongside names, prefixed with `_` and stripped on export).
-- Modular design:
-  - `core/` → flattening/unflattening, refs, dataframe builders
-  - `io_backends/` → output writers (Excel etc.)
-  - `cli/` → command line entrypoints
-- Can be embedded in larger projects or used standalone.
+- Convert JSON ↔ CSV/Excel with round-tripping support
+- Detect and enforce foreign key relationships
+- Validate spreadsheet structures (naming rules, uniqueness, etc.)
+- Orchestrate multi-sheet pipelines via YAML configs
+- Extensible: plug in new backends and transformation steps
 
 ---
 
-## Usage (CLI)
-
-Install dependencies (in editable mode):
+## Installation
 
 ```bash
-make venv
-make deps-dev
+# clone repo
+git clone https://github.com/StefanSchade/spreadsheet-handling.git
+cd spreadsheet-handling
+
+# set up environment
+make setup
 ```
 
-Run a roundtrip conversion:
+## Usage
+
+### Pack JSON into Excel:
 
 ```bash
-# JSON → spreadsheet
-json2sheet scripts/spreadsheet_handling/examples/roundtrip_start.json \
-    -o scripts/spreadsheet_handling/tmp/tmp.xlsx \
-    --levels 3
+sheets-pack examples/roundtrip_start.json -o demo.xlsx --levels 3
 ```
+
+### Unpack Excel back into JSON:
 
 ```bash
-# spreadsheet → JSON
-sheet2json scripts/spreadsheet_handling/tmp/tmp.xlsx \
-    -o scripts/spreadsheet_handling/tmp/tmp.json \
-    --levels 3
+sheets-unpack demo.xlsx -o demo_out --levels 3
 ```
 
-
-The CLI commands json2sheet and sheet2json are installed into your venv as console scripts.
-
-## Usage (Makefile)
-
-The root project ships a Makefile with common tasks:
+### Run full test suite:
 
 ```bash
-make run     # example roundtrip using examples/roundtrip_start.json
-make test    # run pytest suite
-make clean   # remove tmp, __pycache__, .pytest_cache, lockfiles
+make test
 ```
 
-### Development
+### License
 
-Requirements are split:
+This project is licensed under the terms of the MIT License.
+See [LICENCE](LICENSE) for details.
 
-```
-requirements.txt → runtime deps (pandas, xlsxwriter, openpyxl)
 
-requirements-dev.txt → runtime + pytest, hypothesis, etc.
-```
-
-To update the lock files:
-
-```
-make freeze
-make freeze-dev
-```
-
-Tests live under tests/ with data fixtures in tests/data/.
-
-## Separation Into Its Own Repo
-
-Right now this code lives under `/scripts/spreadsheet_handling` in a monorepo.
-
-To separate it in the future:
-
-Move the `scripts/spreadsheet_handling/` directory to its own repo root.
-
-Keep the `src/` layout (already in place).
-
-Keep `pyproject.toml`, `requirements*.txt`, and this `README.md`.
-
-Adjust the `Makefile` (drop monorepo paths).
-
-Optionally publish to:
-
-PyPI (for pip installs): pip install .
-
-Docker registry (if you want isolated runtime environments).
-
-Consumers can then depend on it like:
-
-```
-[tool.poetry.dependencies]
-spreadsheet-handling = { git = "https://github.com/you/spreadsheet-handling.git", tag = "v0.1.0" }
-```
-
-This way the package is self-contained and can grow independently.
