@@ -1,6 +1,8 @@
 # =========================
 # Project variables
 # =========================
+SHELL        := /usr/bin/env bash
+
 ROOT         := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET       := $(ROOT)build
 VENV         := $(ROOT).venv
@@ -16,7 +18,7 @@ STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 
-PYPROJECT    := $(ROOT)pyproject.toml  # trigger for reinstalls
+PYPROJECT    := $(ROOT)pyproject.toml
 
 # pytest logging options for debug runs
 LOG_OPTS  ?= -o log_cli=true -o log_cli_level=DEBUG
@@ -51,7 +53,7 @@ deps: $(DEPS_STAMP) ## Ensure runtime deps installed
 
 # Dev tools (ruff/black/pytest/pytest-cov/pyyaml) via extras
 $(DEV_STAMP): $(DEPS_STAMP) ## Call 'make reset-deps' if pyproject changes (WSL workaround)
-	$(PYTHON) -m pip install -e .
+	$(PYTHON) -m pip install -e '.[dev]'
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEV_STAMP)
 
@@ -96,25 +98,25 @@ ci: syntax lint test ## Run syntax + lint + tests
 # Tests
 # =========================
 test: deps-dev ## Run full test suite (quiet)
-	$(PYTEST) tests -q
+	$(PYTHON) -m pytest tests -q
 
 test-verbose: setup ## Verbose tests with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(LOG_OPTS) tests
+	SHEETS_LOG=INFO $(PYTHON) -m pytest -vv -s $(LOG_OPTS) tests
 
 test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTHON) -m pytest --lf -vv $(LOG_OPTS) tests
 
 # usage: make test-one TESTPATTERN="fk_multi_targets"
 test-one: deps-dev ## Run tests filtered by pattern (set TESTPATTERN=...)
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTHON) -m pytest -vv -k "$(TESTPATTERN)" $(LOG_OPTS) tests
 
 # usage: make test-file FILE=tests/test_fk_helpers_pack.py
 test-file: deps-dev ## Run a single test file (set FILE=...)
-	$(PYTEST) -vv $(LOG_OPTS) $(FILE)
+	$(PYTHON) -m pytest -vv $(LOG_OPTS) $(FILE)
 
 # usage: make test-node NODE='tests/test_fk_helpers_pack.py::test_fk_helper_is_added_in_csv'
 test-node: deps-dev ## Run a single test node (set NODE=file::test)
-	$(PYTEST) -vv $(LOG_OPTS) $(NODE)
+	$(PYTHON) -m pytest -vv $(LOG_OPTS) $(NODE)
 
 # =========================
 # Snapshot
@@ -128,14 +130,14 @@ snapshot: ## Repo snapshot under build/
 # =========================
 coverage: deps-dev ## Coverage in terminal (with missing lines)
 	mkdir -p $(TARGET)
-	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+	COVERAGE_FILE=$(COV_DATA) $(PYTHON) -m pytest \
 		--cov=src/spreadsheet_handling \
 		--cov-report=term-missing \
 		tests
 
 coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 	mkdir -p $(COV_HTML_DIR)
-	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+	COVERAGE_FILE=$(COV_DATA) $(PYTHON) -m pytest \
 		--cov=src/spreadsheet_handling \
 		--cov-report=html:$(COV_HTML_DIR) \
 		tests
