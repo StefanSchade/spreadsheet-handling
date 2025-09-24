@@ -3,14 +3,11 @@
 # =========================
 ROOT         := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET       := $(ROOT)build
-SCRIPTS      := $(ROOT)scripts
-PKGDIR       := $(SCRIPTS)/spreadsheet_handling
 VENV         := $(ROOT).venv
 COV_HTML_DIR := $(TARGET)/htmlcov
 COV_DATA     := $(TARGET)/.coverage
 
 PYTHON       := $(VENV)/bin/python
-PIP          := $(VENV)/bin/pip
 PYTEST       := $(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
@@ -19,7 +16,7 @@ STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 
-PYPROJECT    := $(PKGDIR)/pyproject.toml  # trigger for reinstalls
+PYPROJECT    := $(ROOT)pyproject.toml  # trigger for reinstalls
 
 # pytest logging options for debug runs
 LOG_OPTS  ?= -o log_cli=true -o log_cli_level=DEBUG
@@ -27,7 +24,7 @@ LOG_OPTS  ?= -o log_cli=true -o log_cli_level=DEBUG
 # =========================
 # Phony targets
 # =========================
-.PHONY: help setup reset-deps clean venv \
+.PHONY: help setup reset-deps clean clean-stamps clean-venv distclean venv \
         test test-verbose test-lastfailed test-one test-file test-node \
         format lint syntax ci coverage coverage-html run snapshot doctor
 
@@ -45,16 +42,16 @@ venv: ## Create .venv if missing
 	@test -d $(VENV) || python3 -m venv $(VENV)
 
 # Runtime deps + editable install of the package
-$(DEPS_STAMP): | venv ## $(PYPROJECT) removed as a workaround for wsl - call make reset-deps in case of change
-	$(PIP) install -e $(PKGDIR)
+$(DEPS_STAMP): | venv ## Call 'make reset-deps' if pyproject changes (WSL workaround)
+	$(PYTHON) -m pip install -e .
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEPS_STAMP)
 
 deps: $(DEPS_STAMP) ## Ensure runtime deps installed
 
 # Dev tools (ruff/black/pytest/pytest-cov/pyyaml) via extras
-$(DEV_STAMP): $(DEPS_STAMP)  ## $(PYPROJECT) removed as a workaround for wsl - call make reset-deps in case of change
-	$(PIP) install -e $(PKGDIR)[dev]
+$(DEV_STAMP): $(DEPS_STAMP) ## Call 'make reset-deps' if pyproject changes (WSL workaround)
+	$(PYTHON) -m pip install -e .
 	@mkdir -p $(STAMP_DIR)
 	@touch $(DEV_STAMP)
 
@@ -66,11 +63,10 @@ reset-deps: ## Force reinstall deps (deletes stamps)
 	@rm -f $(DEPS_STAMP) $(DEV_STAMP)
 
 clean: ## Remove caches and build artifacts
-	rm -rf $(PKGDIR)/tmp
 	rm -rf $(TARGET)/
+	rm -rf dist build src/spreadsheet_handling.egg-info
 	find $(ROOT) -type d -name '__pycache__' -prune -exec rm -rf {} +
 	find $(ROOT) -type d -name '.pytest_cache' -prune -exec rm -rf {} +
-	find $(PKGDIR) -maxdepth 1 -type d -name '*.egg-info' -prune -exec rm -rf {} +
 	find $(ROOT) -name '.~lock.*#' -delete
 
 clean-stamps: ## Remove dependency stamps (forces re-install on next run)
@@ -85,14 +81,14 @@ distclean: clean clean-venv ## Deep clean: build artifacts + venv
 # Quality
 # =========================
 format: deps-dev ## Auto-fix with Ruff & Black
-	$(RUFF) check scripts/spreadsheet_handling --fix
-	$(BLACK) scripts/spreadsheet_handling
+	$(RUFF) check src/spreadsheet_handling --fix
+	$(BLACK) src/spreadsheet_handling
 
 lint: deps-dev ## Lint only (Ruff)
-	$(RUFF) check scripts/spreadsheet_handling
+	$(RUFF) check src/spreadsheet_handling
 
 syntax: venv ## Syntax check
-	$(PYTHON) -m compileall -q scripts/spreadsheet_handling
+	$(PYTHON) -m compileall -q src/spreadsheet_handling
 
 ci: syntax lint test ## Run syntax + lint + tests
 
@@ -100,23 +96,23 @@ ci: syntax lint test ## Run syntax + lint + tests
 # Tests
 # =========================
 test: deps-dev ## Run full test suite (quiet)
-	$(PYTEST) scripts/spreadsheet_handling/tests -q
+	$(PYTEST) tests -q
 
 test-verbose: setup ## Verbose tests with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(LOG_OPTS) scripts/spreadsheet_handling/tests
+	SHEETS_LOG=INFO $(PYTEST) -vv -s $(LOG_OPTS) tests
 
 test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(LOG_OPTS) scripts/spreadsheet_handling/tests
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(LOG_OPTS) tests
 
 # usage: make test-one TESTPATTERN="fk_multi_targets"
 test-one: deps-dev ## Run tests filtered by pattern (set TESTPATTERN=...)
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(LOG_OPTS) scripts/spreadsheet_handling/tests
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(LOG_OPTS) tests
 
-# usage: make test-file FILE=scripts/.../test_fk_helpers_pack.py
+# usage: make test-file FILE=tests/test_fk_helpers_pack.py
 test-file: deps-dev ## Run a single test file (set FILE=...)
 	$(PYTEST) -vv $(LOG_OPTS) $(FILE)
 
-# usage: make test-node NODE='scripts/.../test_fk_helpers_pack.py::test_fk_helper_is_added_in_csv'
+# usage: make test-node NODE='tests/test_fk_helpers_pack.py::test_fk_helper_is_added_in_csv'
 test-node: deps-dev ## Run a single test node (set NODE=file::test)
 	$(PYTEST) -vv $(LOG_OPTS) $(NODE)
 
@@ -125,7 +121,7 @@ test-node: deps-dev ## Run a single test node (set NODE=file::test)
 # =========================
 snapshot: ## Repo snapshot under build/
 	mkdir -p $(TARGET)
-	$(ROOT)scripts/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/repo.txt
+	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/repo.txt
 
 # =========================
 # Coverage
@@ -133,29 +129,29 @@ snapshot: ## Repo snapshot under build/
 coverage: deps-dev ## Coverage in terminal (with missing lines)
 	mkdir -p $(TARGET)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		--cov=scripts/spreadsheet_handling/src/spreadsheet_handling \
+		--cov=src/spreadsheet_handling \
 		--cov-report=term-missing \
-		scripts/spreadsheet_handling/tests
+		tests
 
 coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 	mkdir -p $(COV_HTML_DIR)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		--cov=scripts/spreadsheet_handling/src/spreadsheet_handling \
+		--cov=src/spreadsheet_handling \
 		--cov-report=html:$(COV_HTML_DIR) \
-		scripts/spreadsheet_handling/tests
+		tests
 	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # =========================
 # Demo run
 # =========================
 run: deps ## Demo: roundtrip on example
-	$(VENV)/bin/json2sheet \
-	  $(PKGDIR)/examples/roundtrip_start.json \
-	  -o $(PKGDIR)/tmp/tmp.xlsx \
+	$(VENV)/bin/sheets-pack \
+	  examples/roundtrip_start.json \
+	  -o $(TARGET)/demo.xlsx \
 	  --levels 3
-	$(VENV)/bin/sheet2json \
-	  $(PKGDIR)/tmp/tmp.xlsx \
-	  -o $(PKGDIR)/tmp/tmp.json \
+	$(VENV)/bin/sheets-unpack \
+	  $(TARGET)/demo.xlsx \
+	  -o $(TARGET)/demo_out \
 	  --levels 3
 
 # =========================

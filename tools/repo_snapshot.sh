@@ -27,9 +27,15 @@ UTIL="${SCRIPT_DIR}/utils/concat_files.sh"
 [[ -d "$REPO_ROOT_ABS" ]] || { echo "Repo root not found: $REPO_ROOT" >&2; exit 1; }
 mkdir -p -- "$TARGET_DIR_ABS"
 
-# Repo-spezifische Zusatz-Excludes (optional)
-EXTRA_NAME_EXCLUDES=()
-EXTRA_PATH_EXCLUDES=( "$TARGET_DIR_ABS/*" )   # <- ganzes Target prunen
+# folder based
+EXTRA_NAME_EXCLUDES=( "tmp" )
+# pattern based
+EXTRA_PATH_EXCLUDES=(
+  "$TARGET_DIR_ABS/*"
+  # "$REPO_ROOT_ABS/tmp/*"   # optional
+)
+
+shopt -s globstar nullglob
 
 # Optional: nur gewisse Dateitypen
 FIND_FILTER=()
