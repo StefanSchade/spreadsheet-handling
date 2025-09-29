@@ -161,12 +161,19 @@ def _load_frames_from_jsons(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
 # ---------- Writer ----------
 
 
+
 def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
     """
     Excel: MultiIndex-Spalten robust schreiben, indem wir die Spalten
     vor dem Schreiben auf die 1. Ebene flatten (eine Headerzeile).
+    Danach: AutoFilter + dezente Header-Färbung auf jeder Tabelle.
     """
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font
+
     workbook_path = workbook_path.with_suffix(".xlsx")
+
+    # 1) schreiben (wie bisher)
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as xw:
         for sheet, df in frames.items():
             df_out = df.copy()
@@ -174,8 +181,27 @@ def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
                 # nur die erste Ebene verwenden (Level 0)
                 df_out.columns = [t[0] for t in df_out.columns.to_list()]
             df_out.to_excel(xw, sheet_name=sheet, index=False)
-    print(f"[pack] XLSX geschrieben: {workbook_path}")
 
+    # 2) nachbearbeiten: AutoFilter + Header-Styling
+    wb = load_workbook(workbook_path)
+    header_fill = PatternFill("solid", fgColor="DDDDDD")
+    header_font = Font(bold=True)
+
+    for ws in wb.worksheets:
+        # AutoFilter über den genutzten Bereich (inkl. Headerzeile)
+        # ws.dimensions z. B. "A1:D100"
+        ws.auto_filter.ref = ws.dimensions
+
+        # Header-Zeile = 1 (wir schreiben mit header=0)
+        max_col = ws.max_column or 0
+        if max_col > 0:
+            for col_idx in range(1, max_col + 1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.fill = header_fill
+                cell.font = header_font
+
+    wb.save(workbook_path)
+    print(f"[pack] XLSX geschrieben: {workbook_path}")
 
 def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,8 @@
 # =========================
 # Project variables
 # =========================
-SHELL        := /usr/bin/env bash
+SHELL 		 := /usr/bin/env bash
+.SHELLFLAGS  := -eu -o pipefail -c
 
 ROOT         := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET       := $(ROOT)build
