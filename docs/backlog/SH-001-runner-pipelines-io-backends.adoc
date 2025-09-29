@@ -1,0 +1,226 @@
+= SH-001: sheets-run — Pipelines via Dotted Paths & IO Backends
+:status: Proposed
+:owner: Core lib team
+:priority: High
+:target_version: 0.1.0b3–0.1.0b5
+:created: 2025-09-26
+
+== Context
+
+The *spreadsheet-handling-demo* consumer repo validated JSON ⇄ XLSX roundtrips using `sheets-pack` / `sheets-unpack`.
+To progress toward repository-specific pipelines (verify/extract/transforms) we attempted to use `sheets-run` with pipeline configs and custom steps (BoundStep factories). Current library state blocks that path due to missing/partial support of:
+
+- IO backend selection & resolution (kinds and adapters)
+- Pipeline step factory resolution by dotted path
+- Optional “profiles” that bind default IO to pipelines
+- A “sync/unpack” behavior to remove orphan JSONs (nice-to-have)
+
+This backlog item specifies what needs to be implemented in the *spreadsheet_handling* library before the demo can switch from ad-hoc runners back to `sheets-run`.
+
+== Goals
+
+*G1.* Support executing pipelines defined in YAML using *dotted-path* factories (e.g., `plugins.verify_steps:make_verify_step`).
+*G2.* Provide *IO backends* for reading/writing with explicit *kind* names:
+- `json` (directory of `*.json` files, one DataFrame per file)
+- `xlsx` (single workbook, one DataFrame per sheet)
+- (later) `csv` (directory of `*.csv`)
+
+*G3.* Allow IO to be specified either:
+- declaratively in config (`io.profiles.<name>.in/out.kind`), or
+- overridden via CLI flags (`--in-kind/--in-path/--out-kind/--out-path`).
+
+*G4.* (Optional, can be a follow-up) Add `sheets-unpack --delete-missing` with safe guards.
+
+== Non-Goals
+
+- No new data model semantics (FK inference, dedup, etc.) beyond what the engine already exposes.
+- No YAML writer backend in this tranche; JSON/XLSX are sufficient for the demo.
+- No GUI/editor.
+
+== User Stories
+
+*US1 (Plugin author):* “As a plugin author, I want to ship a `BoundStep` factory, and have `sheets-run` import it by dotted path from YAML.”
+
+*US2 (Pipeline user):* “As a user, I want to run `sheets-run --pipeline verify --in-kind json --in-path data --out-kind xlsx --out-path tmp/verify.xlsx` and get deterministic results.”
+
+*US3 (Ops/CI):* “As an operator, I want to define a `sheets.yaml` once (with an `io.profiles.verify`) and call `sheets-run --profile verify` without repeating flags.”
+
+*US4 (Maintainer — optional):* “As a maintainer, I want an optional `--delete-missing` during unpack that safely removes JSON files not represented in the source workbook (with dry-run).”
+
+== Acceptance Criteria
+
+[cols="1,3"]
+|===
+|ID |Criterion
+
+|AC1
+|`sheets-run` accepts `--pipeline <name>`, reads `pipelines.<name>.steps[*].factory` (or alias `dotted`) from YAML, and imports callables of signature `() -> BoundStep`.
+
+|AC2
+|BoundStep must be invoked as `Frames -> Frames` without side effects (no file IO). IO is performed by backends only.
+
+|AC3
+|IO backends resolve by *kind*:
+- `json` → `read_json_dir(path) -> Frames`, `write_json_dir(path, Frames)`.
+- `xlsx` → `read_xlsx(path) -> Frames`, `write_xlsx(path, Frames)`.
+
+|AC4
+|`sheets-run` accepts either:
+- `--in-kind/--in-path/--out-kind/--out-path`, or
+- `--config sheets.yaml --profile <name>`, where the profile resolves both the pipeline and IO kinds/paths (paths can still be overridden by CLI).
+
+|AC5
+|Config schema validation: meaningful error messages for missing `pipeline`, unknown `kind`, or import failures (factory not found).
+
+|AC6
+|Doc examples (README/CLI `--help`) show both “profile-based” and “flag-only” invocations.
+
+|AC7 (optional)
+|`sheets-unpack --delete-missing` exists with `--dry-run` and reports/acts only inside the target dataset directory. Exit codes: 0 OK, 1 issues (dry-run), 2 acted (non-dry-run when deletions occurred).
+
+|===
+
+== CLI Specification
+
+`sheets-run` flags (additions/clarifications):
+
+```
+--config PATH # YAML file with 'pipelines' and optional 'io.profiles'
+--pipeline NAME # pipeline key under 'pipelines'
+--profile NAME # profile key under 'io.profiles' (binds pipeline + kinds)
+--in-kind {json,xlsx[,csv]} # overrides config
+--in-path PATH # overrides config
+--out-kind {json,xlsx[,csv]} # overrides config
+--out-path PATH # overrides config
+--log-level {DEBUG,INFO,...}
+```
+
+
+Error precedence: if both `--profile` and `--pipeline` are given, profile must reference the same pipeline; otherwise error with a clear message.
+
+`sheets-pack`, `sheets-unpack` remain unchanged for now.
+
+== Config Schema
+
+Example minimal `sheets.yaml` (no profiles; kinds via CLI):
+[source,yaml]
+----
+pipelines:
+  verify:
+    steps:
+      - factory: "plugins.verify_steps:make_verify_step"
+        args: { mode: "fail" }
+  extract:
+    steps:
+      - factory: "plugins.transforms:make_extract_products_step"
+        args: {}
+----
+
+With IO profiles:
+[source,yaml]
+----
+io:
+  profiles:
+    verify:
+      pipeline: verify
+      in:  { kind: json,  path: "./data" }
+      out: { kind: xlsx,  path: "./tmp/verify.xlsx" }
+    extract:
+      pipeline: extract
+      in:  { kind: json,  path: "./data" }
+      out: { kind: json,  path: "./target" }
+
+pipelines:
+  verify:
+    steps:
+      - factory: "plugins.verify_steps:make_verify_step"
+        args: { mode: "fail" }
+  extract:
+    steps:
+      - factory: "plugins.transforms:make_extract_products_step"
+        args: {}
+----
+
+Notes:
+- Accept both keys `factory:` and alias `dotted:`; prefer `factory` in docs.
+- Kind names are **`json`** and **`xlsx`** (not `json_dir`): keep consistent with adapter module names.
+
+== IO Backends (Implementation Notes)
+
+*json*:
+- Read: iterate `*.json`, sheet name = filename stem; load arrays-of-records into DataFrame; empty or invalid → empty `DataFrame`.
+- Write: for each `sheet`, write `<sheet>.json` with `orient="records"`, pretty indent (deterministic ordering).
+
+*xlsx*:
+- Read: each sheet → DataFrame; sheet name normalized (<=31 chars, Excel rules).
+- Write: each DataFrame → sheet; guard sheet names; no index.
+
+*csv* (later):
+- Directory of `*.csv`; utf-8, header row required.
+
+All adapters live under `spreadsheet_handling/io/<kind>.py` and export `read_<kind>(path)`, `write_<kind>(path, frames)`.
+
+== Error Handling & Messages
+
+- “Unknown IO kind ‘…’ — available: json, xlsx”
+- “Missing I/O configuration. Provide `--config` with `io.profiles` or pass `--in-kind/--out-kind`.”
+- “Cannot import factory ‘plugins.verify_steps:make_verify_step’ — module not found / attribute missing.”
+- “Profile ‘X’ points to pipeline ‘Y’, but `--pipeline Z` was given. Remove the flag or fix the profile.”
+
+== Testing
+
+*Unit*:
+- Adapters: json/xlsx roundtrip on temp dirs/files.
+- Factory resolution: import success/failure cases.
+- CLI parsing: precedence rules (`profile` vs flags).
+
+*Integration*:
+- Pipeline with 2–3 toy steps over `data/` -> `xlsx` and `json` outputs; assert sheet/file presence and small checksums (row/column counts).
+
+== Migration & Backward Compatibility
+
+- No breaking changes to `sheets-pack`/`sheets-unpack`.
+- `sheets-run` gains functionality; previous calls without IO will continue to work if they never relied on profiles (now they can add them).
+- Accept both `factory` and `dotted` keys during the beta; document `factory` as canonical.
+
+== Open Questions
+
+- Do we want profile *names* to be free-form or constrained? (Recommendation: free-form.)
+- Should profiles be allowed without explicit `pipeline` key if `--pipeline` is passed? (Recommendation: require profile to include `pipeline` for determinism.)
+- Should we support a global default IO profile for `sheets-run` when no flags are given? (Low priority.)
+
+== Milestones
+
+*M1* (0.1.0b3):
+- JSON/XLSX IO backends
+- CLI flags `--in-kind/--in-path/--out-kind/--out-path`
+- Pipeline execution with `factory:` steps
+- Basic errors & docs
+
+*M2* (0.1.0b4):
+- `io.profiles` in config + `--profile` resolution
+- Better error messages & schema checks
+- Example configs in repo
+
+*M3* (0.1.0b5, optional):
+- `sheets-unpack --delete-missing` with `--dry-run`
+- CSV backend (read/write) if needed
+
+== Done When
+
+- The demo repo can remove its local Python runners and call:
++
+[source,bash]
+----
+sheets-run --config sheets.yaml --pipeline verify \
+  --in-kind json --in-path ./data \
+  --out-kind xlsx --out-path ./tmp/verify.xlsx
+
+sheets-run --config sheets.yaml --pipeline extract \
+  --in-kind json --in-path ./data \
+  --out-kind json --out-path ./target
+----
+- CI in the demo repo passes with those calls.
+
+
+
