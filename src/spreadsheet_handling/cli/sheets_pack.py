@@ -160,8 +160,6 @@ def _load_frames_from_jsons(cfg: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
 
 # ---------- Writer ----------
 
-
-
 def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
     """
     Excel: MultiIndex-Spalten robust schreiben, indem wir die Spalten
@@ -202,6 +200,8 @@ def _write_xlsx(workbook_path: Path, frames: Dict[str, pd.DataFrame]) -> None:
 
     wb.save(workbook_path)
     print(f"[pack] XLSX geschrieben: {workbook_path}")
+
+
 
 def _write_csv_folder(out_dir: Path, frames: Dict[str, pd.DataFrame]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)

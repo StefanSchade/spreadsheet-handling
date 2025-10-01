@@ -1,76 +1,145 @@
 from __future__ import annotations
+
 from pathlib import Path
+from typing import Dict, Any
+
 import pandas as pd
-import xlsxwriter
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
 from .base import BackendBase, BackendOptions
 
+
+# ------------------------------
+# Internal: header decorations
+# ------------------------------
+
+def _decorate_workbook(
+        workbook_path: Path,
+        *,
+        auto_filter: bool = True,
+        header_fill_rgb: str = "DDDDDD",
+        freeze_header: bool = False,
+) -> None:
+    """Post-process an XLSX file: AutoFilter + gray bold header (+ optional freeze)."""
+    wb = load_workbook(workbook_path)
+
+    header_fill = PatternFill("solid", fgColor=header_fill_rgb)
+    header_font = Font(bold=True)
+
+    for ws in wb.worksheets:
+        # AutoFilter across used range
+        if auto_filter and ws.max_row and ws.max_column:
+            ws.auto_filter.ref = ws.dimensions
+
+        # Header styling (row 1)
+        if ws.max_column:
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.fill = header_fill
+                cell.font = header_font
+
+        # Freeze pane below header
+        if freeze_header:
+            ws.freeze_panes = "A2"
+
+    wb.save(workbook_path)
+
+
+# ------------------------------
+# ExcelBackend (multi-sheet only)
+# ------------------------------
+
 class ExcelBackend(BackendBase):
-    def write(self, df: pd.DataFrame, path: str, sheet_name: str = "Daten") -> None:
-        levels = df.columns.nlevels if isinstance(df.columns, pd.MultiIndex) else 1
-        tuples = (
-            list(df.columns)
-            if isinstance(df.columns, pd.MultiIndex)
-            else [(c,) for c in df.columns]
-        )
+    """
+    XLSX adapter backed by pandas + openpyxl.
 
-        wb = xlsxwriter.Workbook(path)
-        ws = wb.add_worksheet(sheet_name)
-        fmt_h = wb.add_format({"bold": True, "valign": "bottom"})
-        fmt_c = wb.add_format({})
+    Public API:
+    - write_multi(frames, path, options)
+    - read_multi(path, header_levels, options)
+    """
 
-        for lvl in range(levels):
-            for col, tup in enumerate(tuples):
-                ws.write(lvl, col, "" if tup[lvl] is None else str(tup[lvl]), fmt_h)
+    def write_multi(
+            self,
+            frames: Dict[str, pd.DataFrame],
+            path: str,
+            options: BackendOptions | None = None,
+    ) -> None:
+        """
+        Write multiple DataFrames to an XLSX (one sheet per name), flattening
+        MultiIndex header to level 0. Then decorate header (autofilter + gray + bold).
+        """
+        out = Path(path).with_suffix(".xlsx")
+        out.parent.mkdir(parents=True, exist_ok=True)
 
-        start_row = levels
-        for r, row in enumerate(df.values.tolist(), start=start_row):
-            for c, val in enumerate(row):
-                ws.write(r, c, "" if val is None else val, fmt_c)
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            for sheet, df in frames.items():
+                df_out = df.copy()
+                if isinstance(df_out.columns, pd.MultiIndex):
+                    df_out.columns = [t[0] for t in df_out.columns.to_list()]
+                sheet_name = (sheet or "Sheet")[:31]
+                df_out.to_excel(xw, sheet_name=sheet_name, index=False)
 
-        ws.freeze_panes(start_row, 0)
-        wb.close()
+        # Styling options: BackendOptions has no excel-specific fields, so defaults here.
+        _decorate_workbook(out)
 
-    def read(
-        self,
-        path: str,
-        header_levels: int,
-        sheet_name: str | None = None,
-        options: BackendOptions | None = None,   # <- neu, optional
-    ) -> pd.DataFrame:
-        hdr = list(range(header_levels)) if header_levels and header_levels > 0 else 0
-        df = pd.read_excel(
-            path,
-            sheet_name=sheet_name,
-            header=hdr,
-            dtype=str,
-            engine="openpyxl",
-        )
-        # Einheitlich: leere Zellen als "" statt NaN
-        df = df.where(pd.notnull(df), "")
-        return df
-    
-
-        # Wir schreiben mit *einer* Headerzeile -> hier mit header=0 lesen
-        df = pd.read_excel(path, header=0, sheet_name=sheet_name or 0)
-        # in MultiIndex mit 'header_levels' Ebenen heben
-        tuples = [(c,) + ("",) * (header_levels - 1) for c in list(df.columns)]
-        df = df.copy()
-        df.columns = pd.MultiIndex.from_tuples(tuples)
-        return df
-
-    # Neu: echte Multi-Sheet-Implementierung
     def read_multi(
-        self,
-        path: str,
-        header_levels: int,
-        options: BackendOptions | None = None,
-    ) -> dict[str, pd.DataFrame]:
-        # alle Sheets lesen (flattened Header) und MI wiederherstellen
-        sheets = pd.read_excel(path, sheet_name=None, header=0)
-        out: dict[str, pd.DataFrame] = {}
+            self,
+            path: str,
+            header_levels: int,
+            options: BackendOptions | None = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Read all sheets; assume writer produced a single header row (header=0),
+        then lift to a MultiIndex of length `header_levels` if > 1.
+        """
+        p = Path(path)
+        sheets = pd.read_excel(p, sheet_name=None, header=0, engine="openpyxl", dtype=str)
+        out: Dict[str, pd.DataFrame] = {}
+        levels = header_levels if (header_levels and header_levels > 1) else 1
         for name, df in sheets.items():
-            tuples = [(c,) + ("",) * (header_levels - 1) for c in list(df.columns)]
-            df = df.copy()
-            df.columns = pd.MultiIndex.from_tuples(tuples)
+            df = df.where(pd.notnull(df), "")
+            if not isinstance(df.columns, pd.MultiIndex) and levels > 1:
+                tuples = [(c,) + ("",) * (levels - 1) for c in list(df.columns)]
+                df = df.copy()
+                df.columns = pd.MultiIndex.from_tuples(tuples)
             out[name] = df
         return out
+
+
+# ------------------------------
+# Test-facing convenience API
+# ------------------------------
+
+def write_xlsx(
+        path: str,
+        frames: Dict[str, pd.DataFrame],
+        meta: Any,  # MetaDict (kept loose to avoid import cycles in tests)
+        ctx: Any,   # Context
+) -> None:
+    """
+    Small convenience used by unit tests:
+    - writes XLSX with one sheet per frame (flattening header)
+    - applies AutoFilter + gray/bold header
+    - honors ctx.app.excel.{auto_filter, header_fill_rgb, freeze_header} if present
+    """
+    out = Path(path).with_suffix(".xlsx")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) write via pandas
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        for sheet, df in frames.items():
+            df_out = df.copy()
+            if isinstance(df_out.columns, pd.MultiIndex):
+                df_out.columns = [t[0] for t in df_out.columns.to_list()]
+            sheet_name = (sheet or "Sheet")[:31]
+            df_out.to_excel(xw, sheet_name=sheet_name, index=False)
+
+    # 2) style according to ctx.app.excel if present
+    excel_opts = getattr(getattr(ctx, "app", None), "excel", None)
+    _decorate_workbook(
+        out,
+        auto_filter=getattr(excel_opts, "auto_filter", True) if excel_opts else True,
+        header_fill_rgb=getattr(excel_opts, "header_fill_rgb", "DDDDDD") if excel_opts else "DDDDDD",
+        freeze_header=getattr(excel_opts, "freeze_header", False) if excel_opts else False,
+    )

@@ -1,0 +1,212 @@
+= Spreadsheet Handling – TO-BE Architecture (High-Level)
+
+== Ziele
+* Ein einziger generischer Runner (`run`) treibt Pipelines (Frames→Frames) an.
+* Steps (Transform / Validate / Merge / Extract) teilen sich **einen** Vertrag (Hülle).
+* Typisierte Config (AppConfig + per-Step Configs), YAML als Quelle.
+* **Meta** (Sheet/Column-Rollen, Styling/Policies) wird von Steps erzeugt und vom XLSX-Backend genutzt (kein Heuristik-Raten).
+* Alte CLIs (`sheets-pack`, `sheets-unpack`) werden zu dünnen Adaptern, die an `run` delegieren.
+* `core/` & `pk/` bleiben unberührt; neue Domäne kapselt generische Funktionen.
+
+== Begriffe
+* *Frame* = `pandas.DataFrame`
+* *Frames* = `Dict[str, DataFrame]` (Sheetname → Tabelle)
+* *Pipeline* = Sequenz von Steps
+* *Runner* = Orchestrator: liest IO, führt Steps aus, schreibt IO
+* *Meta* = annotierte Blatt/Spalten-Daten (Rollen/Policies/Styling), für Backends
+* *Issues* = Validierungsbefunde (`info|warn|error`) für CI + ggf. `_issues`-Sheet
+* *Aux-Inputs* = zusätzliche, benannte Input-Frames (z. B. `patch`, `xref`)
+* *Helper-Columns* = +
+Spalten die in Tabellen mit Foreign Keys eingefügt werden, um die diesen zu erläutern. Dadurch, dass dort nicht nur eine technische ID steht, sondern Informationen mit Bedeutung wird die Lesbarkeit erhöht. Für eine Darstellung in Normalform können diese wieder bereinigt werden.
+
+== Meta Daten sind flüchtig
+
+
+
+== Package Layout
+
+=== Adapter (Inbound)
+*Package* `spreadsheet_handling/cli`
+
+* `run.py`
+** *Aufgabe:* generischer Einstieg: YAML laden → `AppConfig` → Pipeline aufbauen → Runner ausführen → Persistierung.
+** *Kompatibilität:* neu, kann frei gestaltet werden.
+** *Flags:* `--config`, `--profile` (optional), `--pipeline`, `--in-kind/path`, `--out-kind/path`.
+
+* `sheets_pack.py` (refined)
+** *Aufgabe:* Legacy-Interface beibehalten, intern `AppConfig` für „JSON→XLSX (Roundtrip-safe)“ bauen und `run` aufrufen.
+** *Extras:* Excel-Optionen (AutoFilter, Header-Farbe) aus globaler Config ziehen.
+
+* `sheets_unpack.py` (refined)
+** *Aufgabe:* Legacy-Interface, intern „XLSX→JSON“ via `run`.
+** *Optionen:* optional Policy „delete_missing“ später über einen Step, nicht „hart“ im Backend.
+
+=== Adapter (Outbound)
+*Package* `spreadsheet_handling/io_backends`
+
+* `router.py`
+** *Aufgabe:* Endpunkt (kind=`json|xlsx|yaml|csv`) auf konkrete Backend-Funktion mappen.
+
+* `base.py`
+** *Aufgabe:* gemeinsame Signatur (read/write) & Optionen-Typen; keine Businesslogik.
+
+* `json_backend.py`, `csv_backend.py`, `yaml_backend.py`
+** *Aufgabe:* (De-)Serialisierung von Frames. Keine Formatierungsfeatures.
+
+* `xlsx_backend.py`
+** *Aufgabe:* Schreiben/Lesen von XLSX. Beim Schreiben:
+*** Header-Zeile fett + hellgrau.
+*** AutoFilter über UsedRange.
+*** Optional: Freeze Panes auf „A2“.
+*** **Meta-unterstützt**: Helper-Spalten einfärben (z. B. zartes Gelb), Blatt-Flags (AutoFilter/Frieren) überschreiben.
+
+=== Application
+*Package* `spreadsheet_handling/pipeline`
+
+* `types.py`
+** *Aufgabe:* Öffentliche Contracts:
+*** `Issue(level, code, msg, sheet?, row?, col?)`
+*** `ColumnMeta(role=key|fk|helper|calc|readonly, note?)`, `SheetMeta(columns, auto_filter?, freeze_header?)`, `MetaDict(sheets)`
+*** `Context(app: AppConfig, run_id, strict, stash, issues)`
+*** `InputBundle(primary: Frames, aux: Dict[str, Frames])`
+*** `StepResult(frames, issues, meta, exports, continue_)`
+*** `Step` (Protocol): `(InputBundle, Context) -> StepResult`
+
+* `config.py`
+** *Aufgabe:* Typisierte Konfig:
+*** `ExcelOptions(auto_filter, header_fill_rgb, freeze_header, helper_fill_rgb)`
+*** `IOEndpoint(kind, path, options: dict)`
+*** `IOConfig(inputs: {primary, …}, output: IOEndpoint)`
+*** `StepRef(name, dotted, args: dict)`
+*** `PipelineConfig(steps: [StepRef])`
+*** `AppConfig(io, pipeline, excel, strict)`
+** *Parser:* YAML→`AppConfig` (leichtgewichtig; später pydantic möglich).
+
+* `resolve.py`
+** *Aufgabe:* `dotted` → Factory laden → Step instanziieren (per `args`).
+
+* `runner.py`
+** *Aufgabe:* Einziger Orchestrator:
+*** Eingänge via `io_backends.router.read_endpoint` laden (primary+aux).
+*** Steps aus `resolve.build_pipeline` beziehen, der Reihe nach ausführen.
+*** `Meta` tief mergen (Sheet + Columns).
+*** Issues sammeln; bei `strict` + „stop“ StepResult abbrechen.
+*** Ausgabe via `io_backends.router.write_endpoint` schreiben (Meta berücksichtigen).
+
+
+
+=== Domain (neu)
+
+==== Package `spreadsheet_handling/domain`
+
+* **Unterpackages:** +
+`transformations/`, `validations/`, `extractions/`
+* **Generik** +
+Das Paket enthält generische, datenmodell-agnostische Funktionen die vom Paket `pipeline` als Step genutzt werden können. Datenmodell-Abhängigkeiten können über die Kommandozeilenparameter eingelesen werden (z.B. Spaltennamen die selektiert werden) - falls die Methodenlogik selbst Spezifika des Datenmodells benötigt, ist eine "dotted" Funktion im Aufruf-Kontext das zu nutzende Muster.
+
+==== Package `transformations/`
+
+* File `helpers.py` enthält Transformationen, die Helper anreichern oder wieder entfernen. Ersteres ist nützlich bei einem Zielformat, das durch Menschen editiert werden soll, zweiteres für die Transformation in ein Zielformat das Redundanzfrei seien soll.
+** `mark_fk(sheet: str, cols: list[str]) -> Step` setzt setzt Meta (role="fk", ref_table="...").
+** `add_helpers(sheet: str, cols: list[str]) -> Step` fügt zu jedem Foreign Key aus der refferenztabelle ref_table 0 bis n zusätzliche Spalten hinzu, die per args / config-yml in dieser Tabelle als "helper" definiert sind - d.h. in dieser Tabelle die entscheidenden Kontextinformationen bieten, die den Key "erläutern". Für die eingefügten Tabelle setzt die Funktion Meta (role="helper", ref_tabe des fk) und verwendet einen Spaltennamen, der über eine Konvention gebildet wird Prefix (default _) + Name der betreffenden spalte in der Ursprungstabelle + @ + Name der Ursprungstabelle selbst. Auf diese Namenskonvention kann nicht verzichtet werden da die Metadaten nicht mit persistiert werden und somit nur innerhalb des einen pipeline-flows erhalten bleiben. Ansonsten muss mit dem neuen Aufruf alles wiedeer mitgegeben werden.
+
+** `clean_aux_columns(prefix: str="_") -> Step` entfernt die spalten, deren titel mit dem prefix="_" beginnt, was andeutet, dass es sich um Zusatz-Infos handelt, nicht um die eigentlichen Daten - nach derzeitigem Feature-Stand sind das genau die Helper Spalten, aber möglicherweise kommen künftig weitere hinzu.
+
+-----
+def clean_aux_columns(
+    sheet: str | None = None,
+    *,
+    drop_roles: list[str] = ("helper",),
+    drop_prefixes: list[str] = ("_", "helper__", "fk__"),
+) -> Step:
+    ...
+sheet=None → auf allen Sheets.
+
+Erst Meta prüfen (role in drop_roles), dann Prefix-Fallback.
+-----
+
+
+* File `cleanup`
+
+* `fk_helpers.py`
+
+
+** `enrich_fk_helpers(mapping: dict[sheet, list[{fk_col, join_sheet, join_col, expose_cols[]}]], prefix="fk__") -> Step`
+* `split_join.py`
+** `split_by_column(sheet, column) -> Step` (Frames → mehrere subtables; Metadaten: evtl. Sheet-Aliases)
+** `join_by_column(base_name, on_column) -> Step`
+
+— *validations/*
+
+* `unique.py`
+** `make_unique_step(args: {sheet, column, mode="warn|fail", emit_sheet?:bool})`
+* `foreign_keys.py`
+** FK-Existenz prüfen: `make_fk_check(args: {sheet, fk_col, ref_sheet, ref_col, mode})`
+* `schema.py` (später)
+** Typen, Requireds, Enum-Werte (leichtgewichtig, optional)
+
+— *extractions/*
+* `select.py`
+** „Armes SQL“: `select_columns(args: {sheet, columns:[...], where?: {col: value|[values]} })`
+** Optional: `rename`, `order_by`, `distinct` (einfach halten)
+
+=== Runner-I/O API
+*Package* `spreadsheet_handling/io`
+
+* `io.py` (Fassaden)
+** `read_endpoint(ep: IOEndpoint) -> Frames`
+** `write_endpoint(ep: IOEndpoint, frames: Frames, meta: MetaDict, ctx: Context) -> None`
+
+== Config-Beispiel (YAML)
+[source,yaml]
+----
+io:
+  inputs:
+    primary: { kind: json, path: "./data" }
+    patch:   { kind: json, path: "./patch" }
+  output:
+    kind: xlsx
+    path: "./tmp/out.xlsx"
+
+pipeline:
+  steps:
+    - name: mark_helper
+      dotted: "spreadsheet_handling.domain.transformations.helpers:mark_helpers"
+      args: { sheet: "products", cols: ["_calc_fee", "helper__limit"] }
+    - name: unique_id
+      dotted: "spreadsheet_handling.domain.validations.unique:make_unique_step"
+      args: { sheet: "products", column: "id", mode: "fail", emit_sheet: true }
+    - name: split_by_fachkomponente
+      dotted: "spreadsheet_handling.domain.transformations.split_join:split_by_column"
+      args: { sheet: "rules", column: "fachkomponente" }
+
+excel:
+  auto_filter: true
+  header_fill_rgb: "DDDDDD"
+  helper_fill_rgb: "FFF5CC"
+  freeze_header: false
+
+strict: true
+----
+
+== Step-Hülle (Contract)
+[source,python]
+----
+@dataclass
+class StepResult:
+    frames: Frames
+    issues: list[Issue] = field(default_factory=list)
+    meta: MetaDict = field(default_factory=MetaDict)
+    exports: dict[str, Any] = field(default_factory=dict)
+    continue_: bool = True
+----
+
+== Teststruktur
+* `tests/unit/io/…` Backends (xlsx-Writer: Autofilter/Styling/Helper-Färbung)
+* `tests/unit/pipeline/…` Runner (Meta-Merge, Strict-Stop, Aux-Inputs)
+* `tests/unit/domain/…` Steps (Transform/Validate/Extract)
+* `tests/integration/roundtrip_test.py` JSON→XLSX→JSON identisch (Helper-Policy ggf. über Step)
+
+== Kompatibilität
+* `sheets-pack`/`sheets-unpack` bleiben gleich in der UX, rufen aber `run` mit passenden `AppConfig`-Defaults.
+* Alte interne Pfade werden nicht mehr verwendet (kein Mischbetrieb nötig).

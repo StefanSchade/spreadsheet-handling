@@ -1,0 +1,212 @@
+= SH-006: Konsolidierung auf Hexagon-Architektur — `run` als Orchestrator; `pack`/`unpack` als dünne Adapter
+:status: Proposed
+:priority: High
+:created: 2025-09-27
+:target_version: 0.1.0bX–0.1.0bY
+
+== Kontext
+
+=== We aim for a pragmatic hexagonal architecture
+
+Ziel ist eine **Hexagonal Architecture** mit einem zentralen Orchestrator (`run`) und **dünnen Adaptern** für `pack`/`unpack`, die nur noch in den Orchestrator delegieren.
+
+==== Desired Structure
+
+* **Adapter (Inbound)**
+** Package `CLI`
+*** Responsibilities +
+Provide (several) access points for the program to be called from the command line
+*** Files
+
+**** `run` +
+**Description:** +
+_A generic access point that loads data from a choosable format, executes a sequence of transformations predefined by the user input in form of a pipeline definiton and persists in another output format that is allso choosable._ +
+ +
+**Priority:** +
+_Has to be done before integrating new functionality. It should probably be done rather late in the refactor when we know what input is required by the backend._ +
+ +
+**Compatibility:** +
+_Assume this is not used right now and can be changed without deprecation warning._ +
+ +
+**** `sheets-pack` _(refined version)_ +
+_A new implementation that mimics the legacy Interface and delegates to `run`._
+
+**** `sheets-unpack` _(refined version)_ +
+_A new implementation that mimics the legacy Interface._
+
+* **Adapter (Outbound)**
+** Package `io_backends`
+*** Responsibilities +
+Provide several persistence backends that read from or write to disk in a range of formats. Depending on the format, additional features like adding colour to certain spreadsheet cells might (excel) or might not (csv) be available. +
+*** Files
+
+**** `router` +
+**Description:** +
+_A factory that provides a the desired backend based on the users configuration._ +
++
+**** `base` +
+_A base class to be inherited from that provides a common interface for access from the outside._
++
+**** `csv_backend`, `json_backend`, `yaml_backend`, `xlsx_backend`, `ods_backend` +
+_A range of backend implementations for specific formats._
++
+
+* **Application**
+** Package `pipeline`
+*** Responsibilities +
+abc. +
+*** Files
+
+**** `pipeline` +
+**Description:** +
+_A factory that provides a the desired backend based on the users configuration._ +
++
+**** `base` +
+_A base class to be inherited from that provides a common interface for access from the outside._
++
+**** `csv_backend`, `json_backend`, `yaml_backend`, `xlsx_backend`, `ods_backend` +
+_A range of backend implementations for specific formats._
++
+
+
+
+
+Appliation
+
+
+==== Pragmatism
+
+=== Legacy Parts that are not compatible with the hexagonal structure
+
+Historisch gewachsene CLIs (`sheets-pack`, `sheets-unpack`) besitzen eigene Lese/Schreib- und Transformationslogik, die die aktuelle Pipeline-/Step-Architektur umgeht. Das erschwert:
+- Konsistente Features (z. B. AutoFilter/Styling, neue I/O-Backends) an einer Stelle zu pflegen,
+- Wiederverwendung von BoundSteps (Frames -> Frames),
+- Konfigurierbare Orchestrierung (Profiles/Pipelines) über alle Wege hinweg.
+
+
+== Ziele
+*G1.* `sheets-run` ist der **einzige** Ausführungspfad für Pipelines/Steps; `pack`/`unpack` sind **Adapter**, die `run` mit passenden Pipelines/Backends aufrufen.
+*G2.* **Adapter-Layer**: CLI (`cli/*.py`) mappt 1:1 die bestehenden Flags auf `run`-Aufrufe (Backward Compatibility).
+*G3.* **Application-Layer**: Pipeline-Orchestrierung (Laden → Steps → Persist), rein in-memory, ohne Dateisystem-Seitenwirkungen.
+*G4.* **Domain-Layer**: Transformationsfunktionen als `Dict[str, DataFrame] -> Dict[str, DataFrame]` (BoundSteps), side-effect free.
+*G5.* **Outbound I/O Backends** tragen **optionale Metadata/Options** (z. B. `excel.auto_filter`, `excel.header_fill_rgb`, `freeze_header`) – konfigurierbar via Config und Flags; Input/Output getrennt konfigurierbar.
+*G6.* Einheitliches Fehler- und Logging-Verhalten über alle CLIs.
+
+== Nicht-Ziele
+- Keine sofortige Entfernung der alten CLIs; stattdessen Deprecation-Phase.
+- Kein Umbau des Domain-Modells (nur sauberes Einhängen über Steps).
+
+== User Stories
+- *US1 (User)*: „Ich will `sheets-pack` nutzen wie bisher, bekomme aber alle neuen Writer-Features automatisch.“
+- *US2 (Dev)*: „Ich will neue Steps/Features einmal integrieren; alle CLIs nutzen sie konsistent.“
+- *US3 (Ops)*: „Ich will dieselben Pipelines sowohl lokal als auch in CI reproduzierbar fahren.“
+
+== Akzeptanzkriterien
+|===
+| ID | Kriterium
+
+| AC1
+| `sheets-pack` ruft intern `sheets-run` mit einer Standard-Pipeline `pipelines.pack` auf:
+- **Input**: `json` (dir)
+- **Output**: `xlsx` (file)
+- Writer-Optionen (`excel.auto_filter`, `excel.header_fill_rgb`, `freeze_header`) werden aus Flags/Config übernommen.
+
+| AC2
+| `sheets-unpack` ruft intern `sheets-run` mit `pipelines.unpack` auf:
+- **Input**: `xlsx` (file)
+- **Output**: `json` (dir)
+- Optionales `--delete-missing` wird als *Step* oder *Adapter-Option* modelliert (dry-run, warn/fail).
+
+| AC3
+| `sheets-run` akzeptiert einheitlich:
+
+--config sheets.yaml
+--pipeline <name> # oder --profile <name>
+--in-kind {json,xlsx,yaml,csv?} --in-path PATH
+--out-kind {json,xlsx,yaml,csv?} --out-path PATH
+--io-options KEY=VALUE [KEY=VALUE ...] # z. B. excel.auto_filter=true
+
+CLI-Overrides schlagen Config-Defaults.
+
+| AC4
+| **Backends** exponieren Options-Mapping:
+- `xlsx`: `auto_filter`, `header_fill_rgb`, `freeze_header`
+- `json`: pretty/indent (falls gewünscht)
+- `yaml` (falls vorhanden): style/indent
+Unerkannte Optionen → klare Warnung.
+
+| AC5
+| **Config-Schema**:
+
+io:
+profiles:
+pack:
+pipeline: pack
+in: { kind: json, path: "./data" }
+out: { kind: xlsx, path: "./tmp/out.xlsx", options: { excel.auto_filter: true } }
+unpack:
+pipeline: unpack
+in: { kind: xlsx, path: "./tmp/in.xlsx" }
+out: { kind: json, path: "./data", options: { delete_missing: false } }
+pipelines:
+pack:
+steps: [] # optional: pre/post denorm/verify
+unpack:
+steps: [] # optional: schema/normalization
+
+
+Schema-Validation mit sinnvollen Fehlermeldungen.
+
+| AC6
+| **Backward Compatibility**: Bisherige Flags von `pack`/`unpack` bleiben gültig; Help-Text weist auf `sheets-run` hin. Deprecation-Notice (minor).
+
+| AC7
+| **Tests**:
+- Unit: Adapter → `run`-Invocation (Argument-Mapping), Options-Mapping in Backends, Fehlerfälle (unknown kind/option).
+- Integration: pack/unpack Roundtrip über `run`, AutoFilter/Styling verifiziert, optional `--delete-missing` Dry-Run.
+|===
+
+== Technischer Entwurf
+
+=== Layer
+- **Adapters (Ingress/Egress)**
+- Ingress: `cli/run.py`, `cli/sheets_pack.py`, `cli/sheets_unpack.py`
+- Egress: `io_backends/<kind>_backend.py` (json/xlsx/yaml/csv?) mit `(read|write)` + `options: dict`
+- **Application**
+- Orchestrator: lädt IO-Config (Kinds/Paths/Options), resolved Pipeline, ruft Steps in Reihenfolge, persistiert via Backend.
+- **Domain**
+- Steps: pure functions / BoundSteps, `Frames` in, `Frames` out.
+
+=== Options-Passing
+- CLI/Config → `io.In.options` / `io.Out.options` (dict[str, Any])
+- Backend validiert bekannte Keys → führt Feature aus (z. B. `auto_filter`).
+
+=== Migration (schrittweise)
+1. `sheets-pack`: intern auf `run` umbauen (Flag-Mapping, Pipeline `pack`, `xlsx`-Options mappen).
+2. `sheets-unpack`: analog (`unpack`, `json`, optional `delete_missing`).
+3. Doku & Examples aktualisieren.
+4. Deprecation-Hinweis in `pack/unpack` (keine sofortige Entfernung).
+
+== Risiken & Gegenmaßnahmen
+- **Verlust von Funktionalität**: Abfangen via ausführlicher Integrationstests (Roundtrip).
+- **Optionen-Matrix wächst**: Options-Namespaces (z. B. `excel.*`) und validierte Mapping-Tabelle pro Backend.
+- **Breaking Changes**: Vermeiden; bei unvermeidbaren Änderungen klare Deprecation-Phase und Migrationshinweise.
+
+== Tests (Details)
+- **Unit**
+- `cli/sheets_pack.py`: assert, dass `run.main([...])` mit korrekten Kinds/Options aufgerufen wird (patch/mocks).
+- Backends: Options übernommen (AutoFilter gesetzt, Header gefärbt; JSON/YAML pretty etc.).
+- **Integration**
+- Mini-Dataset → `sheets-pack` → Excel öffnen (openpyxl) → `auto_filter.ref` gesetzt, Header-Zeile gefärbt.
+- `sheets-unpack` → JSON-Verzeichnis; optional `--delete-missing --dry-run` meldet nur an, ohne zu löschen.
+
+== Dokumentation
+- README: neues „Ein Architekturweg“ (Adapters → Run → Backends → Steps), Beispiele für `pack/unpack` (alt) vs. `run` (neu).
+- CLI-Hilfen mit klaren Beispielen (Profile/Flags).
+
+== Done, wenn
+- `sheets-pack`/`sheets-unpack` delegieren an `run` (alle Roundtrips grün).
+- AutoFilter/Styling-Optionen sind über `run`/Config nutzbar.
+- Doku & Beispiele sind aktualisiert.
+- Deprecation-Hinweis vorhanden, Tests grün (unit + integration).
+
