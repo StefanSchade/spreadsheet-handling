@@ -125,53 +125,69 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 # Tests
 # =========================
 
-.PHONY: test test-verbose test-lastfailed test-one test-file test-node test-unit test-integ
+.PHONY: test test-verbose test-lastfailed test-one test-file test-node test-unit test-integ test-legacy test-all
 
+# Central knobs (kept as-is)
 PYTEST_BASEOPTS   ?= -q
-# Optional log env you already use elsewhere:
-# SHEETS_LOG controls your lib logging level, LOG_OPTS are extra pytest opts
-# examples:
-# make test-verbose LOG_OPTS="-x" (fail fast)
-# make test-one TESTPATTERN="helpers and not slow"
-# make test-one TESTPATTERN="integration or json_roundtrip or xlsx_writer_styling"
 SHEETS_LOG        ?=
 LOG_OPTS          ?=
 
-# Default: run full suite (quiet)
-test: deps-dev ## Run full test suite (quiet)
-	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
+# NEW: default to excluding legacy tests everywhere
+# Override MARK_EXPR on the command line to include/exclude categories.
+# Examples:
+#   make test-all                        # run all tests (clears MARK_EXPR)
+#   make test MARK_EXPR=                 # same as above, run all
+#   make test MARK_EXPR="not slow"       # exclude @pytest.mark.slow
+#   make test MARK_EXPR="integ"          # only integration tests
+#   make test-verbose LOG_OPTS="-x"      # fail fast
+#   make test-one TESTPATTERN="helpers and not slow"
+#   make test-one TESTPATTERN="integration or json_roundtrip or xlsx_writer_styling"
+MARK_EXPR         ?= not legacy
+MARK_OPT          := $(if $(MARK_EXPR),-m "$(MARK_EXPR)",)
+
+# Default: run suite (quiet) with legacy excluded by default
+test: deps-dev ## Run test suite (quiet, excludes legacy by default)
+	$(PYTEST) $(PYTEST_BASEOPTS) $(MARK_OPT) $(LOG_OPTS) tests
 
 # Verbose with inline logs (keeps your old behavior)
 test-verbose: deps-dev ## Verbose tests with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(LOG_OPTS) tests
+	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(LOG_OPTS) tests
 
 # Only last failed, verbose & with DEBUG logs
 test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(LOG_OPTS) tests
 
 # Pattern filter (usage: make test-one TESTPATTERN="fk_multi_targets")
 test-one: deps-dev ## Run tests filtered by pattern (set TESTPATTERN=...)
 	@if [ -z "$(TESTPATTERN)" ]; then echo "Set TESTPATTERN=..."; exit 2; fi
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(MARK_OPT) $(LOG_OPTS) tests
 
 # Single file (usage: make test-file FILE=tests/unit/.../test_something.py)
 test-file: deps-dev ## Run a single test file (set FILE=...)
 	@if [ -z "$(FILE)" ]; then echo "Set FILE=path/to/test_file.py"; exit 2; fi
-	$(PYTEST) -vv $(LOG_OPTS) $(FILE)
+	$(PYTEST) -vv $(MARK_OPT) $(LOG_OPTS) $(FILE)
 
 # Single node (usage: make test-node NODE='tests/x.py::test_y')
 test-node: deps-dev ## Run a single test node (set NODE=file::test)
 	@if [ -z "$(NODE)" ]; then echo "Set NODE=file::test_name"; exit 2; fi
-	$(PYTEST) -vv $(LOG_OPTS) $(NODE)
+	$(PYTEST) -vv $(MARK_OPT) $(LOG_OPTS) $(NODE)
 
-# Unit only (exclude @pytest.mark.integ)
-test-unit: deps-dev ## Unit tests only (exclude integration)
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "not integ" $(LOG_OPTS) tests
+# Unit only: exclude integration AND legacy regardless of MARK_EXPR
+test-unit: deps-dev ## Unit tests only (exclude integration + legacy)
+	$(PYTEST) $(PYTEST_BASEOPTS) -m "not integ and not legacy" $(LOG_OPTS) tests
 
-# Integration only (marked integ)
-test-integ: deps-dev ## Integration tests only
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "integ" $(LOG_OPTS) tests
+# Integration only: include integ, still exclude legacy regardless of MARK_EXPR
+test-integ: deps-dev ## Integration tests only (exclude legacy)
+	$(PYTEST) $(PYTEST_BASEOPTS) -m "integ and not legacy" $(LOG_OPTS) tests
 
+# Legacy only (opt-in)
+test-legacy: deps-dev ## Run ONLY legacy tests
+	$(PYTEST) -vv -m "legacy" $(LOG_OPTS) tests/legacy
+
+# Everything (opt-in): clear MARK_EXPR so no filter is applied
+test-all: MARK_EXPR=
+test-all: deps-dev ## Run ALL tests (including legacy)
+	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
 
 # =========================
 # Demo run

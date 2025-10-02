@@ -1,77 +1,70 @@
 from __future__ import annotations
 
-from importlib import import_module
-from typing import Callable, Dict, Any, Tuple, Union
+import importlib
+from typing import Callable, Dict, List, Tuple
 
 import pandas as pd
 
-from .config import load_app_config, AppConfig, StepRef
-from ..io_backends.router import make_backend
-from ..io_backends.base import BackendOptions
+from .config import AppConfig
+from ..io_backends.router import get_loader, get_saver
 
 Frames = Dict[str, pd.DataFrame]
-MetaDict = Dict[str, Any]
-Issues = list[dict[str, Any]]
+Meta = Dict[str, dict]
+Issues = List[str]
 
 
-def _load_callable(dotted: str) -> Callable[..., Callable[[Frames], Frames]]:
+def _resolve_step(dotted: str, args: dict | None) -> Callable[[Frames], Frames]:
     """
-    Load a step factory from a dotted reference.
-    Accepts either "pkg.mod:factory" or "pkg.mod.factory".
+    Load a step factory via dotted path and return a callable Frames->Frames.
+    The factory may itself already be the step (callable) or return one.
     """
-    if ":" in dotted:
-        mod_name, sym = dotted.split(":", 1)
-    else:
-        mod_name, sym = dotted.rsplit(".", 1)
-    mod = import_module(mod_name)
-    fn = getattr(mod, sym)
-    return fn
+    mod_name, func_name = dotted.split(":", 1) if ":" in dotted else dotted.rsplit(".", 1)
+    module = importlib.import_module(mod_name)
+    factory = getattr(module, func_name)
+    step = factory(**(args or {}))
+    if not callable(step):
+        raise TypeError(f"Step factory '{dotted}' did not return a callable step")
+    return step
 
 
-def _apply_steps(frames: Frames, steps: list[StepRef]) -> Frames:
-    out = frames
-    for step in steps:
-        factory = _load_callable(step.dotted)
-        bound = factory(**(step.args or {}))  # returns Callable[[Frames], Frames]
-        out = bound(out)
-    return out
-
-
-def run_pipeline(
-        cfg_or_path: Union[str, AppConfig],
-        *,
-        run_id: str | None = None,            # accepted but ignored for now
-) -> Tuple[Frames, MetaDict, Issues]:
+def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> Tuple[Frames, Meta, Issues]:
     """
-    Minimal pipeline runner used by tests:
-    - Accepts either a config PATH (str) or a pre-built AppConfig
-    - Reads inputs via IO backends
-    - Applies dotted step factories
-    - Writes to the configured output backend
-    - Returns (frames, meta, issues)
+    Minimal orchestrator:
+      - load frames from primary input
+      - apply steps in order (each step: Frames -> Frames)
+      - save frames to output
+      - return (frames, empty meta, empty issues)
+
+    Parameters
+    ----------
+    app : AppConfig
+        The application configuration (I/O + pipeline).
+    run_id : str | None
+        Optional identifier accepted for compatibility; currently not used.
+    **_ : object
+        Swallows unknown kwargs for forward/backward compat with callers.
     """
-    app: AppConfig = (
-        load_app_config(cfg_or_path) if isinstance(cfg_or_path, str) else cfg_or_path
-    )
+    # Input: expect key 'primary'
+    if "primary" not in app.io.inputs:
+        raise KeyError("AppConfig.io.inputs must contain a 'primary' endpoint")
 
-    # 1) read all inputs (merge by sheet name; last one wins on conflicts)
-    all_frames: Frames = {}
-    for _, endpoint in app.io.inputs.items():
-        backend = make_backend(endpoint.kind)
-        opts = BackendOptions()  # extend as needed
-        frames = backend.read_multi(endpoint.path, header_levels=1, options=opts)
-        all_frames.update(frames)
+    inp = app.io.inputs["primary"]
+    out = app.io.output
 
-    # 2) pipeline steps
-    result: Frames = _apply_steps(all_frames, app.pipeline.steps)
+    loader = get_loader(inp.kind)
+    saver = get_saver(out.kind)
 
-    # 3) write output
-    out_backend = make_backend(app.io.output.kind)
-    out_opts = BackendOptions()
-    out_backend.write_multi(result, app.io.output.path, options=out_opts)
+    frames: Frames = loader(inp.path)
 
-    # 4) meta + issues (placeholder)
-    meta: MetaDict = {}
+    # Steps
+    for s in app.pipeline.steps:
+        dotted = s.dotted or s.name  # tolerate either key
+        step = _resolve_step(dotted, s.args or {})
+        frames = step(frames)
+
+    # Persist
+    saver(frames, out.path)
+
+    meta: Meta = {}
     issues: Issues = []
-
-    return result, meta, issues
+    return frames, meta, issues
