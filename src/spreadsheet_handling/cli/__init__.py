@@ -1,14 +1,17 @@
+# src/spreadsheet_handling/cli/__init__.py
 from __future__ import annotations
-
-# Re-export legacy CLIs (pack/unpack) as before
-from .sheets_pack import run_pack as pack  # noqa: F401
-from .sheets_unpack import run_unpack as unpack  # noqa: F401
-
-# Expose the generic runner *optionally* to avoid import-time failures if its deps are missing
-try:
-    from . import run  # noqa: F401
-except Exception:
-    # Keep package import working even if run.py's optional deps aren't available yet.
-    run = None  # type: ignore[assignment]
+from typing import Any
 
 __all__ = ["pack", "unpack", "run"]
+
+def __getattr__(name: str) -> Any:
+    if name == "pack":
+        from .sheets_pack import run_pack
+        return run_pack
+    if name == "unpack":
+        from .sheets_unpack import run_unpack
+        return run_unpack
+    if name == "run":
+        from . import run as run_mod
+        return run_mod
+    raise AttributeError(name)

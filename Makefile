@@ -142,47 +142,40 @@ LOG_OPTS          ?=
 #   make test-verbose LOG_OPTS="-x"      # fail fast
 #   make test-one TESTPATTERN="helpers and not slow"
 #   make test-one TESTPATTERN="integration or json_roundtrip or xlsx_writer_styling"
+# --- bestehend ---
 MARK_EXPR         ?= not legacy
 MARK_OPT          := $(if $(MARK_EXPR),-m "$(MARK_EXPR)",)
 
+# NEU: wenn "not legacy" drin steht, den Ordner wirklich ignorieren
+IGNORE_OPT        := $(if $(findstring not legacy,$(MARK_EXPR)),--ignore=tests/legacy,)
+
 # Default: run suite (quiet) with legacy excluded by default
 test: deps-dev ## Run test suite (quiet, excludes legacy by default)
-	$(PYTEST) $(PYTEST_BASEOPTS) $(MARK_OPT) $(LOG_OPTS) tests
+	$(PYTEST) $(PYTEST_BASEOPTS) $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
 
-# Verbose with inline logs (keeps your old behavior)
 test-verbose: deps-dev ## Verbose tests with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(LOG_OPTS) tests
+	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
 
-# Only last failed, verbose & with DEBUG logs
 test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
 
-# Pattern filter (usage: make test-one TESTPATTERN="fk_multi_targets")
 test-one: deps-dev ## Run tests filtered by pattern (set TESTPATTERN=...)
 	@if [ -z "$(TESTPATTERN)" ]; then echo "Set TESTPATTERN=..."; exit 2; fi
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(MARK_OPT) $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
 
-# Single file (usage: make test-file FILE=tests/unit/.../test_something.py)
 test-file: deps-dev ## Run a single test file (set FILE=...)
 	@if [ -z "$(FILE)" ]; then echo "Set FILE=path/to/test_file.py"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(LOG_OPTS) $(FILE)
+	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) $(FILE)
 
-# Single node (usage: make test-node NODE='tests/x.py::test_y')
 test-node: deps-dev ## Run a single test node (set NODE=file::test)
 	@if [ -z "$(NODE)" ]; then echo "Set NODE=file::test_name"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(LOG_OPTS) $(NODE)
+	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) $(NODE)
 
-# Unit only: exclude integration AND legacy regardless of MARK_EXPR
-test-unit: deps-dev ## Unit tests only (exclude integration + legacy)
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "not integ and not legacy" $(LOG_OPTS) tests
+test-unit: deps-dev ## Unit tests only (exclude integration)
+	$(PYTEST) $(PYTEST_BASEOPTS) -m "not integ" $(IGNORE_OPT) $(LOG_OPTS) tests
 
-# Integration only: include integ, still exclude legacy regardless of MARK_EXPR
-test-integ: deps-dev ## Integration tests only (exclude legacy)
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "integ and not legacy" $(LOG_OPTS) tests
-
-# Legacy only (opt-in)
-test-legacy: deps-dev ## Run ONLY legacy tests
-	$(PYTEST) -vv -m "legacy" $(LOG_OPTS) tests/legacy
+test-integ: deps-dev ## Integration tests only
+	$(PYTEST) $(PYTEST_BASEOPTS) -m "integ" $(IGNORE_OPT) $(LOG_OPTS) tests
 
 # Everything (opt-in): clear MARK_EXPR so no filter is applied
 test-all: MARK_EXPR=
