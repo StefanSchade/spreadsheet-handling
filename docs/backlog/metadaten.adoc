@@ -1,0 +1,162 @@
+ChatGPT said:
+
+Ja—lass uns „Meta“ explizit machen, statt Heuristiken. Idee: Steps annotieren Blätter/Spalten mit Rollen, der Backend-Writer liest diese Annotationen und färbt/formatierte entsprechend (z. B. Helper-Spalten).
+
+Schlanker Vorschlag
+1) Typen für Metadaten (typed, optional)
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Literal
+import pandas as pd
+
+Frame  = pd.DataFrame
+Frames = Dict[str, Frame]
+
+Role = Literal["key","fk","helper","calc","readonly"]
+
+@dataclass
+class ColumnMeta:
+role: Role = "helper"
+note: Optional[str] = None
+
+@dataclass
+class SheetMeta:
+# Spaltenname -> Meta
+columns: Dict[str, ColumnMeta] = field(default_factory=dict)
+# optionale Flags auf Blatt-Ebene
+auto_filter: Optional[bool] = None
+freeze_header: Optional[bool] = None
+
+@dataclass
+class MetaDict:
+# Blattname -> Meta
+sheets: Dict[str, SheetMeta] = field(default_factory=dict)
+
+2) Pipeline-„Hülle“ erweitert
+
+Füge dem Step-Output einen Meta-Kanal hinzu; der Orchestrator „mergt“ Meta zwischen Schritten.
+
+@dataclass
+class StepResult:
+frames: Frames
+issues: List[...] = field(default_factory=list)
+continue_: bool = True
+exports: Dict[str, object] = field(default_factory=dict)
+meta: MetaDict = field(default_factory=MetaDict)   #  👈 neu
+
+
+Im Orchestrator:
+
+def merge_meta(dst: MetaDict, inc: MetaDict) -> MetaDict:
+# simple deep-merge: sheets + columns überschreiben/ergänzen
+out = MetaDict(sheets={**dst.sheets})
+for sname, smeta in inc.sheets.items():
+base = out.sheets.get(sname, SheetMeta())
+cols = {**base.columns, **smeta.columns}
+out.sheets[sname] = SheetMeta(
+columns=cols,
+auto_filter = smeta.auto_filter if smeta.auto_filter is not None else base.auto_filter,
+freeze_header = smeta.freeze_header if smeta.freeze_header is not None else base.freeze_header,
+)
+return out
+
+def run_pipeline(frames: Frames, steps: list, ctx) -> tuple[Frames, MetaDict]:
+meta_acc = MetaDict()
+data = InputBundle(primary=frames, aux={})
+for step in steps:
+res = step(data, ctx)
+meta_acc = merge_meta(meta_acc, res.meta)   # 👈 Meta kumulieren
+data = InputBundle(primary=res.frames, aux=data.aux)
+if not res.continue_ and ctx.strict:
+break
+return data.primary, meta_acc
+
+3) Beispiel: Step markiert Helper-Spalten
+def mark_helpers(sheet: str, cols: list[str]):
+def step(data, ctx):
+frames = data.primary
+meta = MetaDict(sheets={
+sheet: SheetMeta(columns={c: ColumnMeta(role="helper") for c in cols})
+})
+return StepResult(frames=frames, meta=meta)
+return step
+
+4) Backend nutzt Meta (z. B. XLSX-Writer)
+
+Im (bereits existierenden) _write_xlsx(...) zusätzlich ein optionales meta: MetaDict | None akzeptieren. Farbe/Format nur für Spalten mit role=="helper":
+
+from openpyxl.styles import PatternFill, Font
+HELPER_FILL = PatternFill("solid", fgColor="FFF5CC")  # zartes Gelb
+
+def _write_xlsx(path, frames: Frames, meta: MetaDict | None = None) -> None:
+# ... pandas write wie bisher ...
+wb = load_workbook(path)
+
+    for ws in wb.worksheets:
+        sname = ws.title
+        smeta = (meta.sheets.get(sname) if meta else None)
+
+        # AutoFilter Header & Grau (wie schon umgesetzt)
+        ws.auto_filter.ref = ws.dimensions
+        # Header grau + fett (bereits vorhanden)
+
+        # Helper-Spalten einfärben:
+        if smeta and smeta.columns:
+            # Map: Spaltenname -> Index ermitteln aus erster Zeile
+            header_cells = [cell.value for cell in ws[1]]
+            for col_name, cmeta in smeta.columns.items():
+                if cmeta.role == "helper" and col_name in header_cells:
+                    col_idx = header_cells.index(col_name) + 1
+                    for row in range(2, ws.max_row + 1):
+                        ws.cell(row=row, column=col_idx).fill = HELPER_FILL
+
+        # Optionale Blatt-Flags:
+        if smeta and smeta.freeze_header:
+            ws.freeze_panes = "A2"
+
+    wb.save(path)
+
+
+Vorteil: keine Heuristik, keine Namenskonvention erzwingen. Steps sagen explizit, was „helper“ ist.
+
+5) Schreibbare Config? — Ja, aber nur über Meta/Context, nicht in-place
+
+Config (AppConfig) bleibt „Input“ (deterministisch).
+
+Schreibzustand packen wir in meta oder ctx.stash (z. B. ctx.stash["sheet_aliases"]), damit Steps Kommunikation betreiben können, ohne globale Config zu mutieren.
+
+Persistiert wird nur das, was der Out-Adapter schreibt (Frames), Meta ist Steuerspur.
+
+6) Bonus: „Excel-only“-Helper
+
+Wenn du Helper-Spalten nicht ins JSON zurückschreiben willst:
+
+Markiere sie als role="helper" und setze eine Policy im Runner/Unpack:
+
+beim Unpack dropt der JSON-Writer alle Spalten mit role="helper" (Meta-gestützt)
+
+oder: pack/transform fügt Helper nur vor dem Excel-Write hinzu (nicht in den Frames, die zurück persistiert werden)
+
+7) YAML-Konfiguration (optional)
+
+Meta kann auch konfiguriert entstehen, nicht nur dynamisch:
+
+pipelines:
+pack:
+steps:
+- dotted: plugins.meta:mark_helpers
+args:
+sheet: "products"
+cols: ["_calc_fee", "helper__limit"]
+
+
+Der Step liest args, baut MetaDict, der Writer färbt.
+
+Fazit
+
+Ja: Schritte können Blätter/Spalten annotieren (Meta).
+
+Backend nutzt Meta für gezieltes Styling (ohne Ratespiele).
+
+Config bleibt read-only, „Schreibsignale“ laufen über meta (und optional ctx.stash).
+
+Minimal-invasiv: du erweiterst nur StepResult + Orchestrator; bestehende Steps/Backends funktionieren weiter (Meta ist optional).

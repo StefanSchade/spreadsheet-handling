@@ -1,82 +1,50 @@
 from __future__ import annotations
-import json
+
 from pathlib import Path
+from typing import Dict
+
 import pandas as pd
+
 from .base import BackendBase, BackendOptions
+
+Frames = Dict[str, pd.DataFrame]
 
 
 class JSONBackend(BackendBase):
-    """Liest/schreibt einen Ordner mit {sheet}.json-Dateien (Liste von Objekten je Datei)."""
+    """
+    Backend for a directory of JSON files, one file per sheet (e.g. products.json).
+    """
 
-    def write_multi(
-        self,
-        sheets: dict[str, pd.DataFrame],
-        path: str,
-        options: BackendOptions | None = None,
-    ) -> None:
+    def read_multi(self, path: str, header_levels: int, options: BackendOptions | None = None) -> Frames:
+        in_dir = Path(path)
+        out: Frames = {}
+        for p in sorted(in_dir.glob("*.json")):
+            df = pd.read_json(p, dtype=str)
+            df = df.where(pd.notnull(df), "")  # normalize empties as ""
+            out[p.stem] = df
+        return out
+
+    def write_multi(self, frames: Frames, path: str, options: BackendOptions | None = None) -> None:
         out_dir = Path(path)
         out_dir.mkdir(parents=True, exist_ok=True)
+        for name, df in frames.items():
+            p = out_dir / f"{name}.json"
+            df.to_json(p, orient="records", force_ascii=False)
 
-        helper_prefix = options.helper_prefix if options else "_"
-        drop_helpers = (
-            options.drop_helpers_on_export
-            if (options and options.drop_helpers_on_export is not None)
-            else True  # JSON: per default Helper nicht mit exportieren
-        )
-        encoding = options.encoding if (options and options.encoding) else "utf-8"
 
-        for name, df in sheets.items():
-            df_out = df.copy()
+# ---- Test-facing convenience wrappers (kept for compatibility) ----
 
-            # Level-0-Header flatten
-            if isinstance(df_out.columns, pd.MultiIndex):
-                lvl0 = [t[0] for t in df_out.columns.to_list()]
-                df_out.columns = lvl0
+def read_json_dir(path: str) -> Frames:
+    """
+    tests expect: frames = read_json_dir(path)
+    """
+    opts = BackendOptions()
+    return JSONBackend().read_multi(path, header_levels=1, options=opts)
 
-            # Helper-Spalten optional entfernen
-            if drop_helpers and helper_prefix:
-                keep = [
-                    c
-                    for c in df_out.columns
-                    if not (isinstance(c, str) and c.startswith(helper_prefix))
-                ]
-                df_out = df_out[keep]
 
-            # NaN -> None, dann JSON schreiben
-            records = df_out.where(pd.notnull(df_out), None).to_dict(orient="records")
-            with (out_dir / f"{name}.json").open("w", encoding=encoding) as f:
-                json.dump(records, f, ensure_ascii=False, indent=2)
-
-    def read_multi(
-        self,
-        path: str,
-        header_levels: int,
-        options: BackendOptions | None = None,
-    ) -> dict[str, pd.DataFrame]:
-        in_dir = Path(path)
-        if not in_dir.is_dir():
-            raise FileNotFoundError(f"{in_dir} ist kein Verzeichnis")
-
-        levels = (
-            int(options.levels) if (options and options.levels is not None) else int(header_levels)
-        )
-        encoding = options.encoding if (options and options.encoding) else "utf-8"
-
-        out: dict[str, pd.DataFrame] = {}
-        for p in sorted(in_dir.glob("*.json")):
-            with p.open("r", encoding=encoding) as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                data = [data]
-            if not isinstance(data, list):
-                raise ValueError(f"Ungültige JSON-Struktur in {p}: erwartet Liste/Objekt")
-
-            df = pd.DataFrame(data)
-            # Spalten in MultiIndex heben (nur Level-0 belegt, Rest leer)
-            tuples = [(c,) + ("",) * (levels - 1) for c in list(df.columns)]
-            df.columns = pd.MultiIndex.from_tuples(tuples)
-            out[p.stem] = df
-
-        if not out:
-            raise FileNotFoundError(f"Keine *.json in {in_dir} gefunden.")
-        return out
+def write_json_dir(path: str, frames: Frames) -> None:
+    """
+    tests expect: write_json_dir(path, frames)
+    """
+    opts = BackendOptions()
+    JSONBackend().write_multi(frames, path, options=opts)
