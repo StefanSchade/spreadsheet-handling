@@ -141,25 +141,29 @@ def main(argv: list[str] | None = None) -> int:
         if "io" in inline:
             config = {"io": inline["io"]}
 
-    # Select I/O (profile or top-level), then apply overrides
-    io_cfg = _select_io_config(config, args.profile)
-    if not io_cfg:
-        raise SystemExit("Missing I/O configuration. Provide --config/--pipeline-yaml with 'io', or add CLI overrides.")
+   # --- after parsing args + (optional) config load ---
 
-    inp = dict(io_cfg.get("input") or {})
-    out = dict(io_cfg.get("output") or {})
+    # 1) start with whatever is in the config (or empty)
+    io_cfg = _select_io_config(config, args.profile) if config else {}
 
-    # CLI overrides
-    if args.in_kind:  inp["kind"]  = args.in_kind
-    if args.in_path:  inp["path"]  = args.in_path
-    if args.out_kind: out["kind"]  = args.out_kind
-    if args.out_path: out["path"]  = args.out_path
+    # 2) build working dicts
+    inp = dict((io_cfg.get("input") or {}))
+    out = dict((io_cfg.get("output") or {}))
 
-    # Validate resulting IO
-    if not inp or not out:
-        raise SystemExit("I/O config incomplete. Need input.{kind,path} and output.{kind,path}.")
-    if "kind" not in inp or "path" not in inp or "kind" not in out or "path" not in out:
-        raise SystemExit("I/O config incomplete. Need input.{kind,path} and output.{kind,path}.")
+    # 3) apply CLI overrides (these should always win)
+    if args.in_kind:  inp["kind"] = args.in_kind
+    if args.in_path:  inp["path"] = args.in_path
+    if args.out_kind: out["kind"] = args.out_kind
+    if args.out_path: out["path"] = args.out_path
+
+    # 4) validate *after* overrides
+    missing = [k for k in ("kind", "path") if k not in inp] + \
+              [f"out.{k}" for k in ("kind", "path") if k not in out]
+    if missing:
+        raise SystemExit(
+            "Missing I/O configuration. Provide --config/--pipeline-yaml with 'io', "
+            "or add CLI overrides."
+        )
 
     # Choose loader/saver
     loader = get_loader(str(inp["kind"]))
