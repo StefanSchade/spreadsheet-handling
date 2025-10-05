@@ -185,6 +185,7 @@ test-all: deps-dev ## Run ALL tests (including legacy)
 # =========================
 # Demo run
 # =========================
+
 run: deps ## Demo: roundtrip on example
 	$(VENV)/bin/sheets-pack \
 	  examples/roundtrip_start.json \

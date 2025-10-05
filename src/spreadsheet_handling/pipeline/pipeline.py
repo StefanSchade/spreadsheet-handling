@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Proto
 import logging
 import pandas as pd
 
+import importlib
+
 # Wir nutzen die bestehende Engine weiter (keine Logik-Duplikate)
 from ..engine.orchestrator import Engine
 
@@ -43,21 +45,54 @@ class BoundStep:
     def __call__(self, frames: Frames) -> Frames:
         return self.fn(frames)
 
-
 # ======================================================================================
-# Pipeline Runner
+# Pipeline Runner (unchanged)
 # ======================================================================================
 
 def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
-    """
-    Wendet alle Steps der Reihe nach auf die Frames-Map an.
-    """
     out = frames
     for step in steps:
         log.debug("→ step: %s config=%s", getattr(step, "name", "<unnamed>"), getattr(step, "config", {}))
         out = step(out)
     return out
 
+# ======================================================================================
+# Plugin step support (factory-based)
+# ======================================================================================
+
+import importlib
+
+def _resolve_callable(dotted: str) -> Callable[..., Any]:
+    """
+    Import a dotted callable like 'package.module:function' or 'package.module.attr'.
+    Accepts both 'pkg.mod:func' and 'pkg.mod.func' styles.
+    """
+    if ":" in dotted:
+        mod_path, attr = dotted.split(":", 1)
+    else:
+        mod_path, attr = dotted.rsplit(".", 1)
+    mod = importlib.import_module(mod_path)
+    fn = getattr(mod, attr)
+    if not callable(fn):
+        raise TypeError(f"Not callable: {dotted}")
+    return fn
+
+def make_plugin_step(*, func: str, args: Dict[str, Any] | None = None, name: str = "plugin") -> BoundStep:
+    """
+    Factory for a 'plugin' step.
+    - func: dotted path to a callable (e.g. 'plugins.extractions.foo:run' or 'plugins.extractions.foo.run')
+    - args: optional dict of kwargs passed to the callable
+    The callable should accept (frames: dict[str, DataFrame], **kwargs) and either return a
+    frames dict or None (None keeps the incoming frames unchanged).
+    """
+    fn = _resolve_callable(func)
+    cfg = {"func": func, "args": dict(args or {})}
+
+    def run(fr: Frames) -> Frames:
+        result = fn(fr, **cfg["args"])
+        return fr if result is None else result
+
+    return BoundStep(name=name, config=cfg, fn=run)
 
 # ======================================================================================
 # Step-Factories (Closures, die die Konfiguration binden)
@@ -142,26 +177,26 @@ def make_drop_helpers_step(
 
 
 # ======================================================================================
-# Registry & Config-Binding (optional, für CLI/YAML)
+# Registry & Config-Binding (for CLI/YAML)
 # ======================================================================================
 
 class StepSpec(TypedDict, total=False):
     step: str
     name: str
-    # beliebige weitere Felder abhängig vom Step, z. B.:
     defaults: Dict[str, Any]
     mode_missing_fk: str
     mode_duplicate_ids: str
     prefix: str
+    # plugin-specific
+    func: str
+    args: Dict[str, Any]
 
-
-# Registriere hier die Step-Namen auf ihre Factory-Funktionen.
-# Jede Factory nimmt nur **kwargs (aus YAML/CLI) entgegen.
 REGISTRY: Dict[str, Callable[..., BoundStep]] = {
-    "identity": make_identity_step,
-    "validate": make_validate_step,
-    "apply_fks": make_apply_fks_step,
+    "identity":     make_identity_step,
+    "validate":     make_validate_step,
+    "apply_fks":    make_apply_fks_step,
     "drop_helpers": make_drop_helpers_step,
+    "plugin":       make_plugin_step,   # ← NEW
 }
 
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
