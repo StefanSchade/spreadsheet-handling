@@ -175,19 +175,51 @@ def write_xlsx(
 # Test-/router-facing convenience (module-level) API
 # ======================================================================================
 
-def save_xlsx(frames: Dict[str, pd.DataFrame], path: str) -> None:
-    """
-    Router-facing writer: one sheet per frame, with styling.
-    """
-    ExcelBackend().write_multi(frames, path, options=None)
+# src/spreadsheet_handling/io_backends/xlsx_backend.py
+from typing import Dict, Any
+import pandas as pd
+from .base import BackendOptions
+from .xlsx_backend import ExcelBackend  # falls die Klasse hier liegt; sonst anpassen
 
+def _flatten_cols_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure single-level string headers for Excel output."""
+    if not isinstance(df.columns, pd.MultiIndex):
+        # already flat; also guard against tuple-like strings
+        df.columns = [str(c) for c in df.columns]
+        return df
 
-def load_xlsx(path: str) -> Dict[str, pd.DataFrame]:
+    def first_nonempty(tup) -> str:
+        for x in tup:
+            s = str(x)
+            if s:
+                return s
+        return ""
+
+    flat = [first_nonempty(t) for t in df.columns.tolist()]
+    new_df = df.copy()
+    new_df.columns = flat
+    return new_df
+
+def save_xlsx(
+        frames: Dict[str, pd.DataFrame],
+        path: str,
+        options: BackendOptions | None = None
+) -> None:
+    """Router-facing saver that guarantees flat string headers."""
+    sanitized: Dict[str, pd.DataFrame] = {}
+    for name, df in frames.items():
+        sanitized[name] = _flatten_cols_for_excel(df)
+    ExcelBackend().write_multi(sanitized, path, options=options)
+
+def load_xlsx(
+        path: str,
+        options: BackendOptions | None = None   # <-- NEU
+) -> dict[str, pd.DataFrame]:
     """
     Router-facing reader: read all sheets, assume single header row.
     (Lifts to MultiIndex of length 1 → effectively stays flat.)
     """
-    return ExcelBackend().read_multi(path, header_levels=1, options=None)
+    return ExcelBackend().read_multi(path, header_levels=1, options=options)
 
 
 __all__ = [

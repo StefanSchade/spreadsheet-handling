@@ -101,7 +101,7 @@ ci: syntax lint test ## Run syntax + lint + tests
 # =========================
 snapshot: ## Repo snapshot under build/
 	mkdir -p $(TARGET)
-	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/repo.txt
+	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/spreadsheet-handling.txt
 
 # =========================
 # Coverage

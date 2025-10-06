@@ -175,6 +175,20 @@ def make_drop_helpers_step(
 
     return BoundStep(name=name, config=cfg, fn=run)
 
+def make_flatten_headers_step(*, sheet: str | None = None, mode: str = "first_nonempty", sep: str = "", name: str = "flatten_headers") -> BoundStep:
+    from ..domain.transformations.helpers import flatten_headers as _flatten
+    cfg = {"sheet": sheet, "mode": mode, "sep": sep}
+    def run(fr: Frames) -> Frames:
+        return _flatten(sheet, mode=mode, sep=sep)(fr)
+    return BoundStep(name=name, config=cfg, fn=run)
+
+def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_helpers") -> BoundStep:
+    from ..domain.transformations.helpers import reorder_helpers_next_to_fk as _reorder
+    cfg = {"sheet": sheet, "helper_prefix": helper_prefix}
+    def run(fr: Frames) -> Frames:
+        return _reorder(sheet, helper_prefix=helper_prefix)(fr)
+    return BoundStep(name=name, config=cfg, fn=run)
+
 
 # ======================================================================================
 # Registry & Config-Binding (for CLI/YAML)
@@ -191,12 +205,15 @@ class StepSpec(TypedDict, total=False):
     func: str
     args: Dict[str, Any]
 
+# Registry & Config-Binding
 REGISTRY: Dict[str, Callable[..., BoundStep]] = {
-    "identity":     make_identity_step,
-    "validate":     make_validate_step,
-    "apply_fks":    make_apply_fks_step,
-    "drop_helpers": make_drop_helpers_step,
-    "plugin":       make_plugin_step,   # ← NEW
+    "identity":         make_identity_step,
+    "validate":         make_validate_step,
+    "apply_fks":        make_apply_fks_step,
+    "drop_helpers":     make_drop_helpers_step,
+    "plugin":           make_plugin_step,        # schon drin
+    "flatten_headers":  make_flatten_headers_step,   # NEU
+    "reorder_helpers":  make_reorder_helpers_step,   # NEU
 }
 
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
