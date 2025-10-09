@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -12,31 +12,16 @@ from spreadsheet_handling.pipeline import (
     build_steps_from_config,
     build_steps_from_yaml,
 )
+from spreadsheet_handling.cli.logging_utils import setup_logging
+from spreadsheet_handling.cli.runtime import run_cli
 
 log = logging.getLogger("sheets.run")
-
-
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
-def _setup_logging(verbosity: int) -> None:
-    level = logging.WARNING
-    if verbosity == 1:
-        level = logging.INFO
-    elif verbosity >= 2:
-        level = logging.DEBUG
-    logging.basicConfig(level=level, format="%(levelname)s  %(name)s:%(message)s")
 
 
 # ---------------------------------------------------------------------
 # I/O selection helpers
 # ---------------------------------------------------------------------
 def _select_io_config(config: Dict[str, Any], profile: str | None) -> Dict[str, Any]:
-    """
-    Return an io-config block (dict with 'input' and 'output').
-    Profiles here are primarily a convenient way to select a *named pipeline*
-    (via io.profiles[<name>].pipeline) and optionally provide I/O defaults.
-    """
     io = (config or {}).get("io") or {}
     if profile:
         profiles = io.get("profiles") or {}
@@ -48,16 +33,11 @@ def _select_io_config(config: Dict[str, Any], profile: str | None) -> Dict[str, 
 
 
 def _maybe_load_inline_config_from_pipeline_yaml(pipeline_yaml: str) -> Dict[str, Any]:
-    """
-    If a steps YAML (given via --pipeline-yaml) also carries an 'io:' block,
-    return {'io': ...} so callers can use it as config when no --config was supplied.
-    """
     with open(pipeline_yaml, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     out: Dict[str, Any] = {}
     if isinstance(raw.get("io"), dict):
         out["io"] = raw["io"]
-    # Also allow "pipelines" and "pipeline" in the same file if users want it
     if isinstance(raw.get("pipelines"), dict):
         out["pipelines"] = raw["pipelines"]
     if isinstance(raw.get("pipeline"), list):
@@ -65,9 +45,6 @@ def _maybe_load_inline_config_from_pipeline_yaml(pipeline_yaml: str) -> Dict[str
     return out
 
 
-# ---------------------------------------------------------------------
-# Pipeline selection helpers
-# ---------------------------------------------------------------------
 def _select_pipeline_steps(
         config: Dict[str, Any],
         *,
@@ -75,13 +52,6 @@ def _select_pipeline_steps(
         pipeline_yaml: str | None,
         profile: str | None,
 ):
-    """
-    Build steps from either:
-      - a dedicated pipeline YAML (`--pipeline-yaml`), or
-      - config.pipelines[<pipeline_name>], or
-      - profile-bound pipeline (io.profiles[profile].pipeline), or
-      - config.pipeline (single unnamed pipeline spec)
-    """
     if pipeline_yaml:
         return build_steps_from_yaml(pipeline_yaml)
 
@@ -108,28 +78,37 @@ def _select_pipeline_steps(
     specs = (config or {}).get("pipeline") or []
     return build_steps_from_config(specs)
 
-
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="sheets-run",
         description="Generic runner for standard/custom pipelines (I/O + steps).",
     )
-    parser.add_argument("--config", help="Path to a config YAML (may include io, pipelines, pipeline).")
-    parser.add_argument("--pipeline-yaml", help="Path to a pipeline YAML. If it also contains 'io:', that will be used unless --config is supplied.")
-    parser.add_argument("--profile", help="Name of io.profiles[...] in the config.")
+
+    # yaml config options
+    parser.add_argument("--config", help="Path to a config YAML. May include io, pipelines, pipeline.")
     parser.add_argument("--pipeline", help="Name of pipelines[...] in the config.")
+    parser.add_argument( "--steps", help="Path to a YAML defining steps for ad hoc run. May also include io")
+    parser.add_argument( "--pipeline", help="Name of a pipeline defined under 'pipelines:' in --config.")
+    parser.add_argument("--profile", help="Name of 'io.profiles[...]' in --config (binds IO and optional default pipeline).")
+
+    # deprecated configs
+    parser.add_argument("--pipeline-yaml", dest="steps", help=argparse.SUPPRESS)
+
     # path overrides (override selected profile/top-level io)
     parser.add_argument("--in-kind", help="Override input.kind (e.g., json_dir, csv_dir, xlsx)")
     parser.add_argument("--in-path", help="Override input.path")
     parser.add_argument("--out-kind", help="Override output.kind (e.g., json_dir, csv_dir, xlsx)")
     parser.add_argument("--out-path", help="Override output.path")
+
+    # logging options
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (repeatable)")
+    parser.add_argument("--debug", action="store_true", help="Show full tracebacks on errors")
 
     args = parser.parse_args(argv)
-    _setup_logging(args.verbose)
+    setup_logging(args.verbose)
 
     # Load config: prefer explicit --config; otherwise accept 'io' from --pipeline-yaml
     config: Dict[str, Any] = {}
@@ -141,8 +120,6 @@ def main(argv: list[str] | None = None) -> int:
         if "io" in inline:
             config = {"io": inline["io"]}
 
-   # --- after parsing args + (optional) config load ---
-
     # 1) start with whatever is in the config (or empty)
     io_cfg = _select_io_config(config, args.profile) if config else {}
 
@@ -151,18 +128,20 @@ def main(argv: list[str] | None = None) -> int:
     out = dict((io_cfg.get("output") or {}))
 
     # 3) apply CLI overrides (these should always win)
-    if args.in_kind:  inp["kind"] = args.in_kind
-    if args.in_path:  inp["path"] = args.in_path
-    if args.out_kind: out["kind"] = args.out_kind
-    if args.out_path: out["path"] = args.out_path
+    if args.in_kind:
+        inp["kind"] = args.in_kind
+    if args.in_path:
+        inp["path"] = args.in_path
+    if args.out_kind:
+        out["kind"] = args.out_kind
+    if args.out_path:
+        out["path"] = args.out_path
 
     # 4) validate *after* overrides
-    missing = [k for k in ("kind", "path") if k not in inp] + \
-              [f"out.{k}" for k in ("kind", "path") if k not in out]
+    missing = [k for k in ("kind", "path") if k not in inp] + [f"out.{k}" for k in ("kind", "path") if k not in out]
     if missing:
         raise SystemExit(
-            "Missing I/O configuration. Provide --config/--pipeline-yaml with 'io', "
-            "or add CLI overrides."
+            "Missing I/O configuration. Provide --config/--pipeline-yaml with 'io', or add CLI overrides."
         )
 
     # Choose loader/saver
@@ -187,4 +166,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run_cli(main)

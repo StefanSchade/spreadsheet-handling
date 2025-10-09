@@ -4,8 +4,14 @@
 SHELL 		 := /usr/bin/env bash
 .SHELLFLAGS  := -eu -o pipefail -c
 
+REPO := $(shell git rev-parse --show-toplevel 2>/dev/null | xargs basename)
+VER  := $(shell git describe --tags --always --dirty 2>/dev/null || echo DEV-SNAPSHOT)
+REV  := $(shell git rev-parse --short HEAD 2>/dev/null || echo local)
+DATE := $(shell date -Iseconds)
+
 ROOT         := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TARGET       := $(ROOT)build
+DOC_BUILD_DIR := $(TARGET)/doc
 VENV         := $(ROOT).venv
 COV_HTML_DIR := $(TARGET)/htmlcov
 COV_DATA     := $(TARGET)/.coverage
@@ -95,10 +101,26 @@ syntax: venv ## Syntax check
 
 ci: syntax lint test ## Run syntax + lint + tests
 
+# =========================
+# Snapshot
+# =========================
+
+.PHONY: docs-user
+docs-user:
+	@set -e; \
+	asciidoctor \
+		-a project-name="$(REPO)" \
+		-a project-version="$(VER)" \
+		-a build-rev="$(REV)" \
+		-a build-date="$(date -Iseconds)" \
+		-D "$(DOC_BUILD_DIR)/user_guide/" \
+		-o index.html docs/user_guide/user_guide.adoc; \
+	echo "✅ Docs written to $(DOC_BUILD_DIR)/user_guide/index.html"
 
 # =========================
 # Snapshot
 # =========================
+
 snapshot: ## Repo snapshot under build/
 	mkdir -p $(TARGET)
 	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/spreadsheet-handling.txt

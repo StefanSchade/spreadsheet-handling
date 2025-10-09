@@ -1,8 +1,8 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
-from ..pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
-from ..pipeline.runner import run_pipeline
+from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
+from spreadsheet_handling.pipeline.runner import run_pipeline
 
 def _args():
     p = argparse.ArgumentParser(prog="sheets-unpack", description="XLSX -> JSON")
