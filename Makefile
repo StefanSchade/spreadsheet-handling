@@ -126,25 +126,23 @@ snapshot: ## Repo snapshot under build/
 	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/spreadsheet-handling.txt
 
 # =========================
-# Coverage
+# Test variables (shared)
 # =========================
-coverage: deps-dev ## Coverage in terminal (with missing lines)
-	mkdir -p $(TARGET)
-	COVERAGE_FILE=$(COV_DATA) $(PYTHON) -m pytest \
-		--cov=src/spreadsheet_handling \
-		--cov-report=term-missing \
-		tests
 
-coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
-	mkdir -p $(COV_HTML_DIR)
-	COVERAGE_FILE=$(COV_DATA) $(PYTHON) -m pytest \
-		--cov=src/spreadsheet_handling \
-		--cov-report=html:$(COV_HTML_DIR) \
-		tests
-	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
+PYTEST       ?= $(VENV)/bin/pytest
+PKG_NAME     ?= your_package_name   # <--- anpassen
+
+# Default: Legacy-Tests ausschließen
+MARK         ?= "not legacy"
+
+# Zusätzliche Pytest-Optionen (CLI-Override möglich)
+PYTEST_OPTS  ?=
+
+# Testauswahl (Verzeichnis/Datei/Pfad); leer => Standard "tests"
+TEST_PATH    ?=
 
 # =========================
-# Tests
+# Test targets
 # =========================
 
 .PHONY: test test-verbose test-lastfailed test-one test-file test-node test-unit test-integ test-legacy test-all
@@ -203,6 +201,26 @@ test-integ: deps-dev ## Integration tests only
 test-all: MARK_EXPR=
 test-all: deps-dev ## Run ALL tests (including legacy)
 	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
+
+# =========================
+# Coverage
+# =========================
+coverage: deps-dev ## Coverage in terminal (with missing lines)
+	mkdir -p $(TARGET)
+	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		--cov=src/spreadsheet_handling \
+		--cov-report=term-missing \
+		tests
+
+coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
+	mkdir -p $(COV_HTML_DIR)
+	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		--cov=src/spreadsheet_handling \
+		--cov-report=html:$(COV_HTML_DIR) \
+		tests
+	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # =========================
 # Demo run

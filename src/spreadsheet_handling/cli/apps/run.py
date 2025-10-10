@@ -49,11 +49,11 @@ def _select_pipeline_steps(
         config: Dict[str, Any],
         *,
         pipeline_name: str | None,
-        pipeline_yaml: str | None,
+        steps_yaml: str | None,
         profile: str | None,
 ):
-    if pipeline_yaml:
-        return build_steps_from_yaml(pipeline_yaml)
+    if steps_yaml:
+        return build_steps_from_yaml(steps_yaml)
 
     if pipeline_name:
         pipelines = (config.get("pipelines") or {})
@@ -152,7 +152,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     steps = _select_pipeline_steps(
         config,
         pipeline_name=args.pipeline,
-        pipeline_yaml=args.pipeline_yaml,
+        steps_yaml=args.steps,
         profile=args.profile,
     )
 
