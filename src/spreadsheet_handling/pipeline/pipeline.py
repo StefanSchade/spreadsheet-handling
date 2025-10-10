@@ -190,6 +190,18 @@ def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = 
     return BoundStep(name=name, config=cfg, fn=run)
 
 
+# in pipeline/pipeline.py
+def make_add_validations_step(*, rules: list[dict], name: str = "add_validations") -> BoundStep:
+    from ..domain.validations.validate_columns import add_validations as _impl
+
+    cfg = {"rules": rules}
+    def run(fr: Frames) -> Frames:
+        return _impl(fr, rules=cfg["rules"])
+    return BoundStep(name=name, config=cfg, fn=run)
+
+
+
+
 # ======================================================================================
 # Registry & Config-Binding (for CLI/YAML)
 # ======================================================================================
@@ -211,9 +223,10 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "validate":         make_validate_step,
     "apply_fks":        make_apply_fks_step,
     "drop_helpers":     make_drop_helpers_step,
-    "plugin":           make_plugin_step,        # schon drin
-    "flatten_headers":  make_flatten_headers_step,   # NEU
-    "reorder_helpers":  make_reorder_helpers_step,   # NEU
+    "plugin":           make_plugin_step,
+    "flatten_headers":  make_flatten_headers_step,
+    "reorder_helpers":  make_reorder_helpers_step,
+    "add_validations": make_add_validations_step,
 }
 
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:

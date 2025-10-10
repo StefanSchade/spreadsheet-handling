@@ -6,6 +6,10 @@ from typing import Dict, Any
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
+from openpyxl import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.worksheet.datavalidation import DataValidation
+
 
 # Keep the base import so existing imports/typing remain valid.
 from .base import BackendBase, BackendOptions
@@ -50,6 +54,62 @@ def _decorate_workbook(
             ws.freeze_panes = "A2"
 
     wb.save(workbook_path)
+
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl import load_workbook
+
+def _apply_xlsx_validations(xlsx_path: Path, frames: dict[str, pd.DataFrame]) -> None:
+    """
+    Reads frames.meta["constraints"] (your neutral schema) and applies
+    Excel data validations to the written workbook.
+    MVP: supports rule.type == "in_list" on a named column.
+    """
+    meta = getattr(frames, "meta", {}) or {}
+    constraints = meta.get("constraints") or []
+    if not constraints:
+        return
+
+    wb = load_workbook(xlsx_path)
+    for c in constraints:
+        rule = (c or {}).get("rule") or {}
+        if rule.get("type") != "in_list":
+            continue  # only handle in_list in MVP
+
+        sheet = c.get("sheet")
+        col_name = c.get("column")
+        if not sheet or not col_name or sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+
+        col_ix = _find_col_index_by_header(ws, col_name)  # 1-based
+        if not col_ix:
+            continue
+
+        start_row = 2                      # assume row 1 is header
+        end_row = max(ws.max_row or 1, 2)  # at least two rows
+        cell_range = f"{get_column_letter(col_ix)}{start_row}:{get_column_letter(col_ix)}{end_row}"
+
+        values = list(rule.get("values") or [])
+        if not values:
+            continue
+
+        dv = DataValidation(type="list", formula1=f'"{",".join(map(str, values))}"', allow_blank=True)
+        ws.add_data_validation(dv)
+        dv.add(cell_range)
+
+    wb.save(xlsx_path)
+
+def _find_col_index_by_header(ws: Worksheet, header: str) -> int | None:
+    """
+    Map header-text in row 1 to 1-based column index. Strict string match.
+    """
+    for j, cell in enumerate(ws[1], start=1):
+        if str(cell.value) == str(header):
+            return j
+    return None
+
 
 
 def _flatten_header_to_level0(df: pd.DataFrame) -> pd.DataFrame:
@@ -106,6 +166,13 @@ class ExcelBackend(BackendBase):
             header_fill_rgb="DDDDDD",
             freeze_header=False,
         )
+
+        try:
+            _apply_xlsx_validations(Path(out), frames)   # <-- add this line
+        except Exception:
+            # keep robust; don't break writing if validations fail
+            pass
+
 
     def read_multi(
             self,
@@ -227,3 +294,95 @@ __all__ = [
     "save_xlsx",
     "load_xlsx",
 ]
+
+# vaildation feature
+
+# add at top if not present
+from openpyxl import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.worksheet.datavalidation import DataValidation
+
+def write_multi(frames, path: str, options: dict | None = None) -> None:
+    # ... existing writing logic that creates wb + sheets and writes data ...
+    wb = _create_workbook_from_frames(frames)  # <- your existing function/logic
+    _apply_xlsx_presentation_hints(wb, frames)
+    wb.save(path)
+
+def _apply_xlsx_presentation_hints(wb, frames) -> None:
+    meta = getattr(frames, "meta", {}) or {}
+    pres = (meta.get("presentation") or {}).get("xlsx") or {}
+
+    # 1) if user already provided explicit xlsx validations, apply them
+    _apply_validations_from_hints(wb, pres.get("validations") or [])
+
+    # 2) additionally: synthesize validations from generic constraints (in_list only)
+    _constraints_to_validations_and_apply(wb, frames, meta.get("constraints") or [])
+
+def _apply_validations_from_hints(wb, validations: list[dict]) -> None:
+    for v in validations:
+        sheet = wb[v["sheet"]]
+        dv = _make_list_validation(v)
+        sheet.add_data_validation(dv)
+        dv.add(v["range"])
+
+def _constraints_to_validations_and_apply(wb, frames, constraints: list[dict]) -> None:
+    # MVP: only in_list on a column -> convert to a range covering all data rows
+    for c in constraints:
+        rule = c.get("rule") or {}
+        if rule.get("type") != "in_list":
+            continue  # ignore other types for now
+
+        sheet_name = c["sheet"]
+        ws = wb[sheet_name]
+        col_letter = _resolve_column_letter(frames, sheet_name, c.get("column"))
+        if not col_letter:
+            continue
+
+        start_row = 2  # assuming row 1 is header
+        end_row = _infer_last_row(ws)
+        cell_range = f"{col_letter}{start_row}:{col_letter}{end_row}"
+        v = {
+            "sheet": sheet_name,
+            "range": cell_range,
+            "values": list(rule.get("values") or []),
+            "allow_blank": True,
+        }
+        dv = _make_list_validation(v)
+        ws.add_data_validation(dv)
+        dv.add(cell_range)
+
+def _make_list_validation(v: dict) -> DataValidation:
+    # values -> "A,B,C" literal list; prefer source_range if provided
+    if v.get("source_range"):
+        dv = DataValidation(type="list", formula1=f'={v["source_range"]}',
+                            allow_blank=bool(v.get("allow_blank", True)))
+    else:
+        literal = ",".join(map(str, v.get("values") or []))
+        dv = DataValidation(type="list", formula1=f'"{literal}"',
+                            allow_blank=bool(v.get("allow_blank", True)))
+    return dv
+
+def _infer_last_row(ws: Worksheet) -> int:
+    # robust end row (openpyxl sometimes leaves gaps); fallback to max used row
+    return max(ws.max_row or 1, 2)
+
+def _resolve_column_letter(frames, sheet: str, column_name: str | None) -> str | None:
+    """
+    Map a logical column name to an Excel column letter using the frame's current header.
+    Assumes row 1 contains headers that match DataFrame columns.
+    """
+    if not column_name:
+        return None
+    # obtain the column index from frames (you likely have frames.sheets[sheet] as a list of dicts or a df)
+    df = _as_dataframe(frames, sheet)  # implement according to your frames structure
+    if column_name not in list(df.columns):
+        return None
+    idx = list(df.columns).index(column_name)  # 0-based
+    return _number_to_col(idx + 1)  # 1-based
+
+def _number_to_col(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n-1, 26)
+        s = chr(65 + r) + s
+    return s
