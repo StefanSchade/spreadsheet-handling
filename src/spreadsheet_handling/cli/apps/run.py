@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, Optional
 
 import yaml
+import os
 
 from spreadsheet_handling.io_backends.router import get_loader, get_saver
 from spreadsheet_handling.pipeline import (
@@ -21,19 +22,21 @@ log = logging.getLogger("sheets.run")
 # ---------------------------------------------------------------------
 # I/O selection helpers
 # ---------------------------------------------------------------------
-def _select_io_config(config: Dict[str, Any], profile: str | None) -> Dict[str, Any]:
-    io = (config or {}).get("io") or {}
-    if profile:
-        profiles = io.get("profiles") or {}
-        sel = profiles.get(profile)
-        if not sel:
-            raise SystemExit(f"Unknown profile '{profile}'. Available: {list(profiles)}")
-        return sel
-    return io
 
+def _load_config(args):
+    """Prefer the explicit config --config; otherwise accept 'io' from --steps"""
+    config: Dict[str, Any] = {}
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    elif args.steps and os.path.exists(args.steps):
+        inline = _maybe_load_inline_config_from_steps_yaml(args.steps)
+        if "io" in inline:
+            config = {"io": inline["io"]}
+    return config
 
-def _maybe_load_inline_config_from_pipeline_yaml(pipeline_yaml: str) -> Dict[str, Any]:
-    with open(pipeline_yaml, "r", encoding="utf-8") as f:
+def _maybe_load_inline_config_from_steps_yaml(steps_yaml: str) -> Dict[str, Any]:
+    with open(steps_yaml, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     out: Dict[str, Any] = {}
     if isinstance(raw.get("io"), dict):
@@ -44,6 +47,15 @@ def _maybe_load_inline_config_from_pipeline_yaml(pipeline_yaml: str) -> Dict[str
         out["pipeline"] = raw["pipeline"]
     return out
 
+def _select_io_config(config: Dict[str, Any], profile: str | None) -> Dict[str, Any]:
+    io = (config or {}).get("io") or {}
+    if profile:
+        profiles = io.get("profiles") or {}
+        sel = profiles.get(profile)
+        if not sel:
+            raise SystemExit(f"Unknown profile '{profile}'. Available: {list(profiles)}")
+        return sel
+    return io
 
 def _select_pipeline_steps(
         config: Dict[str, Any],
@@ -51,32 +63,46 @@ def _select_pipeline_steps(
         pipeline_name: str | None,
         steps_yaml: str | None,
         profile: str | None,
-):
+    ):
+    """Extract pipeline specifications, determine the relevant pipeline and extract the steps."""
     if steps_yaml:
-        return build_steps_from_yaml(steps_yaml)
-
-    if pipeline_name:
-        pipelines = (config.get("pipelines") or {})
-        specs = pipelines.get(pipeline_name)
-        if specs is None:
-            raise SystemExit(f"Unknown pipeline '{pipeline_name}'. Available: {list(pipelines)}")
-        return build_steps_from_config(specs)
-
-    if profile:
-        prof_spec = (((config or {}).get("io") or {}).get("profiles") or {}).get(profile) or {}
-        prof_pipeline_name = prof_spec.get("pipeline")
-        if prof_pipeline_name:
-            pipelines = (config.get("pipelines") or {})
-            specs = pipelines.get(prof_pipeline_name)
-            if specs is None:
-                raise SystemExit(
-                    f"Profile '{profile}' refers to unknown pipeline '{prof_pipeline_name}'. "
-                    f"Available: {list(pipelines)}"
-                )
-            return build_steps_from_config(specs)
-
-    specs = (config or {}).get("pipeline") or []
+        return build_steps_from_yaml(steps_yaml) # Ad-hoc steps file wins
+    spec_of_pipelines_by_name = (config or {}).get("pipelines") or {}
+    # Determine effective pipeline name (explicit > from profile > None)
+    effective_name = pipeline_name or _pipeline_name_from_profile(config, profile)
+    # Resolve specs
+    if effective_name:
+        specs = _get_pipeline_specs_or_die(spec_of_pipelines_by_name, effective_name, profile)
+    else:
+        # fallback to top-level `pipeline: [...]` (ad-hoc list in config)
+        specs = (config or {}).get("pipeline") or []
+    # Build
     return build_steps_from_config(specs)
+
+def _pipeline_name_from_profile(config: Dict[str, Any], profile: str | None) -> str | None:
+    """Profiles may declare a default pipeline, or they may not."""
+    if not profile:
+        return None
+    io = (config or {}).get("io") or {}
+    profiles = io.get("profiles") or {}
+    prof_spec = profiles.get(profile) or {}
+    return prof_spec.get("pipeline")
+
+
+def _get_pipeline_specs_or_die(pipelines: Dict[str, Any], name: str, profile: str | None) -> list[dict]:
+    """In case the pipeline specs are missing, fail."""
+    specs = pipelines.get(name)
+    if specs is not None:
+        return specs
+    # Construct a precise error depending on whether this came from --pipeline or from profile
+    if profile:
+        raise SystemExit(
+            f"Profile '{profile}' refers to unknown pipeline '{name}'. "
+            f"Available: {list(pipelines)}"
+        )
+    raise SystemExit(
+        f"Unknown pipeline '{name}'. Available: {list(pipelines)}"
+    )
 
 # ---------------------------------------------------------------------
 # CLI
@@ -89,9 +115,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # yaml config options
     parser.add_argument("--config", help="Path to a config YAML. May include io, pipelines, pipeline.")
-    parser.add_argument("--pipeline", help="Name of pipelines[...] in the config.")
-    parser.add_argument( "--steps", help="Path to a YAML defining steps for ad hoc run. May also include io")
     parser.add_argument( "--pipeline", help="Name of a pipeline defined under 'pipelines:' in --config.")
+    parser.add_argument( "--steps", help="Path to a YAML defining steps for ad hoc run. May also include io")
     parser.add_argument("--profile", help="Name of 'io.profiles[...]' in --config (binds IO and optional default pipeline).")
 
     # deprecated configs
@@ -110,15 +135,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
 
-    # Load config: prefer explicit --config; otherwise accept 'io' from --pipeline-yaml
-    config: Dict[str, Any] = {}
-    if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-    elif args.pipeline_yaml:
-        inline = _maybe_load_inline_config_from_pipeline_yaml(args.pipeline_yaml)
-        if "io" in inline:
-            config = {"io": inline["io"]}
+    config = _load_config(args)
 
     # 1) start with whatever is in the config (or empty)
     io_cfg = _select_io_config(config, args.profile) if config else {}
@@ -141,7 +158,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     missing = [k for k in ("kind", "path") if k not in inp] + [f"out.{k}" for k in ("kind", "path") if k not in out]
     if missing:
         raise SystemExit(
-            "Missing I/O configuration. Provide --config/--pipeline-yaml with 'io', or add CLI overrides."
+            "Missing I/O configuration. Provide --config/--steps with 'io', or add CLI overrides."
         )
 
     # Choose loader/saver
@@ -163,7 +180,6 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     log.info("Done. Wrote output to %s", out["path"])
     return 0
-
 
 if __name__ == "__main__":
     run_cli(main)
