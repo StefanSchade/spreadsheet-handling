@@ -1,30 +1,34 @@
-# src/spreadsheet_handling/steps/validations.py
-from __future__ import annotations
-from typing import Any, Dict, List
+def add_validations(frames, *, rules: list[dict]):
+    # get or create meta on either frames.meta (attr) or frames["_meta"] (dict key)
+    if hasattr(frames, "meta"):
+        meta = frames.meta or {}
+        where = "attr"
+    elif isinstance(frames, dict):
+        meta = frames.get("_meta") or {}
+        frames["_meta"] = meta
+        where = "key"
+    else:
+        # last resort: create a temporary sidecar
+        meta = {}
+        where = "temp"
 
-def add_validations(frames, *, rules: List[Dict[str, Any]]) -> "Frames":
-    """
-    Add backend-agnostic validation constraints to frames.meta["constraints"].
-    Expected rule format (per item):
-      { sheet: str, column: str,
-        rule: { type: "in_list", values: [...] },   # MVP supports in_list
-        on_violation: "error" | "warn" | "coerce" } # default "error"
-    """
-    meta = dict(frames.meta or {})
     constraints = list(meta.get("constraints") or [])
     for r in rules:
-        # minimal sanity: require fields
-        if not isinstance(r, dict) or "sheet" not in r or "rule" not in r:
-            raise ValueError(f"invalid validation rule: {r}")
-        rule = r.get("rule") or {}
+        rule = (r.get("rule") or {})
         if rule.get("type") != "in_list":
-            raise ValueError(f"unsupported rule.type={rule.get('type')} (MVP supports 'in_list')")
+            raise ValueError(f"unsupported rule.type={rule.get('type')}")
         constraints.append({
             "sheet": r["sheet"],
-            "column": r.get("column"),            # optional if you use explicit ranges later
+            "column": r.get("column"),
             "rule": {"type": "in_list", "values": list(rule.get("values") or [])},
             "on_violation": r.get("on_violation", "error"),
         })
+
     meta["constraints"] = constraints
-    frames.meta = meta
+
+    if where == "attr":
+        frames.meta = meta
+    elif where == "key":
+        frames["_meta"] = meta
+
     return frames

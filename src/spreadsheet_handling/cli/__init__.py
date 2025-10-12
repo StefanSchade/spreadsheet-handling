@@ -1,17 +1,16 @@
-# src/spreadsheet_handling/cli/__init__.py
 from __future__ import annotations
-from typing import Any
 
-__all__ = ["pack", "unpack", "run"]
+# Explizite, empfohlene Callables
+from .apps.run import main as run_main
+from .apps.sheets_pack import main as pack_main
+from .apps.sheets_unpack import main as unpack_main
 
-def __getattr__(name: str) -> Any:
-    if name == "pack":
-        from .sheets_pack import run_pack
-        return run_pack
-    if name == "unpack":
-        from .sheets_unpack import run_unpack
-        return run_unpack
-    if name == "run":
-        from . import run as run_mod
-        return run_mod
-    raise AttributeError(name)
+# Bequeme Aliase (keine Deprecation, nur Komfort)
+run = run_main
+pack = pack_main
+unpack = unpack_main
+
+__all__ = [
+    "run_main", "pack_main", "unpack_main",  # bevorzugte, explizite API
+    "run", "pack", "unpack",                 # bequeme Aliase
+]
