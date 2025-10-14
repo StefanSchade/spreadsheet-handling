@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Final
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -12,6 +12,11 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from .base import BackendBase, BackendOptions
 
+import logging
+
+log = logging.getLogger("sheets.xlsx")
+
+_RESERVED_FRAME_KEYS: Final[set[str]] = {"_meta"}   # extend here if we add more internals
 
 # ======================================================================================
 # Styling helpers
@@ -61,10 +66,11 @@ def _decorate_workbook(
 def _find_col_index_by_header(ws: Worksheet, header: str) -> Optional[int]:
     """
     Return 1-based column index for the given header text found in row 1.
-    Strict string comparison.
+    Match tolerant compare that ignores whitespace / case  differences.
     """
+    want = str(header).strip().lower()
     for j, cell in enumerate(ws[1], start=1):
-        if str(cell.value) == str(header):
+        if str(cell.value).strip().lower() == want:
             return j
     return None
 
@@ -78,8 +84,7 @@ def _apply_xlsx_validations(
 
     - Reads meta from frames.meta (attribute) OR frames["_meta"] (dict key).
     - Resolves the target column by inspecting the worksheet header (row 1),
-      not by accessing DataFrame columns. This works regardless of how frames are
-      represented in memory (DataFrame, list-of-dicts, etc.).
+      not by accessing DataFrame columns.
     - MVP supports rule.type == "in_list" on a named column.
     """
     meta = (
@@ -87,45 +92,41 @@ def _apply_xlsx_validations(
             or (frames.get("_meta") if isinstance(frames, dict) else None)
             or {}
     )
-    constraints: list[dict] = meta.get("constraints") or []
+    constraints = list(meta.get("constraints") or [])
+    log.info("[xlsx] start validations: %d constraint(s)", len(constraints))
     if not constraints:
         return
 
     wb = load_workbook(xlsx_path)
-
+    added = 0
     for c in constraints:
         rule = (c or {}).get("rule") or {}
         if rule.get("type") != "in_list":
             continue
-
         sheet = c.get("sheet")
-        column_name = c.get("column")
-        if not sheet or not column_name or sheet not in wb.sheetnames:
+        col = c.get("column")
+        if not sheet or not col or sheet not in wb.sheetnames:
+            log.warning("[xlsx] skip: bad sheet/col %s", c)
             continue
-
-        ws: Worksheet = wb[sheet]
-        col_ix = _find_col_index_by_header(ws, str(column_name))
+        ws = wb[sheet]
+        col_ix = _find_col_index_by_header(ws, str(col))
         if not col_ix:
+            log.warning("[xlsx] header not found: %s.%s", sheet, col)
             continue
-
-        start_row = 2                       # assume row 1 = header
-        end_row = max(ws.max_row or 1, 2)   # at least two rows
-        col_letter = get_column_letter(col_ix)
-        cell_range = f"{col_letter}{start_row}:{col_letter}{end_row}"
-
+        start_row = 2
+        end_row = max(ws.max_row or 1, 2)
+        rng = f"{get_column_letter(col_ix)}{start_row}:{get_column_letter(col_ix)}{end_row}"
         values = list(rule.get("values") or [])
         if not values:
+            log.warning("[xlsx] no values for %s.%s", sheet, col)
             continue
-
-        dv = DataValidation(
-            type="list",
-            formula1=f'"{",".join(map(str, values))}"',
-            allow_blank=True,
-        )
+        dv = DataValidation(type="list", formula1=f'"{",".join(map(str, values))}"', allow_blank=True)
         ws.add_data_validation(dv)
-        dv.add(cell_range)
-
+        dv.add(rng)
+        added += 1
+        log.info("[xlsx] added: sheet=%s col=%s range=%s values=%s", sheet, col, rng, values)
     wb.save(xlsx_path)
+    log.info("[xlsx] done: %d validations added", added)
 
 
 # ======================================================================================
@@ -152,17 +153,15 @@ def _flatten_cols_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     component per tuple.
     """
     if not isinstance(df.columns, pd.MultiIndex):
-        out = df.copy()
-        out.columns = [str(c) for c in out.columns]
-        return out
-
-    def first_nonempty(tup: tuple[Any, ...]) -> str:
+        df = df.copy()
+        df.columns = [str(c) for c in df.columns]
+        return df
+    def first_nonempty(tup) -> str:
         for x in tup:
-            s = "" if x is None else str(x)
+            s = str(x)
             if s:
                 return s
         return ""
-
     flat = [first_nonempty(t) for t in df.columns.tolist()]
     new_df = df.copy()
     new_df.columns = flat
@@ -201,7 +200,10 @@ class ExcelBackend(BackendBase):
         # 1) write data
         with pd.ExcelWriter(out, engine="openpyxl") as xw:
             for sheet_name, df in frames.items():
-                sheet = (sheet_name or "Sheet")[:31]  # Excel sheet name limit
+                name = str(sheet_name)
+                if name in _RESERVED_FRAME_KEYS:    # <-- only skip explicit internals
+                    continue
+                sheet = (name or "Sheet")[:31]
                 df0 = _ensure_dataframe(df)
                 df_out = _flatten_header_to_level0(df0)
                 df_out.to_excel(xw, sheet_name=sheet, index=False)
@@ -247,15 +249,32 @@ class ExcelBackend(BackendBase):
 # ======================================================================================
 
 def save_xlsx(
-        frames: Dict[str, pd.DataFrame],
+        frames: Dict[str, Any],
         path: str,
         options: BackendOptions | None = None,
 ) -> None:
-    """Router-facing saver that guarantees flat string headers."""
-    sanitized: Dict[str, pd.DataFrame] = {}
+    """
+    Preserve meta under '_meta' (either from frames['_meta'] or frames.meta)
+    so the writer can apply data validations; coerce all sheets to DataFrames.
+    """
+    sanitized: Dict[str, Any] = {}
+
+    # carry over meta (either attribute or dict key)
+    meta_attr = getattr(frames, "meta", None)
+    if isinstance(frames, dict) and "_meta" in frames:
+        sanitized["_meta"] = frames["_meta"]
+    elif meta_attr is not None:
+        sanitized["_meta"] = meta_attr
+
     for name, df in frames.items():
+        name_str = str(name)
+        if name_str in _RESERVED_FRAME_KEYS:
+            # keep meta entry in mapping (writer will skip writing it as a sheet)
+            sanitized[name_str] = df
+            continue
         df0 = _ensure_dataframe(df)
-        sanitized[name] = _flatten_cols_for_excel(df0)
+        sanitized[name_str] = _flatten_cols_for_excel(df0)
+
     ExcelBackend().write_multi(sanitized, path, options=options)
 
 
