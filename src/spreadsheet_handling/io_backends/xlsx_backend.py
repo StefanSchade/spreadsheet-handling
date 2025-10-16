@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Final
-
+import os
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
@@ -13,6 +13,13 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from .base import BackendBase, BackendOptions
 
 import logging
+
+# IR + composer + passes + renderer
+from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
+from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
+
+
 
 log = logging.getLogger("sheets.xlsx")
 
@@ -183,39 +190,44 @@ class ExcelBackend(BackendBase):
 
     def write_multi(
             self,
-            frames: Dict[str, pd.DataFrame],
+            frames: dict[str, pd.DataFrame],
             path: str,
-            options: BackendOptions | None = None,
+            options=None,
     ) -> None:
         """
-        Write multiple DataFrames to an XLSX:
-        - one sheet per dict key
-        - flatten MultiIndex headers to level 0 (single header row)
-        - apply header styling (autofilter + gray + bold), optionally freeze header
-        - apply data validations from frames meta (if present)
+        Write multiple DataFrames to an XLSX using the new IR pipeline.
         """
-        out = Path(path).with_suffix(".xlsx")
-        out.parent.mkdir(parents=True, exist_ok=True)
+        use_ir = (
+                (options and getattr(options, "use_ir_backend", None) is True)
+                or os.getenv("SH_XLSX_BACKEND", "").lower() in {"ir","new","1","true"}
+        )
+        if not use_ir:
+            # ---- LEGACY PATH (what you had before) ----
+            out = Path(path).with_suffix(".xlsx")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with pd.ExcelWriter(out, engine="openpyxl") as xw:
+                for sheet_name, df in frames.items():
+                    name = str(sheet_name)
+                    if name in _RESERVED_FRAME_KEYS:
+                        continue
+                    sheet = (name or "Sheet")[:31]
+                    df0 = _ensure_dataframe(df)
+                    df_out = _flatten_header_to_level0(df0)
+                    df_out.to_excel(xw, sheet_name=sheet, index=False)
+            _decorate_workbook(out, auto_filter=True, header_fill_rgb="DDDDDD", freeze_header=False)
+            try:
+                _apply_xlsx_validations(out, frames)
+            except Exception:
+                pass
+            return
 
-        # 1) write data
-        with pd.ExcelWriter(out, engine="openpyxl") as xw:
-            for sheet_name, df in frames.items():
-                name = str(sheet_name)
-                if name in _RESERVED_FRAME_KEYS:    # <-- only skip explicit internals
-                    continue
-                sheet = (name or "Sheet")[:31]
-                df0 = _ensure_dataframe(df)
-                df_out = _flatten_header_to_level0(df0)
-                df_out.to_excel(xw, sheet_name=sheet, index=False)
-
-        # 2) style
-        _decorate_workbook(out, auto_filter=True, header_fill_rgb="DDDDDD", freeze_header=False)
-
-        # 3) validations (never fail the write because of presentation)
-        try:
-            _apply_xlsx_validations(out, frames)
-        except Exception:
-            pass
+        # ---- NEW IR PATH ----
+        out_path = Path(path).with_suffix(".xlsx")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = (frames.get("_meta") if isinstance(frames, dict) else {}) or getattr(frames, "meta", {}) or {}
+        ir = compose_workbook(frames, meta)
+        apply_render_passes(ir, meta)
+        render_workbook(ir, out_path)
 
     def read_multi(
             self,

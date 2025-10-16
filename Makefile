@@ -17,7 +17,7 @@ COV_HTML_DIR := $(TARGET)/htmlcov
 COV_DATA     := $(TARGET)/.coverage
 
 PYTHON       := $(VENV)/bin/python
-PYTEST       := $(VENV)/bin/pytest
+PYTEST       := ?(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
 
@@ -129,11 +129,11 @@ snapshot: ## Repo snapshot under build/
 # Test variables (shared)
 # =========================
 
-PYTEST       ?= $(VENV)/bin/pytest
+PYTEST 		 := $(shell test -x $(VENV)/bin/pytest && echo $(VENV)/bin/pytest || echo pytest)
 PKG_NAME     ?= your_package_name   # <--- anpassen
 
 # Default: Legacy-Tests ausschließen
-MARK         ?= "not legacy"
+MARK         ?= not legacy and not xlsx_ir
 
 # Zusätzliche Pytest-Optionen (CLI-Override möglich)
 PYTEST_OPTS  ?=
@@ -163,7 +163,7 @@ LOG_OPTS          ?=
 #   make test-one TESTPATTERN="helpers and not slow"
 #   make test-one TESTPATTERN="integration or json_roundtrip or xlsx_writer_styling"
 # --- bestehend ---
-MARK_EXPR         ?= not legacy
+MARK_EXPR         ?= not legacy and not xlsx_ir
 MARK_OPT          := $(if $(MARK_EXPR),-m "$(MARK_EXPR)",)
 
 # NEU: wenn "not legacy" drin steht, den Ordner wirklich ignorieren
@@ -172,6 +172,18 @@ IGNORE_OPT        := $(if $(findstring not legacy,$(MARK_EXPR)),--ignore=tests/l
 # Default: run suite (quiet) with legacy excluded by default
 test: deps-dev ## Run test suite (quiet, excludes legacy by default)
 	$(PYTEST) $(PYTEST_BASEOPTS) $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
+
+# helper used by test-ir / test-legacy (uses venv pytest!)
+test-with-marker:
+	$(PYTEST) $(PYTEST_BASEOPTS) -m '$(MARK_EXPR)' $(EXTRA_IGNORE) $(LOG_OPTS)
+
+# IR-only: force env + ignore legacy during collection
+test-ir:
+	SH_XLSX_BACKEND=ir $(MAKE) test-with-marker MARK_EXPR='xlsx_ir' EXTRA_IGNORE='--ignore=tests/legacy'
+
+# Legacy-only: collect only legacy-marked tests (don’t ignore the folder)
+test-legacy:
+	$(MAKE) test-with-marker MARK_EXPR='legacy' EXTRA_IGNORE=''
 
 test-verbose: deps-dev ## Verbose tests with inline logs
 	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
@@ -201,6 +213,8 @@ test-integ: deps-dev ## Integration tests only
 test-all: MARK_EXPR=
 test-all: deps-dev ## Run ALL tests (including legacy)
 	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
+
+
 
 # =========================
 # Coverage

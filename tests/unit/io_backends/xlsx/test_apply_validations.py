@@ -1,5 +1,6 @@
 # tests/unit/io_backends/xls/test_apply_validations.py
 import pandas as pd
+import pytest
 from openpyxl import load_workbook
 
 from spreadsheet_handling.io_backends.xlsx_backend import ExcelBackend
@@ -7,6 +8,7 @@ from spreadsheet_handling.io_backends.xlsx_backend import ExcelBackend
 class Frames(dict):
     pass
 
+@pytest.mark.xlsx_ir
 def test_apply_in_list_validation_smoke(tmp_path):
     frames = Frames({"Kunden": pd.DataFrame({"Kategorie": ["Privat", ""]})})
     frames.meta = {

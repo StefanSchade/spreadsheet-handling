@@ -1,5 +1,6 @@
 # tests/unit/io_backends/test_xlsx_writer_styling.py
 import pandas as pd
+import pytest
 from pathlib import Path
 from openpyxl import load_workbook
 from spreadsheet_handling.pipeline.types import MetaDict, Context
@@ -15,6 +16,7 @@ def _ctx(tmp_path: Path) -> Context:
     )
     return Context(app=app)
 
+@pytest.mark.xlsx_legacy
 def test_xlsx_header_and_autofilter(tmp_path: Path):
     frames = {"T": pd.DataFrame([{"a":"1", "b":"2"}, {"a":"3", "b":"4"}])}
     ctx = _ctx(tmp_path)

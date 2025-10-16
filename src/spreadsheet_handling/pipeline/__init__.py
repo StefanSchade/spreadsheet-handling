@@ -1,4 +1,6 @@
-from .pipeline import (  # re-export public API
+# src/spreadsheet_handling/pipeline/__init__.py
+
+from .pipeline import (  # existing re-exports
     BoundStep,
     Step,
     run_pipeline,
@@ -11,6 +13,9 @@ from .pipeline import (  # re-export public API
     REGISTRY,
 )
 
+# NEW: re-export config API
+from .config import load_app_config, AppConfig  # add others if you like
+
 __all__ = [
     "BoundStep",
     "Step",
@@ -22,4 +27,8 @@ __all__ = [
     "make_apply_fks_step",
     "make_drop_helpers_step",
     "REGISTRY",
+    # NEW
+    "load_app_config",
+    "AppConfig",
 ]
+
