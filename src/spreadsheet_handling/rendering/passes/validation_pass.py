@@ -15,38 +15,36 @@ def apply(ir, meta: Dict[str, Any]):
     NOTE: We don't yet resolve the real column index; we use column 1 (A) as a placeholder
     just to satisfy tests that only assert presence of any validation.
     """
-    constraints = meta.get("constraints") or []
-    if not constraints:
-        return ir
-
+    constraints = (meta or {}).get("constraints") or []
     for c in constraints:
-        if not isinstance(c, dict):
-            continue
         sheet_name = c.get("sheet")
+        col_name = c.get("column")
         rule = (c.get("rule") or {})
-        if rule.get("type") != "in_list":
+        if not sheet_name or not col_name or rule.get("type") != "in_list":
             continue
-        values = rule.get("values") or []
-        if not sheet_name or not values:
-            continue
-
         sheet_ir = ir.sheets.get(sheet_name)
-        if not sheet_ir:
-            # sheet may not exist yet (composer creates per frame-name),
-            # skip silently for now
+        if not sheet_ir or not sheet_ir.tables:
+            continue
+        table = sheet_ir.tables[0]  # first table on the sheet (refine if needed)
+        col_idx = table.header_map.get(str(col_name))
+        if not col_idx:
+            # can't resolve → skip or log via meta.issues later
             continue
 
-        # Very generous default area: A2:A500 (row 2..500)
-        # We'll refine once composer provides column mapping.
-        r1, r2 = 2, 500
-        c1 = c2 = 1  # column A
+        # data rows start below header, typical row 2..(n_rows)
+        r1, r2 = 2, table.n_rows
+        c1 = c2 = col_idx
+
+        values = rule.get("values") or []
+        formula = f"\"{','.join(str(v).replace('\"','\"\"') for v in values)}\""
 
         sheet_ir.validations.append(
             DataValidationSpec(
                 kind="list",
                 area=(r1, c1, r2, c2),
-                formula=_csv_formula([str(v) for v in values]),
+                formula=formula,
                 allow_empty=True,
             )
         )
     return ir
+
