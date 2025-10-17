@@ -1,0 +1,84 @@
+=== Concept: FTR-PARTITION-BY-DOMAIN — Split/Merge by Component Attribute
+
+==== Purpose
+Reduce Git merge conflicts by splitting large frames into deterministic per-component slices before persistence, and reassembling them losslessly on read.
+
+==== Scope
+* Applies to frames where rows carry (directly or via join) a **mutually exclusive and fully comprehensive** component attribute (e.g., `component`).
+* Lives in **domain/transformations**; I/O adapters stay neutral; IR may use the same component info for presentation (optional).
+
+==== Bijective Steps
+* `partition_by_component(frames, meta)` — split input frames into multiple frames keyed by component.
+* `merge_by_component(frames, meta)` — recompose the original frames from the component-sliced frames.
+
+==== Requirements
+* Deterministic naming/layout of partitions (stable across runs).
+* Lossless recomposition: merge restores exactly the pre-partition state (row order may be normalized if configured).
+* Configurable **lookup** of the component attribute: direct column or join on a lookup table.
+* Reject or flag rows with missing/unknown components.
+
+==== Default-Heuristic vs. Explicit Configuration
+*Heuristics (best-effort defaults)*::
+- If a column `component` exists in a frame, use it directly.
+- If not, and a frame named `components` exists with columns `(variable, component)`, join on `variable` to obtain `component`.
+- Partitioned frame names default to `<frame>__<component>`.
+
+*Explicit configuration (persisted in meta)*::
+[source,yaml]
+----
+partition_by_domain:
+  frames:            # which frames to split
+    - products
+    - features
+  component:
+    column: component            # direct column; OR
+    via_join:                    # alternative: derive via join
+      lookup_frame: components
+      source_key: variable
+      lookup_key: variable
+      result_col: component
+  naming:
+    template: "{frame}__{component}"   # deterministic naming
+  order:
+    components: [Core, Pricing, Risk]   # optional stable order for output
+  on_missing_component: error           # error|warn|drop
+----
+
+==== Algorithm (Partition)
+1. For each configured frame:
+   a. Resolve `component` for every row (direct column or join).
+   b. Validate mutual exclusivity (exactly one component per row).
+   c. Emit a new frame per distinct component using `naming.template`.
+   d. Preserve all original columns; optionally normalize row order.
+
+==== Algorithm (Merge)
+1. For each original frame name, gather all slices that match `naming.template`.
+2. Concatenate slices in configured `components` order (if given), otherwise by sorted component name.
+3. Restore exactly the original column set and dtypes; preserve or normalize order per config.
+
+==== Edge Cases
+* **Missing component**: follow `on_missing_component` (error/warn/drop) and record to `meta.issues`.
+* **Unknown component value**: treat as missing unless `allow_unknown: true` is set.
+* **Overlapping components**: if derived via join produces >1 component per row, raise error (violates mutual exclusivity).
+* **Empty partitions**: allowed; still create empty frames if `emit_empty: true` is set (useful for stable diffs).
+
+==== Meta Persistence
+* Store effective configuration (resolved heuristics + user config) under `partition_by_domain` in meta.
+* Store a manifest of produced slices for traceability:
+[source,yaml]
+----
+partition_by_domain_manifest:
+  products: [products__Core, products__Pricing, products__Risk]
+  features: [features__Core, features__Pricing, features__Risk]
+----
+
+==== Interaction with IR (Optional)
+* IR can group or color-code tables by component on render, but partitioning logic remains in the domain layer.
+
+==== Acceptance
+* Partition followed by merge yields the original frames byte-for-byte (modulo configured order normalization).
+* Naming of partitions is deterministic and documented in meta.
+* Rows with missing/overlapping components are handled per policy and logged to `meta.issues`.
+
+==== Rationale
+Partitioning prior to persistence increases the likelihood of automatic Git merges when multiple teams edit disjoint components, while keeping transforms reversible and adapter-agnostic.
