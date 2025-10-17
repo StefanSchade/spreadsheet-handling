@@ -1,10 +1,9 @@
 # tests/unit/domain/validations/test_validate_colums_xls_effect.py
 import pandas as pd
 from openpyxl import load_workbook
-from types import SimpleNamespace
 import pytest
 
-from spreadsheet_handling.io_backends.xlsx_backend import ExcelBackend
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
 class Frames(dict):
     """Dict-like frames that can also carry .meta."""

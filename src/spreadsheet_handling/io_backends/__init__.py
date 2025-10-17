@@ -1,6 +1,6 @@
 from .base import BackendBase, BackendOptions
 from .csv_backend import CSVBackend
-from .xlsx_backend import ExcelBackend
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from .json_backend import JSONBackend
 
 

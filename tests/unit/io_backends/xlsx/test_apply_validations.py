@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
-from spreadsheet_handling.io_backends.xlsx_backend import ExcelBackend
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
 class Frames(dict):
     pass

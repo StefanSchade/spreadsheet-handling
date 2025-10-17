@@ -10,7 +10,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from .base import BackendBase, BackendOptions
+from spreadsheet_handling.io_backends.base import BackendBase, BackendOptions
 
 import logging
 

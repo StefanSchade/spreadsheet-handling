@@ -5,7 +5,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 from spreadsheet_handling.pipeline.types import MetaDict, Context
 from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
-from spreadsheet_handling.io_backends.xlsx_backend import write_xlsx
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import write_xlsx
 
 def _ctx(tmp_path: Path) -> Context:
     app = AppConfig(

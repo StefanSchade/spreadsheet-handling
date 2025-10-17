@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
 
 # XLSX backend
 try:
-    from .xlsx_backend import load_xlsx as _load_xlsx, save_xlsx as _save_xlsx
+    from spreadsheet_handling.io_backends.xlsx.xlsx_backend import load_xlsx as _load_xlsx, save_xlsx as _save_xlsx
 except Exception:  # pragma: no cover
     _load_xlsx = None  # type: ignore[assignment]
     _save_xlsx = None  # type: ignore[assignment]
