@@ -1,42 +1,80 @@
-from typing import Any, Dict, List
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
 from ..ir import DataValidationSpec
+from ..ir import WorkbookIR, SheetIR, TableBlock
+
 
 def _csv_formula(values: List[str]) -> str:
-    # openpyxl expects: formula1='"A,B,C"'
+    """
+    Build an Excel list validation formula from values.
+    Excel expects: formula1='"A,B,C"'. Double quotes must be escaped.
+    """
     escaped = ",".join(v.replace('"', '""') for v in values)
     return f'"{escaped}"'
 
-def apply(ir, meta: Dict[str, Any]):
+
+def _first_table(sheet: SheetIR) -> Optional[TableBlock]:
+    return sheet.tables[0] if sheet.tables else None
+
+
+def apply(ir: WorkbookIR, meta: Dict[str, Any] | None) -> WorkbookIR:
     """
-    Minimal implementation:
-    - looks for meta["constraints"] entries with:
-        {"sheet": "<name>", "column": "<col-name>", "rule": {"type": "in_list", "values": [...]}}
-    - attaches a list validation to a generous default area on that sheet.
-    NOTE: We don't yet resolve the real column index; we use column 1 (A) as a placeholder
-    just to satisfy tests that only assert presence of any validation.
+    Translate domain constraints from meta into DataValidationSpec entries
+    on the corresponding SheetIR, using TableBlock.header_map to target the
+    correct column.
+
+    Supported rule:
+      - {"type": "in_list", "values": [...]}
+
+    Soft-fails: if sheet/column cannot be resolved, no validation is added.
     """
-    constraints = (meta or {}).get("constraints") or []
+    if not meta:
+        return ir
+
+    constraints = meta.get("constraints") or []
+    if not isinstance(constraints, list):
+        return ir
+
     for c in constraints:
+        if not isinstance(c, dict):
+            continue
+
         sheet_name = c.get("sheet")
         col_name = c.get("column")
-        rule = (c.get("rule") or {})
-        if not sheet_name or not col_name or rule.get("type") != "in_list":
+        rule = c.get("rule") or {}
+
+        if not sheet_name or not col_name:
             continue
-        sheet_ir = ir.sheets.get(sheet_name)
-        if not sheet_ir or not sheet_ir.tables:
+        if rule.get("type") != "in_list":
+            # future: extend with other types (e.g., whole-number, custom formula, ranges)
             continue
-        table = sheet_ir.tables[0]  # first table on the sheet (refine if needed)
+
+        sheet_ir = ir.sheets.get(str(sheet_name))
+        if not sheet_ir:
+            # Unknown sheet -> skip (could log to meta.issues in a separate pass)
+            continue
+
+        table = _first_table(sheet_ir)
+        if not table:
+            continue
+
+        # Resolve the real column index via header_map (1-based)
         col_idx = table.header_map.get(str(col_name))
         if not col_idx:
-            # can't resolve → skip or log via meta.issues later
+            # header not found -> skip
             continue
 
-        # data rows start below header, typical row 2..(n_rows)
-        r1, r2 = 2, table.n_rows
-        c1 = c2 = col_idx
+        # Data region: rows 2..n_rows (row 1 is header), column = col_idx
+        r1: int = 2
+        r2: int = max(2, table.n_rows)  # guard; if empty table.n_rows==1, keep at least 2..2
+        c1: int = col_idx
+        c2: int = col_idx
 
         values = rule.get("values") or []
-        formula = f"\"{','.join(str(v).replace('\"','\"\"') for v in values)}\""
+        # normalize to strings; keep stable order
+        value_strings: List[str] = [str(v) for v in values]
+        formula = _csv_formula(value_strings)
 
         sheet_ir.validations.append(
             DataValidationSpec(
@@ -46,5 +84,5 @@ def apply(ir, meta: Dict[str, Any]):
                 allow_empty=True,
             )
         )
-    return ir
 
+    return ir
