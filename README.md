@@ -47,6 +47,16 @@ sheets-unpack demo.xlsx -o demo_out --levels 3
 make test
 ```
 
+### AI Usage & Position Statement
+
+- AI tools are used at all levels of this project: requirement analysis, solution design, coding.
+- Human oversight, testing, and review remain essential. AI augments reasoning and speed but does not replace engineering judgment.
+- Quality and maintainability are goals treated with priority; AI contributes to these.
+
+*Industry trends support this approach:*
+according to the [JetBrains Developer Ecosystem 2025 survey published by *Golem.de*](https://www.golem.de/news/umfrage-unter-24-000-entwicklern-gesamtes-berufsfeld-befindet-sich-im-wandel-2510-188855.html), AI adoption is already pervasive and considered a core competency.
+
+
 ### License
 
 This project is licensed under the terms of the MIT License.
