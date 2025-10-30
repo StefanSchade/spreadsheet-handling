@@ -118,13 +118,13 @@ ensure-pip: venv
 # ==================================
 PIP_VERBOSE_FLAG := $(if $(VERBOSE),-v,)
 
-$(DEPS_STAMP): ensure-pip
-	@tools/pip_install_spec.sh -p $(PYTHON) -s . $(PIP_VERBOSE_FLAG)
+$(DEPS_STAMP): ensure-pip ## install python runtime dependencies non editable
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s . $(PIP_VERBOSE_FLAG)
 	@mkdir -p "$(STAMP_DIR)"
 	@touch "$(DEPS_STAMP)"
 
-$(DEV_STAMP): $(DEPS_STAMP)
-	@tools/pip_install_spec.sh -p $(PYTHON) -s '.[dev]' $(PIP_VERBOSE_FLAG)
+$(DEV_STAMP): $(DEPS_STAMP) ## install python dev dependencies editable
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s '.[dev]' -E $(PIP_VERBOSE_FLAG)
 	@mkdir -p "$(STAMP_DIR)"
 	@touch "$(DEV_STAMP)"
 
