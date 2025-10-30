@@ -1,6 +1,10 @@
 # =========================
 # Project variables
 # =========================
+REPO ?= spreadsheet-handling
+VER  ?= 0.0.0                           # retrieve from git later on
+REV  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "nogit")
+
 SHELL 		 := /usr/bin/env bash
 .SHELLFLAGS  := -eu -o pipefail -c
 
@@ -9,13 +13,18 @@ VER  := $(shell git describe --tags --always --dirty 2>/dev/null || echo DEV-SNA
 REV  := $(shell git rev-parse --short HEAD 2>/dev/null || echo local)
 DATE := $(shell date -Iseconds)
 
-ROOT         := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-TARGET       := $(ROOT)build
+ROOT          := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+TARGET        := $(ROOT)build
 DOC_BUILD_DIR := $(TARGET)/doc
-VENV         := $(ROOT).venv
-COV_HTML_DIR := $(TARGET)/htmlcov
-COV_DATA     := $(TARGET)/.coverage
+VENV          := $(ROOT).venv
+COV_HTML_DIR  := $(TARGET)/htmlcov
+COV_DATA      := $(TARGET)/.coverage
 
+# System Python executables
+SYS_PY       ?= python3
+SYS_PIP      ?= pip3
+
+# VENV Python executables
 PYTHON       := $(VENV)/bin/python
 PYTEST       := ?(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
@@ -27,15 +36,17 @@ DEV_STAMP    := $(STAMP_DIR)/dev
 
 PYPROJECT    := $(ROOT)pyproject.toml
 
+VERBOSE      ?= TRUE
+
 # pytest logging options for debug runs
 LOG_OPTS  ?= -o log_cli=true -o log_cli_level=DEBUG
 
 # =========================
 # Phony targets
 # =========================
-.PHONY: help setup reset-deps clean clean-stamps clean-venv distclean venv \
-        test test-verbose test-lastfailed test-one test-file test-node \
-        format lint syntax ci coverage coverage-html run snapshot doctor
+.PHONY: test test-verbose test-lastfailed test-one test-file test-node \
+        coverage coverage-html run snapshot doctor \
+        check-sys-python check-pip
 
 # =========================
 # Help (auto)
@@ -44,31 +55,86 @@ help: ## Show this help
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | sed -E 's/:.*?## /: /' | sort
 
-# =========================
-# Environment & dependencies
-# =========================
-venv: ## Create .venv if missing
-	@test -d $(VENV) || python3 -m venv $(VENV)
+# ============================================================
+#  checks for Python / pip / venv availability
+# ============================================================
+.PHONY: check-sys-python
+check-sys-python: ## Sanity check on the system Python
+	@command -v $(SYS_PY) >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "❌  System Python was not found on your PATH."; \
+		echo "    Please install Python 3.10+ and ensure 'python3' or 'python' is available."; \
+		echo "    For example:"; \
+		echo "      sudo apt install python3 python3-pip"; \
+		echo "      or see https://www.python.org/downloads/"; \
+		echo ""; \
+		exit 127; \
+	}
 
-# Runtime deps + editable install of the package
-$(DEPS_STAMP): | venv ## Call 'make reset-deps' if pyproject changes (WSL workaround)
-	$(PYTHON) -m pip install -e .
-	@mkdir -p $(STAMP_DIR)
-	@touch $(DEPS_STAMP)
+.PHONY: check-pip
+check-pip: ##  Sanity check on the system pip
+	@command -v $(SYS_PIP ) >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "❌  pip was not found on your PATH."; \
+		echo "    Please install pip for Python 3."; \
+		echo "    For example:"; \
+		echo "      sudo apt install python3-pip"; \
+		echo "      or see https://pip.pypa.io/en/stable/installation/"; \
+		echo ""; \
+		exit 127; \
+	}
 
-deps: $(DEPS_STAMP) ## Ensure runtime deps installed
+.PHONY: check-venv-mod
+check-venv-mod: check-sys-python ## Sanity check on the venv module
+	@$(SYS_PY) -c "import venv" >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "❌  The 'venv' module is not available in your Python."; \
+		echo "    On Ubuntu/WSL install it with:"; \
+		echo "      sudo apt install python3-venv"; \
+		echo ""; \
+		exit 127; \
+	}
 
-# Dev tools (ruff/black/pytest/pytest-cov/pyyaml) via extras
-$(DEV_STAMP): $(DEPS_STAMP) ## Call 'make reset-deps' if pyproject changes (WSL workaround)
-	$(PYTHON) -m pip install -e '.[dev]'
-	@mkdir -p $(STAMP_DIR)
-	@touch $(DEV_STAMP)
+.PHONY: venv
+venv: check-venv-mod ## Create the venv if needed
+	@if [ ! -d "$(VENV)" ]; then \
+		echo "➡️  Creating virtualenv at $(VENV)"; \
+		$(SYS_PY) -m venv "$(VENV)" || { \
+			echo ""; \
+			echo "❌  Failed to create venv. Ensure 'python3-venv' is installed."; \
+			echo "    Ubuntu/WSL: sudo apt install python3-venv"; \
+			echo ""; \
+			exit 1; \
+		}; \
+	fi
+	@mkdir -p "$(STAMP_DIR)"
+
+.PHONY: ensure-pip
+ensure-pip: venv
+	@tools/ensure_pip.sh $(PYTHON)
+
+# ==================================
+# Project Environment & dependencies
+# ==================================
+PIP_VERBOSE_FLAG := $(if $(VERBOSE),-v,)
+
+$(DEPS_STAMP): ensure-pip
+	@tools/pip_install_spec.sh -p $(PYTHON) -s . $(PIP_VERBOSE_FLAG)
+	@mkdir -p "$(STAMP_DIR)"
+	@touch "$(DEPS_STAMP)"
+
+$(DEV_STAMP): $(DEPS_STAMP)
+	@tools/pip_install_spec.sh -p $(PYTHON) -s '.[dev]' $(PIP_VERBOSE_FLAG)
+	@mkdir -p "$(STAMP_DIR)"
+	@touch "$(DEV_STAMP)"
 
 deps-dev: venv $(DEV_STAMP) ## Ensure dev deps installed
 
-setup: deps-dev ## One-shot: create venv + install runtime & dev deps
+.PHONY: setup
+setup: $(DEV_STAMP)  ## Convenient target to install dev and runtime incl. dependencies
 
-reset-deps: ## Force reinstall deps (deletes stamps)
+.PHONY: reset-deps
+reset-deps: ## Force reinstall deps (deletes stamps) as a workaround for WSL
 	@rm -f $(DEPS_STAMP) $(DEV_STAMP)
 
 clean: ## Remove caches and build artifacts
@@ -78,44 +144,130 @@ clean: ## Remove caches and build artifacts
 	find $(ROOT) -type d -name '.pytest_cache' -prune -exec rm -rf {} +
 	find $(ROOT) -name '.~lock.*#' -delete
 
+.PHONY: clean-stamps
 clean-stamps: ## Remove dependency stamps (forces re-install on next run)
 	rm -rf $(STAMP_DIR)
 
+.PHONY: clean-venv
 clean-venv: clean-stamps ## Remove the virtualenv entirely
 	rm -rf $(VENV)
 
+.PHONY: distclean
 distclean: clean clean-venv ## Deep clean: build artifacts + venv
 
 # =========================
 # Quality
 # =========================
+.PHONY: format
 format: deps-dev ## Auto-fix with Ruff & Black
 	$(RUFF) check src/spreadsheet_handling --fix
 	$(BLACK) src/spreadsheet_handling
 
+.PHONY: lint
 lint: deps-dev ## Lint only (Ruff)
 	$(RUFF) check src/spreadsheet_handling
 
+.PHONY: syntax
 syntax: venv ## Syntax check
 	$(PYTHON) -m compileall -q src/spreadsheet_handling
 
+.PHONY: ci
 ci: syntax lint test ## Run syntax + lint + tests
 
 # =========================
-# Snapshot
+# Docs (AsciiDoc → HTML/PDF)
 # =========================
+DOC_BUILD_DIR ?= build/docs
+BUILD_DATE := $(shell date -Iseconds)
 
-.PHONY: docs-user
-docs-user:
+# All .adoc files two levels under docs/
+DOCS_SRC := $(wildcard docs/*/*.adoc)
+
+.PHONY: docs-user docs-html docs-pdf check-asciidoctor check-asciidoctor-pdf clean-docs
+
+.PHONY: docs-all
+docs-all: docs-html docs-pdf ## build html and pdf for all 2-level docs
+
+.PHONY: docs-html
+docs-html: check-asciidoctor ## build HTML for all docs/*/*.adoc
 	@set -e; \
-	asciidoctor \
-		-a project-name="$(REPO)" \
-		-a project-version="$(VER)" \
-		-a build-rev="$(REV)" \
-		-a build-date="$(date -Iseconds)" \
-		-D "$(DOC_BUILD_DIR)/user_guide/" \
-		-o index.html docs/user_guide/user_guide.adoc; \
-	echo "✅ Docs written to $(DOC_BUILD_DIR)/user_guide/index.html"
+	if [ -z "$(DOCS_SRC)" ]; then \
+		echo "ℹ️  No docs found under docs/*/*.adoc"; \
+	else \
+		for src in $(DOCS_SRC); do \
+			subdir="$$(dirname "$$src" | sed 's#^docs/##')"; \
+			outdir="$(DOC_BUILD_DIR)/$$subdir"; \
+			mkdir -p "$$outdir"; \
+			outname="$$(basename "$$src" .adoc).html"; \
+			asciidoctor \
+				-a project-name="$(REPO)" \
+				-a project-version="$(VER)" \
+				-a build-rev="$(REV)" \
+				-a build-date="$(BUILD_DATE)" \
+				-D "$$outdir" \
+				-o "$$outname" "$$src"; \
+			echo "• $$src  →  $$outdir/$$outname"; \
+		done; \
+		echo "✅ HTML docs written to $(DOC_BUILD_DIR)"; \
+	fi
+
+.PHONY: docs-pdf
+docs-pdf: check-asciidoctor-pdf ## Build PDF for all docs/*/*.adoc
+	@set -e; \
+	if [ -z "$(DOCS_SRC)" ]; then \
+		echo "ℹ️  No docs found under docs/*/*.adoc"; \
+	else \
+		for src in $(DOCS_SRC); do \
+			subdir="$$(dirname "$$src" | sed 's#^docs/##')"; \
+			outdir="$(DOC_BUILD_DIR)/$$subdir"; \
+			mkdir -p "$$outdir"; \
+			outname="$$(basename "$$src" .adoc).pdf"; \
+			asciidoctor-pdf \
+				-a project-name="$(REPO)" \
+				-a project-version="$(VER)" \
+				-a build-rev="$(REV)" \
+				-a build-date="$(BUILD_DATE)" \
+				-D "$$outdir" \
+				-o "$$outname" "$$src"; \
+			echo "• $$src  →  $$outdir/$$outname"; \
+		done; \
+		echo "✅ PDF docs written to $(DOC_BUILD_DIR)"; \
+	fi
+
+.PHONY: check-asciidoctor
+check-asciidoctor: ## Sanity check asciidocutor
+	@command -v asciidoctor >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "❌  'asciidoctor' not found on PATH."; \
+		echo "    Install it, e.g.:"; \
+		echo "      # Ubuntu"; \
+		echo "      sudo apt install asciidoctor"; \
+		echo "      # macOS (Homebrew)"; \
+		echo "      brew install asciidoctor"; \
+		echo ""; \
+		exit 127; \
+	}
+
+.PHONY: check-asciidoctor-pdf
+check-asciidoctor-pdf: check-asciidoctor ## Sanity check asciidoctor-pdf
+	@command -v asciidoctor-pdf >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "❌  'asciidoctor-pdf' not found on PATH."; \
+		echo "    Install it, e.g.:"; \
+		echo "      # RubyGems"; \
+		echo "      gem install asciidoctor-pdf"; \
+		echo "      # Ubuntu (may be in universe)"; \
+		echo "      sudo apt install ruby-asciidoctor-pdf || gem install asciidoctor-pdf"; \
+		echo "      # macOS"; \
+		echo "      gem install asciidoctor-pdf"; \
+		echo ""; \
+		exit 127; \
+	}
+
+.PHONY: clean-docs
+clean-docs:
+	@rm -rf "$(DOC_BUILD_DIR)"
+	@echo "🧹 Docs cleaned (removed $(DOC_BUILD_DIR))"
 
 # =========================
 # Snapshot
@@ -124,6 +276,28 @@ docs-user:
 snapshot: ## Repo snapshot under build/
 	mkdir -p $(TARGET)
 	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/spreadsheet-handling.txt
+
+# =========================
+# Coverage
+# =========================
+.PHONY: coverage
+coverage: deps-dev ## Coverage in terminal (with missing lines)
+	mkdir -p $(TARGET)
+	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		--cov=src/spreadsheet_handling \
+		--cov-report=term-missing \
+		tests
+
+.PHONY: coverage-html
+coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
+	mkdir -p $(COV_HTML_DIR)
+	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
+		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		--cov=src/spreadsheet_handling \
+		--cov-report=html:$(COV_HTML_DIR) \
+		tests
+	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # =========================
 # Test variables (shared)
@@ -214,27 +388,6 @@ test-all: MARK_EXPR=
 test-all: deps-dev ## Run ALL tests (including legacy)
 	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
 
-
-
-# =========================
-# Coverage
-# =========================
-coverage: deps-dev ## Coverage in terminal (with missing lines)
-	mkdir -p $(TARGET)
-	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
-		--cov=src/spreadsheet_handling \
-		--cov-report=term-missing \
-		tests
-
-coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
-	mkdir -p $(COV_HTML_DIR)
-	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
-		--cov=src/spreadsheet_handling \
-		--cov-report=html:$(COV_HTML_DIR) \
-		tests
-	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # =========================
 # Demo run
