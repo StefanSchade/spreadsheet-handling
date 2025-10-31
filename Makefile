@@ -31,10 +31,16 @@ RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
 
 STAMP_DIR    := $(VENV)/.stamp
-DEPS_STAMP   := $(STAMP_DIR)/deps
+DEPS_STAMP     := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 
 PYPROJECT    := $(ROOT)pyproject.toml
+
+
+# --- Inputs that trigger re-install when they change
+DEPS_INPUTS := pyproject.toml requirements.txt
+DEV_INPUTS  := pyproject.toml requirements-dev.txt
+
 
 VERBOSE      ?= TRUE
 
@@ -118,14 +124,16 @@ ensure-pip: venv
 # ==================================
 PIP_VERBOSE_FLAG := $(if $(VERBOSE),-v,)
 
-$(DEPS_STAMP): ensure-pip ## install python runtime dependencies non editable
-	@tools/pip_install_spec.sh -p "$(PYTHON)" -s . $(PIP_VERBOSE_FLAG)
+$(DEPS_STAMP): $(DEPS_INPUTS) | ensure-pip ## install python runtime dependencies non editable
 	@mkdir -p "$(STAMP_DIR)"
+	@echo "➡️  Installing runtime (editable) only when inputs changed..."
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s . $(PIP_VERBOSE_FLAG)
 	@touch "$(DEPS_STAMP)"
 
-$(DEV_STAMP): $(DEPS_STAMP) ## install python dev dependencies editable
-	@tools/pip_install_spec.sh -p "$(PYTHON)" -s '.[dev]' -E $(PIP_VERBOSE_FLAG)
+$(DEV_STAMP): $(DEPS_STAMP) $(DEV_INPUTS) ## install python dev dependencies editable
 	@mkdir -p "$(STAMP_DIR)"
+	@echo "➡️  Installing dev extras only when inputs changed..."
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s '.[dev]' -E $(PIP_VERBOSE_FLAG)
 	@touch "$(DEV_STAMP)"
 
 deps-dev: venv $(DEV_STAMP) ## Ensure dev deps installed
