@@ -1,0 +1,80 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol, Dict, Any, List
+from ..ir import WorkbookIR, SheetIR, DataValidationSpec
+
+class IRPass(Protocol):
+    def apply(self, doc: WorkbookIR) -> WorkbookIR: ...
+
+@dataclass
+class StylePass:
+    default_header_fill_rgb: str = "#F2F2F2"
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        for sh in doc.sheets.values():
+            opts: Dict[str, Any] = sh.meta.get("options", {})
+            header_fill = opts.get("header_fill_rgb", self.default_header_fill_rgb)
+            style = {"header": {"bold": True, "fill": header_fill}}
+            styles = sh.meta.get("__style", {})
+            styles.update(style)
+            sh.meta["__style"] = styles
+        return doc
+
+@dataclass
+class FilterPass:
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        for sh in doc.sheets.values():
+            opts: Dict[str, Any] = sh.meta.get("options", {})
+            if not opts.get("auto_filter", True):
+                continue
+            if not sh.tables:
+                continue
+            t = sh.tables[0]
+            if t.n_cols == 0 or t.n_rows == 0:
+                continue
+            sh.meta["__autofilter"] = {
+                "top_left": (t.top, t.left),
+                "bottom_right": (t.top + t.n_rows - 1, t.left + t.n_cols - 1),
+            }
+        return doc
+
+@dataclass
+class FreezePass:
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        for sh in doc.sheets.values():
+            opts: Dict[str, Any] = sh.meta.get("options", {})
+            if opts.get("freeze_header", False):
+                sh.meta["__freeze"] = {"row": 2, "col": 1}
+        return doc
+
+@dataclass
+class ValidationPass:
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        for sh in doc.sheets.values():
+            raw: List[Dict[str, Any]] = sh.meta.get("_p1_validations", [])
+            for spec in raw:
+                if spec.get("kind") != "list":
+                    continue
+                col = int(spec["col"])
+                r1 = int(spec.get("from_row", 2))
+                r2 = int(spec.get("to_row", r1))
+                values = list(map(str, spec.get("values", [])))
+                formula = '"' + ",".join(values) + '"'
+                dv = DataValidationSpec(kind="list", area=(r1, col, r2, col), formula=formula, allow_empty=True)
+                sh.validations.append(dv)
+        return doc
+
+@dataclass
+class MetaPass:
+    minimal_fields: List[str] = None
+    def __post_init__(self):
+        if self.minimal_fields is None:
+            self.minimal_fields = ["version", "exported_at", "author"]
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        meta = doc.hidden_sheets.get("_meta")
+        if not meta:
+            meta = SheetIR(name="_meta", meta={})
+            doc.hidden_sheets["_meta"] = meta
+        for f in self.minimal_fields:
+            meta.meta.setdefault(f, "")
+        meta.meta["_hidden"] = True
+        return doc
