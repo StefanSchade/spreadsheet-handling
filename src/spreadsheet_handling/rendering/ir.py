@@ -26,14 +26,25 @@ class StyleSpec:
 @dataclass
 class TableBlock:
     frame_name: str
-    top: int                           # 1-based row of header top-left
-    left: int                          # 1-based col of header top-left
-    header_rows: int = 1               # for future multi-row headers
-    header_cols: int = 1               # for future row headers
-    n_rows: int = 0                    # total rows incl. header
+    top: int = 1
+    left: int = 1
+    header_rows: int = 1
+    header_cols: int = 1
+    n_rows: int = 0
     n_cols: int = 0
     headers: List[str] = field(default_factory=list)
-    header_map: Dict[str, int] = field(default_factory=dict)  # header -> 1-based col index
+    header_map: Dict[str, int] = field(default_factory=dict)
+    # legacy alias (to be removed under FTR-IR-TYPING-CANONICAL)
+    top_left: Optional[tuple[int, int]] = None
+
+    def __post_init__(self):
+        if self.top_left is not None:
+            # only apply if caller didn’t set canonical fields
+            if (self.top, self.left) == (1, 1):
+                self.top, self.left = self.top_left
+            # optionally warn:
+            # warnings.warn("TableBlock.top_left is deprecated; use top/left", DeprecationWarning)
+
 
 @dataclass
 class SheetIR:
@@ -41,6 +52,7 @@ class SheetIR:
     tables: List[TableBlock] = field(default_factory=list)
     validations: List[DataValidationSpec] = field(default_factory=list)
     meta: Dict[str, object] = field(default_factory=dict)
+    styles: List[StyleSpec] = field(default_factory=list)
 
 @dataclass
 class WorkbookIR:
