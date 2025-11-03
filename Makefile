@@ -281,9 +281,14 @@ clean-docs:
 # Snapshot
 # =========================
 
-snapshot: ## Repo snapshot under build/
-	mkdir -p $(TARGET)
-	$(ROOT)tools/repo_snapshot.sh $(ROOT) $(TARGET) $(TARGET)/spreadsheet-handling.txt
+.PHONY: snapshot
+snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries, etc.)
+	@echo "➡️  Creating repository snapshot..."
+	mkdir -p "$(TARGET)"
+	@# Call the outer script which delegates to concat_files_core.sh
+	@bash "$(ROOT)tools/repo_snapshot.sh" "$(ROOT)" "$(TARGET)" "$(TARGET)/spreadsheet-handling.txt"
+	@echo "✅  Snapshot written to $(TARGET)/spreadsheet-handling.txt"
+
 
 # =========================
 # Coverage
