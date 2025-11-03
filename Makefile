@@ -26,7 +26,7 @@ SYS_PIP      ?= pip3
 
 # VENV Python executables
 PYTHON       := $(VENV)/bin/python
-PYTEST       := ?(VENV)/bin/pytest
+PYTEST       := $(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
 
@@ -307,95 +307,114 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 		tests
 	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
-# =========================
-# Test variables (shared)
-# =========================
-
-PYTEST 		 := $(shell test -x $(VENV)/bin/pytest && echo $(VENV)/bin/pytest || echo pytest)
-PKG_NAME     ?= your_package_name   # <--- anpassen
-
-# Default: Legacy-Tests ausschließen
-MARK         ?= not legacy and not xlsx_ir
-
-# Zusätzliche Pytest-Optionen (CLI-Override möglich)
-PYTEST_OPTS  ?=
-
-# Testauswahl (Verzeichnis/Datei/Pfad); leer => Standard "tests"
-TEST_PATH    ?=
+# ================================
+# How to run the test suite
+# ================================
+#
+# Defaults:
+# - We exclude pre-hex legacy tests by default: MARK ?= not legacy
+# - IR tests are opt-in (use `make test-ir`)
+# - To run everything, use `make test-all`
+#
+# Common:
+#   make test                          # unit + integ, excludes legacy (default)
+#   make test MARK=                    # run all tests (no marker filter)
+#   make test MARK="not slow"          # exclude slow tests (still excludes legacy)
+#   make test-verbose                  # verbose, stream logs
+#   make test-lastfailed               # re-run last failed
+#
+# Slices:
+#   make test-unit                     # unit only (excludes integ)
+#   make test-integ                    # integration only
+#   make test-ir                       # IR-only tests (SH_XLSX_BACKEND=ir)
+#   make test-legacy                   # legacy-only (pre-hex), NOT excluded
+#   make test-all                      # everything; no filters, no ignores
+#
+# Focus:
+#   make test-one TESTPATTERN="foo and not slow"
+#   make test-file FILE=tests/unit/pipeline/test_runner.py
+#   make test-node NODE=tests/unit/pipeline/test_runner.py::test_happy_path
+#
+# Notes:
+# - To temporarily include legacy in a normal run, override MARK:
+#     make test MARK=""
+#   or:
+#     make test MARK="legacy"
+# - The pre-hex folder is ignored only when MARK contains `not legacy`.
+# - By default we use the venv’s pytest if available: $(VENV)/bin/pytest
 
 # =========================
 # Test targets
 # =========================
+.PHONY: test test-verbose test-lastfailed test-one test-file test-node \
+        test-unit test-integ test-ir test-legacy test-all
 
-.PHONY: test test-verbose test-lastfailed test-one test-file test-node test-unit test-integ test-legacy test-all
+# Venv + pytest resolution
+VENV         ?= .venv
+PYTEST       ?= $(if $(wildcard $(VENV)/bin/pytest),$(VENV)/bin/pytest,pytest)
 
-# Central knobs (kept as-is)
-PYTEST_BASEOPTS   ?= -q
-SHEETS_LOG        ?=
-LOG_OPTS          ?=
+# Default filters and knobs - keep default simple to avoid surprise ANDs with CLI filters
+MARK         ?= not legacy
+PYTEST_OPTS  ?=
+TEST_PATH    ?= tests
+PREHEX_DIR   ?= tests/legacy_pre_hex
 
-# NEW: default to excluding legacy tests everywhere
-# Override MARK_EXPR on the command line to include/exclude categories.
-# Examples:
-#   make test-all                        # run all tests (clears MARK_EXPR)
-#   make test MARK_EXPR=                 # same as above, run all
-#   make test MARK_EXPR="not slow"       # exclude @pytest.mark.slow
-#   make test MARK_EXPR="integ"          # only integration tests
-#   make test-verbose LOG_OPTS="-x"      # fail fast
-#   make test-one TESTPATTERN="helpers and not slow"
-#   make test-one TESTPATTERN="integration or json_roundtrip or xlsx_writer_styling"
-# --- bestehend ---
-MARK_EXPR         ?= not legacy and not xlsx_ir
-MARK_OPT          := $(if $(MARK_EXPR),-m "$(MARK_EXPR)",)
+# Apply -m only if MARK is set
+MARK_OPT     := $(if $(strip $(MARK)),-m '$(MARK)',)
 
-# NEU: wenn "not legacy" drin steht, den Ordner wirklich ignorieren
-IGNORE_OPT        := $(if $(findstring not legacy,$(MARK_EXPR)),--ignore=tests/legacy,)
+# Ignore pre-hex only when we *exclude* legacy
+IGNORE_OPT   := $(if $(findstring not legacy,$(MARK)),$(if $(wildcard $(PREHEX_DIR)),--ignore=$(PREHEX_DIR),),)
 
-# Default: run suite (quiet) with legacy excluded by default
-test: deps-dev ## Run test suite (quiet, excludes legacy by default)
-	$(PYTEST) $(PYTEST_BASEOPTS) $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
+# Helper macro
+define run_pytest
+	$(PYTEST) $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(1)
+endef
 
-# helper used by test-ir / test-legacy (uses venv pytest!)
-test-with-marker:
-	$(PYTEST) $(PYTEST_BASEOPTS) -m '$(MARK_EXPR)' $(EXTRA_IGNORE) $(LOG_OPTS)
+# ---- Targets (with ## help comments) ----
 
-# IR-only: force env + ignore legacy during collection
-test-ir:
-	SH_XLSX_BACKEND=ir $(MAKE) test-with-marker MARK_EXPR='xlsx_ir' EXTRA_IGNORE='--ignore=tests/legacy'
+test: deps-dev ## Run all tests except legacy (default)
+	$(call run_pytest,$(TEST_PATH))
 
-# Legacy-only: collect only legacy-marked tests (don’t ignore the folder)
-test-legacy:
-	$(MAKE) test-with-marker MARK_EXPR='legacy' EXTRA_IGNORE=''
+test-verbose: deps-dev ## Verbose run with inline logs
+	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
 
-test-verbose: deps-dev ## Verbose tests with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
+test-lastfailed: deps-dev ## Re-run only last failed tests (verbose)
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
 
-test-lastfailed: deps-dev ## Only last failed tests, verbose & logs
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
-
-test-one: deps-dev ## Run tests filtered by pattern (set TESTPATTERN=...)
+test-one: deps-dev ## Run tests filtered by TESTPATTERN (make test-one TESTPATTERN="expr")
 	@if [ -z "$(TESTPATTERN)" ]; then echo "Set TESTPATTERN=..."; exit 2; fi
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k "$(TESTPATTERN)" $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) tests
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k '$(TESTPATTERN)' $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
 
-test-file: deps-dev ## Run a single test file (set FILE=...)
+test-file: deps-dev ## Run a single test file (make test-file FILE=path/to/test_file.py)
 	@if [ -z "$(FILE)" ]; then echo "Set FILE=path/to/test_file.py"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) $(FILE)
+	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(FILE)
 
-test-node: deps-dev ## Run a single test node (set NODE=file::test)
+test-node: deps-dev ## Run a single test node (make test-node NODE=file::test_name)
 	@if [ -z "$(NODE)" ]; then echo "Set NODE=file::test_name"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) $(NODE)
+	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(NODE)
 
-test-unit: deps-dev ## Unit tests only (exclude integration)
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "not integ" $(IGNORE_OPT) $(LOG_OPTS) tests
+test-unit: deps-dev ## Unit tests only (exclude integ)
+	$(PYTEST) -q -m 'not integ' $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
 
 test-integ: deps-dev ## Integration tests only
-	$(PYTEST) $(PYTEST_BASEOPTS) -m "integ" $(IGNORE_OPT) $(LOG_OPTS) tests
+	$(PYTEST) -q -m 'integ' $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
 
-# Everything (opt-in): clear MARK_EXPR so no filter is applied
-test-all: MARK_EXPR=
-test-all: deps-dev ## Run ALL tests (including legacy)
-	$(PYTEST) $(PYTEST_BASEOPTS) $(LOG_OPTS) tests
+test-ir: deps-dev ## IR-only tests (SH_XLSX_BACKEND=ir)
+	SH_XLSX_BACKEND=ir $(PYTEST) -q -m 'xlsx_ir' $(PYTEST_OPTS) $(TEST_PATH)
 
+test-legacy: deps-dev ## Legacy-only (pre-hex tests, normally excluded)
+	$(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) $(TEST_PATH)
+
+test-all: deps-dev ## Run entire suite (no filters, includes legacy)
+	$(PYTEST) -q $(PYTEST_OPTS) $(TEST_PATH)
+
+# Legacy-only (archived) — by default these are ignored via conftest
+test-legacy: deps-dev ## Legacy-only (pre-hex; ignored by default unless RUN_PREHEX=1)
+	$(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) tests
+
+# Try to run archived legacy tests (will likely error)
+test-legacy-try: deps-dev ## Attempt to run pre-hex legacy tests (RUN_PREHEX=1)
+	RUN_PREHEX=1 $(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) tests
 
 # =========================
 # Demo run
