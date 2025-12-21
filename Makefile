@@ -14,11 +14,12 @@ REV  := $(shell git rev-parse --short HEAD 2>/dev/null || echo local)
 DATE := $(shell date -Iseconds)
 
 ROOT          := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-TARGET        := $(ROOT)build
-DOC_BUILD_DIR := $(TARGET)/doc
+BUILD_DIR     := $(ROOT)build
+TARGET_DIR    := $(ROOT)target
+DOC_BUILD_DIR := $(BUILD_DIR)/doc
 VENV          := $(ROOT).venv
-COV_HTML_DIR  := $(TARGET)/htmlcov
-COV_DATA      := $(TARGET)/.coverage
+COV_HTML_DIR  := $(BUILD_DIR)/htmlcov
+COV_DATA      := $(BUILD_DIR)/.coverage
 
 # System Python executables
 SYS_PY       ?= python3
@@ -36,11 +37,9 @@ DEV_STAMP    := $(STAMP_DIR)/dev
 
 PYPROJECT    := $(ROOT)pyproject.toml
 
-
-# --- Inputs that trigger re-install when they change
-DEPS_INPUTS := pyproject.toml requirements.txt
-DEV_INPUTS  := pyproject.toml requirements-dev.txt
-
+# pyproject is single source of truth
+DEPS_INPUTS := pyproject.toml
+DEV_INPUTS  := pyproject.toml
 
 VERBOSE      ?= TRUE
 
@@ -103,21 +102,14 @@ check-venv-mod: check-sys-python ## Sanity check on the venv module
 
 .PHONY: venv
 venv: check-venv-mod ## Create the venv if needed
-	@if [ ! -d "$(VENV)" ]; then \
-		echo "➡️  Creating virtualenv at $(VENV)"; \
-		$(SYS_PY) -m venv "$(VENV)" || { \
-			echo ""; \
-			echo "❌  Failed to create venv. Ensure 'python3-venv' is installed."; \
-			echo "    Ubuntu/WSL: sudo apt install python3-venv"; \
-			echo ""; \
-			exit 1; \
-		}; \
-	fi
-	@mkdir -p "$(STAMP_DIR)"
+	@if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then \
+	  echo "❌ Python not found. Install Python 3.x."; exit 2; fi
+	@PY="$$(command -v python3 || command -v python)"; \
+	test -x "$(VENV)/bin/python" || $$PY -m venv "$(VENV)"
 
 .PHONY: ensure-pip
-ensure-pip: venv
-	@tools/ensure_pip.sh $(PYTHON)
+ensure-pip: venv ## Ensure pip in venv (robust, distro-safe)
+	@tools/ensure_pip.sh "$(PYTHON)"
 
 # ==================================
 # Project Environment & dependencies
@@ -146,7 +138,7 @@ reset-deps: ## Force reinstall deps (deletes stamps) as a workaround for WSL
 	@rm -f $(DEPS_STAMP) $(DEV_STAMP)
 
 clean: ## Remove caches and build artifacts
-	rm -rf $(TARGET)/
+	rm -rf $(BUILD_DIR)/
 	rm -rf dist build src/spreadsheet_handling.egg-info
 	find $(ROOT) -type d -name '__pycache__' -prune -exec rm -rf {} +
 	find $(ROOT) -type d -name '.pytest_cache' -prune -exec rm -rf {} +
@@ -185,7 +177,7 @@ ci: syntax lint test ## Run syntax + lint + tests
 # =========================
 # Docs (AsciiDoc → HTML/PDF)
 # =========================
-DOC_BUILD_DIR ?= build/docs
+DOC_BUILD_DIR ?= target/docs
 BUILD_DATE := $(shell date -Iseconds)
 
 # All .adoc files two levels under docs/
@@ -284,10 +276,10 @@ clean-docs:
 .PHONY: snapshot
 snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries, etc.)
 	@echo "➡️  Creating repository snapshot..."
-	mkdir -p "$(TARGET)"
+	mkdir -p "$(BUILD_DIR)"
 	@# Call the outer script which delegates to concat_files_core.sh
-	@bash "$(ROOT)tools/repo_snapshot.sh" "$(ROOT)" "$(TARGET)" "$(TARGET)/spreadsheet-handling.txt"
-	@echo "✅  Snapshot written to $(TARGET)/spreadsheet-handling.txt"
+	@bash "$(ROOT)tools/repo_snapshot.sh" "$(ROOT)" "$(BUILD_DIR)" "$(BUILD_DIR)/spreadsheet-handling.txt"
+	@echo "✅  Snapshot written to $(BUILD_DIR)/spreadsheet-handling.txt"
 
 
 # =========================
@@ -295,7 +287,7 @@ snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries,
 # =========================
 .PHONY: coverage
 coverage: deps-dev ## Coverage in terminal (with missing lines)
-	mkdir -p $(TARGET)
+	mkdir -p $(BUILD_DIR)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
 		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
 		--cov=src/spreadsheet_handling \
@@ -428,11 +420,11 @@ test-legacy-try: deps-dev ## Attempt to run pre-hex legacy tests (RUN_PREHEX=1)
 run: deps ## Demo: roundtrip on example
 	$(VENV)/bin/sheets-pack \
 	  examples/roundtrip_start.json \
-	  -o $(TARGET)/demo.xlsx \
+	  -o $(BUILD_DIR)/demo.xlsx \
 	  --levels 3
 	$(VENV)/bin/sheets-unpack \
-	  $(TARGET)/demo.xlsx \
-	  -o $(TARGET)/demo_out \
+	  $(BUILD_DIR)/demo.xlsx \
+	  -o $(BUILD_DIR)/demo_out \
 	  --levels 3
 
 # =========================
