@@ -214,6 +214,25 @@ def make_bootstrap_meta_step(
     return BoundStep(name=name, config=cfg, fn=run)
 
 
+def make_apply_overrides_step(
+    *,
+    overrides_path: str | None = None,
+    overrides: Dict[str, Any] | None = None,
+    name: str = "apply_overrides",
+) -> BoundStep:
+    from ..domain.yaml_overrides import load_overrides, apply_overrides as _apply
+
+    cfg = {"overrides_path": overrides_path, "overrides": overrides}
+    def run(fr: Frames) -> Frames:
+        ov = cfg["overrides"]
+        if ov is None and cfg["overrides_path"]:
+            ov = load_overrides(cfg["overrides_path"])
+        if ov:
+            return _apply(fr, ov)
+        return fr
+    return BoundStep(name=name, config=cfg, fn=run)
+
+
 
 
 # ======================================================================================
@@ -242,6 +261,7 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "reorder_helpers":  make_reorder_helpers_step,
     "add_validations":  make_add_validations_step,
     "bootstrap_meta":   make_bootstrap_meta_step,
+    "apply_overrides":  make_apply_overrides_step,
 }
 
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:

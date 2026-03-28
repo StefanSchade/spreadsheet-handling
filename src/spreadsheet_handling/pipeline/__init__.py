@@ -11,6 +11,7 @@ from .pipeline import (  # existing re-exports
     make_apply_fks_step,
     make_drop_helpers_step,
     make_bootstrap_meta_step,
+    make_apply_overrides_step,
     REGISTRY,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "make_apply_fks_step",
     "make_drop_helpers_step",
     "make_bootstrap_meta_step",
+    "make_apply_overrides_step",
     "REGISTRY",
     # NEW
     "load_app_config",

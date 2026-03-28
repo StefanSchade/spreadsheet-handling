@@ -59,6 +59,12 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
         )
         sh.tables.append(tbl)
 
+        # inject per-sheet options from meta (set by yaml_overrides / bootstrap_meta)
+        if meta:
+            sheet_opts = (meta.get("sheets") or {}).get(str(name))
+            if isinstance(sheet_opts, dict) and sheet_opts:
+                sh.meta.setdefault("options", {}).update(sheet_opts)
+
     # stash the domain meta so meta_pass can persist it (unchanged from your version)
     if meta:
         meta_sheet = wb.hidden_sheets.setdefault("_meta", SheetIR(name="_meta"))
