@@ -6,6 +6,7 @@ from .plan import (
     RenderPlan,
     DefineSheet,
     SetHeader,
+    MergeCells,
     ApplyHeaderStyle,
     ApplyColumnStyle,
     SetAutoFilter,
@@ -74,24 +75,41 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
 
         if sh.tables:
             t = sh.tables[0]
-            if t.headers and t.header_rows >= 1:
+            header_grid = sh.meta.get("__header_grid")
+            if header_grid and t.header_rows >= 1:
+                for row_off, row_vals in enumerate(header_grid):
+                    r = t.top + row_off
+                    for idx, text in enumerate(row_vals, start=0):
+                        c = t.left + idx
+                        if text:
+                            plan.add(SetHeader(sheet=sheet_name, row=r, col=c, text=text))
+                for m in sh.meta.get("__header_merges", []) or []:
+                    mr1, mc1, mr2, mc2 = map(int, m)
+                    plan.add(MergeCells(
+                        sheet=sheet_name,
+                        r1=t.top + mr1 - 1,
+                        c1=t.left + mc1 - 1,
+                        r2=t.top + mr2 - 1,
+                        c2=t.left + mc2 - 1,
+                    ))
+            elif t.headers and t.header_rows >= 1:
                 r = t.top
                 for idx, text in enumerate(t.headers, start=0):
                     c = t.left + idx
                     plan.add(SetHeader(sheet=sheet_name, row=r, col=c, text=text))
             styles = sh.meta.get("__style", {})
             header_style = styles.get("header")
-            if header_style and t.headers:
-                r = t.top
-                for idx in range(len(t.headers)):
-                    c = t.left + idx
-                    plan.add(ApplyHeaderStyle(
-                        sheet=sheet_name,
-                        row=r,
-                        col=c,
-                        bold=bool(header_style.get("bold", False)),
-                        fill_rgb=header_style.get("fill"),
-                    ))
+            if header_style and t.n_cols:
+                for r in range(t.top, t.top + max(1, t.header_rows)):
+                    for idx in range(t.n_cols):
+                        c = t.left + idx
+                        plan.add(ApplyHeaderStyle(
+                            sheet=sheet_name,
+                            row=r,
+                            col=c,
+                            bold=bool(header_style.get("bold", False)),
+                            fill_rgb=header_style.get("fill"),
+                        ))
 
         af = sh.meta.get("__autofilter")
         if af:

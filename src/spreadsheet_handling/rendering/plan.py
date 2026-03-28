@@ -16,6 +16,15 @@ class SetHeader:
     col: int
     text: str
 
+
+@dataclass(frozen=True)
+class MergeCells:
+    sheet: str
+    r1: int
+    c1: int
+    r2: int
+    c2: int
+
 @dataclass(frozen=True)
 class ApplyHeaderStyle:
     sheet: str
@@ -67,6 +76,7 @@ class WriteMeta:
 RenderOp = Union[
     DefineSheet,
     SetHeader,
+    MergeCells,
     ApplyHeaderStyle,
     ApplyColumnStyle,
     SetAutoFilter,

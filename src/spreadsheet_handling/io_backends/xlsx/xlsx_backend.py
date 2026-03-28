@@ -151,6 +151,17 @@ def _apply_plan_to_existing(xlsx_path: Path, plan: Any) -> None:
         if oname in ("DefineSheet", "SetHeader"):
             continue
 
+        if oname == "MergeCells":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                r1 = int(getattr(op, "r1", 1))
+                c1 = int(getattr(op, "c1", 1))
+                r2 = int(getattr(op, "r2", r1))
+                c2 = int(getattr(op, "c2", c1))
+                ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
+            continue
+
         if oname == "ApplyHeaderStyle":
             sheet = getattr(op, "sheet", None)
             if sheet and sheet in wb.sheetnames:

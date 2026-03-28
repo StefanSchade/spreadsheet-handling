@@ -64,7 +64,11 @@ class FreezePass:
         for sh in doc.sheets.values():
             opts: Dict[str, Any] = sh.meta.get("options", {})
             if opts.get("freeze_header", False):
-                sh.meta["__freeze"] = {"row": 2, "col": 1}
+                if sh.tables:
+                    t = sh.tables[0]
+                    sh.meta["__freeze"] = {"row": t.top + t.header_rows, "col": t.left}
+                else:
+                    sh.meta["__freeze"] = {"row": 2, "col": 1}
         return doc
 
 @dataclass
@@ -105,8 +109,8 @@ class ValidationPass:
             col_idx = t.header_map.get(str(col_name))
             if not col_idx:
                 continue
-            r1 = 2
-            r2 = max(2, t.n_rows)
+            r1 = t.top + t.header_rows
+            r2 = max(r1, t.top + t.n_rows - 1)
             values = [str(v) for v in (rule.get("values") or [])]
             formula = '"' + ",".join(values) + '"'
             dv = DataValidationSpec(kind="list", area=(r1, col_idx, r2, col_idx), formula=formula, allow_empty=True)
