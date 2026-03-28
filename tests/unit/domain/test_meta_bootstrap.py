@@ -68,7 +68,7 @@ class TestDeepMerge:
 
 
 # ---------------------------------------------------------------------------
-# bootstrap_meta – dict-key interface (frames["_meta"])
+# bootstrap_meta - dict-key interface (frames["_meta"])
 # ---------------------------------------------------------------------------
 
 class TestBootstrapMetaDictInterface:
@@ -111,7 +111,7 @@ class TestBootstrapMetaDictInterface:
 
 
 # ---------------------------------------------------------------------------
-# bootstrap_meta – attribute interface (frames.meta)
+# bootstrap_meta - attribute interface (frames.meta)
 # ---------------------------------------------------------------------------
 
 class TestBootstrapMetaAttrInterface:

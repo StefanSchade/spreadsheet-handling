@@ -17,6 +17,7 @@ import logging
 # IR + composer + passes + renderer
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
+from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
 
 
@@ -136,6 +137,98 @@ def _apply_xlsx_validations(
     log.info("[xlsx] done: %d validations added", added)
 
 
+def _apply_plan_to_existing(xlsx_path: Path, plan: Any) -> None:
+    """
+    Open an existing XLSX (written by pandas) and overlay IR RenderPlan ops
+    for styling, freeze, auto-filter, validations, and hidden meta sheets.
+    Skips SetHeader/DefineSheet since data is already written.
+    """
+    wb = load_workbook(xlsx_path)
+
+    for op in getattr(plan, "ops", []) or []:
+        oname = type(op).__name__
+
+        if oname in ("DefineSheet", "SetHeader"):
+            continue
+
+        if oname == "ApplyHeaderStyle":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                row = int(getattr(op, "row", 1))
+                col = int(getattr(op, "col", 1))
+                cell = ws.cell(row=row, column=col)
+                if getattr(op, "bold", False):
+                    cell.font = Font(bold=True)
+                fill_rgb = getattr(op, "fill_rgb", None)
+                if fill_rgb:
+                    cell.fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
+            continue
+
+        if oname == "ApplyColumnStyle":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                col = int(getattr(op, "col", 1))
+                from_row = int(getattr(op, "from_row", 2))
+                to_row = int(getattr(op, "to_row", 2))
+                fill_rgb = getattr(op, "fill_rgb", None)
+                if fill_rgb:
+                    for r in range(from_row, to_row + 1):
+                        ws.cell(row=r, column=col).fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
+            continue
+
+        if oname == "SetAutoFilter":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                r1, c1 = int(getattr(op, "r1", 1)), int(getattr(op, "c1", 1))
+                r2, c2 = int(getattr(op, "r2", 1)), int(getattr(op, "c2", 1))
+                ref = f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
+                ws.auto_filter.ref = ref
+            continue
+
+        if oname == "SetFreeze":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                row = int(getattr(op, "row", 1))
+                col = int(getattr(op, "col", 1))
+                ws.freeze_panes = f"{get_column_letter(col)}{row}"
+            continue
+
+        if oname == "AddValidation":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                r1, c1 = int(getattr(op, "r1", 1)), int(getattr(op, "c1", 1))
+                r2, c2 = int(getattr(op, "r2", 1)), int(getattr(op, "c2", 1))
+                formula = getattr(op, "formula", "")
+                allow = bool(getattr(op, "allow_empty", True))
+                dv = DataValidation(type="list", formula1=formula, allow_blank=allow)
+                ws.add_data_validation(dv)
+                ref = f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
+                dv.add(ref)
+            continue
+
+        if oname == "WriteMeta":
+            sheet_name = getattr(op, "sheet", "_meta")
+            hidden = bool(getattr(op, "hidden", True))
+            kv = getattr(op, "kv", {})
+            if sheet_name not in wb.sheetnames:
+                ws = wb.create_sheet(sheet_name)
+            else:
+                ws = wb[sheet_name]
+            for idx, (k, v) in enumerate(kv.items(), start=1):
+                ws.cell(row=idx, column=1, value=str(k))
+                ws.cell(row=idx, column=2, value=str(v))
+            if hidden:
+                ws.sheet_state = "hidden"
+            continue
+
+    wb.save(xlsx_path)
+
+
 # ======================================================================================
 # Header flattening for writer
 # ======================================================================================
@@ -224,10 +317,24 @@ class ExcelBackend(BackendBase):
         # ---- NEW IR PATH ----
         out_path = Path(path).with_suffix(".xlsx")
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Write raw data via pandas (IR doesn't store cell values)
+        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+            for sheet_name, df in frames.items():
+                name = str(sheet_name)
+                if name in _RESERVED_FRAME_KEYS:
+                    continue
+                sheet = (name or "Sheet")[:31]
+                df0 = _ensure_dataframe(df)
+                df_out = _flatten_header_to_level0(df0)
+                df_out.to_excel(xw, sheet_name=sheet, index=False)
+
+        # Step 2: Build IR → passes → render plan → overlay formatting
         meta = (frames.get("_meta") if isinstance(frames, dict) else {}) or getattr(frames, "meta", {}) or {}
         ir = compose_workbook(frames, meta)
         apply_render_passes(ir, meta)
-        render_workbook(ir, out_path)
+        plan = build_render_plan(ir)
+        _apply_plan_to_existing(out_path, plan)
 
     def read_multi(
             self,

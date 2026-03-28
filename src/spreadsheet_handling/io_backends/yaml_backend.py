@@ -38,7 +38,7 @@ def load_yaml_dir(path: str) -> Frames:
             df = pd.DataFrame(data)
         elif isinstance(data, dict):
             # Falls jemand versehentlich ein Mapping statt einer Liste schreibt:
-            # wir nehmen die values, wenn das homogen ist – sonst einzeiliges DF
+            # wir nehmen die values, wenn das homogen ist - sonst einzeiliges DF
             values = list(data.values())
             if all(isinstance(x, dict) for x in values):
                 df = pd.DataFrame(values)  # type: ignore[arg-type]

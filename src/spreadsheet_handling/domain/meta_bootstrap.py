@@ -1,9 +1,9 @@
 """Bootstrap domain meta with fault-tolerant merging.
 
 Implements the precedence model from FTR-META-BOOTSTRAP:
-  1. Persistence  – existing meta from frames (or {} if missing)
-  2. Profile       – defaults from pipeline profile
-  3. CLI/Runtime   – explicit overrides (highest priority)
+  1. Persistence  - existing meta from frames (or {} if missing)
+  2. Profile       - defaults from pipeline profile
+  3. CLI/Runtime   - explicit overrides (highest priority)
 """
 from __future__ import annotations
 

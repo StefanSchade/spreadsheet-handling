@@ -38,7 +38,7 @@ def normalize_sheet_key(name: str) -> str:
 
 def assert_no_parentheses_in_columns(df: pd.DataFrame, sheet_name: str) -> None:
     """
-    Spaltenüberschriften dürfen KEINE Klammern enthalten – mit Ausnahme
+    Spaltenüberschriften dürfen KEINE Klammern enthalten - mit Ausnahme
     von korrekt gematchten FK-Spalten gemäß FK_PATTERN (z. B. id_(Guten_Morgen)).
     """
     first = [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]

@@ -39,5 +39,5 @@ def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> tupl
     saver = get_saver(out.kind)
     saver(frames, out.path, options=getattr(out, "options", None))
 
-    # (Meta/Issues aktuell noch leer – API bleibt)
+    # (Meta/Issues aktuell noch leer - API bleibt)
     return frames, {}, []

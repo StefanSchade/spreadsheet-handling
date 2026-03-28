@@ -40,6 +40,6 @@ def test_roundtrip_xlsx_drops_helper_columns(tmp_path: Path):
     out_json = tmp_path / "out"
     run_unpack(out_xlsx, out_json, levels=3, backend="xlsx")
 
-    # Bestellungen.json soll KEINE Helper-Spalte enthalten – nur die Originalfelder
+    # Bestellungen.json soll KEINE Helper-Spalte enthalten - nur die Originalfelder
     bestellungen = json.loads((out_json / "Bestellungen.json").read_text(encoding="utf-8"))
     assert bestellungen == [{"bestellnr": "B-1", "id_(Guten_Morgen)": 1}]

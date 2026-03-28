@@ -119,13 +119,13 @@ Note: Makefile uses `/usr/bin/env bash` with `set -euo pipefail`. Run under WSL 
 |-------|-------|--------|
 | 1 | Stabilize & Modularize XLSX Backend | ✅ Complete |
 | 2 | Domain Consistency & Meta Integration | 🔄 In Progress |
-| 3 | IR Parity & Features (P1–P4 slices) | 🔄 Active |
+| 3 | IR Parity & Features (P1-P4 slices) | 🔄 Active |
 | 4 | Feature Expansion & Domain Transforms | 📋 Planned |
 | 5 | Integration & Demo Repository | 📋 Planned |
 | 6 | Consolidate Domain & Cleanup | 📋 Planned |
 | 7 | Final Polish for 1.0 | 📋 Planned |
 
-**Key open features (Phase 2–3)**:
+**Key open features (Phase 2-3)**:
 - `FTR-ONE-ORCHESTRATOR` — unified orchestrate() (current feature branch)
 - `FTR-STYLE-THEMES` — centralized styling via IR StylePass
 - `FTR-META-BOOTSTRAP` — fault-tolerant meta merging

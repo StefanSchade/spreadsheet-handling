@@ -42,6 +42,6 @@ def test_apply_fks_adds_helper_column(tmp_path):
     helper_cols0 = [c for c in lvl0 if isinstance(c, str) and c.startswith("_")]
     assert helper_cols0, f"no helper column found in level-0 of {lvl0}"
 
-    # Werte prüfen – robust via level0_series (funktioniert bei MI und Tuple-Namen)
+    # Werte prüfen - robust via level0_series (funktioniert bei MI und Tuple-Namen)
     s = level0_series(dfq, helper_cols0[0])
     assert s.tolist() == ["Alpha", "Beta"]

@@ -14,7 +14,7 @@ if ! "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
 fi
 
 if ! "$VENV_PY" -m pip -V >/dev/null 2>&1; then
-  echo "⚠️  pip missing after ensurepip – running get-pip.py"
+  echo "⚠️  pip missing after ensurepip - running get-pip.py"
   TMP_FILE="$(mktemp /tmp/getpip.XXXXXX.py)"
   echo "➡️  Downloading get-pip.py to $TMP_FILE"
   if ! curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$TMP_FILE"; then

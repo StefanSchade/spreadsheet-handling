@@ -311,7 +311,7 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         try:
             bound = factory(name=name, **spec) if name is not None else factory(**spec)  # type: ignore[arg-type]
         except TypeError:
-            # Factory might not accept 'name' – retry without it and wrap
+            # Factory might not accept 'name' - retry without it and wrap
             if name is not None:
                 tmp = factory(**spec)  # type: ignore[arg-type]
                 bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
