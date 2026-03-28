@@ -70,6 +70,7 @@ class FreezePass:
 @dataclass
 class ValidationPass:
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        # Legacy path: per-sheet _p1_validations (column index based)
         for sh in doc.sheets.values():
             raw: List[Dict[str, Any]] = sh.meta.get("_p1_validations", [])
             for spec in raw:
@@ -82,6 +83,35 @@ class ValidationPass:
                 formula = '"' + ",".join(values) + '"'
                 dv = DataValidationSpec(kind="list", area=(r1, col, r2, col), formula=formula, allow_empty=True)
                 sh.validations.append(dv)
+
+        # New path: workbook-level constraints (column name based)
+        meta_sheet = doc.hidden_sheets.get("_meta")
+        wb_meta = (meta_sheet.meta.get("workbook_meta_blob") or {}) if meta_sheet else {}
+        constraints = wb_meta.get("constraints") or []
+        for c in constraints:
+            if not isinstance(c, dict):
+                continue
+            sheet_name = c.get("sheet")
+            col_name = c.get("column")
+            rule = c.get("rule") or {}
+            if not sheet_name or not col_name:
+                continue
+            if rule.get("type") != "in_list":
+                continue
+            sh = doc.sheets.get(str(sheet_name))
+            if not sh or not sh.tables:
+                continue
+            t = sh.tables[0]
+            col_idx = t.header_map.get(str(col_name))
+            if not col_idx:
+                continue
+            r1 = 2
+            r2 = max(2, t.n_rows)
+            values = [str(v) for v in (rule.get("values") or [])]
+            formula = '"' + ",".join(values) + '"'
+            dv = DataValidationSpec(kind="list", area=(r1, col_idx, r2, col_idx), formula=formula, allow_empty=True)
+            sh.validations.append(dv)
+
         return doc
 
 @dataclass
