@@ -105,8 +105,9 @@ def orchestrate(
     frames = _load_frames(inp, header_levels=header_levels)
 
     if steps:
-        log.info("orchestrate: running %d step(s)", len(list(steps)))
-        frames = run_pipeline(frames, steps)
+        step_list = list(steps)
+        log.info("orchestrate: running %d step(s)", len(step_list))
+        frames = run_pipeline(frames, step_list)
 
     log.info("orchestrate: writing output kind=%s path=%s", out.kind, out.path)
     _save_frames(out, frames)

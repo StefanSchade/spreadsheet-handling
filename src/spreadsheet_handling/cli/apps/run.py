@@ -7,9 +7,8 @@ from typing import Any, Dict, Optional
 import yaml
 import os
 
-from spreadsheet_handling.io_backends.router import get_loader, get_saver
+from spreadsheet_handling.orchestrator import orchestrate
 from spreadsheet_handling.pipeline import (
-    run_pipeline,
     build_steps_from_config,
     build_steps_from_yaml,
 )
@@ -161,10 +160,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Missing I/O configuration. Provide --config/--steps with 'io', or add CLI overrides."
         )
 
-    # Choose loader/saver
-    loader = get_loader(str(inp["kind"]))
-    saver = get_saver(str(out["kind"]))
-
     # Build steps
     steps = _select_pipeline_steps(
         config,
@@ -173,10 +168,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         profile=args.profile,
     )
 
-    # Run
-    frames = loader(str(inp["path"]))
-    frames = run_pipeline(frames, steps)
-    saver(frames, str(out["path"]))
+    # Run via unified orchestrator
+    orchestrate(input=inp, output=out, steps=steps or None)
 
     log.info("Done. Wrote output to %s", out["path"])
     return 0

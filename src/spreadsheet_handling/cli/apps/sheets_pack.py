@@ -1,28 +1,23 @@
 from __future__ import annotations
-import argparse, sys, yaml
-from pathlib import Path
-from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
-from spreadsheet_handling.pipeline.runner import run_pipeline
+import argparse
 
-def _args():
+from spreadsheet_handling.orchestrator import orchestrate
+
+
+def _args(argv: list[str] | None = None):
     p = argparse.ArgumentParser(prog="sheets-pack", description="JSON/CSV -> XLSX")
     p.add_argument("input_dir", help="Directory with .json or .csv")
     p.add_argument("-o", "--output", required=True, help="Output .xlsx file")
-    p.add_argument("--input-kind", default="json", choices=["json","json_dir","csv_dir"])
-    return p.parse_args()
+    p.add_argument("--input-kind", default="json", choices=["json", "json_dir", "csv_dir"])
+    return p.parse_args(argv)
+
 
 def main(argv: list[str] | None = None) -> int:
-    a = _args()
-    app = AppConfig(
-        io=IOConfig(
-            inputs={"primary": IOEndpoint(kind=a.input_kind, path=a.input_dir)},
-            output=IOEndpoint(kind="xlsx", path=a.output),
-        ),
-        pipeline=PipelineConfig(steps=[]),
-        excel=ExcelOptions(),  # defaults: autofilter + gray header
-        strict=False,
+    a = _args(argv)
+    orchestrate(
+        input={"kind": a.input_kind, "path": a.input_dir},
+        output={"kind": "xlsx", "path": a.output},
     )
-    frames, meta, issues = run_pipeline(app)
     print(f"[pack] XLSX geschrieben: {a.output}")
     return 0
 
