@@ -148,7 +148,17 @@ def _apply_plan_to_existing(xlsx_path: Path, plan: Any) -> None:
     for op in getattr(plan, "ops", []) or []:
         oname = type(op).__name__
 
-        if oname in ("DefineSheet", "SetHeader"):
+        if oname == "DefineSheet":
+            continue
+
+        if oname == "SetHeader":
+            sheet = getattr(op, "sheet", None)
+            if sheet and sheet in wb.sheetnames:
+                ws = wb[sheet]
+                row = int(getattr(op, "row", 1))
+                col = int(getattr(op, "col", 1))
+                text = getattr(op, "text", "")
+                ws.cell(row=row, column=col, value=text)
             continue
 
         if oname == "MergeCells":
@@ -329,7 +339,11 @@ class ExcelBackend(BackendBase):
         out_path = Path(path).with_suffix(".xlsx")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: Write raw data via pandas (IR doesn't store cell values)
+        # Build IR first to know table geometry (header depth, offsets, etc.)
+        meta = (frames.get("_meta") if isinstance(frames, dict) else {}) or getattr(frames, "meta", {}) or {}
+        ir = compose_workbook(frames, meta)
+
+        # Step 1: Write raw data via pandas WITHOUT headers; plan writes headers.
         with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
             for sheet_name, df in frames.items():
                 name = str(sheet_name)
@@ -337,12 +351,16 @@ class ExcelBackend(BackendBase):
                     continue
                 sheet = (name or "Sheet")[:31]
                 df0 = _ensure_dataframe(df)
-                df_out = _flatten_header_to_level0(df0)
-                df_out.to_excel(xw, sheet_name=sheet, index=False)
+                table = ir.sheets.get(name).tables[0] if ir.sheets.get(name) and ir.sheets.get(name).tables else None
+                header_rows = int(table.header_rows) if table else 1
+                start_row = max(0, header_rows)  # pandas startrow is 0-based
+                # pandas cannot write MultiIndex columns with header=False,index=False;
+                # for data-only writes we can safely normalize to simple numeric columns.
+                df_data = df0.copy()
+                df_data.columns = list(range(df_data.shape[1]))
+                df_data.to_excel(xw, sheet_name=sheet, index=False, header=False, startrow=start_row)
 
         # Step 2: Build IR → passes → render plan → overlay formatting
-        meta = (frames.get("_meta") if isinstance(frames, dict) else {}) or getattr(frames, "meta", {}) or {}
-        ir = compose_workbook(frames, meta)
         apply_render_passes(ir, meta)
         plan = build_render_plan(ir)
         _apply_plan_to_existing(out_path, plan)
