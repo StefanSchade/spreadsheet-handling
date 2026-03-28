@@ -200,6 +200,20 @@ def make_add_validations_step(*, rules: list[dict], name: str = "add_validations
     return BoundStep(name=name, config=cfg, fn=run)
 
 
+def make_bootstrap_meta_step(
+    *,
+    profile_defaults: Dict[str, Any] | None = None,
+    cli_overrides: Dict[str, Any] | None = None,
+    name: str = "bootstrap_meta",
+) -> BoundStep:
+    from ..domain.meta_bootstrap import bootstrap_meta as _impl
+
+    cfg = {"profile_defaults": profile_defaults, "cli_overrides": cli_overrides}
+    def run(fr: Frames) -> Frames:
+        return _impl(fr, profile_defaults=cfg["profile_defaults"], cli_overrides=cfg["cli_overrides"])
+    return BoundStep(name=name, config=cfg, fn=run)
+
+
 
 
 # ======================================================================================
@@ -226,7 +240,8 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "plugin":           make_plugin_step,
     "flatten_headers":  make_flatten_headers_step,
     "reorder_helpers":  make_reorder_helpers_step,
-    "add_validations": make_add_validations_step,
+    "add_validations":  make_add_validations_step,
+    "bootstrap_meta":   make_bootstrap_meta_step,
 }
 
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:

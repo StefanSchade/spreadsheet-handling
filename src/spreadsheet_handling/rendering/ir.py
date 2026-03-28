@@ -54,6 +54,10 @@ class SheetIR:
     meta: Dict[str, object] = field(default_factory=dict)
     styles: List[StyleSpec] = field(default_factory=list)
 
+    def __post_init__(self):
+        if self.meta is None:
+            self.meta = {}
+
 @dataclass
 class WorkbookIR:
     sheets: Dict[str, SheetIR] = field(default_factory=dict)
