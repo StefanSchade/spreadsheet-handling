@@ -140,7 +140,7 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
             continue
 
         # Freeze panes (if present)
-        if oname in {"FreezeBelowHeader", "FreezePane"}:
+        if oname in {"FreezeBelowHeader", "FreezePane", "SetFreeze"}:
             sheet = getattr(op, "sheet", None)
             row = int(getattr(op, "row", 2))
             col = int(getattr(op, "col", 1))
