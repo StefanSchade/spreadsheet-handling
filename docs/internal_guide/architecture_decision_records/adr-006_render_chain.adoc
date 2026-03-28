@@ -1,0 +1,94 @@
+=== ADR-006 — Render Chain: Compose → Passes → Plan → Render
+
+:date: 2026-03-28
+:deciders: dr_stefan_schade@yahoo.com
+
+==== Context
+
+ADR-003 introduced the IR layer; ADR-RENDER-FLOW-VS-DOMAIN-PIPELINE separated terminology.
+However, the concrete data flow through the rendering layer — from domain `Frames` to a physical `.xlsx` file — was not documented.
+As the project grows and new passes/backends are added, a clear reference for the render chain is needed.
+
+==== Decision
+
+The render chain follows four sequential stages with well-defined inputs and outputs:
+
+[source,text]
+----
+  Frames + Meta
+      │
+      ▼
+  ① compose_workbook()        # rendering/composer/layout_composer.py
+      │  Frames → WorkbookIR
+      │  One TableBlock per sheet; geometry, headers, header_map
+      │  Meta stashed in hidden _meta SheetIR
+      ▼
+  ② apply_ir_passes()         # rendering/flow.py
+      │  WorkbookIR → WorkbookIR  (mutated)
+      │  Passes: StylePass → FilterPass → FreezePass → ValidationPass → MetaPass
+      │  Each pass reads/writes SheetIR.meta keys (__style, __autofilter, __freeze, _p1_validations)
+      ▼
+  ③ build_render_plan()       # rendering/flow.py
+      │  WorkbookIR → RenderPlan
+      │  Converts IR enrichments to backend-agnostic RenderOp sequence
+      │  Ops: DefineSheet, SetHeader, ApplyHeaderStyle, SetAutoFilter, SetFreeze, AddValidation, WriteMeta
+      ▼
+  ④ render_workbook()         # io_backends/xlsx/openpyxl_renderer.py
+      │  RenderPlan → .xlsx file
+      │  Backend-specific: interprets each RenderOp via openpyxl API
+      └──► done
+----
+
+==== Key Types
+
+[cols="30,70"]
+|===
+| Type | Purpose
+
+| `WorkbookIR`
+| Container: `sheets: Dict[str, SheetIR]` + `hidden_sheets`
+
+| `SheetIR`
+| Per-sheet: `tables: List[TableBlock]`, `validations`, `meta` dict (pass annotations via dunder keys)
+
+| `TableBlock`
+| Geometry of one table: `top`, `left`, `n_rows`, `n_cols`, `headers`, `header_map` (1-based)
+
+| `RenderPlan`
+| Ordered list of `RenderOp` + `sheet_order`
+
+| `RenderOp`
+| Union of frozen dataclasses (DefineSheet, SetHeader, ApplyHeaderStyle, SetAutoFilter, SetFreeze, AddValidation, WriteMeta)
+
+| `IRPass`
+| Protocol with `apply(WorkbookIR) -> WorkbookIR`
+|===
+
+==== Pass Convention
+
+Passes communicate via well-known keys in `SheetIR.meta`:
+
+* `options` — Input from domain config (auto_filter, freeze_header, header_fill_rgb)
+* `__style` — Written by StylePass, read by `build_render_plan()`
+* `__autofilter` — Written by FilterPass
+* `__freeze` — Written by FreezePass
+* `_p1_validations` — Legacy validation DTOs consumed by the in-core ValidationPass
+* `constraints` — Domain validation rules consumed by `validation_pass.apply()`
+
+New passes should follow this pattern: read from a well-defined key, write to a dunder-prefixed key.
+
+==== Dual Backend Note
+
+`ExcelBackend.write_multi()` currently supports two paths controlled by `SH_XLSX_BACKEND`:
+
+* **Legacy**: pandas `ExcelWriter` + `_decorate_workbook()` post-processing
+* **IR**: compose → passes → plan → render
+
+This coexistence is intentional (ADR-005 dual test harness). The legacy path will be removed under FTR-CLEANUP-IR-P4.
+
+==== Consequences
+
+* New rendering features (FTR-STYLE-THEMES, FTR-VALIDATION-PASS-INFRA) are implemented as IR passes.
+* New backends (ODS via FTR-ODS-RENDERER) implement only a `RenderPlan` executor — no domain knowledge needed.
+* The RenderPlan is introspectable and testable without a backend (assert on ops list).
+* Domain logic and presentation logic remain cleanly separated per ADR-RENDER-FLOW-VS-DOMAIN-PIPELINE.
