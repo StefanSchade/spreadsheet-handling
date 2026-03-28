@@ -9,14 +9,35 @@ class IRPass(Protocol):
 @dataclass
 class StylePass:
     default_header_fill_rgb: str = "#F2F2F2"
+    default_helper_fill_rgb: str | None = "#E8F0FE"
+    helper_prefix: str = "_"
+
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
         for sh in doc.sheets.values():
             opts: Dict[str, Any] = sh.meta.get("options", {})
+
+            # Header style
             header_fill = opts.get("header_fill_rgb", self.default_header_fill_rgb)
             style = {"header": {"bold": True, "fill": header_fill}}
             styles = sh.meta.get("__style", {})
             styles.update(style)
             sh.meta["__style"] = styles
+
+            # Helper column highlighting
+            helper_fill = opts.get("helper_fill_rgb", self.default_helper_fill_rgb)
+            prefix = opts.get("helper_prefix", self.helper_prefix)
+            if helper_fill and sh.tables:
+                t = sh.tables[0]
+                helper_cols = [
+                    idx for name, idx in t.header_map.items()
+                    if str(name).startswith(prefix)
+                ]
+                if helper_cols:
+                    sh.meta["__helper_cols"] = {
+                        "cols": helper_cols,
+                        "fill": helper_fill,
+                    }
+
         return doc
 
 @dataclass

@@ -50,6 +50,15 @@ class AddValidation:
     allow_empty: bool = True
 
 @dataclass(frozen=True)
+class ApplyColumnStyle:
+    """Apply a fill color to an entire data column (below header)."""
+    sheet: str
+    col: int          # 1-based column index
+    from_row: int     # typically 2 (first data row)
+    to_row: int       # last data row
+    fill_rgb: Optional[str] = None  # "#RRGGBB" or None
+
+@dataclass(frozen=True)
 class WriteMeta:
     sheet: str  # typically "_meta"
     kv: Dict[str, str]
@@ -59,6 +68,7 @@ RenderOp = Union[
     DefineSheet,
     SetHeader,
     ApplyHeaderStyle,
+    ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
     AddValidation,

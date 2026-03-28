@@ -7,7 +7,7 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 
 
 # --------------------------------------------------------------------------------------
@@ -111,6 +111,21 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
             if sheet:
                 ws = _get_ws(wb, sheet)
                 _write(ws, row, col, text)
+            continue
+
+        # Header style (bold + fill)
+        if oname == "ApplyHeaderStyle":
+            sheet = getattr(op, "sheet", None)
+            if sheet:
+                ws = _get_ws(wb, sheet)
+                row = int(getattr(op, "row", 1))
+                col = int(getattr(op, "col", 1))
+                cell = ws.cell(row=row, column=col)
+                if getattr(op, "bold", False):
+                    cell.font = Font(bold=True)
+                fill_rgb = getattr(op, "fill_rgb", None)
+                if fill_rgb:
+                    cell.fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
             continue
 
         # Generic cell write
@@ -217,21 +232,20 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
         # Unknown op -> ignore (smoke path)
         # print(f"[xlsx renderer] skipping op {oname}")
 
-    # --- P1 parity: default header styling (bold row 1) ---
-    for ws in wb.worksheets:
-        if ws.max_column:
-            for j in range(1, ws.max_column + 1):
-                cell = ws.cell(row=1, column=j)
-                if cell.value not in (None, ""):
-                    # preserve existing attrs, just force bold
-                    cell.font = Font(name=cell.font.name, size=cell.font.size, bold=True)
-
-    # --- P1 parity: apply default freeze pane and autofilter if requested ---
-    for ws in wb.worksheets:
-        if not ws.freeze_panes:
-            ws.freeze_panes = "A2"
-        if not ws.auto_filter.ref and ws.max_row and ws.max_column:
-            ws.auto_filter.ref = ws.dimensions
+        # ApplyColumnStyle: fill data cells in a column range
+        if oname == "ApplyColumnStyle":
+            sheet = getattr(op, "sheet", None)
+            if sheet:
+                ws = _get_ws(wb, sheet)
+                col = int(getattr(op, "col", 1))
+                r1 = int(getattr(op, "from_row", 2))
+                r2 = int(getattr(op, "to_row", r1))
+                fill_rgb = getattr(op, "fill_rgb", None)
+                if fill_rgb:
+                    fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
+                    for r in range(r1, r2 + 1):
+                        ws.cell(row=r, column=col).fill = fill
+            continue
 
     wb.save(out_path)
 

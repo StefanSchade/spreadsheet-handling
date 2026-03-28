@@ -7,6 +7,7 @@ from .plan import (
     DefineSheet,
     SetHeader,
     ApplyHeaderStyle,
+    ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
     AddValidation,
@@ -102,6 +103,21 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
         if fz:
             plan.add(SetFreeze(sheet=sheet_name, row=int(fz["row"]), col=int(fz["col"])))
 
+        # Helper column highlighting
+        hc = sh.meta.get("__helper_cols")
+        if hc and sh.tables:
+            t = sh.tables[0]
+            data_start = t.top + t.header_rows
+            data_end = t.top + t.n_rows - 1
+            if data_end >= data_start:
+                for col_idx in hc["cols"]:
+                    plan.add(ApplyColumnStyle(
+                        sheet=sheet_name,
+                        col=col_idx,
+                        from_row=data_start,
+                        to_row=data_end,
+                        fill_rgb=hc["fill"],
+                    ))
         for dv in sh.validations:
             plan.add(AddValidation(
                 sheet=sheet_name,

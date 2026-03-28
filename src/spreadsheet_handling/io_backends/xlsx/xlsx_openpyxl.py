@@ -12,6 +12,7 @@ from spreadsheet_handling.rendering.plan import (
     DefineSheet,
     SetHeader,
     ApplyHeaderStyle,
+    ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
     AddValidation,
@@ -55,6 +56,14 @@ def render_plan(plan: RenderPlan, out_path: Path | str) -> None:
                 cell.font = Font(bold=True)
             if op.fill_rgb:
                 cell.fill = PatternFill("solid", fgColor=op.fill_rgb.lstrip("#"))
+
+        elif isinstance(op, ApplyColumnStyle):
+            ws = sheets[op.sheet]
+            fill_rgb = op.fill_rgb
+            if fill_rgb:
+                fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
+                for r in range(op.from_row, op.to_row + 1):
+                    ws.cell(row=r, column=op.col).fill = fill
 
         elif isinstance(op, SetAutoFilter):
             ws = sheets[op.sheet]
