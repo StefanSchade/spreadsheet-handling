@@ -182,6 +182,14 @@ def make_flatten_headers_step(*, sheet: str | None = None, mode: str = "first_no
         return _flatten(sheet, mode=mode, sep=sep)(fr)
     return BoundStep(name=name, config=cfg, fn=run)
 
+
+def make_unflatten_headers_step(*, sheet: str | None = None, sep: str = ".", name: str = "unflatten_headers") -> BoundStep:
+    from ..domain.transformations.helpers import unflatten_headers as _unflatten
+    cfg = {"sheet": sheet, "sep": sep}
+    def run(fr: Frames) -> Frames:
+        return _unflatten(sheet, sep=sep)(fr)
+    return BoundStep(name=name, config=cfg, fn=run)
+
 def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_helpers") -> BoundStep:
     from ..domain.transformations.helpers import reorder_helpers_next_to_fk as _reorder
     cfg = {"sheet": sheet, "helper_prefix": helper_prefix}
@@ -258,6 +266,7 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "drop_helpers":     make_drop_helpers_step,
     "plugin":           make_plugin_step,
     "flatten_headers":  make_flatten_headers_step,
+    "unflatten_headers": make_unflatten_headers_step,
     "reorder_helpers":  make_reorder_helpers_step,
     "add_validations":  make_add_validations_step,
     "bootstrap_meta":   make_bootstrap_meta_step,

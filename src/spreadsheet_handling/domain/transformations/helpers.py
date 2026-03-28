@@ -128,6 +128,42 @@ def flatten_headers(sheet: Optional[str] = None, *, mode: str = "first_nonempty"
     return _step
 
 
+def unflatten_headers(sheet: Optional[str] = None, *, sep: str = ".") -> Step:
+    """
+    Convert flat string headers into a MultiIndex by splitting with `sep`.
+
+    Notes
+    -----
+    - If a frame already has MultiIndex columns, it is passed through unchanged.
+    - Reversibility is guaranteed only when headers were flattened with a stable
+      separator and no header part contains that separator.
+    """
+    def _step(frames: Frames) -> Frames:
+        if not sep:
+            raise ValueError("unflatten_headers requires a non-empty sep")
+
+        out: Frames = {}
+        for name, df in frames.items():
+            if sheet is not None and name != sheet:
+                out[name] = df
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                out[name] = df
+                continue
+
+            cols = [str(c) for c in list(df.columns)]
+            parts = [c.split(sep) for c in cols]
+            max_levels = max((len(p) for p in parts), default=1)
+            tuples = [tuple(p + [""] * (max_levels - len(p))) for p in parts]
+
+            nd = df.copy()
+            nd.columns = pd.MultiIndex.from_tuples(tuples)
+            out[name] = nd
+        return out
+    return _step
+
+
 # --- NEW: reorder helpers right after their FK column --------------------------------
 import re
 _FK_RE = re.compile(r"^id_\((.+)\)$")  # matches id_(branch) -> "branch"
