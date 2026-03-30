@@ -358,19 +358,50 @@ class ExcelBackend(BackendBase):
         Read all sheets assuming a single header row (header=0).
         If header_levels > 1, lift columns to a MultiIndex (level-0 data,
         remaining levels empty strings).
+
+        Hidden sheets (e.g. ``_meta``) are excluded from data frames.
+        If a ``_meta`` sheet is present its key/value pairs are extracted
+        and returned as ``frames["_meta"]`` (a plain dict, not a DataFrame).
         """
         p = Path(path)
+
+        # --- detect hidden sheets via openpyxl before pandas reads -----------
+        wb = load_workbook(p, read_only=True, data_only=True)
+        hidden_names: set[str] = set()
+        try:
+            for ws in wb.worksheets:
+                if ws.sheet_state == "hidden":
+                    hidden_names.add(ws.title)
+        finally:
+            wb.close()
+
+        # --- extract meta from hidden _meta sheet (if present) ---------------
+        meta_dict: Dict[str, Any] = {}
+        if "_meta" in hidden_names:
+            from spreadsheet_handling.rendering.parse_ir import _read_meta_sheet
+            wb2 = load_workbook(p, data_only=True)
+            try:
+                meta_dict = _read_meta_sheet(wb2)
+            finally:
+                wb2.close()
+
+        # --- read data sheets via pandas -------------------------------------
         sheets = pd.read_excel(p, sheet_name=None, header=0, engine="openpyxl", dtype=str)
         out: Dict[str, pd.DataFrame] = {}
         levels = header_levels if (header_levels and header_levels > 1) else 1
 
         for name, df in sheets.items():
+            if name in hidden_names:
+                continue
             df = df.where(pd.notnull(df), "")  # normalize NaNs to empty strings
             if not isinstance(df.columns, pd.MultiIndex) and levels > 1:
                 tuples = [(c,) + ("",) * (levels - 1) for c in list(df.columns)]
                 df = df.copy()
                 df.columns = pd.MultiIndex.from_tuples(tuples)
             out[name] = df
+
+        if meta_dict:
+            out["_meta"] = meta_dict  # type: ignore[assignment]
 
         return out
 

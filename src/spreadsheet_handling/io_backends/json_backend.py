@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict
 
 import pandas as pd
+import yaml
 
 from .base import BackendBase, BackendOptions
 
@@ -108,6 +109,15 @@ class JSONBackend(BackendBase):
             df = pd.read_json(p, dtype=str)
             df = df.where(pd.notnull(df), "")  # normalize empties as ""
             out[p.stem] = df
+
+        # --- read optional _meta sidecar ------------------------------------
+        sidecar = in_dir / "_meta.yaml"
+        if sidecar.exists():
+            with open(sidecar, encoding="utf-8") as fh:
+                meta = yaml.safe_load(fh)
+            if isinstance(meta, dict):
+                out["_meta"] = meta  # type: ignore[assignment]
+
         return out
 
     def write_multi(self, frames: Frames, path: str, options: BackendOptions | None = None) -> None:
@@ -132,6 +142,8 @@ class JSONBackend(BackendBase):
             fmt.update({k: options[k] for k in ("pretty", "indent", "sort_keys", "ensure_ascii") if k in options})
 
         for name, df in frames.items():
+            if name == "_meta":
+                continue  # handled separately as sidecar below
             p = out_dir / f"{name}.json"
             # NaNs -> "", Reihenfolge = DataFrame-Spaltenreihenfolge
             clean = df.where(pd.notnull(df), "")
@@ -152,6 +164,13 @@ class JSONBackend(BackendBase):
                               separators=(",", ":"),  # kompakt
                               sort_keys=fmt["sort_keys"])
                     fh.write("\n")
+
+        # --- write optional _meta sidecar -----------------------------------
+        meta = frames.get("_meta")
+        if meta is not None and isinstance(meta, dict):
+            sidecar = out_dir / "_meta.yaml"
+            with open(sidecar, "w", encoding="utf-8", newline="\n") as fh:
+                yaml.safe_dump(meta, fh, default_flow_style=False, allow_unicode=True)
 
 # ---- Test-facing convenience wrappers (kept for compatibility) ----
 
