@@ -36,7 +36,7 @@ mkdir -p -- "$TARGET_ABS"
 
 # 1) Directory name prunes (applies anywhere in tree)
 EX_DIRS=(
-  ".git" ".venv" "__pycache__" ".mypy_cache" ".pytest_cache" ".ruff_cache"
+  ".git" ".venv" ".venv_win" "__pycache__" ".mypy_cache" ".pytest_cache" ".ruff_cache"
   ".idea" ".vscode" "node_modules" "dist" "build" "tmp" "lib" "lib64" "bin"
   "dist" "tmp" "output"
 )
