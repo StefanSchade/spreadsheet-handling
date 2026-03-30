@@ -1,5 +1,5 @@
 from . import meta_pass, validation_pass, style_pass
-from .core import StylePass, FilterPass, FreezePass, ValidationPass, MetaPass
+from .core import StylePass, FilterPass, FreezePass, ValidationPass, MetaPass, NamedRangePass
 
 def apply_all(ir, meta):
     """Apply all IR passes in deterministic order.
@@ -18,7 +18,7 @@ def apply_all(ir, meta):
         if "workbook_meta_blob" not in meta_sheet.meta:
             meta_sheet.meta["workbook_meta_blob"] = meta
 
-    passes = [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass()]
+    passes = [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass(), NamedRangePass()]
     for p in passes:
         ir = p.apply(ir)
     return ir

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Any
 from .ir import WorkbookIR, SheetIR, TableBlock
-from .passes.core import IRPass, StylePass, FilterPass, FreezePass, ValidationPass, MetaPass
+from .passes.core import IRPass, StylePass, FilterPass, FreezePass, ValidationPass, MetaPass, NamedRangePass
 from .plan import (
     RenderPlan,
     DefineSheet,
@@ -14,6 +14,7 @@ from .plan import (
     AddValidation,
     WriteDataBlock,
     WriteMeta,
+    DefineNamedRange,
 )
 
 def compose_ir(domain_input: Dict[str, Any]) -> WorkbookIR:
@@ -156,6 +157,14 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
                 allow_empty=bool(dv.allow_empty),
             ))
 
+        # Named ranges
+        for nr in sh.named_ranges:
+            plan.add(DefineNamedRange(
+                name=nr.name,
+                sheet=sheet_name,
+                r1=nr.area[0], c1=nr.area[1], r2=nr.area[2], c2=nr.area[3],
+            ))
+
     for sheet_name, sh in doc.hidden_sheets.items():
         hidden = bool(sh.meta.get("_hidden", True))
         kv = {k: v for k, v in sh.meta.items() if k != "_hidden"}
@@ -164,4 +173,4 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     return plan
 
 def default_p1_passes() -> List[IRPass]:
-    return [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass()]
+    return [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass(), NamedRangePass()]

@@ -52,6 +52,7 @@ class SheetIR:
     name: str
     tables: List[TableBlock] = field(default_factory=list)
     validations: List[DataValidationSpec] = field(default_factory=list)
+    named_ranges: List[NamedRange] = field(default_factory=list)
     meta: Dict[str, object] = field(default_factory=dict)
     styles: List[StyleSpec] = field(default_factory=list)
 

@@ -81,6 +81,15 @@ class WriteMeta:
     kv: Dict[str, str]
     hidden: bool = True
 
+@dataclass(frozen=True)
+class DefineNamedRange:
+    name: str
+    sheet: str
+    r1: int
+    c1: int
+    r2: int
+    c2: int
+
 RenderOp = Union[
     DefineSheet,
     SetHeader,
@@ -92,6 +101,7 @@ RenderOp = Union[
     AddValidation,
     WriteDataBlock,
     WriteMeta,
+    DefineNamedRange,
 ]
 
 # ----- Render Plan -----

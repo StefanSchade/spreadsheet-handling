@@ -245,6 +245,21 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
         if oname == "DefineSheet":
             continue
 
+        # Named ranges
+        if oname == "DefineNamedRange":
+            name = getattr(op, "name", "")
+            sheet = getattr(op, "sheet", "")
+            r1 = int(getattr(op, "r1", 1))
+            c1 = int(getattr(op, "c1", 1))
+            r2 = int(getattr(op, "r2", 1))
+            c2 = int(getattr(op, "c2", 1))
+            if name and sheet:
+                from openpyxl.workbook.defined_name import DefinedName
+                ref = f"'{sheet}'!${get_column_letter(c1)}${r1}:${get_column_letter(c2)}${r2}"
+                dn = DefinedName(name, attr_text=ref)
+                wb.defined_names.add(dn)
+            continue
+
         # AddMetaSheet (we only ensure the sheet exists; content optional for P1)
         if oname in {"AddMetaSheet", "DefineHiddenSheet"}:
             sheet = getattr(op, "sheet", None) or getattr(op, "name", None)

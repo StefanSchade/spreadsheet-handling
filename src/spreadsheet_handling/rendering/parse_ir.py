@@ -21,7 +21,7 @@ import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.cell.cell import MergedCell
 
-from .ir import WorkbookIR, SheetIR, TableBlock, DataValidationSpec
+from .ir import WorkbookIR, SheetIR, TableBlock, DataValidationSpec, NamedRange
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,9 @@ def parse_ir(
                 stop_on_empty_col=stop_on_empty_col,
             )
             ir.sheets[ws_name] = sh
+
+        # ---- 3. Extract named ranges -------------------------------------
+        _extract_named_ranges(wb, ir)
 
         return ir
     finally:
@@ -477,6 +480,32 @@ def _extract_freeze(ws: Worksheet, sh: SheetIR) -> None:
             "row": int(row_str),
             "col": column_index_from_string(col_str),
         }
+
+
+# ---------------------------------------------------------------------------
+# Named range extraction
+# ---------------------------------------------------------------------------
+
+def _extract_named_ranges(wb: openpyxl.Workbook, ir: WorkbookIR) -> None:
+    """Read Excel defined names and attach them to the appropriate SheetIR."""
+    import re
+    from openpyxl.utils import column_index_from_string as cifs
+
+    for name, dn in wb.defined_names.items():
+        for title, coord in dn.destinations:
+            if title not in ir.sheets:
+                continue
+            # coord is like "$A$1:$C$10"
+            m = re.match(r'\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)', coord)
+            if not m:
+                continue
+            c1 = cifs(m.group(1))
+            r1 = int(m.group(2))
+            c2 = cifs(m.group(3))
+            r2 = int(m.group(4))
+            ir.sheets[title].named_ranges.append(
+                NamedRange(name=dn.name, sheet=title, area=(r1, c1, r2, c2))
+            )
 
 
 # ---------------------------------------------------------------------------
