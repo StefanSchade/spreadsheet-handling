@@ -5,6 +5,10 @@ import pandas as pd
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.passes import apply_all
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-MULTIHEADER-P2")
+
 
 
 def test_build_render_plan_emits_multirow_headers_and_merges() -> None:

@@ -5,6 +5,9 @@ import pytest
 from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR
 from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
 
+pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+
+
 @pytest.mark.xlsx_ir
 def test_render_stub_creates_file(tmp_path):
     ir = WorkbookIR()

@@ -1,5 +1,8 @@
+import pytest
 import types
 import spreadsheet_handling.cli.apps.run as runmod
+
+pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
 
 
 def test_main_with_steps_only(monkeypatch):

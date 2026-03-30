@@ -1,4 +1,8 @@
 from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+
 
 def test_ir_basic_structure():
     wb = WorkbookIR()

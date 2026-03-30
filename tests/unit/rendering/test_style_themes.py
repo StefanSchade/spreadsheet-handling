@@ -30,6 +30,8 @@ from spreadsheet_handling.rendering.plan import (
     SetFreeze,
 )
 
+pytestmark = pytest.mark.ftr("FTR-STYLE-THEMES")
+
 
 # ---------------------------------------------------------------------------
 # helpers

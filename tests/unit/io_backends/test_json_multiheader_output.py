@@ -7,6 +7,10 @@ import pandas as pd
 
 from spreadsheet_handling.domain.transformations.helpers import flatten_headers
 from spreadsheet_handling.io_backends.json_backend import write_json_dir
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-MULTIHEADER-P2")
+
 
 
 def test_json_backend_writes_nested_objects_for_multiindex_columns(tmp_path: Path) -> None:

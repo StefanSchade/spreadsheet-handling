@@ -14,6 +14,9 @@ from spreadsheet_handling.rendering.flow import (
 )
 from spreadsheet_handling.rendering.ir import SheetIR, WorkbookIR
 
+pytestmark = pytest.mark.ftr("FTR-VALIDATION-PASS-INFRA")
+
+
 
 # ---------------------------------------------------------------------------
 # Domain step: add_validations writes constraints into meta

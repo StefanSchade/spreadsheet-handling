@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
 
 import pandas as pd
 import pytest

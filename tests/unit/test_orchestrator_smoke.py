@@ -5,6 +5,9 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
 
 from spreadsheet_handling.orchestrator import orchestrate
 from spreadsheet_handling.pipeline.pipeline import BoundStep, Frames

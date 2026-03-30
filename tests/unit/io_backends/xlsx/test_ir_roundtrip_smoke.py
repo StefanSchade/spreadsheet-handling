@@ -4,6 +4,9 @@ import yaml
 from spreadsheet_handling.pipeline.runner import run_pipeline
 from spreadsheet_handling.pipeline import load_app_config
 
+pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+
+
 @pytest.mark.xlsx_ir
 def test_ir_json_to_xlsx_roundtrip(tmp_path):
     (tmp_path / "in").mkdir()

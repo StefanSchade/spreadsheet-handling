@@ -5,6 +5,9 @@ import importlib
 from pathlib import Path
 
 import pandas as pd
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-TEST-HARNESS")
 
 from spreadsheet_handling.pipeline.pipeline import build_steps_from_config, run_pipeline
 

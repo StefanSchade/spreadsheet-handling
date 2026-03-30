@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import pandas as pd
 
+import pytest
+
 from spreadsheet_handling.domain.transformations.helpers import (
     mark_helpers,
     clean_aux_columns,
     flatten_headers,
     unflatten_headers,
 )
+
+pytestmark = pytest.mark.ftr("FTR-MULTIHEADER-P2")
 
 
 def test_mark_helpers_and_clean() -> None:

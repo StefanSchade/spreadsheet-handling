@@ -8,6 +8,9 @@ from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta, _deep_mer
 from spreadsheet_handling.pipeline.pipeline import make_bootstrap_meta_step, REGISTRY, build_steps_from_config
 from spreadsheet_handling.rendering.ir import SheetIR
 
+pytestmark = pytest.mark.ftr("FTR-META-BOOTSTRAP")
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers

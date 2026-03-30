@@ -1,5 +1,9 @@
 import pandas as pd
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+
 
 def test_compose_creates_one_sheet_per_frame():
     frames = {"A": pd.DataFrame({"x":[1,2]}), "B": pd.DataFrame({"y":[3]})}

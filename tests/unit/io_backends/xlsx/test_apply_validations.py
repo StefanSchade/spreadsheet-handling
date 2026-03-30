@@ -5,6 +5,9 @@ from openpyxl import load_workbook
 
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
+pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+
+
 class Frames(dict):
     pass
 

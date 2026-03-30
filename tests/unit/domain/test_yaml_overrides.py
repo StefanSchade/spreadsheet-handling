@@ -13,6 +13,8 @@ from spreadsheet_handling.pipeline.pipeline import (
     REGISTRY,
 )
 
+pytestmark = pytest.mark.ftr("FTR-YAML-OVERRIDES")
+
 
 # ---------------------------------------------------------------------------
 # Helpers

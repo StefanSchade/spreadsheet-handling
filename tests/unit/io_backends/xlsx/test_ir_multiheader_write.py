@@ -4,6 +4,10 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
+import pytest
+
+pytestmark = pytest.mark.ftr("FTR-MULTIHEADER-P2")
+
 
 
 def test_ir_backend_writes_multirow_headers_with_merges(tmp_path, monkeypatch):
