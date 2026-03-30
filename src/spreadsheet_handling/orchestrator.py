@@ -10,6 +10,7 @@ from .pipeline.pipeline import run_pipeline, BoundStep, Frames  # reuse existing
 
 # Backends (existing adapters)
 from .io_backends.json_backend import JSONBackend
+from .io_backends.xml_backend import XMLBackend
 from .io_backends.yaml_backend import load_yaml_dir as _yaml_load, save_yaml_dir as _yaml_save
 from .io_backends.xlsx.xlsx_backend import ExcelBackend
 
@@ -45,6 +46,8 @@ def _coerce_io(d: Mapping[str, Any] | None, role: str) -> IODesc:
 def _load_frames(inp: IODesc, *, header_levels: int = 1) -> Frames:
     if inp.kind in {"json", "json_dir"}:
         return JSONBackend().read_multi(inp.path, header_levels=header_levels, options=inp.options)
+    if inp.kind in {"xml", "xml_dir"}:
+        return XMLBackend().read_multi(inp.path, header_levels=header_levels, options=inp.options)
     if inp.kind in {"yaml", "yaml_dir"}:
         return _yaml_load(inp.path)
     if inp.kind in {"xlsx", "excel"}:
@@ -54,6 +57,9 @@ def _load_frames(inp: IODesc, *, header_levels: int = 1) -> Frames:
 def _save_frames(out: IODesc, frames: Frames) -> None:
     if out.kind in {"json", "json_dir"}:
         JSONBackend().write_multi(frames, out.path, options=out.options)
+        return
+    if out.kind in {"xml", "xml_dir"}:
+        XMLBackend().write_multi(frames, out.path, options=out.options)
         return
     if out.kind in {"yaml", "yaml_dir"}:
         _yaml_save(frames, out.path)

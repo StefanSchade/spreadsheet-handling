@@ -32,6 +32,13 @@ except Exception:  # pragma: no cover
     _load_yaml_dir = None  # type: ignore[assignment]
     _save_yaml_dir = None  # type: ignore[assignment]
 
+# XML backend
+try:
+    from .xml_backend import read_xml_dir as _load_xml_dir, write_xml_dir as _save_xml_dir
+except Exception:  # pragma: no cover
+    _load_xml_dir = None  # type: ignore[assignment]
+    _save_xml_dir = None  # type: ignore[assignment]
+
 
 def _require(fn: object, kind: str, rw: str) -> None:
     if fn is None:
@@ -65,6 +72,12 @@ if _load_yaml_dir and _save_yaml_dir:
     for alias in ("yaml_dir", "yaml"):
         LOADERS[alias] = _load_yaml_dir
         SAVERS[alias] = _save_yaml_dir
+
+# XML (register both 'xml_dir' and 'xml')
+if _load_xml_dir and _save_xml_dir:
+    for alias in ("xml_dir", "xml"):
+        LOADERS[alias] = _load_xml_dir
+        SAVERS[alias] = _save_xml_dir
 
 
 def get_loader(kind: str) -> Callable[[str], Frames]:
