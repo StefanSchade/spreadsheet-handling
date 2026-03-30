@@ -75,7 +75,8 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
     """
     Build a naive 1-table-per-sheet IR:
       - Table starts at A1 (top=1, left=1).
-      - One header row (header_rows=1).
+      - Header rows dynamically set from MultiIndex column levels
+        (1 for single-level, N for N-level MultiIndex).
       - Records headers + header_map for later validation/formatting passes.
       - Skips non-DataFrame entries.
       - Preserves domain meta in a hidden _meta sheet.

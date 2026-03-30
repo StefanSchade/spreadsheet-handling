@@ -71,3 +71,23 @@ def test_unflatten_requires_non_empty_separator() -> None:
         assert False, "expected ValueError"
     except ValueError as e:
         assert "non-empty sep" in str(e)
+
+
+def test_flatten_join_preserves_empty_levels_roundtrip() -> None:
+    """Ragged MultiIndex: empty-string levels must survive flatten→unflatten."""
+    cols = pd.MultiIndex.from_tuples(
+        [
+            ("order", ""),
+            ("date", ""),
+            ("customer", "name"),
+        ]
+    )
+    df = pd.DataFrame([["O1", "2026-01-01", "Alice"]], columns=cols)
+    frames = {"orders": df}
+
+    flat = flatten_headers("orders", mode="join", sep=".")(frames)
+    assert list(flat["orders"].columns) == ["order.", "date.", "customer.name"]
+
+    restored = unflatten_headers("orders", sep=".")(flat)
+    assert isinstance(restored["orders"].columns, pd.MultiIndex)
+    assert list(restored["orders"].columns) == list(cols)

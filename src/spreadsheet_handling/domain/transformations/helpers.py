@@ -118,7 +118,7 @@ def flatten_headers(sheet: Optional[str] = None, *, mode: str = "first_nonempty"
             if mode == "level0":
                 new = [str(t[0]) for t in tuples]
             elif mode == "join":
-                new = [sep.join(str(x) for x in t if str(x)) for t in tuples]
+                new = [sep.join(str(x) for x in t) for t in tuples]
             else:  # first_nonempty
                 new = [next((str(x) for x in t if str(x)), "") for t in tuples]
 

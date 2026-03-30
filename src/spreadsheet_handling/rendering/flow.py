@@ -153,4 +153,4 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     return plan
 
 def default_p1_passes() -> List[IRPass]:
-    return [StylePass(), FilterPass(), FreezePass(), ValidationPass(), MetaPass()]
+    return [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass()]
