@@ -1,34 +1,41 @@
 from __future__ import annotations
-from spreadsheet_handling.rendering.flow import compose_ir, apply_ir_passes, build_render_plan, default_p1_passes
-from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_plan as render_plan_to_xlsx
+from spreadsheet_handling.rendering.flow import build_render_plan
+from spreadsheet_handling.rendering.passes import apply_all
+from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
 from tests.utils.xlsx_normalize import normalize_xlsx
 
+import pandas as pd
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
 
 def test_p1_smoke_render_flow(tmp_path):
-    domain = {
-        "sheets": [
-            {
-                "name": "Sheet1",
-                "headers": ["A", "B", "C"],
-                "rows": [["a1", "b1", "c1"]],
-                "validations": [{"kind": "list", "col": 2, "values": ["A","B","C"], "from_row": 2, "to_row": 100}],
-                "options": {"header_fill_rgb": "#F2F2F2", "freeze_header": True, "auto_filter": True},
-                "meta": {"author": "tester"}
+    frames = {
+        "Sheet1": pd.DataFrame({"A": ["a1"], "B": ["b1"], "C": ["c1"]}),
+    }
+    meta = {
+        "version": "0.1.0",
+        "exported_at": "2025-10-28T00:00:00Z",
+        "author": "tester",
+        "sheets": {
+            "Sheet1": {
+                "header_fill_rgb": "#F2F2F2",
+                "freeze_header": True,
+                "auto_filter": True,
             }
+        },
+        "constraints": [
+            {"sheet": "Sheet1", "column": "B", "rule": {"type": "in_list", "values": ["A", "B", "C"]}},
         ],
-        "workbook_meta": {"version": "0.1.0", "exported_at": "2025-10-28T00:00:00Z", "author": "tester"}
     }
 
-    ir = compose_ir(domain)
-    ir = apply_ir_passes(ir, default_p1_passes())
+    ir = compose_workbook(frames, meta)
+    ir = apply_all(ir, meta)
     plan = build_render_plan(ir)
 
     out = tmp_path / "p1.xlsx"
-    render_plan_to_xlsx(plan, str(out))
-    print("PLAN OPS:", getattr(plan, "ops", None))  # ← shows if AddValidation exists
+    render_workbook(plan, str(out))
 
     shape = normalize_xlsx(str(out))
     assert "Sheet1" in shape["sheets"]

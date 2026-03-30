@@ -17,50 +17,6 @@ from .plan import (
     DefineNamedRange,
 )
 
-def compose_ir(domain_input: Dict[str, Any]) -> WorkbookIR:
-    """
-    Compose a minimal IR from a simple DTO (temporary for P1).
-    """
-    wb = WorkbookIR()
-    for sheet_dto in domain_input.get("sheets", []):
-        name = sheet_dto["name"]
-        headers = sheet_dto.get("headers", [])
-        rows = sheet_dto.get("rows", [])
-        n_rows = len(rows) + 1 if headers else len(rows)
-        n_cols = len(headers) if headers else (len(rows[0]) if rows else 0)
-        header_map = {h: idx + 1 for idx, h in enumerate(headers)}
-
-        table = TableBlock(
-            frame_name="main",
-            top=1,
-            left=1,
-            header_rows=1 if headers else 0,
-            header_cols=1,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            headers=headers,
-            header_map=header_map,
-        )
-        sheet_ir = SheetIR(name=name, tables=[table], meta=sheet_dto.get("meta", {}))
-
-        # carry validation DTOs (for ValidationPass)
-        p1_valids = sheet_dto.get("validations", [])
-        if p1_valids:
-            sheet_ir.meta["_p1_validations"] = p1_valids
-
-        # options (style/autofilter/freeze)
-        opts = sheet_dto.get("options", {})
-        if opts:
-            sheet_ir.meta["options"] = opts
-
-        wb.sheets[name] = sheet_ir
-
-    # workbook-level meta on hidden _meta sheet
-    hidden_meta_sheet = SheetIR(name="_meta", meta=domain_input.get("workbook_meta", {}))
-    wb.hidden_sheets["_meta"] = hidden_meta_sheet
-
-    return wb
-
 def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
     for p in passes:
         doc = p.apply(doc)

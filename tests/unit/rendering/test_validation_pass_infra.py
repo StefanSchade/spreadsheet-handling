@@ -9,9 +9,7 @@ from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.passes.core import ValidationPass, MetaPass
 from spreadsheet_handling.rendering.passes import apply_all
-from spreadsheet_handling.rendering.flow import (
-    compose_ir, apply_ir_passes, build_render_plan, default_p1_passes,
-)
+from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.ir import SheetIR, WorkbookIR
 
 pytestmark = pytest.mark.ftr("FTR-VALIDATION-PASS-INFRA")
@@ -179,7 +177,7 @@ class TestEndToEndConstraintPropagation:
 
 class TestEndToEndXlsx:
     def test_constraints_appear_in_xlsx(self, tmp_path):
-        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_plan
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
         from tests.utils.xlsx_normalize import normalize_xlsx
 
         frames = {"Data": pd.DataFrame({"id": [1, 2], "color": ["red", "blue"]})}
@@ -195,7 +193,7 @@ class TestEndToEndXlsx:
         plan = build_render_plan(ir)
 
         out = tmp_path / "test.xlsx"
-        render_plan(plan, str(out))
+        render_workbook(plan, str(out))
 
         shape = normalize_xlsx(str(out))
         assert "Data" in shape["validations"]

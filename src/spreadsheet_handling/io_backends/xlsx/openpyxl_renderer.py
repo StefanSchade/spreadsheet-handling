@@ -33,36 +33,7 @@ def _write(ws: Worksheet, row: int, col: int, value: Any) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# IR path (legacy)
-#   Expects an object with attribute `sheets: Dict[str, SheetIR]`
-#   where each SheetIR may have .validations like list[{kind, area, formula, allow_empty}]
-# --------------------------------------------------------------------------------------
-
-def _render_from_ir(ir: Any, out_path: Path) -> None:
-    wb = Workbook()
-    default = wb.active
-    wb.remove(default)
-
-    # sheets
-    for name, sheet_ir in getattr(ir, "sheets", {}).items():
-        ws = _get_ws(wb, name)
-
-        # optional validations in IR form
-        for dv_spec in getattr(sheet_ir, "validations", []) or []:
-            if getattr(dv_spec, "kind", None) == "list":
-                area = getattr(dv_spec, "area", None)
-                formula = getattr(dv_spec, "formula", None)
-                allow = bool(getattr(dv_spec, "allow_empty", True))
-                if area and formula:
-                    r1, c1, r2, c2 = area
-                    dv = DataValidation(type="list", formula1=formula, allow_blank=allow)
-                    ws.add_data_validation(dv)
-                    dv.add(_area_to_ref(r1, c1, r2, c2))
-
-    wb.save(out_path)
-
-# --------------------------------------------------------------------------------------
-# RenderPlan path (new)
+# RenderPlan path
 #   Duck-typed executor that understands common ops used in P1:
 #   - DefineSheet(sheet, order?)
 #   - SetHeader(sheet, row, col, text)
@@ -293,30 +264,15 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
 
 def render_workbook(obj: Any, out_path: Path | str) -> None:
     """
-    Render either:
-      - IR object with `.sheets` (legacy), or
-      - RenderPlan object with `.ops` (new).
+    Render a RenderPlan (`.ops`) to XLSX.
     """
     out_path = Path(out_path)
-
-    if hasattr(obj, "sheets"):
-        _render_from_ir(obj, out_path)
-        return
 
     if hasattr(obj, "ops"):
         _render_from_plan(obj, out_path)
         return
 
-    raise TypeError("render_workbook: unsupported object; expected IR (.sheets) or RenderPlan (.ops)")
+    raise TypeError("render_workbook: unsupported object; expected RenderPlan (.ops)")
 
 
-# Historical alias used by early IR smoke tests.
-def render_plan(plan: Any, out_path: Path | str) -> None:
-    """
-    Deprecated: prefer render_workbook(plan, out_path).
-    Kept temporarily for experimental tests.
-    """
-    render_workbook(plan, out_path)
-
-
-__all__ = ["render_workbook", "render_plan"]
+__all__ = ["render_workbook"]

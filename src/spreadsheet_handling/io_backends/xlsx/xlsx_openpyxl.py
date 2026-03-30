@@ -99,40 +99,4 @@ def render_plan(plan: RenderPlan, out_path: Path | str) -> None:
 
     wb.save(out_p)
 
-# --- Legacy IR-based function kept for compatibility (will be removed) ---
 
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.datavalidation import DataValidation as _DV
-
-def _area_to_ref(area):
-    r1, c1, r2, c2 = area
-    c1l = get_column_letter(c1)
-    c2l = get_column_letter(c2)
-    if r1 == r2 and c1 == c2:
-        return f"{c1l}{r1}"
-    return f"{c1l}{r1}:{c2l}{r2}"
-
-def render_workbook_ir_legacy(ir, out_path: Path | str):
-    """
-    Previous adapter entry-point: writes directly from IR.
-    Retained only to avoid breaking existing callers until deprecation lands.
-    """
-    out_p = Path(out_path)
-    out_p.parent.mkdir(parents=True, exist_ok=True)
-
-    wb = Workbook()
-    default = wb.active
-    wb.remove(default)
-
-    for name, sheet_ir in ir.sheets.items():
-        ws = wb.create_sheet(title=name)
-        if not ws.max_row:
-            ws["A1"] = " "
-
-        for dv_spec in sheet_ir.validations:
-            if dv_spec.kind == "list":
-                dv = _DV(type="list", formula1=dv_spec.formula, allow_blank=dv_spec.allow_empty)
-                ws.add_data_validation(dv)
-                dv.add(_area_to_ref(dv_spec.area))
-
-    wb.save(out_p)
