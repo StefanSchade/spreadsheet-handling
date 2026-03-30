@@ -150,6 +150,18 @@ def _render_from_plan(plan: Any, out_path: Path) -> None:
                 _write(ws, row, col, val)
             continue
 
+        # Bulk data block write
+        if oname == "WriteDataBlock":
+            sheet = getattr(op, "sheet", None)
+            if sheet:
+                ws = _get_ws(wb, sheet)
+                r1 = int(getattr(op, "r1", 1))
+                c1 = int(getattr(op, "c1", 1))
+                for row_off, row_data in enumerate(op.data):
+                    for col_off, val in enumerate(row_data):
+                        ws.cell(row=r1 + row_off, column=c1 + col_off, value=val)
+            continue
+
         # Freeze panes (if present)
         if oname in {"FreezeBelowHeader", "FreezePane", "SetFreeze"}:
             sheet = getattr(op, "sheet", None)

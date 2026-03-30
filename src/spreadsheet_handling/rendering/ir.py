@@ -34,6 +34,7 @@ class TableBlock:
     n_cols: int = 0
     headers: List[str] = field(default_factory=list)
     header_map: Dict[str, int] = field(default_factory=dict)
+    data: Optional[List[List]] = None  # row-major 2D data (None = not populated)
     # legacy alias (to be removed under FTR-IR-TYPING-CANONICAL)
     top_left: Optional[tuple[int, int]] = None
 

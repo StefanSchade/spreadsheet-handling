@@ -114,6 +114,7 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
             n_cols=n_cols,
             headers=headers,
             header_map=header_map,
+            data=df.values.tolist(),
         )
         sh.tables.append(tbl)
         sh.meta["__header_grid"] = header_grid

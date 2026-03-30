@@ -68,6 +68,14 @@ class ApplyColumnStyle:
     fill_rgb: Optional[str] = None  # "#RRGGBB" or None
 
 @dataclass(frozen=True)
+class WriteDataBlock:
+    """Write a rectangular block of cell values."""
+    sheet: str
+    r1: int       # top-left row (1-based)
+    c1: int       # top-left col (1-based)
+    data: tuple   # tuple of tuples — row-major 2D data
+
+@dataclass(frozen=True)
 class WriteMeta:
     sheet: str  # typically "_meta"
     kv: Dict[str, str]
@@ -82,6 +90,7 @@ RenderOp = Union[
     SetAutoFilter,
     SetFreeze,
     AddValidation,
+    WriteDataBlock,
     WriteMeta,
 ]
 

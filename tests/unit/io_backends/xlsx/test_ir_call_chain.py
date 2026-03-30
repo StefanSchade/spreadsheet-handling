@@ -5,7 +5,7 @@ import pytest
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 import spreadsheet_handling.io_backends.xlsx.xlsx_backend as xb   # <-- patch THIS module's symbols
 
-pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
+pytestmark = pytest.mark.ftr("FTR-IR-DATA-CELLS")
 
 
 @pytest.mark.xlsx_ir
@@ -32,19 +32,22 @@ def test_ir_pipeline_is_called(monkeypatch, tmp_path):
         calls.append("build_plan")
         return _FakePlan()
 
-    def fake_apply_plan(xlsx_path, plan):
-        calls.append("apply_plan")
+    def fake_render(plan, out_path):
+        calls.append("render")
+        # create a minimal xlsx so the .exists() check works
+        from openpyxl import Workbook
+        Workbook().save(out_path)
 
     # Patch the names that xlsx_backend actually calls
     monkeypatch.setattr(xb, "compose_workbook", fake_compose, raising=True)
     monkeypatch.setattr(xb, "apply_render_passes", fake_apply_all, raising=True)
     monkeypatch.setattr(xb, "build_render_plan", fake_build_plan, raising=True)
-    monkeypatch.setattr(xb, "_apply_plan_to_existing", fake_apply_plan, raising=True)
+    monkeypatch.setattr(xb, "render_workbook", fake_render, raising=True)
 
     frames = {"Sheet1": pd.DataFrame({"a": [1, 2]})}
     out = tmp_path / "book.xlsx"
 
     ExcelBackend().write_multi(frames, out)
 
-    assert calls == ["compose", "passes", "build_plan", "apply_plan"]
+    assert calls == ["compose", "passes", "build_plan", "render"]
     assert out.exists()

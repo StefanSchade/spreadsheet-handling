@@ -12,6 +12,7 @@ from .plan import (
     SetAutoFilter,
     SetFreeze,
     AddValidation,
+    WriteDataBlock,
     WriteMeta,
 )
 
@@ -110,6 +111,16 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
                             bold=bool(header_style.get("bold", False)),
                             fill_rgb=header_style.get("fill"),
                         ))
+
+            # Data cells
+            if t.data is not None:
+                data_start = t.top + t.header_rows
+                plan.add(WriteDataBlock(
+                    sheet=sheet_name,
+                    r1=data_start,
+                    c1=t.left,
+                    data=tuple(tuple(row) for row in t.data),
+                ))
 
         af = sh.meta.get("__autofilter")
         if af:

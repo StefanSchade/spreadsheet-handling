@@ -343,27 +343,10 @@ class ExcelBackend(BackendBase):
         meta = (frames.get("_meta") if isinstance(frames, dict) else {}) or getattr(frames, "meta", {}) or {}
         ir = compose_workbook(frames, meta)
 
-        # Step 1: Write raw data via pandas WITHOUT headers; plan writes headers.
-        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-            for sheet_name, df in frames.items():
-                name = str(sheet_name)
-                if name in _RESERVED_FRAME_KEYS:
-                    continue
-                sheet = (name or "Sheet")[:31]
-                df0 = _ensure_dataframe(df)
-                table = ir.sheets.get(name).tables[0] if ir.sheets.get(name) and ir.sheets.get(name).tables else None
-                header_rows = int(table.header_rows) if table else 1
-                start_row = max(0, header_rows)  # pandas startrow is 0-based
-                # pandas cannot write MultiIndex columns with header=False,index=False;
-                # for data-only writes we can safely normalize to simple numeric columns.
-                df_data = df0.copy()
-                df_data.columns = list(range(df_data.shape[1]))
-                df_data.to_excel(xw, sheet_name=sheet, index=False, header=False, startrow=start_row)
-
-        # Step 2: Build IR → passes → render plan → overlay formatting
+        # Build IR → passes → render plan (now includes data cells)
         apply_render_passes(ir, meta)
         plan = build_render_plan(ir)
-        _apply_plan_to_existing(out_path, plan)
+        render_workbook(plan, out_path)
 
     def read_multi(
             self,
