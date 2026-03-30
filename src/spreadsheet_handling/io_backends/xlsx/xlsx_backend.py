@@ -362,9 +362,35 @@ class ExcelBackend(BackendBase):
         Hidden sheets (e.g. ``_meta``) are excluded from data frames.
         If a ``_meta`` sheet is present its key/value pairs are extracted
         and returned as ``frames["_meta"]`` (a plain dict, not a DataFrame).
+
+        When the IR backend is active (``SH_XLSX_BACKEND=ir``), the read
+        path uses :func:`parse_ir` for geometry-aware extraction.
         """
+        use_ir = (
+                (options and getattr(options, "use_ir_backend", None) is True)
+                or os.getenv("SH_XLSX_BACKEND", "").lower() in {"ir", "new", "1", "true"}
+        )
         p = Path(path)
 
+        if use_ir:
+            return self._read_multi_ir(p)
+
+        return self._read_multi_legacy(p, header_levels)
+
+    # ------------------------------------------------------------------
+    # IR read path
+    # ------------------------------------------------------------------
+
+    def _read_multi_ir(self, p: Path) -> Dict[str, pd.DataFrame]:
+        from spreadsheet_handling.rendering.parse_ir import parse_ir, workbookir_to_frames
+        ir = parse_ir(p)
+        return workbookir_to_frames(ir)
+
+    # ------------------------------------------------------------------
+    # Legacy (pandas) read path
+    # ------------------------------------------------------------------
+
+    def _read_multi_legacy(self, p: Path, header_levels: int) -> Dict[str, pd.DataFrame]:
         # --- detect hidden sheets via openpyxl before pandas reads -----------
         wb = load_workbook(p, read_only=True, data_only=True)
         hidden_names: set[str] = set()
