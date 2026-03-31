@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Protocol, Dict, Any, List
+from typing import Protocol, Dict, Any, List, Optional
 from ..ir import WorkbookIR, SheetIR, DataValidationSpec, NamedRange
 
 class IRPass(Protocol):
@@ -89,9 +89,9 @@ class ValidationPass:
                 sh.validations.append(dv)
 
         # New path: workbook-level constraints (column name based)
-        meta_sheet = doc.hidden_sheets.get("_meta")
+        meta_sheet: Optional[SheetIR] = doc.hidden_sheets.get("_meta")
         wb_meta = (meta_sheet.meta.get("workbook_meta_blob") or {}) if meta_sheet else {}
-        constraints = wb_meta.get("constraints") or []
+        constraints = wb_meta.get("constraints") or [] if isinstance(wb_meta, dict) else []
         for c in constraints:
             if not isinstance(c, dict):
                 continue
@@ -102,10 +102,10 @@ class ValidationPass:
                 continue
             if rule.get("type") != "in_list":
                 continue
-            sh = doc.sheets.get(str(sheet_name))
-            if not sh or not sh.tables:
+            target = doc.sheets.get(str(sheet_name))
+            if not target or not target.tables:
                 continue
-            t = sh.tables[0]
+            t = target.tables[0]
             col_idx = t.header_map.get(str(col_name))
             if not col_idx:
                 continue
@@ -114,22 +114,21 @@ class ValidationPass:
             values = [str(v) for v in (rule.get("values") or [])]
             formula = '"' + ",".join(values) + '"'
             dv = DataValidationSpec(kind="list", area=(r1, col_idx, r2, col_idx), formula=formula, allow_empty=True)
-            sh.validations.append(dv)
+            target.validations.append(dv)
 
         return doc
 
 @dataclass
 class MetaPass:
-    minimal_fields: List[str] = None
+    minimal_fields: Optional[List[str]] = None
     def __post_init__(self):
         if self.minimal_fields is None:
             self.minimal_fields = ["version", "exported_at", "author"]
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
-        meta = doc.hidden_sheets.get("_meta")
-        if not meta:
-            meta = SheetIR(name="_meta", meta={})
+        meta: SheetIR = doc.hidden_sheets.get("_meta") or SheetIR(name="_meta", meta={})
+        if "_meta" not in doc.hidden_sheets:
             doc.hidden_sheets["_meta"] = meta
-        for f in self.minimal_fields:
+        for f in (self.minimal_fields or []):
             meta.meta.setdefault(f, "")
         meta.meta["_hidden"] = True
         return doc

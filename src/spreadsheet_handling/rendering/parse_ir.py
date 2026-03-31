@@ -113,7 +113,7 @@ def _read_meta_sheet(wb: openpyxl.Workbook) -> Dict[str, Any]:
     blob_str = kv.get("workbook_meta_blob", "")
     if blob_str:
         try:
-            return json.loads(blob_str)
+            return dict(json.loads(str(blob_str)))
         except (json.JSONDecodeError, TypeError):
             pass
         try:

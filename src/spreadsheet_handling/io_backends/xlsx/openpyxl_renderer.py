@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.styles import Font, PatternFill
+
+from spreadsheet_handling.rendering.plan import (
+    RenderPlan,
+    DefineSheet,
+    SetHeader,
+    MergeCells,
+    ApplyHeaderStyle,
+    ApplyColumnStyle,
+    SetAutoFilter,
+    SetFreeze,
+    AddValidation,
+    WriteDataBlock,
+    WriteMeta,
+    DefineNamedRange,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -33,246 +49,125 @@ def _write(ws: Worksheet, row: int, col: int, value: Any) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# RenderPlan path
-#   Duck-typed executor that understands common ops used in P1:
-#   - DefineSheet(sheet, order?)
-#   - SetHeader(sheet, row, col, text)
-#   - SetCell/WriteCell(sheet, row, col, value)
-#   - AddValidation(kind='list', sheet, col, values, from_row, to_row)
-#   - FreezeBelowHeader / AutoFilter (optional if present)
-#   - AddMetaSheet(meta: dict, hidden=True)  (ignored except sheet creation)
+# Typed renderer — dispatches on isinstance checks against plan.py dataclasses
 # --------------------------------------------------------------------------------------
 
-def _render_from_plan(plan: Any, out_path: Path) -> None:
+def _render_from_plan(plan: RenderPlan, out_path: Path) -> None:
     wb = Workbook()
     default = wb.active
     wb.remove(default)
 
-    sheets_order: list[str] = list(getattr(plan, "sheet_order", []) or [])
     defined: set[str] = set()
 
-    # First pass: create sheets deterministically (DefineSheet or from order list)
-    for op in getattr(plan, "ops", []) or []:
-        name = type(op).__name__
-        if name == "DefineSheet":
-            sheet = getattr(op, "sheet", None)
-            if sheet and sheet not in defined:
-                _get_ws(wb, sheet)
-                defined.add(sheet)
+    # First pass: create sheets deterministically
+    for op in plan.ops:
+        if isinstance(op, DefineSheet) and op.sheet not in defined:
+            _get_ws(wb, op.sheet)
+            defined.add(op.sheet)
 
-    for s in sheets_order:
+    for s in plan.sheet_order:
         if s and s not in defined:
             _get_ws(wb, s)
             defined.add(s)
 
     if not defined:
-        # Fallback: ensure at least one sheet exists for smoke tests
         _get_ws(wb, "Sheet1")
 
     # Second pass: execute operations
-    for op in getattr(plan, "ops", []) or []:
-        oname = type(op).__name__
+    for op in plan.ops:
 
-        # Headers
-        if oname == "SetHeader":
-            sheet = getattr(op, "sheet", None)
-            row = int(getattr(op, "row", 1))
-            col = int(getattr(op, "col", 1))
-            text = getattr(op, "text", "")
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                _write(ws, row, col, text)
+        if isinstance(op, DefineSheet):
             continue
 
-        if oname == "MergeCells":
-            sheet = getattr(op, "sheet", None)
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                r1 = int(getattr(op, "r1", 1))
-                c1 = int(getattr(op, "c1", 1))
-                r2 = int(getattr(op, "r2", r1))
-                c2 = int(getattr(op, "c2", c1))
-                ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
+        if isinstance(op, SetHeader):
+            ws = _get_ws(wb, op.sheet)
+            _write(ws, op.row, op.col, op.text)
             continue
 
-        # Header style (bold + fill)
-        if oname == "ApplyHeaderStyle":
-            sheet = getattr(op, "sheet", None)
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                row = int(getattr(op, "row", 1))
-                col = int(getattr(op, "col", 1))
-                cell = ws.cell(row=row, column=col)
-                if getattr(op, "bold", False):
-                    cell.font = Font(bold=True)
-                fill_rgb = getattr(op, "fill_rgb", None)
-                if fill_rgb:
-                    cell.fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
+        if isinstance(op, MergeCells):
+            ws = _get_ws(wb, op.sheet)
+            ws.merge_cells(
+                start_row=op.r1, start_column=op.c1,
+                end_row=op.r2, end_column=op.c2,
+            )
             continue
 
-        # Generic cell write
-        if oname in {"SetCell", "WriteCell"}:
-            sheet = getattr(op, "sheet", None)
-            row = int(getattr(op, "row", 1))
-            col = int(getattr(op, "col", 1))
-            val = getattr(op, "value", "")
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                _write(ws, row, col, val)
+        if isinstance(op, ApplyHeaderStyle):
+            ws = _get_ws(wb, op.sheet)
+            cell = ws.cell(row=op.row, column=op.col)
+            if op.bold:
+                cell.font = Font(bold=True)
+            if op.fill_rgb:
+                cell.fill = PatternFill("solid", fgColor=op.fill_rgb.lstrip("#"))
             continue
 
-        # Bulk data block write
-        if oname == "WriteDataBlock":
-            sheet = getattr(op, "sheet", None)
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                r1 = int(getattr(op, "r1", 1))
-                c1 = int(getattr(op, "c1", 1))
-                for row_off, row_data in enumerate(op.data):
-                    for col_off, val in enumerate(row_data):
-                        ws.cell(row=r1 + row_off, column=c1 + col_off, value=val)
+        if isinstance(op, ApplyColumnStyle):
+            if op.fill_rgb:
+                ws = _get_ws(wb, op.sheet)
+                fill = PatternFill("solid", fgColor=op.fill_rgb.lstrip("#"))
+                for r in range(op.from_row, op.to_row + 1):
+                    ws.cell(row=r, column=op.col).fill = fill
             continue
 
-        # Freeze panes (if present)
-        if oname in {"FreezeBelowHeader", "FreezePane", "SetFreeze"}:
-            sheet = getattr(op, "sheet", None)
-            row = int(getattr(op, "row", 2))
-            col = int(getattr(op, "col", 1))
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                ws.freeze_panes = f"{get_column_letter(col)}{row}"
+        if isinstance(op, WriteDataBlock):
+            ws = _get_ws(wb, op.sheet)
+            for row_off, row_data in enumerate(op.data):
+                for col_off, val in enumerate(row_data):
+                    ws.cell(row=op.r1 + row_off, column=op.c1 + col_off, value=val)
             continue
 
-        # AutoFilter (if present)
-        if oname in {"SetAutoFilter", "AutoFilter"}:
-            sheet = getattr(op, "sheet", None)
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                try:
-                    ws.auto_filter.ref = ws.dimensions  # e.g. "A1:C2"
-                except Exception:
-                    pass
+        if isinstance(op, SetFreeze):
+            ws = _get_ws(wb, op.sheet)
+            ws.freeze_panes = f"{get_column_letter(op.col)}{op.row}"
             continue
 
-        # Data validation (list)
-        if (
-                "Validation" in oname
-                or getattr(op, "kind", None) == "list"
-                or hasattr(op, "values")
-                or hasattr(op, "formula")
-        ):
-            sheet = getattr(op, "sheet", None)
-            if not sheet:
-                continue
-            ws = _get_ws(wb, sheet)
+        if isinstance(op, SetAutoFilter):
+            ws = _get_ws(wb, op.sheet)
+            ref = _area_to_ref(op.r1, op.c1, op.r2, op.c2)
+            ws.auto_filter.ref = ref
+            continue
 
-            # area calculation
-            if all(hasattr(op, x) for x in ("r1", "c1", "r2", "c2")):
-                r1, c1, r2, c2 = int(op.r1), int(op.c1), int(op.r2), int(op.c2)
-            elif hasattr(op, "area"):
-                r1, c1, r2, c2 = map(int, op.area)
-            else:
-                col = int(getattr(op, "col", 1))
-                r1 = int(getattr(op, "from_row", 2))
-                r2 = int(getattr(op, "to_row", r1))
-                r1, c1, r2, c2 = r1, col, r2, col
-
-            ref = _area_to_ref(r1, c1, r2, c2)
-            formula = getattr(op, "formula", None)
-            if not formula:
-                values = list(getattr(op, "values", []) or [])
-                if not values:
-                    continue
-                formula = f'"{",".join(map(str, values))}"'
-            allow = bool(getattr(op, "allow_empty", True))
-
-            # ensure the validation is properly linked to the sheet
-            dv = DataValidation(type="list", formula1=formula, allow_blank=allow)
+        if isinstance(op, AddValidation):
+            ws = _get_ws(wb, op.sheet)
+            ref = _area_to_ref(op.r1, op.c1, op.r2, op.c2)
+            dv = DataValidation(
+                type="list", formula1=op.formula, allow_blank=op.allow_empty,
+            )
             dv.add(ref)
-            if ws.data_validations is None or dv not in ws.data_validations.dataValidation:
-                ws.add_data_validation(dv)
-
-            print(f"✅ Added DV to {sheet}:{ref} -> {formula}")
+            ws.add_data_validation(dv)
             continue
 
-        # WriteMeta: write key/value pairs to the given (possibly hidden) sheet
-        if oname == "WriteMeta":
-            sheet = getattr(op, "sheet", None) or "_meta"
-            kv = getattr(op, "kv", {}) or {}
-            hidden = bool(getattr(op, "hidden", False))
-            ws = _get_ws(wb, sheet)
-            # Write each key/value pair into two columns
+        if isinstance(op, WriteMeta):
+            sheet_name = op.sheet or "_meta"
+            ws = _get_ws(wb, sheet_name)
             row = 1
-            for k, v in kv.items():
+            for k, v in op.kv.items():
                 ws.cell(row=row, column=1, value=str(k))
                 ws.cell(row=row, column=2, value=str(v))
                 row += 1
-            if hidden:
+            if op.hidden:
                 ws.sheet_state = "hidden"
-            print(f"✅ Wrote meta: {len(kv)} items to {sheet}")
             continue
 
-        # DefineSheet (already handled for creation)
-        if oname == "DefineSheet":
-            continue
-
-        # Named ranges
-        if oname == "DefineNamedRange":
-            name = getattr(op, "name", "")
-            sheet = getattr(op, "sheet", "")
-            r1 = int(getattr(op, "r1", 1))
-            c1 = int(getattr(op, "c1", 1))
-            r2 = int(getattr(op, "r2", 1))
-            c2 = int(getattr(op, "c2", 1))
-            if name and sheet:
-                from openpyxl.workbook.defined_name import DefinedName
-                ref = f"'{sheet}'!${get_column_letter(c1)}${r1}:${get_column_letter(c2)}${r2}"
-                dn = DefinedName(name, attr_text=ref)
-                wb.defined_names.add(dn)
-            continue
-
-        # AddMetaSheet (we only ensure the sheet exists; content optional for P1)
-        if oname in {"AddMetaSheet", "DefineHiddenSheet"}:
-            sheet = getattr(op, "sheet", None) or getattr(op, "name", None)
-            if sheet:
-                _get_ws(wb, sheet)
-            continue
-
-        # Unknown op -> ignore (smoke path)
-        # print(f"[xlsx renderer] skipping op {oname}")
-
-        # ApplyColumnStyle: fill data cells in a column range
-        if oname == "ApplyColumnStyle":
-            sheet = getattr(op, "sheet", None)
-            if sheet:
-                ws = _get_ws(wb, sheet)
-                col = int(getattr(op, "col", 1))
-                r1 = int(getattr(op, "from_row", 2))
-                r2 = int(getattr(op, "to_row", r1))
-                fill_rgb = getattr(op, "fill_rgb", None)
-                if fill_rgb:
-                    fill = PatternFill("solid", fgColor=fill_rgb.lstrip("#"))
-                    for r in range(r1, r2 + 1):
-                        ws.cell(row=r, column=col).fill = fill
+        if isinstance(op, DefineNamedRange):
+            ref = (
+                f"'{op.sheet}'!"
+                f"${get_column_letter(op.c1)}${op.r1}:"
+                f"${get_column_letter(op.c2)}${op.r2}"
+            )
+            wb.defined_names.add(DefinedName(op.name, attr_text=ref))
             continue
 
     wb.save(out_path)
+
 
 # --------------------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------------------
 
-def render_workbook(obj: Any, out_path: Path | str) -> None:
-    """
-    Render a RenderPlan (`.ops`) to XLSX.
-    """
-    out_path = Path(out_path)
-
-    if hasattr(obj, "ops"):
-        _render_from_plan(obj, out_path)
-        return
-
-    raise TypeError("render_workbook: unsupported object; expected RenderPlan (.ops)")
+def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
+    """Render a *RenderPlan* to an XLSX file via openpyxl."""
+    _render_from_plan(plan, Path(out_path))
 
 
 __all__ = ["render_workbook"]

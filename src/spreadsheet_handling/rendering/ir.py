@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Literal
+from typing import Any, Dict, List, Tuple, Optional, Literal
 
 CellRef = Tuple[int, int]           # (row, col) 1-based
 AreaRef = Tuple[int, int, int, int] # (r1, c1, r2, c2)
@@ -35,16 +35,7 @@ class TableBlock:
     headers: List[str] = field(default_factory=list)
     header_map: Dict[str, int] = field(default_factory=dict)
     data: Optional[List[List]] = None  # row-major 2D data (None = not populated)
-    # legacy alias (to be removed under FTR-IR-TYPING-CANONICAL)
-    top_left: Optional[tuple[int, int]] = None
 
-    def __post_init__(self):
-        if self.top_left is not None:
-            # only apply if caller didn’t set canonical fields
-            if (self.top, self.left) == (1, 1):
-                self.top, self.left = self.top_left
-            # optionally warn:
-            # warnings.warn("TableBlock.top_left is deprecated; use top/left", DeprecationWarning)
 
 
 @dataclass
@@ -53,7 +44,7 @@ class SheetIR:
     tables: List[TableBlock] = field(default_factory=list)
     validations: List[DataValidationSpec] = field(default_factory=list)
     named_ranges: List[NamedRange] = field(default_factory=list)
-    meta: Dict[str, object] = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
     styles: List[StyleSpec] = field(default_factory=list)
 
     def __post_init__(self):
