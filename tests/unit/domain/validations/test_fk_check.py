@@ -41,7 +41,7 @@ class TestDuplicateIds:
         frames = {"X": pd.DataFrame({"id": [1, 1, 2], "name": ["a", "b", "c"]})}
         findings = check_duplicate_ids(frames, DEFAULTS)
         assert len(findings) == 1
-        assert findings[0].kind == "duplicate_id"
+        assert findings[0].category == "duplicate_id"
         assert findings[0].sheet == "X"
         assert "1" in findings[0].detail
 
@@ -59,7 +59,7 @@ class TestUnresolvableFks:
         a = pd.DataFrame({"id": [10], "id_(B)": [99]})  # 99 not in B
         findings = check_unresolvable_fks({"A": a, "B": b}, DEFAULTS)
         assert len(findings) == 1
-        assert findings[0].kind == "unresolvable_fk"
+        assert findings[0].category == "unresolvable_fk"
         assert "99" in findings[0].detail
 
 
@@ -76,7 +76,7 @@ class TestUnexpectedHelpers:
         a = pd.DataFrame({"id": [1], "_Z_name": ["orphan"]})
         findings = check_unexpected_helpers({"A": a}, DEFAULTS)
         assert len(findings) == 1
-        assert findings[0].kind == "unexpected_helper"
+        assert findings[0].category == "unexpected_helper"
         assert findings[0].column == "_Z_name"
 
 
@@ -92,7 +92,7 @@ class TestMissingHelpers:
         frames = _two_sheet_frames(with_helper=False)
         findings = check_missing_helpers(frames, DEFAULTS)
         assert len(findings) == 1
-        assert findings[0].kind == "missing_helper"
+        assert findings[0].category == "missing_helper"
         assert findings[0].column == "_B_name"
 
 
@@ -108,7 +108,7 @@ class TestHelperValues:
         frames = _two_sheet_frames(with_helper=True, helper_values=["WRONG", "beta"])
         findings = check_helper_values(frames, DEFAULTS)
         assert len(findings) == 1
-        assert findings[0].kind == "value_mismatch"
+        assert findings[0].category == "value_mismatch"
         assert "1 row(s)" in findings[0].detail
 
 
@@ -125,6 +125,6 @@ class TestValidateAll:
         b = pd.DataFrame({"id": [1, 1], "name": ["alpha", "alpha"]})
         a = pd.DataFrame({"id": [10], "id_(B)": [1]})
         findings = validate_fk_helpers({"A": a, "B": b}, DEFAULTS)
-        kinds = {f.kind for f in findings}
+        kinds = {f.category for f in findings}
         assert "duplicate_id" in kinds
         assert "missing_helper" in kinds

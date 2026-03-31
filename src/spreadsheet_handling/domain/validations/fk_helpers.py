@@ -5,8 +5,7 @@ No logging, no exceptions for validation issues — callers decide policy.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List
 
 import pandas as pd
 
@@ -17,28 +16,16 @@ from ...core.fk import (
     detect_fk_columns,
 )
 from ...core.indexing import has_level0, level0_series
+from .findings import Finding
 
 
 # ---------------------------------------------------------------------------
-# Finding dataclass
+# Backward-compat alias
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class FKFinding:
-    """A single FK-helper validation finding."""
-    sheet: str
-    kind: Literal[
-        "unexpected_helper",
-        "missing_helper",
-        "value_mismatch",
-        "unresolvable_fk",
-        "duplicate_id",
-    ]
-    column: str
-    detail: str = ""
+FKFinding = Finding  # tests may import FKFinding — it's now just Finding
 
-
-Findings = List[FKFinding]
+Findings = List[Finding]
 Frames = Dict[str, pd.DataFrame]
 
 
@@ -66,9 +53,9 @@ def check_unexpected_helpers(
         for col in first_cols:
             col_s = str(col)
             if col_s.startswith(helper_prefix) and col_s not in expected_helpers:
-                findings.append(FKFinding(
+                findings.append(Finding(
+                    category="unexpected_helper",
                     sheet=sheet_name,
-                    kind="unexpected_helper",
                     column=col_s,
                     detail=f"helper column '{col_s}' has no matching FK column",
                 ))
@@ -93,9 +80,9 @@ def check_missing_helpers(
         )
         for fk in fk_defs:
             if fk.helper_column not in first_cols:
-                findings.append(FKFinding(
+                findings.append(Finding(
+                    category="missing_helper",
                     sheet=sheet_name,
-                    kind="missing_helper",
                     column=fk.helper_column,
                     detail=f"FK column '{fk.fk_column}' expects helper '{fk.helper_column}'",
                 ))
@@ -154,9 +141,9 @@ def check_helper_values(
             if mismatches:
                 n = len(mismatches)
                 sample = mismatches[:3]
-                findings.append(FKFinding(
+                findings.append(Finding(
+                    category="value_mismatch",
                     sheet=sheet_name,
-                    kind="value_mismatch",
                     column=fk.helper_column,
                     detail=f"{n} row(s) differ from canonical lookup (rows {sample})",
                 ))
@@ -196,9 +183,9 @@ def check_unresolvable_fks(
                 if _norm(v) not in target_map
             })
             if missing:
-                findings.append(FKFinding(
+                findings.append(Finding(
+                    category="unresolvable_fk",
                     sheet=sheet_name,
-                    kind="unresolvable_fk",
                     column=fk.fk_column,
                     detail=f"values not found in '{fk.target_sheet_key}': {missing}",
                 ))
@@ -222,9 +209,9 @@ def check_duplicate_ids(
         counts = ids.value_counts(dropna=False)
         dups = [str(idx) for idx, cnt in counts.items() if cnt > 1 and str(idx) != "nan"]
         if dups:
-            findings.append(FKFinding(
+            findings.append(Finding(
+                category="duplicate_id",
                 sheet=sheet_name,
-                kind="duplicate_id",
                 column=id_field,
                 detail=f"duplicate values: {dups}",
             ))
