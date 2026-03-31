@@ -1,26 +1,26 @@
 # tests/unit/io_backends/test_xlsx_writer_styling.py
+import types as _types
 import pandas as pd
 import pytest
 from pathlib import Path
 from openpyxl import load_workbook
-from spreadsheet_handling.pipeline.types import MetaDict, Context
 from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import write_xlsx
 
-def _ctx(tmp_path: Path) -> Context:
+def _ctx(tmp_path: Path):
     app = AppConfig(
         io=IOConfig(inputs={"primary": IOEndpoint(kind="json", path="unused")}, output=IOEndpoint(kind="xlsx", path=str(tmp_path/"out.xlsx"))),
         pipeline=PipelineConfig(steps=[]),
         excel=ExcelOptions(auto_filter=True, header_fill_rgb="DDDDDD", freeze_header=False, helper_fill_rgb="FFF5CC"),
         strict=True,
     )
-    return Context(app=app)
+    return _types.SimpleNamespace(app=app)
 
 @pytest.mark.ftr("FTR-CLEANUP-IR-P4")
 def test_xlsx_header_and_autofilter(tmp_path: Path):
     frames = {"T": pd.DataFrame([{"a":"1", "b":"2"}, {"a":"3", "b":"4"}])}
     ctx = _ctx(tmp_path)
-    meta = MetaDict()
+    meta = {}
     out = tmp_path/"out.xlsx"
     write_xlsx(str(out), frames, meta, ctx)
 

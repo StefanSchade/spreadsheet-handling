@@ -6,8 +6,7 @@ from typing import Any, Dict, Tuple, List
 
 from ..io_backends.router import get_loader, get_saver
 from .config import AppConfig, PipelineConfig
-from . import pipeline as pl  # <- um Namenskollision mit dieser Datei zu vermeiden
-from .pipeline import build_steps_from_config  # Steps aus Spezifikation binden
+from .registry import run_pipeline as _run_pipeline, build_steps_from_config
 
 
 def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
@@ -32,7 +31,7 @@ def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> tupl
 
     # --- Ausführen (nur wenn Steps vorhanden) ---
     if bound_steps:
-        frames = pl.run_pipeline(frames, bound_steps)
+        frames = _run_pipeline(frames, bound_steps)
 
     # --- Output schreiben ---
     out = io.output
