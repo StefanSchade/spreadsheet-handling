@@ -100,12 +100,9 @@ class TestJSONSidecar:
 # ===========================================================================
 # XLSX meta tests
 # ===========================================================================
-
-@pytest.mark.xlsx_ir
 class TestXLSXMeta:
 
     def test_write_creates_hidden_meta_sheet(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -117,7 +114,6 @@ class TestXLSXMeta:
         wb.close()
 
     def test_read_extracts_meta(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -126,7 +122,6 @@ class TestXLSXMeta:
         assert "_meta" not in {k for k in back if isinstance(back[k], pd.DataFrame)}
 
     def test_read_excludes_hidden_sheets_from_data(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -137,7 +132,6 @@ class TestXLSXMeta:
 
     def test_roundtrip_xlsx(self, tmp_path: Path, monkeypatch):
         """Full XLSX roundtrip: meta survives write → read."""
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         frames = _sample_frames()
         ExcelBackend().write_multi(frames, str(out))
@@ -151,13 +145,10 @@ class TestXLSXMeta:
 # ===========================================================================
 # Cross-backend roundtrip
 # ===========================================================================
-
-@pytest.mark.xlsx_ir
 class TestCrossBackendRoundtrip:
 
     def test_json_to_xlsx_to_json_meta_survives(self, tmp_path: Path, monkeypatch):
         """JSON → XLSX → JSON: meta must survive the round-trip."""
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         json_dir = tmp_path / "step1_json"
         xlsx_path = tmp_path / "step2.xlsx"
         json_dir2 = tmp_path / "step3_json"

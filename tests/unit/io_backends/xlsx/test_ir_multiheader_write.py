@@ -11,7 +11,6 @@ pytestmark = pytest.mark.ftr("FTR-MULTIHEADER-P2")
 
 
 def test_ir_backend_writes_multirow_headers_with_merges(tmp_path, monkeypatch):
-    monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
 
     cols = pd.MultiIndex.from_tuples([
         ("order", "id"),

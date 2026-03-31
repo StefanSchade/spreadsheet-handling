@@ -19,7 +19,7 @@ from spreadsheet_handling.rendering.composer.layout_composer import compose_work
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.parse_ir import parse_ir
 
-pytestmark = [pytest.mark.ftr("FTR-NAMED-RANGES"), pytest.mark.xlsx_ir]
+pytestmark = [pytest.mark.ftr("FTR-NAMED-RANGES")]
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,6 @@ class TestNamedRangeEmission:
 class TestNamedRangeXLSXRoundtrip:
 
     def test_named_ranges_written_to_xlsx(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         frames = {
             "products": pd.DataFrame([
                 {"id": "P-1", "name": "Alpha"},
@@ -127,7 +126,6 @@ class TestNamedRangeXLSXRoundtrip:
         wb.close()
 
     def test_named_ranges_roundtrip_via_parse_ir(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         frames = {
             "products": pd.DataFrame([
                 {"id": "P-1", "name": "Alpha"},

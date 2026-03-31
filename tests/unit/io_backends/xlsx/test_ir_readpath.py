@@ -13,7 +13,7 @@ from spreadsheet_handling.io_backends.json_backend import JSONBackend
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.parse_ir import parse_ir, workbookir_to_frames
 
-pytestmark = [pytest.mark.ftr("FTR-IR-READPATH"), pytest.mark.xlsx_ir]
+pytestmark = [pytest.mark.ftr("FTR-IR-READPATH")]
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,6 @@ def _sample_frames(*, with_meta: bool = True) -> dict:
 class TestParseIRDataExtraction:
 
     def test_table_data_populated(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -58,7 +57,6 @@ class TestParseIRDataExtraction:
         assert tbl.data[1][1] == "Beta"
 
     def test_table_data_all_strings(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -76,7 +74,6 @@ class TestParseIRDataExtraction:
 class TestWorkbookIRToFrames:
 
     def test_returns_all_visible_sheets(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -86,7 +83,6 @@ class TestWorkbookIRToFrames:
         assert "branches" in frames
 
     def test_dataframe_columns_match(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -96,7 +92,6 @@ class TestWorkbookIRToFrames:
         assert list(frames["branches"].columns) == ["branch_id", "manager"]
 
     def test_dataframe_values_match(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -106,7 +101,6 @@ class TestWorkbookIRToFrames:
         assert frames["branches"].iloc[1]["manager"] == "Bob"
 
     def test_meta_extracted(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -124,7 +118,6 @@ class TestWorkbookIRToFrames:
 class TestReadMultiIR:
 
     def test_ir_read_returns_dataframes(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -133,7 +126,6 @@ class TestReadMultiIR:
         assert len(back["products"]) == 2
 
     def test_ir_read_excludes_hidden_sheets(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
@@ -150,7 +142,6 @@ class TestJSONXLSXJSONRoundtrip:
 
     def test_data_roundtrips(self, tmp_path: Path, monkeypatch):
         """JSON → XLSX (IR write) → XLSX (IR read) → JSON: data values match."""
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         json_in = tmp_path / "json_in"
         xlsx_path = tmp_path / "mid.xlsx"
         json_out = tmp_path / "json_out"
@@ -185,7 +176,6 @@ class TestJSONXLSXJSONRoundtrip:
 
     def test_meta_roundtrips(self, tmp_path: Path, monkeypatch):
         """Meta survives JSON → XLSX → JSON roundtrip."""
-        monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
         json_in = tmp_path / "json_in"
         xlsx_path = tmp_path / "mid.xlsx"
         json_out = tmp_path / "json_out"

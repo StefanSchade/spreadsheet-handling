@@ -6,9 +6,6 @@ from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 import spreadsheet_handling.io_backends.xlsx.xlsx_backend as xb   # <-- patch THIS module's symbols
 
 pytestmark = pytest.mark.ftr("FTR-IR-DATA-CELLS")
-
-
-@pytest.mark.xlsx_ir
 def test_ir_pipeline_is_called(monkeypatch, tmp_path):
     calls = []
 

@@ -9,7 +9,7 @@ class Frames(dict):
     """Dict-like frames that can also carry .meta."""
     pass
 
-@pytest.mark.xlsx_legacy
+@pytest.mark.ftr("FTR-CLEANUP-IR-P4")
 def test_xlsx_validations_applied(tmp_path):
     # 1) frames + meta
     frames = Frames({"Kunden": pd.DataFrame({"Kategorie": ["Privat", ""]})})

@@ -134,19 +134,14 @@ def test_ir_write_numeric_data_roundtrip(tmp_path):
 
 
 def test_ir_backend_write_multi_produces_data(tmp_path):
-    """Integration: ExcelBackend.write_multi with IR path writes data cells."""
-    import os
-    os.environ["SH_XLSX_BACKEND"] = "ir"
-    try:
-        from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
-        frames = {"Items": pd.DataFrame({"code": ["A", "B"], "qty": [10, 20]})}
-        out = tmp_path / "backend.xlsx"
-        ExcelBackend().write_multi(frames, str(out))
+    """Integration: ExcelBackend.write_multi writes data cells."""
+    from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
+    frames = {"Items": pd.DataFrame({"code": ["A", "B"], "qty": [10, 20]})}
+    out = tmp_path / "backend.xlsx"
+    ExcelBackend().write_multi(frames, str(out))
 
-        wb = openpyxl.load_workbook(out)
-        ws = wb["Items"]
-        assert ws.cell(1, 1).value == "code"
-        assert ws.cell(2, 1).value == "A"
-        assert ws.cell(3, 2).value == 20
-    finally:
-        os.environ.pop("SH_XLSX_BACKEND", None)
+    wb = openpyxl.load_workbook(out)
+    ws = wb["Items"]
+    assert ws.cell(1, 1).value == "code"
+    assert ws.cell(2, 1).value == "A"
+    assert ws.cell(3, 2).value == 20

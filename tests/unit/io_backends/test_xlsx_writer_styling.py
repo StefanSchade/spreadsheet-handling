@@ -16,7 +16,7 @@ def _ctx(tmp_path: Path) -> Context:
     )
     return Context(app=app)
 
-@pytest.mark.xlsx_legacy
+@pytest.mark.ftr("FTR-CLEANUP-IR-P4")
 def test_xlsx_header_and_autofilter(tmp_path: Path):
     frames = {"T": pd.DataFrame([{"a":"1", "b":"2"}, {"a":"3", "b":"4"}])}
     ctx = _ctx(tmp_path)

@@ -344,7 +344,7 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 # Test targets
 # =========================
 .PHONY: test test-verbose test-lastfailed test-one test-file test-node \
-        test-unit test-integ test-ir test-legacy test-all
+        test-unit test-integ test-legacy test-all
 
 # Venv + pytest resolution
 VENV         ?= .venv
@@ -395,14 +395,6 @@ test-unit: deps-dev ## Unit tests only (exclude integ)
 
 test-integ: deps-dev ## Integration tests only
 	$(PYTEST) -q -m 'integ' $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
-
-test-ir: deps-dev ## IR-only tests (SH_XLSX_BACKEND=ir)
-	SH_XLSX_BACKEND=ir $(PYTEST) -q -m 'xlsx_ir' $(PYTEST_OPTS) $(TEST_PATH)
-
-test-parity: deps-dev ## Parity: legacy vs IR structural equivalence (FTR-PARITY-IR-P3)
-	TZ=UTC LC_ALL=C PYTHONHASHSEED=0 $(PYTEST) -v \
-		tests/integration/io_backends/xlsx/test_parity_ir_p3.py \
-		$(IGNORE_OPT) $(PYTEST_OPTS)
 
 test-legacy: deps-dev ## Legacy-only (pre-hex tests, normally excluded)
 	$(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) $(TEST_PATH)

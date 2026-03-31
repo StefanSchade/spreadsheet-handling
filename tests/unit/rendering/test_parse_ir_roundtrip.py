@@ -22,7 +22,6 @@ pytestmark = pytest.mark.ftr("FTR-ROUNDTRIP-SAFE-P1")
 @pytest.fixture(autouse=True)
 def _use_ir_backend(monkeypatch):
     """Force the IR backend for all tests in this module."""
-    monkeypatch.setenv("SH_XLSX_BACKEND", "ir")
 
 
 # ---------------------------------------------------------------------------

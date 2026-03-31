@@ -211,12 +211,10 @@ class TestBuildRenderPlan:
 # ---------------------------------------------------------------------------
 
 class TestXlsxStyleOutput:
-
-    @pytest.mark.xlsx_ir
     def test_header_bold_and_fill_in_xlsx(self, tmp_path: Path) -> None:
         """Verify that header cells in the output workbook have bold font and fill."""
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-        from spreadsheet_handling.io_backends.xlsx.xlsx_openpyxl import render_plan
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
         from openpyxl import load_workbook
 
         frames = {"products": pd.DataFrame([{"id": "a", "name": "Alpha"}])}
@@ -225,17 +223,15 @@ class TestXlsxStyleOutput:
         plan = build_render_plan(ir)
 
         out = tmp_path / "out.xlsx"
-        render_plan(plan, out)
+        render_workbook(plan, out)
 
         wb = load_workbook(out)
         ws = wb.active
         assert ws.cell(row=1, column=1).font.bold is True
         assert ws.cell(row=1, column=1).fill.fgColor.rgb is not None
-
-    @pytest.mark.xlsx_ir
     def test_autofilter_present(self, tmp_path: Path) -> None:
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-        from spreadsheet_handling.io_backends.xlsx.xlsx_openpyxl import render_plan
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
         from openpyxl import load_workbook
 
         frames = {"products": pd.DataFrame([{"id": "a", "name": "Alpha"}])}
@@ -244,17 +240,15 @@ class TestXlsxStyleOutput:
         plan = build_render_plan(ir)
 
         out = tmp_path / "out.xlsx"
-        render_plan(plan, out)
+        render_workbook(plan, out)
 
         wb = load_workbook(out)
         ws = wb.active
         assert ws.auto_filter.ref is not None
-
-    @pytest.mark.xlsx_ir
     def test_helper_column_fill_in_xlsx(self, tmp_path: Path) -> None:
         """Verify helper columns get a distinct fill color in the output."""
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-        from spreadsheet_handling.io_backends.xlsx.xlsx_openpyxl import render_plan
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
         from openpyxl import load_workbook
 
         frames = {
@@ -268,7 +262,7 @@ class TestXlsxStyleOutput:
         plan = build_render_plan(ir)
 
         out = tmp_path / "out.xlsx"
-        render_plan(plan, out)
+        render_workbook(plan, out)
 
         wb = load_workbook(out)
         ws = wb.active

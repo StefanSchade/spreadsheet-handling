@@ -10,8 +10,6 @@ pytestmark = pytest.mark.ftr("FTR-IR-WRITEPATH-P1")
 
 class Frames(dict):
     pass
-
-@pytest.mark.xlsx_ir
 def test_apply_in_list_validation_smoke(tmp_path):
     frames = Frames({"Kunden": pd.DataFrame({"Kategorie": ["Privat", ""]})})
     frames.meta = {
