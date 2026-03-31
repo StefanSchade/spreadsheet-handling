@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, cast
-from dataclasses import is_dataclass
+from typing import Any, Dict, Mapping
 from pathlib import Path
 import os
 
@@ -9,7 +8,7 @@ import pandas as pd
 from xml.etree.ElementTree import Element, SubElement, ElementTree, indent
 import xml.etree.ElementTree as ET
 
-from .base import BackendBase, BackendOptions
+from .base import BackendBase, BackendOptions, coerce_backend_options
 
 Frames = Dict[str, pd.DataFrame]
 
@@ -19,17 +18,6 @@ def _is_empty_header_segment(x: Any) -> bool:
         return True
     s = str(x).strip()
     return s == "" or s.lower() in ("nan", "none") or s.startswith("Unnamed:")
-
-
-def _coerce_options(opts: Mapping[str, Any] | BackendOptions | None) -> BackendOptions:
-    if opts is None:
-        return cast(BackendOptions, {})
-    try:
-        if isinstance(BackendOptions, type) and is_dataclass(BackendOptions):
-            return BackendOptions(**dict(opts))  # type: ignore[misc,call-arg]
-    except Exception:
-        pass
-    return cast(BackendOptions, dict(opts))
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +191,10 @@ class XMLBackend(BackendBase):
 
 def read_xml_dir(path: str, *, header_levels: int = 1,
                  options: Mapping[str, Any] | BackendOptions | None = None) -> Frames:
-    return XMLBackend().read_multi(path, header_levels=header_levels, options=_coerce_options(options))
+    return XMLBackend().read_multi(path, header_levels=header_levels, options=coerce_backend_options(options))
 
 
 def write_xml_dir(frames: Frames, path: str, *,
                   options: Mapping[str, Any] | BackendOptions | None = None) -> None:
     """Write frames to a directory of XML files, one per sheet."""
-    XMLBackend().write_multi(frames, str(path), options=_coerce_options(options))
+    XMLBackend().write_multi(frames, str(path), options=coerce_backend_options(options))

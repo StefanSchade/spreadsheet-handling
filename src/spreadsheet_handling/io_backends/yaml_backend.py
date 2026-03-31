@@ -6,6 +6,8 @@ from typing import Dict, Iterable, List
 import pandas as pd
 import yaml
 
+from .base import BackendOptions
+
 Frames = Dict[str, pd.DataFrame]
 
 
@@ -15,7 +17,10 @@ def _glob_yaml_files(root: Path) -> Iterable[Path]:
     yield from root.glob("*.yaml")
 
 
-def load_yaml_dir(path: str) -> Frames:
+def load_yaml_dir(
+    path: str,
+    options: BackendOptions | None = None,
+) -> Frames:
     """
     Liest einen Ordner mit YAML-Dateien in Frames:
       - Jede Datei entspricht einem Sheet
@@ -55,7 +60,11 @@ def load_yaml_dir(path: str) -> Frames:
     return frames
 
 
-def save_yaml_dir(frames: Frames, path: str) -> None:
+def save_yaml_dir(
+    frames: Frames,
+    path: str,
+    options: BackendOptions | None = None,
+) -> None:
     """
     Schreibt Frames als YAML-Dateien (eine Datei pro Sheet):
       - Listen von Records (List[Dict[str, Any]])

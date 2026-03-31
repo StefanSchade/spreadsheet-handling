@@ -1,6 +1,10 @@
 from __future__ import annotations
+
+from pathlib import Path
+
 import pandas as pd
-from .base import BackendBase
+
+from .base import BackendBase, BackendOptions
 
 
 def _escape_csv_cell(v) -> str:
@@ -18,7 +22,13 @@ class CSVBackend(BackendBase):
     - UTF-8 ohne BOM.
     """
 
-    def write(self, df: pd.DataFrame, path: str, sheet_name: str = "Daten") -> None:
+    def write(
+        self,
+        df: pd.DataFrame,
+        path: str,
+        sheet_name: str = "Daten",
+        options: BackendOptions | None = None,
+    ) -> None:
         if not isinstance(df.columns, pd.MultiIndex):
             df = df.copy()
             df.columns = pd.MultiIndex.from_arrays([df.columns], names=[None])
@@ -37,7 +47,6 @@ class CSVBackend(BackendBase):
             for row in body_rows:
                 f.write(",".join(_escape_csv_cell(v) for v in row) + "\n")
 
-   # optional: options tolerieren
     def read(
         self,
         path: str,
@@ -54,8 +63,7 @@ class CSVBackend(BackendBase):
             na_values=[],
         )
         return df
-    
-    # Neu: Multi-Sheet aus Ordner
+
     def read_multi(
         self,
         path: str,
@@ -73,3 +81,25 @@ class CSVBackend(BackendBase):
         if not out:
             raise FileNotFoundError(f"Keine *.csv in {folder} gefunden.")
         return out
+
+
+def load_csv_dir(
+    path: str,
+    options: BackendOptions | None = None,
+) -> dict[str, pd.DataFrame]:
+    return CSVBackend().read_multi(path, header_levels=1, options=options)
+
+
+def save_csv_dir(
+    frames: dict[str, pd.DataFrame],
+    path: str,
+    options: BackendOptions | None = None,
+) -> None:
+    out_dir = Path(path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = CSVBackend()
+    for sheet_name, df in frames.items():
+        if sheet_name == "_meta":
+            continue
+        backend.write(df, str(out_dir / f"{sheet_name}.csv"), options=options)

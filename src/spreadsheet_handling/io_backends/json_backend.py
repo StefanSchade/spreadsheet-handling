@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 import json
-from dataclasses import is_dataclass
 import os
 from pathlib import Path
 from typing import Dict
@@ -10,7 +9,7 @@ from typing import Dict
 import pandas as pd
 import yaml
 
-from .base import BackendBase, BackendOptions
+from .base import BackendBase, BackendOptions, coerce_backend_options
 
 Frames = Dict[str, pd.DataFrame]
 
@@ -63,25 +62,6 @@ def _records_nested_from_multiindex(df: pd.DataFrame) -> list[dict[str, Any]]:
         out.append(obj)
     return out
 
-
-def _coerce_options(opts: Mapping[str, Any] | BackendOptions | None) -> BackendOptions:
-    """
-    Accept None | dict | BackendOptions and return BackendOptions.
-    - If BackendOptions is a dataclass type, construct it from the mapping.
-    - Otherwise (TypedDict / alias), return a plain dict casted to BackendOptions.
-    """
-    if opts is None:
-        # empty default
-        return cast(BackendOptions, {})
-    # if the "type" itself is a class / dataclass constructor, try to build it
-    try:
-        # hasattr check avoids calling is_dataclass on non-class aliases
-        if isinstance(BackendOptions, type) and is_dataclass(BackendOptions):
-            return BackendOptions(**dict(opts))  # type: ignore[misc,call-arg]
-    except Exception:
-        pass
-    # Otherwise just return a plain dict (compatible with TypedDict/alias)
-    return cast(BackendOptions, dict(opts))
 
 class JSONBackend(BackendBase):
     """
@@ -171,29 +151,16 @@ def read_json_dir(path: str, *, header_levels: int = 1, options: Mapping[str, An
     Public convenience wrapper used by get_loader(). Accepts optional options.
     """
     from .json_backend import JSONBackend  # keep local to avoid circulars
-    return JSONBackend().read_multi(path, header_levels=header_levels, options=_coerce_options(options))
+    return JSONBackend().read_multi(path, header_levels=header_levels, options=coerce_backend_options(options))
 
 
-def write_json_dir(arg1, arg2=None, *, options: Mapping[str, Any] | BackendOptions | None = None) -> None:
+def write_json_dir(
+    frames: Frames,
+    path: str | os.PathLike[str],
+    *,
+    options: Mapping[str, Any] | BackendOptions | None = None,
+) -> None:
     """
-    Backward- & forward-compatible:
-      - write_json_dir(path, frames)
-      - write_json_dir(frames, path)
+    Write frames to a directory of JSON files, one per sheet.
     """
-    from .json_backend import JSONBackend
-
-    def _is_pathlike(x):
-        from pathlib import Path
-        import os as _os
-        return isinstance(x, (str, Path)) or hasattr(x, "__fspath__") or isinstance(x, _os.PathLike)
-
-    if _is_pathlike(arg1) and isinstance(arg2, dict):
-        path = arg1
-        frames = arg2
-    elif isinstance(arg1, dict) and _is_pathlike(arg2):
-        frames = arg1
-        path = arg2
-    else:
-        raise TypeError("write_json_dir expects (path, frames) or (frames, path)")
-
-    JSONBackend().write_multi(frames, path, options=_coerce_options(options))
+    JSONBackend().write_multi(frames, os.fspath(path), options=coerce_backend_options(options))

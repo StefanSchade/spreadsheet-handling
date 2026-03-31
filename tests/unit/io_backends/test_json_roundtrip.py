@@ -9,7 +9,7 @@ def test_json_roundtrip(tmp_path: Path):
         "branches": pd.DataFrame([{"branch_id":"B-1","city":"X"}]),
     }
     out = tmp_path / "data"
-    write_json_dir(str(out), frames)
+    write_json_dir(frames, str(out))
     back = read_json_dir(str(out))
     assert set(back.keys()) == {"products","branches"}
     assert list(back["products"].columns) == ["id","name"]

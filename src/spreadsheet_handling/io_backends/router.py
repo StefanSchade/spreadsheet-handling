@@ -1,92 +1,49 @@
 from __future__ import annotations
+
 from typing import Callable, Dict
+
 import pandas as pd
+
+from .csv_backend import load_csv_dir, save_csv_dir
+from .json_backend import read_json_dir, write_json_dir
+from .xml_backend import read_xml_dir, write_xml_dir
+from .yaml_backend import load_yaml_dir, save_yaml_dir
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import load_xlsx, save_xlsx
 
 Frames = dict[str, pd.DataFrame]
 
-# CSV directory backend
-try:
-    from .csv_backend import load_csv_dir as _load_csv_dir, save_csv_dir as _save_csv_dir
-except Exception:  # pragma: no cover
-    _load_csv_dir = None  # type: ignore[assignment]
-    _save_csv_dir = None  # type: ignore[assignment]
+LOADERS: Dict[str, Callable[..., Frames]] = {
+    "csv_dir": load_csv_dir,
+    "xlsx": load_xlsx,
+    "json_dir": read_json_dir,
+    "json": read_json_dir,
+    "yaml_dir": load_yaml_dir,
+    "yaml": load_yaml_dir,
+    "xml_dir": read_xml_dir,
+    "xml": read_xml_dir,
+}
 
-# XLSX backend
-try:
-    from spreadsheet_handling.io_backends.xlsx.xlsx_backend import load_xlsx as _load_xlsx, save_xlsx as _save_xlsx
-except Exception:  # pragma: no cover
-    _load_xlsx = None  # type: ignore[assignment]
-    _save_xlsx = None  # type: ignore[assignment]
-
-# JSON backend
-try:
-    from .json_backend import read_json_dir as _load_json_dir, write_json_dir as _save_json_dir
-except Exception:  # pragma: no cover
-    _load_json_dir = None  # type: ignore[assignment]
-    _save_json_dir = None  # type: ignore[assignment]
-
-# YAML backend
-try:
-    from .yaml_backend import load_yaml_dir as _load_yaml_dir, save_yaml_dir as _save_yaml_dir
-except Exception:  # pragma: no cover
-    _load_yaml_dir = None  # type: ignore[assignment]
-    _save_yaml_dir = None  # type: ignore[assignment]
-
-# XML backend
-try:
-    from .xml_backend import read_xml_dir as _load_xml_dir, write_xml_dir as _save_xml_dir
-except Exception:  # pragma: no cover
-    _load_xml_dir = None  # type: ignore[assignment]
-    _save_xml_dir = None  # type: ignore[assignment]
+SAVERS: Dict[str, Callable[..., None]] = {
+    "csv_dir": save_csv_dir,
+    "xlsx": save_xlsx,
+    "json_dir": write_json_dir,
+    "json": write_json_dir,
+    "yaml_dir": save_yaml_dir,
+    "yaml": save_yaml_dir,
+    "xml_dir": write_xml_dir,
+    "xml": write_xml_dir,
+}
 
 
-def _require(fn: object, kind: str, rw: str) -> None:
-    if fn is None:
-        raise SystemExit(
-            f"I/O backend for '{kind}' ({rw}) is not available. "
-            f"Ensure the module exists and is importable."
-        )
-
-
-LOADERS: Dict[str, Callable[[str], Frames]] = {}
-SAVERS: Dict[str, Callable[[Frames, str], None]] = {}
-
-# CSV
-if _load_csv_dir and _save_csv_dir:
-    LOADERS["csv_dir"] = _load_csv_dir
-    SAVERS["csv_dir"] = _save_csv_dir
-
-# XLSX
-if _load_xlsx and _save_xlsx:
-    LOADERS["xlsx"] = _load_xlsx
-    SAVERS["xlsx"] = _save_xlsx
-
-# JSON (register both 'json_dir' and 'json')
-if _load_json_dir and _save_json_dir:
-    for alias in ("json_dir", "json"):
-        LOADERS[alias] = _load_json_dir
-        SAVERS[alias] = _save_json_dir
-
-# YAML (register both 'yaml_dir' and 'yaml')
-if _load_yaml_dir and _save_yaml_dir:
-    for alias in ("yaml_dir", "yaml"):
-        LOADERS[alias] = _load_yaml_dir
-        SAVERS[alias] = _save_yaml_dir
-
-# XML (register both 'xml_dir' and 'xml')
-if _load_xml_dir and _save_xml_dir:
-    for alias in ("xml_dir", "xml"):
-        LOADERS[alias] = _load_xml_dir
-        SAVERS[alias] = _save_xml_dir
-
-
-def get_loader(kind: str) -> Callable[[str], Frames]:
+def get_loader(kind: str) -> Callable[..., Frames]:
     fn = LOADERS.get(kind)
-    _require(fn, kind, "read")
-    return fn  # type: ignore[return-value]
+    if fn is None:
+        raise ValueError(f"Unknown loader kind: {kind}")
+    return fn
 
 
-def get_saver(kind: str) -> Callable[[Frames, str], None]:
+def get_saver(kind: str) -> Callable[..., None]:
     fn = SAVERS.get(kind)
-    _require(fn, kind, "write")
-    return fn  # type: ignore[return-value]
+    if fn is None:
+        raise ValueError(f"Unknown saver kind: {kind}")
+    return fn

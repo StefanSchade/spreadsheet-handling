@@ -27,7 +27,7 @@ def test_json_backend_writes_nested_objects_for_multiindex_columns(tmp_path: Pat
     }
 
     out = tmp_path / "out"
-    write_json_dir(str(out), frames)
+    write_json_dir(frames, str(out))
 
     data = json.loads((out / "orders.json").read_text(encoding="utf-8"))
     assert data[0]["order"]["id"] == "O1"
@@ -48,7 +48,7 @@ def test_flatten_step_keeps_json_output_flat(tmp_path: Path) -> None:
     frames_flat = flatten_headers("orders", mode="join", sep=".")(frames)
 
     out = tmp_path / "out_flat"
-    write_json_dir(str(out), frames_flat)
+    write_json_dir(frames_flat, str(out))
 
     data = json.loads((out / "orders.json").read_text(encoding="utf-8"))
     assert "order.id" in data[0]
