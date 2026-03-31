@@ -3,7 +3,6 @@ from .csv_backend import CSVBackend
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from .json_backend import JSONBackend
 from .xml_backend import XMLBackend
-from .ods_backend import ODSBackend
 from .errors import DeprecatedAdapterError
 
 
@@ -12,7 +11,6 @@ _BACKENDS = {
     "csv": CSVBackend,
     "json": JSONBackend,
     "xml": XMLBackend,
-    "ods": ODSBackend,
     # aliases:
     "excel": ExcelBackend,
 }
@@ -30,7 +28,6 @@ __all__ = [
     "DeprecatedAdapterError",
     "ExcelBackend",
     "JSONBackend",
-    "ODSBackend",
     "XMLBackend",
     "make_backend",
 ]
