@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd
 
 
@@ -8,7 +10,7 @@ def is_empty_header(x: str | None) -> bool:
     return s == "" or s.lower() in ("nan", "none") or s.startswith("Unnamed:")
 
 
-def set_nested(d, segs, value):
+def set_nested(d: dict[str, Any], segs: list[str], value: Any) -> None:
     cur = d
     for i, s in enumerate(segs):
         last = i == len(segs) - 1
@@ -18,7 +20,7 @@ def set_nested(d, segs, value):
             cur = cur.setdefault(s, {})
 
 
-def row_to_obj(paths: list[str], values: list[str]) -> dict:
+def row_to_obj(paths: list[str | None], values: list[Any]) -> dict[str, Any]:
     obj = {}
     for p, v in zip(paths, values):
         if v is None:
@@ -32,7 +34,7 @@ def row_to_obj(paths: list[str], values: list[str]) -> dict:
     return obj
 
 
-def df_to_objects(df: pd.DataFrame) -> list[dict]:
+def df_to_objects(df: pd.DataFrame) -> list[dict[str, Any]]:
     # Header-Pfade bauen, leere/Unnamed-Zellen skippen
     paths = []
     for col in df.columns:

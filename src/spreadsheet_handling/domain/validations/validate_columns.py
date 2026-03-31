@@ -1,4 +1,13 @@
-def add_validations(frames, *, rules: list[dict]):
+from __future__ import annotations
+
+from typing import Any, Dict
+
+import pandas as pd
+
+Frames = Dict[str, pd.DataFrame]
+
+
+def add_validations(frames: Frames, *, rules: list[dict[str, Any]]) -> Frames:
     # get or create meta on either frames.meta (attr) or frames["_meta"] (dict key)
     if hasattr(frames, "meta"):
         meta = frames.meta or {}

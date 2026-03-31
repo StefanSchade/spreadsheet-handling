@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import json
 from collections import OrderedDict
+from typing import Any
 
 
-def flatten_json(obj, parent=None, sep=".") -> OrderedDict[str, str]:
+def flatten_json(obj: Any, parent: str | None = None, sep: str = ".") -> OrderedDict[str, str]:
     out = OrderedDict()
     if isinstance(obj, dict):
         for k, v in obj.items():  # bewahrt JSON-Key-Order

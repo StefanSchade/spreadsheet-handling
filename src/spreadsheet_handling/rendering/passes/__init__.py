@@ -1,7 +1,8 @@
 from . import meta_pass, validation_pass, style_pass
 from .core import StylePass, FilterPass, FreezePass, ValidationPass, MetaPass, NamedRangePass, IRPass
+from ..ir import WorkbookIR
 
-def apply_all(ir, meta):
+def apply_all(ir: WorkbookIR, meta: dict) -> WorkbookIR:
     """Apply all IR passes in deterministic order.
 
     Uses the CorePass classes (same as default_p1_passes in flow.py)
