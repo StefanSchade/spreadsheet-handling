@@ -8,8 +8,14 @@ import pandas as pd
 
 import importlib
 
-# Wir nutzen die bestehende Engine weiter (keine Logik-Duplikate)
-from ..engine.orchestrator import Engine
+from ..core.fk import (
+    build_registry,
+    build_id_label_maps,
+    detect_fk_columns,
+    apply_fk_helpers as _apply_fk_helpers,
+    FKDef,
+)
+from ..core.indexing import has_level0, level0_series
 
 log = logging.getLogger("sheets.pipeline")
 
@@ -116,7 +122,8 @@ def make_validate_step(
     name: str = "validate",
 ) -> BoundStep:
     """
-    Wrappt Engine.validate zu einem Pipeline-Step (keine Behavior-Änderung).
+    Validates frames: checks duplicate IDs and missing FK references.
+    Delegates to core/fk pure functions (no Engine dependency).
     """
     cfg = {
         "defaults": dict(defaults or {}),
@@ -124,14 +131,75 @@ def make_validate_step(
         "mode_duplicate_ids": mode_duplicate_ids,
     }
 
+    def _norm_id(v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        return str(v).strip()
+
     def run(fr: Frames) -> Frames:
-        eng = Engine(defaults=cfg["defaults"])
-        # validate liefert Report; Frames bleiben (gewollt) unverändert
-        eng.validate(
-            fr,
-            mode_missing_fk=cfg["mode_missing_fk"],
-            mode_duplicate_ids=cfg["mode_duplicate_ids"],
-        )
+        defs = cfg["defaults"]
+        id_field = str(defs.get("id_field", "id"))
+        detect_fk = bool(defs.get("detect_fk", True))
+        helper_prefix = str(defs.get("helper_prefix", "_"))
+
+        reg = build_registry(fr, defs)
+        id_maps = build_id_label_maps(fr, reg)
+
+        # 1) Duplicate IDs per target sheet
+        dups_by_sheet: Dict[str, list] = {}
+        for skey, meta in reg.items():
+            sheet_name = meta["sheet_name"]
+            df = fr[sheet_name]
+            if not has_level0(df, id_field):
+                continue
+            ids = level0_series(df, id_field).astype("string")
+            counts = ids.value_counts(dropna=False)
+            dups = [str(idx) for idx, cnt in counts.items() if cnt > 1 and str(idx) != "nan"]
+            if dups:
+                dups_by_sheet[sheet_name] = dups
+
+        m_dup = cfg["mode_duplicate_ids"]
+        if dups_by_sheet:
+            msg = f"duplicate IDs: {dups_by_sheet}"
+            if m_dup == "fail":
+                log.error(msg)
+                raise ValueError(msg)
+            elif m_dup == "warn":
+                log.warning(msg)
+
+        # 2) Missing FK references
+        m_fk = cfg["mode_missing_fk"]
+        missing_by_sheet: Dict[str, list] = {}
+        if detect_fk:
+            for sheet_name, df in fr.items():
+                fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+                for fk in fk_defs:
+                    col = fk.fk_column
+                    target_key = fk.target_sheet_key
+                    if col not in df.columns:
+                        continue
+                    vals = level0_series(df, col).astype("string")
+                    target_map = id_maps.get(target_key, {})
+                    missing_vals = sorted(
+                        {str(v) for v in vals.dropna().unique() if _norm_id(v) not in target_map}
+                    )
+                    if missing_vals:
+                        missing_by_sheet.setdefault(sheet_name, []).append(
+                            {"column": col, "missing_values": missing_vals}
+                        )
+
+        if missing_by_sheet:
+            if m_fk == "fail":
+                raise ValueError(f"missing FK references: {missing_by_sheet}")
+            elif m_fk == "warn":
+                compact = {
+                    s: {iss["column"]: iss["missing_values"] for iss in issues}
+                    for s, issues in missing_by_sheet.items()
+                }
+                log.warning("missing FK references: %s", compact)
+
         return fr
 
     return BoundStep(name=name, config=cfg, fn=run)
@@ -143,15 +211,29 @@ def make_apply_fks_step(
     name: str = "apply_fks",
 ) -> BoundStep:
     """
-    Wrappt Engine.apply_fks (fügt Helper-Spalten hinzu).
+    Detects FK columns and adds helper columns via core/fk pure functions.
     """
     cfg = {
         "defaults": dict(defaults or {}),
     }
 
     def run(fr: Frames) -> Frames:
-        eng = Engine(defaults=cfg["defaults"])
-        return eng.apply_fks(fr)
+        defs = cfg["defaults"]
+        if not bool(defs.get("detect_fk", True)):
+            return fr
+
+        reg = build_registry(fr, defs)
+        id_maps = build_id_label_maps(fr, reg)
+        levels = int(defs.get("levels", 3))
+        helper_prefix = str(defs.get("helper_prefix", "_"))
+
+        out: Frames = {}
+        for sheet_name, df in fr.items():
+            fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+            out[sheet_name] = _apply_fk_helpers(
+                df, fk_defs, id_maps, levels, helper_prefix=helper_prefix
+            )
+        return out
 
     return BoundStep(name=name, config=cfg, fn=run)
 
