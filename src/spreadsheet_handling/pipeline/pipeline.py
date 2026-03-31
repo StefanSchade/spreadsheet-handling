@@ -280,6 +280,33 @@ def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = 
     return BoundStep(name=name, config=cfg, fn=run)
 
 
+def make_check_fk_helpers_step(
+    *,
+    defaults: Dict[str, Any] | None = None,
+    mode: str = "warn",  # 'ignore' | 'warn' | 'fail'
+    name: str = "check_fk_helpers",
+) -> BoundStep:
+    """
+    Run FK-helper consistency checks (pure domain validation).
+    Returns frames unchanged; logs or raises based on *mode*.
+    """
+    from ..domain.validations.fk_helpers import validate_fk_helpers
+
+    cfg = {"defaults": dict(defaults or {}), "mode": mode}
+
+    def run(fr: Frames) -> Frames:
+        findings = validate_fk_helpers(fr, cfg["defaults"])
+        if findings and cfg["mode"] != "ignore":
+            summary = "; ".join(f"[{f.sheet}] {f.kind}: {f.column}" for f in findings)
+            if cfg["mode"] == "fail":
+                raise ValueError(f"FK-helper check failed: {summary}")
+            else:
+                log.warning("FK-helper findings: %s", summary)
+        return fr
+
+    return BoundStep(name=name, config=cfg, fn=run)
+
+
 # in pipeline/pipeline.py
 def make_add_validations_step(*, rules: list[dict], name: str = "add_validations") -> BoundStep:
     from ..domain.validations.validate_columns import add_validations as _impl
@@ -346,6 +373,7 @@ REGISTRY: Dict[str, Callable[..., BoundStep]] = {
     "validate":         make_validate_step,
     "apply_fks":        make_apply_fks_step,
     "drop_helpers":     make_drop_helpers_step,
+    "check_fk_helpers": make_check_fk_helpers_step,
     "plugin":           make_plugin_step,
     "flatten_headers":  make_flatten_headers_step,
     "unflatten_headers": make_unflatten_headers_step,
