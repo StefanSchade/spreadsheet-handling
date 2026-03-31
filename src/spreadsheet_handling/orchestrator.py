@@ -6,7 +6,8 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 import logging
 import pandas as pd
 
-from .pipeline.pipeline import run_pipeline, BoundStep, Frames  # reuse existing types/runner
+from .pipeline.registry import run_pipeline
+from .pipeline.types import BoundStep, Frames
 
 # Backends (existing adapters)
 from .io_backends.json_backend import JSONBackend

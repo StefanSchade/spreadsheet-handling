@@ -206,17 +206,7 @@ def read_xml_dir(path: str, *, header_levels: int = 1,
     return XMLBackend().read_multi(path, header_levels=header_levels, options=_coerce_options(options))
 
 
-def write_xml_dir(arg1: Any, arg2: Any = None, *,
+def write_xml_dir(frames: Frames, path: str, *,
                   options: Mapping[str, Any] | BackendOptions | None = None) -> None:
-    """Backward-compatible: write_xml_dir(path, frames) or write_xml_dir(frames, path)."""
-    def _is_pathlike(x: Any) -> bool:
-        return isinstance(x, (str, Path)) or hasattr(x, "__fspath__")
-
-    if _is_pathlike(arg1) and isinstance(arg2, dict):
-        path, frames = arg1, arg2
-    elif isinstance(arg1, dict) and _is_pathlike(arg2):
-        frames, path = arg1, arg2
-    else:
-        raise TypeError("write_xml_dir expects (path, frames) or (frames, path)")
-
+    """Write frames to a directory of XML files, one per sheet."""
     XMLBackend().write_multi(frames, str(path), options=_coerce_options(options))

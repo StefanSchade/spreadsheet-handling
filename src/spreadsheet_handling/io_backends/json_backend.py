@@ -2,14 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping, cast
 import json
-
-try:
-    # wherever BackendOptions lives in your tree
-    from ..pipeline.types import BackendOptions
-except Exception:
-    # fallback to keep things running even if the import changes again
-    BackendOptions = dict[str, Any]  # type: ignore[assignment]
-
 from dataclasses import is_dataclass
 import os
 from pathlib import Path

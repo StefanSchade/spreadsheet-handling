@@ -6,8 +6,6 @@ from typing import Callable, Dict, Iterable, Optional
 import re
 import pandas as pd
 
-from ...pipeline.types import Step, Frames
-
 Frames = Dict[str, pd.DataFrame]
 Step = Callable[[Frames], Frames]
 
