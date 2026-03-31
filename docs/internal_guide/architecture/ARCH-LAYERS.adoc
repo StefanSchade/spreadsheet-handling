@@ -1,7 +1,7 @@
 === ARCH-LAYERS — Layer Responsibilities and Boundaries
 
-:updated: 2025-10-28
-:status:
+:updated: 2026-03-31
+:status: post-3b
 
 This section defines the conceptual layers of the Spreadsheet Handling architecture and their relationships.
 It clarifies boundaries, dependencies, and responsibilities to ensure modularity and avoid leakage between concerns.
@@ -34,7 +34,7 @@ User- and system-facing entry point. This layer defines how the system is invoke
 
 '''
 
-==== 2) PIPELINE Layer — Application / Orchestration Layer
+==== 2) PIPELINE Layer -- Application / Orchestration Layer
 
 *Role:*
 Coordinates the high-level workflow. In DDD terms, this is the **Application Service Layer**.
@@ -47,6 +47,18 @@ It wires together domain operations, rendering, and persistence without embeddin
 - Orchestrate calls into the **Domain** layer and downstream into **Render IR** or other output ports.
 - Maintain order and dependency of tasks; assemble results and errors.
 
+*Implementation:*
+
+The pipeline is driven by a **REGISTRY** that maps step names (strings) to factory functions.
+YAML configuration declares a sequence of steps with their parameters.
+`build_steps_from_config()` resolves each step name, calls the factory with the provided kwargs,
+and returns a list of `BoundStep` objects (name + config + closure).
+`run_pipeline()` executes them in order.
+
+Step factories call **core** and **domain** functions directly -- there is no intermediate
+Engine mediator.  The former `Engine` class is retained as a backward-compatible shim
+for legacy tests but is not used in production paths.
+
 *Must NOT:*
 
 - Contain domain-specific logic (e.g., how a transformation computes its output).
@@ -54,13 +66,14 @@ It wires together domain operations, rendering, and persistence without embeddin
 
 *Dependencies:*
 
-* Domain (to execute transformations)
+* Domain (to execute transformations and apply severity policy)
+* Core (for FK detection, registry, id-label maps)
 * Render IR (for spreadsheet persistence)
 * Directly to other I/O backends (for non-spreadsheet formats like JSON, CSV, XML)
 
 '''
 
-==== 3) DOMAIN Layer — Core Model and Business Logic
+==== 3) DOMAIN Layer -- Core Model and Business Logic
 
 *Role:*::
 The heart of the system. Holds all business rules, transformation semantics, and validation logic.
@@ -68,10 +81,17 @@ The heart of the system. Holds all business rules, transformation semantics, and
 *Responsibilities:*
 
 - Define the **Domain Model**: workbook, worksheet, and transformation objects.
-- Implement domain transformations (`Workbook → Workbook`).
+- Implement domain transformations (`Frames -> Frames`).
 - Produce **semantic meta-information** that describes the workbook (e.g., which columns are ephemeral, linked, calculated, foreign keys, or required).
 - Guarantee deterministic results for equivalent inputs.
 - Contain all invariants and validation rules.
+
+*Sub-packages:*
+
+`transformations/`:: Header flattening/unflattening, helper reordering, and other pure data transformations.
+`validations/`:: Structured validation checks that produce `Finding` objects.  The severity policy (`apply_severity_policy`) decides control flow (ignore / warn / fail) -- see <<Validation Findings and Severity Policy>>.
+`meta_bootstrap.py`:: Merges meta from persistence, profiles, and CLI overrides.
+`yaml_overrides.py`:: Loads and applies YAML override documents to frames.
 
 *Must NOT:*
 
@@ -81,12 +101,32 @@ The heart of the system. Holds all business rules, transformation semantics, and
 
 *Dependencies:*
 
-→ none (pure core)
-← Pipeline orchestrates it.
+-> Core (pure utility functions: FK detection, indexing, DataFrame construction)
+<- Pipeline orchestrates it.
 
 '''
 
-==== 4) RENDER IR Layer — Rendering Abstraction / Spreadsheet Adapter
+==== 3b) CORE Layer -- Pure Utility Functions
+
+*Role:*::
+Leaf-level library of stateless, side-effect-free functions used by both Domain and Pipeline.
+
+*Modules:*
+
+`fk.py`:: FK detection, registry building, id-label maps, helper-column application (`FKDef`, `build_registry`, `detect_fk_columns`, `build_id_label_maps`, `apply_fk_helpers`).
+`indexing.py`:: DataFrame column access aware of MultiIndex levels (`has_level0`, `level0_series`).
+`df_build.py`:: Build MultiIndex DataFrames from flat records.
+`flatten.py`:: Flatten nested JSON dicts with configurable separator.
+`refs.py`:: Cell reference arithmetic for rendering.
+
+*Dependencies:*
+
+-> pandas (external)
+<- Domain, Pipeline, IO backends
+
+'''
+
+==== 4) RENDER IR Layer -- Rendering Abstraction / Spreadsheet Adapter
 
 *Role:*::
 Adapter layer for spreadsheet-like backends (XLSX, ODS, OOXML).
@@ -100,6 +140,11 @@ This layer exists to avoid duplicating spreadsheet-specific logic across differe
 - Define and maintain the **Render IR model** (WorkbookIR, SheetIR, TableBlock, DataValidationSpec, etc.).
 - Ensure backend-agnostic semantics.
 
+*Composition Flow:*::
+`compose_workbook(frames, meta)` builds a naive 1-table-per-sheet `WorkbookIR`.
+Passes then enrich the IR: `MetaPass` -> `ValidationPass` -> `StylePass` -> `FilterPass` -> `FreezePass`.
+Finally `build_render_plan()` flattens the IR into a sequence of `RenderOp` objects.
+
 *Must NOT:*::
 - Import or reference backend APIs (OpenPyXL, odfpy, etc.).
 - Write files or manage serialization formats.
@@ -110,8 +155,8 @@ This layer exists to avoid duplicating spreadsheet-specific logic across differe
   Examples: `DefineSheet`, `SetHeader`, `ApplyHeaderStyle`, `SetAutoFilter`, `AddValidation`, `MergeCells`, `WriteMeta`.
 
 *Dependencies:*::
-→ I/O Backend (via protocol or adapter)
-← Pipeline invokes it.
+-> I/O Backend (via protocol or adapter)
+<- Pipeline invokes it.
 
 '''
 ==== 5) IO_BACKEND Layer — Output Port / Technical Persistence
@@ -140,3 +185,111 @@ Each backend converts abstract render or data directives into a specific file fo
 
 ==== Layer Dependency Overview
 
+....
+CLI
+ |
+ v
+Pipeline  --->  Domain  --->  Core  (leaf, no deps)
+ |                                     ^
+ +------------>  Render IR             |
+                    |                  |
+                    v                  |
+                IO Backends  ----------+
+....
+
+*Rules:*
+
+- **Core** has no inward dependencies -- it is the leaf layer.
+- **Domain** depends only on Core.
+- **Pipeline** depends on Domain and Core for step logic, and on Render IR for spreadsheet output preparation.
+- **Render IR** depends only on IO Backends for final persistence (protocol boundary).
+- **IO Backends** depend on Core for cell-reference math and on external libraries for format-specific serialization.
+- **CLI** depends on Pipeline and Orchestrator; it never reaches into Domain or Core directly.
+
+'''
+
+[[validation-findings-severity]]
+==== Validation Findings and Severity Policy
+
+Validation checks in `domain/validations/` produce structured `Finding` objects instead of
+raising exceptions or logging directly.  This keeps the validation functions pure and testable.
+
+*Finding:*::
+A frozen dataclass with fields: `category` (string tag like `"duplicate_id"`, `"unresolvable_fk"`,
+`"unexpected_helper"`), `sheet`, `column`, `detail`, and a default `severity`.
+
+*Severity:*::
+One of `"ignore"` (silent), `"warn"` (log warning), or `"fail"` (raise `ValueError`).
+
+*SeverityPolicy:*::
+A `Dict[str, Severity]` mapping category names to a severity.
+A special `"__default__"` key provides the fallback.
+Example: `{"duplicate_id": "fail", "missing_helper": "ignore", "__default__": "warn"}`
+
+*Flow:*::
+. A pipeline step calls one or more pure check functions (e.g., `check_duplicate_ids`, `check_unresolvable_fks`).
+. The step builds a `SeverityPolicy` from its configuration (e.g., `mode_missing_fk`, `mode_duplicate_ids`).
+. `apply_severity_policy(findings, policy)` iterates over findings, logs warnings, and raises on failures.
+. The validation functions themselves never log or raise -- the caller decides policy.
+
+*Current categories:*
+
+[cols="1,2"]
+|===
+| Category | Meaning
+
+| `duplicate_id`
+| A sheet contains duplicate values in the ID column.
+
+| `unresolvable_fk`
+| An FK column references an ID that does not exist in the target sheet.
+
+| `unexpected_helper`
+| A helper column (prefixed `_`) has no matching FK column.
+
+| `missing_helper`
+| An FK column's expected helper column is absent.
+
+| `value_mismatch`
+| A helper column value differs from the canonical id-label lookup.
+|===
+
+'''
+
+==== Feature Slice: FK-Helper Behavior Across Layers
+
+This section traces the FK-helper feature through all architectural layers to illustrate
+how responsibilities are distributed.
+
+*1. Core (`core/fk.py`):*::
+Pure functions that operate on `Frames` (Dict of DataFrames).
+`build_registry()` scans sheet names for FK-naming conventions and returns a registry dict.
+`detect_fk_columns()` inspects a DataFrame's columns against the registry and returns `FKDef` tuples.
+`build_id_label_maps()` extracts id-to-label lookup dicts per sheet.
+`apply_fk_helpers()` adds helper columns (label lookups) to a DataFrame.
+These functions have no side effects and no configuration awareness.
+
+*2. Domain -- Validation (`domain/validations/fk_helpers.py`):*::
+Five pure check functions consume `Frames` + defaults and return `List[Finding]`.
+They call Core functions to build registry and id-maps, then inspect for inconsistencies.
+`validate_fk_helpers()` is a convenience aggregator that runs all five checks.
+The functions produce findings but never log or raise -- severity is determined by the caller.
+
+*3. Domain -- Transformation (`domain/transformations/helpers.py`):*::
+`reorder_helpers_next_to_fk()` rearranges columns so that helper columns appear adjacent to their FK column.  Pure `DataFrame -> DataFrame` transformation.
+
+*4. Pipeline (`pipeline/pipeline.py`):*::
+Step factories wire Core and Domain functions into pipeline-compatible `BoundStep` closures:
+- `make_validate_step` calls `check_duplicate_ids` + `check_unresolvable_fks`, applies severity policy.
+- `make_apply_fks_step` calls `build_registry` + `detect_fk_columns` + `apply_fk_helpers`.
+- `make_check_fk_helpers_step` calls `validate_fk_helpers`, applies severity policy.
+All three are registered in `REGISTRY` and can be invoked from YAML pipeline definitions.
+
+*5. Render IR + IO Backend:*::
+The rendering layer is FK-agnostic.  Helper columns are regular DataFrame columns by the time
+`compose_workbook()` builds the IR.  Styling passes may highlight helper columns via `SheetIR.meta["options"]`,
+but no FK-specific logic exists in the rendering or backend layers.
+
+*6. CLI:*::
+The CLI passes configuration (profile defaults, YAML pipeline) to the Orchestrator.
+It never references FK concepts directly.
