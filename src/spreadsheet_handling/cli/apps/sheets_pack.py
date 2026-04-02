@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse
 
-from spreadsheet_handling.orchestrator import orchestrate
+from spreadsheet_handling.application.orchestrator import orchestrate
 from spreadsheet_handling.pipeline.pipeline import (
     make_bootstrap_meta_step,
     build_steps_from_yaml,

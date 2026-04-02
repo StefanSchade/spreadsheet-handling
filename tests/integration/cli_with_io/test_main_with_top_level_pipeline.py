@@ -1,5 +1,5 @@
 import spreadsheet_handling.cli.apps.run as runmod
-import spreadsheet_handling.orchestrator as orch_mod
+import spreadsheet_handling.application.orchestrator as orch_mod
 
 
 def test_main_with_real_steps_file(tmp_path, monkeypatch):
