@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse
 
-from spreadsheet_handling.orchestrator import orchestrate
+from spreadsheet_handling.application.orchestrator import orchestrate
 
 
 def _args(argv: list[str] | None = None):

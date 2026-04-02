@@ -15,7 +15,7 @@ pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.orchestrator import orchestrate
+from spreadsheet_handling.application.orchestrator import orchestrate
 from spreadsheet_handling.pipeline.pipeline import BoundStep, Frames
 
 

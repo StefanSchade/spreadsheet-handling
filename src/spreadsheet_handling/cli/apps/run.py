@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import yaml
 import os
 
-from spreadsheet_handling.orchestrator import orchestrate
+from spreadsheet_handling.application.orchestrator import orchestrate
 from spreadsheet_handling.pipeline import (
     build_steps_from_config,
     build_steps_from_yaml,

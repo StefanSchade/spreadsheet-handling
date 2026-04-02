@@ -48,7 +48,7 @@ def test_consumer_import_surface():
     from spreadsheet_handling.pipeline.config import load_app_config  # noqa: F811
     from spreadsheet_handling.pipeline.runner import run_pipeline  # noqa: F811
     from spreadsheet_handling.pipeline.pipeline import build_steps_from_config
-    from spreadsheet_handling.orchestrator import orchestrate
+    from spreadsheet_handling.application.orchestrator import orchestrate
 
     assert callable(load_app_config)
     assert callable(run_pipeline)
