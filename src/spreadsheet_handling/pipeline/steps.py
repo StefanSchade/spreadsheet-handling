@@ -34,14 +34,14 @@ def _resolve_callable(dotted: str) -> Callable[..., Any]:
     return fn
 
 
-def make_plugin_step(*, func: str, args: Dict[str, Any] | None = None, name: str = "plugin") -> BoundStep:
+def make_plugin_step(*, dotted: str, args: Dict[str, Any] | None = None, name: str = "plugin") -> BoundStep:
     """
     Factory for a 'plugin' step.
-    func: dotted path to a callable
+    dotted: dotted path to a callable
     args: optional dict of kwargs passed to the callable
     """
-    fn = _resolve_callable(func)
-    cfg = {"func": func, "args": dict(args or {})}
+    fn = _resolve_callable(dotted)
+    cfg = {"dotted": dotted, "args": dict(args or {})}
 
     def run(fr: Frames) -> Frames:
         result = fn(fr, **cfg["args"])

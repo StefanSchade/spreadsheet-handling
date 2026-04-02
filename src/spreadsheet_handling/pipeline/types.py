@@ -56,5 +56,5 @@ class StepSpec(TypedDict, total=False):
     mode_duplicate_ids: str
     prefix: str
     # plugin-specific
-    func: str
+    dotted: str
     args: Dict[str, Any]
