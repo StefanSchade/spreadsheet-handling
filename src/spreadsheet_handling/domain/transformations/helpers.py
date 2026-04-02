@@ -6,6 +6,8 @@ from typing import Callable, Dict, Iterable, Optional
 import re
 import pandas as pd
 
+from ...frame_keys import copy_reserved_frames, iter_data_frames
+
 Frames = Dict[str, pd.DataFrame]
 Step = Callable[[Frames], Frames]
 
@@ -26,8 +28,9 @@ def mark_helpers(sheet: Optional[str], cols: Iterable[str], prefix: str = "_") -
     cfg = MarkHelpersConfig(sheet=sheet, cols=tuple(cols), prefix=prefix)
 
     def _step(frames: Frames) -> Frames:
-        out: Frames = {}
-        for name, df in frames.items():
+        out: dict[str, object] = {}
+        copy_reserved_frames(frames, out)
+        for name, df in iter_data_frames(frames):
             if cfg.sheet is not None and name != cfg.sheet:
                 out[name] = df
                 continue
@@ -42,7 +45,7 @@ def mark_helpers(sheet: Optional[str], cols: Iterable[str], prefix: str = "_") -
                     rename_map[c] = f"{cfg.prefix}{c}"
 
             out[name] = df.rename(columns=rename_map)
-        return out
+        return out  # type: ignore[return-value]
 
     return _step
 
@@ -75,8 +78,9 @@ def clean_aux_columns(
             col_s = str(col)
             return any(col_s.startswith(p) for p in cfg.drop_prefixes)
 
-        out: Frames = {}
-        for name, df in frames.items():
+        out: dict[str, object] = {}
+        copy_reserved_frames(frames, out)
+        for name, df in iter_data_frames(frames):
             if cfg.sheet is not None and name != cfg.sheet:
                 out[name] = df
                 continue
@@ -86,7 +90,7 @@ def clean_aux_columns(
 
             keep = [c for c in df.columns if not _is_aux(str(c))]
             out[name] = df.loc[:, keep]
-        return out
+        return out  # type: ignore[return-value]
 
     return _step
 
@@ -103,8 +107,9 @@ def _flatten_header_to_level0(df: pd.DataFrame) -> pd.DataFrame:
 
 def flatten_headers(sheet: Optional[str] = None, *, mode: str = "first_nonempty", sep: str = "") -> Step:
     def _step(frames: Frames) -> Frames:
-        out: Frames = {}
-        for name, df in frames.items():
+        out: dict[str, object] = {}
+        copy_reserved_frames(frames, out)
+        for name, df in iter_data_frames(frames):
             if sheet is not None and name != sheet:
                 out[name] = df; continue
             cols = list(df.columns)
@@ -122,7 +127,7 @@ def flatten_headers(sheet: Optional[str] = None, *, mode: str = "first_nonempty"
 
             nd = df.copy(); nd.columns = new
             out[name] = nd
-        return out
+        return out  # type: ignore[return-value]
     return _step
 
 
@@ -140,8 +145,9 @@ def unflatten_headers(sheet: Optional[str] = None, *, sep: str = ".") -> Step:
         if not sep:
             raise ValueError("unflatten_headers requires a non-empty sep")
 
-        out: Frames = {}
-        for name, df in frames.items():
+        out: dict[str, object] = {}
+        copy_reserved_frames(frames, out)
+        for name, df in iter_data_frames(frames):
             if sheet is not None and name != sheet:
                 out[name] = df
                 continue
@@ -158,7 +164,7 @@ def unflatten_headers(sheet: Optional[str] = None, *, sep: str = ".") -> Step:
             nd = df.copy()
             nd.columns = pd.MultiIndex.from_tuples(tuples)
             out[name] = nd
-        return out
+        return out  # type: ignore[return-value]
     return _step
 
 
@@ -194,8 +200,9 @@ def reorder_helpers_next_to_fk(
     Funktioniert sowohl mit normalen Spalten als auch mit MultiIndex-Spalten.
     """
     def _step(frames: Frames) -> Frames:
-        out: Frames = {}
-        for name, df in frames.items():
+        out: dict[str, object] = {}
+        copy_reserved_frames(frames, out)
+        for name, df in iter_data_frames(frames):
             if sheet is not None and name != sheet:
                 out[name] = df
                 continue
@@ -238,5 +245,5 @@ def reorder_helpers_next_to_fk(
                 colpos = rebuild_index()
 
             out[name] = df.loc[:, cols]
-        return out
+        return out  # type: ignore[return-value]
     return _step

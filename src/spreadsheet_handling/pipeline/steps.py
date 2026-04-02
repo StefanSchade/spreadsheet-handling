@@ -9,6 +9,7 @@ import importlib
 import logging
 from typing import Any, Callable, Dict
 
+from ..frame_keys import copy_reserved_frames, iter_data_frames
 from .types import BoundStep, Frames
 
 log = logging.getLogger("sheets.pipeline")
@@ -123,13 +124,14 @@ def make_apply_fks_step(
         levels = int(defs.get("levels", 3))
         helper_prefix = str(defs.get("helper_prefix", "_"))
 
-        out: Frames = {}
-        for sheet_name, df in fr.items():
+        out: dict[str, Any] = {}
+        copy_reserved_frames(fr, out)
+        for sheet_name, df in iter_data_frames(fr):
             fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
             out[sheet_name] = _apply_fk_helpers(
                 df, fk_defs, id_maps, levels, helper_prefix=helper_prefix
             )
-        return out
+        return out  # type: ignore[return-value]
 
     return BoundStep(name=name, config=cfg, fn=run)
 
@@ -143,11 +145,12 @@ def make_drop_helpers_step(
     cfg = {"prefix": prefix}
 
     def run(fr: Frames) -> Frames:
-        out: Frames = {}
-        for sheet, df in fr.items():
+        out: dict[str, Any] = {}
+        copy_reserved_frames(fr, out)
+        for sheet, df in iter_data_frames(fr):
             cols = [c for c in df.columns if not str(c).startswith(cfg["prefix"])]
             out[sheet] = df.loc[:, cols]
-        return out
+        return out  # type: ignore[return-value]
 
     return BoundStep(name=name, config=cfg, fn=run)
 

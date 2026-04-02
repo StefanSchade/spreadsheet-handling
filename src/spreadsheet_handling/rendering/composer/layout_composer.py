@@ -5,6 +5,13 @@ import pandas as pd
 from ..ir import WorkbookIR, SheetIR, TableBlock
 
 _RESERVED_FRAME_KEYS = {"_meta"}  # extend as needed
+_WORKBOOK_OPTION_KEYS = {
+    "freeze_header",
+    "auto_filter",
+    "header_fill_rgb",
+    "helper_fill_rgb",
+    "helper_prefix",
+}
 
 
 def _build_header_grid_and_merges(df: pd.DataFrame) -> tuple[list[list[str]], list[tuple[int, int, int, int]], int]:
@@ -82,6 +89,11 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
       - Preserves domain meta in a hidden _meta sheet.
     """
     wb = WorkbookIR()
+    workbook_options = {
+        key: meta[key]
+        for key in _WORKBOOK_OPTION_KEYS
+        if meta and key in meta
+    }
 
     for name, df in frames.items():
         # skip reserved frames and non-DataFrames
@@ -121,11 +133,14 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
         if header_merges:
             sh.meta["__header_merges"] = header_merges
 
-        # inject per-sheet options from meta (set by yaml_overrides / bootstrap_meta)
+        # inject workbook and per-sheet options from meta
+        options = dict(workbook_options)
         if meta:
             sheet_opts = (meta.get("sheets") or {}).get(str(name))
             if isinstance(sheet_opts, dict) and sheet_opts:
-                sh.meta.setdefault("options", {}).update(sheet_opts)
+                options.update(sheet_opts)
+        if options:
+            sh.meta.setdefault("options", {}).update(options)
 
     # stash the domain meta so meta_pass can persist it (unchanged from your version)
     if meta:

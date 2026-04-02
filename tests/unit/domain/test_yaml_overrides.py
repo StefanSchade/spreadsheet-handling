@@ -191,6 +191,29 @@ class TestApplyOverridesStep:
 # ---------------------------------------------------------------------------
 
 class TestComposerIntegration:
+    def test_workbook_defaults_flow_to_each_sheet_options(self):
+        from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+        frames = {"Sheet1": pd.DataFrame({"a": [1]})}
+        meta = {"freeze_header": True, "auto_filter": False, "header_fill_rgb": "#123456"}
+        ir = compose_workbook(frames, meta)
+        opts = ir.sheets["Sheet1"].meta.get("options", {})
+        assert opts["freeze_header"] is True
+        assert opts["auto_filter"] is False
+        assert opts["header_fill_rgb"] == "#123456"
+
+    def test_sheet_options_override_workbook_defaults(self):
+        from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+        frames = {"Sheet1": pd.DataFrame({"a": [1]})}
+        meta = {
+            "freeze_header": True,
+            "auto_filter": True,
+            "sheets": {"Sheet1": {"freeze_header": False}},
+        }
+        ir = compose_workbook(frames, meta)
+        opts = ir.sheets["Sheet1"].meta.get("options", {})
+        assert opts["freeze_header"] is False
+        assert opts["auto_filter"] is True
+
     def test_sheet_options_flow_to_ir(self):
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
         frames = {"Sheet1": pd.DataFrame({"a": [1]})}
@@ -221,6 +244,39 @@ class TestComposerIntegration:
 # ---------------------------------------------------------------------------
 
 class TestEndToEnd:
+    def test_yaml_defaults_reach_render_plan(self, tmp_path):
+        from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+        from spreadsheet_handling.rendering.passes.core import StylePass, FilterPass, FreezePass
+        from spreadsheet_handling.rendering.flow import apply_ir_passes, build_render_plan
+
+        ov_path = tmp_path / "overrides.yaml"
+        ov_path.write_text(yaml.dump({
+            "defaults": {
+                "freeze_header": True,
+                "auto_filter": True,
+                "header_fill_rgb": "#00FF00",
+            },
+            "sheets": {
+                "Products": {
+                    "freeze_header": False,
+                },
+            },
+        }))
+
+        frames = {"Products": pd.DataFrame({"id": [1, 2], "name": ["A", "B"]})}
+        frames["_meta"] = {}
+        overrides = load_overrides(ov_path)
+        apply_overrides(frames, overrides)
+
+        meta = frames["_meta"]
+        ir = compose_workbook(frames, meta)
+        ir = apply_ir_passes(ir, [StylePass(), FilterPass(), FreezePass()])
+        plan = build_render_plan(ir)
+
+        op_names = [(type(op).__name__, getattr(op, "sheet", None)) for op in plan.ops]
+        assert ("SetAutoFilter", "Products") in op_names
+        assert ("SetFreeze", "Products") not in op_names
+
     def test_yaml_overrides_reach_render_plan(self, tmp_path):
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
         from spreadsheet_handling.rendering.passes.core import StylePass, FilterPass, FreezePass

@@ -3,6 +3,8 @@ import re
 from typing import Any, Dict, List, NamedTuple
 import pandas as pd
 
+from ..frame_keys import iter_data_frames
+
 # Neu: zentrale Indexing-Helpers verwenden
 from .indexing import level0_series as _series_from_first_level
 
@@ -73,7 +75,7 @@ def build_registry(
     id_field = str(defaults.get("id_field", "id"))
     label_field = str(defaults.get("label_field", "name"))
     reg: Dict[str, Dict[str, Any]] = {}
-    for sheet_name, _df in frames.items():
+    for sheet_name, _df in iter_data_frames(frames):
         key = normalize_sheet_key(sheet_name)
         reg[key] = {
             "sheet_name": sheet_name,

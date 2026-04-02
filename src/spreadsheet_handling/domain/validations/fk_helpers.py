@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from ...frame_keys import iter_data_frames
 from ...core.fk import (
     FKDef,
     build_registry,
@@ -43,7 +44,7 @@ def check_unexpected_helpers(
     reg = build_registry(frames, defs)
     findings: Findings = []
 
-    for sheet_name, df in frames.items():
+    for sheet_name, df in iter_data_frames(frames):
         fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
         expected_helpers = {fk.helper_column for fk in fk_defs}
 
@@ -73,7 +74,7 @@ def check_missing_helpers(
     reg = build_registry(frames, defs)
     findings: Findings = []
 
-    for sheet_name, df in frames.items():
+    for sheet_name, df in iter_data_frames(frames):
         fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
         first_cols = set(
             (c[0] if isinstance(c, tuple) else c) for c in df.columns.tolist()
@@ -108,7 +109,7 @@ def check_helper_values(
             return None
         return str(v).strip()
 
-    for sheet_name, df in frames.items():
+    for sheet_name, df in iter_data_frames(frames):
         fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
         first_cols = set(
             (c[0] if isinstance(c, tuple) else c) for c in df.columns.tolist()
@@ -169,7 +170,7 @@ def check_unresolvable_fks(
             return None
         return str(v).strip()
 
-    for sheet_name, df in frames.items():
+    for sheet_name, df in iter_data_frames(frames):
         fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
         for fk in fk_defs:
             target_map = id_maps.get(fk.target_sheet_key, {})
@@ -202,7 +203,7 @@ def check_duplicate_ids(
     id_field = str(defs.get("id_field", "id"))
     findings: Findings = []
 
-    for sheet_name, df in frames.items():
+    for sheet_name, df in iter_data_frames(frames):
         if not has_level0(df, id_field):
             continue
         ids = level0_series(df, id_field).astype("string")
