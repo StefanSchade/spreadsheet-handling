@@ -16,6 +16,17 @@ indexes, hierarchies). Enables round-tripping of complex spreadsheet models.
 `spreadsheet-handling-demo` — Tutorial/demo repo that consumes this package.
 Both repos live side-by-side in the workspace for shared context.
 
+## Tooling Sync Note
+
+`tools/` in this repo is the canonical source for shared helper scripts that are also used by
+`spreadsheet-handling-demo`. The demo repo intentionally does not commit duplicate copies of these
+scripts; instead its gitignored tooling and Makefile targets refer back to the source here.
+
+Practical consequence: local changes under `tools/` may come from synchronization work with the
+demo repo and are not automatically unrelated or suspicious. They should still be reviewed and
+staged deliberately, but their presence in a dirty worktree is expected often enough that agents
+and maintainers should not assume they are accidental.
+
 ## Architecture
 
 Hexagonal architecture (ADR-001), pragmatic Python variant:
