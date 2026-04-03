@@ -8,9 +8,7 @@ import spreadsheet_handling.cli.apps.run as runmod
 
 def test_main_with_real_steps_file(tmp_path, monkeypatch):
     steps_path = tmp_path / "steps.yml"
-    steps_path.write_text("pipeline:
-  - step: identity
-")
+    steps_path.write_text("pipeline:\n  - step: identity\n")
 
     called = {}
 
@@ -34,16 +32,11 @@ def test_main_with_real_steps_file(tmp_path, monkeypatch):
 def test_main_with_top_level_pipeline(tmp_path, monkeypatch):
     cfg_path = tmp_path / "dummy.yml"
     cfg_path.write_text(
-        "io:
-"
-        "  input: {kind: json_dir, path: in}
-"
-        "  output: {kind: json_dir, path: out}
-"
-        "pipeline:
-"
-        "  - step: identity
-"
+        "io:\n"
+        "  input: {kind: json_dir, path: in}\n"
+        "  output: {kind: json_dir, path: out}\n"
+        "pipeline:\n"
+        "  - step: identity\n"
     )
 
     called = {}
