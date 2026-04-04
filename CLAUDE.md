@@ -27,6 +27,22 @@ demo repo and are not automatically unrelated or suspicious. They should still b
 staged deliberately, but their presence in a dirty worktree is expected often enough that agents
 and maintainers should not assume they are accidental.
 
+## Virtualenv Note
+
+Both repos maintain their own local `/.venv`. If a `.venv` exists but important modules such as
+`pip`, `pytest`, `yaml`, or `openpyxl` are missing, the environment may be only partially created
+or may have stale dependency stamps. In that situation, a plain `make setup` can be insufficient
+because the Makefile may skip package installation when the stamp files still exist.
+
+Preferred recovery in the main repo is:
+
+```bash
+make reset-deps && make setup
+```
+
+Apply the equivalent reset-and-setup flow in the demo repo when needed. Treat `.venv` changes as
+local environment state, not as normal source edits to stage casually.
+
 ## Architecture
 
 Hexagonal architecture (ADR-001), pragmatic Python variant:
