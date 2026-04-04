@@ -126,9 +126,69 @@ def test_main_run_path_honors_sheet_level_overrides(tmp_path):
     assert product.freeze_panes == "A2"
     assert product.auto_filter and product.auto_filter.ref
     assert (product["A1"].fill.fgColor.rgb or "").endswith("FFCC00")
+    assert len(product.data_validations.dataValidation) >= 1
 
     assert branch.freeze_panes is None
     assert not (branch.auto_filter and branch.auto_filter.ref)
     assert (branch["A1"].fill.fgColor.rgb or "").endswith("00CCFF")
+
+    wb.close()
+
+
+def test_main_run_path_merges_workbook_defaults_with_sheet_overrides(tmp_path):
+    from openpyxl import load_workbook
+
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    (in_dir / "product.json").write_text(
+        json.dumps([{"id": "P-1", "name": "Starter"}]),
+        encoding="utf-8",
+    )
+    (in_dir / "branch.json").write_text(
+        json.dumps([{"id": "B-1", "city": "Berlin"}]),
+        encoding="utf-8",
+    )
+
+    cfg_path = tmp_path / "run-defaults.yml"
+    cfg = {
+        "io": {
+            "input": {"kind": "json_dir", "path": str(in_dir)},
+            "output": {"kind": "xlsx", "path": str(tmp_path / "defaults.xlsx")},
+        },
+        "pipeline": [
+            {
+                "step": "apply_overrides",
+                "overrides": {
+                    "defaults": {
+                        "freeze_header": True,
+                        "auto_filter": True,
+                        "header_fill_rgb": "#DDDDDD",
+                    },
+                    "sheets": {
+                        "branch": {
+                            "freeze_header": False,
+                            "auto_filter": False,
+                        },
+                    },
+                },
+            }
+        ],
+    }
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    rc = runmod.main(["--config", str(cfg_path)])
+    assert rc == 0
+
+    wb = load_workbook(tmp_path / "defaults.xlsx")
+    product = wb["product"]
+    branch = wb["branch"]
+
+    assert product.freeze_panes == "A2"
+    assert product.auto_filter and product.auto_filter.ref
+    assert (product["A1"].fill.fgColor.rgb or "").endswith("DDDDDD")
+
+    assert branch.freeze_panes is None
+    assert not (branch.auto_filter and branch.auto_filter.ref)
+    assert (branch["A1"].fill.fgColor.rgb or "").endswith("DDDDDD")
 
     wb.close()
