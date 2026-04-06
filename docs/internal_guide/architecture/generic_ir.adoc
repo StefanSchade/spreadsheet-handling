@@ -1,0 +1,287 @@
+== Meta-Registry, Verhaltensprofile und Trennung von `meta_canonical` / `meta_rendering`
+
+=== Ausgangslage
+
+Im aktuellen System werden unter `meta` unterschiedliche Arten von Information transportiert.
+Das ist im Alltag praktikabel, macht aber den Charakter einzelner Meta-Einträge nur teilweise sichtbar.
+
+Typische Beispiele sind:
+
+* Aussagen mit fachlich-strukturellem Bezug, etwa dass eine Spalte eine Helper-Spalte ist
+* renderwirksame Direktiven, etwa `freeze header`
+* potenziell auch Informationen, die aus einem Spreadsheet gelesen und nur für Roundtrip wieder mitgeführt werden
+
+Diese Einträge sehen im Transport zunächst ähnlich aus, haben aber nicht dieselbe Rolle im System.
+Genau diese Unterscheidung soll expliziter werden.
+
+=== Grundproblem
+
+Heute liegen unter `meta` Aussagen nebeneinander, die sehr unterschiedlich weiterverarbeitet werden:
+
+* manche beschreiben fachliche oder strukturelle Eigenschaften
+* manche sollen direkt oder indirekt das Render-Ergebnis beeinflussen
+* manche müssen für Roundtrip erhalten bleiben, ohne im Write Path noch Verhalten auszulösen
+
+Solange diese Unterschiede nicht sauber beschrieben sind, bleiben zentrale Fragen nur implizit beantwortet:
+
+* Welche Information ist die Quelle der Wahrheit?
+* Welche Information darf im IR noch Render-Verhalten bestimmen?
+* Welche Information wird nur persistiert?
+* Wo werden Konflikte aufgelöst, etwa bei widersprüchlichen renderwirksamen Direktiven?
+* Welche Regeln gehören in den IR-Layer und welche gerade nicht in Adapter oder Domain?
+
+Mit einem einzigen Backend kann man solche Fragen noch informell im Code verteilen.
+Spätestens mit mehreren Spreadsheet-Backends wird daraus jedoch unnötige Unklarheit, weil Adapter sonst leicht implizite Spezialfälle unterschiedlich interpretieren.
+
+=== Grundidee
+
+Die vorgeschlagene Richtung ist bewusst pragmatisch.
+Es geht zunächst nicht darum, Meta vollständig neu zu modellieren oder sofort einen generischen Mechanismus einzuführen.
+
+Der erste Schritt ist eine Registry als strukturierte Dokumentation, zunächst manuell gepflegt, zum Beispiel in JSON-Form.
+Für jeden Meta-Eintrag wird dort festgehalten, welchen Charakter er im System hat und wie er sich entlang des Write Paths verhält.
+
+Für diesen Charakter verwenden wir hier den Arbeitsbegriff *Verhaltensprofil*.
+Gemeint ist nicht die Ontologie eines Eintrags, sondern sein Verhalten im System.
+
+Beispiele für solche Angaben sind:
+
+* beeinflusst der Eintrag das Render-Verhalten direkt, indirekt oder gar nicht?
+* muss er persistiert werden oder ist er nur Laufzeitinformation?
+* kann er aus anderer Meta abgeleitet werden?
+* kann er sich über Scope-Grenzen vererben, etwa von Workbook zu Sheet?
+* wie verhält er sich bei Merge oder Konflikten?
+* hat er bei Konflikten im Render-Verhalten Vorrang vor anderen Einträgen?
+
+Damit wird die Registry zunächst zu einem Mittel der Explikation.
+Erst später kann daraus im IR-Layer an einzelnen Stellen auch ausführbares Verhalten werden.
+
+=== Begriffe
+
+==== `meta_canonical`
+
+`meta_canonical` bezeichnet die kanonischen Meta-Aussagen aus Domain, Input oder Parse.
+Sie sind die Quelle der Wahrheit für Persistenz und Roundtrip.
+
+Sie dürfen im Adapter mitgeführt und persistiert werden.
+Nach der Ableitung in `meta_rendering` sollen sie das Render-Ergebnis jedoch nicht mehr direkt beeinflussen.
+
+Typische Beispiele:
+
+* strukturelle Aussagen über Rollen oder Beziehungen
+* deklarative Angaben, aus denen später Render-Verhalten abgeleitet wird
+* roundtrip-relevante Payload, die erhalten bleiben muss
+
+==== `meta_rendering`
+
+`meta_rendering` bezeichnet die operative, renderwirksame Sicht auf Meta im IR-Layer.
+Sie entsteht aus `meta_canonical` zusammen mit IR-Regeln wie Vererbung, Priorisierung und Konfliktauflösung und bestimmt, welches backend-neutrale Spreadsheet-Verhalten in den RenderPlan eingeht.
+
+`meta_rendering` ist nicht die kanonische Persistenzform.
+Sie dient dem aktuellen Write Path und umfasst nicht nur Layout im engeren Sinn.
+
+Typische Beispiele:
+
+* konkrete Freeze-, Filter- oder Style-Entscheidungen
+* Named Ranges, Validierungen oder andere renderwirksame Spreadsheet-Semantik
+* priorisierte oder bereits zusammengeführte Information, die für das Rendering benötigt wird
+
+==== Verhaltensprofil
+
+Ein Verhaltensprofil beschreibt in der Registry, wie ein Meta-Eintrag im System behandelt wird.
+Es beantwortet nicht primär die Frage, was ein Eintrag "ist", sondern was er entlang des Pfads Domain -> IR -> Adapter bewirkt.
+
+Ein Verhaltensprofil kann unter anderem Aussagen enthalten zu:
+
+* Scope, etwa Workbook, Sheet, Tabelle, Spalte oder Bereich
+* Herkunft
+* Render-Relevanz
+* Persistenz
+* Roundtrip-Relevanz
+* Vererbung über Scope-Grenzen, etwa Workbook -> Sheet
+* Merge-Verhalten
+* Priorität bei Konflikten im Render-Verhalten
+* Producer und Consumer
+* Ownership entlang der Schichten
+
+==== `RenderPlan`
+
+Der `RenderPlan` ist die konkrete, aber backend-neutrale Projektion des renderrelevanten Verhaltens.
+Er ist nicht die kanonische Quelle der Bedeutung, sondern die ausführbare Darstellung für Spreadsheet-Adapter.
+
+=== Zielbild für den Write Path
+
+Das angestrebte Modell für den Write Path ist:
+
+[source,text]
+----
+Domain/Input
+  -> meta_canonical
+  -> IR bildet aus meta_canonical unter Vererbung, Priorisierung und Konfliktauflösung ein meta_rendering
+  -> RenderPlan wird aus meta_rendering erzeugt
+  -> Adapter rendert den RenderPlan
+  -> Adapter persistiert meta_canonical für Roundtrip
+----
+
+Die Rollen der Schichten sind dabei:
+
+* `meta_canonical` entsteht aus Domain, Input und perspektivisch auch aus Parse.
+* Der IR-Layer interpretiert `meta_canonical` zusammen mit eigenen Regeln für Vererbung, Priorisierung und Konfliktauflösung und bildet daraus `meta_rendering`.
+* Der `RenderPlan` enthält die backend-neutrale Ausführungssicht.
+* Der Adapter setzt den `RenderPlan` technisch um und behandelt `meta_canonical` nur noch als Persistenz-Payload für Roundtrip.
+
+=== Gewollte Invarianten
+
+==== Invariante 1: `meta_canonical` ist nach der IR-Ableitung nicht mehr renderwirksam
+
+Sobald `meta_rendering` abgeleitet wurde, soll die weitere Render-Verarbeitung nicht mehr direkt von `meta_canonical` abhängen.
+
+Prüfbarer Architekturtest:
+
+* Wenn man `meta_canonical` nach dem IR-Eingang entfernt, muss das Render-Ergebnis gleich bleiben.
+
+==== Invariante 2: Roundtrip hängt nicht an `meta_rendering`
+
+Alles, was dauerhaft für Rekonstruktion oder Wiederpersistenz benötigt wird, muss in `meta_canonical` liegen oder daraus stabil persistiert werden.
+`meta_rendering` ist keine alleinige Quelle für Roundtrip.
+
+==== Invariante 3: Adapter sind keine Semantikmaschine
+
+Adapter sollen `meta_canonical` nicht erneut semantisch auswerten, um Render-Verhalten zu bestimmen.
+Sie sollen den `RenderPlan` ausführen und `meta_canonical` nur mitführen, lesen oder persistieren, soweit Roundtrip das verlangt.
+
+==== Invariante 4: Wiederverwendbare Meta-Regeln sitzen im IR-Layer
+
+Wenn es generische Regeln für Priorität, Merge, Vererbung oder Projektion gibt, gehören sie in den IR-Layer.
+Weder Domain noch Adapter sollen die allgemeine Meta-Politik in voller Breite tragen.
+
+=== Die Registry als erster Schritt
+
+Der erste Ausbau ist bewusst unspektakulär:
+
+* Die Registry wird zunächst manuell gepflegt.
+* Sie ist zuerst Dokumentation und Explikation.
+* Sie ersetzt weder sofort Typisierung noch Speziallogik im Code.
+
+Für jeden Eintrag sollten mindestens festgehalten werden:
+
+* Name und Bedeutung
+* Scope
+* Herkunft
+* Verhaltensprofil
+* Producer und Consumer
+* Persistenz- und Roundtrip-Verhalten
+* Render-Relevanz
+* Konflikt- oder Prioritätsregeln, falls vorhanden
+
+Der Nutzen dieses ersten Schritts ist vor allem begriffliche Klarheit.
+Er macht sichtbar, welche Arten von Meta es bereits gibt und wo sie heute noch unscharf vermischt werden.
+
+=== Was später aus der Registry werden kann
+
+Wenn die Einträge und ihre Verhaltensprofile stabil genug beschrieben sind, kann der IR-Layer wiederkehrende Entscheidungen gezielt aus dieser Registry ableiten.
+
+Typische Beispiele wären:
+
+* Prioritäten bei widersprüchlichen renderwirksamen Direktiven
+* Merge-Regeln
+* Vererbungsregeln
+* selektive Projektion von `meta_canonical` nach `meta_rendering`
+
+Wichtig ist die Reihenfolge:
+
+* zuerst explizieren
+* dann stabilisieren
+* erst danach punktuell im IR verwenden
+
+Das Ziel ist also nicht eine universelle Meta-Maschine.
+Expliziter Code bleibt dort sinnvoll, wo die Semantik zu speziell oder zu unregelmäßig ist.
+
+=== Bewusste Grenze: Diese Notiz beschreibt nur den Write Path
+
+Die hier beschriebene Trennung beantwortet zunächst nur die Richtung von Domain/Input nach Adapter.
+
+Nicht vorgedacht ist an dieser Stelle die vollständige Rückrichtung.
+Falls später die Anforderung entsteht, benutzerseitige Formatierung aus einem Spreadsheet im Roundtrip zu erhalten, braucht es eine explizite Rückprojektion von Format- oder Workbook-Information in `meta_canonical`.
+
+Wo diese Rückprojektion genau sitzt, ist noch offen.
+Das aktuelle Modell soll sie nicht festlegen, aber auch nicht verbauen.
+
+=== Schrittweiser Weg
+
+==== Schritt 1: Trennung im Write Path explizit machen
+
+Einführung einer klaren Unterscheidung zwischen `meta_canonical` und `meta_rendering`.
+
+Ziele:
+
+* kanonische Meta bleibt für Persistenz und Roundtrip erhalten
+* render- und spreadsheetwirksame Meta wird separat im IR gebildet
+* Render-Verhalten und Persistenz werden konzeptionell entkoppelt
+
+==== Schritt 2: Invarianten absichern
+
+Architekturtests und wenige gezielte Integrationsfälle sichern die neue Trennung ab.
+
+Wesentliche Prüfungen:
+
+* Entfernen von `meta_canonical` nach dem IR-Eingang ändert das Render-Ergebnis nicht.
+* Roundtrip-relevante Information hängt nicht ausschließlich an `meta_rendering`.
+* Adapter führen `RenderPlan` aus, statt kanonische Meta erneut als Render-Semantik zu interpretieren.
+
+==== Schritt 3: Registry aufbauen
+
+Erfassung der vorhandenen Meta-Einträge in strukturierter Form.
+Das Ziel ist zunächst Verständlichkeit, nicht Automation.
+
+==== Schritt 4: Wiederkehrende Regeln konsolidieren
+
+Aus der Registry werden gemeinsame Muster sichtbar:
+
+* welche Einträge sich vererben
+* welche sich überschreiben
+* welche nur transportiert werden
+* welche direkt zu Render-Semantik führen
+* welche Konflikt- oder Prioritätsregeln haben
+
+==== Schritt 5: Gezielte IR-Nutzung prüfen
+
+Erst auf einem stabileren Modell kann entschieden werden, welche dieser Regeln sinnvoll generisch im IR ausgeführt werden.
+
+==== Schritt 6: Typisierung und Tooling nachziehen
+
+Wenn Begriffe und Regeln belastbar sind, können darauf aufbauend typisierte Repräsentationen, Konsistenzprüfungen oder generierte Dokumentation folgen.
+
+=== Nicht-Ziele der ersten Ausbaustufe
+
+Folgendes ist ausdrücklich nicht Ziel dieses Schritts:
+
+* vollständige Neu-Modellierung aller Meta in einem Zug
+* sofortige Volltypisierung
+* sofortige Code-Generierung
+* ein zwanghaft generischer Mechanismus für alle Meta-Regeln
+* eine endgültige Festlegung des Parse- oder Rückprojektion-Pfads
+
+=== Praktische Leitfrage
+
+Für neue Meta-Einträge ist die nützlichste Frage daher oft nicht:
+
+"Was ist das ontologisch genau?"
+
+Sondern:
+
+"Welches Verhaltensprofil hat dieser Eintrag und in welcher Schicht darf er noch Verhalten auslösen?"
+
+=== Zusammenfassung
+
+Der Vorschlag trennt nicht aus Selbstzweck, sondern um unterschiedliche Rollen von Meta sichtbarer zu machen.
+
+Der geplante Weg ist:
+
+* `meta_canonical` als Quelle für Persistenz und Roundtrip klar zu benennen
+* `meta_rendering` als render- und spreadsheetwirksame IR-Sicht getrennt zu bilden
+* Meta-Einträge über eine Registry mit Verhaltensprofilen explizit zu machen
+* mögliche generische Entscheidungen erst später und nur gezielt im IR-Layer einzuführen
+
+Damit wird die Registry zunächst ein Klärungsinstrument.
+Falls sich daraus später stabile Regeln ableiten lassen, können sie im IR-Layer genutzt werden, ohne Domain und Adapter mit allgemeiner Meta-Politik zu überladen.
