@@ -137,7 +137,7 @@ class MetaPass:
 import re
 
 def _safe_name(s: str) -> str:
-    """Sanitise a string for use in an Excel defined name."""
+    """Sanitise a string for use in the current spreadsheet-safe defined-name subset."""
     return re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_').lower() or "unnamed"
 
 

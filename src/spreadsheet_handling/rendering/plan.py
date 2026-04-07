@@ -50,12 +50,12 @@ class SetFreeze:
 @dataclass(frozen=True)
 class AddValidation:
     sheet: str
-    kind: str  # e.g., "list"
+    kind: str  # spreadsheet-neutral validation kind, e.g. "list"
     r1: int
     c1: int
     r2: int
     c2: int
-    formula: str
+    formula: str  # adapter-facing validation expression derived from canonical constraint semantics
     allow_empty: bool = True
 
 @dataclass(frozen=True)
@@ -77,8 +77,10 @@ class WriteDataBlock:
 
 @dataclass(frozen=True)
 class WriteMeta:
-    sheet: str  # typically "_meta"
-    kv: Dict[str, str]
+    """Persist hidden workbook metadata payload in a backend-specific carrier."""
+
+    sheet: str  # XLSX currently uses a hidden "_meta" sheet; other backends may choose another carrier
+    kv: Dict[str, str]  # concrete persisted representation of canonical workbook metadata
     hidden: bool = True
 
 @dataclass(frozen=True)
