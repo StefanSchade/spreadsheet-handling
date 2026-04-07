@@ -1,50 +1,82 @@
-# tests/unit/io_backends/xlsx/test_ir_call_chain.py
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
-import spreadsheet_handling.io_backends.xlsx.xlsx_backend as xb   # <-- patch THIS module's symbols
+import spreadsheet_handling.io_backends.xlsx.xlsx_backend as xb
 
-pytestmark = pytest.mark.ftr("FTR-IR-DATA-CELLS")
-def test_ir_pipeline_is_called(monkeypatch, tmp_path):
-    calls = []
+pytestmark = pytest.mark.ftr('FTR-SPREADSHEET-BACKEND-CONTRACT-P3H')
 
-    class _FakeIR:
-        sheets = {}
-        hidden_sheets = {}
 
-    class _FakePlan:
-        ops = []
-        sheet_order = []
+def test_xlsx_backend_uses_spreadsheet_contract_for_write(monkeypatch, tmp_path):
+    calls: list[str] = []
+    sentinel_plan = object()
 
-    def fake_compose(frames, meta):
-        calls.append("compose")
-        return _FakeIR()
-
-    def fake_apply_all(ir, meta):
-        calls.append("passes")
-        return ir
-
-    def fake_build_plan(ir):
-        calls.append("build_plan")
-        return _FakePlan()
+    def fake_build_plan(frames, meta):
+        assert 'Sheet1' in frames
+        calls.append('build_plan')
+        return sentinel_plan
 
     def fake_render(plan, out_path):
-        calls.append("render")
-        # create a minimal xlsx so the .exists() check works
-        from openpyxl import Workbook
-        Workbook().save(out_path)
+        assert plan is sentinel_plan
+        calls.append('render')
+        Path(out_path).touch()
 
-    # Patch the names that xlsx_backend actually calls
-    monkeypatch.setattr(xb, "compose_workbook", fake_compose, raising=True)
-    monkeypatch.setattr(xb, "apply_render_passes", fake_apply_all, raising=True)
-    monkeypatch.setattr(xb, "build_render_plan", fake_build_plan, raising=True)
-    monkeypatch.setattr(xb, "render_workbook", fake_render, raising=True)
+    monkeypatch.setattr(xb, 'build_spreadsheet_render_plan', fake_build_plan, raising=True)
+    monkeypatch.setattr(xb, 'render_workbook', fake_render, raising=True)
 
-    frames = {"Sheet1": pd.DataFrame({"a": [1, 2]})}
-    out = tmp_path / "book.xlsx"
+    frames = {'Sheet1': pd.DataFrame({'a': [1, 2]})}
+    out = tmp_path / 'book.xlsx'
 
     ExcelBackend().write_multi(frames, out)
 
-    assert calls == ["compose", "passes", "build_plan", "render"]
+    assert calls == ['build_plan', 'render']
     assert out.exists()
+
+
+def test_xlsx_backend_uses_spreadsheet_contract_for_read(monkeypatch, tmp_path):
+    expected = {'Sheet1': pd.DataFrame({'a': [1, 2]})}
+
+    def fake_read_frames(path, *, parser):
+        assert parser is xb.parse_workbook
+        assert Path(path).name == 'book.xlsx'
+        return expected
+
+    monkeypatch.setattr(xb, 'read_spreadsheet_frames', fake_read_frames, raising=True)
+
+    out = tmp_path / 'book.xlsx'
+    out.touch()
+
+    back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+    assert back is expected
+
+
+def test_xlsx_backend_imports_spreadsheet_contract_not_rendering_internals():
+    module_path = Path(xb.__file__).resolve()
+    tree = ast.parse(module_path.read_text(encoding='utf-8'), filename=str(module_path))
+
+    imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append(node.module or '')
+
+    forbidden = (
+        'spreadsheet_handling.rendering.composer',
+        'spreadsheet_handling.rendering.passes',
+        'spreadsheet_handling.rendering.flow',
+        'spreadsheet_handling.rendering.parse_ir',
+    )
+    violations = [name for name in imports if any(name.startswith(prefix) for prefix in forbidden)]
+
+    assert not violations, (
+        'xlsx_backend.py must depend on the spreadsheet contract instead of rendering internals:\n'
+        + '\n'.join(sorted(violations))
+    )
+    assert 'spreadsheet_handling.io_backends.spreadsheet_contract' in imports

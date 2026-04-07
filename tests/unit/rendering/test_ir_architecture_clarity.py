@@ -144,19 +144,7 @@ def test_xlsx_backend_stops_at_render_plan(monkeypatch, tmp_path):
     calls: list[str] = []
     sentinel_plan = object()
 
-    class _FakeIR:
-        sheets = {}
-        hidden_sheets = {}
-
-    def fake_compose(frames, meta):
-        calls.append("compose")
-        return _FakeIR()
-
-    def fake_apply_all(ir, meta):
-        calls.append("passes")
-        return ir
-
-    def fake_build_plan(ir):
+    def fake_build_plan(frames, meta):
         calls.append("build_plan")
         return sentinel_plan
 
@@ -165,13 +153,11 @@ def test_xlsx_backend_stops_at_render_plan(monkeypatch, tmp_path):
         calls.append("render")
         Path(out_path).touch()
 
-    monkeypatch.setattr(xlsx_backend, "compose_workbook", fake_compose, raising=True)
-    monkeypatch.setattr(xlsx_backend, "apply_render_passes", fake_apply_all, raising=True)
-    monkeypatch.setattr(xlsx_backend, "build_render_plan", fake_build_plan, raising=True)
+    monkeypatch.setattr(xlsx_backend, "build_spreadsheet_render_plan", fake_build_plan, raising=True)
     monkeypatch.setattr(xlsx_backend, "render_workbook", fake_render, raising=True)
 
     out = tmp_path / "book.xlsx"
     ExcelBackend().write_multi(_sample_frames(), out)
 
-    assert calls == ["compose", "passes", "build_plan", "render"]
+    assert calls == ["build_plan", "render"]
     assert out.exists()
