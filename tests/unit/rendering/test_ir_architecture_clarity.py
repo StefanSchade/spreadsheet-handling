@@ -106,7 +106,10 @@ def test_visible_render_result_is_stable_without_hidden_meta_payload_after_ir_de
 
     with_payload = copy.deepcopy(ir)
     without_payload = copy.deepcopy(ir)
-    without_payload.hidden_sheets.clear()
+    meta_sheet = without_payload.hidden_sheets.get("_meta")
+    assert meta_sheet is not None
+    assert "workbook_meta_blob" in meta_sheet.meta
+    meta_sheet.meta.pop("workbook_meta_blob", None)
 
     with_path = tmp_path / "with_payload.xlsx"
     without_path = tmp_path / "without_payload.xlsx"
