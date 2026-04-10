@@ -10,8 +10,9 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.io_backends.json_backend import JSONBackend
+from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
-from spreadsheet_handling.rendering.parse_ir import parse_ir, workbookir_to_frames
+from spreadsheet_handling.rendering.workbook_projection import workbookir_to_frames
 
 pytestmark = [pytest.mark.ftr("FTR-IR-READPATH")]
 
@@ -40,16 +41,16 @@ def _sample_frames(*, with_meta: bool = True) -> dict:
 
 
 # ===========================================================================
-# parse_ir now extracts data
+# openpyxl parser now extracts data
 # ===========================================================================
 
-class TestParseIRDataExtraction:
+class TestOpenpyxlParserDataExtraction:
 
     def test_table_data_populated(self, tmp_path: Path, monkeypatch):
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         tbl = ir.sheets["products"].tables[0]
         assert tbl.data is not None
         assert len(tbl.data) == 2
@@ -60,7 +61,7 @@ class TestParseIRDataExtraction:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         tbl = ir.sheets["products"].tables[0]
         for row in tbl.data:
             for cell in row:
@@ -77,7 +78,7 @@ class TestWorkbookIRToFrames:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         frames = workbookir_to_frames(ir)
         assert "products" in frames
         assert "branches" in frames
@@ -86,7 +87,7 @@ class TestWorkbookIRToFrames:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         frames = workbookir_to_frames(ir)
         assert list(frames["products"].columns) == ["id", "name", "branch_id"]
         assert list(frames["branches"].columns) == ["branch_id", "manager"]
@@ -95,7 +96,7 @@ class TestWorkbookIRToFrames:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         frames = workbookir_to_frames(ir)
         assert frames["products"].iloc[0]["name"] == "Alpha"
         assert frames["branches"].iloc[1]["manager"] == "Bob"
@@ -104,7 +105,7 @@ class TestWorkbookIRToFrames:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(_sample_frames(), str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         frames = workbookir_to_frames(ir)
         assert "_meta" in frames
         meta = frames["_meta"]

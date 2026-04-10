@@ -8,9 +8,9 @@ from typing import Any, Mapping, Protocol
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.ir import WorkbookIR
-from spreadsheet_handling.rendering.parse_ir import workbookir_to_frames
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
 from spreadsheet_handling.rendering.plan import RenderPlan
+from spreadsheet_handling.rendering.workbook_projection import workbookir_to_frames
 
 
 class SpreadsheetRenderer(Protocol):

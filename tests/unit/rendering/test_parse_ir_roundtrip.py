@@ -12,7 +12,7 @@ from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.passes import apply_all
 from spreadsheet_handling.rendering.flow import build_render_plan
-from spreadsheet_handling.rendering.parse_ir import parse_ir
+from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
 pytestmark = pytest.mark.ftr("FTR-ROUNDTRIP-SAFE-P1")
@@ -52,7 +52,7 @@ class TestFlatTableRoundtrip:
         xlsx = tmp_path / "products.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
 
         assert "Products" in ir.sheets
         sh = ir.sheets["Products"]
@@ -77,7 +77,7 @@ class TestFlatTableRoundtrip:
         xlsx = tmp_path / "multi.xlsx"
         _write_frames_via_ir(frames, {}, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
 
         assert "Orders" in ir.sheets
         assert "Products" in ir.sheets
@@ -90,7 +90,7 @@ class TestFlatTableRoundtrip:
         xlsx = tmp_path / "data.xlsx"
         _write_frames_via_ir({"Sheet": df}, {}, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         tbl = ir.sheets["Sheet"].tables[0]
         assert tbl.n_rows == 6  # 1 header + 5 data
 
@@ -114,7 +114,7 @@ class TestMultiIndexRoundtrip:
         xlsx = tmp_path / "multi_hdr.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         tbl = ir.sheets["Orders"].tables[0]
 
         assert tbl.header_rows == 2
@@ -132,7 +132,7 @@ class TestMultiIndexRoundtrip:
         xlsx = tmp_path / "merges.xlsx"
         _write_frames_via_ir({"Orders": df}, {}, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         merges = ir.sheets["Orders"].meta.get("__header_merges", [])
 
         # "order" should be merged across cols 1-2 in row 1
@@ -149,7 +149,7 @@ class TestMultiIndexRoundtrip:
         xlsx = tmp_path / "grid.xlsx"
         _write_frames_via_ir({"Orders": df}, {}, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         grid = ir.sheets["Orders"].meta.get("__header_grid", [])
 
         assert len(grid) == 2  # 2 header rows
@@ -170,7 +170,7 @@ class TestMetaRoundtrip:
         xlsx = tmp_path / "meta.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
 
         assert "_meta" in ir.hidden_sheets
         assert ir.hidden_sheets["_meta"].meta.get("_hidden") is True
@@ -189,7 +189,7 @@ class TestFreezeAndFilter:
         xlsx = tmp_path / "freeze.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         freeze = ir.sheets["Data"].meta.get("__freeze")
 
         assert freeze is not None
@@ -203,7 +203,7 @@ class TestFreezeAndFilter:
         xlsx = tmp_path / "filter.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         assert "__autofilter_ref" in ir.sheets["Data"].meta
 
 
@@ -225,7 +225,7 @@ class TestValidationRoundtrip:
         xlsx = tmp_path / "valid.xlsx"
         _write_frames_via_ir(frames, meta, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         vals = ir.sheets["Data"].validations
 
         assert len(vals) >= 1
@@ -245,7 +245,7 @@ class TestEdgeCases:
         xlsx = tmp_path / "empty.xlsx"
         _write_frames_via_ir(frames, {}, xlsx)
 
-        ir = parse_ir(xlsx)
+        ir = parse_workbook(xlsx)
         tbl = ir.sheets["Empty"].tables[0]
         assert tbl.header_rows == 1
         assert tbl.n_cols == 1

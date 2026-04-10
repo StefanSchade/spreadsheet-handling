@@ -79,7 +79,7 @@ class WriteDataBlock:
 class WriteMeta:
     """Persist hidden workbook metadata payload in a backend-specific carrier."""
 
-    sheet: str  # XLSX currently uses a hidden "_meta" sheet; other backends may choose another carrier
+    sheet: str  # Current backends may use a hidden "_meta" sheet; other carriers remain possible.
     kv: Dict[str, str]  # concrete persisted representation of canonical workbook metadata
     hidden: bool = True
 

@@ -16,8 +16,8 @@ from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.plan import DefineNamedRange
 from spreadsheet_handling.rendering.passes import apply_all
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
-from spreadsheet_handling.rendering.parse_ir import parse_ir
 
 pytestmark = [pytest.mark.ftr("FTR-NAMED-RANGES")]
 
@@ -125,7 +125,7 @@ class TestNamedRangeXLSXRoundtrip:
         assert "products_products_body" in names
         wb.close()
 
-    def test_named_ranges_roundtrip_via_parse_ir(self, tmp_path: Path, monkeypatch):
+    def test_named_ranges_roundtrip_via_openpyxl_parser(self, tmp_path: Path, monkeypatch):
         frames = {
             "products": pd.DataFrame([
                 {"id": "P-1", "name": "Alpha"},
@@ -134,7 +134,7 @@ class TestNamedRangeXLSXRoundtrip:
         out = tmp_path / "test.xlsx"
         ExcelBackend().write_multi(frames, str(out))
 
-        ir = parse_ir(out)
+        ir = parse_workbook(out)
         nr_names = {nr.name for nr in ir.sheets["products"].named_ranges}
         assert "products_products_table" in nr_names
         assert "products_products_body" in nr_names
