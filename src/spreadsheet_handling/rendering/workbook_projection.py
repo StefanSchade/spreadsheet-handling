@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Project spreadsheet-generic ``WorkbookIR`` data back into frames."""
+"""Project spreadsheet-generic ``WorkbookIR`` data back into frames independent of concrete spreadsheet backends."""
 
 import ast
 import json

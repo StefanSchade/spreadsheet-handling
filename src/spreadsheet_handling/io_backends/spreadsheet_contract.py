@@ -20,7 +20,7 @@ class SpreadsheetRenderer(Protocol):
 
 
 class SpreadsheetParser(Protocol):
-    """Adapter-specific parser that reconstructs a ``WorkbookIR`` from a workbook file."""
+    """Format-specific parser that must stop at ``WorkbookIR``."""
 
     def __call__(self, path: str | Path) -> WorkbookIR: ...
 
@@ -41,7 +41,7 @@ def read_spreadsheet_frames(
     *,
     parser: SpreadsheetParser,
 ) -> dict[str, Any]:
-    """Parse a workbook file via a format-specific parser and reconstruct frames."""
+    """Parse via a format-specific parser and generically project ``WorkbookIR`` to frames."""
     return workbookir_to_frames(parser(path))
 
 

@@ -18,6 +18,14 @@ from spreadsheet_handling.rendering.ir import (
     WorkbookIR,
 )
 
+_OPTION_HINT_KEYS = (
+    "freeze_header",
+    "auto_filter",
+    "header_fill_rgb",
+    "helper_fill_rgb",
+    "helper_prefix",
+)
+
 
 def parse_workbook(path: str | Path) -> WorkbookIR:
     """
@@ -33,6 +41,11 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
         ir = WorkbookIR()
 
         embedded_meta = _read_meta_sheet(wb)
+        workbook_option_hints = {
+            key: embedded_meta[key]
+            for key in _OPTION_HINT_KEYS
+            if key in embedded_meta
+        }
 
         for ws_name in wb.sheetnames:
             ws = wb[ws_name]
@@ -41,11 +54,14 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
                 continue
 
             sheet_meta_hints = (embedded_meta.get("sheets") or {}).get(ws_name, {})
+            meta_hints = dict(workbook_option_hints)
+            if isinstance(sheet_meta_hints, dict):
+                meta_hints.update(sheet_meta_hints)
             ir.sheets[ws_name] = _parse_visible_sheet(
                 ws,
                 sheet_name=ws_name,
                 anchors=None,
-                meta_hints=sheet_meta_hints,
+                meta_hints=meta_hints,
                 stop_on_empty_row=True,
                 stop_on_empty_col=False,
             )
@@ -110,7 +126,7 @@ def _parse_visible_sheet(
     sh = SheetIR(name=sheet_name)
 
     options = {}
-    for key in ("freeze_header", "auto_filter", "header_fill_rgb", "helper_prefix"):
+    for key in _OPTION_HINT_KEYS:
         if key in meta_hints:
             options[key] = meta_hints[key]
     if options:
