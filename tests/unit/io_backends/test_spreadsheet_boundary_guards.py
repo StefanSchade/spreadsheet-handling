@@ -5,7 +5,8 @@ from __future__ import annotations
 These checks intentionally cover the most important spreadsheet boundary modules
 and adapter entry points. They are not a full repository-wide architecture
 linter, but a focused drift-protection layer for the seams that Phase 3i wants
-to keep narrow.
+to keep narrow. The rendering-tree guard also encodes the current policy that
+`spreadsheet_handling.rendering` stays adapter-free and generic.
 """
 
 import ast
@@ -71,7 +72,7 @@ def test_generic_spreadsheet_modules_stay_free_of_xlsx_and_openpyxl_dependencies
         _assert_no_import_prefixes(module_path, forbidden_prefixes=forbidden_prefixes)
 
 
-def test_xlsx_backend_only_reaches_generic_code_via_spreadsheet_contract():
+def test_xlsx_backend_imports_generic_code_through_spreadsheet_contract_boundary():
     imports = _module_imports(backend_mod)
 
     assert "spreadsheet_handling.io_backends.spreadsheet_contract" in imports
@@ -90,7 +91,7 @@ def test_xlsx_backend_only_reaches_generic_code_via_spreadsheet_contract():
     ]
 
     assert not violations, (
-        "xlsx_backend.py must stay on the spreadsheet contract boundary:\n"
+        "xlsx_backend.py must keep generic imports on the spreadsheet contract boundary:\n"
         + "\n".join(sorted(violations))
     )
 
