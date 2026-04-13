@@ -6,7 +6,10 @@ import pytest
 import yaml
 
 
-pytestmark = pytest.mark.ftr("FTR-META-REGISTRY-P3H")
+pytestmark = [
+    pytest.mark.ftr("FTR-META-REGISTRY-P3H"),
+    pytest.mark.ftr("FTR-META-REGISTRY-HARDENING-P3I"),
+]
 
 
 def _load_registry() -> dict:
@@ -21,23 +24,14 @@ def _load_registry() -> dict:
 def test_meta_registry_has_required_profile_fields():
     registry = _load_registry()
     entries = registry.get("entries")
+    maintenance_contract = registry.get("maintenance_contract")
 
-    assert registry.get("registry_version") == 1
+    assert registry.get("registry_version") == 2
     assert isinstance(entries, list)
     assert entries
+    assert isinstance(maintenance_contract, dict)
 
-    required_fields = {
-        "name",
-        "layer",
-        "meaning",
-        "scope",
-        "origin",
-        "render_relevance",
-        "persistence_behavior",
-        "roundtrip_relevance",
-        "producer",
-        "consumer",
-    }
+    required_fields = set(maintenance_contract.get("common_required_fields", []))
 
     for entry in entries:
         assert required_fields <= set(entry)
@@ -78,3 +72,27 @@ def test_meta_registry_seeds_current_known_entries():
         "__autofilter_ref",
         "_hidden",
     } <= names
+
+
+def test_meta_registry_exposes_maintenance_contract():
+    registry = _load_registry()
+    maintenance_contract = registry.get("maintenance_contract")
+    reference_conventions = registry.get("reference_conventions")
+
+    assert isinstance(maintenance_contract, dict)
+    assert maintenance_contract.get("maintenance_mode") == "manual_review_artifact"
+    assert maintenance_contract.get("runtime_binding") == "forbidden"
+    assert {
+        "canonical_meta",
+        "derived_operational_view",
+        "carrier_artifact",
+        "read_path_hint",
+    } <= set(maintenance_contract.get("allowed_classifications", []))
+    assert {
+        "meta_canonical",
+        "meta_rendering",
+    } <= set(maintenance_contract.get("allowed_layers", []))
+
+    assert isinstance(reference_conventions, dict)
+    assert reference_conventions.get("code_reference_prefix") == "spreadsheet_handling"
+    assert isinstance(reference_conventions.get("approved_narrative_references"), list)
