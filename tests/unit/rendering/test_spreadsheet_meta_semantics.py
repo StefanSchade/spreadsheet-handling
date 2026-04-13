@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Current-state and transitional spreadsheet-meta checks.
+
+This module intentionally keeps smoke/presence checks and tolerated
+current-XLSX-shape assertions. Durable spreadsheet-semantics invariants live in
+``test_spreadsheet_semantic_invariants.py``.
+"""
+
 import ast
 
 import pandas as pd
@@ -10,9 +17,6 @@ from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
 from spreadsheet_handling.rendering.plan import (
     AddValidation,
-    DefineNamedRange,
-    SetAutoFilter,
-    SetFreeze,
     WriteMeta,
 )
 
@@ -63,41 +67,7 @@ def test_current_hidden_meta_payload_carrier_is_reconstructible():
     assert ast.literal_eval(meta_ops[0].kv["workbook_meta_blob"]) == meta
 
 
-def test_non_layout_spreadsheet_semantics_reach_render_plan():
-    meta = _sample_meta()
-    ir = compose_workbook(_sample_frames(), meta)
-    ir = apply_render_passes(ir, meta)
-    plan = build_render_plan(ir)
-
-    assert any(isinstance(op, SetFreeze) for op in plan.ops)
-    assert any(isinstance(op, SetAutoFilter) for op in plan.ops)
-    assert any(isinstance(op, AddValidation) for op in plan.ops)
-    assert any(isinstance(op, DefineNamedRange) for op in plan.ops)
-
-
-def test_sheet_options_override_workbook_defaults_before_render_plan():
-    meta = {
-        "freeze_header": True,
-        "auto_filter": True,
-        "sheets": {
-            "Products": {
-                "freeze_header": False,
-            }
-        },
-    }
-    ir = compose_workbook(_sample_frames(), meta)
-
-    assert ir.sheets["Products"].meta["options"]["auto_filter"] is True
-    assert ir.sheets["Products"].meta["options"]["freeze_header"] is False
-
-    ir = apply_render_passes(ir, meta)
-    plan = build_render_plan(ir)
-
-    assert any(isinstance(op, SetAutoFilter) for op in plan.ops)
-    assert not any(isinstance(op, SetFreeze) for op in plan.ops)
-
-
-def test_validation_formula_is_derived_adapter_expression_not_canonical_rule():
+def test_current_validation_formula_is_adapter_expression_not_canonical_rule():
     meta = _sample_meta()
     ir = compose_workbook(_sample_frames(), meta)
     ir = apply_render_passes(ir, meta)
