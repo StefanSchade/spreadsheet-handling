@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 from pathlib import Path
 from typing import Any
 
@@ -131,11 +133,21 @@ def _validation_summary(sheet: SheetIR) -> list[tuple[str, tuple[int, int, int, 
         (
             validation.kind,
             validation.area,
-            validation.formula,
+            _normalized_validation_values(validation.formula),
             validation.allow_empty,
         )
         for validation in sheet.validations
     )
+
+
+def _normalized_validation_values(formula: str) -> tuple[str, ...]:
+    text = str(formula or "")
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+    if not text:
+        return ()
+    reader = csv.reader(io.StringIO(text), delimiter=",", quotechar='"')
+    return tuple(next(reader))
 
 
 def _supported_sheet_summary(sheet: SheetIR) -> dict[str, Any]:

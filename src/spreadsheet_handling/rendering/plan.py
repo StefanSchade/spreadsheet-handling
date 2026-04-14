@@ -55,7 +55,7 @@ class AddValidation:
     c1: int
     r2: int
     c2: int
-    formula: str  # adapter-facing validation expression derived from canonical constraint semantics
+    formula: str  # adapter-facing validation expression derived from meta_canonical["constraints"]
     allow_empty: bool = True
 
 @dataclass(frozen=True)

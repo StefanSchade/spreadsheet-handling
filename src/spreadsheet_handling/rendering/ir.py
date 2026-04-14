@@ -15,7 +15,7 @@ class NamedRange:
 class DataValidationSpec:
     kind: str                          # spreadsheet-neutral validation kind, e.g. "list"
     area: Tuple[int, int, int, int]    # (r1, c1, r2, c2), 1-based
-    formula: str                       # adapter-facing validation expression; canonical rule meaning stays in meta_canonical
+    formula: str                       # adapter-facing validation expression; canonical rule meaning stays in meta_canonical["constraints"]
     allow_empty: bool = True
 
 @dataclass
