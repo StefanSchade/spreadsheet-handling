@@ -1,0 +1,168 @@
+== FK Helper Metadata Concept
+
+=== Purpose
+
+FK helper columns are not purely a rendering detail and not purely a data-model concern.
+They sit between both worlds:
+
+- in one direction, a pure domain model is enriched with visible helper columns before a spreadsheet is written;
+- in the other direction, a spreadsheet may already contain helper columns and must be cleaned back to a pure domain model.
+
+To support both directions reliably, helper semantics should not live only in ad hoc pipeline arguments or only in column-name heuristics.
+
+This concept therefore distinguishes between:
+
+- canonical helper metadata;
+- derived operational helper metadata;
+- enrichment and cleanup steps that consume and produce this metadata.
+
+=== Core Idea
+
+There are two different questions:
+
+1. Which fields of a referenced target table are meaningful helper candidates?
+2. Which concrete columns in the current working sheet are materialized helper columns?
+
+These questions belong to different metadata layers.
+
+=== Canonical Metadata
+
+Canonical metadata describes helper intent at the schema/domain level.
+
+Typical example:
+
+[source,yaml]
+----
+sheets:
+  branch:
+    fk_helpers:
+      available_fields: [name, category, region, status]
+      default_fields: [name, category]
+----
+
+Meaning:
+
+- `available_fields` lists target-side attributes that may be exposed as helper columns.
+- `default_fields` defines the default helper materialization when a source-side FK does not override the choice.
+
+This information semantically belongs to the referenced target table, because it describes what that table can offer as a human-readable helper view.
+
+=== Source-Side Override Metadata
+
+Source-side metadata may still override the default choice for a concrete FK usage.
+
+[source,yaml]
+----
+sheets:
+  product:
+    foreign_keys:
+      - column: id_(branch)
+        target: branch
+        helper_fields: [name]
+----
+
+Resolution order should therefore conceptually be:
+
+1. FK-specific source-side override
+2. target-sheet `default_fields`
+3. pipeline/global fallback
+4. legacy `label_field`
+
+=== Derived Operational Metadata
+
+During domain processing we also need metadata that marks concrete materialized helper columns in the current sheet state.
+
+Typical derived facts are:
+
+- this column is a helper column;
+- it belongs to FK column `id_(branch)`;
+- it materializes target `branch`;
+- it represents helper field `name`.
+
+This metadata is operational rather than canonical. It is produced by enrichment or bootstrap steps and is then consumed by later cleanup, validation, styling, and roundtrip steps.
+
+Conceptually this could look like:
+
+[source,yaml]
+----
+meta_derived:
+  sheets:
+    product:
+      helper_columns:
+        - column: _branch_name
+          role: helper
+          fk_column: id_(branch)
+          target: branch
+          value_field: name
+----
+
+The exact storage shape may evolve, but the distinction matters:
+
+- canonical metadata says what *should* be possible by model;
+- derived metadata says what *is currently materialized* in the working spreadsheet-shaped domain state.
+
+=== JSON to Domain to Spreadsheet
+
+When starting from JSON or another pure model source, the flow is conceptually:
+
+1. load pure data into domain frames
+2. run `bootstrap_meta` so pipeline-visible metadata exists in the working state
+3. resolve FK helper intent from canonical metadata and optional source-side overrides
+4. enrich helper columns into the working frames
+5. write spreadsheet output
+
+Important point:
+
+- helper enrichment is a domain/pipeline concern, not a responsibility of the spreadsheet renderer itself
+
+The spreadsheet renderer may *use* derived helper metadata, for example for:
+
+- helper fill colors
+- optional protection
+- future formula-driven helper rendering
+
+But it should not be the component that decides which helper columns exist semantically.
+
+=== Spreadsheet to Domain to JSON
+
+When starting from spreadsheet input, the flow is conceptually different:
+
+1. parse spreadsheet into domain frames
+2. parse accompanying metadata or sidecar metadata if available
+3. if helper provenance is already persisted, bootstrap derived helper metadata from it
+4. if helper provenance is not persisted, derive helper metadata from known conventions and canonical FK helper rules
+5. run cleanup/de-enrichment to remove helper columns for pure persistence
+6. persist JSON and optional sidecar metadata
+
+This matters especially when spreadsheet editing is the starting point, because helper columns may already exist before any enrichment step of the current run has happened.
+
+=== Persistence and Roundtrip
+
+For roundtrip-safe processing, helper provenance should survive outside the visible spreadsheet surface.
+
+That means:
+
+- helper metadata should not require editing hidden sheets in Excel as the primary mechanism;
+- helper metadata should instead live in sidecar/domain metadata that can be bootstrapped into the working state;
+- if JSON is persisted directly, a hidden or sidecar JSON metadata payload may preserve helper provenance for later continuation of the roundtrip.
+
+If helper columns are removed during cleanup, the canonical metadata may remain, while the derived operational metadata is expected to change because the helper columns are no longer materialized in the current working state.
+
+=== Consequences
+
+This concept suggests a longer-term direction:
+
+- helper materialization should eventually prefer metadata-driven classification over prefix-only heuristics;
+- target-sheet helper defaults belong naturally to canonical metadata;
+- concrete helper-column markers belong to derived operational metadata;
+- `bootstrap_meta` is the natural place where persisted metadata becomes active working metadata before enrichment or cleanup steps run.
+
+=== Current State vs. Target State
+
+Current implementation is intentionally simpler:
+
+- helper field selection currently lives mainly in pipeline defaults such as `helper_fields_by_fk`;
+- helper cleanup/styling still relies heavily on prefix-based recognition;
+- helper provenance is not yet modeled as a first-class derived metadata structure.
+
+This is acceptable for the current project phase, but the bidirectional spreadsheet/domain story suggests the metadata-driven model above as the more complete target state.
