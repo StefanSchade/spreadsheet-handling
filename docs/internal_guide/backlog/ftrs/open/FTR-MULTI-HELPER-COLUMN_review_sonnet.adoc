@@ -1,0 +1,104 @@
+= Review — FTR-MULTI-HELPER-COLUMN (Claude Sonnet Preserve)
+
+== Gesamtbewertung
+
+Das Ticket ist umgesetzt und der Ansatz ist architektonisch sauber.
+Das FKDef-Modell traegt den multi-helper Ausbau natuerlich: ein `value_field`
+pro NamedTuple-Instanz, eine Instanz pro gewuenschtem Helper. Das vermeidet
+jede Listenstruktur innerhalb von `FKDef` selbst und haelt alle nachgelagerten
+Iterationsschleifen einheitlich.
+
+Kein Teil der Umsetzung greift in den Schreibpfad ein. Die Aenderungen liegen
+vollstaendig in `core/fk.py`, `domain/transformations/helpers.py`,
+`domain/validations/fk_helpers.py` und der Pipeline-Orchestrierung.
+
+== Architektur: Datenbasis
+
+`_resolve_helper_fields` liefert eine nach `dict.fromkeys` stabil
+de-duplizierte Liste — die konfigurierte Reihenfolge bleibt also erhalten,
+auch wenn ein Feld mehrfach aufgefuehrt wird. Das ist eine stille, korrekte
+Entscheidung, die in keinem Kommentar erwaehnt wird, aber gut ist.
+
+Die Prioritaetskette (`by_fk` -> `by_target[key]` -> `by_target[name]` ->
+`helper_fields` -> `label_field`) ist nachvollziehbar und erweiterbar.
+Die doppelte Abfrage von `by_target` (einmal per Sheet-Key, einmal per
+originalem Sheet-Namen) deckt einen echten Praxisfall ab — gut.
+
+`build_id_value_maps` baut nur Maps fuer tatsaechlich benoetigte Felder
+(via `fields_by_sheet`). Wenn ein gefordertes Feld im Zielblatt nicht
+existiert, wird eine leere Map zurueckgegeben — korrekt und lautlos. Eine
+Warnung waere hier vertretbar, liegt aber ausserhalb des FTR-Scope.
+
+== Architektur: apply_fk_helpers
+
+Die Backward-Compatibility im Dispatch ist funktional korrekt, aber
+erklaerungsbeduerftig:
+
+[source,python]
+----
+if isinstance(target_maps, dict) and target_maps and all(
+    isinstance(v, dict) for v in target_maps.values()
+):
+    value_map = target_maps.get(value_field, {})
+elif isinstance(target_maps, dict):
+    value_map = target_maps  # altes flaches Format
+----
+
+Der zweite Ast greift auch dann, wenn `target_maps == {}` (leer, weil Sheet
+nicht in der Registry) — was zu `value_map = {}` fuehrt. Das ist korrekt, aber
+nicht offensichtlich. Ein Kommentar oder eine explizite `else: value_map = {}`
+Variante waere klarer.
+
+Die `first_cols`-Duplikat-Sperre wird einmalig vor der Schleife gebaut und
+nicht aktualisiert. Wenn `fk_defs` zwei Eintraege mit identischem
+`helper_column` enthalten wuerden (z. B. durch Konfigurationsfehler), wuerde
+der zweite still uebersprungen. `detect_fk_columns` kann das nicht
+produzieren, solange konfigurierte Felder de-dupliziert werden, aber die Stille
+bleibt eine stille Annahme.
+
+== reorder_helpers_next_to_fk
+
+Der Algorithmus faengt eine nicht-triviale Positionsarithmetik ab. Fuer den
+Normalfall — Helper am Tabellenende, FK in der Mitte — funktioniert er korrekt:
+`fk_ix + k` baut die Gruppe Stueck fuer Stueck auf.
+
+Es gibt eine stille Annahme: `fk_ix` wird vor der inneren Schleife festgelegt
+und innerhalb nicht aktualisiert. Wenn ein Helper sich links vom FK befindet
+(Position p < fk_ix), verschiebt `cols.remove(h)` den FK auf `fk_ix - 1`,
+aber `cols.insert(fk_ix + k, ...)` rechnet noch mit dem alten Index. Das
+Ergebnis waere, dass der Helper rechts neben statt direkt hinter den FK
+gestellt wird.
+
+In der normalen Pipeline-Reihenfolge (erst Enrich, dann Reorder) entsteht
+dieser Fall nicht — Helper werden am Ende angehaengt. Der Algorithmus haette
+aber Probleme, wenn der Schritt auf einer bereits manuell vorsortieren DataFrame
+aufgerufen wird. Kein Blocker, aber ein dokumentierungswertes Limit.
+
+== Validierung: seen_fk_columns
+
+Der Guard `seen_fk_columns` ist minimal und richtig. Da `detect_fk_columns`
+nun N Eintraege pro FK-Spalte zurueckgibt, wuerde ohne ihn jeder
+unaufloesbare FK-Wert N-mal gemeldet. Die Korrektur ist an der richtigen
+Stelle (im Caller, nicht im Validator selbst).
+
+== Konfigurationsinterface
+
+[source,yaml]
+----
+defaults:
+  helper_fields_by_fk:
+    id_(branch): [category, name]
+----
+
+Die Konfigurationsform ist minimal und enspricht dem bestehenden
+`defaults`-Muster. Rueckwaertskompatibilitaet ist durch den Fallback auf
+`label_field` gesichert.
+
+== Offene Punkte (ausserhalb dieses Tickets)
+
+- Formelbasierte Helper-Berechnung (`FTR-FORMULA-PROVIDERS`)
+- Weitergehende Legenden-/Compact-Darstellungen
+- Einheitlichere FK-Konfiguration ueber mehrere Backlog-Bloecke hinweg
+- Optionale Warnung bei konfigurierten Feldern, die im Zielblatt nicht existieren
+- Dokumentierter Hinweis auf das Limit von `reorder_helpers_next_to_fk` bei
+  Helper-Spalten, die bereits links der FK liegen
