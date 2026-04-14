@@ -84,6 +84,7 @@ def test_openpyxl_parser_delegates_visible_sheet_interpretation_to_helper_module
 
     imported_modules: list[str] = []
     defined_functions: list[str] = []
+    called_functions: list[str] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -92,7 +93,9 @@ def test_openpyxl_parser_delegates_visible_sheet_interpretation_to_helper_module
             imported_modules.append(node.module or "")
         elif isinstance(node, ast.FunctionDef):
             defined_functions.append(node.name)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            called_functions.append(node.func.id)
 
     assert "spreadsheet_handling.io_backends.xlsx.parser_interpretation" in imported_modules
     assert "_parse_visible_sheet" in defined_functions
-    assert "_parse_table_block" not in defined_functions
+    assert "build_visible_sheet_ir" in called_functions
