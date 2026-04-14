@@ -15,8 +15,11 @@ internal guide:
 Practical summary:
 
 * Repo-facing code, docs, and commit messages are in English.
-* Use Conventional Commits; for FTR work, use the FTR ID as scope and avoid
-  vague commit subjects.
+* Use Conventional Commits; for FTR work, include the FTR ID prominently in the
+  commit message, preferably as the Conventional Commit scope, and avoid vague
+  commit subjects.
+* Do not create repo commits for ticketed work that omit the corresponding FTR
+  ID unless the user explicitly asks for a different commit style.
 * Treat the internal guide, ADRs, and active FTR/review files as the source of
   truth; do not rely on this file as a standalone project summary.
 * Stay inside the workspace repositories and avoid destructive or irreversible
