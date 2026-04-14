@@ -129,6 +129,19 @@ class TestMultiFkTargets:
         lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
         assert lvl0 == ["id", "other", "id_(B)", "_B_category", "_B_name"]
 
+    def test_reorder_helpers_moves_left_side_helpers_directly_behind_fk(self):
+        frames = {
+            "A": pd.DataFrame(
+                [[10, "Alpha", "A", 1, "tail"]],
+                columns=["id", "_B_name", "_B_category", "id_(B)", "tail"],
+            )
+        }
+
+        out = run_pipeline(frames, [make_reorder_helpers_step(helper_prefix="_")])
+
+        lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
+        assert lvl0 == ["id", "id_(B)", "_B_name", "_B_category", "tail"]
+
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")
 class TestMissingLabelField:
