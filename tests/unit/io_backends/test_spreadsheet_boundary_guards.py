@@ -15,6 +15,10 @@ from pathlib import Path
 import pytest
 
 import spreadsheet_handling.io_backends._interfaces as interfaces_mod
+import spreadsheet_handling.io_backends.ods.odf_parser as ods_parser_mod
+import spreadsheet_handling.io_backends.ods.parser_interpretation as ods_interpretation_mod
+import spreadsheet_handling.io_backends.ods.odf_renderer as ods_renderer_mod
+import spreadsheet_handling.io_backends.ods.ods_backend as ods_backend_mod
 import spreadsheet_handling.io_backends.spreadsheet_contract as contract_mod
 import spreadsheet_handling.io_backends.xlsx.openpyxl_parser as parser_mod
 import spreadsheet_handling.io_backends.xlsx.openpyxl_renderer as renderer_mod
@@ -65,6 +69,8 @@ def test_generic_spreadsheet_modules_stay_free_of_xlsx_and_openpyxl_dependencies
 
     forbidden_prefixes = (
         "openpyxl",
+        "odf",
+        "spreadsheet_handling.io_backends.ods",
         "spreadsheet_handling.io_backends.xlsx",
     )
 
@@ -96,6 +102,30 @@ def test_xlsx_backend_imports_generic_code_through_spreadsheet_contract_boundary
     )
 
 
+def test_ods_backend_imports_generic_code_through_spreadsheet_contract_boundary():
+    imports = _module_imports(ods_backend_mod)
+
+    assert "spreadsheet_handling.io_backends.spreadsheet_contract" in imports
+
+    forbidden_prefixes = (
+        "spreadsheet_handling.rendering.composer",
+        "spreadsheet_handling.rendering.passes",
+        "spreadsheet_handling.rendering.flow",
+        "spreadsheet_handling.rendering.plan",
+        "spreadsheet_handling.rendering.workbook_projection",
+        "spreadsheet_handling.rendering.ir",
+    )
+    violations = [
+        name for name in imports
+        if any(name.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+
+    assert not violations, (
+        "ods_backend.py must keep generic imports on the spreadsheet contract boundary:\n"
+        + "\n".join(sorted(violations))
+    )
+
+
 def test_xlsx_parser_stops_at_workbook_ir_boundary():
     imports = _module_imports(parser_mod)
 
@@ -117,6 +147,55 @@ def test_xlsx_parser_stops_at_workbook_ir_boundary():
 
     assert not violations, (
         "openpyxl_parser.py must stop at WorkbookIR and not reach through to other boundaries:\n"
+        + "\n".join(sorted(violations))
+    )
+
+
+def test_ods_parser_stops_at_workbook_ir_boundary():
+    imports = _module_imports(ods_parser_mod)
+
+    assert "spreadsheet_handling.rendering.ir" in imports
+    assert "spreadsheet_handling.io_backends.ods.parser_interpretation" in imports
+
+    forbidden_prefixes = (
+        "spreadsheet_handling.io_backends.spreadsheet_contract",
+        "spreadsheet_handling.rendering.workbook_projection",
+        "spreadsheet_handling.rendering.composer",
+        "spreadsheet_handling.rendering.passes",
+        "spreadsheet_handling.rendering.flow",
+        "spreadsheet_handling.rendering.plan",
+    )
+    violations = [
+        name for name in imports
+        if any(name.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+
+    assert not violations, (
+        "odf_parser.py must stop at WorkbookIR and not reach through to other boundaries:\n"
+        + "\n".join(sorted(violations))
+    )
+
+
+def test_ods_parser_interpretation_stays_out_of_projection_and_contract_layers():
+    imports = _module_imports(ods_interpretation_mod)
+
+    assert "spreadsheet_handling.rendering.ir" in imports
+
+    forbidden_prefixes = (
+        "spreadsheet_handling.io_backends.spreadsheet_contract",
+        "spreadsheet_handling.rendering.workbook_projection",
+        "spreadsheet_handling.rendering.composer",
+        "spreadsheet_handling.rendering.passes",
+        "spreadsheet_handling.rendering.flow",
+        "spreadsheet_handling.rendering.plan",
+    )
+    violations = [
+        name for name in imports
+        if any(name.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+
+    assert not violations, (
+        "ods/parser_interpretation.py must stay on the parser-side interpretation boundary:\n"
         + "\n".join(sorted(violations))
     )
 
@@ -165,5 +244,29 @@ def test_xlsx_renderer_consumes_render_plan_without_reaching_back_into_rendering
 
     assert not violations, (
         "openpyxl_renderer.py must consume RenderPlan without reaching back into earlier layers:\n"
+        + "\n".join(sorted(violations))
+    )
+
+
+def test_ods_renderer_consumes_render_plan_without_reaching_back_into_rendering_pipeline():
+    imports = _module_imports(ods_renderer_mod)
+
+    assert "spreadsheet_handling.rendering.plan" in imports
+
+    forbidden_prefixes = (
+        "spreadsheet_handling.io_backends.spreadsheet_contract",
+        "spreadsheet_handling.rendering.workbook_projection",
+        "spreadsheet_handling.rendering.composer",
+        "spreadsheet_handling.rendering.passes",
+        "spreadsheet_handling.rendering.flow",
+        "spreadsheet_handling.rendering.ir",
+    )
+    violations = [
+        name for name in imports
+        if any(name.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+
+    assert not violations, (
+        "odf_renderer.py must consume RenderPlan without reaching back into earlier layers:\n"
         + "\n".join(sorted(violations))
     )

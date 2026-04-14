@@ -15,6 +15,8 @@ from spreadsheet_handling.io_backends.router import get_loader, get_saver
         ("yaml", get_loader),
         ("xml_dir", get_loader),
         ("xml", get_loader),
+        ("ods", get_loader),
+        ("calc", get_loader),
         ("xlsx", get_loader),
         ("csv_dir", get_saver),
         ("json_dir", get_saver),
@@ -23,6 +25,8 @@ from spreadsheet_handling.io_backends.router import get_loader, get_saver
         ("yaml", get_saver),
         ("xml_dir", get_saver),
         ("xml", get_saver),
+        ("ods", get_saver),
+        ("calc", get_saver),
         ("xlsx", get_saver),
     ],
 )

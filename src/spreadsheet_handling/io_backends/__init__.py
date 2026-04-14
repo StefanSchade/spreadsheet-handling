@@ -1,5 +1,6 @@
 from .base import BackendBase, BackendOptions
 from .csv_backend import CSVBackend
+from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from .json_backend import JSONBackend
 from .xml_backend import XMLBackend
@@ -9,11 +10,13 @@ from .spreadsheet_contract import SpreadsheetParser, SpreadsheetRenderer
 
 _BACKENDS = {
     'xlsx': ExcelBackend,
+    'ods': OdsBackend,
     'csv': CSVBackend,
     'json': JSONBackend,
     'xml': XMLBackend,
     # aliases:
     'excel': ExcelBackend,
+    'calc': OdsBackend,
 }
 
 def make_backend(kind: str) -> BackendBase:
@@ -29,6 +32,7 @@ __all__ = [
     'DeprecatedAdapterError',
     'ExcelBackend',
     'JSONBackend',
+    'OdsBackend',
     'SpreadsheetParser',
     'SpreadsheetRenderer',
     'XMLBackend',

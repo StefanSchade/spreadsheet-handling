@@ -11,7 +11,7 @@ pytestmark = pytest.mark.ftr("FTR-ADAPTER-DEPRECATION-STUBS")
 class TestFactoryIntegration:
     def test_make_backend_active_still_works(self):
         """Active backends are unaffected."""
-        for kind in ("xlsx", "json", "csv", "xml"):
+        for kind in ("xlsx", "ods", "json", "csv", "xml"):
             backend = make_backend(kind)
             assert backend is not None
 
@@ -19,7 +19,6 @@ class TestFactoryIntegration:
         with pytest.raises(ValueError, match="Unknown backend"):
             make_backend("foobar")
 
-    def test_make_backend_ods_raises_value_error(self):
-        """ODS was removed; requesting it is now an unknown-backend error."""
-        with pytest.raises(ValueError, match="Unknown backend"):
-            make_backend("ods")
+    def test_make_backend_calc_alias_resolves(self):
+        backend = make_backend("calc")
+        assert backend is not None
