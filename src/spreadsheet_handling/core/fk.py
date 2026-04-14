@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 import re
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, Iterable, List, NamedTuple
+
 import pandas as pd
 
 from ..frame_keys import iter_data_frames
@@ -17,6 +19,7 @@ class FKDef(NamedTuple):
     id_field: str  # z. B. "id" oder "Schluessel"
     target_sheet_key: str  # z. B. "Guten_Morgen"
     helper_column: str  # z. B. "_Guten_Morgen_name"
+    value_field: str  # z. B. "name" oder "category"
 
 
 def _norm_id(v) -> str | None:
@@ -89,8 +92,46 @@ def _first_level_columns(df: pd.DataFrame) -> List[str]:
     return [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]
 
 
+def _normalize_helper_fields(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    else:
+        values = [str(item) for item in value]
+    # Stable de-duplication keeps configured order intact.
+    return list(dict.fromkeys(v for v in values if v))
+
+
+def _resolve_helper_fields(
+    fk_column: str,
+    sheet_key: str,
+    registry: Dict[str, Dict[str, Any]],
+    defaults: Dict[str, Any] | None = None,
+) -> List[str]:
+    defs = defaults or {}
+    by_fk = defs.get("helper_fields_by_fk") or {}
+    by_target = defs.get("helper_fields_by_target") or {}
+    sheet_name = str(registry[sheet_key]["sheet_name"])
+
+    if fk_column in by_fk:
+        return _normalize_helper_fields(by_fk[fk_column])
+    if sheet_key in by_target:
+        return _normalize_helper_fields(by_target[sheet_key])
+    if sheet_name in by_target:
+        return _normalize_helper_fields(by_target[sheet_name])
+    if "helper_fields" in defs:
+        return _normalize_helper_fields(defs.get("helper_fields"))
+
+    label_field = str(registry[sheet_key]["label_field"])
+    return [label_field]
+
+
 def detect_fk_columns(
-    df: pd.DataFrame, registry: Dict[str, Dict[str, Any]], helper_prefix: str = "_"
+    df: pd.DataFrame,
+    registry: Dict[str, Dict[str, Any]],
+    helper_prefix: str = "_",
+    defaults: Dict[str, Any] | None = None,
 ) -> List[FKDef]:
     """
     Findet Spalten wie 'id_(Guten_Morgen)' bzw. 'Schluessel_(Guten_Morgen)'.
@@ -115,13 +156,68 @@ def detect_fk_columns(
             # Strikt: nur akzeptieren, wenn Prefix zum Zielblatt-id_field passt
             # (alternativ: akzeptieren & trotzdem target_id_field verwenden)
             continue
-        helper_col = f"{helper_prefix}{sheet_key}_name"
-        fks.append(
-            FKDef(
-                fk_column=c, id_field=id_field, target_sheet_key=sheet_key, helper_column=helper_col
+        helper_fields = _resolve_helper_fields(c, sheet_key, registry, defaults)
+        for value_field in helper_fields:
+            helper_col = f"{helper_prefix}{sheet_key}_{value_field}"
+            fks.append(
+                FKDef(
+                    fk_column=c,
+                    id_field=id_field,
+                    target_sheet_key=sheet_key,
+                    helper_column=helper_col,
+                    value_field=value_field,
+                )
+            )
+    return fks
+
+
+def build_id_value_maps(
+    frames: Dict[str, pd.DataFrame],
+    registry: Dict[str, Dict[str, Any]],
+    *,
+    fields_by_sheet: Dict[str, Iterable[str]] | None = None,
+) -> Dict[str, Dict[str, Dict[Any, Any]]]:
+    """
+    Fuer jedes Sheet verschachtelte Maps: {field_name -> {id_value -> field_value}}.
+    Wenn `fields_by_sheet` gesetzt ist, werden nur die benoetigten Felder erzeugt.
+    """
+    maps: Dict[str, Dict[str, Dict[Any, Any]]] = {}
+    requested_by_sheet = fields_by_sheet or {}
+
+    for sheet_key, meta in registry.items():
+        sheet_name = meta["sheet_name"]
+        df = frames[sheet_name]
+        id_field = str(meta["id_field"])
+        cols = _first_level_columns(df)
+
+        requested = list(
+            dict.fromkeys(
+                str(field)
+                for field in requested_by_sheet.get(
+                    sheet_key, [c for c in cols if c != id_field]
+                )
+                if str(field) and str(field) != id_field
             )
         )
-    return fks
+        if id_field not in cols:
+            maps[sheet_key] = {field: {} for field in requested}
+            continue
+
+        id_series = _series_from_first_level(df, id_field)
+        sheet_maps: Dict[str, Dict[Any, Any]] = {}
+        for field in requested:
+            if field not in cols:
+                sheet_maps[field] = {}
+                continue
+            value_series = _series_from_first_level(df, field)
+            field_map: Dict[Any, Any] = {}
+            for i, v in zip(id_series.tolist(), value_series.tolist()):
+                key = _norm_id(i)
+                if key is not None:
+                    field_map[key] = v
+            sheet_maps[field] = field_map
+        maps[sheet_key] = sheet_maps
+    return maps
 
 
 def build_id_label_maps(
@@ -131,26 +227,36 @@ def build_id_label_maps(
     Für jedes Sheet eine Map: {id_value -> label_value}.
     Nimmt id_field & label_field aus Registry. Fehlende Felder -> leere Map.
     """
+    fields_by_sheet = {
+        sheet_key: [str(meta["label_field"])] for sheet_key, meta in registry.items()
+    }
+    value_maps = build_id_value_maps(frames, registry, fields_by_sheet=fields_by_sheet)
     maps: Dict[str, Dict[Any, Any]] = {}
+    for sheet_key, meta in registry.items():
+        label_field = str(meta["label_field"])
+        maps[sheet_key] = value_maps.get(sheet_key, {}).get(label_field, {})
+    return maps
+
+
+def build_id_sets(
+    frames: Dict[str, pd.DataFrame],
+    registry: Dict[str, Dict[str, Any]],
+) -> Dict[str, set[str]]:
+    """Fuer jedes Sheet die vorhandenen IDs als normalisierte String-Menge."""
+    id_sets: Dict[str, set[str]] = {}
     for sheet_key, meta in registry.items():
         sheet_name = meta["sheet_name"]
         df = frames[sheet_name]
-        id_field = meta["id_field"]
-        label_field = meta["label_field"]
+        id_field = str(meta["id_field"])
         cols = _first_level_columns(df)
-        if id_field not in cols or label_field not in cols:
-            maps[sheet_key] = {}
+        if id_field not in cols:
+            id_sets[sheet_key] = set()
             continue
-        id_series = _series_from_first_level(df, id_field)
-        label_series = _series_from_first_level(df, label_field)
-        # robust gegen keys mit NaN oder Typunterschieden
-        m: Dict[Any, Any] = {}
-        for i, v in zip(id_series.tolist(), label_series.tolist()):
-            key = _norm_id(i)
-            if key is not None:
-                m[key] = v
-        maps[sheet_key] = m
-    return maps
+        ids = _series_from_first_level(df, id_field)
+        id_sets[sheet_key] = {
+            key for key in (_norm_id(value) for value in ids.tolist()) if key is not None
+        }
+    return id_sets
 
 
 # in scripts/spreadsheet_handling/src/spreadsheet_handling/core/fk.py
@@ -159,7 +265,7 @@ def build_id_label_maps(
 def apply_fk_helpers(
     df: pd.DataFrame,
     fk_defs: List[FKDef],
-    id_label_maps: Dict[str, Dict[Any, Any]],
+    id_value_maps: Dict[str, Any],
     levels: int,
     helper_prefix: str = "_",
 ) -> pd.DataFrame:
@@ -174,18 +280,31 @@ def apply_fk_helpers(
         if isinstance(fk, dict):
             fk_col = fk["column"]  # z.B. "id_(A)"
             target_key = fk.get("target_key") or fk.get("target_sheet_key")
-            helper_col = f"{helper_prefix}{target_key}_name"
+            value_field = str(fk.get("value_field", "name"))
+            helper_col = str(
+                fk.get("helper_column") or f"{helper_prefix}{target_key}_{value_field}"
+            )
         else:
             fk_col = fk.fk_column
             target_key = fk.target_sheet_key
             helper_col = fk.helper_column
+            value_field = fk.value_field
         # -------------------------------------------
 
         # nicht duplizieren
         if helper_col in first_cols:
             continue
 
-        label_map = id_label_maps.get(target_key, {})
+        target_maps = id_value_maps.get(target_key, {})
+        if isinstance(target_maps, dict) and target_maps and all(
+            isinstance(v, dict) for v in target_maps.values()
+        ):
+            value_map = target_maps.get(value_field, {})
+        elif isinstance(target_maps, dict):
+            # Backward-compatible path for older callers that still pass a flat id->label map.
+            value_map = target_maps
+        else:
+            value_map = {}
 
         # FK-Werte aus Level-0 holen (nicht DataFrame!)
         fk_series = _series_from_first_level(new_df, fk_col)
@@ -194,7 +313,7 @@ def apply_fk_helpers(
         # robustes Lookup mit Normalisierung
         values = []
         for rid in raw_ids:
-            lbl = label_map.get(_norm_id(rid))
+            lbl = value_map.get(_norm_id(rid))
             values.append(lbl)
 
         # neue Spalte als MultiIndex-Tuple gleicher Länge

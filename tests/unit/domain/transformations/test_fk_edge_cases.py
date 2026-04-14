@@ -18,6 +18,7 @@ from spreadsheet_handling.core.fk import (
 from spreadsheet_handling.core.indexing import level0_series
 from spreadsheet_handling.pipeline.pipeline import (
     make_apply_fks_step,
+    make_reorder_helpers_step,
     run_pipeline,
 )
 
@@ -92,6 +93,41 @@ class TestMultiFkTargets:
         assert orte_helper and kunden_helper
         assert list(level0_series(dfq, orte_helper[0])) == ["Insel", "Berg"]
         assert list(level0_series(dfq, kunden_helper[0])) == ["Anna", "Bob"]
+
+    def test_reorder_helpers_respects_configured_helper_order(self):
+        frames = {
+            "B": pd.DataFrame(
+                [
+                    {"id": 1, "name": "Alpha", "category": "A"},
+                    {"id": 2, "name": "Beta", "category": "B"},
+                ]
+            ),
+            "A": pd.DataFrame(
+                [
+                    {"id": 10, "other": "x", "id_(B)": 1},
+                    {"id": 20, "other": "y", "id_(B)": 2},
+                ]
+            ),
+        }
+        defaults = {
+            "id_field": "id",
+            "label_field": "name",
+            "helper_prefix": "_",
+            "detect_fk": True,
+            "levels": 3,
+            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
+        }
+
+        out = run_pipeline(
+            frames,
+            [
+                make_apply_fks_step(defaults=defaults),
+                make_reorder_helpers_step(helper_prefix="_"),
+            ],
+        )
+
+        lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
+        assert lvl0 == ["id", "other", "id_(B)", "_B_category", "_B_name"]
 
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")

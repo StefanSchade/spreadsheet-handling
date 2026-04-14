@@ -7,9 +7,11 @@ import pandas as pd
 from spreadsheet_handling.core.fk import (
     build_registry,
     build_id_label_maps,
+    build_id_value_maps,
     detect_fk_columns,
     apply_fk_helpers,
 )
+from spreadsheet_handling.core.indexing import level0_series
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-REFACTOR-P3B")
 
@@ -60,3 +62,29 @@ class TestApplyFkHelpers:
         # Empty registry simulates detect_fk=False (no target sheets matched)
         fk_defs = detect_fk_columns(frames["A"], {}, helper_prefix="_")
         assert fk_defs == []
+
+    def test_adds_multiple_helper_columns_in_configured_order(self):
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]}),
+            "B": pd.DataFrame(
+                {
+                    "id": [1, 2],
+                    "name": ["alpha", "beta"],
+                    "category": ["x", "y"],
+                }
+            ),
+        }
+        defaults = {
+            **DEFAULTS,
+            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
+        }
+        reg = build_registry(frames, defaults)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_", defaults=defaults)
+        id_maps = build_id_value_maps(frames, reg, fields_by_sheet={"B": ["category", "name"]})
+
+        result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
+        lvl0 = [c[0] if isinstance(c, tuple) else c for c in result.columns]
+
+        assert lvl0 == ["id", "id_(B)", "_B_category", "_B_name"]
+        assert level0_series(result, "_B_category").tolist() == ["x", "y"]
+        assert level0_series(result, "_B_name").tolist() == ["alpha", "beta"]

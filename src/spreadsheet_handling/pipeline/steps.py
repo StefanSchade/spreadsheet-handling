@@ -107,7 +107,7 @@ def make_apply_fks_step(
     """Detect FK columns and add helper columns via core/fk pure functions."""
     from ..core.fk import (
         build_registry,
-        build_id_label_maps,
+        build_id_value_maps,
         detect_fk_columns,
         apply_fk_helpers as _apply_fk_helpers,
     )
@@ -120,14 +120,25 @@ def make_apply_fks_step(
             return fr
 
         reg = build_registry(fr, defs)
-        id_maps = build_id_label_maps(fr, reg)
         levels = int(defs.get("levels", 3))
         helper_prefix = str(defs.get("helper_prefix", "_"))
+        fk_defs_by_sheet: dict[str, Any] = {}
+        fields_by_target: dict[str, list[str]] = {}
+
+        for sheet_name, df in iter_data_frames(fr):
+            fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix, defaults=defs)
+            fk_defs_by_sheet[sheet_name] = fk_defs
+            for fk in fk_defs:
+                fields_by_target.setdefault(fk.target_sheet_key, [])
+                if fk.value_field not in fields_by_target[fk.target_sheet_key]:
+                    fields_by_target[fk.target_sheet_key].append(fk.value_field)
+
+        id_maps = build_id_value_maps(fr, reg, fields_by_sheet=fields_by_target)
 
         out: dict[str, Any] = {}
         copy_reserved_frames(fr, out)
         for sheet_name, df in iter_data_frames(fr):
-            fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+            fk_defs = fk_defs_by_sheet[sheet_name]
             out[sheet_name] = _apply_fk_helpers(
                 df, fk_defs, id_maps, levels, helper_prefix=helper_prefix
             )
@@ -144,11 +155,20 @@ def make_drop_helpers_step(
     """Remove all helper columns (starting with prefix) from all sheets."""
     cfg = {"prefix": prefix}
 
+    def _visible_label(col: Any) -> str:
+        if isinstance(col, tuple):
+            for part in col:
+                label = str(part)
+                if label:
+                    return label
+            return ""
+        return str(col)
+
     def run(fr: Frames) -> Frames:
         out: dict[str, Any] = {}
         copy_reserved_frames(fr, out)
         for sheet, df in iter_data_frames(fr):
-            cols = [c for c in df.columns if not str(c).startswith(cfg["prefix"])]
+            cols = [c for c in df.columns if not _visible_label(c).startswith(cfg["prefix"])]
             out[sheet] = df.loc[:, cols]
         return out  # type: ignore[return-value]
 

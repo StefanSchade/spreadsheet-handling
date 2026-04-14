@@ -13,7 +13,8 @@ from ...frame_keys import iter_data_frames
 from ...core.fk import (
     FKDef,
     build_registry,
-    build_id_label_maps,
+    build_id_sets,
+    build_id_value_maps,
     detect_fk_columns,
 )
 from ...core.indexing import has_level0, level0_series
@@ -45,7 +46,7 @@ def check_unexpected_helpers(
     findings: Findings = []
 
     for sheet_name, df in iter_data_frames(frames):
-        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix, defaults=defs)
         expected_helpers = {fk.helper_column for fk in fk_defs}
 
         first_cols = [
@@ -75,7 +76,7 @@ def check_missing_helpers(
     findings: Findings = []
 
     for sheet_name, df in iter_data_frames(frames):
-        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix, defaults=defs)
         first_cols = set(
             (c[0] if isinstance(c, tuple) else c) for c in df.columns.tolist()
         )
@@ -99,7 +100,6 @@ def check_helper_values(
     defs = defaults or {}
     helper_prefix = str(defs.get("helper_prefix", "_"))
     reg = build_registry(frames, defs)
-    id_maps = build_id_label_maps(frames, reg)
     findings: Findings = []
 
     def _norm(v: Any) -> str | None:
@@ -109,8 +109,20 @@ def check_helper_values(
             return None
         return str(v).strip()
 
+    fk_defs_by_sheet: Dict[str, List[FKDef]] = {}
+    fields_by_target: Dict[str, list[str]] = {}
     for sheet_name, df in iter_data_frames(frames):
-        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix, defaults=defs)
+        fk_defs_by_sheet[sheet_name] = fk_defs
+        for fk in fk_defs:
+            fields_by_target.setdefault(fk.target_sheet_key, [])
+            if fk.value_field not in fields_by_target[fk.target_sheet_key]:
+                fields_by_target[fk.target_sheet_key].append(fk.value_field)
+
+    id_maps = build_id_value_maps(frames, reg, fields_by_sheet=fields_by_target)
+
+    for sheet_name, df in iter_data_frames(frames):
+        fk_defs = fk_defs_by_sheet[sheet_name]
         first_cols = set(
             (c[0] if isinstance(c, tuple) else c) for c in df.columns.tolist()
         )
@@ -119,7 +131,7 @@ def check_helper_values(
             if fk.helper_column not in first_cols:
                 continue  # missing helper — reported by check_missing_helpers
 
-            target_map = id_maps.get(fk.target_sheet_key, {})
+            target_map = id_maps.get(fk.target_sheet_key, {}).get(fk.value_field, {})
             try:
                 fk_series = level0_series(df, fk.fk_column)
                 helper_series = level0_series(df, fk.helper_column)
@@ -160,7 +172,7 @@ def check_unresolvable_fks(
     defs = defaults or {}
     helper_prefix = str(defs.get("helper_prefix", "_"))
     reg = build_registry(frames, defs)
-    id_maps = build_id_label_maps(frames, reg)
+    id_sets = build_id_sets(frames, reg)
     findings: Findings = []
 
     def _norm(v: Any) -> str | None:
@@ -171,9 +183,14 @@ def check_unresolvable_fks(
         return str(v).strip()
 
     for sheet_name, df in iter_data_frames(frames):
-        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix)
+        seen_fk_columns: set[str] = set()
+        fk_defs = detect_fk_columns(df, reg, helper_prefix=helper_prefix, defaults=defs)
         for fk in fk_defs:
-            target_map = id_maps.get(fk.target_sheet_key, {})
+            if fk.fk_column in seen_fk_columns:
+                continue
+            seen_fk_columns.add(fk.fk_column)
+
+            target_ids = id_sets.get(fk.target_sheet_key, set())
             try:
                 fk_series = level0_series(df, fk.fk_column)
             except KeyError:
@@ -181,7 +198,7 @@ def check_unresolvable_fks(
 
             missing = sorted({
                 str(v) for v in fk_series.dropna().unique()
-                if _norm(v) not in target_map
+                if _norm(v) not in target_ids
             })
             if missing:
                 findings.append(Finding(

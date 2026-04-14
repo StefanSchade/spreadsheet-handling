@@ -29,6 +29,29 @@ def _two_sheet_frames(*, with_helper: bool = False, helper_values: list | None =
     return {"A": a, "B": b}
 
 
+def _two_sheet_frames_multi_helper(
+    *,
+    include_name: bool = True,
+    include_category: bool = True,
+    name_values: list | None = None,
+    category_values: list | None = None,
+):
+    b = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "name": ["alpha", "beta"],
+            "category": ["x", "y"],
+        }
+    )
+    cols_a = {"id": [10, 20], "id_(B)": [1, 2]}
+    if include_name:
+        cols_a["_B_name"] = name_values or ["alpha", "beta"]
+    if include_category:
+        cols_a["_B_category"] = category_values or ["x", "y"]
+    a = pd.DataFrame(cols_a)
+    return {"A": a, "B": b}
+
+
 # --- check_duplicate_ids ---
 
 class TestDuplicateIds:
@@ -61,6 +84,14 @@ class TestUnresolvableFks:
         assert len(findings) == 1
         assert findings[0].category == "unresolvable_fk"
         assert "99" in findings[0].detail
+
+    def test_reports_unresolvable_fk_only_once_for_multi_helpers(self):
+        defaults = {**DEFAULTS, "helper_fields_by_fk": {"id_(B)": ["name", "category"]}}
+        b = pd.DataFrame({"id": [1], "name": ["alpha"], "category": ["x"]})
+        a = pd.DataFrame({"id": [10], "id_(B)": [99]})
+        findings = check_unresolvable_fks({"A": a, "B": b}, defaults)
+        assert len(findings) == 1
+        assert findings[0].column == "id_(B)"
 
 
 # --- check_unexpected_helpers ---
@@ -95,6 +126,13 @@ class TestMissingHelpers:
         assert findings[0].category == "missing_helper"
         assert findings[0].column == "_B_name"
 
+    def test_detects_missing_helper_for_multi_helper_config(self):
+        defaults = {**DEFAULTS, "helper_fields_by_fk": {"id_(B)": ["name", "category"]}}
+        frames = _two_sheet_frames_multi_helper(include_name=True, include_category=False)
+        findings = check_missing_helpers(frames, defaults)
+        assert len(findings) == 1
+        assert findings[0].column == "_B_category"
+
 
 # --- check_helper_values ---
 
@@ -110,6 +148,13 @@ class TestHelperValues:
         assert len(findings) == 1
         assert findings[0].category == "value_mismatch"
         assert "1 row(s)" in findings[0].detail
+
+    def test_detects_wrong_value_for_second_helper_field(self):
+        defaults = {**DEFAULTS, "helper_fields_by_fk": {"id_(B)": ["name", "category"]}}
+        frames = _two_sheet_frames_multi_helper(category_values=["WRONG", "y"])
+        findings = check_helper_values(frames, defaults)
+        assert len(findings) == 1
+        assert findings[0].column == "_B_category"
 
 
 # --- validate_fk_helpers (combined) ---
