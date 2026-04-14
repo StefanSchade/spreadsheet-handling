@@ -43,7 +43,7 @@ def test_pipeline_validate_apply_drop_roundtrip():
     pd.testing.assert_frame_equal(out["A"], frames["A"])
 
     # B should have no helper columns after drop
-    assert all(not str(c).startswith("_") for c in out["B"].columns)
+    assert list(out["B"].columns) == ["id_(A)"]
 
     # FK column is untouched
     assert "id_(A)" in out["B"].columns
@@ -69,4 +69,30 @@ def test_pipeline_build_from_config_registry():
     assert "A" in out and "B" in out
     assert "id_(A)" in out["B"].columns
     # helpers should be dropped at the end
-    assert all(not str(c).startswith("_") for c in out["B"].columns)
+    assert list(out["B"].columns) == ["id_(A)"]
+
+
+def test_pipeline_reorder_multi_helpers_next_to_fk_in_configured_order():
+    frames = {
+        "A": pd.DataFrame({"id": ["1", "2"], "name": ["Alpha", "Beta"], "category": ["A", "B"]}),
+        "B": pd.DataFrame({"id": ["10", "20"], "value": ["x", "y"], "id_(A)": ["2", "1"]}),
+    }
+    defaults = {
+        "id_field": "id",
+        "label_field": "name",
+        "detect_fk": True,
+        "helper_prefix": "_",
+        "levels": 3,
+        "helper_fields_by_fk": {"id_(A)": ["category", "name"]},
+    }
+
+    out = run_pipeline(
+        frames,
+        [
+            make_apply_fks_step(defaults=defaults),
+            build_steps_from_config([{"step": "reorder_helpers", "helper_prefix": "_"}])[0],
+        ],
+    )
+
+    lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["B"].columns]
+    assert lvl0 == ["id", "value", "id_(A)", "_A_category", "_A_name"]

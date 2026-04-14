@@ -7,6 +7,7 @@ import re
 import pandas as pd
 
 from ...frame_keys import copy_reserved_frames, iter_data_frames
+from ...core.fk import FK_PATTERN
 
 Frames = Dict[str, pd.DataFrame]
 Step = Callable[[Frames], Frames]
@@ -74,8 +75,8 @@ def clean_aux_columns(
     )
 
     def _step(frames: Frames) -> Frames:
-        def _is_aux(col: str) -> bool:
-            col_s = str(col)
+        def _is_aux(col: object) -> bool:
+            col_s = _first_nonempty_label(col)
             return any(col_s.startswith(p) for p in cfg.drop_prefixes)
 
         out: dict[str, object] = {}
@@ -88,7 +89,7 @@ def clean_aux_columns(
                 out[name] = df
                 continue
 
-            keep = [c for c in df.columns if not _is_aux(str(c))]
+            keep = [c for c in df.columns if not _is_aux(c)]
             out[name] = df.loc[:, keep]
         return out  # type: ignore[return-value]
 
@@ -168,11 +169,6 @@ def unflatten_headers(sheet: Optional[str] = None, *, sep: str = ".") -> Step:
     return _step
 
 
-# --- NEW: reorder helpers right after their FK column --------------------------------
-import re
-_FK_RE = re.compile(r"^id_\((.+)\)$")  # matches id_(branch) -> "branch"
-
-
 def _first_nonempty_label(col: object) -> str:
     """
     Liefert die sichtbare Bezeichnung einer Spalte:
@@ -223,10 +219,10 @@ def reorder_helpers_next_to_fk(
 
             for c in list(cols):
                 label = labels[c]
-                m = _FK_RE.match(label)
+                m = FK_PATTERN.match(label)
                 if not m:
                     continue
-                target = m.group(1)  # z.B. "branch"
+                target = m.group("sheet_key")  # z.B. "branch"
                 fk_ix = colpos.get(c, -1)
                 if fk_ix < 0:
                     continue
