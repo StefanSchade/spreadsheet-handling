@@ -1,0 +1,114 @@
+===== FTR-FK-HELPER-PROVENANCE-CLEANUP -- Persist Derived Helper Provenance and Prefer It During Cleanup
+
+*Status:* Open
+*Epic:* Phase 4a -- First feature wave on top of the new architecture
+
+*Context:*::
+After `FTR-MULTI-HELPER-COLUMN`, the helper path can materialize multiple helper
+columns per FK and keep their configured order. But the concrete interpretation
+of those materialized columns is still lost immediately after enrichment:
+`apply_fks` knows which helper columns it just created, while `drop_helpers`
+still removes by prefix and later checks still lean on naming conventions.
+
+That is good enough for a first enrichment-only path, but it is the main weak
+spot for second roundtrips and spreadsheet-first workflows. The current helper
+concept now distinguishes between:
+
+- target-side helper capability as canonical intent
+- concrete helper-column materialization as derived operational state
+
+This ticket intentionally targets only the smaller second part.
+
+*Goal:*::
+Introduce a minimal derived helper-provenance payload for the currently
+materialized helper columns, and make cleanup prefer that metadata while keeping
+the current prefix-based behavior as fallback.
+
+*Scope:*::
+- `apply_fks` records one derived provenance entry per materialized helper
+  column.
+- The payload lives under `_meta` in an explicitly non-canonical namespace.
+- The first slice stores enough information to identify helper columns later:
+  `column`, `fk_column`, `target`, and `value_field`.
+- `drop_helpers` removes helper columns from derived provenance first when that
+  metadata exists.
+- `drop_helpers` keeps the current prefix-based cleanup as backward-compatible
+  fallback when no helper provenance is available.
+- Helper provenance is updated or removed when the corresponding helper columns
+  are removed from the working state.
+- Existing `_meta` persistence paths (hidden workbook payload / JSON sidecar)
+  continue to carry the helper provenance without introducing a second carrier.
+
+*Proposed Minimal Shape:*::
+
+[source,yaml]
+----
+_meta:
+  derived:
+    sheets:
+      desks:
+        helper_columns:
+          - column: _employees_first_name
+            fk_column: id_(employees)
+            target: employees
+            value_field: first_name
+          - column: _employees_last_name
+            fk_column: id_(employees)
+            target: employees
+            value_field: last_name
+----
+
+The important point is not the exact spelling of every parent key, but that the
+namespace is visibly derived/operational rather than folded into canonical
+sheet intent such as `_meta["sheets"]`.
+
+*Non-Goals:*::
+- No change to the current helper-field selection precedence in `apply_fks`
+  (`helper_fields_by_fk`, `helper_fields_by_target`, `helper_fields`,
+  `label_field`).
+- No formula-driven helper values.
+- No rename support for helper columns or relevant sheets.
+- No generic metadata engine for all future derived state.
+- No requirement that validation and styling fully switch to metadata-backed
+  recognition in this slice; prefix-based behavior may remain there for now.
+
+*Implementation Direction:*::
+- Keep the existing `FKDef`-based helper enrichment logic.
+- Add a small helper-meta write path near `apply_fks`, because that step already
+  has the fully resolved concrete helper interpretation.
+- Add a small helper-meta read path near `drop_helpers`, because cleanup is the
+  first consumer that should stop relying on prefix alone.
+- Prefer metadata-backed removal when present, but do not break existing files
+  or workflows that only have prefix-based helper columns.
+- Keep the slice local to helper enrichment / cleanup / persistence tests rather
+  than coupling it to a broader metadata refactor.
+
+*Acceptance:*::
+- Running `apply_fks` materializes helper columns and also writes derived helper
+  provenance into `_meta`.
+- Multi-helper enrichment writes one provenance entry per helper column in the
+  same configured order as the materialized helper columns.
+- Running `drop_helpers` on frames with helper provenance removes the helper
+  columns described by that metadata.
+- Running `drop_helpers` on frames without helper provenance still behaves
+  compatibly via prefix-based fallback.
+- After cleanup, helper provenance no longer claims helper columns that have
+  been removed from the working state.
+- JSON sidecar roundtrip preserves the helper provenance payload.
+- Spreadsheet roundtrip through the existing hidden `_meta` carrier preserves
+  the helper provenance payload.
+- Existing helper-field selection behavior and current unsupported rename policy
+  remain unchanged.
+
+*Suggested Test Areas:*::
+- `tests/unit/domain/transformations/test_fk_helpers_enrich.py`
+- `tests/unit/pipeline/test_pipeline_meta_sidecar.py`
+- `tests/unit/io_backends/test_meta_persistence.py`
+- a focused new test for `drop_helpers` preferring metadata over prefix when
+  both are present
+
+*Relation to Existing Work:*::
+This is a follow-up slice after `FTR-MULTI-HELPER-COLUMN`, not a replacement for
+it. The multi-helper work expanded materialization; this ticket stabilizes the
+roundtrip story for those materialized helpers without jumping to formulas,
+rename repair, or a universal metadata model.
