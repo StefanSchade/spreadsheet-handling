@@ -142,6 +142,29 @@ def make_apply_fks_step(
             out[sheet_name] = _apply_fk_helpers(
                 df, fk_defs, id_maps, levels, helper_prefix=helper_prefix
             )
+
+        # --- FTR-FK-HELPER-PROVENANCE-CLEANUP: persist derived helper provenance ---
+        has_any_fks = any(bool(fds) for fds in fk_defs_by_sheet.values())
+        if has_any_fks or "_meta" in out:
+            meta: dict[str, Any] = dict(out.get("_meta") or {})
+            if has_any_fks:
+                derived: dict[str, Any] = meta.setdefault("derived", {})
+                derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
+                for sheet_name, fk_defs in fk_defs_by_sheet.items():
+                    if not fk_defs:
+                        continue
+                    entries = [
+                        {
+                            "column": fk.helper_column,
+                            "fk_column": fk.fk_column,
+                            "target": fk.target_sheet_key,
+                            "value_field": fk.value_field,
+                        }
+                        for fk in fk_defs
+                    ]
+                    derived_sheets[sheet_name] = {"helper_columns": entries}
+            out["_meta"] = meta
+
         return out  # type: ignore[return-value]
 
     return BoundStep(name=name, config=cfg, fn=run)
@@ -152,7 +175,13 @@ def make_drop_helpers_step(
     prefix: str = "_",
     name: str = "drop_helpers",
 ) -> BoundStep:
-    """Remove all helper columns (starting with prefix) from all sheets."""
+    """Remove all helper columns (starting with prefix) from all sheets.
+
+    When derived helper provenance exists in ``_meta["derived"]["sheets"]``,
+    columns listed there are removed first and the provenance entries are
+    cleaned up.  Prefix-based removal remains as backward-compatible fallback
+    for frames without provenance metadata.
+    """
     cfg = {"prefix": prefix}
 
     def _visible_label(col: Any) -> str:
@@ -167,9 +196,39 @@ def make_drop_helpers_step(
     def run(fr: Frames) -> Frames:
         out: dict[str, Any] = {}
         copy_reserved_frames(fr, out)
+        meta: dict[str, Any] = dict(out.get("_meta") or {})
+        derived_sheets: dict[str, Any] = (meta.get("derived") or {}).get("sheets") or {}
+
         for sheet, df in iter_data_frames(fr):
-            cols = [c for c in df.columns if not _visible_label(c).startswith(cfg["prefix"])]
-            out[sheet] = df.loc[:, cols]
+            sheet_prov = (derived_sheets.get(sheet) or {}).get("helper_columns")
+            if sheet_prov:
+                # Metadata-backed removal: drop exactly the columns listed in provenance
+                prov_cols = {entry["column"] for entry in sheet_prov}
+                cols = [
+                    c for c in df.columns
+                    if _visible_label(c) not in prov_cols
+                ]
+                out[sheet] = df.loc[:, cols]
+            else:
+                # Prefix-based fallback
+                cols = [c for c in df.columns if not _visible_label(c).startswith(cfg["prefix"])]
+                out[sheet] = df.loc[:, cols]
+
+        # Clean up helper provenance after removal
+        if derived_sheets:
+            for sheet_name in list(derived_sheets.keys()):
+                if "helper_columns" in (derived_sheets.get(sheet_name) or {}):
+                    derived_sheets[sheet_name].pop("helper_columns")
+                    if not derived_sheets[sheet_name]:
+                        del derived_sheets[sheet_name]
+            # Write cleaned meta back
+            derived = meta.get("derived") or {}
+            if derived.get("sheets") is not None and not derived["sheets"]:
+                del derived["sheets"]
+            if not derived:
+                meta.pop("derived", None)
+            out["_meta"] = meta
+
         return out  # type: ignore[return-value]
 
     return BoundStep(name=name, config=cfg, fn=run)
