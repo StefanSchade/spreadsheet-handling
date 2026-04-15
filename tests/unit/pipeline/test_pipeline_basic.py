@@ -36,8 +36,8 @@ def test_pipeline_validate_apply_drop_roundtrip():
 
     out = run_pipeline(frames, steps)
 
-    # Structure still there
-    assert set(out.keys()) == {"A", "B"}
+    # Structure still there (_meta may appear from helper provenance)
+    assert {"A", "B"} <= set(out.keys())
 
     # A unchanged
     pd.testing.assert_frame_equal(out["A"], frames["A"])

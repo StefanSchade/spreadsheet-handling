@@ -96,6 +96,36 @@ class TestJSONSidecar:
         back = JSONBackend().read_multi(str(out), header_levels=1)
         assert "_meta" not in back
 
+    def test_derived_helper_provenance_roundtrip_json(self, tmp_path: Path):
+        """FTR-FK-HELPER-PROVENANCE-CLEANUP: derived helper provenance survives JSON sidecar roundtrip."""
+        meta_with_prov = {
+            **_SAMPLE_META,
+            "derived": {
+                "sheets": {
+                    "desks": {
+                        "helper_columns": [
+                            {
+                                "column": "_employees_first_name",
+                                "fk_column": "id_(employees)",
+                                "target": "employees",
+                                "value_field": "first_name",
+                            },
+                        ]
+                    }
+                }
+            },
+        }
+        frames = _sample_frames()
+        frames["_meta"] = meta_with_prov
+        out = tmp_path / "json_prov"
+        JSONBackend().write_multi(frames, str(out))
+        back = JSONBackend().read_multi(str(out), header_levels=1)
+
+        prov = back["_meta"]["derived"]["sheets"]["desks"]["helper_columns"]
+        assert len(prov) == 1
+        assert prov[0]["column"] == "_employees_first_name"
+        assert prov[0]["target"] == "employees"
+
 
 # ===========================================================================
 # XLSX meta tests

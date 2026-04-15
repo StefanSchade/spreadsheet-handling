@@ -12,6 +12,7 @@ from spreadsheet_handling.core.fk import (
     apply_fk_helpers,
 )
 from spreadsheet_handling.core.indexing import level0_series
+from spreadsheet_handling.pipeline.steps import make_apply_fks_step
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-REFACTOR-P3B")
 
@@ -88,3 +89,61 @@ class TestApplyFkHelpers:
         assert lvl0 == ["id", "id_(B)", "_B_category", "_B_name"]
         assert level0_series(result, "_B_category").tolist() == ["x", "y"]
         assert level0_series(result, "_B_name").tolist() == ["alpha", "beta"]
+
+
+class TestApplyFksStepProvenance:
+    """FTR-FK-HELPER-PROVENANCE-CLEANUP: apply_fks writes derived provenance."""
+
+    def test_provenance_written_for_single_helper(self):
+        frames = _frames()
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        meta = out["_meta"]
+        prov = meta["derived"]["sheets"]["A"]["helper_columns"]
+        assert len(prov) == 1
+        assert prov[0] == {
+            "column": "_B_name",
+            "fk_column": "id_(B)",
+            "target": "B",
+            "value_field": "name",
+        }
+
+    def test_provenance_written_for_multiple_helpers_in_order(self):
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]}),
+            "B": pd.DataFrame(
+                {"id": [1, 2], "name": ["alpha", "beta"], "category": ["x", "y"]}
+            ),
+        }
+        defaults = {
+            **DEFAULTS,
+            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
+        }
+        step = make_apply_fks_step(defaults=defaults)
+        out = step.fn(frames)
+
+        prov = out["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+        assert len(prov) == 2
+        assert prov[0]["column"] == "_B_category"
+        assert prov[1]["column"] == "_B_name"
+        assert prov[0]["value_field"] == "category"
+        assert prov[1]["value_field"] == "name"
+
+    def test_no_provenance_for_sheet_without_fks(self):
+        frames = _frames()
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        derived_sheets = out["_meta"]["derived"]["sheets"]
+        assert "B" not in derived_sheets
+
+    def test_provenance_preserves_existing_meta(self):
+        frames = _frames()
+        frames["_meta"] = {"version": "3.0", "author": "test"}
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        assert out["_meta"]["version"] == "3.0"
+        assert out["_meta"]["author"] == "test"
+        assert "derived" in out["_meta"]

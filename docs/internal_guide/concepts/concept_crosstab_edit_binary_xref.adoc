@@ -1,0 +1,404 @@
+== Use Case: Crosstab for Editing Binary Cross References
+
+=== Purpose
+
+This use case describes a first compact spreadsheet view for editing a binary relation between two entity sets.
+
+The repository form stays normalized.
+
+The spreadsheet form becomes a matrix that is easier for humans to read and edit.
+
+=== Generic XRef Transform vs. Binary First Slice
+
+This use case sits on top of a more generic transform:
+
+* matrix -> relation
+* relation -> matrix
+
+In the existing repo terminology, this is the `XREF-CROSSTABLE` step of the
+larger compact-transform chain.
+
+The generic base transform should operate on row identity, column identity, and
+cell values without depending on binary semantics.
+
+The current work is the first specialization of that base:
+
+* a binary relation between two entity sets
+* marker-based cell behavior: exact `X` or empty
+* relation rows that semantically mean presence or absence of a PK pair
+
+This distinction matters for later stages.
+
+Binary `X` behavior belongs only to the first-slice specialization.
+
+The base abstraction must not hardcode binary semantics, because later stages
+need the same matrix machinery for richer value-bearing relations and for
+`COMPACT-MULTIAXIS`.
+
+=== Example
+
+A neutral example uses these three tables:
+
+* `features`
+* `markets`
+* `feature_market_links`
+
+`features` and `markets` are master tables.
+
+`feature_market_links` is the normalized link table.
+
+=== First Slice
+
+The first supported slice is intentionally narrow.
+
+It supports one binary relation only.
+
+It does not yet support:
+
+* stacked multiple relations on the same axes
+* compact tuple codecs such as `A-B-C`
+* legend-driven decoding
+* multi-row spreadsheet headers
+
+=== Transform Vocabulary
+
+For implementation, the first slice should use the same vocabulary as the
+existing compact-transform planning:
+
+* `expand_xref`
+* `contract_xref`
+
+Minimal meaning:
+
+* `expand_xref`: relation -> matrix
+* `contract_xref`: matrix -> relation
+
+The first binary slice uses a minimal config shape such as:
+
+[source,yaml]
+----
+xref:
+  row_source: features
+  row_pk: feature_id
+  row_label_fields: [product, feature]
+
+  column_source: markets
+  column_pk: market_id
+  column_label_fields: [region, country]
+
+  link_table: feature_market_links
+
+  marker: "X"
+----
+
+This is intentionally small.
+
+It is enough to build `expand_xref` and `contract_xref` for the first slice
+without overdesigning a broader metadata system.
+
+=== Normalized Repository Model
+
+==== Master Table `features`
+
+`features` has an explicit primary key.
+
+Example:
+
+[source,json]
+----
+[
+  {"feature_id": "f1", "product": "server app", "feature": "sap bridge", "product_manager": "abc"},
+  {"feature_id": "f2", "product": "server app", "feature": "containerized deployment", "product_manager": "Mr. Pink"},
+  {"feature_id": "f3", "product": "web application", "feature": "admin console", "product_manager": "Mr. Brown"}
+]
+----
+
+==== Master Table `markets`
+
+`markets` has an explicit primary key.
+
+Example:
+
+[source,json]
+----
+[
+  {"market_id": "m1", "region": "EMEA", "country": "Belgium", "office": "Brussels"},
+  {"market_id": "m2", "region": "EMEA", "country": "France", "office": "Paris"},
+  {"market_id": "m3", "region": "Pacific", "country": "Indonesia", "office": "Jakarta"}
+]
+----
+
+==== Link Table `feature_market_links`
+
+The link table is PK-centered.
+
+It stores PK pairs only.
+
+Example:
+
+[source,json]
+----
+[
+  {"feature_id": "f1", "market_id": "m1"},
+  {"feature_id": "f1", "market_id": "m2"},
+  {"feature_id": "f3", "market_id": "m3"}
+]
+----
+
+This is important.
+
+The first slice should not model the link table with embedded business objects.
+
+It should model it as a normalized relation between two primary keys.
+
+=== Axis Identity and Axis Labels
+
+==== Identity
+
+Axis identity comes from the primary keys of the two master tables.
+
+* row identity comes from the PK of `features`
+* column identity comes from the PK of `markets`
+
+==== Display Labels
+
+Display labels are not the identity.
+
+They are derived from selected helper fields on each axis.
+
+Example:
+
+* row label from `product` + `feature`
+* column label from `region` + `country`
+
+In the first slice, visible axis labels must be unique on their respective axis.
+
+If selected helper fields do not yield unique visible labels, the transformation fails.
+
+=== Axis Identity and Reimport Mapping
+
+Visible labels must not be used to reconstruct identity.
+
+Reimport must rely on persisted axis identity mappings.
+
+Minimal first-slice approach:
+
+* during export, persist mapping of row index -> row PK
+* during export, persist mapping of column index -> column PK
+* store this mapping in hidden metadata such as the existing `_meta` carrier or
+  equivalent
+* during import, read the matrix structure
+* during import, map row and column positions back to PKs via persisted
+  metadata
+* reconstruct PK pairs from those mapped positions
+
+The first slice may use a simple positional mapping for the data area, for
+example:
+
+[source,yaml]
+----
+_meta:
+  xref_maps:
+    feature_market_links:
+      row_pks: [f1, f2, f3]
+      column_pks: [m1, m2, m3]
+----
+
+Meaning:
+
+* data row index 0 maps to `f1`
+* data row index 1 maps to `f2`
+* data column index 0 maps to `m1`
+* data column index 1 maps to `m2`
+
+The exact parent key names may evolve.
+
+The non-optional contract is the mapping principle:
+
+* identity reconstruction comes from persisted axis mappings
+* identity reconstruction must not come from visible display strings
+
+The following are explicitly forbidden in the first slice:
+
+* parsing labels such as `EMEA.Belgium`
+* reconstructing identity from flattened display strings
+* treating visible helper labels as hidden PK surrogates
+
+Flattened labels are display-only and must never be used for identity
+reconstruction.
+
+=== First Rendering Rule
+
+The crosstab is rendered from the two master tables and the normalized link table.
+
+* rows follow the order of the `features` table
+* columns follow the order of the `markets` table
+* a cell contains `X` if the PK pair exists in `feature_market_links`
+* a cell stays empty if the PK pair does not exist
+
+An empty cell has one technical meaning only:
+
+* no relation exists
+
+It may mean many things in the user's head, for example not yet maintained or forgotten.
+
+But for import it simply means that no pair is generated.
+
+=== Cell Value Contract (First Slice)
+
+The first slice uses a strict marker contract for secure footing.
+
+Accepted cell values:
+
+* exact `X`
+* empty cell
+
+Rejected cell values:
+
+* `x`
+* `X `
+* whitespace-only content
+* `1`
+* `true`
+* checkmarks or other symbols
+
+The importer must not normalize, trim, or reinterpret these values in the first
+slice.
+
+If a non-empty cell contains anything other than exact `X`, import fails.
+
+=== First Input Contract
+
+The first slice is restrictive on purpose.
+
+* users may edit cell contents only
+* users may not create new rows directly in the matrix
+* users may not create new columns directly in the matrix
+* users create new features in the `features` table
+* users create new markets in the `markets` table
+
+This gives the first slice a secure footing.
+
+=== Flattened Labels in the First Slice
+
+If an axis uses more than one helper field, the first slice renders one flattened visible label.
+
+Example:
+
+* `EMEA.Belgium`
+* `server app.sap bridge`
+
+The separator is a simple display convention for the current phase.
+
+It is not structural.
+
+Labels are display-only.
+
+They must not be parsed during reimport.
+
+Helper values may themselves contain the separator.
+
+Therefore the separator must not be treated as an identity-bearing syntax.
+
+If flattened helper labels are not unique because of misconfiguration, the
+transformation fails instead of trying to repair or reinterpret them.
+
+True multi-row spreadsheet headers are a later expansion stage.
+
+=== Validation and Error Policy
+
+The first slice should fail fast.
+
+Examples of failure cases:
+
+* a link row references a missing PK
+* the link table contains the same PK pair more than once
+* visible row labels are not unique
+* visible column labels are not unique
+* a matrix cell contains any non-empty value other than exact `X`
+
+For the first safe contract, fail-fast is preferred over tolerant repair.
+
+=== Roundtrip Contract
+
+The roundtrip for the first slice is:
+
+. read `features`
+. read `markets`
+. read `feature_market_links`
+. run `expand_xref` to render the crosstab
+. persist row/column PK mappings in hidden metadata
+. user edits `X` or empty cells
+. read the matrix together with the persisted axis mappings
+. run `contract_xref` to import the matrix back into normalized PK pairs
+. write a new `feature_market_links` table
+
+The master tables remain the source of truth for axis identity and helper content.
+
+The matrix is only the compact editing view for the relation itself.
+
+=== Relationship to Helper Columns
+
+This use case depends on the helper-column idea in transposed form.
+
+Helper fields are needed on both axes:
+
+* helper fields for row labels
+* helper fields for column labels
+
+But the first crosstab slice still remains simpler than the later compact multi-axis view.
+
+It is the binary first slice that should later feed into the broader
+`XREF-CROSSTABLE` -> `COMPACT-MULTIAXIS` expansion path.
+
+=== Later Expansion Stages
+
+==== Stage 2: Codec + Legend
+
+A cell no longer means only presence or absence.
+
+It encodes a tuple.
+
+Example direction:
+
+* `feature × market -> availability_type`
+
+The legend then becomes part of the contract, not just a visual note.
+
+==== Stage 3: Multi-Axis Compact View
+
+Several relations with the same axes are stacked into one compact matrix.
+
+Example direction:
+
+* `feature × market -> available`
+* `feature × market -> rollout_mode`
+* `feature × market -> support_level`
+
+The normalized repository form may then contain several triple tables.
+
+The spreadsheet view compresses them into one compact matrix.
+
+=== Non-Goals of the First Slice
+
+* no tuple codec in the cell
+* no editable legend
+* no stacked multiple relations
+* no direct creation of new row or column entities inside the matrix
+* no multi-row spreadsheet headers
+* no tolerant auto-repair of inconsistent labels or links
+
+=== Practical Reading Rule
+
+If the first crosstab slice is explained correctly, each part should map to one concrete technical object:
+
+* master table `features`
+* master table `markets`
+* link table `feature_market_links`
+* row PK
+* column PK
+* visible helper-based row label
+* visible helper-based column label
+* cell value `X` or empty
+
+If the wording cannot be mapped back to one of these, it is probably too abstract for the current phase.

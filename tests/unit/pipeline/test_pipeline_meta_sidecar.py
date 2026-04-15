@@ -64,3 +64,11 @@ def test_pipeline_steps_preserve_meta_sidecar_and_skip_reserved_keys() -> None:
     assert "_meta" in out
     assert out["_meta"]["constraints"][0]["sheet"] == "product"
     assert "_product_manager_name" in out["product"].columns
+
+    # FTR-FK-HELPER-PROVENANCE-CLEANUP: apply_fks writes derived provenance
+    prov = out["_meta"]["derived"]["sheets"]["product"]["helper_columns"]
+    assert len(prov) == 1
+    assert prov[0]["column"] == "_product_manager_name"
+    assert prov[0]["fk_column"] == "id_(product_manager)"
+    assert prov[0]["target"] == "product_manager"
+    assert prov[0]["value_field"] == "name"
