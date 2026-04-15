@@ -145,14 +145,16 @@ def make_apply_fks_step(
 
         # --- FTR-FK-HELPER-PROVENANCE-CLEANUP: persist derived helper provenance ---
         has_any_fks = any(bool(fds) for fds in fk_defs_by_sheet.values())
-        if has_any_fks or "_meta" in out:
-            meta: dict[str, Any] = dict(out.get("_meta") or {})
-            if has_any_fks:
-                derived: dict[str, Any] = meta.setdefault("derived", {})
-                derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
-                for sheet_name, fk_defs in fk_defs_by_sheet.items():
-                    if not fk_defs:
-                        continue
+        existing_meta = out.get("_meta")
+        has_existing_prov = bool(
+            ((existing_meta or {}).get("derived") or {}).get("sheets")
+        )
+        if has_any_fks or has_existing_prov or existing_meta is not None:
+            meta: dict[str, Any] = dict(existing_meta or {})
+            derived: dict[str, Any] = meta.setdefault("derived", {})
+            derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
+            for sheet_name, fk_defs in fk_defs_by_sheet.items():
+                if fk_defs:
                     entries = [
                         {
                             "column": fk.helper_column,
@@ -162,7 +164,26 @@ def make_apply_fks_step(
                         }
                         for fk in fk_defs
                     ]
-                    derived_sheets[sheet_name] = {"helper_columns": entries}
+                    # Key-selective merge: only replace helper_columns, preserve
+                    # other derived keys that may exist for this sheet.
+                    derived_sheets.setdefault(sheet_name, {})["helper_columns"] = entries
+                else:
+                    # Remove stale provenance for sheets without current FK defs.
+                    if sheet_name in derived_sheets:
+                        derived_sheets[sheet_name].pop("helper_columns", None)
+                        if not derived_sheets[sheet_name]:
+                            del derived_sheets[sheet_name]
+            # Also clean provenance for sheets no longer in frames at all.
+            current_sheets = set(fk_defs_by_sheet)
+            for stale in [k for k in derived_sheets if k not in current_sheets]:
+                derived_sheets[stale].pop("helper_columns", None)
+                if not derived_sheets[stale]:
+                    del derived_sheets[stale]
+            # Prune empty derived namespace.
+            if not derived_sheets:
+                derived.pop("sheets", None)
+            if not derived:
+                meta.pop("derived", None)
             out["_meta"] = meta
 
         return out  # type: ignore[return-value]

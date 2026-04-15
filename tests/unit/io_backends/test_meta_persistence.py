@@ -171,6 +171,38 @@ class TestXLSXMeta:
         # At minimum the version field should survive
         assert meta.get("version") or meta.get("workbook_meta_blob")
 
+    def test_derived_helper_provenance_roundtrip_xlsx(self, tmp_path: Path):
+        """FTR-FK-HELPER-PROVENANCE-CLEANUP: derived helper provenance survives XLSX hidden-sheet roundtrip."""
+        meta_with_prov = {
+            **_SAMPLE_META,
+            "derived": {
+                "sheets": {
+                    "desks": {
+                        "helper_columns": [
+                            {
+                                "column": "_employees_first_name",
+                                "fk_column": "id_(employees)",
+                                "target": "employees",
+                                "value_field": "first_name",
+                            },
+                        ]
+                    }
+                }
+            },
+        }
+        frames = _sample_frames()
+        frames["_meta"] = meta_with_prov
+        out = tmp_path / "prov.xlsx"
+        ExcelBackend().write_multi(frames, str(out))
+        back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+        assert "_meta" in back
+        meta = back["_meta"]
+        prov = meta["derived"]["sheets"]["desks"]["helper_columns"]
+        assert len(prov) == 1
+        assert prov[0]["column"] == "_employees_first_name"
+        assert prov[0]["target"] == "employees"
+
 
 # ===========================================================================
 # Cross-backend roundtrip
