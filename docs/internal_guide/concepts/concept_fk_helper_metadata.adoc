@@ -1,168 +1,373 @@
+[[concept-fk-helper-metadata]]
 == FK Helper Metadata Concept
 
 === Purpose
 
-FK helper columns are not purely a rendering detail and not purely a data-model concern.
-They sit between both worlds:
+This note explains FK helper columns in terms that are close to the current code
+and the current roundtrip goal.
 
-- in one direction, a pure domain model is enriched with visible helper columns before a spreadsheet is written;
-- in the other direction, a spreadsheet may already contain helper columns and must be cleaned back to a pure domain model.
+It is not a full metadata model.
 
-To support both directions reliably, helper semantics should not live only in ad hoc pipeline arguments or only in column-name heuristics.
+It is a working concept for the next small feature slices around helper columns.
 
-This concept therefore distinguishes between:
+The terminology follows
+<<concept-canonical-vs-derived-metadata,Canonical vs. Derived Metadata>>.
+In particular, `derived` here does not mean "freshly computed during this run".
+It means "describing current materialized workbook state rather than stable
+model intent".
 
-- canonical helper metadata;
-- derived operational helper metadata;
-- enrichment and cleanup steps that consume and produce this metadata.
+=== Running Example
 
-=== Core Idea
+In the examples below, the `desks` table contains the FK column and points to
+the `employees` table.
 
-There are two different questions:
+* `desks` is the table containing the FK.
+* `employees` is the target table referenced by that FK.
 
-1. Which fields of a referenced target table are meaningful helper candidates?
-2. Which concrete columns in the current working sheet are materialized helper columns?
+If `desks.id_(employees)` points to `employees.id`, the spreadsheet-facing
+`desks` sheet may also show helper columns such as `_employees_first_name`,
+`_employees_last_name`, or `_employees_birth_date`.
 
-These questions belong to different metadata layers.
+These helper columns make spreadsheet editing easier, but they are redundant and
+should not become normal payload columns in the normalized repository form.
 
-=== Canonical Metadata
+=== Why This Is Tricky
 
-Canonical metadata describes helper intent at the schema/domain level.
+Helper columns sit between two concerns:
 
-Typical example:
+* spreadsheet usability
+* normalized roundtrip-safe data
+
+They are not just rendering decoration.
+
+They also are not ordinary domain payload.
+
+They are redundant columns that are useful in spreadsheet form and must later be
+removed again or at least recognized as derived content.
+
+=== Current Implementation Today
+
+The current implementation already supports the basic idea and now also supports
+multiple helper columns per FK.
+
+Today the operational helper path is mainly shaped by:
+
+* `apply_fks`
+* `drop_helpers`
+* prefix- and naming-based recognition in validation and styling
+
+`bootstrap_meta` is already part of the broader workbook metadata direction and
+already has its own precedence model, but it is not yet the active source of
+helper-field resolution in the current helper implementation.
+
+Today the behavior is roughly this:
+
+* `apply_fks` detects FK columns and adds helper columns
+* helper field selection is driven mainly by step defaults such as
+  `helper_fields_by_fk`, `helper_fields_by_target`, `helper_fields`, and
+  `label_field`
+* `drop_helpers` removes helper columns by prefix
+* validation and styling still rely heavily on helper prefixes and materialized
+  column names
+
+So the current implementation is useful, but still carrier- and naming-driven.
+
+It is not yet a fully metadata-driven helper-column model.
+
+=== Current Detection and Selection Rules
+
+==== FK Detection Today
+
+Today FK detection is still mainly convention-based.
+
+The established convention is currently based on names such as
+`id_(employees)`.
+
+This naming convention is not the final model.
+
+It is a practical detection aid for the current phase.
+
+==== Helper Field Selection Today
+
+Today helper field selection already has a concrete precedence chain inside the
+helper logic.
+
+Current order:
+
+. `helper_fields_by_fk`
+. `helper_fields_by_target` by normalized sheet key
+. `helper_fields_by_target` by original sheet name
+. `helper_fields`
+. `label_field` as legacy fallback
+
+This is important because it means the project already has step-specific
+precedence today.
+
+There is not one single universal precedence ladder for all metadata and all
+steps.
+
+=== Existing Step-Specific Precedence
+
+==== `apply_fks`
+
+`apply_fks` resolves helper fields from its own step defaults.
+
+Today this is still the active source of helper-field resolution.
+
+==== `bootstrap_meta`
+
+`bootstrap_meta` already has its own precedence model.
+
+Current order:
+
+. `profile_defaults`
+. persisted metadata
+. `cli_overrides`
+
+This is relevant for the broader metadata direction around helper columns.
+
+It should not be read as saying that `bootstrap_meta` already drives current
+helper-field selection inside `apply_fks`.
+
+==== Consequence
+
+Precedence must be described per step.
+
+A single global statement such as "user input always wins" would be too crude
+and would already be false for some cases.
+
+=== General Guardrail
+
+The most useful general guardrail is this:
+
+* heuristics may fill gaps
+* heuristics must not silently contradict existing metadata
+
+This matters especially on the second or third roundtrip.
+
+If the first run relies on heuristics and the result is not persisted, later
+runs may interpret the same workbook differently because the carrier state has
+changed.
+
+That creates avoidable inconsistency.
+
+=== Two Different Questions
+
+Helper columns force two different questions that should not be mixed together.
+
+==== Question 1: What may be used as helper source data?
+
+This belongs to the target table.
+
+In the running example, this belongs to `employees`.
+
+Examples:
+
+* which column is the PK of `employees`
+* which columns of `employees` may be exposed as helper fields
+* which helper fields are the defaults if no FK-specific override is given
+
+==== Question 2: Which concrete columns on the current sheet are helper columns?
+
+This belongs to the table containing the FK.
+
+In the running example, this belongs to `desks`.
+
+Examples:
+
+* `_employees_first_name` is a helper column
+* it belongs to FK column `id_(employees)`
+* it points to target table `employees`
+* it materializes source field `first_name`
+
+So the answer is deliberately split:
+
+* helper capability belongs to the target table
+* concrete helper-column materialization belongs to the table containing the FK
+
+=== Minimal Metadata Shapes
+
+==== Target-Side Helper Capability
+
+Example:
 
 [source,yaml]
 ----
 sheets:
-  branch:
+  employees:
     fk_helpers:
-      available_fields: [name, category, region, status]
-      default_fields: [name, category]
+      available_fields: [first_name, last_name, birth_date]
+      default_fields: [first_name, last_name]
 ----
 
-Meaning:
+This says what the target table can offer as helper information.
 
-- `available_fields` lists target-side attributes that may be exposed as helper columns.
-- `default_fields` defines the default helper materialization when a source-side FK does not override the choice.
+This is canonical helper intent.
 
-This information semantically belongs to the referenced target table, because it describes what that table can offer as a human-readable helper view.
+==== Derived Operational Helper Columns on the FK Sheet
 
-=== Source-Side Override Metadata
-
-Source-side metadata may still override the default choice for a concrete FK usage.
-
-[source,yaml]
-----
-sheets:
-  product:
-    foreign_keys:
-      - column: id_(branch)
-        target: branch
-        helper_fields: [name]
-----
-
-Resolution order should therefore conceptually be:
-
-1. FK-specific source-side override
-2. target-sheet `default_fields`
-3. pipeline/global fallback
-4. legacy `label_field`
-
-=== Derived Operational Metadata
-
-During domain processing we also need metadata that marks concrete materialized helper columns in the current sheet state.
-
-Typical derived facts are:
-
-- this column is a helper column;
-- it belongs to FK column `id_(branch)`;
-- it materializes target `branch`;
-- it represents helper field `name`.
-
-This metadata is operational rather than canonical. It is produced by enrichment or bootstrap steps and is then consumed by later cleanup, validation, styling, and roundtrip steps.
-
-Conceptually this could look like:
+Example:
 
 [source,yaml]
 ----
 meta_derived:
   sheets:
-    product:
+    desks:
       helper_columns:
-        - column: _branch_name
-          role: helper
-          fk_column: id_(branch)
-          target: branch
-          value_field: name
+        - column: _employees_first_name
+          fk_column: id_(employees)
+          target: employees
+          value_field: first_name
+        - column: _employees_last_name
+          fk_column: id_(employees)
+          target: employees
+          value_field: last_name
 ----
 
-The exact storage shape may evolve, but the distinction matters:
+This says which helper columns are currently materialized on the current working
+sheet.
 
-- canonical metadata says what *should* be possible by model;
-- derived metadata says what *is currently materialized* in the working spreadsheet-shaped domain state.
+This is derived operational metadata, not canonical sheet intent.
 
-=== JSON to Domain to Spreadsheet
+That second structure is not fully implemented today.
 
-When starting from JSON or another pure model source, the flow is conceptually:
+It is the direction for the next slices.
 
-1. load pure data into domain frames
-2. run `bootstrap_meta` so pipeline-visible metadata exists in the working state
-3. resolve FK helper intent from canonical metadata and optional source-side overrides
-4. enrich helper columns into the working frames
-5. write spreadsheet output
+=== What Is Already True Today
 
-Important point:
+* helper enrichment and helper cleanup exist as real pipeline steps
+* multiple helper columns per FK now exist
+* helper field order is configurable and stable
+* there is already step-specific precedence in helper-field resolution
+* there is already step-specific precedence in `bootstrap_meta`
 
-- helper enrichment is a domain/pipeline concern, not a responsibility of the spreadsheet renderer itself
+=== What Is Not Yet True Today
 
-The spreadsheet renderer may *use* derived helper metadata, for example for:
+* helper cleanup is not yet driven by first-class persisted helper-column
+  metadata
+* helper identification still depends mainly on prefixes and naming conventions
+* helper provenance is not yet modeled as a durable explicit structure in
+  working metadata
+* sheet rename and helper-column rename are not handled as safe supported
+  operations
 
-- helper fill colors
-- optional protection
-- future formula-driven helper rendering
+These limits should be stated explicitly, not hidden behind generic wording.
 
-But it should not be the component that decides which helper columns exist semantically.
+=== Next Slice
 
-=== Spreadsheet to Domain to JSON
+The next slice should stay narrow.
 
-When starting from spreadsheet input, the flow is conceptually different:
+It should not jump directly to formulas, rename support, or a universal
+metadata engine.
 
-1. parse spreadsheet into domain frames
-2. parse accompanying metadata or sidecar metadata if available
-3. if helper provenance is already persisted, bootstrap derived helper metadata from it
-4. if helper provenance is not persisted, derive helper metadata from known conventions and canonical FK helper rules
-5. run cleanup/de-enrichment to remove helper columns for pure persistence
-6. persist JSON and optional sidecar metadata
+The next slice should aim for these improvements:
 
-This matters especially when spreadsheet editing is the starting point, because helper columns may already exist before any enrichment step of the current run has happened.
+. make the current state explicit in the docs
+. define a small helper metadata shape that is concrete enough to guide code
+. distinguish clearly between target-side helper capability and current
+  helper-column materialization
+. persist enough interpreted structure to reduce second-roundtrip drift
+. keep the current naming conventions as fallback aids, not as the only source
+  of truth
 
-=== Persistence and Roundtrip
+=== First Conservative Policy
 
-For roundtrip-safe processing, helper provenance should survive outside the visible spreadsheet surface.
+For the next slice, a restrictive contract is acceptable.
 
 That means:
 
-- helper metadata should not require editing hidden sheets in Excel as the primary mechanism;
-- helper metadata should instead live in sidecar/domain metadata that can be bootstrapped into the working state;
-- if JSON is persisted directly, a hidden or sidecar JSON metadata payload may preserve helper provenance for later continuation of the roundtrip.
+* helper columns present redundant information for easier editing
+* manual edits to helper values are not treated as source truth
+* helper values may be ignored or overwritten on re-enrichment
+* renaming helper columns is unsupported
+* renaming relevant sheets is unsupported
 
-If helper columns are removed during cleanup, the canonical metadata may remain, while the derived operational metadata is expected to change because the helper columns are no longer materialized in the current working state.
+This is not great UX, but it is a feasible first contract.
 
-=== Consequences
+=== Cleanup Policy
 
-This concept suggests a longer-term direction:
+The current cleanup step `drop_helpers` removes by prefix.
 
-- helper materialization should eventually prefer metadata-driven classification over prefix-only heuristics;
-- target-sheet helper defaults belong naturally to canonical metadata;
-- concrete helper-column markers belong to derived operational metadata;
-- `bootstrap_meta` is the natural place where persisted metadata becomes active working metadata before enrichment or cleanup steps run.
+That is good enough for the current implementation phase, but it is also the
+main conceptual weakness.
 
-=== Current State vs. Target State
+The longer-term direction is:
 
-Current implementation is intentionally simpler:
+* prefix may still help with detection
+* cleanup should eventually trust explicit helper-column metadata first
+* prefixes should remain fallback aids and disambiguation tools
 
-- helper field selection currently lives mainly in pipeline defaults such as `helper_fields_by_fk`;
-- helper cleanup/styling still relies heavily on prefix-based recognition;
-- helper provenance is not yet modeled as a first-class derived metadata structure.
+=== Naming Conventions
 
-This is acceptable for the current project phase, but the bidirectional spreadsheet/domain story suggests the metadata-driven model above as the more complete target state.
+FK naming and helper naming serve different purposes and should not be merged
+into one vague naming rule.
+
+==== FK Naming
+
+FK naming helps the system detect that a column is intended as a foreign key.
+
+Example:
+
+* `id_(employees)`
+
+==== Helper Naming
+
+Helper naming helps distinguish derived helper columns from ordinary payload
+columns and helps cleanup avoid collisions.
+
+Example:
+
+* `_employees_first_name`
+
+So even if both are naming conventions, they solve different problems.
+
+=== Current State, Next Slice, Target State
+
+==== Current State
+
+* helper logic is useful and works for controlled conventions
+* multiple helper columns per FK are implemented
+* the implementation is still mainly naming- and prefix-driven
+
+==== Next Slice
+
+* document the current implementation honestly
+* add a minimal concrete metadata shape
+* begin shifting from prefix-only recognition toward metadata-backed
+  recognition
+* keep scope small and conservative
+
+==== Target State
+
+* target-side helper capability is explicit
+* concrete helper-column materialization is explicit
+* cleanup and reimport rely primarily on metadata, not on prefixes alone
+* spreadsheet-first roundtrips become more stable because interpreted structure
+  is persisted
+
+=== Open Questions
+
+The following questions are still open and should be kept concrete rather than
+generic:
+
+* which helper-related metadata survives `drop_helpers`
+* which helper-related metadata disappears together with the materialized helper
+  columns
+* when exactly initial interpretation should be persisted
+* which operations remain unsupported in the first safe contract
+* how much rename repair or orphan cleanup should ever be attempted
+
+=== Practical Reading Rule
+
+If a sentence in this topic sounds too abstract, rewrite it so that a reader can
+map it to one of these concrete things:
+
+* `apply_fks`
+* `drop_helpers`
+* `bootstrap_meta`
+* the `desks` table containing the FK
+* the `employees` target table
+* a concrete helper column such as `_employees_first_name`
+
+If that mapping is missing, the wording is probably too generic to guide
+implementation.
