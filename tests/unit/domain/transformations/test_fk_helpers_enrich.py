@@ -147,3 +147,65 @@ class TestApplyFksStepProvenance:
         assert out["_meta"]["version"] == "3.0"
         assert out["_meta"]["author"] == "test"
         assert "derived" in out["_meta"]
+
+    def test_stale_provenance_removed_for_sheet_without_current_fks(self):
+        """apply_fks removes stale helper_columns provenance for sheets that
+        no longer have FK defs in the current run."""
+        frames = _frames()
+        # Inject stale provenance for a sheet that has no FKs
+        frames["_meta"] = {
+            "derived": {
+                "sheets": {
+                    "B": {
+                        "helper_columns": [
+                            {"column": "_X_old", "fk_column": "id_(X)",
+                             "target": "X", "value_field": "old"},
+                        ]
+                    }
+                }
+            }
+        }
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        derived_sheets = out["_meta"]["derived"]["sheets"]
+        assert "B" not in derived_sheets
+        assert "A" in derived_sheets
+
+    def test_stale_provenance_removed_for_sheet_no_longer_in_frames(self):
+        """apply_fks cleans provenance for sheets that are not in frames at all."""
+        frames = _frames()
+        frames["_meta"] = {
+            "derived": {
+                "sheets": {
+                    "Gone": {
+                        "helper_columns": [
+                            {"column": "_Z_val", "fk_column": "id_(Z)",
+                             "target": "Z", "value_field": "val"},
+                        ]
+                    }
+                }
+            }
+        }
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        derived_sheets = out["_meta"]["derived"]["sheets"]
+        assert "Gone" not in derived_sheets
+
+    def test_key_selective_merge_preserves_other_derived_keys(self):
+        """apply_fks only replaces helper_columns, not the whole sheet dict."""
+        frames = _frames()
+        frames["_meta"] = {
+            "derived": {
+                "sheets": {
+                    "A": {"other_derived_key": "keep_me"}
+                }
+            }
+        }
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(frames)
+
+        sheet_derived = out["_meta"]["derived"]["sheets"]["A"]
+        assert sheet_derived["other_derived_key"] == "keep_me"
+        assert "helper_columns" in sheet_derived

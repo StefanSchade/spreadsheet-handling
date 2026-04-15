@@ -1,0 +1,170 @@
+===== FTR-FK-HELPER-DOMAIN-EXTRACTION -- Move FK Helper Business Logic out of `pipeline.steps`
+
+*Status:* Open
+*Epic:* Phase 4a -- First feature wave on top of the new architecture
+
+*Purpose:*::
+Restore the intended boundary between generic pipeline orchestration and
+feature-specific domain behavior by extracting FK-helper logic out of
+`pipeline.steps` and into domain-owned functions.
+
+*Context:*::
+The current FK-helper path already goes beyond thin step orchestration.
+`make_apply_fks_step(...)` in `pipeline.steps` does not only bind config and call
+a domain function; it also builds FK registries, resolves target-field maps,
+loops over sheets, and now writes helper provenance into `_meta`.
+Likewise, `make_drop_helpers_step(...)` performs helper-specific cleanup and
+provenance mutation directly in the pipeline layer.
+
+This is pragmatically workable for a small slice, but it weakens the intended
+architecture:
+
+- `pipeline.steps` should remain a generic orchestration library
+- feature semantics should live in domain transformations
+- pipeline-level tests should verify composition, not carry the primary burden of
+  helper-feature correctness
+
+The earlier `FTR-FK-HELPER-REFACTOR-P3B` already pointed in this direction. This
+ticket is the focused follow-up that finishes the cut for the current helper
+feature shape, including derived provenance handling from
+`FTR-FK-HELPER-PROVENANCE-CLEANUP`.
+
+*Goal:*::
+Make `pipeline.steps` thin again for FK-helper behavior:
+
+- step factories bind configuration
+- step factories call focused domain entry points
+- helper enrichment, helper cleanup, and helper-provenance mutation live in the
+  domain layer
+
+*Pipeline Boundary After Refactor:*::
+After this refactor, `pipeline.steps` may still own:
+
+- step-factory registration and step naming
+- config binding / forwarding into step-local call arguments
+- generic reserved-frame handling such as `_meta` preservation
+- generic sequencing of steps
+- generic severity / warn / fail policy wiring where that policy is not
+  helper-specific business logic
+
+After this refactor, `pipeline.steps` must no longer own:
+
+- helper-field resolution
+- FK registry planning specific to helper enrichment
+- FK-helper provenance writes or synchronization
+- helper cleanup decisions
+- helper-specific heuristics or naming-rule decisions beyond passing configured
+  arguments through
+- helper-specific `_meta` mutation
+
+*Scope:*::
+- Extract the helper-specific body of `make_apply_fks_step(...)` into one or more
+  domain-owned functions/modules.
+- Extract the helper-specific body of `make_drop_helpers_step(...)` into
+  domain-owned functions/modules.
+- Keep reserved-frame handling and generic step-wrapping concerns in
+  `pipeline.steps`.
+- Keep the current helper behavior unchanged:
+  - FK detection rules
+  - helper-field resolution precedence
+  - helper-column materialization
+  - derived helper provenance under `_meta["derived"]["sheets"][sheet]["helper_columns"]`
+  - metadata-backed cleanup with prefix fallback
+- Move the primary correctness tests for helper behavior toward domain-level
+  tests; pipeline tests may remain as thin integration/smoke coverage.
+
+*Design Principle:*::
+`pipeline.steps` should know *that* a helper step exists, but not *how* FK
+helpers are semantically resolved, materialized, or cleaned.
+
+In other words:
+
+- orchestration belongs to pipeline
+- business logic belongs to domain
+
+*Implementation Direction:*::
+- Introduce a focused domain module or modules for FK-helper transformations.
+- Provide explicit domain entry points, for example along these lines:
+  - `domain.transformations.fk_helpers.resolve_helper_plan(...)`
+  - `domain.transformations.fk_helpers.enrich_helpers(...)`
+  - `domain.transformations.fk_helpers.drop_helpers(...)`
+
+Equivalent names are acceptable, but the domain API should expose a clear cut
+between:
+
+- planning/resolution of helper behavior
+- enrichment/materialization
+- cleanup/provenance synchronization
+
+- Let `make_apply_fks_step(...)` become a thin adapter that binds config and
+  delegates to the domain entry point.
+- Let `make_drop_helpers_step(...)` become a thin adapter that binds config and
+  delegates to the domain entry point.
+- Keep helper-specific `_meta` writes and mutations out of `pipeline.steps`.
+- Preserve current behavior before attempting deeper redesign.
+
+If the final implementation chooses slightly different function names, the
+ownership boundary and semantic split above are still the non-negotiable part of
+the ticket.
+
+*Drift Protection:*::
+This ticket should not only move code once; it should make future drift back
+into `pipeline.steps` less likely.
+
+Add a lightweight architecture guard or equivalent focused test that defends the
+intended boundary, for example by checking that:
+
+- `pipeline.steps` no longer contains FK-helper-specific field-resolution logic
+- `pipeline.steps` no longer mutates helper provenance directly
+- helper-semantics tests live primarily at the domain level
+
+The goal is a small executable fitness function for this seam, not a heavy
+general-purpose architecture framework.
+
+*Non-Goals:*::
+- No full rewrite of the step system.
+- No requirement to move every existing step out of `pipeline.steps` in this
+  ticket.
+- No change to helper semantics or supported user contract.
+- No expansion into formula helpers, rename support, or generalized metadata
+  engines.
+- No broad refactor of unrelated validation or rendering code.
+
+*Acceptance:*::
+- `pipeline.steps.make_apply_fks_step(...)` is reduced to thin orchestration and
+  no longer contains helper-specific enrichment or provenance logic beyond
+  calling a domain entry point.
+- `pipeline.steps.make_drop_helpers_step(...)` is reduced to thin orchestration
+  and no longer contains helper-specific cleanup/provenance logic beyond calling
+  a domain entry point.
+- The domain layer owns the current FK-helper behavior end-to-end for:
+  - helper enrichment
+  - derived helper provenance writes
+  - helper cleanup
+  - provenance cleanup/synchronization
+- Existing FK-helper behavior remains semantically unchanged.
+- `pipeline/steps.py` contains no FK-helper-specific field-resolution logic or
+  helper-provenance mutation after the refactor.
+- Domain-level tests cover the moved helper behavior directly.
+- Pipeline tests remain, but mainly as smoke/integration checks that step wiring
+  still works.
+- A lightweight guard or equivalent focused test protects the boundary so the
+  same helper logic does not silently drift back into `pipeline.steps` in later
+  slices.
+
+*Suggested Test Areas:*::
+- `tests/unit/domain/transformations/test_fk_helpers_enrich.py`
+- `tests/unit/domain/transformations/test_drop_helpers_provenance.py`
+- a focused new test module for the extracted domain entry points if the final
+  API shape warrants it
+- existing pipeline smoke tests:
+  - `tests/unit/pipeline/test_pipeline_basic.py`
+  - `tests/unit/pipeline/test_pipeline_meta_sidecar.py`
+  - `tests/unit/pipeline/test_pipeline_yaml.py`
+
+*Relation to Existing Work:*::
+- `FTR-FK-HELPER-REFACTOR-P3B` established the intended architectural direction.
+- `FTR-FK-HELPER-PROVENANCE-CLEANUP` added derived helper provenance and
+  metadata-backed cleanup.
+- This ticket is the immediate refactor follow-up that moves that helper logic
+  out of `pipeline.steps` and back into the domain layer where it belongs.
