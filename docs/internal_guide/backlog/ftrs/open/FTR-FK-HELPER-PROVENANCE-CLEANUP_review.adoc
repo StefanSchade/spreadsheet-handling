@@ -1,0 +1,83 @@
+= Review -- FTR-FK-HELPER-PROVENANCE-CLEANUP
+
+== Findings
+
+=== 1. `apply_fks` laesst veraltete Helper-Provenance fuer Sheets ohne aktuelle FK-Defs stehen
+
+In `src/spreadsheet_handling/pipeline/steps.py` schreibt `make_apply_fks_step(...)`
+die neue Provenance nur fuer Sheets, fuer die `detect_fk_columns(...)` in diesem
+Run Eintraege liefert. Sobald `fk_defs` fuer ein Sheet leer ist, wird der
+existierende Eintrag unter `meta["derived"]["sheets"][sheet]` nicht
+synchronisiert oder entfernt; der Code springt an genau dieser Stelle einfach
+weiter (`steps.py:153-155`).
+
+Das ist fuer eine Struktur, die ausdruecklich den *aktuellen materialisierten*
+Helper-Zustand beschreiben soll, zu schwach. Ein spaeterer Run kann damit noch
+Helper-Provenance fuer ein Sheet mittragen, obwohl dieses Sheet in den aktuellen
+Frames gar keine entsprechenden Helper mehr hat. Spaetestens beim naechsten
+`drop_helpers`-Lauf wird dann mit potenziell veralteter Meta gearbeitet.
+
+Ich wuerde den Write-Pfad so lesen: Er sollte den aktuellen Zustand eines Sheets
+abbilden, nicht nur positive Treffer dazuschreiben.
+
+=== 2. Der Write-Pfad ueberschreibt den gesamten per-Sheet-`derived`-Block
+
+Die Zeile
+
+[source,python]
+----
+derived_sheets[sheet_name] = {"helper_columns": entries}
+----
+
+(`steps.py:165`)
+
+ersetzt den kompletten `derived`-Unterbaum fuer dieses Sheet. Falls unter
+`_meta["derived"]["sheets"][sheet_name]` bereits weitere derived Informationen
+liegen, werden sie still geloescht.
+
+Fuer den aktuellen Patch ist das zwar noch kein unmittelbarer Produktfehler,
+aber es ist eine unnötig breite Schreiboperation in einem bewusst allgemein
+benannten Namespace. Gerade weil das Ticket die neue Provenance nicht als
+One-off-Key, sondern als derived Sheet-State einfuehrt, sollte der Patch hier
+mindestens key-selektiv mergen und nur `helper_columns` ersetzen.
+
+=== 3. Die Tests sichern die JSON-Sidecar-Route ab, aber nicht den Spreadsheet-Carrier explizit
+
+Die neue Roundtrip-Absicherung in
+`tests/unit/io_backends/test_meta_persistence.py:99-127` prueft die
+JSON-Sidecar-Persistenz der neuen Provenance sauber.
+
+Was weiterhin fehlt, ist ein ebenso expliziter Test fuer den Spreadsheet-Pfad
+ueber den versteckten `_meta`-Carrier. Die bestehenden XLSX-Meta-Tests in
+derselben Datei pruefen nur allgemein, dass Meta irgendwie ueberlebt
+(`test_roundtrip_xlsx`), aber nicht, dass gerade
+`_meta["derived"]["sheets"][...]["helper_columns"]` unveraendert erhalten
+bleibt. Fuer die FTR-Acceptance ist das eine echte Luecke, weil dort der
+Spreadsheet-Roundtrip explizit genannt ist.
+
+== Ergebnis
+
+Die Richtung der Umsetzung stimmt:
+
+* `apply_fks` schreibt Helper-Provenance in `_meta["derived"]["sheets"]`
+* `drop_helpers` bevorzugt Meta vor Prefix-Erkennung
+* Prefix-Fallback bleibt fuer Altfaelle erhalten
+* die neuen Unit-Tests treffen die Kernidee des Slices
+
+Ich wuerde den Stand aber noch nicht als ganz fertig markieren. Vor einem
+Abschluss des Tickets wuerde ich mindestens:
+
+* stale Provenance fuer Sheets ohne aktuelle FK-Defs aktiv bereinigen oder
+  ueberschreiben
+* den per-Sheet-Write-Pfad von "replace whole dict" auf gezieltes Mergen
+  umstellen
+* einen expliziten XLSX- oder generischen Spreadsheet-Roundtrip-Test fuer die
+  neue Provenance ergaenzen
+
+== Verifikation
+
+Die Review ist in dieser Session statisch erfolgt.
+
+`pytest` war lokal nicht verfuegbar (`python -m pytest` schlug fehl, weil kein
+`pytest` installiert war), deshalb basiert das Urteil auf Code- und
+Diff-Inspektion statt auf ausgefuehrten Tests.
