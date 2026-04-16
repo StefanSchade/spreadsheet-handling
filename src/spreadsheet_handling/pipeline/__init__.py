@@ -3,6 +3,7 @@
 from .pipeline import (  # existing re-exports
     BoundStep,
     Step,
+    StepRegistration,
     run_pipeline,
     build_steps_from_config,
     build_steps_from_yaml,
@@ -21,6 +22,7 @@ from .config import load_app_config, AppConfig  # add others if you like
 __all__ = [
     "BoundStep",
     "Step",
+    "StepRegistration",
     "run_pipeline",
     "build_steps_from_config",
     "build_steps_from_yaml",
@@ -35,4 +37,3 @@ __all__ = [
     "load_app_config",
     "AppConfig",
 ]
-

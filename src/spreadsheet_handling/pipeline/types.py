@@ -44,6 +44,23 @@ class BoundStep:
         return self.fn(frames)
 
 
+StepFactory = Callable[..., BoundStep]
+StepTarget = str | Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class StepRegistration:
+    """
+    Normalized registry entry for pipeline-addressable steps.
+
+    factory remains the extension point for how a step is bound.
+    target optionally identifies the underlying domain callable when a generic
+    binding path is used.
+    """
+    factory: StepFactory
+    target: StepTarget | None = None
+
+
 # ---------------------------------------------------------------------------
 # Step specification (for config binding)
 # ---------------------------------------------------------------------------

@@ -5,25 +5,21 @@ config-driven pipeline construction from dicts or YAML.
 """
 from __future__ import annotations
 
-import importlib
 import logging
+import importlib
 from typing import Any, Callable, Dict, Iterable, Mapping
 
-from .types import BoundStep, Frames, Step
+from .types import BoundStep, Frames, Step, StepFactory, StepRegistration
 
 from .steps import (
+    make_builder_target_step,
+    make_frames_target_step,
     make_identity_step,
     make_validate_step,
     make_apply_fks_step,
     make_drop_helpers_step,
     make_check_fk_helpers_step,
     make_plugin_step,
-    make_flatten_headers_step,
-    make_unflatten_headers_step,
-    make_reorder_helpers_step,
-    make_add_validations_step,
-    make_bootstrap_meta_step,
-    make_apply_overrides_step,
 )
 
 log = logging.getLogger("sheets.pipeline")
@@ -45,19 +41,37 @@ def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
 # Registry
 # ---------------------------------------------------------------------------
 
-REGISTRY: Dict[str, Callable[..., BoundStep]] = {
+REGISTRY: Dict[str, StepRegistration | StepFactory] = {
     "identity":         make_identity_step,
     "validate":         make_validate_step,
     "apply_fks":        make_apply_fks_step,
     "drop_helpers":     make_drop_helpers_step,
     "check_fk_helpers": make_check_fk_helpers_step,
     "plugin":           make_plugin_step,
-    "flatten_headers":  make_flatten_headers_step,
-    "unflatten_headers": make_unflatten_headers_step,
-    "reorder_helpers":  make_reorder_helpers_step,
-    "add_validations":  make_add_validations_step,
-    "bootstrap_meta":   make_bootstrap_meta_step,
-    "apply_overrides":  make_apply_overrides_step,
+    "flatten_headers": StepRegistration(
+        factory=make_builder_target_step,
+        target="spreadsheet_handling.domain.transformations.helpers:flatten_headers",
+    ),
+    "unflatten_headers": StepRegistration(
+        factory=make_builder_target_step,
+        target="spreadsheet_handling.domain.transformations.helpers:unflatten_headers",
+    ),
+    "reorder_helpers": StepRegistration(
+        factory=make_builder_target_step,
+        target="spreadsheet_handling.domain.transformations.helpers:reorder_helpers_next_to_fk",
+    ),
+    "add_validations": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.validations.validate_columns:add_validations",
+    ),
+    "bootstrap_meta": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.meta_bootstrap:bootstrap_meta",
+    ),
+    "apply_overrides": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.yaml_overrides:load_and_apply_overrides",
+    ),
 }
 
 
@@ -76,17 +90,17 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
       1) registry key (see REGISTRY)
       2) dotted path '<module>:<factory_function>'
     """
-    def resolve_factory(step_id: str) -> Callable[..., BoundStep] | None:
-        factory = REGISTRY.get(step_id)
-        if factory:
-            return factory
+    def resolve_registration(step_id: str) -> StepRegistration | None:
+        entry = REGISTRY.get(step_id)
+        if entry:
+            return entry if isinstance(entry, StepRegistration) else StepRegistration(factory=entry)
         if ":" in step_id:
             mod_name, func_name = step_id.split(":", 1)
             mod = importlib.import_module(mod_name)
             factory = getattr(mod, func_name, None)
             if factory is None:
                 raise AttributeError(f"Factory '{func_name}' not found in module '{mod_name}'")
-            return factory
+            return StepRegistration(factory=factory)
         return None
 
     steps: list[BoundStep] = []
@@ -96,17 +110,24 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         if not step_id:
             raise ValueError(f"Step spec missing 'step': {raw}")
 
-        factory = resolve_factory(step_id)
-        if not factory:
+        registration = resolve_registration(step_id)
+        if not registration:
             raise KeyError(f"Unknown step '{step_id}'. Known registry keys: {list(REGISTRY)}")
 
         name = spec.pop("name", None)
+        factory_kwargs = dict(spec)
+        if registration.target is not None:
+            factory_kwargs["target"] = registration.target
+        if name is not None:
+            factory_kwargs["name"] = name
+        elif registration.target is not None:
+            factory_kwargs["name"] = step_id
 
         try:
-            bound = factory(name=name, **spec) if name is not None else factory(**spec)  # type: ignore[arg-type]
+            bound = registration.factory(**factory_kwargs)  # type: ignore[arg-type]
         except TypeError:
             if name is not None:
-                tmp = factory(**spec)  # type: ignore[arg-type]
+                tmp = registration.factory(**spec)  # type: ignore[arg-type]
                 bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
             else:
                 raise

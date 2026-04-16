@@ -10,7 +10,7 @@ This module re-exports everything so existing imports continue to work.
 from __future__ import annotations
 
 # --- types ---
-from .types import Frames, Step, BoundStep, StepSpec  # noqa: F401
+from .types import Frames, Step, BoundStep, StepSpec, StepRegistration  # noqa: F401
 
 # --- step factories ---
 from .steps import (  # noqa: F401
@@ -35,4 +35,3 @@ from .registry import (  # noqa: F401
     build_steps_from_config,
     build_steps_from_yaml,
 )
-
