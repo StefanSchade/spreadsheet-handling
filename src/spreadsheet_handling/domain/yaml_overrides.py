@@ -79,3 +79,21 @@ def apply_overrides(
 
     _set_meta(frames, meta)
     return frames
+
+
+def load_and_apply_overrides(
+    frames: Any,
+    *,
+    overrides_path: str | Path | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> Any:
+    """Resolve overrides from inline config or path, then apply them.
+
+    This is a domain-facing convenience entry point for pipeline binding.
+    """
+    resolved = overrides
+    if resolved is None and overrides_path:
+        resolved = load_overrides(overrides_path)
+    if resolved:
+        return apply_overrides(frames, resolved)
+    return frames
