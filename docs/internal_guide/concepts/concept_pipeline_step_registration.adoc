@@ -1,0 +1,207 @@
+[[concept-pipeline-step-registration]]
+== Pipeline Step Registration Concept
+
+=== Purpose
+
+This note explains how YAML step names should map to executable pipeline steps
+without letting `pipeline` accumulate feature-specific binding code.
+
+It is not a full workflow-engine design.
+
+It is a working concept for the next small pipeline-normalization slice that
+should land before broader FK-helper extraction and the next guardrail pass.
+
+=== Why This Needs a Concept
+
+The current architecture already says that `pipeline` should stay a linear
+sequencing and transport layer.
+
+That principle is mostly true in `run_pipeline()`.
+
+The current weak point is one layer earlier:
+
+* step registration
+* config binding
+* step construction
+
+Today the registry mainly maps YAML step names to bespoke `make_*_step()`
+factories.
+
+Because no generic binding path exists, every step that needs to reach a
+domain function must either embed the call inline or build its own wrapper.
+The result is that feature-specific business logic accumulates in the pipeline
+layer not by design but by default: there is no better place to put it yet.
+
+This is the root cause of both problems visible today:
+
+* `pipeline.steps` contains factories that thematically belong in domain.
+* Some of those factories have grown fat with domain logic precisely because
+  the generic delegation path was missing.
+
+Once the generic path exists, both problems become addressable: domain-owned
+steps can be migrated to the generic path, and fat factories can be extracted
+to domain without creating another bespoke pipeline wrapper.
+
+=== Deliberate Simplicity of the Pipeline Model
+
+This concept does *not* introduce routing, branching, or process-engine
+behavior.
+
+The intended pipeline model remains deliberately simple:
+
+* YAML declares a linear sequence of steps
+* the orchestrator builds a list of bound steps
+* `run_pipeline()` executes them in order
+
+If orchestration-level routing metadata is ever introduced later, that must be
+a separate explicit control channel.
+
+It must not arise by letting pipeline inspect workbook payload or `_meta`.
+
+=== Current Implementation Today
+
+Today the registry maps step names to factory functions in `pipeline.steps`.
+
+This means the pipeline layer owns not only the runtime step list, but also much
+of the binding logic that connects:
+
+* user-facing YAML step names
+* configuration kwargs
+* the actual domain callable
+
+The current shapes are mixed:
+
+* some domain functions are builder-style:
+  `(...config) -> Step`
+* some domain functions are frames-first:
+  `(frames, **config) -> Frames`
+* some validation paths return findings instead of frames
+* some heavy feature steps still contain extra planning logic in pipeline
+
+So the registry seam is the right place for the next normalization slice.
+
+=== What Should Stay True
+
+The registry should remain factory-based.
+
+That part is useful because it keeps open the option that future step kinds may
+need different binding behavior.
+
+So this concept does *not* say:
+
+* remove factories from the registry
+* force every step kind into one permanent callable signature
+
+Instead it says:
+
+* keep factories as the extension point
+* add a more generic normal path for ordinary domain-addressable steps
+
+=== The New Normal Path
+
+The new normal path should be:
+
+* YAML step name
+* -> registry registration
+* -> generic binding factory
+* -> domain target callable
+* -> `BoundStep`
+
+In that model, the registry entry can carry both:
+
+* the factory to use
+* the intended domain target to bind
+
+This keeps the current flexibility while reducing bespoke pipeline binding code.
+
+=== Minimal Registration Shape
+
+The next slice should introduce a small registration descriptor or equivalent
+mapping shape along these lines:
+
+[source,python]
+----
+@dataclass(frozen=True)
+class StepRegistration:
+    factory: Callable[..., BoundStep]
+    target: str | Callable[..., Any] | None = None
+----
+
+Exact field names are less important than the role split:
+
+* `factory` defines how a step is bound
+* `target` identifies the underlying domain callable when the step follows the
+  generic path
+
+=== Supported Shapes in the Next Slice
+
+The next slice does not need to normalize every possible callable shape.
+
+It only needs a solid generic path for the common step forms already present in
+the codebase:
+
+* builder-style domain callables:
+  `(...config) -> Step`
+* frames-first domain callables:
+  `(frames, **config) -> Frames`
+
+Special step kinds may remain explicit for now:
+
+* plugin steps
+* validation/reporting steps
+* helper-heavy legacy steps that still need separate extraction work
+
+=== Migration Reading Rule
+
+Read the next slice like this:
+
+* registry entries may remain legacy for a while
+* but the preferred path becomes generic binding plus domain target
+* steps migrate in order of how clearly they belong in domain
+* fat factories can move later by a mechanical extraction: wrap the logic in
+  a domain function, then the factory becomes a thin delegate using the
+  generic path
+
+The criterion for migration is thematic ownership, not line count.
+`flatten_headers` is a migration candidate not because it is short but
+because it is thematically domain behavior that happens to live in the
+pipeline package today.
+
+Typical first migration candidates:
+
+* `flatten_headers`
+* `unflatten_headers`
+* `reorder_helpers`
+* `bootstrap_meta`
+* `apply_overrides`
+* `add_validations`
+
+Fat factories such as `apply_fks` and `drop_helpers` are thematically wrong
+in `pipeline` too, but extracting them requires first moving their domain
+logic out. That is the job of `FTR-FK-HELPER-DOMAIN-EXTRACTION`. Once that
+extraction is done, those factories can use the generic path like any other.
+
+Keeping a fat factory in `pipeline` intentionally requires a positive
+justification. The absence of a better place is not a justification.
+
+=== Practical Reading Rule
+
+If a new step can be expressed as:
+
+* a generic binding rule
+* plus a domain target callable
+
+then it should *not* get a new bespoke pipeline factory by default.
+
+Only genuinely special step kinds should justify custom factory code in the
+pipeline layer.
+
+If an existing step has a fat factory, the extraction path is mechanical:
+
+. Move the domain logic into a focused domain function.
+. Let the factory become a thin delegate that binds config and calls that
+  function.
+. If the resulting thin factory fits the generic path, register it that way.
+
+Whether the newly extracted domain function itself needs algorithmic cleanup
+is a separate question and belongs in a separate ticket.
