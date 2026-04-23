@@ -1,0 +1,221 @@
+= Review -- FTR-FK-HELPER-DOMAIN-EXTRACTION
+
+== Ergebnis
+
+Der Refactor geht in die richtige Richtung, ist in diesem Stand aber noch nicht
+abnahmebereit.
+
+Positiv ist: Die eigentliche FK-Helper-Fachlogik wurde aus
+`pipeline.steps` in ein neues Domain-Modul verschoben.  Die verbliebenen
+Factories `make_apply_fks_step(...)` und `make_drop_helpers_step(...)` sind
+jetzt sehr duenne Delegates und enthalten selbst keine FK-Registry-Planung,
+Helper-Provenance-Schreiblogik oder Cleanup-Heuristik mehr.
+
+Der blockierende Punkt liegt in der Registry-Bindung: die neu normalisierten
+`StepRegistration`-Eintraege fuer `apply_fks` und `drop_helpers` passen nicht
+zur Signatur der bestehenden Factories.  Dadurch brechen YAML-/Config-basierte
+Pipeline-Laeufe.
+
+== Findings
+
+=== 1. Blocker: `apply_fks` / `drop_helpers` brechen beim Build aus Config
+
+In `src/spreadsheet_handling/pipeline/registry.py:47` und
+`src/spreadsheet_handling/pipeline/registry.py:51` werden `apply_fks` und
+`drop_helpers` nun als `StepRegistration` mit `target` registriert.
+
+`build_steps_from_config(...)` fuegt diesen `target` bei normalisierten
+Registrierungen in `factory_kwargs` ein (`registry.py:126`) und ruft dann die
+Factory auf (`registry.py:133`).
+
+Die betroffenen Factories akzeptieren aber keinen `target`-Parameter:
+
+- `src/spreadsheet_handling/pipeline/steps.py:154`:
+  `make_apply_fks_step(*, defaults=None, name="apply_fks")`
+- `src/spreadsheet_handling/pipeline/steps.py:173`:
+  `make_drop_helpers_step(*, prefix="_", name="drop_helpers")`
+
+Das fuehrt zu:
+
+[source,text]
+----
+TypeError: make_apply_fks_step() got an unexpected keyword argument 'target'
+----
+
+Reproduziert mit:
+
+[source,powershell]
+----
+& .venv_win\Scripts\python.exe -m pytest `
+  tests/unit/pipeline/test_step_registration.py `
+  tests/unit/pipeline/test_pipeline_yaml.py `
+  tests/unit/pipeline/test_pipeline_basic.py `
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py `
+  tests/unit/domain/transformations/test_drop_helpers_provenance.py `
+  --ignore=lib64 --ignore=.venv\lib64 -q
+----
+
+Ergebnis:
+
+[source,text]
+----
+3 failed, 27 passed
+----
+
+Die fehlschlagenden Tests sind genau die gepflegten Pipeline-Config-Pfade:
+
+- `tests/unit/pipeline/test_pipeline_yaml.py::test_pipeline_from_yaml_fragment`
+- `tests/unit/pipeline/test_pipeline_yaml.py::test_pipeline_from_yaml_supports_multi_helper_config`
+- `tests/unit/pipeline/test_pipeline_basic.py::test_pipeline_build_from_config_registry`
+
+Damit ist die Acceptance "Existing FK-helper behavior remains semantically
+unchanged" fuer den YAML-/Config-Pfad noch nicht erfuellt.
+
+=== 2. Testabdeckung bleibt noch zu stark ueber Pipeline-Factories
+
+Das FTR verlangt, dass die Primaerabdeckung der Helper-Semantik in die Domain
+wandert und Pipeline-Tests hauptsaechlich Wiring/Smoke pruefen.
+
+Die bestehende Domain-Testdatei
+`tests/unit/domain/transformations/test_fk_helpers_enrich.py` importiert fuer
+die Provenance-Faelle aber weiterhin `make_apply_fks_step(...)` aus
+`pipeline.steps`.  Ebenso importiert
+`tests/unit/domain/transformations/test_drop_helpers_provenance.py`
+`make_apply_fks_step(...)` und `make_drop_helpers_step(...)` aus der Pipeline.
+
+Das prueft die neue Domain-Implementierung nur indirekt ueber die
+Pipeline-Factory.  Fuer den gewollten Schnitt waeren direkte Tests gegen
+`domain.transformations.fk_helpers.enrich_helpers(...)` und
+`domain.transformations.fk_helpers.drop_helpers(...)` hilfreicher.  Die
+Pipeline-Tests sollten danach vor allem beweisen, dass die Factory korrekt an
+diese Domain-Einstiegspunkte delegiert.
+
+=== 3. Drift-Schutz ist noch nicht gelandet
+
+Das Ticket fordert eine leichte Fitness-Funktion gegen Rueckdrift, zum Beispiel
+dass `pipeline.steps` keine FK-helper-spezifische Field-Resolution oder
+Helper-Provenance-Mutation mehr enthaelt.
+
+Der aktuelle Code erfuellt die Grenze strukturell weitgehend, aber es gibt noch
+keinen neuen Guard-Test, der diese Grenze dauerhaft schuetzt.  Das ist kein
+zweiter Blocker neben dem kaputten Config-Pfad, aber fuer den Abschluss des FTR
+sollte ein kleiner Guard ergaenzt werden.
+
+== Positive Beobachtungen
+
+- `src/spreadsheet_handling/domain/transformations/fk_helpers.py` ist als
+  fachlicher Zielort gut gewaehlt.
+- `enrich_helpers(...)` uebernimmt die bisherige Planung, Materialisierung und
+  derived Helper-Provenance.
+- `drop_helpers(...)` uebernimmt metadata-backed Cleanup plus Prefix-Fallback.
+- `pipeline.steps` ist fuer `apply_fks` und `drop_helpers` sichtbar duenner und
+  delegiert nur noch an die Domain.
+- Die bisherigen direkten Helper-Tests laufen weiterhin, wenn man die
+  Registry-/YAML-Pfade ausklammert:
++
+[source,powershell]
+----
+& .venv_win\Scripts\python.exe -m pytest `
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py `
+  tests/unit/domain/transformations/test_drop_helpers_provenance.py `
+  --ignore=lib64 --ignore=.venv\lib64 -q
+----
++
+[source,text]
+----
+19 passed
+----
+
+== Empfehlung
+
+Vor dem Abschluss des Tickets sollte zuerst der Registry-Bindungsbruch behoben
+werden.  Saubere Optionen waeren:
+
+- `apply_fks` und `drop_helpers` vorerst wieder als legacy/spezielle Factories
+  im Registry lassen, weil sie bereits selbst duenn an Domain delegieren.
+- Oder die Factories so umbauen, dass sie den normalisierten `target`-Pfad
+  tatsaechlich nutzen und damit zur `StepRegistration`-Form passen.
+
+Danach sollten die Domain-Tests direkt auf die neuen Domain-Entry-Points
+umgestellt oder ergaenzt werden, plus ein kleiner Guard gegen FK-Helper-Logik in
+`pipeline.steps`.
+
+== Review-Status
+
+Nicht akzeptiert in diesem Stand.
+
+Der Architekturzug ist richtig, aber der gepflegte YAML-/Config-Ausfuehrungspfad
+ist aktuell regressiv gebrochen.
+
+== Nachreview 2026-04-23
+
+Die Review-Kommentare aus dem ersten Durchlauf sind im aktuellen Stand
+bearbeitet.
+
+=== Ergebnis
+
+Der aktuelle Stand ist aus Review-Sicht akzeptiert.
+
+Die vorherige Blocker-Feststellung zur Registry-Bindung ist nicht mehr aktuell:
+`apply_fks` und `drop_helpers` bleiben im Registry wieder plain/spezielle
+Factories.  Damit wird kein `target` mehr an Factories uebergeben, die keinen
+`target`-Parameter akzeptieren.  Die YAML-/Config-Pfade bauen und laufen wieder.
+
+=== Erneut gepruefte Punkte
+
+- `pipeline.steps.make_apply_fks_step(...)` und
+  `pipeline.steps.make_drop_helpers_step(...)` sind weiterhin duenne Delegates
+  auf `domain.transformations.fk_helpers.enrich_helpers(...)` bzw.
+  `domain.transformations.fk_helpers.drop_helpers(...)`.
+- Die FK-Helper-Fachlogik, inklusive Registry-/Field-Resolution,
+  Helper-Materialisierung, derived Provenance und Cleanup, liegt jetzt im
+  Domain-Modul.
+- Es gibt direkte Domain-Tests in
+  `tests/unit/domain/transformations/test_fk_helpers_domain.py`.
+- Es gibt einen fokussierten Drift-Guard in
+  `tests/unit/pipeline/test_architecture_guard_fk_helpers.py`, der verhindert,
+  dass zentrale FK-Helper-Core-Symbole oder `_meta`/`helper_columns`-Manipulation
+  wieder in `pipeline.steps` auftauchen.
+
+=== Verifikation
+
+Gezielt relevante Suite:
+
+[source,powershell]
+----
+& .venv_win\Scripts\python.exe -m pytest `
+  tests/unit/pipeline/test_step_registration.py `
+  tests/unit/pipeline/test_pipeline_yaml.py `
+  tests/unit/pipeline/test_pipeline_basic.py `
+  tests/unit/pipeline/test_pipeline_meta_sidecar.py `
+  tests/unit/pipeline/test_architecture_guard_fk_helpers.py `
+  tests/unit/domain/transformations/test_fk_helpers_domain.py `
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py `
+  tests/unit/domain/transformations/test_drop_helpers_provenance.py `
+  tests/unit/domain/transformations/test_fk_edge_cases.py `
+  tests/unit/domain/validations/test_fk_check.py `
+  tests/unit/domain/validations/test_validate_modes.py `
+  --ignore=lib64 --ignore=.venv\lib64 -q
+----
+
+Ergebnis:
+
+[source,text]
+----
+78 passed
+----
+
+Ein breiterer Lauf ueber `tests/unit/pipeline` konnte in der lokalen
+Windows-venv nicht gesammelt werden, weil
+`tests/unit/pipeline/test_run_selected_pipeline_steps.py` ueber CLI/Orchestrator
+den ODS-Backend-Pfad importiert und dort lokal `odf` fehlt.  Das entspricht der
+bereits bekannten lokalen Testumgebungsgrenze und ist kein Hinweis auf eine
+Regression dieses FTRs.
+
+=== Resthinweis
+
+Die Domain-Extraktion ist jetzt gut genug fuer den Abschluss dieses Tickets.
+Die verbleibende groessere Frage, ob weitere Pipeline-Factories wie
+`validate`/`check_fk_helpers` spaeter ebenfalls strukturell normalisiert werden
+sollten, ist kein Blocker fuer `FTR-FK-HELPER-DOMAIN-EXTRACTION` und passt eher
+in die nachgelagerte Guard-/Facade-Cleanup-Linie.
