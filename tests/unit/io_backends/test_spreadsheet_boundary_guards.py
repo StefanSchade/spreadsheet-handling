@@ -14,20 +14,30 @@ from pathlib import Path
 
 import pytest
 
-import spreadsheet_handling.io_backends._interfaces as interfaces_mod
-import spreadsheet_handling.io_backends.ods.odf_parser as ods_parser_mod
-import spreadsheet_handling.io_backends.ods.parser_interpretation as ods_interpretation_mod
-import spreadsheet_handling.io_backends.ods.odf_renderer as ods_renderer_mod
-import spreadsheet_handling.io_backends.ods.ods_backend as ods_backend_mod
-import spreadsheet_handling.io_backends.spreadsheet_contract as contract_mod
-import spreadsheet_handling.io_backends.xlsx.openpyxl_parser as parser_mod
-import spreadsheet_handling.io_backends.xlsx.openpyxl_renderer as renderer_mod
-import spreadsheet_handling.io_backends.xlsx.parser_interpretation as interpretation_mod
-import spreadsheet_handling.io_backends.xlsx.xlsx_backend as backend_mod
-import spreadsheet_handling.rendering as rendering_pkg
+pytestmark = [
+    pytest.mark.ftr("FTR-SPREADSHEET-BOUNDARY-GUARDS-P3I"),
+    pytest.mark.ftr("FTR-ARCHITECTURE-FITNESS-GUARDS-P4X"),
+]
 
 
-pytestmark = pytest.mark.ftr("FTR-SPREADSHEET-BOUNDARY-GUARDS-P3I")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PKG_ROOT = REPO_ROOT / "src" / "spreadsheet_handling"
+RENDERING_ROOT = PKG_ROOT / "rendering"
+DOMAIN_ROOT = PKG_ROOT / "domain"
+CORE_ROOT = PKG_ROOT / "core"
+PIPELINE_ROOT = PKG_ROOT / "pipeline"
+IO_BACKENDS_ROOT = PKG_ROOT / "io_backends"
+
+CONTRACT_PATH = IO_BACKENDS_ROOT / "spreadsheet_contract.py"
+INTERFACES_PATH = IO_BACKENDS_ROOT / "_interfaces.py"
+XLSX_BACKEND_PATH = IO_BACKENDS_ROOT / "xlsx" / "xlsx_backend.py"
+XLSX_PARSER_PATH = IO_BACKENDS_ROOT / "xlsx" / "openpyxl_parser.py"
+XLSX_INTERPRETATION_PATH = IO_BACKENDS_ROOT / "xlsx" / "parser_interpretation.py"
+XLSX_RENDERER_PATH = IO_BACKENDS_ROOT / "xlsx" / "openpyxl_renderer.py"
+ODS_BACKEND_PATH = IO_BACKENDS_ROOT / "ods" / "ods_backend.py"
+ODS_PARSER_PATH = IO_BACKENDS_ROOT / "ods" / "odf_parser.py"
+ODS_INTERPRETATION_PATH = IO_BACKENDS_ROOT / "ods" / "parser_interpretation.py"
+ODS_RENDERER_PATH = IO_BACKENDS_ROOT / "ods" / "odf_renderer.py"
 
 
 def _path_imports(module_path: Path) -> list[str]:
@@ -42,10 +52,6 @@ def _path_imports(module_path: Path) -> list[str]:
     return imports
 
 
-def _module_imports(module) -> list[str]:
-    return _path_imports(Path(module.__file__).resolve())
-
-
 def _assert_no_import_prefixes(module_path: Path, *, forbidden_prefixes: tuple[str, ...]) -> None:
     imports = _path_imports(module_path)
     violations = [
@@ -57,15 +63,13 @@ def _assert_no_import_prefixes(module_path: Path, *, forbidden_prefixes: tuple[s
     )
 
 
+def _package_modules(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
+
+
 def test_generic_spreadsheet_modules_stay_free_of_xlsx_and_openpyxl_dependencies():
-    root = Path(rendering_pkg.__file__).resolve().parent
-    generic_modules = sorted(root.rglob("*.py"))
-    generic_modules.extend(
-        [
-            Path(contract_mod.__file__).resolve(),
-            Path(interfaces_mod.__file__).resolve(),
-        ]
-    )
+    generic_modules = _package_modules(RENDERING_ROOT)
+    generic_modules.extend([CONTRACT_PATH, INTERFACES_PATH])
 
     forbidden_prefixes = (
         "openpyxl",
@@ -79,7 +83,7 @@ def test_generic_spreadsheet_modules_stay_free_of_xlsx_and_openpyxl_dependencies
 
 
 def test_xlsx_backend_imports_generic_code_through_spreadsheet_contract_boundary():
-    imports = _module_imports(backend_mod)
+    imports = _path_imports(XLSX_BACKEND_PATH)
 
     assert "spreadsheet_handling.io_backends.spreadsheet_contract" in imports
 
@@ -103,7 +107,7 @@ def test_xlsx_backend_imports_generic_code_through_spreadsheet_contract_boundary
 
 
 def test_ods_backend_imports_generic_code_through_spreadsheet_contract_boundary():
-    imports = _module_imports(ods_backend_mod)
+    imports = _path_imports(ODS_BACKEND_PATH)
 
     assert "spreadsheet_handling.io_backends.spreadsheet_contract" in imports
 
@@ -127,7 +131,7 @@ def test_ods_backend_imports_generic_code_through_spreadsheet_contract_boundary(
 
 
 def test_xlsx_parser_stops_at_workbook_ir_boundary():
-    imports = _module_imports(parser_mod)
+    imports = _path_imports(XLSX_PARSER_PATH)
 
     assert "spreadsheet_handling.rendering.ir" in imports
     assert "spreadsheet_handling.io_backends.xlsx.parser_interpretation" in imports
@@ -152,7 +156,7 @@ def test_xlsx_parser_stops_at_workbook_ir_boundary():
 
 
 def test_ods_parser_stops_at_workbook_ir_boundary():
-    imports = _module_imports(ods_parser_mod)
+    imports = _path_imports(ODS_PARSER_PATH)
 
     assert "spreadsheet_handling.rendering.ir" in imports
     assert "spreadsheet_handling.io_backends.ods.parser_interpretation" in imports
@@ -177,7 +181,7 @@ def test_ods_parser_stops_at_workbook_ir_boundary():
 
 
 def test_ods_parser_interpretation_stays_out_of_projection_and_contract_layers():
-    imports = _module_imports(ods_interpretation_mod)
+    imports = _path_imports(ODS_INTERPRETATION_PATH)
 
     assert "spreadsheet_handling.rendering.ir" in imports
 
@@ -201,7 +205,7 @@ def test_ods_parser_interpretation_stays_out_of_projection_and_contract_layers()
 
 
 def test_xlsx_parser_interpretation_stays_out_of_projection_and_contract_layers():
-    imports = _module_imports(interpretation_mod)
+    imports = _path_imports(XLSX_INTERPRETATION_PATH)
 
     assert "spreadsheet_handling.rendering.ir" in imports
 
@@ -225,7 +229,7 @@ def test_xlsx_parser_interpretation_stays_out_of_projection_and_contract_layers(
 
 
 def test_xlsx_renderer_consumes_render_plan_without_reaching_back_into_rendering_pipeline():
-    imports = _module_imports(renderer_mod)
+    imports = _path_imports(XLSX_RENDERER_PATH)
 
     assert "spreadsheet_handling.rendering.plan" in imports
 
@@ -249,7 +253,7 @@ def test_xlsx_renderer_consumes_render_plan_without_reaching_back_into_rendering
 
 
 def test_ods_renderer_consumes_render_plan_without_reaching_back_into_rendering_pipeline():
-    imports = _module_imports(ods_renderer_mod)
+    imports = _path_imports(ODS_RENDERER_PATH)
 
     assert "spreadsheet_handling.rendering.plan" in imports
 
@@ -270,3 +274,45 @@ def test_ods_renderer_consumes_render_plan_without_reaching_back_into_rendering_
         "odf_renderer.py must consume RenderPlan without reaching back into earlier layers:\n"
         + "\n".join(sorted(violations))
     )
+
+
+def test_domain_modules_do_not_import_pipeline_layer():
+    forbidden_prefixes = ("spreadsheet_handling.pipeline",)
+
+    for module_path in _package_modules(DOMAIN_ROOT):
+        _assert_no_import_prefixes(module_path, forbidden_prefixes=forbidden_prefixes)
+
+
+def test_core_modules_remain_leaf_only():
+    forbidden_prefixes = (
+        "spreadsheet_handling.domain",
+        "spreadsheet_handling.pipeline",
+        "spreadsheet_handling.rendering",
+        "spreadsheet_handling.io_backends",
+    )
+
+    for module_path in _package_modules(CORE_ROOT):
+        _assert_no_import_prefixes(module_path, forbidden_prefixes=forbidden_prefixes)
+
+
+def test_pipeline_runner_and_registry_stay_out_of_payload_semantics():
+    forbidden_patterns = (
+        '"_meta"',
+        "'_meta'",
+        '["derived"]',
+        "['derived']",
+        '["helper_columns"]',
+        "['helper_columns']",
+    )
+    checked_modules = [
+        PIPELINE_ROOT / "pipeline.py",
+        PIPELINE_ROOT / "registry.py",
+    ]
+
+    for module_path in checked_modules:
+        source = module_path.read_text(encoding="utf-8")
+        violations = [pattern for pattern in forbidden_patterns if pattern in source]
+        assert not violations, (
+            f"{module_path.name} inspects payload semantics that should stay in domain: "
+            + ", ".join(violations)
+        )
