@@ -1,4 +1,3 @@
-# tests/unit/io_backends/test_meta_persistence.py
 """
 FTR-META-PERSISTENCE – meta roundtrips across XLSX and JSON backends.
 

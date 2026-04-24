@@ -1,4 +1,3 @@
-# tests/unit/io_backends/test_json_roundtrip.py
 import pandas as pd
 from pathlib import Path
 from spreadsheet_handling.io_backends.json_backend import write_json_dir, read_json_dir
