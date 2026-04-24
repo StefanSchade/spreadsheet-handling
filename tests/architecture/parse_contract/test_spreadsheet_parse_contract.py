@@ -1,3 +1,8 @@
+"""Parse-contract guards for WorkbookIR projection and canonical meta recovery.
+
+These checks keep format-specific parsing on the `WorkbookIR` side of the read
+path and ensure generic projection remains backend-neutral and canonical.
+"""
 from __future__ import annotations
 
 import ast

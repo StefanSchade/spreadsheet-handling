@@ -1,3 +1,8 @@
+"""Parse-contract guard for the ODS parser interpretation seam.
+
+This check ensures the ODS parser keeps visible-sheet interpretation in its
+local adapter helper module instead of absorbing projection logic directly.
+"""
 from __future__ import annotations
 
 import ast

@@ -1,3 +1,8 @@
+"""Hardening checks for meta registry references and classifications.
+
+These guards verify that reviewed registry entries resolve to permitted layers,
+classifications, and code references instead of drifting silently.
+"""
 from __future__ import annotations
 
 from importlib import import_module

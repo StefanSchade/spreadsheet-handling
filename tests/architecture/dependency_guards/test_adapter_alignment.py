@@ -1,3 +1,9 @@
+"""Dependency guards for the XLSX adapter alignment seam.
+
+These checks keep the generic rendering package and spreadsheet contract free
+of direct XLSX implementation leakage while confirming the XLSX parser owns its
+backend-specific read path locally.
+"""
 from __future__ import annotations
 
 import ast

@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Durable spreadsheet-semantics invariants.
 
 These tests aim to protect spreadsheet-neutral contract statements that later
 adapters should be able to target without inheriting today's XLSX carrier
 shape.
 """
+
+from __future__ import annotations
 
 import copy
 from pathlib import Path
