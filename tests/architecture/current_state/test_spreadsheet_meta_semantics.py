@@ -1,11 +1,13 @@
-from __future__ import annotations
-
 """Current-state and transitional spreadsheet-meta checks.
 
 This module intentionally keeps smoke/presence checks and tolerated
 current-XLSX-shape assertions. Durable spreadsheet-semantics invariants live in
-``test_spreadsheet_semantic_invariants.py``.
+``test_spreadsheet_semantic_invariants.py``. These checks are intentionally
+XLSX-shaped and expected to change when the carrier or backend translation
+strategy evolves.
 """
+
+from __future__ import annotations
 
 import ast
 

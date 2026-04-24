@@ -1,3 +1,8 @@
+"""Semantic invariants for the architecture meta registry artifact.
+
+These checks keep the registry structurally well-formed and preserve the
+reviewed maintenance contract that separates canonical and rendering-side meta.
+"""
 from __future__ import annotations
 
 from pathlib import Path

@@ -1,3 +1,9 @@
+"""Spreadsheet-contract guards for the XLSX backend handoff boundary.
+
+These tests verify that the backend stays on the generic spreadsheet contract
+facade for read and write orchestration and stops at backend-neutral
+RenderPlan execution.
+"""
 from __future__ import annotations
 
 import ast
@@ -80,3 +86,26 @@ def test_xlsx_backend_imports_spreadsheet_contract_not_rendering_internals():
         + '\n'.join(sorted(violations))
     )
     assert 'spreadsheet_handling.io_backends.spreadsheet_contract' in imports
+
+
+def test_xlsx_backend_stops_at_render_plan(monkeypatch, tmp_path):
+    calls: list[str] = []
+    sentinel_plan = object()
+
+    def fake_build_plan(frames, meta):
+        calls.append("build_plan")
+        return sentinel_plan
+
+    def fake_render(plan, out_path):
+        assert plan is sentinel_plan
+        calls.append("render")
+        Path(out_path).touch()
+
+    monkeypatch.setattr(xb, "build_spreadsheet_render_plan", fake_build_plan, raising=True)
+    monkeypatch.setattr(xb, "render_workbook", fake_render, raising=True)
+
+    out = tmp_path / "book.xlsx"
+    ExcelBackend().write_multi({"Sheet1": pd.DataFrame({"a": [1, 2]})}, out)
+
+    assert calls == ["build_plan", "render"]
+    assert out.exists()

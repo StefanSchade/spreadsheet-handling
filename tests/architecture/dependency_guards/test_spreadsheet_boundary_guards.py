@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Conservative architectural seam guards for spreadsheet-capable backends.
 
 These checks intentionally cover the most important spreadsheet boundary modules
@@ -8,6 +6,8 @@ linter, but a focused drift-protection layer for the seams that Phase 3i wants
 to keep narrow. The rendering-tree guard also encodes the current policy that
 `spreadsheet_handling.rendering` stays adapter-free and generic.
 """
+
+from __future__ import annotations
 
 import ast
 from pathlib import Path

@@ -1,3 +1,8 @@
+"""Parse-contract guard for the XLSX parser interpretation seam.
+
+This check ensures the XLSX parser delegates visible-sheet interpretation to
+its adapter-local helper module instead of expanding the parser boundary.
+"""
 from __future__ import annotations
 
 import ast
