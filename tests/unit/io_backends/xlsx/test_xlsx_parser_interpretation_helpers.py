@@ -8,6 +8,7 @@ from spreadsheet_handling.io_backends.xlsx.parser_interpretation import (
     build_sheet_meta_hints,
     build_visible_sheet_ir,
 )
+from spreadsheet_handling.rendering.formulas import list_literal_formula
 from spreadsheet_handling.rendering.ir import DataValidationSpec
 
 
@@ -50,7 +51,7 @@ def test_build_visible_sheet_ir_combines_interpretation_inputs():
         DataValidationSpec(
             kind="list",
             area=(2, 2, 2, 2),
-            formula='"new,done"',
+            formula=list_literal_formula(["new", "done"]),
             allow_empty=True,
         )
     ]

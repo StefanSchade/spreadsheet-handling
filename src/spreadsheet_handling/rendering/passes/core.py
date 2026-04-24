@@ -1,6 +1,8 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 from typing import Protocol, Dict, Any, List, Optional
+from ..formulas import list_literal_formula
 from ..ir import WorkbookIR, SheetIR, DataValidationSpec, NamedRange
 
 class IRPass(Protocol):
@@ -84,7 +86,7 @@ class ValidationPass:
                 r1 = int(spec.get("from_row", 2))
                 r2 = int(spec.get("to_row", r1))
                 values = list(map(str, spec.get("values", [])))
-                formula = '"' + ",".join(values) + '"'
+                formula = list_literal_formula(values)
                 dv = DataValidationSpec(kind="list", area=(r1, col, r2, col), formula=formula, allow_empty=True)
                 sh.validations.append(dv)
 
@@ -112,7 +114,7 @@ class ValidationPass:
             r1 = t.top + t.header_rows
             r2 = max(r1, t.top + t.n_rows - 1)
             values = [str(v) for v in (rule.get("values") or [])]
-            formula = '"' + ",".join(values) + '"'
+            formula = list_literal_formula(values)
             dv = DataValidationSpec(kind="list", area=(r1, col_idx, r2, col_idx), formula=formula, allow_empty=True)
             target.validations.append(dv)
 
@@ -133,8 +135,6 @@ class MetaPass:
         meta.meta["_hidden"] = True
         return doc
 
-
-import re
 
 def _safe_name(s: str) -> str:
     """Sanitise a string for use in the current spreadsheet-safe defined-name subset."""

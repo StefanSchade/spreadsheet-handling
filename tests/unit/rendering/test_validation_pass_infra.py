@@ -5,11 +5,11 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.validations.validate_columns import add_validations
-from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-from spreadsheet_handling.rendering.passes.core import ValidationPass, MetaPass
+from spreadsheet_handling.rendering.passes.core import ValidationPass
 from spreadsheet_handling.rendering.passes import apply_all
 from spreadsheet_handling.rendering.flow import build_render_plan
+from spreadsheet_handling.rendering.formulas import formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR, WorkbookIR
 
 pytestmark = pytest.mark.ftr("FTR-VALIDATION-PASS-INFRA")
@@ -67,7 +67,7 @@ class TestValidationPassFromConstraints:
         assert len(ir.sheets["Products"].validations) == 1
         dv = ir.sheets["Products"].validations[0]
         assert dv.kind == "list"
-        assert "A,B,C" in dv.formula
+        assert formula_list_values(dv.formula) == ("A", "B", "C")
 
     def test_unknown_sheet_silently_skipped(self):
         ir = self._make_ir_with_constraints([{
@@ -172,7 +172,7 @@ class TestEndToEndConstraintPropagation:
                    if type(op).__name__ == "AddValidation" and getattr(op, "sheet", None) == "Orders"]
         assert len(val_ops) >= 1
         assert val_ops[0].kind == "list"
-        assert "open" in val_ops[0].formula
+        assert "open" in formula_list_values(val_ops[0].formula)
 
 
 class TestEndToEndXlsx:

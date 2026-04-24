@@ -14,6 +14,7 @@ import pytest
 from spreadsheet_handling.io_backends import make_backend
 from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook
 from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
+from spreadsheet_handling.rendering.formulas import formula_list_values
 
 
 pytestmark = pytest.mark.ftr("FTR-ODS-CALC-ADAPTER-IMPLEMENTATION-P3J")
@@ -79,7 +80,7 @@ def test_ods_parser_recovers_named_ranges_validations_and_filter_hint(tmp_path: 
     validation = sheet.validations[0]
     assert validation.kind == "list"
     assert validation.area == (2, 2, 3, 2)
-    assert "new" in validation.formula
+    assert "new" in formula_list_values(validation.formula)
 
     assert "_meta" in ir.hidden_sheets
     assert ir.hidden_sheets["_meta"].meta["_hidden"] is True

@@ -3,15 +3,11 @@ Tests for parse_ir: Scenario-A round-trip (our renderer → XLSX → parse_ir �
 """
 from __future__ import annotations
 
-import os
 import pandas as pd
 import pytest
 from pathlib import Path
 
-from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock
-from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-from spreadsheet_handling.rendering.passes import apply_all
-from spreadsheet_handling.rendering.flow import build_render_plan
+from spreadsheet_handling.rendering.formulas import formula_list_values
 from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
@@ -230,7 +226,7 @@ class TestValidationRoundtrip:
 
         assert len(vals) >= 1
         assert vals[0].kind == "list"
-        assert "A" in vals[0].formula
+        assert "A" in formula_list_values(vals[0].formula)
 
 
 # ---------------------------------------------------------------------------

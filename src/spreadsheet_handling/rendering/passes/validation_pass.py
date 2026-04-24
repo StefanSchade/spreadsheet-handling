@@ -1,17 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from ..formulas import list_literal_formula
 from ..ir import DataValidationSpec
 from ..ir import WorkbookIR, SheetIR, TableBlock
-
-
-def _csv_formula(values: List[str]) -> str:
-    """
-    Build an Excel list validation formula from values.
-    Excel expects: formula1='"A,B,C"'. Double quotes must be escaped.
-    """
-    escaped = ",".join(v.replace('"', '""') for v in values)
-    return f'"{escaped}"'
 
 
 def _first_table(sheet: SheetIR) -> Optional[TableBlock]:
@@ -74,7 +66,7 @@ def apply(ir: WorkbookIR, meta: Dict[str, Any] | None) -> WorkbookIR:
         values = rule.get("values") or []
         # normalize to strings; keep stable order
         value_strings: List[str] = [str(v) for v in values]
-        formula = _csv_formula(value_strings)
+        formula = list_literal_formula(value_strings)
 
         sheet_ir.validations.append(
             DataValidationSpec(
