@@ -1,3 +1,9 @@
+"""XLSX IR render-flow integration slice.
+
+Exercises the real compose/pass/plan/render path for XLSX output and verifies
+the produced workbook shape through the normalizer utility.
+"""
+
 from __future__ import annotations
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.passes import apply_all

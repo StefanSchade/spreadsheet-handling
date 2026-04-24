@@ -1,3 +1,9 @@
+"""YAML backend integration slice.
+
+Verifies the real YAML directory writer and reader preserve visible tabular
+frames, including an empty frame, through a filesystem roundtrip.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

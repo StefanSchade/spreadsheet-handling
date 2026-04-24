@@ -1,3 +1,10 @@
+"""Cross-adapter spreadsheet parity integration slice.
+
+Runs representative XLSX and ODS product paths and compares visible frames,
+canonical metadata, and parser-visible semantics for the currently supported
+portable spreadsheet surface.
+"""
+
 from __future__ import annotations
 
 import csv

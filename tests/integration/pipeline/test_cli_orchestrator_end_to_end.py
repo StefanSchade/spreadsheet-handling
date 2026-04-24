@@ -1,3 +1,9 @@
+"""Application orchestrator integration slice.
+
+Exercises the public orchestrate() path with real JSON filesystem IO and a
+pipeline step between load and save.
+"""
+
 from __future__ import annotations
 
 import json

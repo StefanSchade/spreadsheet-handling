@@ -1,3 +1,9 @@
+"""Minimal pipeline roundtrip integration slice.
+
+Runs app config loading and the pipeline runner for a JSON-to-XLSX smoke path
+with spreadsheet output options.
+"""
+
 from pathlib import Path
 import yaml
 from spreadsheet_handling.pipeline.config import load_app_config

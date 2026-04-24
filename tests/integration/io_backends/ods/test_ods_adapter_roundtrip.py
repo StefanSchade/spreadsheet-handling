@@ -1,3 +1,9 @@
+"""ODS adapter integration slice.
+
+Exercises the concrete ODS backend factory, writer, reader, and parser on real
+ODS files while keeping architecture boundary assertions in architecture tests.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

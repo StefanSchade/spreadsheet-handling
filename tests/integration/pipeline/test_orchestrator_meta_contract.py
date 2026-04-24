@@ -1,3 +1,9 @@
+"""Orchestrator metadata integration slice.
+
+Verifies that the application orchestrator preserves canonical metadata
+sidecars while running generic pipeline steps over real JSON directory IO.
+"""
+
 from __future__ import annotations
 
 import json
