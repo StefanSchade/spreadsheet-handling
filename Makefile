@@ -289,19 +289,19 @@ snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries,
 coverage: deps-dev ## Coverage in terminal (with missing lines)
 	mkdir -p $(BUILD_DIR)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		-s $(MARK_OPT) $(LOG_OPTS) \
 		--cov=src/spreadsheet_handling \
 		--cov-report=term-missing \
-		tests
+		$(ACTIVE_TEST_PATHS)
 
 .PHONY: coverage-html
 coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 	mkdir -p $(COV_HTML_DIR)
 	COVERAGE_FILE=$(COV_DATA) $(PYTEST) \
-		-s $(MARK_OPT) $(IGNORE_OPT) $(LOG_OPTS) \
+		-s $(MARK_OPT) $(LOG_OPTS) \
 		--cov=src/spreadsheet_handling \
 		--cov-report=html:$(COV_HTML_DIR) \
-		tests
+		$(ACTIVE_TEST_PATHS)
 	@echo "Open HTML report: file://$(COV_HTML_DIR)/index.html"
 
 # ================================
@@ -309,23 +309,26 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 # ================================
 #
 # Defaults:
-# - We exclude pre-hex legacy tests by default: MARK ?= not legacy
-# - IR tests are opt-in (use `make test-ir`)
-# - To run everything, use `make test-all`
+# - `make test` runs the active suite with `not legacy and not prehex and not slow`
+# - Physical placement remains primary; markers provide focused execution slices
+# - Use `make test-all` to include slow tests across the active suite
 #
 # Common:
-#   make test                          # unit + integ, excludes legacy (default)
-#   make test MARK=                    # run all tests (no marker filter)
-#   make test MARK="not slow"          # exclude slow tests (still excludes legacy)
+#   make test                          # active development slice
+#   make test MARK=                    # same paths, no marker filter
+#   make test MARK="not legacy and not prehex"  # include slow tests
 #   make test-verbose                  # verbose, stream logs
 #   make test-lastfailed               # re-run last failed
 #
 # Slices:
-#   make test-unit                     # unit only (excludes integ)
+#   make test-unit                     # unit only
 #   make test-integ                    # integration only
-#   make test-ir                       # IR-only tests (SH_XLSX_BACKEND=ir)
-#   make test-legacy                   # legacy-only (pre-hex), NOT excluded
-#   make test-all                      # everything; no filters, no ignores
+#   make test-arch                     # architecture / guardrail layer only
+#   make test-ir                       # XLSX IR-focused slice
+#   make test-ods                      # ODS / Calc-focused slice
+#   make test-smoke                    # smoke checks
+#   make test-prehex                   # explicit quarantined pre-hex slice
+#   make test-all                      # all active tests, including slow tests
 #
 # Focus:
 #   make test-one TESTPATTERN="foo and not slow"
@@ -333,82 +336,93 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 #   make test-node NODE=tests/unit/pipeline/test_runner.py::test_happy_path
 #
 # Notes:
-# - To temporarily include legacy in a normal run, override MARK:
-#     make test MARK=""
-#   or:
-#     make test MARK="legacy"
-# - The pre-hex folder is ignored only when MARK contains `not legacy`.
-# - By default we use the venv’s pytest if available: $(VENV)/bin/pytest
+# - Override MARK when you need a custom marker slice on the active topology.
+# - `test-prehex` is explicit and may report a deferred/no-tests outcome when empty.
+# - By default we use the venv's pytest if available: $(VENV)/bin/pytest
 
 # =========================
 # Test targets
 # =========================
 .PHONY: test test-verbose test-lastfailed test-one test-file test-node \
-        test-unit test-integ test-legacy test-all
+        test-unit test-integ test-arch test-ir test-ods test-smoke \
+        test-prehex test-legacy test-legacy-try test-all
 
 # Venv + pytest resolution
 VENV         ?= .venv
 PYTEST       ?= $(if $(wildcard $(VENV)/bin/pytest),$(VENV)/bin/pytest,pytest)
 
-# Default filters and knobs - keep default simple to avoid surprise ANDs with CLI filters
-MARK         ?= not legacy
+# Default filters and knobs
+MARK         ?= not legacy and not prehex and not slow
 PYTEST_OPTS  ?=
-TEST_PATH    ?= tests
+ACTIVE_TEST_PATHS ?= tests/unit tests/integration tests/architecture
 PREHEX_DIR   ?= tests/legacy_pre_hex
 
 # Apply -m only if MARK is set
 MARK_OPT     := $(if $(strip $(MARK)),-m '$(MARK)',)
 
-# Ignore pre-hex only when we *exclude* legacy
-IGNORE_OPT   := $(if $(findstring not legacy,$(MARK)),$(if $(wildcard $(PREHEX_DIR)),--ignore=$(PREHEX_DIR),),)
-
 # Helper macro
 define run_pytest
-	$(PYTEST) $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(1)
+	$(PYTEST) $(MARK_OPT) $(PYTEST_OPTS) $(1)
 endef
 
 # ---- Targets (with ## help comments) ----
 
-test: deps-dev ## Run all tests except legacy (default)
-	$(call run_pytest,$(TEST_PATH))
+test: deps-dev ## Run the normal active development slice
+	$(call run_pytest,$(ACTIVE_TEST_PATHS))
 
 test-verbose: deps-dev ## Verbose run with inline logs
-	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
+	SHEETS_LOG=INFO $(PYTEST) -vv -s $(MARK_OPT) $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
 
 test-lastfailed: deps-dev ## Re-run only last failed tests (verbose)
-	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
+	SHEETS_LOG=DEBUG $(PYTEST) --lf -vv $(MARK_OPT) $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
 
 test-one: deps-dev ## Run tests filtered by TESTPATTERN (make test-one TESTPATTERN="expr")
 	@if [ -z "$(TESTPATTERN)" ]; then echo "Set TESTPATTERN=..."; exit 2; fi
-	SHEETS_LOG=DEBUG $(PYTEST) -vv -k '$(TESTPATTERN)' $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
+	SHEETS_LOG=DEBUG $(PYTEST) -vv -k '$(TESTPATTERN)' $(MARK_OPT) $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
 
 test-file: deps-dev ## Run a single test file (make test-file FILE=path/to/test_file.py)
 	@if [ -z "$(FILE)" ]; then echo "Set FILE=path/to/test_file.py"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(FILE)
+	$(PYTEST) -vv $(MARK_OPT) $(PYTEST_OPTS) $(FILE)
 
 test-node: deps-dev ## Run a single test node (make test-node NODE=file::test_name)
 	@if [ -z "$(NODE)" ]; then echo "Set NODE=file::test_name"; exit 2; fi
-	$(PYTEST) -vv $(MARK_OPT) $(IGNORE_OPT) $(PYTEST_OPTS) $(NODE)
+	$(PYTEST) -vv $(MARK_OPT) $(PYTEST_OPTS) $(NODE)
 
-test-unit: deps-dev ## Unit tests only (exclude integ)
-	$(PYTEST) -q -m 'not integ' $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
+test-unit: deps-dev ## Unit tests only
+	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/unit
 
 test-integ: deps-dev ## Integration tests only
-	$(PYTEST) -q -m 'integ' $(IGNORE_OPT) $(PYTEST_OPTS) $(TEST_PATH)
+	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/integration
 
-test-legacy: deps-dev ## Legacy-only (pre-hex tests, normally excluded)
-	$(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) $(TEST_PATH)
+test-arch: deps-dev ## Architecture and guardrail tests only
+	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/architecture
 
-test-all: deps-dev ## Run entire suite (no filters, includes legacy)
-	$(PYTEST) -q $(PYTEST_OPTS) $(TEST_PATH)
+test-ir: deps-dev ## XLSX IR-focused tests
+	$(PYTEST) -q -m 'xlsx_ir and not slow and not legacy and not prehex' $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
 
-# Legacy-only (archived) — by default these are ignored via conftest
-test-legacy: deps-dev ## Legacy-only (pre-hex; ignored by default unless RUN_PREHEX=1)
-	$(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) tests
+test-ods: deps-dev ## ODS / Calc-focused tests
+	$(PYTEST) -q -m 'ods and not slow and not legacy and not prehex' $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
 
-# Try to run archived legacy tests (will likely error)
-test-legacy-try: deps-dev ## Attempt to run pre-hex legacy tests (RUN_PREHEX=1)
-	RUN_PREHEX=1 $(PYTEST) -q -m 'legacy' $(PYTEST_OPTS) tests
+test-smoke: deps-dev ## Smoke checks only
+	$(PYTEST) -q -m 'smoke and not slow and not legacy and not prehex' $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
+
+test-all: deps-dev ## Run all active tests, including slow tests
+	$(PYTEST) -q $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)
+
+test-prehex: deps-dev ## Explicit quarantined pre-hex slice (or deferred when empty)
+	@if find "$(PREHEX_DIR)" -type f -name 'test_*.py' | grep -q .; then \
+		RUN_PREHEX=1 $(PYTEST) -q $(PYTEST_OPTS) "$(PREHEX_DIR)"; \
+	else \
+		echo "No pre-hex test files present under $(PREHEX_DIR); target currently deferred."; \
+	fi
+
+# Backward-compatible aliases for the explicit pre-hex slice
+test-legacy: test-prehex ## Backward-compatible alias for the explicit pre-hex slice
+	@:
+
+# Alias retained for older local workflows and docs
+test-legacy-try: test-prehex ## Backward-compatible alias for the explicit pre-hex slice
+	@:
 
 # =========================
 # Demo run
