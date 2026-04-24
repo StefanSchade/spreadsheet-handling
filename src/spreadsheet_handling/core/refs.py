@@ -21,11 +21,3 @@ def add_helper_columns(records: list[dict[str, Any]], ref_specs: list[dict[str, 
                     r[hp] = ""
     return records
 
-
-# xlsxwriter-Formeln (optional):
-def write_vlookup_formula(
-    ws: Any, row: int, col: int,
-    lookup_value_cell: str, table_range: str, result_col_index: int,
-) -> None:
-    formula = f"=VLOOKUP({lookup_value_cell},{table_range},{result_col_index},0)"
-    ws.write_formula(row, col, formula)
