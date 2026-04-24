@@ -1,4 +1,3 @@
-# tests/unit/io_backends/xlsx/test_ir_readpath.py
 """
 FTR-IR-READPATH — XLSX read via IR (Excel→IR→Frames+Meta).
 

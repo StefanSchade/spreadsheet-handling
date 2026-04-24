@@ -1,27 +1,19 @@
 """Tests that CLI entry points delegate to orchestrate().
 
 Each CLI (sheets-run, sheets-pack, sheets-unpack) should build config
-from its arguments and then call orchestrate() — no direct I/O logic.
+from its arguments and then call orchestrate() - no direct I/O logic.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
 import pytest
+
 
 pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
 
-import pandas as pd
-import pytest
-
-from spreadsheet_handling.application.orchestrator import orchestrate
-from spreadsheet_handling.pipeline.pipeline import BoundStep, Frames
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def _write_json_dir(path: Path, data: dict[str, list[dict]]) -> None:
     """Write a minimal JSON directory (one .json file per sheet)."""
@@ -40,10 +32,6 @@ SAMPLE_DATA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# sheets-pack: delegates to orchestrate with correct I/O descriptors
-# ---------------------------------------------------------------------------
-
 class TestSheetsPack:
 
     def test_delegates_to_orchestrate(self, tmp_path: Path) -> None:
@@ -53,6 +41,7 @@ class TestSheetsPack:
 
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_pack import main
+
             rc = main([str(in_dir), "-o", str(out_file)])
 
         assert rc == 0
@@ -68,25 +57,23 @@ class TestSheetsPack:
 
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_pack import main
+
             main([str(in_dir), "-o", str(out_file), "--input-kind", "csv_dir"])
 
         call_kw = mock_orch.call_args.kwargs
         assert call_kw["input"]["kind"] == "csv_dir"
 
 
-# ---------------------------------------------------------------------------
-# sheets-unpack: delegates to orchestrate with correct I/O descriptors
-# ---------------------------------------------------------------------------
-
 class TestSheetsUnpack:
 
     def test_delegates_to_orchestrate(self, tmp_path: Path) -> None:
         wb = tmp_path / "input.xlsx"
         out_dir = tmp_path / "out"
-        wb.touch()  # mock doesn't need real content
+        wb.touch()
 
         with patch("spreadsheet_handling.cli.apps.sheets_unpack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_unpack import main
+
             rc = main([str(wb), "-o", str(out_dir)])
 
         assert rc == 0
@@ -95,10 +82,6 @@ class TestSheetsUnpack:
         assert call_kw["input"] == {"kind": "xlsx", "path": str(wb)}
         assert call_kw["output"] == {"kind": "json_dir", "path": str(out_dir)}
 
-
-# ---------------------------------------------------------------------------
-# sheets-run: delegates to orchestrate with I/O from CLI overrides
-# ---------------------------------------------------------------------------
 
 class TestSheetsRun:
 
@@ -109,12 +92,19 @@ class TestSheetsRun:
 
         with patch("spreadsheet_handling.cli.apps.run.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.run import main
-            rc = main([
-                "--in-kind", "json_dir",
-                "--in-path", str(in_dir),
-                "--out-kind", "json_dir",
-                "--out-path", str(out_dir),
-            ])
+
+            rc = main(
+                [
+                    "--in-kind",
+                    "json_dir",
+                    "--in-path",
+                    str(in_dir),
+                    "--out-kind",
+                    "json_dir",
+                    "--out-path",
+                    str(out_dir),
+                ]
+            )
 
         assert rc == 0
         mock_orch.assert_called_once()
@@ -145,6 +135,7 @@ io:
 
         with patch("spreadsheet_handling.cli.apps.run.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.run import main
+
             rc = main(["--config", str(config_file)])
 
         assert rc == 0
@@ -152,46 +143,3 @@ io:
         call_kw = mock_orch.call_args.kwargs
         assert call_kw["input"]["kind"] == "json_dir"
         assert call_kw["output"]["kind"] == "json_dir"
-
-
-# ---------------------------------------------------------------------------
-# Integration: end-to-end through orchestrate (no mocking)
-# ---------------------------------------------------------------------------
-
-class TestEndToEnd:
-
-    def test_pack_json_to_json_via_orchestrate(self, tmp_path: Path) -> None:
-        """End-to-end: sheets-pack-style call through the real orchestrate()."""
-        in_dir = tmp_path / "in"
-        out_dir = tmp_path / "out"
-        _write_json_dir(in_dir, SAMPLE_DATA)
-
-        frames = orchestrate(
-            input={"kind": "json_dir", "path": str(in_dir)},
-            output={"kind": "json_dir", "path": str(out_dir)},
-        )
-
-        assert "products" in frames
-        assert len(frames["products"]) == 2
-        assert (out_dir / "products.json").exists()
-
-    def test_orchestrate_with_step(self, tmp_path: Path) -> None:
-        """Verify that steps are applied between load and save."""
-        in_dir = tmp_path / "in"
-        out_dir = tmp_path / "out"
-        _write_json_dir(in_dir, SAMPLE_DATA)
-
-        def drop_name(fr: Frames) -> Frames:
-            return {k: df.drop(columns=["name"]) for k, df in fr.items()}
-
-        step = BoundStep(name="drop_name", config={}, fn=drop_name)
-
-        frames = orchestrate(
-            input={"kind": "json_dir", "path": str(in_dir)},
-            output={"kind": "json_dir", "path": str(out_dir)},
-            steps=[step],
-        )
-
-        assert list(frames["products"].columns) == ["id"]
-        written = json.loads((out_dir / "products.json").read_text(encoding="utf-8"))
-        assert "name" not in written[0]

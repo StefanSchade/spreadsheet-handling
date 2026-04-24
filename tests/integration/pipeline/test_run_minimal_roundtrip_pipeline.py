@@ -1,4 +1,3 @@
-# tests/integration/test_run_minimal_roundtrip_pipeline.py
 from pathlib import Path
 import yaml
 from spreadsheet_handling.pipeline.config import load_app_config
