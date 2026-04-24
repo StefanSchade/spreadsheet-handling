@@ -1,3 +1,9 @@
+"""Pipeline IR write-path integration smoke slice.
+
+Runs a minimal JSON-to-XLSX pipeline through app config loading and the real
+pipeline runner.
+"""
+
 import pytest
 from pathlib import Path
 import yaml

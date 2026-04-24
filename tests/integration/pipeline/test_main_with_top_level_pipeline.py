@@ -1,3 +1,9 @@
+"""CLI run-path integration slice.
+
+Exercises the CLI entrypoint for top-level pipeline configs and real
+JSON-to-XLSX product runs with workbook and sheet-level metadata.
+"""
+
 import json
 
 import yaml
