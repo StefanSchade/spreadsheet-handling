@@ -12,10 +12,15 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
+import spreadsheet_handling.io_backends.ods.ods_backend as ob
 import spreadsheet_handling.io_backends.xlsx.xlsx_backend as xb
 
-pytestmark = pytest.mark.ftr('FTR-SPREADSHEET-BACKEND-CONTRACT-P3H')
+pytestmark = [
+    pytest.mark.ftr('FTR-SPREADSHEET-BACKEND-CONTRACT-P3H'),
+    pytest.mark.ftr('FTR-ADAPTER-CONTRACT-BOUNDARY-GUARDS-P4'),
+]
 
 
 def test_xlsx_backend_uses_spreadsheet_contract_for_write(monkeypatch, tmp_path):
@@ -58,6 +63,50 @@ def test_xlsx_backend_uses_spreadsheet_contract_for_read(monkeypatch, tmp_path):
     out.touch()
 
     back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+    assert back is expected
+
+
+def test_ods_backend_uses_spreadsheet_contract_for_write(monkeypatch, tmp_path):
+    calls: list[str] = []
+    sentinel_plan = object()
+
+    def fake_build_plan(frames, meta):
+        assert 'Sheet1' in frames
+        calls.append('build_plan')
+        return sentinel_plan
+
+    def fake_render(plan, out_path):
+        assert plan is sentinel_plan
+        calls.append('render')
+        Path(out_path).touch()
+
+    monkeypatch.setattr(ob, 'build_spreadsheet_render_plan', fake_build_plan, raising=True)
+    monkeypatch.setattr(ob, 'render_workbook', fake_render, raising=True)
+
+    frames = {'Sheet1': pd.DataFrame({'a': [1, 2]})}
+    out = tmp_path / 'book.ods'
+
+    OdsBackend().write_multi(frames, out)
+
+    assert calls == ['build_plan', 'render']
+    assert out.exists()
+
+
+def test_ods_backend_uses_spreadsheet_contract_for_read(monkeypatch, tmp_path):
+    expected = {'Sheet1': pd.DataFrame({'a': [1, 2]})}
+
+    def fake_read_frames(path, *, parser):
+        assert parser is ob.parse_workbook
+        assert Path(path).name == 'book.ods'
+        return expected
+
+    monkeypatch.setattr(ob, 'read_spreadsheet_frames', fake_read_frames, raising=True)
+
+    out = tmp_path / 'book.ods'
+    out.touch()
+
+    back = OdsBackend().read_multi(str(out), header_levels=1)
 
     assert back is expected
 
@@ -106,6 +155,29 @@ def test_xlsx_backend_stops_at_render_plan(monkeypatch, tmp_path):
 
     out = tmp_path / "book.xlsx"
     ExcelBackend().write_multi({"Sheet1": pd.DataFrame({"a": [1, 2]})}, out)
+
+    assert calls == ["build_plan", "render"]
+    assert out.exists()
+
+
+def test_ods_backend_stops_at_render_plan(monkeypatch, tmp_path):
+    calls: list[str] = []
+    sentinel_plan = object()
+
+    def fake_build_plan(frames, meta):
+        calls.append("build_plan")
+        return sentinel_plan
+
+    def fake_render(plan, out_path):
+        assert plan is sentinel_plan
+        calls.append("render")
+        Path(out_path).touch()
+
+    monkeypatch.setattr(ob, "build_spreadsheet_render_plan", fake_build_plan, raising=True)
+    monkeypatch.setattr(ob, "render_workbook", fake_render, raising=True)
+
+    out = tmp_path / "book.ods"
+    OdsBackend().write_multi({"Sheet1": pd.DataFrame({"a": [1, 2]})}, out)
 
     assert calls == ["build_plan", "render"]
     assert out.exists()
