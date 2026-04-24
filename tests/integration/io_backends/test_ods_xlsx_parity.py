@@ -18,7 +18,6 @@ from spreadsheet_handling.rendering.ir import SheetIR
 
 
 pytestmark = [
-    pytest.mark.integ,
     pytest.mark.ftr("FTR-ODS-CALC-PARITY-TESTS-P3J"),
 ]
 
