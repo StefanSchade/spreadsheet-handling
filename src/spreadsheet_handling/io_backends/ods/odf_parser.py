@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 import csv
-import io
 import json
 from pathlib import Path
 import re
@@ -35,6 +34,7 @@ from spreadsheet_handling.rendering.ir import (
     SheetIR,
     WorkbookIR,
 )
+from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
 
 
 def _column_index(letters: str) -> int:
@@ -242,14 +242,7 @@ def _parse_range_address(address: str) -> tuple[str, int, int, int, int]:
     return sheet, r1, c1, r2, c2
 
 
-def _xlsx_formula(values: list[str]) -> str:
-    output = io.StringIO()
-    writer = csv.writer(output, delimiter=",", quotechar='"', lineterminator="")
-    writer.writerow(values)
-    return f'"{output.getvalue()}"'
-
-
-def _parse_validation_formula(condition: str) -> str | None:
+def _parse_validation_formula(condition: str) -> ListLiteralFormulaSpec | None:
     match = re.search(r"cell-content-is-in-list\((?P<body>.*)\)", condition)
     if not match:
         return None
@@ -258,7 +251,7 @@ def _parse_validation_formula(condition: str) -> str | None:
         values = next(csv.reader([body], delimiter=";", quotechar='"'))
     except csv.Error:
         return None
-    return _xlsx_formula([value.replace('""', '"') for value in values])
+    return ListLiteralFormulaSpec(tuple(values))
 
 
 def _extract_validations(

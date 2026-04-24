@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ from spreadsheet_handling.rendering.plan import (
     WriteMeta,
     DefineNamedRange,
 )
+from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
 
 
 # --------------------------------------------------------------------------------------
@@ -46,6 +49,15 @@ def _get_ws(wb: Workbook, name: str) -> Worksheet:
 
 def _write(ws: Worksheet, row: int, col: int, value: Any) -> None:
     ws.cell(row=row, column=col, value=value)
+
+
+def _xlsx_validation_formula(formula: FormulaSpec) -> str:
+    if isinstance(formula, ListLiteralFormulaSpec):
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=",", quotechar='"', lineterminator="")
+        writer.writerow(formula.values)
+        return f'"{output.getvalue()}"'
+    raise TypeError(f"Unsupported formula spec: {type(formula).__name__}")
 
 
 # --------------------------------------------------------------------------------------
@@ -131,7 +143,9 @@ def _render_from_plan(plan: RenderPlan, out_path: Path) -> None:
             ws = _get_ws(wb, op.sheet)
             ref = _area_to_ref(op.r1, op.c1, op.r2, op.c2)
             dv = DataValidation(
-                type="list", formula1=op.formula, allow_blank=op.allow_empty,
+                type="list",
+                formula1=_xlsx_validation_formula(op.formula),
+                allow_blank=op.allow_empty,
             )
             dv.add(ref)
             ws.add_data_validation(dv)

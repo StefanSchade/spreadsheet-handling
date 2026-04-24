@@ -7,8 +7,6 @@ portable spreadsheet surface.
 
 from __future__ import annotations
 
-import csv
-import io
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +19,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import (
     parse_workbook as parse_xlsx_workbook,
 )
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
+from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 
 
@@ -134,7 +133,9 @@ def _named_range_summary(sheet: SheetIR) -> list[tuple[str, str, tuple[int, int,
     )
 
 
-def _validation_summary(sheet: SheetIR) -> list[tuple[str, tuple[int, int, int, int], str, bool]]:
+def _validation_summary(
+    sheet: SheetIR,
+) -> list[tuple[str, tuple[int, int, int, int], tuple[str, ...], bool]]:
     return sorted(
         (
             validation.kind,
@@ -146,14 +147,8 @@ def _validation_summary(sheet: SheetIR) -> list[tuple[str, tuple[int, int, int, 
     )
 
 
-def _normalized_validation_values(formula: str) -> tuple[str, ...]:
-    text = str(formula or "")
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
-        text = text[1:-1]
-    if not text:
-        return ()
-    reader = csv.reader(io.StringIO(text), delimiter=",", quotechar='"')
-    return tuple(next(reader))
+def _normalized_validation_values(formula: FormulaSpec) -> tuple[str, ...]:
+    return formula_list_values(formula)
 
 
 def _supported_sheet_summary(sheet: SheetIR) -> dict[str, Any]:

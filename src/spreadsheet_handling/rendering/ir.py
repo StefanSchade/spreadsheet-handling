@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Optional, Literal
+from typing import Any, Dict, List, Tuple, Optional
+
+from .formulas import FormulaSpec
 
 CellRef = Tuple[int, int]           # (row, col) 1-based
 AreaRef = Tuple[int, int, int, int] # (r1, c1, r2, c2)
@@ -15,7 +17,7 @@ class NamedRange:
 class DataValidationSpec:
     kind: str                          # spreadsheet-neutral validation kind, e.g. "list"
     area: Tuple[int, int, int, int]    # (r1, c1, r2, c2), 1-based
-    formula: str                       # adapter-facing validation expression; canonical rule meaning stays in meta_canonical["constraints"]
+    formula: FormulaSpec               # backend-neutral validation intent
     allow_empty: bool = True
 
 @dataclass

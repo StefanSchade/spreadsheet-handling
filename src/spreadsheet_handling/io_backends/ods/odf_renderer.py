@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -36,6 +35,7 @@ from spreadsheet_handling.rendering.plan import (
     WriteDataBlock,
     WriteMeta,
 )
+from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
 
 
 @dataclass
@@ -138,17 +138,10 @@ def _register_hidden_table_style(
     return style_name
 
 
-def _parse_xlsx_csv_formula(formula: str) -> list[str]:
-    text = str(formula or "")
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
-        text = text[1:-1]
-    if not text:
-        return []
-    return next(csv.reader([text], delimiter=",", quotechar='"'))
-
-
-def _ods_validation_condition(formula: str) -> str:
-    values = _parse_xlsx_csv_formula(formula)
+def _ods_validation_condition(formula: FormulaSpec) -> str:
+    if not isinstance(formula, ListLiteralFormulaSpec):
+        raise TypeError(f"Unsupported formula spec: {type(formula).__name__}")
+    values = formula.values
     quoted = ";".join(f'"{value.replace(chr(34), chr(34) * 2)}"' for value in values)
     return f"of:cell-content-is-in-list({quoted})"
 

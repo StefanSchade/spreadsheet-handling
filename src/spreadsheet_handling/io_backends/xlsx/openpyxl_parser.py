@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import csv
+import io
 import json
 from pathlib import Path
 import re
@@ -19,6 +21,7 @@ from spreadsheet_handling.rendering.ir import (
     SheetIR,
     WorkbookIR,
 )
+from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
 
 
 def parse_workbook(path: str | Path) -> WorkbookIR:
@@ -128,7 +131,9 @@ def _extract_validations(ws: Worksheet) -> list[DataValidationSpec]:
     for dv in ws.data_validations.dataValidation:
         if dv.type != "list":
             continue
-        formula = str(dv.formula1) if dv.formula1 else ""
+        formula = _parse_xlsx_list_literal_formula(str(dv.formula1) if dv.formula1 else "")
+        if formula is None:
+            continue
         allow_empty = bool(dv.allow_blank) if dv.allow_blank is not None else True
         for cell_range in dv.sqref.ranges:
             specs.append(
@@ -145,6 +150,21 @@ def _extract_validations(ws: Worksheet) -> list[DataValidationSpec]:
                 )
             )
     return specs
+
+
+def _parse_xlsx_list_literal_formula(formula: str) -> ListLiteralFormulaSpec | None:
+    text = str(formula or "")
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+    elif text:
+        return None
+    if not text:
+        return ListLiteralFormulaSpec(())
+    try:
+        values = next(csv.reader(io.StringIO(text), delimiter=",", quotechar='"'))
+    except csv.Error:
+        return None
+    return ListLiteralFormulaSpec(tuple(values))
 
 
 def _extract_freeze(ws: Worksheet) -> dict[str, int] | None:

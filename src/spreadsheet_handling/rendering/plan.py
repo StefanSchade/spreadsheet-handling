@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Union, Iterable
 
+from .formulas import FormulaSpec
+
 # ----- Render Operations -----
 
 @dataclass(frozen=True)
@@ -55,7 +57,7 @@ class AddValidation:
     c1: int
     r2: int
     c2: int
-    formula: str  # adapter-facing validation expression derived from meta_canonical["constraints"]
+    formula: FormulaSpec  # backend-neutral validation intent
     allow_empty: bool = True
 
 @dataclass(frozen=True)
