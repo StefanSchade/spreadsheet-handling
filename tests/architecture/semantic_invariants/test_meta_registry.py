@@ -63,6 +63,7 @@ def test_meta_registry_seeds_current_known_entries():
         "exported_at",
         "constraints",
         "legend_blocks",
+        "xref_crosstable",
         "freeze_header",
         "auto_filter",
         "header_fill_rgb",
