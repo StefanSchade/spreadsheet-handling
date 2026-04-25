@@ -65,6 +65,46 @@ def test_apply_overrides_generic_registration_binds_frames_first_step() -> None:
     assert out["_meta"]["auto_filter"] is True
 
 
+def test_xref_crosstable_steps_are_config_addressable() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "P-001": ["E"],
+            "P-002": ["S"],
+        })
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "expand_xref",
+                "matrix": "matrix",
+                "output": "long",
+                "row_keys": ["feature_id"],
+                "value_columns": ["P-001", "P-002"],
+            },
+            {
+                "step": "contract_xref",
+                "relation": "long",
+                "output": "roundtrip",
+                "row_keys": ["feature_id"],
+            },
+        ]
+    )
+
+    assert steps[0].config["target"].endswith(":expand_xref")
+    assert steps[1].config["target"].endswith(":contract_xref")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["long"].to_dict(orient="records") == [
+        {"feature_id": "f1", "column_key": "P-001", "value": "E"},
+        {"feature_id": "f1", "column_key": "P-002", "value": "S"},
+    ]
+    assert out["roundtrip"].to_dict(orient="records") == [
+        {"feature_id": "f1", "P-001": "E", "P-002": "S"},
+    ]
+
+
 def test_legacy_registry_entry_still_builds_and_runs() -> None:
     assert not isinstance(REGISTRY["validate"], StepRegistration)
 

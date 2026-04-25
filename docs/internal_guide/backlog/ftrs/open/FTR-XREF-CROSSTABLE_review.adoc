@@ -1,0 +1,111 @@
+== Review: FTR-XREF-CROSSTABLE
+
+Reviewed diff: `diff.txt`. :contentReference[oaicite:0]{index=0}
+
+=== Gesamturteil
+
+Der Slice ist insgesamt gut: `expand_xref` und `contract_xref` sind generisch, bleiben in der Domain-Schicht, behandeln Zellwerte konsequent als opaque und sind sauber über die Pipeline-Registry adressierbar.
+
+Ich würde den Stand akzeptieren, aber vor dem Schließen zwei Punkte nachziehen: MultiIndex-Spalten explizit ausschließen oder testen, und das `name`/Meta-Key-Verhalten bei `contract_xref` schärfen.
+
+=== Positiv
+
+* Die Transformation ist bewusst frames-first und gehört damit in `domain.transformations`.
+* Zellwerte wie `E-R-K` werden nicht interpretiert oder gesplittet. Das respektiert die Grenze zu `CELL-CODEC`.
+* `row_keys` steuern Identität; sichtbare Labels werden nicht zur Reidentifikation verwendet.
+* `expand_xref` persistiert `column_keys` in `_meta["xref_crosstable"]`.
+* `contract_xref` kann die ursprüngliche Spaltenreihenfolge aus Meta wiederverwenden.
+* Duplicate `(row_keys, column_key)`-Paare werden sauber abgelehnt.
+* Pipeline-Integration über `expand_xref` / `contract_xref` ist knapp und passend.
+* Meta-Registry wurde um `xref_crosstable` erweitert.
+
+=== Kritische Punkte
+
+==== 1. MultiIndex-Spalten sind wahrscheinlich nicht sauber unterstützt
+
+`value_columns` und `row_keys` können aktuell `Any` sein. Das wirkt flexibel, aber bei MultiIndex-Spalten wird es schnell unklar:
+
+* `column_key`-Werte könnten Tupel werden
+* Persistenz in `_meta` kann dadurch problematisch werden
+* YAML-Konfiguration kann solche Spalten nicht zuverlässig ausdrücken
+
+Empfehlung für diesen ersten Slice: MultiIndex-Spalten explizit ablehnen, sobald `row_keys` oder `value_columns` Tupel enthalten, oder mindestens einen Test ergänzen, der das gewünschte Verhalten festlegt.
+
+==== 2. `contract_xref` findet Meta nur unter `name or relation`
+
+Bei `expand_xref` wird standardmäßig unter dem Output-Namen gespeichert:
+
+[source,python]
+----
+config_id=name or output
+----
+
+Bei `contract_xref` wird standardmäßig gesucht unter:
+
+[source,python]
+----
+config_id=name or relation
+----
+
+Das funktioniert im Standardfall, weil `relation == previous output` ist. Sobald aber `name` gesetzt wird oder Frames umbenannt werden, kann das Verhalten schwer vorhersehbar werden.
+
+Empfehlung: dokumentieren und testen:
+
+* gleiches `name` bei expand und contract muss funktionieren
+* falscher oder fehlender Name fällt deterministisch auf Relation-Reihenfolge zurück
+
+==== 3. `drop_empty=False` erzeugt volle Matrix, Acceptance spricht aber von sparse default
+
+Im ursprünglichen Backlog-Kontext zu Compact/MultiAxis war sparse handling wichtig. Dieses FTR selbst ist neutraler, aber im Code ist Default:
+
+[source,python]
+----
+drop_empty: bool = False
+----
+
+Das bedeutet: leere Zellen werden als explizite Long-Rows erhalten.
+
+Das ist für verlustfreies Roundtrip gut. Wenn später `COMPACT-MULTIAXIS` sparse-by-default erwartet, muss das dort bewusst anders konfiguriert werden.
+
+Kein Blocker, aber bitte im FTR als Designentscheidung festhalten: XRef default is lossless, not sparse.
+
+==== 4. Output-Frame kann vorhandenen Frame still überschreiben
+
+`out[output] = relation` bzw. `out[output] = matrix_frame` überschreibt vorhandene Frames ohne Warnung.
+
+Das kann okay sein, weil Pipeline-Schritte oft so arbeiten. Für Transformationsschritte mit neuen Relation-/Matrix-Namen ist es aber potenziell gefährlich.
+
+Empfehlung: kein Muss jetzt, aber zumindest bewusst halten. Falls bestehende Step-Konventionen overwrite erlauben, ist das konsistent.
+
+=== Nicht blockierend
+
+* `Frames = dict[str, Any]` ist etwas grob; akzeptabel, da bestehende Frames-Struktur ähnlich pragmatisch ist.
+* `_ordered_unique()` mit `_values_equal()` ist vorsichtig genug für pandas-/NA-Werte.
+* Fehlermeldungen sind brauchbar.
+* Keine Render-/Adapter-Kopplung sichtbar.
+
+=== Entscheidung
+
+*Recommendation:* accept `FTR-XREF-CROSSTABLE` with minor hardening before closing.
+
+=== Nacharbeit umgesetzt
+
+Die empfohlene Nacharbeit wurde nach dem Review eingearbeitet:
+
+* MultiIndex-/Tuple-Spalten werden im ersten Slice explizit abgelehnt und durch
+  Tests abgesichert.
+* Named-config Roundtrips sind getestet: gleicher `name` bei `expand_xref` und
+  `contract_xref` bewahrt die persistierte Spaltenreihenfolge; ein unbekannter
+  Name fällt deterministisch auf die Relation-Reihenfolge zurück.
+* Die FTR dokumentiert nun, dass `drop_empty=false` der verlustfreie Default ist
+  und sparse Expansion opt-in bleibt.
+
+=== Empfohlene Nacharbeit
+
+. MultiIndex-Spalten explizit ablehnen oder mit einem Test definieren.
+. Einen Test für named config roundtrip ergänzen: `expand_xref(..., name="...")` plus `contract_xref(..., name="...")`.
+. Im FTR dokumentieren: Default ist verlustfrei (`drop_empty=False`), sparse Expansion ist opt-in.
+
+=== Fazit
+
+Der Kern ist sauber: Matrix <-> Relation ist generisch, wertsemantikfrei und pipelinefähig. Die Architekturgrenze zu Legend und Cell-Codec bleibt intakt.
