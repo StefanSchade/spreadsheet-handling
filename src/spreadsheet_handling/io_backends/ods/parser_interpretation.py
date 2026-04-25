@@ -50,6 +50,8 @@ def build_visible_sheet_ir(
     meta_hints: Mapping[str, Any],
     validations: list[DataValidationSpec],
     autofilter_ref: str | None,
+    anchors: list[tuple[int, int]] | None = None,
+    stop_on_empty_col: bool = False,
 ) -> SheetIR:
     """Interpret a visible ODS sheet into spreadsheet-neutral ``SheetIR``."""
     sheet = SheetIR(name=sheet_name)
@@ -61,10 +63,43 @@ def build_visible_sheet_ir(
     if options:
         sheet.meta["options"] = options
 
-    top = 1
-    left = 1
+    table_starts = anchors or [(1, 1)]
+    for top, left in table_starts:
+        sheet.tables.append(
+            _parse_table_block(
+                parsed,
+                frame_name=sheet_name,
+                top=top,
+                left=left,
+                stop_on_empty_col=stop_on_empty_col,
+            )
+        )
+
+    header_merges: list[tuple[int, int, int, int]] = []
+    for table_block in sheet.tables:
+        header_merges.extend(_extract_header_merges(parsed, table_block))
+        if table_block.header_rows > 1:
+            sheet.meta["__header_grid"] = _extract_header_grid(parsed, table_block)
+
+    if header_merges:
+        sheet.meta["__header_merges"] = header_merges
+
+    if autofilter_ref:
+        sheet.meta["__autofilter_ref"] = autofilter_ref
+    sheet.validations = list(validations)
+    return sheet
+
+
+def _parse_table_block(
+    parsed: ParsedTable,
+    *,
+    frame_name: str,
+    top: int,
+    left: int,
+    stop_on_empty_col: bool,
+) -> TableBlock:
     header_rows = _detect_header_rows(parsed, top, left)
-    n_cols = _find_col_extent(parsed, top, left)
+    n_cols = _find_col_extent(parsed, top, left, stop_on_empty_col)
     data_start_row = top + header_rows
     n_data_rows = _find_row_extent(parsed, data_start_row, left, n_cols)
     n_rows = header_rows + n_data_rows
@@ -88,15 +123,13 @@ def build_visible_sheet_ir(
     header_map = {header: idx + 1 for idx, header in enumerate(headers)}
     data: list[list[Any]] = []
     for row in range(data_start_row, data_start_row + n_data_rows):
-        data.append(
-            [
-                str(_grid_value(parsed, row, col) or "")
-                for col in range(left, left + n_cols)
-            ]
-        )
+        data.append([
+            str(_grid_value(parsed, row, col) or "")
+            for col in range(left, left + n_cols)
+        ])
 
-    table_block = TableBlock(
-        frame_name=sheet_name,
+    return TableBlock(
+        frame_name=frame_name,
         top=top,
         left=left,
         header_rows=header_rows,
@@ -107,18 +140,6 @@ def build_visible_sheet_ir(
         header_map=header_map,
         data=data,
     )
-    sheet.tables.append(table_block)
-
-    header_merges = _extract_header_merges(parsed, table_block)
-    if header_merges:
-        sheet.meta["__header_merges"] = header_merges
-    if table_block.header_rows > 1:
-        sheet.meta["__header_grid"] = _extract_header_grid(parsed, table_block)
-
-    if autofilter_ref:
-        sheet.meta["__autofilter_ref"] = autofilter_ref
-    sheet.validations = list(validations)
-    return sheet
 
 
 def _grid_value(parsed: ParsedTable, row: int, col: int) -> Any:
@@ -150,12 +171,19 @@ def _detect_header_rows(parsed: ParsedTable, top: int, left: int) -> int:
     return 1
 
 
-def _find_col_extent(parsed: ParsedTable, top: int, left: int) -> int:
+def _find_col_extent(
+    parsed: ParsedTable,
+    top: int,
+    left: int,
+    stop_on_empty: bool = False,
+) -> int:
     n_cols = 0
     max_scan = max(parsed.max_col, left)
     for col in range(left, max_scan + 1):
         value = _grid_value(parsed, top, col)
         if value is None or (isinstance(value, str) and value.strip() == ""):
+            if stop_on_empty:
+                break
             has_more = False
             for lookahead in range(1, 4):
                 if col + lookahead > parsed.max_col:

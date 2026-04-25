@@ -45,15 +45,23 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
                 ir.hidden_sheets[ws_name] = _parse_hidden_sheet(ws)
                 continue
 
+            legend_hints = _legend_table_hints(embedded_meta, sheet_name=ws_name)
+            legend_anchors = [
+                (hint["top"], hint["left"])
+                for hint in legend_hints
+                if isinstance(hint.get("top"), int) and isinstance(hint.get("left"), int)
+            ]
+            anchors = [(1, 1), *legend_anchors] if legend_anchors else None
             meta_hints = build_sheet_meta_hints(embedded_meta, sheet_name=ws_name)
             ir.sheets[ws_name] = _parse_visible_sheet(
                 ws,
                 sheet_name=ws_name,
-                anchors=None,
+                anchors=anchors,
                 meta_hints=meta_hints,
                 stop_on_empty_row=True,
-                stop_on_empty_col=False,
+                stop_on_empty_col=bool(legend_anchors),
             )
+            _apply_legend_table_hints(ir.sheets[ws_name], legend_hints)
 
         _extract_named_ranges(wb, ir)
         return ir
@@ -100,6 +108,52 @@ def _parse_hidden_sheet(ws: Worksheet) -> SheetIR:
         if key is not None:
             sh.meta[str(key)] = str(val) if val is not None else ""
     return sh
+
+
+def _legend_table_hints(
+    workbook_meta: dict[str, Any],
+    *,
+    sheet_name: str,
+) -> list[dict[str, Any]]:
+    raw = workbook_meta.get("legend_blocks") if isinstance(workbook_meta, dict) else None
+    if not isinstance(raw, dict):
+        return []
+
+    hints: list[dict[str, Any]] = []
+    for legend_name, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        resolved = spec.get("resolved")
+        if not isinstance(resolved, dict):
+            continue
+        if str(resolved.get("sheet")) != sheet_name:
+            continue
+        try:
+            hints.append({
+                "name": str(legend_name),
+                "frame_name": str(resolved.get("frame_name") or f"legend_{legend_name}"),
+                "top": int(resolved["top"]),
+                "left": int(resolved["left"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return hints
+
+
+def _apply_legend_table_hints(sheet: SheetIR, hints: list[dict[str, Any]]) -> None:
+    if not hints:
+        return
+    by_position = {
+        (int(hint["top"]), int(hint["left"])): hint
+        for hint in hints
+    }
+    sheet.meta["__legend_blocks"] = list(hints)
+    for table in sheet.tables:
+        hint = by_position.get((table.top, table.left))
+        if not hint:
+            continue
+        table.kind = "legend"
+        table.frame_name = str(hint["frame_name"])
 
 
 def _parse_visible_sheet(

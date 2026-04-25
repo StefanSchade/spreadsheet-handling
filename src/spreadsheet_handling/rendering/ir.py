@@ -37,6 +37,8 @@ class TableBlock:
     headers: List[str] = field(default_factory=list)
     header_map: Dict[str, int] = field(default_factory=dict)
     data: Optional[List[List]] = None  # row-major 2D data (None = not populated)
+    kind: str = "data"
+    title: Optional[str] = None
 
 
 

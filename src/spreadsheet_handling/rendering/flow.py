@@ -22,6 +22,16 @@ def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
         doc = p.apply(doc)
     return doc
 
+
+def _header_grid_for_table(sh: SheetIR, table: TableBlock, table_index: int) -> Any:
+    if table_index != 0:
+        return None
+    header_grid = sh.meta.get("__header_grid")
+    if header_grid and table.header_rows >= 1:
+        return header_grid
+    return None
+
+
 def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     """
     Convert the IR document into a backend-agnostic RenderPlan (sequence of RenderOps).
@@ -31,10 +41,9 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     for sheet_name, sh in doc.sheets.items():
         plan.add(DefineSheet(sheet=sheet_name, order=len(plan.sheet_order)))
 
-        if sh.tables:
-            t = sh.tables[0]
-            header_grid = sh.meta.get("__header_grid")
-            if header_grid and t.header_rows >= 1:
+        for table_index, t in enumerate(sh.tables):
+            header_grid = _header_grid_for_table(sh, t, table_index)
+            if header_grid:
                 for row_off, row_vals in enumerate(header_grid):
                     r = t.top + row_off
                     for idx, text in enumerate(row_vals, start=0):
@@ -56,7 +65,7 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
                     c = t.left + idx
                     plan.add(SetHeader(sheet=sheet_name, row=r, col=c, text=text))
             styles = sh.meta.get("__style", {})
-            header_style = styles.get("header")
+            header_style = styles.get("legend_header") if t.kind == "legend" else styles.get("header")
             if header_style and t.n_cols:
                 for r in range(t.top, t.top + max(1, t.header_rows)):
                     for idx in range(t.n_cols):
