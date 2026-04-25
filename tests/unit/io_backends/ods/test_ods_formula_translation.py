@@ -22,3 +22,12 @@ def test_ods_parser_recovers_list_literal_formula_spec() -> None:
     assert _parse_validation_formula('of:cell-content-is-in-list("new";"done")') == (
         ListLiteralFormulaSpec(("new", "done"))
     )
+
+
+def test_ods_translator_and_parser_preserve_commas_and_quotes() -> None:
+    formula = ListLiteralFormulaSpec(("needs,review", 'he said "yes"'))
+
+    rendered = _ods_validation_condition(formula)
+
+    assert rendered == 'of:cell-content-is-in-list("needs,review";"he said ""yes""")'
+    assert _parse_validation_formula(rendered) == formula

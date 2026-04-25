@@ -18,6 +18,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
+from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
 from spreadsheet_handling.rendering.plan import (
     AddValidation,
@@ -102,6 +103,22 @@ def test_non_layout_spreadsheet_semantics_reach_backend_neutral_render_plan():
     assert any(isinstance(op, SetAutoFilter) for op in plan.ops)
     assert any(isinstance(op, AddValidation) for op in plan.ops)
     assert any(isinstance(op, DefineNamedRange) for op in plan.ops)
+
+
+@pytest.mark.ftr("FTR-FORMULA-PROVIDERS")
+def test_validation_formula_intent_is_structural_not_backend_syntax():
+    meta = _sample_meta()
+    ir = compose_workbook(_sample_frames(), meta)
+    ir = apply_render_passes(ir, meta)
+
+    canonical_rule = ir.hidden_sheets["_meta"].meta["workbook_meta_blob"]["constraints"][0]["rule"]
+    assert canonical_rule == {"type": "in_list", "values": ["new", "done"]}
+
+    plan = build_render_plan(ir)
+    dv_ops = [op for op in plan.ops if isinstance(op, AddValidation)]
+
+    assert len(dv_ops) == 1
+    assert dv_ops[0].formula == ListLiteralFormulaSpec(("new", "done"))
 
 
 def test_sheet_option_precedence_is_resolved_in_ir_before_adapter_execution():

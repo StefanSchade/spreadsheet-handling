@@ -20,3 +20,11 @@ def test_xlsx_parser_recovers_list_literal_formula_spec() -> None:
     assert _parse_xlsx_list_literal_formula('"new,done"') == ListLiteralFormulaSpec(
         ("new", "done")
     )
+
+
+def test_xlsx_translator_and_parser_preserve_commas_and_quotes() -> None:
+    formula = ListLiteralFormulaSpec(("needs,review", 'he said "yes"'))
+
+    rendered = _xlsx_validation_formula(formula)
+
+    assert _parse_xlsx_list_literal_formula(rendered) == formula
