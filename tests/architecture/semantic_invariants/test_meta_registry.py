@@ -62,6 +62,7 @@ def test_meta_registry_seeds_current_known_entries():
         "author",
         "exported_at",
         "constraints",
+        "legend_blocks",
         "freeze_header",
         "auto_filter",
         "header_fill_rgb",
@@ -75,6 +76,7 @@ def test_meta_registry_seeds_current_known_entries():
         "__autofilter",
         "__freeze",
         "__autofilter_ref",
+        "__legend_blocks",
         "_hidden",
     } <= names
 

@@ -75,6 +75,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "helper_fill_rgb": ("meta_canonical", "canonical_meta"),
         "helper_prefix": ("meta_canonical", "canonical_meta"),
         "constraints": ("meta_canonical", "canonical_meta"),
+        "legend_blocks": ("meta_canonical", "canonical_meta"),
         "workbook_meta_blob": ("meta_rendering", "carrier_artifact"),
         "options": ("meta_rendering", "derived_operational_view"),
         "__style": ("meta_rendering", "derived_operational_view"),
@@ -82,6 +83,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "__autofilter": ("meta_rendering", "derived_operational_view"),
         "__freeze": ("meta_rendering", "derived_operational_view"),
         "__autofilter_ref": ("meta_rendering", "read_path_hint"),
+        "__legend_blocks": ("meta_rendering", "read_path_hint"),
         "_hidden": ("meta_rendering", "carrier_artifact"),
     }
 

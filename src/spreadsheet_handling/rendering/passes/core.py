@@ -11,6 +11,7 @@ class IRPass(Protocol):
 @dataclass
 class StylePass:
     default_header_fill_rgb: str = "#F2F2F2"
+    default_legend_header_fill_rgb: str = "#D9EAD3"
     default_helper_fill_rgb: str | None = "#E8F0FE"
     helper_prefix: str = "_"
 
@@ -20,7 +21,14 @@ class StylePass:
 
             # Header style
             header_fill = opts.get("header_fill_rgb", self.default_header_fill_rgb)
-            style = {"header": {"bold": True, "fill": header_fill}}
+            legend_header_fill = opts.get(
+                "legend_header_fill_rgb",
+                self.default_legend_header_fill_rgb,
+            )
+            style = {
+                "header": {"bold": True, "fill": header_fill},
+                "legend_header": {"bold": True, "fill": legend_header_fill},
+            }
             styles = sh.meta.get("__style", {})
             styles.update(style)
             sh.meta["__style"] = styles
