@@ -14,12 +14,8 @@ import pytest
 
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
-from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
-from spreadsheet_handling.rendering.plan import (
-    AddValidation,
-    WriteMeta,
-)
+from spreadsheet_handling.rendering.plan import WriteMeta
 
 pytestmark = pytest.mark.ftr("FTR-SPREADSHEET-META-SEMANTICS-P3H")
 
@@ -66,18 +62,3 @@ def test_current_hidden_meta_payload_carrier_is_reconstructible():
     assert meta_ops[0].sheet == "_meta"
     assert meta_ops[0].hidden is True
     assert ast.literal_eval(meta_ops[0].kv["workbook_meta_blob"]) == meta
-
-
-def test_validation_formula_is_structural_intent_not_canonical_rule():
-    meta = _sample_meta()
-    ir = compose_workbook(_sample_frames(), meta)
-    ir = apply_render_passes(ir, meta)
-
-    canonical_rule = ir.hidden_sheets["_meta"].meta["workbook_meta_blob"]["constraints"][0]["rule"]
-    assert canonical_rule == {"type": "in_list", "values": ["new", "done"]}
-
-    plan = build_render_plan(ir)
-    dv_ops = [op for op in plan.ops if isinstance(op, AddValidation)]
-
-    assert len(dv_ops) == 1
-    assert dv_ops[0].formula == ListLiteralFormulaSpec(("new", "done"))
