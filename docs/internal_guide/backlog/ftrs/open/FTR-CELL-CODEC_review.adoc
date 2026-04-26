@@ -1,0 +1,118 @@
+== Review: FTR-CELL-CODEC
+
+Reviewed diff: `diff.txt`. :contentReference[oaicite:0]{index=0}
+
+=== Gesamturteil
+
+Der erste generische Slice ist grundsätzlich gelungen. `CELL-CODEC` bleibt in der Domain-Schicht, interpretiert Codes nicht fachlich, trennt `whole_cell_code` sauber von `split_tokens` und integriert sich sinnvoll mit `legend_blocks` sowie `xref_crosstable`.
+
+Ich würde den Slice akzeptieren, aber mit einer wichtigen Einschränkung: Das Sparse-Default-Verhalten kann bei Roundtrips ganze leere Gruppen verlieren. Das muss entweder bewusst dokumentiert oder durch einen Test abgesichert werden.
+
+=== Positiv
+
+* `E-R-K` bleibt im Default `whole_cell_code` ein einzelner Code. Das ist exakt die richtige Grenze.
+* Splitten passiert nur explizit über `mode="split_tokens"`.
+* `allowed_from_legend` nutzt die Legend-Blöcke nur als erlaubte Wertemenge, ohne deren Bedeutung zu interpretieren.
+* `decode_cell_values` und `encode_cell_values` sind frames-first und passen zur Pipeline-Registry.
+* `canonical_order` ist sinnvoll auf `split_tokens` begrenzt.
+* MultiIndex-/Tuple-Spalten werden für den ersten Slice explizit abgelehnt. Das ist besser als implizit halb zu funktionieren.
+* `cell_codecs` ist korrekt als `meta_canonical` registriert.
+* Der Pipeline-Test kombiniert `expand_xref -> decode_cell_values -> encode_cell_values -> contract_xref` und prüft damit den wichtigsten Compose-Pfad.
+
+=== Kritische Punkte
+
+==== 1. Sparse-Default kann Roundtrip-Zeilen verlieren
+
+`decode_cell_values` hat:
+
+[source,python]
+----
+drop_empty: bool = True
+----
+
+Das ist für Sparse-Expansion plausibel. Aber im Zusammenspiel mit `XREF-CROSSTABLE` kann dadurch Information verloren gehen:
+
+. `expand_xref` erzeugt bei leerer Matrixzelle eine Long-Row mit `value == ""`.
+. `decode_cell_values(..., drop_empty=True)` verwirft diese Row.
+. `encode_cell_values` kann die Gruppe nicht mehr rekonstruieren.
+. `contract_xref` kennt dann ggf. die ursprüngliche Row-Identity nicht mehr.
+
+Besonders kritisch ist eine Matrix-Zeile, deren alle Zellen leer sind. Diese Row kann komplett verschwinden.
+
+Empfehlung:
+
+* entweder im FTR ausdrücklich dokumentieren: `decode_cell_values` ist sparse by default and not lossless for empty-only groups,
+* oder einen Roundtrip-Test ergänzen, der für verlustfreies Verhalten `drop_empty=False` verwendet.
+
+Für spätere `COMPACT-MULTIAXIS`-Workflows ist das wichtig.
+
+==== 2. `serialize_cell_value()` mit String in `split_tokens` ist leicht überraschend
+
+Aktuell gilt:
+
+[source,python]
+----
+serialize_cell_value("K-E", mode="split_tokens", delimiter="-")
+----
+
+Das behandelt `"K-E"` als einen strukturierten Wert, nicht als zu splittenden Text. Das ist intern konsistent, weil `serialize` strukturierte Werte erwartet.
+
+Trotzdem ist es als public helper missverständlich.
+
+Empfehlung: im Docstring oder Test klarstellen:
+
+* `parse_cell_value()` liest kompakte Zellstrings.
+* `serialize_cell_value()` erwartet bereits strukturierte Codes/Tokens.
+
+==== 3. Kombination aus expliziten allowed values und Legend kann zu strenger Duplicate-Fehlerlogik führen
+
+`_allowed_values()` kombiniert explizite Werte und Legend-Werte und lehnt Duplikate ab.
+
+Das ist streng und kann gewollt sein. Praktisch könnte aber jemand `allowed_codes` ergänzend zur Legend setzen und denselben Code doppelt nennen.
+
+Kein Blocker. Aber die Semantik sollte bewusst sein: explicit + legend is a union input, but duplicates are treated as configuration error.
+
+==== 4. Metadata wird geschrieben, aber nicht zur Auto-Konfiguration wiederverwendet
+
+`decode_cell_values` und `encode_cell_values` schreiben `cell_codecs`-Meta. Aktuell liest der Step daraus aber nicht automatisch spätere Default-Konfiguration.
+
+Das ist für den ersten Slice okay. Dann sollte die Lesart klar sein:
+
+* metadata is persisted contract/documentation,
+* not an implicit runtime config resolver.
+
+=== Nicht blockierend
+
+* `Frames = dict[str, Any]` bleibt pragmatisch und passt zum restlichen Code.
+* Performance mit `iterrows()` und manueller Gruppierung ist für den ersten generischen Slice akzeptabel.
+* Das Fehlen von Domain-Bedeutung ist hier ein Feature, kein Defizit.
+* Keine Render-/Adapter-Kopplung sichtbar.
+
+=== Entscheidung
+
+*Recommendation:* accept `FTR-CELL-CODEC` with small documentation/test hardening.
+
+=== Empfohlene Nacharbeit
+
+. Einen Test für leere Matrix-/Long-Gruppen ergänzen: `drop_empty=True` ist sparse und darf verlieren; `drop_empty=False` ist für lossless roundtrip nötig.
+. Docstring oder FTR-Text zu `parse_cell_value` vs. `serialize_cell_value` schärfen.
+. Optional dokumentieren, dass explicit allowed values plus legend duplicates als Konfigurationsfehler gelten.
+
+=== Nacharbeit umgesetzt
+
+Die Review-Nacharbeit wurde eingearbeitet:
+
+* Tests dokumentieren nun beide Roundtrip-Pfade: sparse default
+  (`drop_empty=True`) kann empty-only XRef-Gruppen verlieren; `drop_empty=False`
+  erhaelt leere Gruppen fuer lossless Roundtrips.
+* `serialize_cell_value` ist per Docstring und Test als Serializer fuer bereits
+  strukturierte Codes/Tokens beschrieben, nicht als Parser fuer kompakte
+  Zellstrings.
+* Die FTR dokumentiert, dass explicit allowed values plus Legend-Duplikate als
+  Konfigurationsfehler gelten.
+* Die FTR stellt klar, dass `cell_codecs` persistierte Contract-Metadaten sind,
+  aber im ersten Slice nicht als impliziter Runtime-Config-Resolver dienen.
+
+=== Fazit
+
+Der Slice hält die Architekturgrenzen ein: XRef macht Struktur, Cell-Codec macht generisches Code-/Token-Handling, Legend liefert erlaubte Werte, Domain-Bedeutung bleibt draußen. Der wichtigste offene Punkt ist nicht Architektur, sondern Roundtrip-Erwartungsmanagement bei leeren Zellen.

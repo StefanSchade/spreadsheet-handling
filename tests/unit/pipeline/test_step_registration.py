@@ -105,6 +105,69 @@ def test_xref_crosstable_steps_are_config_addressable() -> None:
     ]
 
 
+def test_cell_codec_steps_are_config_addressable() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "P-001": ["E-R-K"],
+        }),
+        "_meta": {
+            "legend_blocks": {
+                "status_codes": {
+                    "entries": [
+                        {"token": "E", "label": "Editable"},
+                        {"token": "E-R-K", "label": "Composite whole code"},
+                    ],
+                }
+            }
+        },
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "expand_xref",
+                "matrix": "matrix",
+                "output": "long",
+                "row_keys": ["feature_id"],
+                "value_columns": ["P-001"],
+            },
+            {
+                "step": "decode_cell_values",
+                "source": "long",
+                "output": "decoded",
+                "passthrough_columns": ["feature_id", "column_key"],
+                "allowed_from_legend": "status_codes",
+            },
+            {
+                "step": "encode_cell_values",
+                "source": "decoded",
+                "output": "encoded",
+                "group_by": ["feature_id", "column_key"],
+                "allowed_from_legend": "status_codes",
+            },
+            {
+                "step": "contract_xref",
+                "relation": "encoded",
+                "output": "roundtrip",
+                "row_keys": ["feature_id"],
+                "column_keys": ["P-001"],
+            },
+        ]
+    )
+
+    assert steps[1].config["target"].endswith(":decode_cell_values")
+    assert steps[2].config["target"].endswith(":encode_cell_values")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["decoded"].to_dict(orient="records") == [
+        {"feature_id": "f1", "column_key": "P-001", "code": "E-R-K"},
+    ]
+    assert out["roundtrip"].to_dict(orient="records") == [
+        {"feature_id": "f1", "P-001": "E-R-K"},
+    ]
+
+
 def test_legacy_registry_entry_still_builds_and_runs() -> None:
     assert not isinstance(REGISTRY["validate"], StepRegistration)
 
