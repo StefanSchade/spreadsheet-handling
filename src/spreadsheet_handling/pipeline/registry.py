@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import importlib
-from typing import Any, Callable, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping
 
 from .types import BoundStep, Frames, Step, StepFactory, StepRegistration
 
@@ -79,6 +79,14 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
     "contract_xref": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:contract_xref",
+    ),
+    "decode_cell_values": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.cell_codec:decode_cell_values",
+    ),
+    "encode_cell_values": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.cell_codec:encode_cell_values",
     ),
 }
 
