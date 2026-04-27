@@ -96,6 +96,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.compact_multiaxis:contract_compact_multiaxis",
     ),
+    "enrich_lookup": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup",
+    ),
 }
 
 
