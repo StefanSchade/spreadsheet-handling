@@ -88,6 +88,14 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.cell_codec:encode_cell_values",
     ),
+    "expand_compact_multiaxis": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.compact_multiaxis:expand_compact_multiaxis",
+    ),
+    "contract_compact_multiaxis": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.compact_multiaxis:contract_compact_multiaxis",
+    ),
 }
 
 

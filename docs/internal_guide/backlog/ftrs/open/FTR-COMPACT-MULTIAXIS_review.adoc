@@ -1,0 +1,203 @@
+== Review: FTR-COMPACT-MULTIAXIS
+
+Reviewed diff: `diff.txt`. :contentReference[oaicite:0]{index=0}
+
+=== Vorab: Gesamtstatus und Demo-Integration
+
+Ja, aus meiner Sicht seid ihr jetzt an dem Punkt, an dem eine Integration ins Demo-Repo sinnvoll ist.
+
+Nicht im Sinne von: "Feature ist produktreif und poliert".
+
+Sondern im Sinne von: Der fachlich relevante erste End-to-End-Strang existiert jetzt:
+
+* `LEGEND-BLOCKS` liefert sichtbare Codebook-/Legend-Blöcke.
+* `XREF-CROSSTABLE` kann Matrix <-> Relation transformieren.
+* `CELL-CODEC` kann kompakte Zellwerte als ganze Codes oder Tokens decodieren und encodieren.
+* `COMPACT-MULTIAXIS` komponiert XRef und Codec als Pipeline-Schritte.
+* Sparse-Verhalten und zukünftige `dense_axes`-Rekonstruktion sind konzeptionell abgegrenzt.
+
+Damit ist das Demo-Repo jetzt der richtige Realitätscheck. Genau dort werdet ihr sehen, ob die YAML-Konfiguration verständlich ist, ob die Beispiele zu künstlich sind, und ob der Flow aus Sicht eines Consumers brauchbar wirkt.
+
+Ich würde aber vor dem Demo-Commit mindestens folgende Main-Repo-Checks laufen lassen:
+
+[source,bash]
+----
+pytest -q tests/unit/domain/transformations/test_compact_multiaxis.py
+pytest -q tests/unit/pipeline/test_step_registration.py
+pytest -q tests/architecture
+pytest -q --ignore=tests/legacy_pre_hex tests
+git diff --check
+----
+
+Optional, aber sinnvoll vor Demo-Integration:
+
+[source,bash]
+----
+make test
+make test-integ
+make test-arch
+----
+
+=== Zur Frage `FTR-TEST-ARCHIVE-AND-QUARANTINE-RULES-P3C`
+
+Ich würde `FTR-TEST-ARCHIVE-AND-QUARANTINE-RULES-P3C` jetzt nicht vorziehen.
+
+Der aktuelle Schwerpunkt sollte sein:
+
+. Feature-Kette im Demo-Repo real ausprobieren.
+. Consumer-facing YAML/Beispiele stabilisieren.
+. Erst danach restliche Test-Hygiene-FTRs nachziehen.
+
+`FTR-TEST-ARCHIVE-AND-QUARANTINE-RULES-P3C` ist wichtig für langfristige Ordnung, aber nicht funktional blockierend. Außerdem ist `tests/legacy_pre_hex/` aktuell offenbar ohnehin leer bzw. nur noch als Quarantäne-Ort relevant. Die Regeln für archivierte/quarantänisierte Tests sind damit eher Nachpflege als Voraussetzung für den Demo-Testlauf.
+
+Meine Empfehlung:
+
+[source,text]
+----
+1. FTR-COMPACT-MULTIAXIS final review/fix
+2. Demo-Repo-Integration und realer Beispiel-Flow
+3. Danach Test-Archive/Quarantine und restliche Test-Hygiene
+----
+
+'''
+
+=== Gesamturteil zu FTR-COMPACT-MULTIAXIS
+
+Der Slice ist architektonisch sauber und passt zur bisherigen Linie.
+
+`COMPACT-MULTIAXIS` ist keine neue semantische Großmaschine geworden, sondern eine kontrollierte Komposition aus `XREF-CROSSTABLE` und `CELL-CODEC`. Das ist genau der richtige Zuschnitt.
+
+Die wichtigste Qualität: Das Feature interpretiert Codes nicht fachlich. Es erzeugt eine generische Long-Form und bleibt konfigurationsgetrieben.
+
+Ich würde den FTR akzeptieren, mit zwei kleinen Nacharbeiten vor Abschluss.
+
+'''
+
+=== Positiv
+
+* `expand_compact_multiaxis` komponiert sauber `expand_xref` und `decode_cell_values`.
+* `contract_compact_multiaxis` komponiert sauber `encode_cell_values` und `contract_xref`.
+* Der erste Slice bleibt bei flachen Labels und übernimmt bewusst die Modi `whole_cell_code` und `split_tokens` aus `CELL-CODEC`.
+* `drop_empty: true` ist als sparse default dokumentiert.
+* `drop_empty: false` ist als Modus für strict matrix-shape roundtrip getestet.
+* `dense_axes` ist korrekt als zukünftiger Vertrag reserviert und wird noch nicht halb implementiert.
+* Die Implementierung schreibt `compact_multiaxis`-Meta und erhält zusätzlich die darunterliegenden `xref_crosstable`- und `cell_codecs`-Metadaten.
+* `group` bleibt eine generische Projektion aus Legend- oder Code-Gruppen, nicht Business-Semantik.
+* Die Pipeline-Registry enthält jetzt `expand_compact_multiaxis` und `contract_compact_multiaxis`.
+* Die Tests decken whole-cell roundtrip, sparse default, split-token canonical ordering und Pipeline-Adressierbarkeit ab.
+
+'''
+
+=== Kritische Punkte
+
+==== 1. `dense_axes` wird nur im Expand-Pfad getestet
+
+Die Implementierung ruft `_reject_dense_axes(dense_axes)` sowohl in `expand_compact_multiaxis` als auch in `contract_compact_multiaxis` auf.
+
+Der Test deckt aber nur den Expand-Pfad ab.
+
+Das ist klein, aber wichtig, weil die gefährliche Versuchung eigentlich im Contract-Pfad liegt: Dort könnte später jemand beginnen, fehlende Achsen zu rekonstruieren.
+
+Empfehlung: Einen symmetrischen Test ergänzen:
+
+[source,python]
+----
+def test_contract_rejects_dense_axes_until_explicitly_implemented() -> None:
+    ...
+    with pytest.raises(NotImplementedError, match="dense_axes"):
+        contract_compact_multiaxis(..., dense_axes={...})
+----
+
+==== 2. `code_groups` ist dokumentiert, aber nicht direkt getestet
+
+Der `group`-Output ist über Legend-Gruppen getestet. Das ist gut.
+
+Aber die Implementierung unterstützt zusätzlich explizite `code_groups`. Dafür sollte es mindestens einen Unit-Test geben.
+
+Minimal:
+
+[source,python]
+----
+code_groups={"E": "input", "S": "system"}
+----
+
+und erwarteter Output:
+
+[source,text]
+----
+feature_id | column_key | code | group
+f1         | P-001      | E    | input
+----
+
+Optional zusätzlich ein Konflikttest:
+
+[source,text]
+----
+Legend:      E -> input
+code_groups: E -> other
+=> ValueError
+----
+
+Das wäre ein guter Guard gegen späteres stilles Überschreiben.
+
+==== 3. `code_groups`-Keys in Meta sollten string-artig bleiben
+
+`_codec_payload()` speichert `code_groups` aktuell mit:
+
+[source,python]
+----
+payload["code_groups"] = dict(code_groups)
+----
+
+Da Codes/Tokens konzeptionell kompakte Zellwerte sind, sollten Keys praktisch string-artig sein. Wenn später nicht-string Keys genutzt werden, kann YAML/JSON-Persistenz unschön werden.
+
+Kein Blocker.
+
+Empfehlung: entweder dokumentieren oder später normalisiert speichern:
+
+[source,text]
+----
+code_groups keys should be string-like compact codes/tokens.
+----
+
+'''
+
+=== Nicht blockierend
+
+* Temporäre Frame-Namen wie `__compact_multiaxis_<id>_xref` sind intern und werden wieder entfernt. Das ist akzeptabel.
+* Dass die delegierten Primitive eigene Meta schreiben, ist eher nützlich als störend: Es macht die Zusammensetzung nachvollziehbar.
+* Performance ist für den ersten Slice kein Thema.
+* Keine Render-/Adapter-Kopplung sichtbar.
+* Dass `dense_axes` nicht implementiert ist, ist korrekt. Das Feature wäre groß genug für ein eigenes späteres FTR.
+
+'''
+
+=== Entscheidung
+
+*Recommendation:* accept `FTR-COMPACT-MULTIAXIS` after small test hardening.
+
+=== Empfohlene Nacharbeit vor Abschluss
+
+. Test ergänzen: `contract_compact_multiaxis(..., dense_axes=...)` raises `NotImplementedError`.
+. Test ergänzen: `group`-Projektion über explizite `code_groups`, ohne Legend.
+. Optional: Konflikttest `legend group` vs. `code_groups`.
+. Optional: Dokumentieren, dass `code_groups`-Keys string-artige Codes/Tokens sein sollen.
+
+'''
+
+=== Nacharbeit umgesetzt
+
+* Contract path now rejects `dense_axes` under test.
+* Explicit `code_groups` projection is covered without a legend.
+* Legend-vs-`code_groups` conflicts are covered and raise `ValueError`.
+* `code_groups` metadata keys are normalized through the same strip/case policy as lookup; the FTR documents them as string-like compact code/token keys.
+
+'''
+
+=== Fazit
+
+`FTR-COMPACT-MULTIAXIS` ist ein guter erster generischer Slice. Er komponiert vorhandene Primitive, ohne neue Magie einzuführen.
+
+Der nächste sinnvolle Schritt ist nicht ein weiteres internes Refactoring, sondern Demo-Integration.
+
+Das Demo wird zeigen, ob die API/YAML-Schnittstelle wirklich verständlich ist. Genau diese Consumer-Perspektive fehlt jetzt noch.
