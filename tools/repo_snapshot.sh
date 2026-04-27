@@ -38,7 +38,7 @@ mkdir -p -- "$TARGET_ABS"
 EX_DIRS=(
   ".git" ".venv" ".venv_win" "__pycache__" ".mypy_cache" ".pytest_cache" ".ruff_cache"
   ".idea" ".vscode" "node_modules" "dist" "build" "tmp" "lib" "lib64" "bin"
-  "dist" "tmp" "output"
+  "dist" "tmp" "target" "output"
 )
 
 # 2) Path globs (absolute, include the target dir to avoid recursion)

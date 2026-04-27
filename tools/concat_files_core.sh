@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Concatenate UTF-8 text files under ROOT into OUTFILE,
+# Concatenate UTF-8 compatible text files under ROOT into OUTFILE,
 # excluding via repeated flags:
 #   --exclude-dir NAME        (prunes by directory name)
 #   --exclude-path GLOB       (prunes by full path glob)
@@ -89,8 +89,10 @@ find "$ROOT" \
   "${PRUNE_OUTFILE[@]}" \
   -type f -print0 \
 | while IFS= read -r -d '' FILE; do
-    # Keep blacklist, but still ensure UTF-8 text
-    if file --mime-encoding "$FILE" | grep -qi 'utf-8'; then
+    # Keep blacklist, but still ensure UTF-8 compatible text.
+    # `file` reports pure ASCII files as us-ascii; those are valid UTF-8 too.
+    ENCODING=$(file --mime-encoding "$FILE" | awk '{print $NF}')
+    if [[ "$ENCODING" == "utf-8" || "$ENCODING" == "us-ascii" ]]; then
       {
         printf '==== File: %s ====\n\n' "$FILE"
         cat -- "$FILE"

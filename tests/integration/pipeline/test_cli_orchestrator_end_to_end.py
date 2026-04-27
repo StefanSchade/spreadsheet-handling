@@ -74,3 +74,27 @@ def test_orchestrate_with_step(tmp_path: Path) -> None:
     assert list(frames["products"].columns) == ["id"]
     written = json.loads((out_dir / "products.json").read_text(encoding="utf-8"))
     assert "name" not in written[0]
+
+
+@pytest.mark.ftr("FTR-ODS-CALC-ADAPTER-IMPLEMENTATION-P3J")
+def test_orchestrate_supports_ods_backend_kind(tmp_path: Path) -> None:
+    in_dir = tmp_path / "in"
+    ods_path = tmp_path / "products.ods"
+    out_dir = tmp_path / "out"
+    _write_json_dir(in_dir, SAMPLE_DATA)
+
+    orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "ods", "path": str(ods_path)},
+    )
+
+    assert ods_path.exists()
+
+    frames = orchestrate(
+        input={"kind": "ods", "path": str(ods_path)},
+        output={"kind": "json_dir", "path": str(out_dir)},
+    )
+
+    assert frames["products"].to_dict(orient="records") == SAMPLE_DATA["products"]
+    written = json.loads((out_dir / "products.json").read_text(encoding="utf-8"))
+    assert written == SAMPLE_DATA["products"]
