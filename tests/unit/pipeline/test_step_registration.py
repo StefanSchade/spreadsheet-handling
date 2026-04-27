@@ -168,6 +168,52 @@ def test_cell_codec_steps_are_config_addressable() -> None:
     ]
 
 
+def test_compact_multiaxis_steps_are_config_addressable() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "P-001": ["K-E"],
+        })
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "expand_compact_multiaxis",
+                "matrix": "matrix",
+                "output": "explicit",
+                "row_keys": ["feature_id"],
+                "value_columns": ["P-001"],
+                "mode": "split_tokens",
+                "delimiter": "-",
+                "allowed_tokens": ["E", "K"],
+            },
+            {
+                "step": "contract_compact_multiaxis",
+                "relation": "explicit",
+                "output": "roundtrip",
+                "row_keys": ["feature_id"],
+                "mode": "split_tokens",
+                "delimiter": "-",
+                "allowed_tokens": ["E", "K"],
+                "canonical_order": ["E", "K"],
+            },
+        ]
+    )
+
+    assert steps[0].config["target"].endswith(":expand_compact_multiaxis")
+    assert steps[1].config["target"].endswith(":contract_compact_multiaxis")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["explicit"].to_dict(orient="records") == [
+        {"feature_id": "f1", "column_key": "P-001", "code": "K"},
+        {"feature_id": "f1", "column_key": "P-001", "code": "E"},
+    ]
+    assert out["roundtrip"].to_dict(orient="records") == [
+        {"feature_id": "f1", "P-001": "E-K"},
+    ]
+
+
 def test_legacy_registry_entry_still_builds_and_runs() -> None:
     assert not isinstance(REGISTRY["validate"], StepRegistration)
 
