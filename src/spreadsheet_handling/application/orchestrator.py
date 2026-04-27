@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Iterable, Mapping
 
 import logging
-import pandas as pd
 
 from ..pipeline.registry import run_pipeline
 from ..pipeline.types import BoundStep, Frames
 
 # Backends (existing adapters)
 from ..io_backends.json_backend import JSONBackend
+from ..io_backends.ods.ods_backend import OdsBackend
 from ..io_backends.xml_backend import XMLBackend
 from ..io_backends.yaml_backend import load_yaml_dir as _yaml_load, save_yaml_dir as _yaml_save
 from ..io_backends.xlsx.xlsx_backend import ExcelBackend
@@ -53,6 +53,8 @@ def _load_frames(inp: IODesc, *, header_levels: int = 1) -> Frames:
         return _yaml_load(inp.path)
     if inp.kind in {"xlsx", "excel"}:
         return ExcelBackend().read_multi(inp.path, header_levels=header_levels, options=inp.options)
+    if inp.kind in {"ods", "calc"}:
+        return OdsBackend().read_multi(inp.path, header_levels=header_levels, options=inp.options)
     raise ValueError(f"Unsupported input kind: {inp.kind!r}")
 
 def _save_frames(out: IODesc, frames: Frames) -> None:
@@ -67,6 +69,9 @@ def _save_frames(out: IODesc, frames: Frames) -> None:
         return
     if out.kind in {"xlsx", "excel"}:
         ExcelBackend().write_multi(frames, out.path, options=out.options)
+        return
+    if out.kind in {"ods", "calc"}:
+        OdsBackend().write_multi(frames, out.path, options=out.options)
         return
     raise ValueError(f"Unsupported output kind: {out.kind!r}")
 
