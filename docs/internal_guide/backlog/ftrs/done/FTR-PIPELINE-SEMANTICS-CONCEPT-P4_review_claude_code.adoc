@@ -1,0 +1,195 @@
+== Review: Pipeline Step Semantics, Configuration Contracts, and Frame Lifecycle
+
+:status: review
+:scope: architecture-review
+:reviewed: 2026-04-28
+:source: docs/internal_guide/architecture/pipeline_semantics.adoc
+:ftr: FTR-PIPELINE-SEMANTICS-CONCEPT-P4
+
+=== Overall Assessment
+
+The document is a strong architecture proposal.
+It addresses real problems that are already visible in the current codebase, and it proposes a layered solution that fits the project's hexagonal architecture and incremental delivery model.
+
+The writing is unusually clear for an architecture document -- it distinguishes concerns well, provides concrete YAML examples, and proposes testable acceptance criteria for each implementation slice.
+
+The document is ready to serve as a working reference for Phase 4 development.
+The findings below are improvements and open risks, not blockers.
+
+Rating: *approve with findings*.
+
+===
+
+=== Strengths
+
+==== Clear separation of concerns
+
+The four-category model (primitive / configuration / composite / plugin) is well chosen.
+It maps cleanly onto the existing `REGISTRY` in `registry.py`, which already separates direct factories from `StepRegistration` entries.
+The proposal adds semantic meaning to what is currently a binding-pattern distinction.
+
+==== Heuristic isolation is the right call
+
+The explicit rule that heuristics must write to `_meta` and not silently define execution semantics is the single most valuable design decision in the document.
+It directly addresses the risk that `apply_fks` currently auto-detects FK columns by naming convention without writing an inspectable resolved policy.
+
+==== Concrete examples
+
+The YAML examples for `configure_lookup_helpers` + `add_lookup_helpers` and the frame lifecycle metadata make the intended direction tangible.
+They also show the `auto` escape hatch without making heuristics invisible.
+
+==== Implementation slices are well scoped
+
+The five slices are ordered by risk and dependency.
+Slice 1 (this document) has zero code changes.
+Slice 2 (registry JSON) is a review artifact before it becomes runtime.
+This is a safe ramp.
+
+===
+
+=== Findings
+
+==== F-01: Step category mapping for existing steps is missing
+
+Severity: medium
+
+The document defines four categories but does not provide a complete classification of the 18 existing steps.
+
+Some mappings are obvious (`expand_xref` → primitive, `expand_compact_multiaxis` → composite), but several are ambiguous:
+
+* `bootstrap_meta` -- is this a configuration step or an infrastructure step? It reads from multiple sources (persistence, profile, CLI) and merges them. It does not fit the "writes configuration for later primitives" pattern cleanly because it is not domain-specific.
+* `apply_overrides` -- similar question. It loads YAML overrides, which is closer to infrastructure than domain configuration.
+* `identity` -- pass-through. Does it need a category?
+* `validate` -- the document defines `validation_only` as an inverse kind, but `validate` is not explicitly listed under any step category.
+
+Recommendation: Add an appendix or table that maps every current registry key to a proposed category, even if some are marked `tbd`.
+This makes the category model testable from day one and forces early resolution of edge cases.
+
+==== F-02: Relationship between step registry JSON and existing `REGISTRY` dict is underspecified
+
+Severity: medium
+
+The document proposes a JSON step registry under `docs/` and acknowledges it may later move to `src/`.
+But it does not specify the relationship to the existing `REGISTRY` dict in `registry.py`.
+
+Open questions:
+
+* Should the JSON registry be the single source of truth, with `REGISTRY` derived from it?
+* Or is the JSON registry a documentation artifact validated against `REGISTRY` by architecture tests?
+* If both exist, which one is authoritative when they conflict?
+
+The document mentions "architecture tests verify that pipeline REGISTRY and the JSON step registry are aligned" -- this implies the second model (documentation artifact).
+This should be stated explicitly and early, because the answer affects Slice 2 acceptance criteria.
+
+Recommendation: Add a short paragraph stating that the JSON registry is initially a *review artifact* validated against `REGISTRY`, not a runtime replacement.
+Clarify that the runtime `REGISTRY` remains authoritative until a future slice explicitly changes this.
+
+==== F-03: `meta_contract` field needs alignment with existing two-layer meta model
+
+Severity: medium
+
+The registry shape proposes `meta_contract.reads` and `meta_contract.writes` fields.
+The existing codebase already distinguishes `meta_canonical` (persisted) and `meta_rendering` (derived/working).
+See `generic_ir.adoc` and `meta_bootstrap.py`.
+
+The `meta_contract` field does not specify which layer it refers to.
+
+Example: `add_lookup_helpers` writes to `derived.sheets.*.lookup_helpers` -- is this `meta_canonical` or `meta_rendering`?
+The answer matters for persistence, inverse operations, and the frame lifecycle contract.
+
+Recommendation: Extend `meta_contract` to specify the target layer:
+
+[source,json]
+----
+"meta_contract": {
+  "reads": [{"path": "helper_policies", "layer": "canonical"}],
+  "writes": [{"path": "derived.sheets.*.lookup_helpers", "layer": "rendering"}]
+}
+----
+
+Or document a convention that `meta_contract` always refers to the canonical layer unless annotated otherwise.
+
+==== F-04: Frame lifecycle has no mechanism for multi-pipeline or multi-view scenarios
+
+Severity: low (future risk)
+
+The frame lifecycle contract assumes one linear pipeline producing one workbook view.
+If the project ever supports multiple views from the same pipeline (e.g., a debug view showing intermediate frames alongside a clean production view), the current `render: omit_by_default` / `visible_by_default` model would need extension.
+
+This is not a blocker, but the document could acknowledge this as a known limitation.
+
+Recommendation: Add a sentence in the Frame Lifecycle section:
+
+[source,text]
+----
+The current lifecycle model assumes a single workbook view per pipeline run.
+Multi-view scenarios (e.g., debug view versus production view) are deferred.
+----
+
+==== F-05: Naming proposals do not cover all current steps
+
+Severity: low
+
+The naming table covers FK/helper/lookup steps but omits other steps whose names could also benefit from normalization:
+
+* `flatten_headers` / `unflatten_headers` -- consistent, probably fine.
+* `bootstrap_meta` -- is this name clear to users?
+* `apply_overrides` -- clear enough, but overlaps with the configuration-step concept.
+* `identity` -- fine as-is.
+
+Recommendation: Either expand the naming table to cover all 18 steps or add a note that only FK/helper/lookup steps are in scope for Slice 3.
+
+==== F-06: Composite step "must declare which primitive steps it wraps" -- enforcement unclear
+
+Severity: low
+
+The document states composite steps must declare wrapped primitives, which is the right rule.
+But the enforcement mechanism is not specified.
+
+* Is this a mandatory field in the JSON registry only?
+* Should `StepRegistration` gain a `wrapped_steps` attribute?
+* Should architecture tests verify that the declared primitives exist?
+
+Recommendation: In Slice 2, specify that `wrapped_steps` is a required field for `composite` entries in the JSON registry, and architecture tests verify each wrapped step exists as a registered primitive or configuration step.
+
+==== F-07: `plugin` category rules may be too lenient
+
+Severity: low
+
+Plugin steps are described as "explicit escape hatches" and encouraged to write provenance.
+But the rules do not prevent a plugin from silently creating frames without lifecycle metadata, which would break the frame lifecycle contract.
+
+In practice, the ba-config consumer repository uses plugins (`plugins/transforms.py`).
+
+Recommendation: Consider adding a soft validation that warns when a plugin step produces new frames without corresponding `frame_lifecycle` entries.
+This can be a diagnostic rather than a hard failure.
+
+==== F-08: Release strategy section could be shorter
+
+Severity: editorial
+
+The release strategy section is well reasoned but longer than necessary for an architecture document.
+The core message is: "don't cut a beta before renaming steps; tag instead."
+This could be two sentences plus the exception note.
+
+Recommendation: Consider condensing or moving the release strategy to a backlog item or decision record.
+
+===
+
+=== Minor / Editorial
+
+* The document uses `===` as bare section separators between some sections. AsciiDoc interprets bare `===` as a level-2 heading without title text. This works in some renderers but may cause warnings in strict AsciiDoc processors. Consider removing the bare separators or adding explicit titles.
+
+* The example registry entry for `add_lookup_helpers` references FTR `FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4`. The proposed FTR list at the end uses different names (`FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4`). Verify these are intentionally different FTRs or consolidate.
+
+* The `on` parameter in the `add_lookup_helpers` registry entry has type `["string", "array", "object"]`. Consider documenting what the `object` variant means (e.g., column mapping `{source_col: lookup_col}`).
+
+* Typo-check: no typos found. Terminology is consistent throughout.
+
+===
+
+=== Conclusion
+
+The document provides a solid architectural foundation for the next wave of pipeline development.
+The most impactful next step is mapping all 18 existing steps to the four categories (F-01) and clarifying the JSON registry's relationship to the runtime `REGISTRY` (F-02).
+Both can be resolved within Slice 1 or early in Slice 2.

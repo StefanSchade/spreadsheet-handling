@@ -1,0 +1,680 @@
+== Pipeline Step Semantics, Configuration Contracts, and Frame Lifecycle
+
+:status: draft
+:scope: architecture-review-artifact
+:updated: 2026-04-28
+
+=== Purpose
+
+This document records the intended direction for pipeline step semantics before the public YAML surface hardens further.
+
+The goal is to make transformation behavior explicit, inspectable, and documentable without giving up pragmatic convenience for common cases.
+
+The document is intentionally architectural first. Implementation should happen in small, reviewable slices.
+
+===
+
+=== Problem Statement
+
+The current pipeline has grown useful transformation capabilities, but the public step surface is becoming harder to reason about.
+
+Several different concerns are currently mixed or only implicitly separated:
+
+* primitive data transformations
+* composite transformations that wrap several primitives
+* heuristic discovery of configuration
+* explicit user configuration
+* metadata persistence for later inverse operations
+* render/view decisions about which frames should be visible or editable
+
+This creates several risks:
+
+* Users cannot easily tell whether a step executes a transformation, infers configuration, or does both.
+* Heuristics can become opaque runtime behavior instead of inspectable configuration.
+* Composite steps can hide the fact that several primitive operations are being executed.
+* Intermediate frames can remain visible next to derived frames, creating redundant or inconsistent editable data.
+* The inverse direction of a transformation may depend on metadata that is not clearly documented.
+* User documentation and architecture tests have no single registry from which to derive expectations.
+
+===
+
+=== Design Principle
+
+Pipeline steps should separate configuration, execution, and composition.
+
+[source,text]
+----
+configuration step
+  -> writes explicit configuration into _meta
+
+primitive step
+  -> reads explicit configuration from parameters and/or _meta
+  -> executes one transformation deterministically
+  -> writes provenance and lifecycle metadata
+
+composite step
+  -> wraps a documented sequence of primitive and/or configuration steps
+  -> remains a convenience surface, not the only location of semantics
+----
+
+===
+
+=== Step Categories
+
+==== Primitive Steps
+
+A primitive step performs exactly one domain-level operation.
+
+Examples:
+
+* `expand_xref`
+* `contract_xref`
+* `decode_cell_values`
+* `encode_cell_values`
+* `add_lookup_helpers`
+* `add_fk_helpers`
+* `remove_fk_helpers`
+* `validate_fk_helpers`
+
+Rules:
+
+* A primitive step must not silently infer structural policy from naming conventions unless that inference is explicitly part of a prior configuration contract.
+* A primitive step may accept direct parameters for convenience, but its effective behavior should be representable in `_meta`.
+* A primitive step should write enough provenance to support diagnostics, view decisions, and inverse operations where applicable.
+* A primitive step should declare whether it is bijective, conditionally bijective, projection-only, validation-only, or extraction-like.
+
+==== Configuration Steps
+
+A configuration step writes or validates explicit configuration in `_meta`.
+
+Configuration steps are the intended home for heuristic behavior.
+
+Examples:
+
+* `configure_lookup_helpers`
+* `infer_lookup_helper_policy`
+* `configure_fk_helpers`
+* `infer_fk_relations`
+* `configure_frame_lifecycle`
+* `configure_compact_multiaxis`
+
+Rules:
+
+* A configuration step may use heuristics.
+* A configuration step may interpret `auto` values.
+* A configuration step may combine user-supplied overrides with inferred defaults.
+* The result must be explicit metadata, not hidden runtime behavior.
+* Later primitive steps should be able to run against that resolved metadata.
+
+Design rule:
+
+[source,text]
+----
+Heuristics may propose configuration.
+They must not silently define execution semantics inside the main transform.
+----
+
+==== Composite Steps
+
+A composite step wraps a documented sequence of primitive and/or configuration steps.
+
+Examples:
+
+* `expand_compact_multiaxis`
+* `contract_compact_multiaxis`
+* future workbook-view preparation steps
+
+Rules:
+
+* A composite step must declare which primitive steps it semantically wraps.
+* A composite step must declare which `_meta` contracts it reads and writes.
+* A composite step may remain as a convenience API, but the primitive sequence must remain understandable and testable independently.
+* Composite steps should not become hidden second implementations of primitive behavior.
+
+==== Plugin Steps
+
+Plugin steps are explicit escape hatches into caller-owned code.
+
+Rules:
+
+* A plugin step should be treated as externally owned behavior.
+* A plugin step should still be encouraged to write provenance and lifecycle metadata when it produces or suppresses frames.
+* Plugin behavior should not be used as a substitute for missing generic primitives if the behavior is broadly reusable.
+
+===
+
+=== Heuristics Versus Explicit Configuration
+
+Heuristics and explicit configuration both have legitimate uses.
+
+Heuristics are useful when:
+
+* conventional naming makes intent obvious
+* boilerplate would be disproportionate
+* the user wants a low-friction default path
+* inferred behavior is easy to inspect afterward
+
+Explicit configuration is preferable when:
+
+* naming conventions are ambiguous
+* domain-specific constraints exist
+* debugging and reviewability matter
+* consumer repositories need stable, transparent behavior
+* inverse operations depend on precise reconstruction metadata
+
+The preferred architecture is not a binary choice between heuristic and explicit behavior.
+
+Instead, each configurable aspect may support explicit values or `auto`.
+
+Example:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_lookup_helpers
+    lookup: variables
+    key: ID
+    allowed_helpers: [sort_key, value_label_de, business_component, data_type, module]
+    default_helpers: [value_label_de]
+
+  - step: add_lookup_helpers
+    source: variable_usage_matrix_raw
+    lookup: variables
+    output: variable_usage_matrix
+    on: ID
+    helpers: default
+----
+
+Partly heuristic variant:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_lookup_helpers
+    lookup: variables
+    key: ID
+    allowed_helpers: auto
+    default_helpers: [value_label_de]
+    auto:
+      helper_candidates:
+        exclude: [ID]
+
+  - step: add_lookup_helpers
+    source: variable_usage_matrix_raw
+    lookup: variables
+    output: variable_usage_matrix
+    on: ID
+    helpers: default
+----
+
+In both variants, the primitive step executes against an explicit resolved policy.
+
+===
+
+=== Step Registry
+
+A JSON-based step registry should become the reviewable inventory of the public pipeline surface.
+
+The registry is not initially a runtime engine.
+
+First purpose:
+
+* document every public step
+* classify steps by category
+* document parameters and effective metadata contracts
+* document frame input/output behavior
+* document inverse behavior
+* support architecture tests
+* later support generated user documentation
+
+Recommended initial location:
+
+[source,text]
+----
+docs/internal_guide/architecture/pipeline_step_registry.json
+----
+
+This location is acceptable while the internal guide is still the active architecture staging area. If the registry becomes runtime-bound or public user documentation is generated from it, it should later move to a stable product-facing location such as:
+
+[source,text]
+----
+src/spreadsheet_handling/pipeline/step_registry.json
+----
+
+or:
+
+[source,text]
+----
+docs/reference/pipeline_step_registry.json
+----
+
+Important repository note:
+
+* If the registry stays under `docs/`, `.gitignore` must not treat this JSON file as ephemeral.
+* Add a specific exception if necessary.
+
+=== Minimal Registry Shape
+
+[source,json]
+----
+{
+  "registry_version": 1,
+  "steps": [
+    {
+      "name": "add_lookup_helpers",
+      "category": "primitive",
+      "status": "public",
+      "purpose": "Add configured helper columns from a lookup frame to a source frame.",
+      "wrapped_steps": [],
+      "parameters": {
+        "source": {"required": true, "type": "string"},
+        "lookup": {"required": true, "type": "string"},
+        "output": {"required": true, "type": "string"},
+        "on": {"required": true, "type": ["string", "array", "object"]},
+        "helpers": {"required": true, "type": ["string", "array", "object"]}
+      },
+      "meta_contract": {
+        "reads": ["helper_policies"],
+        "writes": ["derived.sheets.*.lookup_helpers"]
+      },
+      "frame_contract": {
+        "inputs": ["source", "lookup"],
+        "outputs": ["output"],
+        "retains_inputs_by_default": true
+      },
+      "inverse": {
+        "kind": "projection_only",
+        "inverse_step": null,
+        "reason": "Helper columns are derived projections from lookup data and do not own canonical data."
+      },
+      "ftr": "FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4"
+    }
+  ]
+}
+----
+
+Allowed categories:
+
+* `primitive`
+* `configuration`
+* `composite`
+* `plugin`
+
+Allowed inverse kinds:
+
+* `bijective`
+* `conditionally_bijective`
+* `projection_only`
+* `validation_only`
+* `extraction`
+* `unknown`
+
+===
+
+=== Equality and Bijectivity
+
+The project should avoid a simplistic equation of `transformation` with byte-identical representation.
+
+A transformation may be bijective at the level of preserved relations even if the concrete representation changes.
+
+Example:
+
+* A compact matrix may become an explicit relation.
+* The exact shape is not identical.
+* The relation can still preserve all meaningful information if axis contracts, code semantics, and empty-cell semantics are explicit.
+
+Therefore, inverse behavior should be documented more precisely.
+
+Recommended inverse categories:
+
+[cols="1,3"]
+|===
+| Kind | Meaning
+
+| `bijective`
+| The inverse operation reconstructs the relevant information without additional assumptions.
+
+| `conditionally_bijective`
+| The inverse operation is valid only if listed metadata or policy constraints are present.
+
+| `projection_only`
+| The step adds derived information that should not be treated as canonical ownership.
+
+| `validation_only`
+| The step checks consistency but does not transform data.
+
+| `extraction`
+| The step intentionally discards information and cannot reconstruct the input relation.
+
+| `unknown`
+| Temporary classification for legacy or not-yet-reviewed steps.
+|===
+
+Example for compact multiaxis:
+
+[source,json]
+----
+{
+  "name": "contract_compact_multiaxis",
+  "category": "composite",
+  "wrapped_steps": ["encode_cell_values", "contract_xref"],
+  "inverse": {
+    "kind": "conditionally_bijective",
+    "inverse_step": "expand_compact_multiaxis",
+    "requires_meta": [
+      "compact_multiaxis.<name>.row_keys",
+      "compact_multiaxis.<name>.column_keys",
+      "compact_multiaxis.<name>.mode",
+      "compact_multiaxis.<name>.fill_value"
+    ],
+    "notes": "Sparse output is relation-preserving only if empty cells are semantically irrelevant or explicit dense-axis reconstruction metadata is present."
+  }
+}
+----
+
+===
+
+=== Frame Lifecycle and Redundant Data
+
+Many transformations use explicit input and output frames.
+
+Example:
+
+[source,yaml]
+----
+- step: contract_compact_multiaxis
+  relation: variable_codes
+  output: variable_usage_matrix_raw
+----
+
+Keeping both input and output frames can be useful for debugging and traceability.
+
+But it is dangerous when rendering an editable workbook, because users may see and edit multiple redundant representations of the same information.
+
+The solution should not be an obscure render flag.
+
+The solution should be an explicit frame lifecycle contract in `_meta`.
+
+Example:
+
+[source,yaml]
+----
+_meta:
+  frame_lifecycle:
+    variable_codes:
+      role: source
+      canonical: true
+      editable: false
+      render: omit_by_default
+      superseded_by: variable_usage_matrix_raw
+
+    variable_usage_matrix_raw:
+      role: intermediate
+      canonical: false
+      editable: false
+      render: omit_by_default
+      derived_from:
+        - variable_codes
+      superseded_by: variable_usage_matrix
+
+    variable_usage_matrix:
+      role: editable_projection
+      canonical: false
+      editable: true
+      render: visible_by_default
+      derived_from:
+        - variable_usage_matrix_raw
+        - variables
+      consistency_policy:
+        on_conflict: fail
+----
+
+Frame lifecycle should answer:
+
+* Which frames are canonical?
+* Which frames are intermediate?
+* Which frames are editable projections?
+* Which frames are redundant for the current workbook view?
+* Which frames should be omitted by default during spreadsheet rendering?
+* Which frames participate in inverse reconstruction?
+* What happens if redundant representations conflict?
+
+===
+
+=== Rendering and Workbook Views
+
+Pipeline execution must remain linear.
+
+Render visibility must not become hidden pipeline routing.
+
+Wrong direction:
+
+[source,text]
+----
+Pipeline inspects _meta and silently skips steps or payload branches.
+----
+
+Preferred direction:
+
+[source,text]
+----
+Pipeline executes declared steps linearly.
+Steps write explicit lifecycle and view metadata.
+Rendering consumes explicit workbook-view policy to decide visibility/editability.
+----
+
+A future rendering option such as `drop_redundant_data` is acceptable only if it means:
+
+[source,text]
+----
+Do not render frames that are explicitly classified as redundant or omit-by-default in frame_lifecycle.
+----
+
+It must not mean:
+
+[source,text]
+----
+Guess which frames look redundant by name, shape, or position.
+----
+
+===
+
+=== Naming Direction for Helper and Lookup Steps
+
+The current FK/helper/lookup step names should be normalized while controlled consumer repositories can still be updated cheaply.
+
+Recommended direction:
+
+[cols="1,1,3"]
+|===
+| Current name | Proposed name | Rationale
+
+| `apply_fks`
+| `add_fk_helpers`
+| Materializes helper columns based on FK conventions.
+
+| `drop_helpers`
+| `remove_fk_helpers`
+| Removes FK helper columns using provenance or policy.
+
+| `check_fk_helpers`
+| `validate_fk_helpers`
+| Expresses validation rather than generic checking.
+
+| `reorder_helpers`
+| `reorder_fk_helpers`
+| Current behavior is FK-helper specific, not a generic helper concept.
+
+| `enrich_lookup`
+| `add_lookup_helpers`
+| The source frame is enriched with helper fields from a lookup frame.
+|===
+
+Compatibility aliases should be short-lived if used at all.
+
+Because the known consumer repositories are currently controlled, a hard rename with immediate consumer updates is preferable to carrying legacy YAML names indefinitely.
+
+===
+
+=== Implementation Slices
+
+==== Slice 1: Architecture Document
+
+Add this document and include it from the architecture index.
+
+Suggested path:
+
+[source,text]
+----
+docs/internal_guide/architecture/pipeline_step_semantics.adoc
+----
+
+Acceptance:
+
+* The document records step categories, heuristic/configuration separation, registry intent, inverse profiles, and frame lifecycle direction.
+* No production code changes.
+
+==== Slice 2: Step Registry Review Artifact
+
+Add a JSON registry for public pipeline steps.
+
+Acceptance:
+
+* Every public pipeline step has a registry entry.
+* Every registry entry has category, purpose, parameters, meta contract, frame contract, inverse classification, and FTR/reference fields.
+* Architecture tests verify that pipeline `REGISTRY` and the JSON step registry are aligned.
+* No runtime dependency on the registry yet.
+
+==== Slice 3: Step Name Normalization
+
+Rename unclear public step names and update controlled consumers.
+
+Acceptance:
+
+* New examples use only the normalized names.
+* Old names are either removed or retained only as one-beta aliases with explicit warnings.
+* Both controlled consumer repositories are updated in the same integration wave.
+
+==== Slice 4: Lookup/FK Configuration Steps
+
+Introduce explicit configuration steps for lookup helper policy and FK helper policy.
+
+Acceptance:
+
+* Users can declare helper policies explicitly.
+* Users can opt into `auto` for selected aspects.
+* Resolved policy is written to `_meta`.
+* Primitive helper steps execute against resolved policy.
+
+==== Slice 5: Frame Lifecycle Contract
+
+Introduce frame lifecycle metadata and use it for spreadsheet view generation.
+
+Acceptance:
+
+* Transformations can mark source, intermediate, projection, redundant, canonical, and editable frames.
+* Rendering can omit explicitly redundant frames when configured.
+* No renderer guesses redundancy heuristically.
+* Conflict behavior for redundant editable representations is documented.
+
+===
+
+=== Release Strategy
+
+A beta release before this wave is optional but not strongly recommended if the next beta is meant to be a useful integration baseline.
+
+Reasoning:
+
+* The planned changes affect the public YAML step surface.
+* Releasing a beta immediately before renaming steps creates a short-lived baseline that consumers should not copy.
+* The known consumer repositories are controlled, so the cost of changing now is lower than the cost of stabilizing legacy names.
+* The wave can be implemented gradually with small commits and tests.
+
+Recommended release approach:
+
+[source,text]
+----
+Do not cut a public beta solely as a fixed stake before this wave.
+
+Instead:
+  1. Add the architecture document.
+  2. Add the step registry as a non-runtime review artifact.
+  3. Rename the public steps and update controlled consumers.
+  4. Add the first configuration-step slice for lookup helpers.
+  5. Then cut the beta as the new integration baseline.
+----
+
+Exception:
+
+If there is an urgent need to preserve the exact current behavior for comparison, create a git tag or internal checkpoint instead of promoting it as the next beta release.
+
+===
+
+=== Proposed FTRs
+
+==== FTR-PIPELINE-STEP-SEMANTICS-P4
+
+Purpose:
+
+* Add this architecture document.
+* Define primitive, configuration, composite, and plugin step categories.
+* Define heuristic-to-metadata configuration semantics.
+* Define inverse classification and frame lifecycle direction.
+
+==== FTR-PIPELINE-STEP-REGISTRY-P4
+
+Purpose:
+
+* Add the JSON step registry.
+* Add architecture tests for registry completeness.
+* Prepare the registry for generated user documentation.
+
+==== FTR-PIPELINE-STEP-NAMING-P4
+
+Purpose:
+
+* Rename unclear public step names before consumer integration hardens.
+* Update controlled consumer repositories.
+* Decide whether old names are removed immediately or retained as short-lived aliases.
+
+==== FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4
+
+Purpose:
+
+* Add configuration steps for lookup helper and FK helper policy.
+* Support explicit values and controlled `auto` options.
+* Ensure primitive helper steps execute resolved metadata contracts.
+
+==== FTR-FRAME-LIFECYCLE-P4
+
+Purpose:
+
+* Add explicit lifecycle metadata for source, intermediate, projection, canonical, editable, and redundant frames.
+* Use lifecycle metadata for workbook view/render decisions.
+* Avoid inconsistent editable spreadsheet outputs.
+
+===
+
+=== Open Questions
+
+* Should the step registry initially live under `docs/internal_guide/architecture/` or directly under `src/spreadsheet_handling/pipeline/`?
+* Should legacy step names be removed immediately or retained for exactly one beta with warnings?
+* Which direct YAML parameters should remain as convenience syntax once configuration steps exist?
+* Should frame lifecycle be written by every transformation step immediately, or first by selected high-risk transformations such as compact multiaxis and lookup helpers?
+* How strict should conflict handling be when a readback contains both canonical and editable projection frames?
+
+===
+
+=== Working Decision
+
+The project should proceed with this wave.
+
+The wave is large enough to justify an architecture document and FTR split, but implementation should remain incremental.
+
+Do not stabilize unintuitive step names merely for short-term compatibility.
+
+Do not hide heuristic behavior inside primitive transformation steps.
+
+Do not let render visibility become implicit pipeline routing.
+
+Make configuration, transformation, composition, inverse behavior, and frame lifecycle explicit enough that both architecture tests and user documentation can be derived from the same reviewed registry.
