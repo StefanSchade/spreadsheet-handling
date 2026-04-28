@@ -1,0 +1,189 @@
+===== Review: FTR-PIPELINE-STEP-REGISTRY-P4
+
+*Status:* Reviewed post-implementation.
+*Reviewed:* 2026-04-28
+*Commit:* 830abd3 (`docs(architecture): add pipeline step registry`)
+*Overall:* approve with findings
+
+'''
+
+====== Scope check
+
+The commit delivers exactly what the FTR promised:
+
+[cols="1,1,3"]
+|===
+| Deliverable | Present | Notes
+
+| JSON registry artifact
+| yes
+| `docs/internal_guide/architecture/pipeline_step_registry.json` — 958 lines, 18 step entries.
+
+| `.gitignore` exception
+| yes
+| Explicit `!` exception for the registry JSON under `docs/`.
+
+| Architecture guard tests
+| yes
+| `tests/architecture/dependency_guards/test_pipeline_step_registry.py` — 8 tests, all green.
+
+| Runtime behavior unchanged
+| yes
+| No changes to `registry.py`, `steps.py`, or any domain code.
+
+| Backlog housekeeping
+| yes
+| FTR moved from `ftrs/open/` to `ftrs/done/`, `_ftrs_open.adoc` and `_ftrs_done.adoc` updated.
+
+| Consumer repos
+| n/a
+| No consumer changes needed for this commit (registry is documentation-only). The naming commit `f0c3147` is a separate FTR.
+|===
+
+*No scope creep observed.* The registry commit touches exactly 6 files, all within scope.
+
+'''
+
+====== Registry quality
+
+===== Strengths
+
+* *Complete runtime coverage.* The test `test_pipeline_step_registry_covers_runtime_registry_exactly` enforces 1:1 correspondence between the JSON registry and `REGISTRY`. This is the single most important guard.
+
+* *Maintenance contract is self-describing.* Allowed categories, statuses, factory shapes, parameter source kinds, inverse kinds, and meta persistence values are all declared in the JSON header and validated by tests. Adding a new enum value requires updating both the contract and the entries — good drift protection.
+
+* *Composite transparency.* The guard `test_pipeline_step_registry_composites_declare_resolving_wrapped_steps` enforces that composite steps list their wrapped primitives and those primitives exist. This was one of the findings from the concept review (F-06) and is now covered.
+
+* *Alias lifecycle guard.* Even though no aliases exist yet, the test `test_pipeline_step_registry_aliases_are_structured_and_release_bounded` is already in place. This means the first alias addition will be structurally constrained from day one.
+
+* *`infrastructure` category.* The concept review (F-01) asked for a complete mapping of all 18 steps. This is done. `bootstrap_meta` and `apply_overrides` are classified as `infrastructure`, `identity` as `infrastructure/pass_through`. This is a reasonable answer to the ambiguity flagged in the review.
+
+===== Findings
+
+====== F-01: `meta_contract` `registry_ref` validation is incomplete
+
+Severity: low
+
+The test `test_pipeline_step_registry_meta_contract_references_meta_registry` checks structural shape and persistence validity, but does *not* verify that non-null `registry_ref` values actually exist in `meta_registry.yaml`.
+
+The test loads `_load_meta_registry_names()` but the function result is never used for cross-validation against `registry_ref` values.
+
+This means a typo in `registry_ref` (e.g., `"constraintss"` instead of `"constraints"`) would pass silently.
+
+Recommendation: Add an assertion that `ref["registry_ref"] in meta_registry_names` when `ref["registry_ref"]` is not `null`. This is likely a one-liner fix.
+
+====== F-02: `validate` step is `primitive` but has `validation_only` inverse — category placement worth a second look
+
+Severity: editorial
+
+The `validate` step is classified as `category: primitive` with `subtype: fk_integrity_validation`.
+The pipeline semantics concept doc defines `validation_only` as an inverse kind for steps that "check consistency but do not transform data."
+
+A step that only validates and never transforms could also be classified as `infrastructure` (like `identity`) or deserve a dedicated `validation` subtype under `primitive`.
+The current classification is defensible, but `validate` being both `primitive` and `validation_only` may confuse consumers who expect `primitive` steps to produce output transformations.
+
+No action required — just flagging as a decision to confirm intentionally.
+
+====== F-03: `add_fk_helpers` and `remove_fk_helpers` reference `implementation` targets with old function names
+
+Severity: low
+
+The naming commit (f0c3147, separate FTR) renamed the YAML-facing step names, but the `references.implementation` fields still point to the original factory function names:
+
+* `add_fk_helpers` → `implementation: spreadsheet_handling.pipeline.steps:make_apply_fks_step`
+* `remove_fk_helpers` → `implementation: spreadsheet_handling.pipeline.steps:make_drop_helpers_step`
+* `validate_fk_helpers` → `implementation: spreadsheet_handling.pipeline.steps:make_check_fk_helpers_step`
+
+This is technically correct (the Python functions were not renamed), but creates an asymmetry: the YAML name says `add_fk_helpers` while the implementation reference says `make_apply_fks_step`.
+
+Recommendation: Either rename the Python factory functions in a follow-up or add a note that internal factory names are intentionally decoupled from the public YAML surface.
+
+====== F-04: `replaces` field exists on some entries but is not in `common_required_step_fields`
+
+Severity: low
+
+The entries `add_fk_helpers`, `remove_fk_helpers`, `validate_fk_helpers`, `reorder_fk_helpers`, and `add_lookup_helpers` have a `replaces` field.
+This field is not listed in `common_required_step_fields`, which is correct (not all steps have it).
+
+But there is no validation that `replaces` values are not also present as current step names.
+The naming guard test covers this for the known five renames, but a general structural check would catch future mistakes.
+
+Recommendation: Consider adding a generic guard that `replaces` values do not collide with current entry names.
+
+====== F-05: `subtype` field is present but not in the maintenance contract
+
+Severity: editorial
+
+Every entry has a `subtype` field (e.g., `pass_through`, `fk_helper_projection`, `meta_bootstrap`), but `subtype` is not listed in `common_required_step_fields` and has no `allowed_subtypes` enum.
+
+This means subtypes are currently free-text and not guarded. This is probably intentional for flexibility, but differs from the stricter approach taken for other fields.
+
+Recommendation: Either add `subtype` to the contract with an allowed set, or add a brief comment in the JSON noting that subtypes are intentionally unguarded.
+
+====== F-06: ba-config already uses the new names — no action needed there
+
+Severity: informational
+
+The ba-config repo (`elmar_workbook.yaml`) already uses `add_lookup_helpers` and does not reference any old step names (`apply_fks`, `drop_helpers`, etc.).
+This was presumably done during the feature branch work, not as a separate naming migration.
+No ba-config changes are needed for this FTR.
+
+'''
+
+====== Test quality
+
+The 8 tests are well structured:
+
+[cols="1,3"]
+|===
+| Test | Assessment
+
+| `test_pipeline_step_registry_is_a_review_artifact`
+| Good. Validates the "not runtime-bound" contract header.
+
+| `test_pipeline_step_registry_covers_runtime_registry_exactly`
+| Critical guard. Prevents drift between JSON and Python.
+
+| `test_pipeline_step_registry_entries_have_required_shape_and_enums`
+| Thorough. Checks required fields, category/status/shape enums, parameter structure, inverse structure, and frame contract structure.
+
+| `test_pipeline_step_registry_resolves_runtime_targets`
+| Smart. Cross-checks `StepRegistration.target` against JSON `target` fields, and factory shape against binding type.
+
+| `test_pipeline_step_registry_composites_declare_resolving_wrapped_steps`
+| Good. Prevents opaque composites. Also checks non-composites have empty `wrapped_steps`.
+
+| `test_pipeline_step_registry_aliases_are_structured_and_release_bounded`
+| Forward-looking. Ready for the first alias.
+
+| `test_pipeline_step_registry_tracks_replaced_names_without_runtime_aliases`
+| Naming-specific (correctly marked `@pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")`). Hardcodes the five expected renames.
+
+| `test_pipeline_step_registry_meta_contract_references_meta_registry`
+| Structural check — but see F-01 about missing cross-validation.
+|===
+
+'''
+
+====== Conclusion
+
+Solid delivery. The registry is well-structured, the guards are meaningful, and the commit is cleanly scoped.
+
+The most actionable follow-up is F-01 (meta_registry cross-validation one-liner).
+F-03 (factory function name asymmetry) is worth deciding on before the naming commit is considered fully closed.
+The rest is editorial.
+
+'''
+
+====== Disposition 2026-04-28
+
+The review is accepted as positive.
+
+Follow-up handling:
+
+* F-01: current persistent `registry_ref` validation was already present after the naming slice; additionally hardened to validate any non-null `registry_ref`.
+* F-02: no action. `validate` remains a validation-only primitive for now.
+* F-03: no immediate rename. Internal factory names remain implementation details while the public YAML names are normalized.
+* F-04: addressed with a generic guard that `replaces` values do not collide with current registry entries or runtime keys.
+* F-05: addressed by making `subtype` part of `common_required_step_fields` and validating it as a non-empty string.
+* F-06: no action in the core repo. `ba-config` changes remain intentionally uncommitted for a later persona-specific commit.

@@ -87,6 +87,7 @@ def test_pipeline_step_registry_entries_have_required_shape_and_enums() -> None:
         assert entry["category"] in contract["categories"]
         assert entry["status"] in contract["statuses"]
         assert entry["factory_shape"] in contract["factory_shapes"]
+        assert isinstance(entry["subtype"], str) and entry["subtype"].strip()
         assert isinstance(entry["purpose"], str) and entry["purpose"].strip()
         assert isinstance(entry["parameters"], dict)
         assert isinstance(entry["wrapped_steps"], list)
@@ -178,6 +179,16 @@ def test_pipeline_step_registry_tracks_replaced_names_without_runtime_aliases() 
         assert replaced_name not in REGISTRY
 
 
+def test_pipeline_step_registry_replaced_names_do_not_collide_with_current_surface() -> None:
+    entries = _entries_by_name()
+
+    for entry in entries.values():
+        for replaced_name in entry.get("replaces", []):
+            assert isinstance(replaced_name, str) and replaced_name.strip(), entry["name"]
+            assert replaced_name not in entries, (entry["name"], replaced_name)
+            assert replaced_name not in REGISTRY, (entry["name"], replaced_name)
+
+
 def test_pipeline_step_registry_meta_contract_references_meta_registry() -> None:
     registry = _load_step_registry()
     contract = _contract_sets(registry)
@@ -205,4 +216,10 @@ def test_pipeline_step_registry_meta_contract_references_meta_registry() -> None
                         ref,
                     )
                 else:
+                    if ref["registry_ref"] is not None:
+                        assert ref["registry_ref"] in meta_registry_names, (
+                            entry["name"],
+                            direction,
+                            ref,
+                        )
                     assert "reason" in ref and ref["reason"], (entry["name"], direction, ref)
