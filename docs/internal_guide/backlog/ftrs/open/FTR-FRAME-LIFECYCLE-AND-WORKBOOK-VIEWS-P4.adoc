@@ -1,0 +1,667 @@
+===== FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4 -- Model frame lifecycle and workbook view rendering explicitly
+
+*Status:* Open
+*Epic:* Phase 4 -- Feature Expansion and Domain Transformations
+*Priority:* High
+
+*Depends-on:*
+
+* <<FTR-PIPELINE-SEMANTICS-CONCEPT-P4#,FTR-PIPELINE-SEMANTICS-CONCEPT-P4>>
+* <<FTR-PIPELINE-STEP-REGISTRY-P4#,FTR-PIPELINE-STEP-REGISTRY-P4>>
+* <<FTR-PIPELINE-STEP-NAMING-P4#,FTR-PIPELINE-STEP-NAMING-P4>>
+
+*Related-to:*
+
+* <<FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4#,FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4>>
+* <<FTR-PIPELINE-SEMANTICS-GUARDS-P4#,FTR-PIPELINE-SEMANTICS-GUARDS-P4>>
+* <<FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4#,FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4>>
+* <<FTR-FK-HELPER-DOMAIN-EXTRACTION#,FTR-FK-HELPER-DOMAIN-EXTRACTION>>
+* <<FTR-COMPACT-MULTIAXIS#,FTR-COMPACT-MULTIAXIS>>
+* <<FTR-SPREADSHEET-META-REGISTRY-P4#,FTR-SPREADSHEET-META-REGISTRY-P4>>
+* <<FTR-SPREADSHEET-SEMANTIC-INVARIANTS-P3I#,FTR-SPREADSHEET-SEMANTIC-INVARIANTS-P3I>>
+* <<FTR-SPREADSHEET-BACKEND-CONTRACT-P3H#,FTR-SPREADSHEET-BACKEND-CONTRACT-P3H>>
+* <<FTR-ARCHITECTURE-GUARD-INVENTORY-P4#,FTR-ARCHITECTURE-GUARD-INVENTORY-P4>>
+* <<FTR-GUARDRAIL-DECISION-RECORD-P4#,FTR-GUARDRAIL-DECISION-RECORD-P4>>
+
+'''
+
+====== Purpose
+
+Introduce an explicit frame lifecycle model and workbook view policy so that derived, intermediate, redundant, canonical, editable, and diagnostic frames are not handled implicitly.
+
+The goal is to avoid editable workbooks that expose multiple inconsistent representations of the same information, while preserving traceability, debug usefulness, and plugin extensibility.
+
+Rendering should be able to omit redundant or intermediate frames only when that decision is backed by explicit lifecycle/view metadata, not by name-based or shape-based guessing.
+
+'''
+
+====== Context
+
+`FTR-PIPELINE-SEMANTICS-CONCEPT-P4` established that pipeline execution should remain linear and that render visibility must not become hidden pipeline routing.
+
+Several current transformations naturally produce input/output frame pairs or multi-stage intermediate frames.
+
+Example:
+
+[source,yaml]
+----
+- step: contract_compact_multiaxis
+  relation: variable_codes
+  output: variable_usage_matrix_raw
+----
+
+After such a step, both the source relation and the projected matrix may exist in `Frames`.
+
+This is often useful for debugging and traceability. It is also risky for editable spreadsheet output, because a user may see and edit both canonical source data and derived projection data.
+
+The current consumer-facing integration also uses plugin code to materialize workbook views. That is legitimate: plugins are intended escape hatches for missing generic functionality and use-case-specific behavior. However, recurring view-materialization patterns should be candidates for generic framework support.
+
+This FTR introduces the common lifecycle and view vocabulary needed for both generic rendering and plugin-produced workbook views.
+
+'''
+
+====== Problem statement
+
+The framework currently lacks an explicit answer to these questions:
+
+* Which frames are canonical sources?
+* Which frames are derived projections?
+* Which frames are intermediate implementation artifacts?
+* Which frames are safe to expose in an editable workbook?
+* Which frames are redundant for a particular workbook view?
+* Which frames should be omitted from rendering by default?
+* Which frames are diagnostic-only?
+* Which frames participate in inverse reconstruction?
+* What happens when a readback contains conflicting redundant representations?
+
+Without a lifecycle model, downstream code tends to rely on implicit conventions:
+
+* frame names such as `_raw` or `_view`
+* plugin-specific keep/drop behavior
+* user discipline not to edit redundant sheets
+* ad hoc render flags
+* local knowledge of transformation order
+
+That is not strong enough for a framework that aims to support generated workbooks, inverse transformations, and maintainable consumer integration.
+
+'''
+
+====== Goals
+
+. Define a canonical `_meta.frame_lifecycle` metadata shape.
+. Allow transformation and plugin steps to describe frame roles explicitly.
+. Distinguish canonical, source, intermediate, projection, redundant, editable, diagnostic, and hidden/system frames.
+. Define a workbook view policy that consumes lifecycle metadata for rendering decisions.
+. Allow spreadsheet rendering to omit frames explicitly marked as redundant or omit-by-default.
+. Preserve debug and traceability use cases by allowing lifecycle-controlled visibility modes.
+. Keep pipeline execution linear; do not introduce payload-driven routing.
+. Keep plugins supported and able to declare caller-owned lifecycle responsibility.
+. Add meta-registry and step-registry entries for lifecycle/view metadata.
+. Add focused tests for lifecycle metadata and render omission behavior.
+
+'''
+
+====== Scope
+
+This FTR includes:
+
+* define `_meta.frame_lifecycle`
+* define initial lifecycle roles and render/editability flags
+* define workbook view policy fields
+* add helper functions for writing and reading lifecycle metadata
+* update selected high-risk transformations to write lifecycle metadata
+* update selected plugin/view materialization paths or document their lifecycle responsibility
+* add render-side support for omitting explicitly redundant or omit-by-default frames
+* add tests for lifecycle-driven rendering behavior
+* add meta-registry entries for lifecycle and view metadata
+* add step-registry fields or updates for frame contracts where needed
+
+Initial high-value candidate transformations:
+
+* `contract_compact_multiaxis`
+* `expand_compact_multiaxis`
+* `add_lookup_helpers`
+* selected plugin workbook-view materialization paths in controlled consumers
+
+The first implementation does not need to cover every transformation in the repository. It should establish the model and cover the transformations most likely to create redundant editable spreadsheet views.
+
+'''
+
+====== Non-goals
+
+This FTR does not:
+
+* introduce branching, routing, or DAG execution
+* allow the pipeline to skip steps based on `_meta`
+* infer redundancy from frame names, shapes, or suffixes
+* implement full multi-view workbook generation
+* solve all readback conflict scenarios
+* replace all plugin workbook-view logic immediately
+* require every transformation to emit lifecycle metadata in the first slice
+* change the spreadsheet backend contract beyond consuming explicit view/lifecycle metadata
+* remove debug/intermediate frames from in-memory `Frames` by default
+
+Deep lifecycle guards belong to `FTR-PIPELINE-SEMANTICS-GUARDS-P4`.
+
+Configuration-producing helper policy steps belong to `FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4`.
+
+'''
+
+====== Design rule
+
+Rendering may omit frames only from explicit lifecycle/view metadata.
+
+[source,text]
+----
+Allowed:
+  omit frame because _meta.frame_lifecycle[frame].render == omit_by_default
+  omit frame because workbook_view policy says to drop explicitly redundant frames
+
+Forbidden:
+  omit frame because its name ends with _raw
+  omit frame because another frame has similar columns
+  omit frame because a plugin happened to remove similarly shaped sheets before
+----
+
+Pipeline execution remains linear:
+
+[source,text]
+----
+Pipeline executes declared steps.
+Steps may write lifecycle/view metadata.
+Rendering consumes lifecycle/view metadata.
+Pipeline does not branch or skip semantic work by inspecting lifecycle metadata.
+----
+
+'''
+
+====== Target metadata model
+
+Suggested lifecycle shape:
+
+[source,yaml]
+----
+_meta:
+  frame_lifecycle:
+    variable_codes:
+      role: canonical_source
+      canonical: true
+      editable: false
+      render: omit_by_default
+      derived_from: []
+      superseded_by:
+        - variable_usage_matrix_raw
+      consistency_policy:
+        on_conflict: fail
+
+    variable_usage_matrix_raw:
+      role: intermediate
+      canonical: false
+      editable: false
+      render: omit_by_default
+      derived_from:
+        - variable_codes
+      superseded_by:
+        - variable_usage_matrix
+      produced_by:
+        step: contract_compact_multiaxis
+        name: elmar_variable_matrix
+
+    variable_usage_matrix:
+      role: editable_projection
+      canonical: false
+      editable: true
+      render: visible_by_default
+      derived_from:
+        - variable_usage_matrix_raw
+        - variables
+      consistency_policy:
+        on_conflict: fail
+----
+
+The exact structure may be refined during implementation, but the metadata should be explicit and inspectable.
+
+'''
+
+====== Initial lifecycle roles
+
+The lifecycle model should start with a small role vocabulary.
+
+[cols="1,4"]
+|===
+| Role | Meaning
+
+| `canonical_source`
+| A frame that owns canonical data for later reconstruction or validation.
+
+| `source`
+| A frame used as input but not necessarily canonical ownership.
+
+| `intermediate`
+| A derived frame used between transformations; usually not intended for editable workbook exposure.
+
+| `editable_projection`
+| A derived view intended for user editing, with explicit inverse or validation expectations.
+
+| `readonly_projection`
+| A derived view intended for display or diagnostics but not user editing.
+
+| `diagnostic`
+| A frame included to explain validation, differences, or processing state.
+
+| `redundant`
+| A frame that duplicates information available through another lifecycle path and should usually be omitted from editable views.
+
+| `system`
+| A framework-owned hidden or technical frame, not user-facing data.
+
+| `unknown`
+| Transitional classification for legacy or plugin-produced frames not yet reviewed.
+|===
+
+Roles can be refined later, but the first implementation should avoid a large ontology.
+
+'''
+
+====== Render policy values
+
+Suggested `render` values:
+
+[cols="1,4"]
+|===
+| Value | Meaning
+
+| `visible_by_default`
+| Render in ordinary workbook output unless the selected view suppresses it.
+
+| `omit_by_default`
+| Omit from ordinary workbook output unless the selected view requests debug/full output.
+
+| `hidden_by_default`
+| Render as a hidden sheet if the backend supports hidden sheets.
+
+| `debug_only`
+| Render only in explicit debug/development views.
+
+| `never`
+| Do not render as a user-visible workbook sheet.
+
+| `unknown`
+| Transitional value for frames not yet classified.
+|===
+
+Suggested `editable` values:
+
+[cols="1,4"]
+|===
+| Value | Meaning
+
+| `true`
+| Intended for user editing.
+
+| `false`
+| Not intended for user editing.
+
+| `readonly`
+| Visible but not intended for editing; backend support may vary.
+
+| `unknown`
+| Transitional classification.
+|===
+
+The first implementation may use booleans for `editable`, but registry/meta documentation should leave room for `readonly` semantics.
+
+'''
+
+====== Workbook view policy
+
+Frame lifecycle describes frames. Workbook view policy describes how a particular output should use those lifecycle declarations.
+
+Suggested shape:
+
+[source,yaml]
+----
+_meta:
+  workbook_view:
+    mode: editable
+    include_roles:
+      - editable_projection
+      - readonly_projection
+      - diagnostic
+    omit_roles:
+      - intermediate
+      - redundant
+      - system
+    drop_redundant_data: true
+    include_debug_frames: false
+    unknown_frame_policy: visible
+----
+
+The initial view model can be intentionally narrow:
+
+* default editable view
+* optional debug/full view
+* explicit treatment for unknown frames
+
+Multi-view workbook generation is deferred.
+
+'''
+
+====== Render behavior
+
+Spreadsheet rendering should be able to consume lifecycle/view metadata before composing visible workbook sheets.
+
+Target behavior:
+
+. Build or receive `Frames + meta_canonical` as today.
+. Resolve the workbook view policy.
+. Filter or mark frames according to `_meta.frame_lifecycle` and `_meta.workbook_view`.
+. Pass the selected frames to the spreadsheet render path.
+. Persist canonical metadata for roundtrip where appropriate.
+
+Important boundary:
+
+* The pipeline should not change execution behavior based on lifecycle metadata.
+* The render/write path may decide which frames become visible workbook sheets based on explicit lifecycle/view metadata.
+
+Rendering should not infer lifecycle from names such as `_raw`, `_matrix`, `_view`, or `_debug`.
+
+'''
+
+====== Plugin interaction
+
+Plugins remain legitimate extension points.
+
+A plugin may:
+
+* create workbook-specific view frames
+* drop or keep source frames
+* materialize use-case-specific projections
+* write lifecycle metadata
+* declare caller-owned lifecycle responsibility
+
+This FTR should not force all workbook-view plugin logic into generic framework code.
+
+Instead, plugins should participate in the lifecycle model in one of two ways:
+
+[cols="1,4"]
+|===
+| Mode | Meaning
+
+| `declared_lifecycle`
+| The plugin writes `_meta.frame_lifecycle` for frames it creates, drops, or supersedes.
+
+| `caller_owned_lifecycle`
+| The plugin declares that lifecycle decisions are owned by the plugin/consumer and should not be inferred by the generic framework.
+|===
+
+Reusable plugin patterns should be reviewed later for migration into generic configuration, primitive, or composite steps.
+
+Plugin behavior should be a source of framework learning, not an architecture violation.
+
+'''
+
+====== Transformation interaction
+
+Transformations should gradually write lifecycle metadata where they create derived or redundant frames.
+
+Initial candidate: `contract_compact_multiaxis`
+
+[source,yaml]
+----
+relation: variable_codes
+output: variable_usage_matrix_raw
+----
+
+Expected lifecycle effect:
+
+* input relation remains available in memory
+* output matrix is marked as derived from relation
+* output may become an intermediate if later enriched into a final editable projection
+* relation may be omitted from ordinary editable workbook views if superseded by a projection
+
+Initial candidate: `add_lookup_helpers`
+
+[source,yaml]
+----
+source: variable_usage_matrix_raw
+lookup: variables
+output: variable_usage_matrix
+----
+
+Expected lifecycle effect:
+
+* source frame may become intermediate or superseded
+* lookup frame remains canonical/reference data unless another policy says otherwise
+* output frame becomes editable or readonly projection depending on view policy
+
+These defaults should be conservative. Do not hide canonical source data unless lifecycle policy explicitly says it is safe.
+
+'''
+
+====== Inverse and consistency behavior
+
+Frame lifecycle does not by itself solve inverse transformation.
+
+It records which frames are expected to own data, derive data, or act as editable projections.
+
+Consistency policy should be explicit.
+
+Suggested values for `consistency_policy.on_conflict`:
+
+[cols="1,4"]
+|===
+| Value | Meaning
+
+| `fail`
+| Conflicting redundant/canonical/projection data is an error.
+
+| `prefer_canonical`
+| Canonical source wins; projection differences are ignored or reported.
+
+| `prefer_projection`
+| Editable projection wins and is used to reconstruct canonical form.
+
+| `warn`
+| Conflict is reported but does not fail.
+
+| `ignore`
+| Conflict is intentionally ignored.
+
+| `unknown`
+| Transitional policy not yet defined.
+|===
+
+The first implementation may only document or persist these policies. Full readback conflict handling may be a follow-up.
+
+'''
+
+====== Meta registry updates
+
+Add meta-registry entries for:
+
+[source,text]
+----
+frame_lifecycle
+workbook_view
+----
+
+The entries should clarify:
+
+* layer: `meta_canonical`
+* classification: `canonical_meta` or a more precise agreed classification
+* meaning: lifecycle/view policy for frames in the current workbook transformation context
+* scope: workbook-level mapping with frame-local children
+* origin: transformation steps, plugin steps, caller-supplied meta, or configuration steps
+* render relevance: direct for workbook views, indirect/direct for lifecycle depending on use
+* persistence behavior: persisted if needed for roundtrip, diagnostics, or inverse reconstruction
+* roundtrip relevance: important when editable projections or redundant frames participate in readback
+* producers: selected transformations, plugins, lifecycle configuration steps
+* consumers: render/write path, future readback/conflict handling, diagnostics
+
+If lifecycle is initially treated as an operational view rather than canonical metadata, the meta registry must say so explicitly. Do not leave its layer/classification ambiguous.
+
+'''
+
+====== Step registry updates
+
+Update step-registry entries to describe lifecycle behavior for affected steps.
+
+For selected transformations, add or refine:
+
+* `frame_contract.reads`
+* `frame_contract.writes`
+* `frame_contract.preserves`
+* `frame_contract.replaces`
+* `frame_contract.drops`
+* `frame_contract.internal_frames`
+* `frame_contract.view_outputs`
+* lifecycle metadata writes
+
+For plugin step entry, document lifecycle responsibility mode:
+
+[source,json]
+----
+{
+  "name": "plugin",
+  "category": "plugin",
+  "plugin_contract": {
+    "may_change_frame_set": true,
+    "lifecycle_responsibility": "declared_lifecycle_or_caller_owned",
+    "diagnostics": "warn_if_frames_change_without_lifecycle"
+  }
+}
+----
+
+For composite steps, lifecycle metadata should be consistent with internal frame policy.
+
+'''
+
+====== Architecture guard scope in this FTR
+
+This FTR may add only focused guards that are stable enough.
+
+Useful first guards:
+
+. `frame_lifecycle` and `workbook_view` meta-registry entries exist.
+. Render omission code does not use hard-coded frame-name suffixes for lifecycle decisions.
+. Step-registry entries for selected lifecycle-aware transformations declare frame contracts.
+. Plugin registry entry explicitly allows lifecycle responsibility.
+
+Defer broader guards to `FTR-PIPELINE-SEMANTICS-GUARDS-P4`:
+
+* all lifecycle-writing transformations have complete lifecycle entries
+* readback conflict handling honors consistency policy
+* renderer never infers redundancy by shape
+* composite internal frame references cannot leak into public lifecycle
+
+'''
+
+====== Tests
+
+Required tests:
+
+. A lifecycle-aware transformation writes expected `_meta.frame_lifecycle` entries.
+. A lookup-helper projection can mark source/output lifecycle correctly in a representative case.
+. A compact-multiaxis contraction can mark source/output lifecycle correctly in a representative case.
+. Rendering with `drop_redundant_data` or equivalent view policy omits only explicitly omitted/redundant frames.
+. Rendering without that policy preserves current visibility behavior or follows documented default behavior.
+. Unknown frames follow `unknown_frame_policy`.
+. Plugin-created view frames can be accepted when lifecycle is declared or caller-owned responsibility is explicit.
+
+Negative tests:
+
+. Renderer must not omit a frame merely because its name ends with `_raw`.
+. Renderer must not omit a frame merely because it is listed as `derived_from` unless render/view policy says so.
+. Conflicting lifecycle entries fail validation if the validation helper is introduced in this slice.
+
+The first slice may keep readback conflict behavior as documentation plus metadata tests if full inverse/readback handling would make the FTR too large.
+
+'''
+
+====== Suggested implementation direction
+
+. Add lifecycle data structures or small helper functions in the domain/pipeline-adjacent layer.
+. Add meta-registry entries for `frame_lifecycle` and `workbook_view`.
+. Update selected transformations to write lifecycle metadata.
+. Update plugin contract documentation and step-registry entry.
+. Add a render-side frame selection helper that consumes lifecycle/view metadata.
+. Wire the helper into spreadsheet output only where behavior is explicitly configured.
+. Keep default output behavior conservative unless explicitly changed.
+. Add tests for lifecycle metadata and render omission.
+. Record intentional current-state gaps in delivery notes.
+
+Avoid building a broad lifecycle engine in the first slice. Implement the smallest useful path that prevents redundant editable workbook views in the current integration scenario.
+
+'''
+
+====== Acceptance criteria
+
+. `_meta.frame_lifecycle` is defined and documented.
+. `_meta.workbook_view` or an equivalent explicit view policy is defined and documented.
+. Meta-registry entries exist for lifecycle/view metadata.
+. Step-registry entries for selected lifecycle-aware steps declare frame contract effects.
+. At least one compact/matrix transformation writes lifecycle metadata.
+. At least one lookup/helper projection path writes or preserves lifecycle metadata appropriately.
+. Rendering can omit explicitly redundant or omit-by-default frames when configured.
+. Rendering does not infer redundancy from frame names or frame shapes.
+. Plugins remain supported and can either write lifecycle metadata or declare caller-owned lifecycle responsibility.
+. Tests cover lifecycle metadata creation and lifecycle-driven render selection.
+. Existing active tests continue to pass.
+. Any readback conflict behavior not implemented in this slice is explicitly documented as follow-up.
+
+'''
+
+====== Review guidance
+
+When reviewing this FTR, check:
+
+* Is lifecycle metadata explicit enough to avoid name-based render heuristics?
+* Does the pipeline remain linear and free of lifecycle-driven routing?
+* Are canonical frames and editable projections clearly distinguished?
+* Are intermediate frames allowed for debugging without becoming default editable workbook sheets?
+* Does the design keep plugins viable?
+* Are plugin-produced workbook views either lifecycle-aware or explicitly caller-owned?
+* Does render omission require explicit lifecycle/view policy?
+* Are unknown/transitional frames handled conservatively?
+* Are meta-registry and step-registry updates aligned?
+
+'''
+
+====== Rationale
+
+The framework increasingly produces multiple related frame representations: canonical relations, compact matrices, enriched workbook views, helper projections, and debug/intermediate frames.
+
+Keeping all of them in memory is useful. Rendering all of them as editable workbook sheets is not always safe.
+
+A lifecycle model lets the framework say explicitly:
+
+* this frame owns data
+* this frame is derived
+* this frame is editable
+* this frame is redundant in this workbook view
+* this frame is diagnostic-only
+* this frame should not be rendered by default
+
+That is more robust than relying on naming conventions, plugin side effects, or user discipline.
+
+The lifecycle model also provides the vocabulary needed for later inverse/readback consistency checks.
+
+'''
+
+====== Initial GDR entry
+
+[source,text]
+----
+Guard ID: GDR-FRAME-LIFECYCLE-001
+Boundary / Invariant: Workbook rendering may omit redundant/intermediate frames only through explicit lifecycle/view metadata
+Type: durable-invariant
+Protected modules / paths: src/spreadsheet_handling/pipeline/, src/spreadsheet_handling/domain/transformations/, src/spreadsheet_handling/rendering/, docs/internal_guide/architecture/meta_registry.yaml, docs/internal_guide/architecture/pipeline_step_registry.json
+Forbidden patterns / imports: render omission based on frame-name suffixes or shape heuristics; pipeline branching or step skipping based on frame_lifecycle
+Allowed exceptions: explicitly documented current-state plugin paths with caller-owned lifecycle responsibility
+Exception sunset condition: current-state plugin exceptions reviewed when a reusable workbook-view pattern appears or before the next beta that claims lifecycle-aware rendering
+Owner / Review role: pipeline and rendering architecture review
+Review cadence: each transformation that creates derived frames, each plugin workbook-view path, and each render visibility change
+Failure mode in CI: lifecycle metadata test failure, render non-guessing guard failure, or registry/meta-registry alignment failure
+Linked FTR(s): FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4, FTR-PIPELINE-SEMANTICS-CONCEPT-P4, FTR-PIPELINE-STEP-REGISTRY-P4, FTR-PIPELINE-SEMANTICS-GUARDS-P4
+----

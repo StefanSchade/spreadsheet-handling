@@ -1,69 +1,102 @@
 == Pipeline Step Semantics, Configuration Contracts, and Frame Lifecycle
 
 :status: draft
-:scope: architecture-review-artifact
+:scope: architecture
 :updated: 2026-04-28
 
 === Purpose
 
-This document records the intended direction for pipeline step semantics before the public YAML surface hardens further.
+This document defines the intended semantics for pipeline steps before the public YAML surface hardens further.
 
-The goal is to make transformation behavior explicit, inspectable, and documentable without giving up pragmatic convenience for common cases.
+It separates configuration, primitive execution, composition, plugins, frame lifecycle, and render/view decisions so that pipeline behavior remains explicit, inspectable, testable, and documentable.
 
-The document is intentionally architectural first. Implementation should happen in small, reviewable slices.
-
-===
+The document is an architecture artifact. It is not itself a runtime contract. Implementation should happen in small, reviewable slices.
 
 === Problem Statement
 
-The current pipeline has grown useful transformation capabilities, but the public step surface is becoming harder to reason about.
+The pipeline already supports useful transformations, but the step surface is becoming harder to reason about.
 
-Several different concerns are currently mixed or only implicitly separated:
+Several concerns are currently mixed or only implicitly separated:
 
 * primitive data transformations
-* composite transformations that wrap several primitives
+* composite transformations that call several primitives
 * heuristic discovery of configuration
 * explicit user configuration
-* metadata persistence for later inverse operations
+* metadata persistence for inverse or diagnostic use
+* plugin extension points
 * render/view decisions about which frames should be visible or editable
 
-This creates several risks:
+This creates avoidable risks:
 
 * Users cannot easily tell whether a step executes a transformation, infers configuration, or does both.
 * Heuristics can become opaque runtime behavior instead of inspectable configuration.
-* Composite steps can hide the fact that several primitive operations are being executed.
-* Intermediate frames can remain visible next to derived frames, creating redundant or inconsistent editable data.
-* The inverse direction of a transformation may depend on metadata that is not clearly documented.
-* User documentation and architecture tests have no single registry from which to derive expectations.
+* Composite steps can hide primitive operations and temporary frames.
+* Plugins can materialize workbook views without a common lifecycle language.
+* Intermediate and derived frames can remain visible next to canonical frames, creating redundant editable data.
+* Inverse operations may rely on metadata that is not documented as part of a step contract.
+* User documentation and architecture tests have no single inventory from which to derive expectations.
 
-===
+=== Core Design Principle
 
-=== Design Principle
-
-Pipeline steps should separate configuration, execution, and composition.
+Pipeline steps should separate configuration, execution, composition, and extension.
 
 [source,text]
 ----
 configuration step
-  -> writes explicit configuration into _meta
+  -> writes explicit, resolved configuration into _meta
 
 primitive step
-  -> reads explicit configuration from parameters and/or _meta
-  -> executes one transformation deterministically
-  -> writes provenance and lifecycle metadata
+  -> reads direct parameters and/or resolved configuration
+  -> builds one effective configuration
+  -> executes one deterministic operation
+  -> writes provenance and lifecycle metadata where applicable
 
 composite step
   -> wraps a documented sequence of primitive and/or configuration steps
-  -> remains a convenience surface, not the only location of semantics
+  -> declares public outputs, internal frames, and wrapped step trace policy
+
+plugin step
+  -> remains an explicit escape hatch for caller-owned behavior
+  -> may later be replaced by generic framework behavior if the use case proves reusable
 ----
 
-===
+Design rule:
+
+[source,text]
+----
+Heuristics may propose configuration.
+They must not silently define execution semantics inside the main primitive transform.
+----
 
 === Step Categories
 
-==== Primitive Steps
+The step registry should support at least these categories:
 
-A primitive step performs exactly one domain-level operation.
+[cols="1,4"]
+|===
+| Category | Meaning
+
+| `primitive`
+| Executes one domain-level operation or validation using explicit parameters and/or resolved metadata.
+
+| `configuration`
+| Creates or validates configuration in `_meta`; may use heuristics and `auto`.
+
+| `composite`
+| Wraps a documented sequence of primitive and/or configuration steps.
+
+| `plugin`
+| Calls external, caller-owned code through a deliberate extension point.
+
+| `infrastructure`
+| Provides pipeline mechanics such as pass-through, bootstrap, or external override loading; not a domain transformation.
+|===
+
+A category is not enough by itself. Registry entries should also carry subtype and inverse information where useful, for example `validation`, `header_shape`, `meta_bootstrap`, `view_materialization`, or `lookup_projection`.
+
+=== Primitive Steps
+
+A primitive step performs exactly one operation.
 
 Examples:
 
@@ -78,16 +111,18 @@ Examples:
 
 Rules:
 
-* A primitive step must not silently infer structural policy from naming conventions unless that inference is explicitly part of a prior configuration contract.
-* A primitive step may accept direct parameters for convenience, but its effective behavior should be representable in `_meta`.
-* A primitive step should write enough provenance to support diagnostics, view decisions, and inverse operations where applicable.
-* A primitive step should declare whether it is bijective, conditionally bijective, projection-only, validation-only, or extraction-like.
+* A primitive step must not interpret `auto` values, except for explicitly documented transitional legacy behavior.
+* A primitive step may accept direct YAML parameters for convenience.
+* If a primitive step accepts direct parameters, it must be possible to express the same effective behavior as resolved metadata.
+* If direct YAML parameters and resolved `_meta` policy both apply and conflict, the step must fail rather than choose one silently.
+* A primitive step should write provenance where the result is derived or needed for diagnostics.
+* A primitive step should declare its inverse kind.
 
-==== Configuration Steps
+=== Configuration Steps
 
 A configuration step writes or validates explicit configuration in `_meta`.
 
-Configuration steps are the intended home for heuristic behavior.
+Configuration steps are the intended place for heuristics.
 
 Examples:
 
@@ -100,71 +135,11 @@ Examples:
 
 Rules:
 
-* A configuration step may use heuristics.
-* A configuration step may interpret `auto` values.
-* A configuration step may combine user-supplied overrides with inferred defaults.
-* The result must be explicit metadata, not hidden runtime behavior.
-* Later primitive steps should be able to run against that resolved metadata.
-
-Design rule:
-
-[source,text]
-----
-Heuristics may propose configuration.
-They must not silently define execution semantics inside the main transform.
-----
-
-==== Composite Steps
-
-A composite step wraps a documented sequence of primitive and/or configuration steps.
-
-Examples:
-
-* `expand_compact_multiaxis`
-* `contract_compact_multiaxis`
-* future workbook-view preparation steps
-
-Rules:
-
-* A composite step must declare which primitive steps it semantically wraps.
-* A composite step must declare which `_meta` contracts it reads and writes.
-* A composite step may remain as a convenience API, but the primitive sequence must remain understandable and testable independently.
-* Composite steps should not become hidden second implementations of primitive behavior.
-
-==== Plugin Steps
-
-Plugin steps are explicit escape hatches into caller-owned code.
-
-Rules:
-
-* A plugin step should be treated as externally owned behavior.
-* A plugin step should still be encouraged to write provenance and lifecycle metadata when it produces or suppresses frames.
-* Plugin behavior should not be used as a substitute for missing generic primitives if the behavior is broadly reusable.
-
-===
-
-=== Heuristics Versus Explicit Configuration
-
-Heuristics and explicit configuration both have legitimate uses.
-
-Heuristics are useful when:
-
-* conventional naming makes intent obvious
-* boilerplate would be disproportionate
-* the user wants a low-friction default path
-* inferred behavior is easy to inspect afterward
-
-Explicit configuration is preferable when:
-
-* naming conventions are ambiguous
-* domain-specific constraints exist
-* debugging and reviewability matter
-* consumer repositories need stable, transparent behavior
-* inverse operations depend on precise reconstruction metadata
-
-The preferred architecture is not a binary choice between heuristic and explicit behavior.
-
-Instead, each configurable aspect may support explicit values or `auto`.
+* Configuration steps may use heuristics.
+* Configuration steps may interpret `auto`.
+* Configuration steps may combine user-supplied overrides with inferred defaults.
+* Configuration steps must write resolved, inspectable metadata.
+* Later primitive steps should be able to execute against that resolved metadata.
 
 Example:
 
@@ -207,23 +182,296 @@ pipeline:
     helpers: default
 ----
 
-In both variants, the primitive step executes against an explicit resolved policy.
+The primitive step does not own the heuristic. It executes the resolved policy.
 
-===
+=== Inline Parameters, Resolved Metadata, and Conflict Rules
+
+Primitive steps may support direct YAML parameters during the transition to richer configuration steps.
+
+This is acceptable only if conflict behavior is explicit.
+
+Rules:
+
+. A primitive step builds an `effective_config` before execution.
+. `effective_config` may be built from inline YAML, resolved `_meta` policy, or both.
+. If inline YAML and resolved `_meta` policy define the same semantic field with different values, the step fails.
+. `auto` is not a valid primitive-step value unless explicitly documented as transitional legacy behavior.
+. The registry marks every parameter by source kind.
+
+Recommended parameter source kinds:
+
+[cols="1,3"]
+|===
+| Source kind | Meaning
+
+| `inline_only`
+| Parameter is supplied directly and is not part of a reusable policy.
+
+| `policy_ref`
+| Parameter selects or references a resolved policy from `_meta`.
+
+| `resolved_meta`
+| Parameter is expected to be read from `_meta` after configuration.
+
+| `inline_or_policy`
+| Parameter may come from direct YAML or `_meta`, but conflicts fail.
+
+| `deprecated_alias`
+| Transitional name or shape retained only for migration.
+|===
+
+=== Composite Steps
+
+A composite step is a convenience wrapper over a documented sequence of lower-level operations.
+
+Examples:
+
+* `expand_compact_multiaxis`
+* `contract_compact_multiaxis`
+* future workbook-view preparation steps
+
+Rules:
+
+* A composite step must declare `wrapped_steps` in the step registry.
+* Every wrapped step must exist as a registered primitive, configuration, or infrastructure step.
+* A composite step must declare public outputs.
+* A composite step must declare internal frames, if any.
+* A composite step must declare whether primitive trace metadata is kept, suppressed, or nested under the composite namespace.
+* A composite step must not become a hidden second implementation of the primitive behavior.
+
+Composite provenance policy is mandatory when composite steps use temporary frames internally. If primitive metadata points at frames that are removed before the step returns, later lifecycle, inverse, or documentation logic can misread those frames as public artifacts.
+
+Recommended composite fields:
+
+[source,json]
+----
+{
+  "category": "composite",
+  "wrapped_steps": ["encode_cell_values", "contract_xref"],
+  "frame_contract": {
+    "reads": ["variable_codes"],
+    "writes": ["variable_usage_matrix_raw"],
+    "internal_frames": ["__compact_multiaxis_<name>_encoded"],
+    "public_outputs": ["variable_usage_matrix_raw"]
+  },
+  "composite_trace": {
+    "primitive_meta_policy": "nested_under_composite",
+    "suppressed_meta": [],
+    "notes": "Internal primitive traces must not be interpreted as public frame contracts."
+  }
+}
+----
+
+Allowed primitive metadata policies for composite steps:
+
+[cols="1,3"]
+|===
+| Policy | Meaning
+
+| `preserve_public`
+| Wrapped primitive metadata is kept because it references public frames.
+
+| `nested_under_composite`
+| Wrapped primitive metadata is retained only as internal trace below the composite namespace.
+
+| `suppress_internal`
+| Wrapped primitive metadata that refers only to internal frames is not emitted.
+
+| `current_state_unknown`
+| Temporary classification until the composite is reviewed.
+|===
+
+=== Plugin Steps and Genericization Loop
+
+Plugins are legitimate and must remain integrable.
+
+A plugin is the right place for behavior that is not yet generic, is tied to a concrete consumer model, or is still being explored.
+
+The intended lifecycle for plugin-originated behavior is:
+
+[source,text]
+----
+Plugin solves a real use case.
+Then review asks:
+  A) Is this reusable framework behavior?
+     -> add a generic primitive/configuration/composite step and migrate controlled plugins.
+  B) Is this consumer-specific behavior?
+     -> keep it as plugin logic and document the responsibility boundary.
+----
+
+The framework must not be designed so tightly that plugins become second-class or impossible.
+
+Rules:
+
+* Plugin steps are explicit extension points, not architecture violations.
+* A plugin may create, replace, drop, or materialize frames.
+* If a plugin changes the frame set, it should either write lifecycle metadata or declare that it owns lifecycle responsibility for its output.
+* Missing lifecycle metadata from a plugin should initially produce diagnostics or review warnings, not a hard failure.
+* Genericization should be driven by recurring plugin patterns, not by theoretical purity.
+
+Recommended plugin registry fields:
+
+[source,json]
+----
+{
+  "name": "plugin",
+  "category": "plugin",
+  "plugin_contract": {
+    "may_change_frame_set": true,
+    "lifecycle_responsibility": "caller_owned_or_declared",
+    "diagnostics": "warn_if_frames_change_without_lifecycle"
+  }
+}
+----
+
+Workbook-view plugins such as consumer-specific `build_*_workbook_views` functions should be treated as current transition paths. They may remain plugins when they are model-specific, or become generic view-materialization steps if the pattern repeats.
+
+=== Infrastructure Steps
+
+Some steps are not domain transformations and should not be forced into the primitive/configuration/composite model.
+
+Examples:
+
+* `identity`
+* `bootstrap_meta`
+* `apply_overrides`
+
+These are infrastructure or meta-bootstrap steps.
+
+Rules:
+
+* Infrastructure steps still need registry entries.
+* Infrastructure steps still need documented parameter surfaces.
+* Infrastructure steps may read or write `_meta`, but their role should be classified explicitly as bootstrap, override loading, or pass-through.
+
+=== Current Runtime Step Classification
+
+This table is a starting classification for the current runtime registry. It should be verified mechanically in the first registry implementation slice.
+
+[cols="2,2,2,5"]
+|===
+| Current step | Proposed category | Proposed direction | Notes
+
+| `identity`
+| `infrastructure`
+| keep name
+| Pass-through step. Useful for tests and generated configs.
+
+| `validate`
+| `primitive`
+| consider `validate_fk_integrity`
+| Current generic name hides that the implementation focuses on duplicate IDs and FK resolvability.
+
+| `apply_fks`
+| `primitive` transitional
+| `add_fk_helpers`
+| Currently contains FK convention detection. Target direction is to split policy inference from helper materialization.
+
+| `drop_helpers`
+| `primitive`
+| `remove_fk_helpers`
+| Current name is too broad. Removal should use provenance or explicit policy where possible.
+
+| `check_fk_helpers`
+| `primitive`
+| `validate_fk_helpers`
+| Validation-only primitive.
+
+| `plugin`
+| `plugin`
+| keep name
+| Deliberate extension point. Should remain open and documented.
+
+| `flatten_headers`
+| `primitive`
+| keep name
+| Header-shape primitive.
+
+| `unflatten_headers`
+| `primitive`
+| keep name
+| Header-shape primitive.
+
+| `reorder_helpers`
+| `primitive`
+| `reorder_fk_helpers`
+| Current behavior is FK-helper specific rather than generic helper behavior.
+
+| `add_validations`
+| `configuration`
+| consider `configure_validations`
+| Writes validation intent for later rendering. The current name sounds like immediate backend behavior.
+
+| `bootstrap_meta`
+| `infrastructure`
+| keep name or clarify in docs
+| Merges profile defaults, persisted meta, and runtime overrides. Not a domain-specific configuration step.
+
+| `apply_overrides`
+| `infrastructure`
+| keep name or clarify in docs
+| Loads/applies external override documents. Adjacent to configuration but not itself a domain policy primitive.
+
+| `expand_xref`
+| `primitive`
+| keep name
+| Matrix to relation transformation.
+
+| `contract_xref`
+| `primitive`
+| keep name
+| Relation to matrix transformation.
+
+| `decode_cell_values`
+| `primitive`
+| keep name
+| Compact cell-code values to explicit rows/tokens.
+
+| `encode_cell_values`
+| `primitive`
+| keep name
+| Explicit rows/tokens to compact cell-code values.
+
+| `expand_compact_multiaxis`
+| `composite`
+| keep name
+| Wraps `expand_xref` and `decode_cell_values`.
+
+| `contract_compact_multiaxis`
+| `composite`
+| keep name
+| Wraps `encode_cell_values` and `contract_xref`.
+
+| `enrich_lookup`
+| `primitive`
+| `add_lookup_helpers`
+| Explicit lookup-helper projection. Proposed name better describes the source frame effect.
+|===
+
+Only FK/helper/lookup names are in the immediate rename scope unless a later decision explicitly broadens the naming wave.
 
 === Step Registry
 
 A JSON-based step registry should become the reviewable inventory of the public pipeline surface.
 
-The registry is not initially a runtime engine.
+Initial status:
 
-First purpose:
+[source,text]
+----
+The JSON step registry is a review artifact validated against runtime REGISTRY.
+It is not initially the runtime source of truth.
+Runtime REGISTRY remains authoritative until a future decision explicitly changes that.
+----
+
+Initial purpose:
 
 * document every public step
-* classify steps by category
-* document parameters and effective metadata contracts
+* classify steps by category and subtype
+* document parameters and their source kinds
+* document effective metadata contracts
 * document frame input/output behavior
 * document inverse behavior
+* document composite wrappers and plugin extension contracts
 * support architecture tests
 * later support generated user documentation
 
@@ -234,7 +482,7 @@ Recommended initial location:
 docs/internal_guide/architecture/pipeline_step_registry.json
 ----
 
-This location is acceptable while the internal guide is still the active architecture staging area. If the registry becomes runtime-bound or public user documentation is generated from it, it should later move to a stable product-facing location such as:
+This location is acceptable while the internal guide is the active architecture staging area. If the registry becomes runtime-bound or directly product-facing, it should later move to a stable product-facing location such as:
 
 [source,text]
 ----
@@ -248,84 +496,121 @@ or:
 docs/reference/pipeline_step_registry.json
 ----
 
-Important repository note:
+Repository rule:
 
-* If the registry stays under `docs/`, `.gitignore` must not treat this JSON file as ephemeral.
-* Add a specific exception if necessary.
+* If the JSON registry stays under `docs/`, add a precise `.gitignore` exception for this file.
+* Do not rely on a path currently treated as ephemeral by repository ignore rules.
 
-=== Minimal Registry Shape
+=== Step Registry Schema Direction
+
+Recommended minimal registry entry shape:
 
 [source,json]
 ----
 {
-  "registry_version": 1,
-  "steps": [
+  "name": "add_lookup_helpers",
+  "runtime_name": "enrich_lookup",
+  "category": "primitive",
+  "subtype": "lookup_projection",
+  "status": "proposed_rename",
+  "target": "spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup",
+  "factory_shape": "frames_target",
+  "aliases": [
     {
-      "name": "add_lookup_helpers",
-      "category": "primitive",
-      "status": "public",
-      "purpose": "Add configured helper columns from a lookup frame to a source frame.",
-      "wrapped_steps": [],
-      "parameters": {
-        "source": {"required": true, "type": "string"},
-        "lookup": {"required": true, "type": "string"},
-        "output": {"required": true, "type": "string"},
-        "on": {"required": true, "type": ["string", "array", "object"]},
-        "helpers": {"required": true, "type": ["string", "array", "object"]}
-      },
-      "meta_contract": {
-        "reads": ["helper_policies"],
-        "writes": ["derived.sheets.*.lookup_helpers"]
-      },
-      "frame_contract": {
-        "inputs": ["source", "lookup"],
-        "outputs": ["output"],
-        "retains_inputs_by_default": true
-      },
-      "inverse": {
-        "kind": "projection_only",
-        "inverse_step": null,
-        "reason": "Helper columns are derived projections from lookup data and do not own canonical data."
-      },
-      "ftr": "FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4"
+      "name": "enrich_lookup",
+      "status": "deprecated_alias",
+      "deprecated_since": "0.1.0b-next",
+      "remove_after": "0.1.0b-next+1"
     }
-  ]
+  ],
+  "parameters": {
+    "source": {"required": true, "type": "string", "source_kind": "inline_only"},
+    "lookup": {"required": true, "type": "string", "source_kind": "inline_or_policy"},
+    "output": {"required": true, "type": "string", "source_kind": "inline_only"},
+    "on": {
+      "required": true,
+      "type": ["string", "array", "object"],
+      "source_kind": "inline_or_policy",
+      "notes": "Object form maps source columns to lookup columns."
+    },
+    "helpers": {"required": true, "type": ["string", "array", "object"], "source_kind": "inline_or_policy"}
+  },
+  "meta_contract": {
+    "reads": [
+      {"path": "helper_policies", "layer": "meta_canonical", "classification": "canonical_meta", "registry_ref": "helper_policies"}
+    ],
+    "writes": [
+      {"path": "derived.sheets.*.lookup_helpers", "layer": "meta_canonical", "classification": "canonical_meta", "registry_ref": "derived_lookup_helpers"}
+    ]
+  },
+  "frame_contract": {
+    "reads": ["source", "lookup"],
+    "writes": ["output"],
+    "preserves": ["source", "lookup"],
+    "replaces": [],
+    "drops": [],
+    "internal_frames": [],
+    "view_outputs": ["output"]
+  },
+  "inverse": {
+    "kind": "projection_only",
+    "inverse_step": null,
+    "reason": "Helper columns are derived projections from lookup data and do not own canonical data."
+  },
+  "wrapped_steps": [],
+  "ftr": "FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4",
+  "docs": {"user_reference": "generated"}
 }
 ----
 
-Allowed categories:
+The exact schema should be introduced in the registry implementation slice. The important part is that the schema is strict enough to support guards.
 
-* `primitive`
-* `configuration`
-* `composite`
-* `plugin`
+=== Step Registry and Meta Registry Alignment
 
-Allowed inverse kinds:
+The step registry must not become a second, independent source of metadata truth.
 
-* `bijective`
-* `conditionally_bijective`
-* `projection_only`
-* `validation_only`
-* `extraction`
-* `unknown`
+The existing meta registry remains the review artifact for spreadsheet-relevant metadata entries and their layer/classification behavior.
 
-===
+Rule:
+
+[source,text]
+----
+Every root referenced by step_registry[*].meta_contract must either:
+  A) exist in meta_registry.yaml, or
+  B) be explicitly marked as transient / trace-only in the step registry.
+----
+
+Recommended additions to the meta registry during follow-up work:
+
+* `helper_policies`
+* `frame_lifecycle`
+* `derived.sheets.*.helper_columns`
+* `derived.sheets.*.lookup_helpers` or the current equivalent lookup provenance path
+* composite trace namespaces if retained persistently
+
+Registry `meta_contract` entries should include at least:
+
+* `path`
+* `layer`
+* `classification`
+* `registry_ref` or `transient_reason`
+* persistence/roundtrip relevance where applicable
 
 === Equality and Bijectivity
 
-The project should avoid a simplistic equation of `transformation` with byte-identical representation.
+The project should not equate transformation with byte-identical representation.
 
-A transformation may be bijective at the level of preserved relations even if the concrete representation changes.
+A transformation can be relation-preserving even when the concrete representation changes.
 
 Example:
 
-* A compact matrix may become an explicit relation.
-* The exact shape is not identical.
-* The relation can still preserve all meaningful information if axis contracts, code semantics, and empty-cell semantics are explicit.
+* A normalized relation can become a compact matrix.
+* The concrete table shape changes.
+* The transformation can still preserve all relevant relations if row keys, column keys, code semantics, and empty-cell semantics are explicit.
 
-Therefore, inverse behavior should be documented more precisely.
+Therefore the registry should classify inverse behavior precisely.
 
-Recommended inverse categories:
+Recommended inverse kinds:
 
 [cols="1,3"]
 |===
@@ -336,6 +621,9 @@ Recommended inverse categories:
 
 | `conditionally_bijective`
 | The inverse operation is valid only if listed metadata or policy constraints are present.
+
+| `relation_preserving`
+| The operation preserves the relevant relation but not the exact representation.
 
 | `projection_only`
 | The step adds derived information that should not be treated as canonical ownership.
@@ -372,9 +660,7 @@ Example for compact multiaxis:
 }
 ----
 
-===
-
-=== Frame Lifecycle and Redundant Data
+=== Frame Lifecycle
 
 Many transformations use explicit input and output frames.
 
@@ -391,7 +677,7 @@ Keeping both input and output frames can be useful for debugging and traceabilit
 
 But it is dangerous when rendering an editable workbook, because users may see and edit multiple redundant representations of the same information.
 
-The solution should not be an obscure render flag.
+The solution should not be an obscure render flag or name-based guess.
 
 The solution should be an explicit frame lifecycle contract in `_meta`.
 
@@ -402,7 +688,7 @@ Example:
 _meta:
   frame_lifecycle:
     variable_codes:
-      role: source
+      role: canonical_source
       canonical: true
       editable: false
       render: omit_by_default
@@ -439,9 +725,9 @@ Frame lifecycle should answer:
 * Which frames participate in inverse reconstruction?
 * What happens if redundant representations conflict?
 
-===
+The initial lifecycle model assumes one workbook view per pipeline run. Multi-view scenarios such as debug view versus production view are deferred.
 
-=== Rendering and Workbook Views
+=== Workbook Views, Rendering, and Pipeline Boundaries
 
 Pipeline execution must remain linear.
 
@@ -477,11 +763,11 @@ It must not mean:
 Guess which frames look redundant by name, shape, or position.
 ----
 
-===
+Workbook-view plugins that physically materialize or suppress frames are allowed, but they should either emit lifecycle metadata or declare caller-owned lifecycle responsibility.
 
 === Naming Direction for Helper and Lookup Steps
 
-The current FK/helper/lookup step names should be normalized while controlled consumer repositories can still be updated cheaply.
+The FK/helper/lookup step names should be normalized while controlled consumer repositories can still be updated cheaply.
 
 Recommended direction:
 
@@ -495,7 +781,7 @@ Recommended direction:
 
 | `drop_helpers`
 | `remove_fk_helpers`
-| Removes FK helper columns using provenance or policy.
+| Removes FK helper columns using provenance or explicit policy.
 
 | `check_fk_helpers`
 | `validate_fk_helpers`
@@ -512,169 +798,153 @@ Recommended direction:
 
 Compatibility aliases should be short-lived if used at all.
 
-Because the known consumer repositories are currently controlled, a hard rename with immediate consumer updates is preferable to carrying legacy YAML names indefinitely.
+Registry fields such as `aliases`, `replaced_by`, `deprecated_since`, `warn_until`, and `remove_after` should make the migration contract machine-readable.
 
-===
+If a hard rename is chosen, the corresponding implementation work should list controlled consumer repositories and include smoke checks for their updated YAML pipelines.
 
-=== Implementation Slices
+=== Guard Strategy
 
-==== Slice 1: Architecture Document
+The concept should become guardable in layers. Guards should start with structural registry checks before attempting broad source-code interpretation.
 
-Add this document and include it from the architecture index.
+First-wave guard candidates:
 
-Suggested path:
+[cols="1,4"]
+|===
+| Guard | Rule
 
-[source,text]
-----
-docs/internal_guide/architecture/pipeline_step_semantics.adoc
-----
+| Registry completeness
+| Every public runtime `REGISTRY` entry has exactly one step-registry entry.
 
-Acceptance:
+| Registry resolution
+| Every public step-registry entry resolves to a runtime `REGISTRY` entry, a documented alias, or an explicit external/plugin class.
 
-* The document records step categories, heuristic/configuration separation, registry intent, inverse profiles, and frame lifecycle direction.
-* No production code changes.
+| Category validity
+| Every step has category in `primitive`, `configuration`, `composite`, `plugin`, or `infrastructure`.
 
-==== Slice 2: Step Registry Review Artifact
+| Composite transparency
+| Composite steps have non-empty `wrapped_steps`; every wrapped step exists; public outputs and internal frames are declared.
 
-Add a JSON registry for public pipeline steps.
+| Composite frame references
+| Composite metadata must not reference frames absent from both the final frame set and declared `internal_frames` / lifecycle metadata.
 
-Acceptance:
+| Meta-registry alignment
+| Every persistent `meta_contract` root exists in `meta_registry.yaml`; otherwise the registry entry marks it as transient or trace-only.
 
-* Every public pipeline step has a registry entry.
-* Every registry entry has category, purpose, parameters, meta contract, frame contract, inverse classification, and FTR/reference fields.
-* Architecture tests verify that pipeline `REGISTRY` and the JSON step registry are aligned.
-* No runtime dependency on the registry yet.
+| Alias lifecycle
+| Deprecated aliases have `deprecated_since` and `remove_after` or equivalent release-bound fields.
 
-==== Slice 3: Step Name Normalization
+| `auto` restriction
+| Primitive-step parameter schemas do not allow `auto`, except explicitly marked transitional parameters.
 
-Rename unclear public step names and update controlled consumers.
+| Inline versus policy conflicts
+| Parameters marked `inline_or_policy` require conflict behavior; silent precedence is disallowed.
 
-Acceptance:
+| Plugin diagnostics
+| Plugin steps that change frame sets without lifecycle metadata can produce diagnostics rather than hard failures.
 
-* New examples use only the normalized names.
-* Old names are either removed or retained only as one-beta aliases with explicit warnings.
-* Both controlled consumer repositories are updated in the same integration wave.
+| Render non-guessing
+| Render omission features may use lifecycle/view metadata but must not infer redundancy from frame names or shapes.
 
-==== Slice 4: Lookup/FK Configuration Steps
+| Pipeline non-routing
+| Pipeline orchestration must not use `_meta` for semantic branching or hidden step skipping.
+|===
 
-Introduce explicit configuration steps for lookup helper policy and FK helper policy.
+Not every guard has to be implemented immediately. The first useful guard wave is registry completeness, category validity, composite transparency, meta-registry alignment, and alias lifecycle.
 
-Acceptance:
+=== Adoption Path
 
-* Users can declare helper policies explicitly.
-* Users can opt into `auto` for selected aspects.
-* Resolved policy is written to `_meta`.
-* Primitive helper steps execute against resolved policy.
+Adoption should be incremental.
 
-==== Slice 5: Frame Lifecycle Contract
+==== Step 1: Concept and Decision Record
 
-Introduce frame lifecycle metadata and use it for spreadsheet view generation.
+* Add this architecture document.
+* Add a short ADR that records the decision to classify steps, separate heuristics from primitive execution, preserve plugins, and make frame lifecycle explicit.
+* No production code changes are required.
 
-Acceptance:
+==== Step 2: Step Registry Review Artifact
 
-* Transformations can mark source, intermediate, projection, redundant, canonical, and editable frames.
-* Rendering can omit explicitly redundant frames when configured.
-* No renderer guesses redundancy heuristically.
-* Conflict behavior for redundant editable representations is documented.
+* Add a JSON registry for public pipeline steps.
+* Keep runtime `REGISTRY` authoritative initially.
+* Validate the JSON registry against runtime `REGISTRY`.
+* Add registry completeness and category guards.
+* Add a `.gitignore` exception if the registry lives under `docs/`.
 
-===
+==== Step 3: Step Name Normalization
+
+* Rename unclear FK/helper/lookup step names while controlled consumers can still be updated cheaply.
+* Decide whether old names are removed immediately or retained only as release-bounded aliases.
+* Make alias lifecycle machine-readable in the registry.
+* Update controlled consumers in the same integration wave.
+
+==== Step 4: Lookup/FK Configuration Steps
+
+* Introduce explicit configuration steps for lookup helper policy and FK helper policy.
+* Support explicit values and controlled `auto` options.
+* Write resolved policy to `_meta`.
+* Ensure primitive helper steps execute against resolved policy or direct inline config.
+* Fail on conflicts between inline config and resolved policy.
+
+==== Step 5: Frame Lifecycle and Workbook Views
+
+* Add frame lifecycle metadata for source, canonical, intermediate, projection, redundant, editable, and diagnostic frames.
+* Use lifecycle metadata for workbook view/render decisions.
+* Avoid renderer-side guessing.
+* Keep plugin-created workbook views supported through lifecycle metadata or explicit caller-owned responsibility.
+
+==== Step 6: Guard Hardening
+
+* Add architecture tests for the stable parts of the concept.
+* Start with structural registry guards.
+* Add source-level heuristic and routing guards only where the invariant is stable enough.
+
+=== Companion ADR Direction
+
+A companion ADR should be short and decision-focused.
+
+It should record:
+
+* pipeline steps are classified as primitive, configuration, composite, plugin, or infrastructure
+* heuristics belong to configuration-producing steps
+* primitive execution must be deterministic against direct config and/or resolved metadata
+* the step registry starts as a review artifact validated against runtime `REGISTRY`
+* metadata paths in step contracts must align with the meta registry
+* frame lifecycle is the explicit language for redundant/intermediate/view frames
+* plugins remain supported extension points and are candidates for later genericization, not architecture violations
+
+Rejected alternatives:
+
+* keep heuristics hidden inside primitive execution steps
+* let composite steps hide primitive behavior without registry trace
+* infer render visibility from frame names or shapes
+* close the plugin surface in the name of purity
 
 === Release Strategy
 
-A beta release before this wave is optional but not strongly recommended if the next beta is meant to be a useful integration baseline.
+Do not cut a public beta solely as a fixed stake before the naming and registry direction is settled.
 
-Reasoning:
-
-* The planned changes affect the public YAML step surface.
-* Releasing a beta immediately before renaming steps creates a short-lived baseline that consumers should not copy.
-* The known consumer repositories are controlled, so the cost of changing now is lower than the cost of stabilizing legacy names.
-* The wave can be implemented gradually with small commits and tests.
-
-Recommended release approach:
-
-[source,text]
-----
-Do not cut a public beta solely as a fixed stake before this wave.
-
-Instead:
-  1. Add the architecture document.
-  2. Add the step registry as a non-runtime review artifact.
-  3. Rename the public steps and update controlled consumers.
-  4. Add the first configuration-step slice for lookup helpers.
-  5. Then cut the beta as the new integration baseline.
-----
-
-Exception:
-
-If there is an urgent need to preserve the exact current behavior for comparison, create a git tag or internal checkpoint instead of promoting it as the next beta release.
-
-===
-
-=== Proposed FTRs
-
-==== FTR-PIPELINE-STEP-SEMANTICS-P4
-
-Purpose:
-
-* Add this architecture document.
-* Define primitive, configuration, composite, and plugin step categories.
-* Define heuristic-to-metadata configuration semantics.
-* Define inverse classification and frame lifecycle direction.
-
-==== FTR-PIPELINE-STEP-REGISTRY-P4
-
-Purpose:
-
-* Add the JSON step registry.
-* Add architecture tests for registry completeness.
-* Prepare the registry for generated user documentation.
-
-==== FTR-PIPELINE-STEP-NAMING-P4
-
-Purpose:
-
-* Rename unclear public step names before consumer integration hardens.
-* Update controlled consumer repositories.
-* Decide whether old names are removed immediately or retained as short-lived aliases.
-
-==== FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4
-
-Purpose:
-
-* Add configuration steps for lookup helper and FK helper policy.
-* Support explicit values and controlled `auto` options.
-* Ensure primitive helper steps execute resolved metadata contracts.
-
-==== FTR-FRAME-LIFECYCLE-P4
-
-Purpose:
-
-* Add explicit lifecycle metadata for source, intermediate, projection, canonical, editable, and redundant frames.
-* Use lifecycle metadata for workbook view/render decisions.
-* Avoid inconsistent editable spreadsheet outputs.
-
-===
+If a comparison point is needed, use a git tag or internal checkpoint. The next beta should ideally present the cleaner YAML surface rather than immediately deprecating names it just exposed.
 
 === Open Questions
 
 * Should the step registry initially live under `docs/internal_guide/architecture/` or directly under `src/spreadsheet_handling/pipeline/`?
-* Should legacy step names be removed immediately or retained for exactly one beta with warnings?
+* Should old FK/helper/lookup names be removed immediately or retained for exactly one beta with warnings?
 * Which direct YAML parameters should remain as convenience syntax once configuration steps exist?
-* Should frame lifecycle be written by every transformation step immediately, or first by selected high-risk transformations such as compact multiaxis and lookup helpers?
-* How strict should conflict handling be when a readback contains both canonical and editable projection frames?
-
-===
+* Should frame lifecycle first be written by selected high-risk transformations only, such as compact multiaxis and lookup helpers?
+* How strict should readback conflict handling be when both canonical and editable projection frames are present?
+* Which plugin diagnostics should be warnings, and which should eventually become hard failures?
 
 === Working Decision
 
-The project should proceed with this wave.
-
-The wave is large enough to justify an architecture document and FTR split, but implementation should remain incremental.
+Proceed with the pipeline semantics wave, but keep implementation incremental.
 
 Do not stabilize unintuitive step names merely for short-term compatibility.
 
 Do not hide heuristic behavior inside primitive transformation steps.
 
+Do not let composite steps hide internal frame and provenance behavior.
+
 Do not let render visibility become implicit pipeline routing.
 
-Make configuration, transformation, composition, inverse behavior, and frame lifecycle explicit enough that both architecture tests and user documentation can be derived from the same reviewed registry.
+Do keep plugins as first-class extension points.
+
+Make configuration, transformation, composition, plugin responsibility, inverse behavior, and frame lifecycle explicit enough that architecture tests and user documentation can be derived from the same reviewed registry.

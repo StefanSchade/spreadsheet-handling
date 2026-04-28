@@ -1,0 +1,591 @@
+===== FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4 -- Add explicit configuration steps for lookup and FK helper policies
+
+*Status:* Open
+*Epic:* Phase 4 -- Feature Expansion and Domain Transformations
+*Priority:* High
+
+*Depends-on:*
+
+* <<FTR-PIPELINE-SEMANTICS-CONCEPT-P4#,FTR-PIPELINE-SEMANTICS-CONCEPT-P4>>
+* <<FTR-PIPELINE-STEP-REGISTRY-P4#,FTR-PIPELINE-STEP-REGISTRY-P4>>
+* <<FTR-PIPELINE-STEP-NAMING-P4#,FTR-PIPELINE-STEP-NAMING-P4>>
+* <<FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4#,FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4>>
+* <<FTR-FK-HELPER-DOMAIN-EXTRACTION#,FTR-FK-HELPER-DOMAIN-EXTRACTION>>
+
+*Related-to:*
+
+* <<FTR-PIPELINE-SEMANTICS-GUARDS-P4#,FTR-PIPELINE-SEMANTICS-GUARDS-P4>>
+* <<FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4#,FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4>>
+* <<FTR-PIPELINE-STEP-REGISTRATION-NORMALIZATION#,FTR-PIPELINE-STEP-REGISTRATION-NORMALIZATION>>
+* <<FTR-MULTI-HELPER-COLUMN#,FTR-MULTI-HELPER-COLUMN>>
+* <<FTR-FK-HELPER-PROVENANCE-CLEANUP#,FTR-FK-HELPER-PROVENANCE-CLEANUP>>
+* <<FTR-FK-HELPER-REFACTOR-P3B#,FTR-FK-HELPER-REFACTOR-P3B>>
+* <<FTR-ARCHITECTURE-GUARD-INVENTORY-P4#,FTR-ARCHITECTURE-GUARD-INVENTORY-P4>>
+* <<FTR-GUARDRAIL-DECISION-RECORD-P4#,FTR-GUARDRAIL-DECISION-RECORD-P4>>
+
+'''
+
+====== Purpose
+
+Introduce explicit configuration-producing pipeline steps for lookup-helper and FK-helper policies.
+
+The goal is to separate policy discovery and policy declaration from primitive helper execution.
+
+After this FTR, helper materialization steps such as `add_lookup_helpers` and `add_fk_helpers` should be able to execute against resolved metadata policies instead of owning hidden heuristic behavior themselves.
+
+'''
+
+====== Context
+
+`FTR-PIPELINE-SEMANTICS-CONCEPT-P4` defines the architectural rule that heuristics may propose configuration but must not silently define primitive execution semantics.
+
+`FTR-PIPELINE-STEP-REGISTRY-P4` introduces a reviewed inventory of public pipeline steps.
+
+`FTR-PIPELINE-STEP-NAMING-P4` normalizes the helper-related public step names.
+
+`FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4` introduces explicit lookup-helper enrichment with support for helper fields, allowlists, defaults, ordering, missing-value policy, and metadata-backed helper policies.
+
+The current explicit lookup-helper implementation is already close to the target model, because it supports declarative parameters and can use `_meta` policy. What is still missing is a first-class configuration step that writes the resolved policy before the primitive lookup-helper step executes.
+
+The FK-helper path still mixes more concerns: FK convention detection, target lookup, helper field selection, and helper materialization are not yet cleanly separated into configuration and execution.
+
+'''
+
+====== Problem statement
+
+The framework currently supports helper enrichment, but users still need to understand which behavior is inline step configuration, which behavior is metadata policy, and which behavior is heuristic.
+
+This creates several problems:
+
+* The same helper policy can be repeated across multiple primitive steps.
+* The boundary between explicit configuration and inferred behavior is not clear enough.
+* `auto`-style convenience cannot be expressed consistently.
+* FK-convention helper behavior and explicit lookup-helper behavior are related but not presented through a shared policy concept.
+* Primitive steps risk becoming too smart if they both infer policy and execute transformations.
+* Later user documentation has no stable shape for explaining helper policy declaration separately from helper application.
+
+This FTR creates the missing policy-declaration layer.
+
+'''
+
+====== Design rule
+
+Configuration steps may interpret `auto`.
+
+Primitive steps must execute resolved policy.
+
+[source,text]
+----
+configure_* step
+  -> may use explicit values, defaults, and selected heuristics
+  -> writes resolved helper policy into _meta
+
+add_*_helpers step
+  -> reads inline config and/or resolved policy
+  -> fails on conflicts
+  -> materializes helper columns
+----
+
+This is not a ban on convenience. It is a rule that convenience must become inspectable configuration before execution.
+
+'''
+
+====== Goals
+
+. Add a configuration step for explicit lookup-helper policies.
+. Add a configuration step or clearly scoped first slice for FK-helper policies.
+. Support explicit values and selected `auto` options in configuration steps.
+. Write resolved helper policies into `_meta`.
+. Keep primitive helper steps deterministic against inline config and/or resolved policy.
+. Make inline-config versus `_meta` conflicts fail instead of silently applying precedence.
+. Register the new configuration steps in the runtime registry.
+. Add entries for the new steps to the JSON pipeline step registry.
+. Add or update meta-registry entries for persistent helper policy metadata.
+. Preserve plugin extensibility.
+. Avoid changing existing helper materialization behavior except where needed to read resolved policy and detect conflicts.
+
+'''
+
+====== Scope
+
+This FTR includes:
+
+* `configure_lookup_helpers` as a configuration-producing step
+* a first FK-helper configuration step, preferably `configure_fk_helpers`
+* resolved metadata shape for helper policies
+* support for explicit helper allowlists
+* support for explicit default helper fields
+* support for selected `auto` values inside configuration steps
+* primitive-step support for reading resolved policy by reference
+* conflict detection between inline primitive config and resolved metadata policy
+* tests for explicit policy, `auto` policy, conflict behavior, and policy-backed helper execution
+* step-registry updates
+* meta-registry updates or explicit current-state notes
+
+Suggested initial step names:
+
+[source,text]
+----
+configure_lookup_helpers
+configure_fk_helpers
+----
+
+A narrower first implementation may start with `configure_lookup_helpers` and add `configure_fk_helpers` immediately after, but the FTR should keep the shared policy model visible.
+
+'''
+
+====== Non-goals
+
+This FTR does not:
+
+* introduce a general workflow engine
+* add branching, routing, or DAG execution
+* make helper policies a complete schema language
+* replace all direct inline primitive configuration immediately
+* remove plugin support
+* implement frame lifecycle behavior
+* implement workbook view materialization
+* change rendering semantics
+* introduce formula-driven lookup helpers
+* require every FK/helper heuristic to be implemented in this first slice
+
+Frame lifecycle belongs to `FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4`.
+
+Deep architecture guards belong to `FTR-PIPELINE-SEMANTICS-GUARDS-P4`.
+
+Formula-driven helper cells belong to a formula/helper-specific follow-up if needed.
+
+'''
+
+====== Target metadata model
+
+The resolved helper policy should live in `_meta` as canonical, inspectable configuration.
+
+Suggested shape:
+
+[source,yaml]
+----
+_meta:
+  helper_policies:
+    lookup:
+      variables:
+        key: ID
+        allowed_helpers:
+          - sort_key
+          - value_label_de
+          - business_component
+          - data_type
+          - module
+        default_helpers:
+          - value_label_de
+        missing: fail
+        order:
+          helper_position: before_key
+          sort_by:
+            - sort_key
+
+    fk:
+      Products:
+        key: id
+        allowed_helpers:
+          - name
+          - category
+          - description
+        default_helpers:
+          - name
+        fk_column_convention:
+          pattern: id_(Products)
+----
+
+The exact structure may be adjusted during implementation, but the policy should separate lookup policies from FK-convention policies.
+
+The resolved policy must be concrete. It should not persist unresolved `auto` values as execution semantics.
+
+'''
+
+====== Lookup-helper configuration step
+
+`configure_lookup_helpers` declares or infers policies for explicit lookup-helper enrichment.
+
+Example with explicit policy:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_lookup_helpers
+    lookup: variables
+    key: ID
+    allowed_helpers: [sort_key, value_label_de, business_component, data_type, module]
+    default_helpers: [value_label_de]
+    missing: fail
+    order:
+      helper_position: before_key
+      sort_by: [sort_key]
+
+  - step: add_lookup_helpers
+    source: variable_usage_matrix_raw
+    lookup: variables
+    output: variable_usage_matrix
+    on: ID
+    helpers: default
+----
+
+Example with selected heuristics:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_lookup_helpers
+    lookup: variables
+    key: ID
+    allowed_helpers: auto
+    default_helpers: [value_label_de]
+    auto:
+      helper_candidates:
+        exclude: [ID]
+        include_if_dtype: [string, integer, boolean]
+
+  - step: add_lookup_helpers
+    source: variable_usage_matrix_raw
+    lookup: variables
+    output: variable_usage_matrix
+    on: ID
+    helpers: default
+----
+
+Configuration-step behavior:
+
+* resolve `allowed_helpers` to a concrete list
+* resolve `default_helpers` to a concrete list
+* validate that default helpers are included in allowed helpers
+* validate that allowed helpers exist in the lookup frame, unless explicitly configured otherwise
+* write the resolved policy to `_meta.helper_policies.lookup[lookup]`
+* never leave unresolved `auto` as the policy consumed by the primitive step
+
+'''
+
+====== FK-helper configuration step
+
+`configure_fk_helpers` declares or infers policies for FK-convention helper enrichment.
+
+The FK-helper path differs from lookup-helper enrichment because FK target detection may be convention-driven.
+
+Example explicit FK-helper policy:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_fk_helpers
+    targets:
+      Products:
+        key: id
+        label: name
+        allowed_helpers: [name, category, description]
+        default_helpers: [name]
+        fk_columns:
+          convention: id_(Products)
+
+  - step: add_fk_helpers
+    helpers: default
+----
+
+Example with controlled convention inference:
+
+[source,yaml]
+----
+pipeline:
+  - step: configure_fk_helpers
+    targets: auto
+    auto:
+      id_column_candidates: [id, ID]
+      fk_column_pattern: "id_({target})"
+      allowed_helpers:
+        exclude: [id, ID]
+      default_helpers:
+        prefer: [name, label, value_label_de]
+
+  - step: add_fk_helpers
+    helpers: default
+----
+
+Configuration-step behavior:
+
+* resolve target tables to a concrete target policy map
+* resolve target key columns
+* resolve FK column conventions or explicit FK column mappings
+* resolve allowed helper fields per target
+* resolve default helper fields per target
+* write concrete policy to `_meta.helper_policies.fk`
+* preserve enough information for validation and later removal/reordering steps
+
+This FTR does not need to complete every FK heuristic in the first implementation, but it should define the target policy shape and implement at least explicit FK-helper policy declaration if feasible.
+
+'''
+
+====== Primitive step interaction
+
+Primitive helper steps should support resolved policies without becoming policy inference engines.
+
+Expected interactions:
+
+[cols="1,2,3"]
+|===
+| Primitive step | Policy source | Behavior
+
+| `add_lookup_helpers`
+| `_meta.helper_policies.lookup[lookup]`
+| Uses resolved allowlist/defaults when `helpers: default` or a policy reference is used.
+
+| `add_fk_helpers`
+| `_meta.helper_policies.fk`
+| Uses resolved target helper policy where available; transitional legacy convention behavior may remain explicit.
+
+| `validate_fk_helpers`
+| `_meta.helper_policies.fk` and/or existing FK registry
+| Validates helper consistency against resolved helper policy where available.
+
+| `remove_fk_helpers`
+| helper provenance and/or `_meta.helper_policies.fk`
+| Removes derived FK helper columns, preferably via provenance.
+
+| `reorder_fk_helpers`
+| helper provenance and/or `_meta.helper_policies.fk`
+| Reorders helper columns according to resolved FK helper relation.
+|===
+
+Inline parameters remain allowed for pragmatic YAML readability, but they must be compatible with resolved policy.
+
+Conflict rule:
+
+[source,text]
+----
+If inline primitive config and resolved _meta policy define the same semantic field differently, fail.
+Do not silently let one source win.
+----
+
+'''
+
+====== `auto` semantics
+
+`auto` is valid in configuration steps.
+
+`auto` should not be valid in primitive helper steps, except for explicitly documented transitional behavior.
+
+Acceptable:
+
+[source,yaml]
+----
+- step: configure_lookup_helpers
+  lookup: variables
+  key: ID
+  allowed_helpers: auto
+----
+
+Discouraged target-state primitive usage:
+
+[source,yaml]
+----
+- step: add_lookup_helpers
+  source: variable_usage_matrix_raw
+  lookup: variables
+  helpers: auto
+----
+
+If a primitive currently accepts `auto`, it should be classified as transitional and migrated toward configuration-step usage.
+
+'''
+
+====== Step registry updates
+
+Add registry entries for:
+
+* `configure_lookup_helpers`
+* `configure_fk_helpers`
+
+The entries should use:
+
+* `category: configuration`
+* subtype such as `lookup_helper_policy` or `fk_helper_policy`
+* `meta_contract.writes` for `_meta.helper_policies.*`
+* `frame_contract.reads` for the frames inspected by the configuration step
+* `inverse.kind: validation_only` or `unknown`, depending on whether the step is treated as pure configuration materialization
+
+Update existing primitive entries for:
+
+* `add_lookup_helpers`
+* `add_fk_helpers`
+* `validate_fk_helpers`
+* `remove_fk_helpers`
+* `reorder_fk_helpers`
+
+The primitive entries should declare their policy reads where applicable.
+
+'''
+
+====== Meta registry updates
+
+Add or update meta-registry entries for the persistent helper policy keys introduced here.
+
+At minimum:
+
+[source,text]
+----
+helper_policies
+helper_policies.lookup
+helper_policies.fk
+----
+
+The entries should clarify:
+
+* layer: `meta_canonical`
+* classification: `canonical_meta`
+* meaning: resolved helper policy for later primitive steps
+* scope: workbook-level policy with lookup-target or FK-target children
+* origin: configuration steps, persisted input meta, or caller-supplied meta
+* render relevance: indirect
+* persistence behavior: persisted as part of canonical workbook metadata
+* roundtrip relevance: policy should survive when needed to reconstruct or validate helper behavior
+* producers: configuration steps
+* consumers: helper primitive steps and validations
+
+If the implementation uses a narrower current-state key, the meta registry must document that key instead of inventing a parallel name in prose.
+
+'''
+
+====== Plugin interaction
+
+Plugins remain valid extension points.
+
+This FTR must not prevent a plugin from:
+
+* creating helper policies
+* modifying `_meta.helper_policies` intentionally
+* materializing use-case-specific workbook views
+* using domain-specific heuristics that are too narrow for generic framework behavior
+
+However, reusable plugin behavior should be reviewed for migration into generic configuration steps.
+
+Plugin-produced helper policy should be treated as caller-supplied canonical meta if it follows the resolved policy shape.
+
+'''
+
+====== Tests
+
+Required tests for `configure_lookup_helpers`:
+
+. explicit allowed/default helpers are written to `_meta.helper_policies.lookup`
+. `allowed_helpers: auto` resolves to a concrete list
+. default helpers must be a subset of allowed helpers
+. unknown helper fields fail unless explicitly allowed by a documented mode
+. `add_lookup_helpers` can use a resolved default policy
+. inline helper fields conflicting with resolved policy fail
+. inline helper fields that are allowed by policy succeed
+. missing lookup keys respect the resolved `missing` policy
+
+Required tests for `configure_fk_helpers` if implemented in this slice:
+
+. explicit target policy is written to `_meta.helper_policies.fk`
+. allowed/default FK helpers are resolved per target
+. target key columns are validated
+. FK helper materialization can use resolved default policy
+. invalid helper requests fail against resolved allowlist
+
+Required registry/meta tests:
+
+. new configuration steps appear in the runtime registry
+. new configuration steps appear in the JSON step registry
+. new helper policy metadata roots are represented in `meta_registry.yaml` or explicitly marked as current-state follow-up
+
+Regression tests:
+
+. existing inline `add_lookup_helpers` behavior still works unless intentionally deprecated
+. existing FK-helper behavior still works unless intentionally migrated under a documented compatibility path
+
+'''
+
+====== Suggested implementation direction
+
+. Add a small domain helper for resolving lookup-helper policy.
+. Add `configure_lookup_helpers` pipeline step factory.
+. Persist resolved lookup-helper policy under `_meta.helper_policies.lookup`.
+. Update `add_lookup_helpers` to read resolved policy when `helpers: default` or a policy reference is used.
+. Add explicit conflict detection between inline config and resolved policy.
+. Add the meta-registry entry for helper policies.
+. Add step-registry entries and tests.
+. Add `configure_fk_helpers` either in the same slice or as the immediate second part of this FTR.
+. Keep direct inline primitive usage working for now unless explicitly deprecated by the naming/configuration plan.
+
+The implementation should avoid a large generic policy engine. Start with the helper policy use case.
+
+'''
+
+====== Acceptance criteria
+
+. `configure_lookup_helpers` exists and is registered as a public configuration step.
+. `configure_lookup_helpers` writes resolved lookup-helper policy to `_meta`.
+. `add_lookup_helpers` can consume resolved lookup-helper policy.
+. `auto` is interpreted in the configuration step, not in the primitive execution path.
+. Default helpers are validated against allowed helpers.
+. Requested helpers outside the allowed set fail.
+. Inline primitive config conflicting with resolved `_meta` policy fails.
+. Direct inline `add_lookup_helpers` usage remains supported unless explicitly deprecated.
+. `configure_fk_helpers` is implemented or explicitly split into a documented immediate follow-up within this FTR's delivery notes.
+. Step registry entries exist for new configuration steps.
+. Meta registry entries exist for persistent helper policy metadata, or current-state gaps are explicitly documented.
+. Tests cover explicit policy, selected heuristic policy, policy-backed execution, and conflict behavior.
+. No plugin extension capability is removed.
+. Existing active tests continue to pass.
+
+'''
+
+====== Review guidance
+
+When reviewing this FTR, check:
+
+* Does the configuration step produce concrete, inspectable policy?
+* Are unresolved `auto` values prevented from becoming primitive execution semantics?
+* Does primitive execution remain deterministic?
+* Are explicit user overrides and inferred defaults clearly separated?
+* Are helper allowlists actually enforced?
+* Are default helpers constrained by allowlists?
+* Does inline-vs-meta conflict handling fail rather than silently choose precedence?
+* Is FK-convention behavior still understandable as a policy, not hidden magic?
+* Are plugin paths still possible?
+* Are metadata paths aligned with the meta registry?
+
+'''
+
+====== Rationale
+
+The framework should offer both convenience and transparency.
+
+Heuristics are useful when naming conventions and common defaults make intent obvious. But hidden heuristics inside primitive transformation steps make debugging and documentation harder.
+
+Explicit configuration steps provide a better compromise:
+
+* users can write full policy when they need control
+* users can use `auto` selectively when convenience is worth it
+* the resolved result is visible in `_meta`
+* primitive steps stay simpler and more deterministic
+* later guards and documentation can reason about the policy surface
+
+This FTR turns the helper-policy work from an implementation detail into a first-class pipeline concept.
+
+'''
+
+====== Initial GDR entry
+
+[source,text]
+----
+Guard ID: GDR-LOOKUP-FK-CONFIG-001
+Boundary / Invariant: Helper policy inference belongs to configuration steps; primitive helper steps execute resolved policy
+Type: durable-invariant
+Protected modules / paths: src/spreadsheet_handling/pipeline/, src/spreadsheet_handling/domain/transformations/, docs/internal_guide/architecture/pipeline_step_registry.json, docs/internal_guide/architecture/meta_registry.yaml
+Forbidden patterns / imports: unresolved auto semantics in primitive helper execution paths; silent precedence between inline config and _meta policy
+Allowed exceptions: explicitly documented transitional primitive parameters with removal or review condition
+Exception sunset condition: transitional primitive auto handling reviewed before the next public beta after configuration steps land
+Owner / Review role: pipeline architecture review
+Review cadence: each helper policy, FK helper, lookup helper, or YAML-facing helper parameter change
+Failure mode in CI: registry/category guard failure, helper policy validation failure, or conflict-behavior test failure
+Linked FTR(s): FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4, FTR-PIPELINE-SEMANTICS-CONCEPT-P4, FTR-PIPELINE-STEP-REGISTRY-P4, FTR-PIPELINE-SEMANTICS-GUARDS-P4
+----
