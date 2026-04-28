@@ -21,10 +21,10 @@ def enrich_lookup(
     source: str,
     lookup: str,
     output: str,
-    on: str | list[str],
+    on: str | list[str] | None = None,
     helpers: dict[str, Any] | str | None = None,
     order: dict[str, Any] | None = None,
-    missing: str = "fail",
+    missing: str | None = None,
 ) -> Frames:
     """Enrich *source* with helper columns from *lookup* by joining on *on*.
 
@@ -44,7 +44,7 @@ def enrich_lookup(
         - ``dict`` with ``fields`` (list of column names to project),
           optional ``allowed`` (allowlist), optional ``default`` (defaults).
         - ``"default"`` – use ``default`` from a matching helper policy in
-          ``_meta["helper_policies"][<lookup>]``.
+          ``_meta["helper_policies"]["lookup"][<lookup>]``.
         - ``None`` – no helper projection (only the join key is used).
     order:
         Optional dict with ``helper_position`` (``"before_key"`` or
@@ -52,18 +52,23 @@ def enrich_lookup(
         (list of columns to sort the result by).
     missing:
         How to handle source rows without a matching lookup key.
-        ``"fail"`` (default) raises on unmatched rows.
+        ``"fail"`` raises on unmatched rows.
         ``"empty"`` fills missing helper values with ``""``.
+        When omitted and a resolved helper policy exists, the policy value is used.
     """
-    if missing not in _VALID_MISSING_MODES:
+    policy = _resolve_policy(lookup, frames)
+    join_keys = _resolve_join_keys(on, policy, lookup)
+    missing_mode = _resolve_missing(missing, policy, lookup)
+    order_cfg = _resolve_order(order, policy, lookup)
+
+    if missing_mode not in _VALID_MISSING_MODES:
         raise ValueError(
-            f"Invalid missing mode {missing!r}; expected one of {sorted(_VALID_MISSING_MODES)}"
+            f"Invalid missing mode {missing_mode!r}; expected one of {sorted(_VALID_MISSING_MODES)}"
         )
 
     source_df = _require_frame(frames, source)
     lookup_df = _require_frame(frames, lookup)
 
-    join_keys = [on] if isinstance(on, str) else list(on)
     for key in join_keys:
         if key not in source_df.columns:
             raise KeyError(f"Join key {key!r} not found in source frame {source!r}")
@@ -73,21 +78,21 @@ def enrich_lookup(
     _check_duplicate_lookup_keys(lookup_df, join_keys, lookup)
 
     fields = _resolve_fields(helpers, lookup, frames)
-    if fields is not None:
-        _validate_fields(fields, lookup_df, lookup)
+    sort_by = order_cfg.get("sort_by")
+    projection_fields = _fields_with_sort_helpers(fields, join_keys, sort_by, lookup_df)
+    if projection_fields is not None:
+        _validate_fields(projection_fields, lookup_df, lookup)
         allowed = _resolve_allowed(helpers, lookup, frames)
         if allowed is not None:
-            _check_allowed(fields, allowed, lookup)
-        _check_column_conflict(source_df, join_keys, fields, source)
+            _check_allowed(projection_fields, allowed, lookup)
+        _check_column_conflict(source_df, join_keys, projection_fields, source)
 
-    helper_cols = _build_helper_projection(lookup_df, join_keys, fields)
+    helper_cols = _build_helper_projection(lookup_df, join_keys, projection_fields)
 
     enriched = source_df.merge(helper_cols, on=join_keys, how="left")
 
-    if missing == "fail":
+    if missing_mode == "fail":
         _check_unmatched_rows(enriched, source_df, join_keys, fields, source, lookup)
-
-    order_cfg = order or {}
 
     helper_position = order_cfg.get("helper_position", "after_data")
     if helper_position not in _VALID_HELPER_POSITIONS:
@@ -96,10 +101,10 @@ def enrich_lookup(
             f"expected one of {sorted(_VALID_HELPER_POSITIONS)}"
         )
 
-    sort_by = order_cfg.get("sort_by")
     if sort_by:
         _check_sort_columns(sort_by, enriched, output)
         enriched = enriched.sort_values(sort_by, na_position="last").reset_index(drop=True)
+        enriched = _drop_temporary_sort_helpers(enriched, source_df, fields, sort_by)
 
     if helper_position == "before_key" and fields is not None:
         enriched = _reorder_helpers_before_key(enriched, join_keys, fields)
@@ -185,7 +190,67 @@ def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:
     policies = meta.get("helper_policies")
     if not isinstance(policies, dict):
         return None
-    return policies.get(lookup)
+    lookup_policies = policies.get("lookup")
+    if isinstance(lookup_policies, dict) and isinstance(lookup_policies.get(lookup), dict):
+        return lookup_policies[lookup]
+    legacy_policy = policies.get(lookup)
+    if isinstance(legacy_policy, dict):
+        return legacy_policy
+    return None
+
+
+def _resolve_join_keys(
+    on: str | list[str] | None,
+    policy: dict[str, Any] | None,
+    lookup: str,
+) -> list[str]:
+    policy_key = policy.get("key") if policy is not None else None
+    if on is None:
+        if policy_key is None:
+            raise ValueError(f"No join key configured for lookup {lookup!r}")
+        return [policy_key] if isinstance(policy_key, str) else list(policy_key)
+
+    join_keys = [on] if isinstance(on, str) else list(on)
+    if policy_key is not None:
+        policy_keys = [policy_key] if isinstance(policy_key, str) else list(policy_key)
+        if join_keys != policy_keys:
+            raise ValueError(
+                f"Inline join key {join_keys!r} conflicts with resolved helper policy "
+                f"for lookup {lookup!r}: {policy_keys!r}"
+            )
+    return join_keys
+
+
+def _resolve_missing(
+    missing: str | None,
+    policy: dict[str, Any] | None,
+    lookup: str,
+) -> str:
+    policy_missing = policy.get("missing") if policy is not None else None
+    if missing is None:
+        return str(policy_missing or "fail")
+    if policy_missing is not None and missing != policy_missing:
+        raise ValueError(
+            f"Inline missing mode {missing!r} conflicts with resolved helper policy "
+            f"for lookup {lookup!r}: {policy_missing!r}"
+        )
+    return missing
+
+
+def _resolve_order(
+    order: dict[str, Any] | None,
+    policy: dict[str, Any] | None,
+    lookup: str,
+) -> dict[str, Any]:
+    policy_order = policy.get("order") if policy is not None else None
+    if order is None:
+        return dict(policy_order or {})
+    if policy_order and order != policy_order:
+        raise ValueError(
+            f"Inline order {order!r} conflicts with resolved helper policy "
+            f"for lookup {lookup!r}: {policy_order!r}"
+        )
+    return dict(order)
 
 
 def _resolve_fields(
@@ -215,7 +280,16 @@ def _resolve_fields(
             return list(fields)
         default = helpers.get("default")
         if default is not None:
-            return list(default)
+            configured = [default] if isinstance(default, str) else list(default)
+            policy = _resolve_policy(lookup, frames)
+            if policy is not None and policy.get("default_helpers") is not None:
+                resolved = list(policy.get("default_helpers") or [])
+                if configured != resolved:
+                    raise ValueError(
+                        f"Inline default helpers {configured!r} conflict with resolved "
+                        f"helper policy for lookup {lookup!r}: {resolved!r}"
+                    )
+            return configured
         policy = _resolve_policy(lookup, frames)
         if policy is not None:
             return list(policy.get("default_helpers") or [])
@@ -228,16 +302,58 @@ def _resolve_allowed(
     lookup: str,
     frames: Frames,
 ) -> list[str] | None:
+    policy = _resolve_policy(lookup, frames)
     if isinstance(helpers, dict):
         allowed = helpers.get("allowed")
         if allowed is not None:
-            return list(allowed)
-    policy = _resolve_policy(lookup, frames)
+            inline_allowed = list(allowed)
+            if policy is not None and policy.get("allowed_helpers") is not None:
+                policy_allowed = list(policy.get("allowed_helpers") or [])
+                if inline_allowed != policy_allowed:
+                    raise ValueError(
+                        f"Inline allowed helpers {inline_allowed!r} conflict with resolved "
+                        f"helper policy for lookup {lookup!r}: {policy_allowed!r}"
+                    )
+            return inline_allowed
     if policy is not None:
         allowed = policy.get("allowed_helpers")
         if allowed is not None:
             return list(allowed)
     return None
+
+
+def _fields_with_sort_helpers(
+    fields: list[str] | None,
+    join_keys: list[str],
+    sort_by: list[str] | None,
+    lookup_df: pd.DataFrame,
+) -> list[str] | None:
+    if fields is None:
+        return None
+    extra_sort_fields = [
+        field for field in (sort_by or [])
+        if field not in join_keys and field in lookup_df.columns
+    ]
+    return list(dict.fromkeys(fields + extra_sort_fields))
+
+
+def _drop_temporary_sort_helpers(
+    enriched: pd.DataFrame,
+    source_df: pd.DataFrame,
+    fields: list[str] | None,
+    sort_by: list[str] | None,
+) -> pd.DataFrame:
+    if fields is None:
+        return enriched
+    output_fields = set(fields)
+    source_fields = set(source_df.columns)
+    temporary = [
+        field for field in (sort_by or [])
+        if field not in output_fields and field not in source_fields and field in enriched.columns
+    ]
+    if not temporary:
+        return enriched
+    return enriched.drop(columns=temporary)
 
 
 def _validate_fields(fields: list[str], lookup_df: pd.DataFrame, lookup: str) -> None:

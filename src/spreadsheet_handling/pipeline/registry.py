@@ -64,6 +64,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.validations.validate_columns:add_validations",
     ),
+    "configure_lookup_helpers": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.helper_policies:configure_lookup_helpers",
+    ),
     "bootstrap_meta": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.meta_bootstrap:bootstrap_meta",
