@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from spreadsheet_handling.pipeline.pipeline import (
     REGISTRY,
@@ -8,6 +9,15 @@ from spreadsheet_handling.pipeline.pipeline import (
     build_steps_from_config,
     run_pipeline,
 )
+
+
+RENAMED_PIPELINE_STEPS = {
+    "apply_fks": "add_fk_helpers",
+    "drop_helpers": "remove_fk_helpers",
+    "check_fk_helpers": "validate_fk_helpers",
+    "reorder_helpers": "reorder_fk_helpers",
+    "enrich_lookup": "add_lookup_helpers",
+}
 
 
 def test_registry_uses_descriptor_for_migrated_builder_step() -> None:
@@ -63,6 +73,20 @@ def test_apply_overrides_generic_registration_binds_frames_first_step() -> None:
 
     assert steps[0].config["target"].endswith(":load_and_apply_overrides")
     assert out["_meta"]["auto_filter"] is True
+
+
+@pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")
+def test_pipeline_registry_uses_normalized_helper_step_names() -> None:
+    for old_name, new_name in RENAMED_PIPELINE_STEPS.items():
+        assert old_name not in REGISTRY
+        assert new_name in REGISTRY
+
+
+@pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")
+def test_replaced_pipeline_step_names_fail_clearly() -> None:
+    for old_name in RENAMED_PIPELINE_STEPS:
+        with pytest.raises(KeyError, match=f"Unknown step '{old_name}'"):
+            build_steps_from_config([{"step": old_name}])
 
 
 def test_xref_crosstable_steps_are_config_addressable() -> None:

@@ -154,7 +154,7 @@ def make_validate_step(
 def make_apply_fks_step(
     *,
     defaults: Dict[str, Any] | None = None,
-    name: str = "apply_fks",
+    name: str = "add_fk_helpers",
 ) -> BoundStep:
     """Detect FK columns and add helper columns.
 
@@ -173,7 +173,7 @@ def make_apply_fks_step(
 def make_drop_helpers_step(
     *,
     prefix: str = "_",
-    name: str = "drop_helpers",
+    name: str = "remove_fk_helpers",
 ) -> BoundStep:
     """Remove all helper columns (starting with prefix) from all sheets.
 
@@ -208,7 +208,7 @@ def make_unflatten_headers_step(*, sheet: str | None = None, sep: str = ".", nam
     )
 
 
-def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_helpers") -> BoundStep:
+def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_fk_helpers") -> BoundStep:
     return make_builder_target_step(
         target="spreadsheet_handling.domain.transformations.helpers:reorder_helpers_next_to_fk",
         name=name,
@@ -221,7 +221,7 @@ def make_check_fk_helpers_step(
     *,
     defaults: Dict[str, Any] | None = None,
     mode: str = "warn",
-    name: str = "check_fk_helpers",
+    name: str = "validate_fk_helpers",
 ) -> BoundStep:
     """Run FK-helper consistency checks (pure domain validation)."""
     from ..domain.validations.fk_helpers import validate_fk_helpers
