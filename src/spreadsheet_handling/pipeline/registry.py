@@ -44,9 +44,9 @@ def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
 REGISTRY: Dict[str, StepRegistration | StepFactory] = {
     "identity":         make_identity_step,
     "validate":         make_validate_step,
-    "apply_fks":        make_apply_fks_step,
-    "drop_helpers":     make_drop_helpers_step,
-    "check_fk_helpers": make_check_fk_helpers_step,
+    "add_fk_helpers":      make_apply_fks_step,
+    "remove_fk_helpers":   make_drop_helpers_step,
+    "validate_fk_helpers": make_check_fk_helpers_step,
     "plugin":           make_plugin_step,
     "flatten_headers": StepRegistration(
         factory=make_builder_target_step,
@@ -56,7 +56,7 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_builder_target_step,
         target="spreadsheet_handling.domain.transformations.helpers:unflatten_headers",
     ),
-    "reorder_helpers": StepRegistration(
+    "reorder_fk_helpers": StepRegistration(
         factory=make_builder_target_step,
         target="spreadsheet_handling.domain.transformations.helpers:reorder_helpers_next_to_fk",
     ),
@@ -96,7 +96,7 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.compact_multiaxis:contract_compact_multiaxis",
     ),
-    "enrich_lookup": StepRegistration(
+    "add_lookup_helpers": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup",
     ),

@@ -58,8 +58,8 @@ def test_pipeline_build_from_config_registry():
             "mode_missing_fk": "warn",
             "defaults": {"id_field": "id", "label_field": "name", "detect_fk": True, "helper_prefix": "_"},
         },
-        {"step": "apply_fks", "defaults": {"id_field": "id", "label_field": "name", "detect_fk": True}},
-        {"step": "drop_helpers", "prefix": "_"},
+        {"step": "add_fk_helpers", "defaults": {"id_field": "id", "label_field": "name", "detect_fk": True}},
+        {"step": "remove_fk_helpers", "prefix": "_"},
     ]
 
     steps = build_steps_from_config(cfg_pipeline)
@@ -90,7 +90,7 @@ def test_pipeline_reorder_multi_helpers_next_to_fk_in_configured_order():
         frames,
         [
             make_apply_fks_step(defaults=defaults),
-            build_steps_from_config([{"step": "reorder_helpers", "helper_prefix": "_"}])[0],
+            build_steps_from_config([{"step": "reorder_fk_helpers", "helper_prefix": "_"}])[0],
         ],
     )
 

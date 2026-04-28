@@ -161,6 +161,23 @@ def test_pipeline_step_registry_aliases_are_structured_and_release_bounded() -> 
                 assert "remove_after" in alias
 
 
+@pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")
+def test_pipeline_step_registry_tracks_replaced_names_without_runtime_aliases() -> None:
+    entries = _entries_by_name()
+    expected_replacements = {
+        "add_fk_helpers": "apply_fks",
+        "remove_fk_helpers": "drop_helpers",
+        "validate_fk_helpers": "check_fk_helpers",
+        "reorder_fk_helpers": "reorder_helpers",
+        "add_lookup_helpers": "enrich_lookup",
+    }
+
+    for current_name, replaced_name in expected_replacements.items():
+        assert entries[current_name]["replaces"] == [replaced_name]
+        assert replaced_name not in entries
+        assert replaced_name not in REGISTRY
+
+
 def test_pipeline_step_registry_meta_contract_references_meta_registry() -> None:
     registry = _load_step_registry()
     contract = _contract_sets(registry)
