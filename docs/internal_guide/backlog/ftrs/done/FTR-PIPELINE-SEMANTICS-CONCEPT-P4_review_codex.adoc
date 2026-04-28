@@ -1,0 +1,270 @@
+== Review: Pipeline Step Semantics, Configuration Contracts, and Frame Lifecycle (Codex)
+
+:status: review
+:scope: architecture-review
+:reviewed: 2026-04-28
+:source: docs/internal_guide/architecture/pipeline_semantics.adoc
+:ftr: FTR-PIPELINE-SEMANTICS-CONCEPT-P4
+:related-review: FTR-PIPELINE-SEMANTICS-CONCEPT-P4_review_claude_code.adoc
+
+=== Kurzfazit
+
+Das Konzept ist in der Grundrichtung richtig und sollte weiterverfolgt werden.
+Die Trennung von Konfiguration, primitiver Ausfuehrung, Komposition und Rendering-Sicht passt gut zur bestehenden Pipeline-Architektur und trifft konkrete Reibungspunkte in `REGISTRY`, `_meta` und den Consumer-YAMLs.
+
+Meine Bewertung: *approve direction, tighten before implementation*.
+
+Die wichtigsten Nachschaerfungen liegen nicht im Schreibstil, sondern in den Vertragskanten:
+
+* Composite-Steps brauchen eine klare Policy fuer interne Primitive-Meta und Temp-Frames.
+* Die neue Step-Registry darf nicht neben der bestehenden Meta-Registry eine zweite, abweichende Wahrheit aufbauen.
+* Direct YAML params, resolved `_meta` und `auto` brauchen eine explizite Konflikt- und Praezedenzregel.
+* Frame-Lifecycle muss mit aktuellen workbook-view Plugins zusammengedacht werden.
+
+Claudes Review trifft bereits mehrere Punkte, insbesondere die komplette Klassifikation aller aktuellen Steps und die Beziehung zwischen JSON-Step-Registry und runtime `REGISTRY`.
+Dieses Review wiederholt diese Punkte nur dort, wo sie fuer die folgenden Risiken wichtig sind.
+
+=== Review-Basis
+
+Gelesen bzw. stichprobenartig gegen den Ist-Zustand geprueft:
+
+* `docs/internal_guide/architecture/pipeline_semantics.adoc`
+* `docs/internal_guide/architecture/pipeline_semantics_review_claude_code.adoc`
+* `src/spreadsheet_handling/pipeline/registry.py`
+* `src/spreadsheet_handling/pipeline/steps.py`
+* `src/spreadsheet_handling/pipeline/types.py`
+* `src/spreadsheet_handling/domain/transformations/compact_multiaxis.py`
+* `src/spreadsheet_handling/domain/transformations/xref_crosstable.py`
+* `src/spreadsheet_handling/domain/transformations/cell_codec.py`
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup.py`
+* `src/spreadsheet_handling/domain/transformations/fk_helpers.py`
+* `docs/internal_guide/architecture/meta_registry.yaml`
+* `docs/internal_guide/architecture/generic_ir.adoc`
+* `../ba-config/pipelines/elmar_workbook.yaml`
+* `../ba-config/plugins/nxt_config/workbook_views.py`
+
+=== Findings
+
+==== C-01: Composite-Steps koennen heute Primitive-Meta auf geloeschte Temp-Frames zeigen lassen
+
+Severity: high
+
+Das Konzept sagt, Composite-Steps sollen deklarieren, welche Primitive sie semantisch wrappen (`pipeline_semantics.adoc:117` ff.).
+Das ist richtig, aber der aktuelle `compact_multiaxis`-Ist-Zustand zeigt eine wichtige Vertragsluecke.
+
+`expand_compact_multiaxis` ruft intern `expand_xref` und `decode_cell_values` auf, schreibt danach aber den Temp-Frame wieder weg (`src/spreadsheet_handling/domain/transformations/compact_multiaxis.py:53`, `:64`, `:83`).
+Analog nutzt `contract_compact_multiaxis` intern `encode_cell_values` und `contract_xref`, entfernt danach aber den Temp-Frame (`src/spreadsheet_handling/domain/transformations/compact_multiaxis.py:154`, `:171`, `:184`).
+Die Primitive schreiben ihrerseits eigene Meta (`xref_crosstable` in `xref_crosstable.py:269`, `cell_codecs` in `cell_codec.py:606`).
+
+Risiko:
+
+* Die spaetere Step-Registry koennte `wrapped_steps` korrekt deklarieren, aber die tatsaechliche `_meta` enthaelt dann primitive Trace-Eintraege, die auf interne Temp-Frames zeigen, die im finalen Frame-Set gar nicht mehr existieren.
+* Frame-Lifecycle, Inverse-Logik und User-Dokumentation koennen dadurch nicht vorhandene Frames als echte Pipeline-Artefakte missverstehen.
+
+Empfehlung:
+
+* Vor oder in Slice 2 eine Composite-Provenance-Policy festlegen:
+  `public_outputs`, `internal_frames`, `internal_step_trace`, `suppressed_meta` oder aehnlich.
+* Interne Primitive-Meta entweder unter dem Composite namespace kapseln oder beim Composite bewusst unterdruecken.
+* Architekturtest ergaenzen: Registry-/Meta-Eintraege duerfen nach einem Composite nicht auf Frames zeigen, die weder im finalen Frame-Set noch in `frame_lifecycle` als interne/omitted Frames erklaert sind.
+
+==== C-02: Step-Registry und Meta-Registry drohen zwei unabhaengige Vertragsquellen zu werden
+
+Severity: high
+
+Das Konzept fuehrt eine `pipeline_step_registry.json` mit `meta_contract.reads` und `meta_contract.writes` ein (`pipeline_semantics.adoc:214`, `:256`, `:276`).
+Gleichzeitig gibt es bereits `docs/internal_guide/architecture/meta_registry.yaml` als gepflegte Meta-Vertragsquelle mit Layern wie `meta_canonical` und `meta_rendering`.
+
+Aktuell sind zentrale neue bzw. vorhandene Pipeline-Meta-Wurzeln dort nicht vollstaendig als solche sichtbar:
+
+* `helper_policies` wird von `enrich_lookup` gelesen (`enrich_lookup.py:47`, `:185`), ist aber nicht als eigener Root in `meta_registry.yaml` geseedet.
+* `frame_lifecycle` wird im Konzept neu eingefuehrt (`pipeline_semantics.adoc:377`, `:403`), ist aber naturgemaess noch nicht in der Meta-Registry.
+* `derived.sheets.*.helper_columns` und `derived.sheets.*.enrich_lookup` werden von FK-/Lookup-Transforms geschrieben (`fk_helpers.py:64`, `:94`, `enrich_lookup.py:290`, `:302`), sind aber als Vertrag schwerer auffindbar als `xref_crosstable`, `cell_codecs` und `compact_multiaxis`.
+
+Risiko:
+
+* Die Step-Registry dokumentiert Meta-Pfade, die die Meta-Registry nicht kennt.
+* Architekturtests koennen beide Dateien einzeln gruen halten, waehrend die eigentlichen Semantikvertraege auseinanderlaufen.
+
+Empfehlung:
+
+* In Slice 2 als Acceptance aufnehmen: Jeder `meta_contract` root in der Step-Registry muss entweder in `meta_registry.yaml` existieren oder explizit als step-lokaler, nicht persistierter Trace markiert sein.
+* `helper_policies`, `frame_lifecycle` und die relevanten `derived.sheets`-Contracts gezielt in die Meta-Registry aufnehmen oder bewusst als Uebergangs-/Trace-Namespace kennzeichnen.
+* Im Registry-JSON nicht nur String-Pfade verwenden, sondern mindestens `path`, `layer`, `classification` und optional `registry_ref`.
+
+==== C-03: Direkte YAML-Parameter und resolved `_meta` brauchen eine harte Konfliktregel
+
+Severity: medium-high
+
+Das Konzept erlaubt, dass Primitive direkte Parameter akzeptieren, aber ihr effektives Verhalten in `_meta` repraesentierbar bleibt (`pipeline_semantics.adoc:64` ff.).
+Gleichzeitig sollen Configuration-Steps Heuristiken in resolved metadata schreiben (`pipeline_semantics.adoc:86` ff., `:146` ff.).
+
+Die konkrete Lookup-Richtung zeigt die Unschaerfe:
+
+* `enrich_lookup` kann Helper direkt aus `helpers.fields` bekommen.
+* Es kann `helpers: default` aus `_meta["helper_policies"][lookup]` lesen.
+* Es kann `helpers.allowed` direkt bekommen oder aus der Policy lesen.
+
+Ohne Praezedenzregel bleibt offen:
+
+* Was passiert, wenn YAML-Parameter und `_meta`-Policy widersprechen?
+* Wird eine Inline-Konfiguration als resolved policy zurueckgeschrieben?
+* Darf ein Primitive noch `auto` interpretieren oder nur eine Configuration-Step?
+* Welche Form ist spaeter fuer Inverse, Diagnose und Doku autoritativ?
+
+Empfehlung:
+
+* Eine explizite Regel aufnehmen, z.B.:
+  "Primitive koennen inline config akzeptieren, muessen daraus aber vor Ausfuehrung eine `effective_config` bilden. Wenn `policy_ref`/`_meta` und inline config beide gesetzt sind und sich widersprechen, ist das ein Fehler."
+* `auto` ausschliesslich in Configuration-Steps erlauben.
+* In der Step-Registry pro Parameter markieren, ob er `inline_only`, `policy_ref`, `resolved_meta` oder `deprecated_alias` ist.
+
+==== C-04: Frame-Lifecycle muss die aktuelle workbook-view Plugin-Praxis ausdruecklich abholen
+
+Severity: medium-high
+
+Das Konzept trennt lineare Pipeline-Ausfuehrung von Render-Sicht und sagt, Rendering solle explizite Lifecycle-/View-Meta konsumieren (`pipeline_semantics.adoc:444` ff.).
+Das ist die richtige Zielrichtung.
+
+Der aktuelle Consumer `ba-config` nutzt aber bereits einen anderen Mechanismus:
+
+* `elmar_workbook.yaml` fuehrt `contract_compact_multiaxis`, danach `enrich_lookup`, danach ein Plugin `build_elmar_workbook_views` aus (`../ba-config/pipelines/elmar_workbook.yaml:16`, `:29`, `:42`).
+* Dieses Plugin kann mit `keep_source: false` die bisherigen Frames physisch aus der Ausgabe entfernen (`../ba-config/pipelines/elmar_workbook.yaml:45`, `../ba-config/plugins/nxt_config/workbook_views.py:37`, `:40`).
+
+Das ist praktisch und fuer den aktuellen Use Case nachvollziehbar, liegt aber genau zwischen "Transformation" und "Workbook View".
+
+Risiko:
+
+* Frame-Lifecycle wird im Framework eingefuehrt, aber der wichtigste reale View-Building-Pfad bleibt ein Plugin, das Frames selbst ersetzt.
+* Renderer-Policy und Plugin-View-Policy konkurrieren dann, statt dieselbe Lifecycle-Sprache zu sprechen.
+
+Empfehlung:
+
+* In Slice 5 ausdruecklich festlegen, wie workbook-view Plugins eingeordnet werden:
+  `view_materialization` Composite-Step, Plugin-Projection, oder bewusst transienter Consumer-Code.
+* Wenn Plugins Frames erzeugen, unterdruecken oder ersetzen, sollten sie Lifecycle-Meta schreiben oder zumindest deklarieren, dass sie Lifecycle-Verantwortung vollstaendig selbst uebernehmen.
+* `frame_lifecycle` sollte nicht nur Render-Omission beschreiben, sondern auch View-Projektionen, die schon vor dem Renderer als Frames materialisiert werden.
+
+==== C-05: Der vorgeschlagene JSON-Ort ist aktuell von `.gitignore` blockiert
+
+Severity: medium
+
+Das Konzept schlaegt initial `docs/internal_guide/architecture/pipeline_step_registry.json` vor (`pipeline_semantics.adoc:234`).
+Die Datei wuerde aktuell von `.gitignore` ignoriert, weil `/docs/**/*.json` als ephemer markiert ist (`.gitignore:72`).
+
+Das Konzept erwaehnt diesen Punkt bereits abstrakt.
+Da der Fall im Repo tatsaechlich zutrifft, sollte es in Slice 2 nicht nur ein Hinweis sein, sondern Acceptance.
+
+Empfehlung:
+
+* Falls der JSON-Pfad unter `docs/` bleibt, im selben Slice eine explizite `.gitignore`-Ausnahme aufnehmen, z.B. fuer genau `pipeline_step_registry.json`.
+* Alternativ die Registry sofort in einen nicht ignorierten Pfad legen, wenn sie absehbar test- oder produktionsnah wird.
+
+==== C-06: Step-Renames brauchen einen maschinenlesbaren Migrationsvertrag
+
+Severity: medium
+
+Die Namensrichtung fuer FK/helper/lookup ist gut (`pipeline_semantics.adoc:482` ff.).
+Der aktuelle `ba-config`-Consumer nutzt aber bereits `enrich_lookup` in einer echten Pipeline (`../ba-config/pipelines/elmar_workbook.yaml:29`), und weitere alte Namen koennen in Doku, Tests oder Consumer-YAMLs auftauchen.
+
+Risiko:
+
+* Die Step-Registry beschreibt neue Namen, runtime `REGISTRY` enthaelt alte und neue Namen gemischt, und Consumer-Updates bleiben nur textuell geplant.
+* Kurzlebige Aliase bleiben am Ende doch dauerhaft, weil ihr Ablaufdatum nicht pruefbar ist.
+
+Empfehlung:
+
+* Im Registry-Schema Felder fuer `aliases`, `replaced_by`, `deprecated_since`, `warn_until` oder `remove_after` vorsehen.
+* Wenn bewusst hart umbenannt wird, dann im FTR eine konkrete Consumer-Liste und Smoke-Pruefung aufnehmen.
+* Architekturtest: Deprecated aliases duerfen nur existieren, wenn sie ein Entferndatum oder eine konkrete Release-Grenze haben.
+
+==== C-07: Slice-1-Pfad und Architektur-Index sind noch nicht konsistent
+
+Severity: low
+
+Die Datei liegt aktuell als `docs/internal_guide/architecture/pipeline_semantics.adoc` vor.
+Im Slice-1-Abschnitt steht aber als vorgeschlagener Pfad `docs/internal_guide/architecture/pipeline_step_semantics.adoc` (`pipeline_semantics.adoc:523`, `:529`).
+Ausserdem ist die neue Architektur-Notiz noch nicht in `_architecture.adoc` included; dort steht aktuell u.a. `generic_ir.adoc`, aber kein `pipeline_semantics.adoc`.
+
+Empfehlung:
+
+* Vor Abschluss von Slice 1 den Namen finalisieren und die Include-Stelle setzen.
+* Wenn der kuerzere Name `pipeline_semantics.adoc` bleiben soll, den Slice-Text anpassen.
+
+==== C-08: Bare `===` Separatoren sind fuer striktes AsciiDoc unguenstig
+
+Severity: editorial
+
+Die Quelldatei nutzt mehrfach eine einzelne Zeile `===` als optische Trennung.
+Das kann von manchen AsciiDoc-Tools als leerer Heading-Titel gelesen werden.
+
+Empfehlung:
+
+* Die Separatorzeilen entfernen oder durch echte Abschnittstitel ersetzen.
+* Das lohnt sich besonders, wenn aus der internen Doku spaeter generierte Referenzdoku entstehen soll.
+
+=== Ergaenzende Empfehlungen
+
+==== Step-Kategorien
+
+Ich stimme Claudes Punkt zu: Die vier Kategorien brauchen eine vollstaendige Mapping-Tabelle fuer den aktuellen `REGISTRY`-Stand.
+Ich wuerde dabei aber nicht versuchen, alles in die vier fachlichen Kategorien zu pressen.
+
+`bootstrap_meta`, `apply_overrides` und eventuell `identity` sind eher Infrastruktur-/Meta-Bootstrap-Schritte als fachliche Configuration-Steps.
+Entweder die Kategorie `infrastructure` ergaenzen oder diese Faelle bewusst als `configuration` mit Subtyp kennzeichnen.
+Das ist klein, verhindert aber spaeter unscharfe Tests.
+
+==== Registry-Schema
+
+Das minimale Registry-Schema sollte aus meiner Sicht noch diese Felder bekommen:
+
+* `runtime_name`
+* `target`
+* `factory_shape`
+* `category`
+* `status`
+* `aliases`
+* `parameters`
+* `meta_contract`
+* `frame_contract`
+* `inverse`
+* `wrapped_steps`
+* `ftr`
+* `docs`
+
+`target` und `factory_shape` muessen nicht heissen, dass JSON sofort runtime source of truth wird.
+Sie machen aber die Alignment-Tests gegen `StepRegistration.target` und alte bare factories wesentlich praeziser.
+
+==== Frame-Contract
+
+`frame_contract.retains_inputs_by_default` reicht fuer die naechsten Fragen vermutlich nicht aus.
+Hilfreich waeren explizitere Felder:
+
+* `reads`
+* `writes`
+* `preserves`
+* `replaces`
+* `drops`
+* `internal_frames`
+* `view_outputs`
+
+Gerade Composite- und Plugin-Schritte brauchen diese Sprache, sonst faellt `frame_lifecycle` spaeter zu viel implizite Semantik zu.
+
+=== Vorgeschlagene naechste Aenderungen am Konzept
+
+1. In den Composite-Step-Abschnitt eine Policy fuer interne Primitive-Meta und Temp-Frames aufnehmen.
+2. Im Step-Registry-Abschnitt die Kopplung an `meta_registry.yaml` explizit machen.
+3. Im Configuration-/Primitive-Abschnitt eine Praezedenz- und Konfliktregel fuer inline params vs. `_meta` definieren.
+4. Im Frame-Lifecycle-Abschnitt workbook-view Plugins als aktuellen Uebergangspfad erwaehnen.
+5. Slice 2 um die `.gitignore`-Ausnahme fuer JSON unter `docs/` erweitern.
+6. Slice 3 um maschinenlesbare Rename-/Alias-Felder in der Registry erweitern.
+7. Slice 1 mit finalem Dateinamen und Include in `_architecture.adoc` abschliessen.
+
+=== Schlussbewertung
+
+Das Konzept ist tragfaehig.
+Es sollte nicht wegen der offenen Punkte gestoppt werden, aber die Punkte C-01 bis C-04 sollten vor groesseren Runtime-Aenderungen geklaert werden.
+
+Besonders C-01 ist ein guter Fruehtest fuer die Architekturidee:
+Wenn die neue Semantik-Sprache Temp-Frames, Composite-Provenance und sichtbare Workbook-Views sauber ausdruecken kann, dann traegt sie wahrscheinlich auch die naechsten Pipeline-Schritte.
+Wenn nicht, wuerde die Registry nur die aktuelle Implizitheit in strukturierter Form konservieren.
