@@ -141,10 +141,12 @@ def test_enrich_lookup_helpers_default_from_policy() -> None:
     frames = _frames(**{
         "_meta": {
             "helper_policies": {
-                "variables": {
-                    "key": "ID",
-                    "allowed_helpers": ["sort_key", "value_label_de", "module"],
-                    "default_helpers": ["value_label_de"],
+                "lookup": {
+                    "variables": {
+                        "key": "ID",
+                        "allowed_helpers": ["sort_key", "value_label_de", "module"],
+                        "default_helpers": ["value_label_de"],
+                    }
                 }
             }
         }
@@ -188,9 +190,11 @@ def test_enrich_lookup_allowed_from_policy() -> None:
     frames = _frames(**{
         "_meta": {
             "helper_policies": {
-                "variables": {
-                    "allowed_helpers": ["sort_key"],
-                    "default_helpers": ["sort_key"],
+                "lookup": {
+                    "variables": {
+                        "allowed_helpers": ["sort_key"],
+                        "default_helpers": ["sort_key"],
+                    }
                 }
             }
         }
