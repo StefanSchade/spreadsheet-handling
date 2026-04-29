@@ -145,6 +145,7 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         step_id = spec.pop("step", None)
         if not step_id:
             raise ValueError(f"Step spec missing 'step': {raw}")
+        _ensure_string_parameter_keys(step_id, spec)
 
         registration = resolve_registration(step_id)
         if not registration:
@@ -169,6 +170,24 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
                 raise
         steps.append(bound)
     return steps
+
+
+def _ensure_string_parameter_keys(step_id: str, spec: Mapping[Any, Any]) -> None:
+    non_string_keys = [key for key in spec if not isinstance(key, str)]
+    if not non_string_keys:
+        return
+
+    hint = ""
+    if step_id == "add_lookup_helpers" and True in non_string_keys:
+        hint = (
+            " This commonly means an unquoted YAML 1.1 boolean-like key such "
+            "as `on:` was parsed as True; prefer `key:`/`keys:` or quote the "
+            "legacy spelling as `\"on\":`."
+        )
+    raise ValueError(
+        f"Step {step_id!r} contains non-string parameter key(s) {non_string_keys!r}."
+        f"{hint}"
+    )
 
 
 # ---------------------------------------------------------------------------

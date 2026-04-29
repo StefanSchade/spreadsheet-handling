@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import textwrap
+
 import pandas as pd
 import pytest
 
@@ -7,6 +10,7 @@ from spreadsheet_handling.pipeline.pipeline import (
     REGISTRY,
     StepRegistration,
     build_steps_from_config,
+    build_steps_from_yaml,
     run_pipeline,
 )
 
@@ -41,7 +45,7 @@ def test_add_lookup_helpers_pipeline_smoke() -> None:
         "source": "matrix_raw",
         "lookup": "variables",
         "output": "matrix",
-        "on": "ID",
+        "key": "ID",
         "helpers": {"fields": ["sort_key", "label"]},
         "order": {"sort_by": ["sort_key"]},
     }])
@@ -54,3 +58,80 @@ def test_add_lookup_helpers_pipeline_smoke() -> None:
     assert "sort_key" in result.columns
     assert "label" in result.columns
     assert list(result["ID"]) == ["v2", "v1"]
+
+
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_add_lookup_helpers_yaml_accepts_unquoted_key_alias(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: variables
+                output: matrix
+                key: ID
+                helpers:
+                  fields: [label]
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "variables": pd.DataFrame({"ID": ["v1", "v2"], "label": ["Eins", "Zwei"]}),
+        "matrix_raw": pd.DataFrame({"ID": ["v2", "v1"]}),
+    }
+
+    out = run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+
+    assert list(out["matrix"]["label"]) == ["Zwei", "Eins"]
+
+
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_add_lookup_helpers_yaml_accepts_quoted_legacy_on(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: variables
+                output: matrix
+                "on": ID
+                helpers:
+                  fields: [label]
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "variables": pd.DataFrame({"ID": ["v1", "v2"], "label": ["Eins", "Zwei"]}),
+        "matrix_raw": pd.DataFrame({"ID": ["v2", "v1"]}),
+    }
+
+    out = run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+
+    assert list(out["matrix"]["label"]) == ["Zwei", "Eins"]
+
+
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_add_lookup_helpers_yaml_diagnoses_unquoted_legacy_on(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: variables
+                output: matrix
+                on: ID
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"on:.*key.*keys"):
+        build_steps_from_yaml(str(cfg_path))

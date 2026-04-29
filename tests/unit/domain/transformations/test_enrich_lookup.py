@@ -286,6 +286,54 @@ def test_enrich_lookup_multi_key_join() -> None:
     assert list(out["result"]["label"]) == ["L1", "L2"]
 
 
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_enrich_lookup_accepts_key_alias() -> None:
+    frames = _frames()
+    out = enrich_lookup(
+        frames,
+        source="variable_usage_matrix_raw",
+        lookup="variables",
+        output="result",
+        key="ID",
+        helpers={"fields": ["value_label_de"]},
+    )
+
+    assert list(out["result"]["value_label_de"]) == ["Eins", "Zwei"]
+
+
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_enrich_lookup_accepts_keys_alias() -> None:
+    source = pd.DataFrame({"k1": ["a", "b"], "k2": [1, 2], "val": ["x", "y"]})
+    lookup = pd.DataFrame({"k1": ["a", "b"], "k2": [1, 2], "label": ["L1", "L2"]})
+    frames = {"src": source, "lkp": lookup}
+
+    out = enrich_lookup(
+        frames,
+        source="src",
+        lookup="lkp",
+        output="result",
+        keys=["k1", "k2"],
+        helpers={"fields": ["label"]},
+    )
+
+    assert list(out["result"]["label"]) == ["L1", "L2"]
+
+
+@pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
+def test_enrich_lookup_rejects_multiple_join_key_forms() -> None:
+    frames = _frames()
+    with pytest.raises(ValueError, match="exactly one"):
+        enrich_lookup(
+            frames,
+            source="variable_usage_matrix_raw",
+            lookup="variables",
+            output="result",
+            key="ID",
+            on="ID",
+            helpers={"fields": ["value_label_de"]},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Finding 1: Duplicate lookup keys
 # ---------------------------------------------------------------------------
