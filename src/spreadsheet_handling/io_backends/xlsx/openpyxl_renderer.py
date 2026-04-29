@@ -27,6 +27,7 @@ from spreadsheet_handling.rendering.plan import (
     DefineNamedRange,
 )
 from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
+from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
 
 
 # --------------------------------------------------------------------------------------
@@ -60,6 +61,108 @@ def _xlsx_validation_formula(formula: FormulaSpec) -> str:
     raise TypeError(f"Unsupported formula spec: {type(formula).__name__}")
 
 
+def _collect_formula_context(
+    plan: RenderPlan,
+) -> tuple[dict[str, dict[str, int]], dict[str, tuple[int, int]]]:
+    sheet_headers: dict[str, dict[str, int]] = {}
+    sheet_data_bounds: dict[str, tuple[int, int]] = {}
+    for op in plan.ops:
+        if isinstance(op, SetHeader):
+            sheet_headers.setdefault(op.sheet, {}).setdefault(op.text, op.col)
+        elif isinstance(op, WriteDataBlock) and op.data:
+            sheet_data_bounds.setdefault(op.sheet, (op.r1, op.r1 + len(op.data) - 1))
+    return sheet_headers, sheet_data_bounds
+
+
+def _quote_xlsx_sheet_name(sheet: str) -> str:
+    return "'" + str(sheet).replace("'", "''") + "'"
+
+
+def _xlsx_string_literal(value: object) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _header_col(
+    sheet_headers: dict[str, dict[str, int]],
+    *,
+    sheet: str,
+    column: str,
+) -> int:
+    try:
+        return sheet_headers[sheet][column]
+    except KeyError as exc:
+        raise KeyError(f"Formula column {column!r} not found on sheet {sheet!r}") from exc
+
+
+def _data_bounds(
+    sheet_data_bounds: dict[str, tuple[int, int]],
+    *,
+    sheet: str,
+) -> tuple[int, int]:
+    try:
+        return sheet_data_bounds[sheet]
+    except KeyError as exc:
+        raise KeyError(f"Formula lookup sheet {sheet!r} has no data block") from exc
+
+
+def _xlsx_lookup_formula(
+    formula: LookupFormulaSpec,
+    *,
+    current_sheet: str,
+    row: int,
+    sheet_headers: dict[str, dict[str, int]],
+    sheet_data_bounds: dict[str, tuple[int, int]],
+) -> str:
+    source_col = _header_col(
+        sheet_headers,
+        sheet=current_sheet,
+        column=formula.source_key_column,
+    )
+    lookup_key_col = _header_col(
+        sheet_headers,
+        sheet=formula.lookup_sheet,
+        column=formula.lookup_key_column,
+    )
+    lookup_value_col = _header_col(
+        sheet_headers,
+        sheet=formula.lookup_sheet,
+        column=formula.lookup_value_column,
+    )
+    lookup_start, lookup_end = _data_bounds(sheet_data_bounds, sheet=formula.lookup_sheet)
+
+    source_ref = f"${get_column_letter(source_col)}{row}"
+    lookup_sheet = _quote_xlsx_sheet_name(formula.lookup_sheet)
+    key_range = (
+        f"{lookup_sheet}!${get_column_letter(lookup_key_col)}${lookup_start}:"
+        f"${get_column_letter(lookup_key_col)}${lookup_end}"
+    )
+    value_range = (
+        f"{lookup_sheet}!${get_column_letter(lookup_value_col)}${lookup_start}:"
+        f"${get_column_letter(lookup_value_col)}${lookup_end}"
+    )
+    missing = _xlsx_string_literal(formula.missing)
+    return f"=XLOOKUP({source_ref},{key_range},{value_range},{missing})"
+
+
+def _xlsx_cell_value(
+    value: Any,
+    *,
+    current_sheet: str,
+    row: int,
+    sheet_headers: dict[str, dict[str, int]],
+    sheet_data_bounds: dict[str, tuple[int, int]],
+) -> Any:
+    if isinstance(value, LookupFormulaSpec):
+        return _xlsx_lookup_formula(
+            value,
+            current_sheet=current_sheet,
+            row=row,
+            sheet_headers=sheet_headers,
+            sheet_data_bounds=sheet_data_bounds,
+        )
+    return value
+
+
 # --------------------------------------------------------------------------------------
 # Typed renderer — dispatches on isinstance checks against plan.py dataclasses
 # --------------------------------------------------------------------------------------
@@ -70,6 +173,7 @@ def _render_from_plan(plan: RenderPlan, out_path: Path) -> None:
     wb.remove(default)
 
     defined: set[str] = set()
+    sheet_headers, sheet_data_bounds = _collect_formula_context(plan)
 
     # First pass: create sheets deterministically
     for op in plan.ops:
@@ -125,7 +229,18 @@ def _render_from_plan(plan: RenderPlan, out_path: Path) -> None:
             ws = _get_ws(wb, op.sheet)
             for row_off, row_data in enumerate(op.data):
                 for col_off, val in enumerate(row_data):
-                    ws.cell(row=op.r1 + row_off, column=op.c1 + col_off, value=val)
+                    row = op.r1 + row_off
+                    ws.cell(
+                        row=row,
+                        column=op.c1 + col_off,
+                        value=_xlsx_cell_value(
+                            val,
+                            current_sheet=op.sheet,
+                            row=row,
+                            sheet_headers=sheet_headers,
+                            sheet_data_bounds=sheet_data_bounds,
+                        ),
+                    )
             continue
 
         if isinstance(op, SetFreeze):

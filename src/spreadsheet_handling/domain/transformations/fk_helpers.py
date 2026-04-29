@@ -9,14 +9,19 @@ from __future__ import annotations
 from typing import Any
 
 from ...core.fk import (
+    FKDef,
     build_registry,
     build_id_value_maps,
     detect_fk_columns,
     apply_fk_helpers as _apply_fk_helpers,
 )
 from ...frame_keys import copy_reserved_frames, iter_data_frames
+from ...rendering.formulas import lookup_formula
 
 Frames = dict[str, Any]
+
+_VALUE_HELPER_MODES = {"value", "values"}
+_FORMULA_HELPER_MODES = {"formula", "formulas"}
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +41,12 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
     reg = build_registry(frames, defaults)
     levels = int(defaults.get("levels", 3))
     helper_prefix = str(defaults.get("helper_prefix", "_"))
+    helper_value_mode = _helper_value_mode(defaults)
+    helper_value_provider = (
+        _lookup_formula_provider(reg)
+        if helper_value_mode in _FORMULA_HELPER_MODES
+        else None
+    )
     fk_defs_by_sheet: dict[str, Any] = {}
     fields_by_target: dict[str, list[str]] = {}
 
@@ -54,11 +65,42 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
     for sheet_name, df in iter_data_frames(frames):
         fk_defs = fk_defs_by_sheet[sheet_name]
         out[sheet_name] = _apply_fk_helpers(
-            df, fk_defs, id_maps, levels, helper_prefix=helper_prefix
+            df,
+            fk_defs,
+            id_maps,
+            levels,
+            helper_prefix=helper_prefix,
+            helper_value_provider=helper_value_provider,
         )
 
     _write_helper_provenance(out, fk_defs_by_sheet)
     return out
+
+
+def _helper_value_mode(defaults: dict[str, Any]) -> str:
+    mode = str(defaults.get("helper_value_mode", "values")).lower()
+    if mode not in _VALUE_HELPER_MODES and mode not in _FORMULA_HELPER_MODES:
+        raise ValueError(
+            "helper_value_mode must be one of "
+            f"{sorted(_VALUE_HELPER_MODES | _FORMULA_HELPER_MODES)}"
+        )
+    return mode
+
+
+def _lookup_formula_provider(registry: dict[str, dict[str, Any]]):
+    def provider(fk: FKDef, raw_ids: list[Any]) -> list[Any]:
+        target = registry.get(fk.target_sheet_key) or {}
+        lookup_sheet = str(target.get("sheet_name") or fk.target_sheet_key)
+        formula = lookup_formula(
+            source_key_column=fk.fk_column,
+            lookup_sheet=lookup_sheet,
+            lookup_key_column=fk.id_field,
+            lookup_value_column=fk.value_field,
+            missing="",
+        )
+        return [formula for _ in raw_ids]
+
+    return provider
 
 
 def _write_helper_provenance(
