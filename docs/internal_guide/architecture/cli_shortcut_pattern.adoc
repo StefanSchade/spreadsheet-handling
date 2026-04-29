@@ -1,0 +1,140 @@
+=== CLI Shortcut Pattern — Opinionated Commands as Pipeline Facades
+
+:status: concept
+:scope: architecture
+:updated: 2026-04-29
+
+==== Purpose
+
+This document records the architectural intent behind thin CLI shortcut
+commands that orchestrate a full pipeline behind the user's back.
+
+The pattern is not legacy.  It is an intentional product mechanism that should
+survive future cleanup of specific shortcut names.
+
+==== Problem
+
+The generic `sheets-run` command is powerful but requires the user to prepare
+a configuration file, a pipeline YAML, and I/O descriptors before anything
+happens.  This is the right model for repeatable, version-controlled workflows
+-- but it is a poor entry point for:
+
+* first-time exploration ("I just want to see my JSONs as a spreadsheet")
+* domain-specific tasks that have a natural CLI vocabulary
+  ("create an empty calendar from April to September")
+* CI/CD steps where the orchestration intent fits in a single command line
+
+==== Pattern
+
+A *CLI shortcut* is a thin command that:
+
+1. accepts a small number of user-facing parameters
+2. builds I/O descriptors and an optional default pipeline from those parameters
+3. delegates to `application.orchestrator.orchestrate()`
+4. never reaches behind the orchestrator into lower pipeline internals
+
+[source,text]
+----
+CLI shortcut command
+  -> reads user-facing parameters (paths, dates, options)
+  -> builds io descriptors: { kind, path }
+  -> optionally builds a default pipeline (list of step configs)
+  -> calls orchestrate(input=..., output=..., steps=...)
+  -> prints a confirmation or result summary
+----
+
+The shortcut does not own transformation logic.  It only translates a
+user-friendly parameter surface into the generic orchestration contract.
+
+==== Current examples
+
+`sheets-pack`::
+Reads an input directory and an output XLSX path.  Builds a default pipeline
+with `bootstrap_meta` (auto-filter, freeze-header defaults).  Delegates to
+`orchestrate()`.
+
+`sheets-unpack`::
+Reads an input XLSX and an output directory.  No pipeline steps.  Delegates
+to `orchestrate()`.
+
+Both are thin: `sheets_pack.py` is ~50 lines, `sheets_unpack.py` is ~25 lines.
+The names reflect the original "pack JSONs into Excel" POC vocabulary and are
+scheduled for deprecation, but the *mechanism* remains.
+
+==== Future example: domain-specific shortcut
+
+Imagine a project management module that lets users maintain a Gantt-style
+availability calendar in a spreadsheet and export it as normalized resource
+allocation data.
+
+A CLI shortcut for this might look like:
+
+[source,text]
+----
+sheets-create-calendar --from 2026-04 --to 2026-09 --team backend -o calendar.xlsx
+----
+
+Behind the scenes:
+
+[source,text]
+----
+def main(argv):
+    args = parse_args(argv)
+    orchestrate(
+        input={"kind": "generated", "generator": "calendar", "params": {
+            "from": args.from_date,
+            "to": args.to_date,
+            "team": args.team,
+        }},
+        output={"kind": "xlsx", "path": args.output},
+        steps=[
+            {"step": "generate_calendar_scaffold", ...},
+            {"step": "add_validations", "rules": [...]},
+        ],
+    )
+----
+
+The user never sees a pipeline YAML.  The command is self-contained,
+discoverable via `--help`, and delegates to the same orchestration seam
+that `sheets-run` uses.
+
+==== Rules
+
+* A shortcut must delegate to `orchestrate()`.  It must not call pipeline
+  internals directly.
+* A shortcut may build a default pipeline, but the pipeline must be a plain
+  list of step configs -- no special execution paths.
+* A shortcut should be implementable in under 100 lines.  If it grows beyond
+  that, the complexity belongs in a plugin step or a domain module, not in the
+  CLI layer.
+* Shortcuts are registered as `[project.scripts]` entry points in
+  `pyproject.toml`, just like `sheets-run`.
+* Shortcuts should be independently testable by calling `main(argv)` with
+  synthetic arguments.
+
+==== Relationship to other architecture concepts
+
+`sheets-run`::
+The generic, config-driven entry point.  Shortcuts are a convenience layer
+*on top of* the same orchestration contract.  They do not replace `sheets-run`.
+
+`--steps` / `--pipeline`::
+The underlying step-execution model.  Shortcuts may use it internally (via
+`orchestrate()`) but never expose it to the user.
+
+`FTR-PIPELINE-FACADE-AND-SIMPLE-CLI-CLEANUP-P4A`::
+Rescoped to tighten the pipeline facade and deprecate the legacy `pack`/`unpack`
+names while preserving this pattern.
+
+`FTR-SIMPLE-CLI-SHIMS-P6`::
+The broader Phase-6 question of which shortcuts the project should offer as
+an intentional product surface.  This concept document defines the mechanism;
+Phase 6 decides the concrete command set.
+
+==== Open questions
+
+* Should shortcuts share a common base class or remain independent `main()`
+  functions?  Current recommendation: independent functions.  A base class
+  adds abstraction without clear benefit while the shortcut count is small.
+* Should the framework provide a shortcut *template* or *generator* for
+  consumer repositories?  Deferred until real demand exists.
