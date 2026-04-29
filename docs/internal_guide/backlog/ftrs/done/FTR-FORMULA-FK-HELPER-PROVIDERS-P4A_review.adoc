@@ -1,0 +1,290 @@
+===== Review: FTR-FORMULA-FK-HELPER-PROVIDERS-P4A
+
+*Status:* Reviewed post-implementation.
+*Reviewed:* 2026-04-29
+*Commit:* a88c872 (`feat(rendering): add FK helper lookup formula specs`)
+*Overall:* approve with findings
+
+'''
+
+====== Scope check
+
+The commit delivers a clean, minimal slice: FK helper cells can now carry structured `LookupFormulaSpec` intent instead of copied string values, and both XLSX and ODS adapters translate that intent to backend-specific `XLOOKUP(...)` formulas.
+
+[cols="1,1,3"]
+|===
+| Deliverable | Present | Notes
+
+| `LookupFormulaSpec` dataclass
+| yes
+| `rendering/formulas.py` — frozen, string-normalizing, backend-neutral. Clean extension of the existing `FormulaSpec` union.
+
+| `FormulaSpec` union updated
+| yes
+| `ListLiteralFormulaSpec \| LookupFormulaSpec`. Existing code that matches on `ListLiteralFormulaSpec` continues to work.
+
+| Domain-level formula provider
+| yes
+| `fk_helpers.py:_lookup_formula_provider` — returns `LookupFormulaSpec` per row. Opt-in via `defaults.helper_value_mode: formula`.
+
+| `core.fk` hook
+| yes
+| `apply_fk_helpers` receives optional `helper_value_provider` callback. Leaf function stays clean — no rendering imports.
+
+| XLSX adapter translation
+| yes
+| `openpyxl_renderer.py` — `_xlsx_lookup_formula` emits `=XLOOKUP(...)` with absolute lookup ranges and relative source ref.
+
+| ODS adapter translation
+| yes
+| `odf_renderer.py` — `_ods_lookup_formula` emits `of:=XLOOKUP(...)` with OpenFormula address syntax and semicolon separators.
+
+| Generic formula spec test
+| yes
+| `test_formula_specs.py` — tests string normalization of `LookupFormulaSpec`.
+
+| Domain-level test
+| yes
+| `test_fk_helpers_domain.py` — tests formula mode writes structured specs, rejects unknown modes.
+
+| XLSX adapter test
+| yes
+| `test_xlsx_formula_translation.py` — unit test for formula string + integration test writing and reading back an `.xlsx` file.
+
+| ODS adapter test
+| yes
+| `test_ods_formula_translation.py` — unit test for formula string + integration test writing an `.ods` file and checking XML content.
+
+| Meta registry update
+| yes
+| Added narrative references for FK-helper and plugin producers to `reference_conventions.approved_narrative_references`.
+
+| Backlog housekeeping
+| yes
+| FTR moved from `ftrs/open/` to `ftrs/done/`, both index files updated.
+
+| Runtime behavior default
+| preserved
+| Copied helper values remain the default. Formula mode is opt-in via `helper_value_mode: formula`.
+|===
+
+*No scope creep.* 14 files changed, all within scope. The implementation note in the FTR explicitly documents that lookup formula readback/parsing is deferred.
+
+'''
+
+====== Architecture quality
+
+===== Strengths
+
+* *Layer separation is exemplary.* The domain layer produces `LookupFormulaSpec` objects without any backend syntax. The rendering layer carries them as structured intent. Only the concrete adapters (`openpyxl_renderer.py`, `odf_renderer.py`) emit backend strings. This is exactly the boundary the hexagonal architecture demands.
+
+* *`core.fk` stays leaf-only.* The `helper_value_provider` callback is the right abstraction — `apply_fk_helpers` does not import rendering or formula modules. It just calls an optional function that returns values per FK definition. This keeps the core module testable without adapter dependencies.
+
+* *Opt-in via `helper_value_mode`.* Existing pipelines are unaffected. The `formula` mode must be explicitly requested in `defaults`. This is a safe rollout strategy.
+
+* *Formula context collection is a two-pass approach.* Both renderers first collect header positions and data bounds from the plan, then use that context during cell rendering. This avoids relying on render-order assumptions and handles cross-sheet lookups cleanly.
+
+* *Tests assert at the right layer boundaries.* Generic tests check `LookupFormulaSpec` semantics, domain tests check structured intent (not strings), adapter tests check both the translated formula string and full render-write-read roundtrips.
+
+===== Findings
+
+====== F-01: Same `LookupFormulaSpec` instance is reused for all rows in a sheet
+
+Severity: low
+
+In `_lookup_formula_provider` (fk_helpers.py):
+
+[source,python]
+----
+formula = lookup_formula(
+    source_key_column=fk.fk_column,
+    lookup_sheet=lookup_sheet,
+    lookup_key_column=fk.id_field,
+    lookup_value_column=fk.value_field,
+    missing="",
+)
+return [formula for _ in raw_ids]
+----
+
+The same frozen `LookupFormulaSpec` instance is replicated for every row. This is correct because `LookupFormulaSpec` is row-independent — the actual row reference (`$B5`) is resolved later by the adapter.
+
+However, this means every cell in the helper column stores the same object. For large sheets (thousands of rows), this creates many references to the same immutable object. Python will share the reference rather than copy data, so memory is not a concern — but it is worth documenting that the spec is intentionally row-independent.
+
+No action required.
+
+====== F-02: `_collect_formula_context` uses `setdefault` — only the first `WriteDataBlock` per sheet defines bounds
+
+Severity: medium
+
+In `openpyxl_renderer.py`:
+
+[source,python]
+----
+sheet_data_bounds.setdefault(op.sheet, (op.r1, op.r1 + len(op.data) - 1))
+----
+
+And in `odf_renderer.py`:
+
+[source,python]
+----
+if op.data and sheet.data_bounds is None:
+    sheet.data_bounds = (op.r1, op.r1 + len(op.data) - 1)
+----
+
+Both renderers record bounds from only the first `WriteDataBlock` per sheet. If a sheet has multiple data blocks (e.g., from split rendering or multiple write operations), the lookup range will only cover the first block.
+
+Currently the rendering pipeline generates one data block per sheet, so this works. But the implicit assumption is fragile.
+
+Recommendation: Either document the assumption that each sheet has exactly one `WriteDataBlock`, or extend the logic to compute the union bounds across all data blocks per sheet (take `min(r1)` and `max(r1 + len(data) - 1)`).
+
+====== F-03: XLSX source key ref uses relative row (`$B5`) but absolute column — minor inconsistency documentation
+
+Severity: editorial
+
+The XLSX formula:
+
+[source,text]
+----
+=XLOOKUP($B5,'Customers'!$A$2:$A$4,'Customers'!$B$2:$B$4,"")
+----
+
+The source cell reference `$B5` has an absolute column and relative row. The lookup ranges are fully absolute (`$A$2:$A$4`). This is the correct Excel behavior for formulas that should be copyable down a column.
+
+This is not a bug — it is standard spreadsheet convention. But it is worth noting that the formula is designed for vertical copy, not horizontal copy. If a user copies the formula sideways, the source column reference would not adjust. This matches the FK helper use case (helpers are in fixed columns, data extends vertically).
+
+No action required — just confirming the design is intentional.
+
+====== F-04: ODS renderer cell gets `stringvalue=""` regardless of actual formula result
+
+Severity: low
+
+In `odf_renderer.py`:
+
+[source,python]
+----
+table_cell = TableCell(
+    formula=formula,
+    valuetype="string",
+    stringvalue="",
+    attributes=attributes,
+)
+----
+
+The ODS cell carries `stringvalue=""` as a placeholder. When a spreadsheet application opens the file, it will recalculate the formula and display the actual result. Until recalculation, the cell displays empty.
+
+This is standard practice for ODS files with formulas (you cannot know the result at render time without evaluating the formula). But it differs from the XLSX behavior where openpyxl writes only the formula and Excel evaluates on open.
+
+No action required — but users opening ODS files in read-only viewers that do not recalculate will see empty cells. This is a known ODS limitation.
+
+====== F-05: `_helper_value_mode` accepts both singular and plural forms — should be documented
+
+Severity: low
+
+In `fk_helpers.py`:
+
+[source,python]
+----
+_VALUE_HELPER_MODES = {"value", "values"}
+_FORMULA_HELPER_MODES = {"formula", "formulas"}
+----
+
+Both `value` and `values`, and both `formula` and `formulas` are accepted. This is user-friendly but creates an undocumented alias surface. The YAML surface documentation should pick one canonical form and mention the aliases.
+
+Recommendation: Document `values` and `formula` as the canonical forms in the step registry or FTR, and note that the singular/plural aliases are accepted for convenience.
+
+====== F-06: Step registry not updated for `add_fk_helpers` formula mode parameter
+
+Severity: low
+
+The JSON step registry entry for `add_fk_helpers` does not list `helper_value_mode` as a parameter. It is passed via `defaults` (which is an opaque `object`), so technically the registry is correct — but the formula-mode capability is invisible in the registry.
+
+Recommendation: Either add `helper_value_mode` as a documented parameter in the `defaults` object description, or add a note in the registry entry about the formula-mode extension point.
+
+====== F-07: `_header_col` and `_data_bounds` helpers are duplicated between XLSX and ODS renderers
+
+Severity: editorial
+
+The functions `_header_col`, `_data_bounds`, and the string-literal escaping helpers are structurally identical in both renderers (only the formula syntax differs). This is acceptable for two adapters but would become maintenance overhead if more adapters are added.
+
+No action required now — the concept document already defers backend abstraction. Worth noting for future adapter work.
+
+'''
+
+====== Test quality
+
+[cols="1,1,3"]
+|===
+| Test file | Tests added | Assessment
+
+| `test_formula_specs.py`
+| 1
+| Tests `LookupFormulaSpec` string normalization including `missing=None` → `"None"`. Good boundary check.
+
+| `test_fk_helpers_domain.py`
+| 2
+| Tests formula-mode writes structured specs (not strings), and rejects unknown mode. Clean layer check — asserts `LookupFormulaSpec` instances, not formula strings.
+
+| `test_xlsx_formula_translation.py`
+| 2
+| Unit test asserts exact XLOOKUP string. Integration test writes `.xlsx`, reads back with openpyxl, and asserts formula cell value. Excellent end-to-end coverage.
+
+| `test_ods_formula_translation.py`
+| 2
+| Unit test asserts exact OpenFormula string. Integration test writes `.ods`, reads XML from ZIP, and asserts formula attribute presence. Good cross-adapter parity.
+
+| `test_meta_registry_hardening.py`
+| 1 line
+| Added `helper_policies` to seed profile assertions. Keeps meta registry guard in sync.
+|===
+
+Total: 7 new test cases across 5 files. Coverage is well-distributed across layers.
+
+'''
+
+====== Acceptance criteria check
+
+[cols="1,1"]
+|===
+| Criterion | Met
+
+| FK helper behavior as structured intent above adapters
+| yes — `LookupFormulaSpec` in `rendering/formulas.py`
+
+| XLSX/ODS syntax only in adapter code
+| yes — `_xlsx_lookup_formula` / `_ods_lookup_formula` are adapter-local
+
+| Generic tests without backend strings
+| yes — `test_formula_specs.py` and `test_fk_helpers_domain.py`
+
+| Adapter tests for emitted backend syntax
+| yes — both XLSX and ODS unit + integration tests
+|===
+
+'''
+
+====== Conclusion
+
+Clean, well-layered implementation. The `LookupFormulaSpec` boundary is the right abstraction level, the adapter translations are correct for both backends, and the opt-in mode preserves backward compatibility.
+
+Most actionable follow-ups:
+
+* F-02 (medium): The single-data-block assumption in `_collect_formula_context` / `_BufferedSheet.data_bounds` is fragile. Document or harden before more complex rendering scenarios arrive.
+* F-06 (low): Make `helper_value_mode: formula` visible in the step registry.
+* F-05 (low): Pick canonical mode names (`values` / `formula`) for documentation.
+
+'''
+
+====== Disposition 2026-04-29
+
+Addressed in follow-up commit:
+
+* F-02: Hardened lookup-range context collection in both XLSX and ODS renderers. Formula lookup ranges now use the union of all `WriteDataBlock` row bounds per referenced sheet instead of assuming a single data block.
+* F-05: Documented canonical `helper_value_mode` values as `values` and `formula`; the singular/plural aliases remain accepted for YAML ergonomics.
+* F-06: Added a step-registry note on `add_fk_helpers.defaults.helper_value_mode`.
+
+Accepted as intentional/current behavior:
+
+* F-01: `LookupFormulaSpec` is row-independent by design; adapters resolve the concrete current-row reference while rendering each cell.
+* F-03: XLSX formulas keep the source key column absolute and row relative because FK helper formulas are designed to copy vertically.
+* F-04: ODS formula cells carry an empty cached string value and rely on spreadsheet recalculation.
+* F-07: Adapter-local helper duplication is acceptable while only two backends exist; a shared translator layer can be introduced when another adapter makes the duplication material.
