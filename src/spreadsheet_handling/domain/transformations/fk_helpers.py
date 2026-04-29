@@ -126,19 +126,48 @@ def _defaults_with_fk_policies(
     by_fk = dict(execution_defaults.get("helper_fields_by_fk") or {})
     id_by_target = dict(execution_defaults.get("id_field_by_target") or {})
     label_by_target = dict(execution_defaults.get("label_field_by_target") or {})
+    inline_helper_prefix = (
+        str(defaults["helper_prefix"])
+        if "helper_prefix" in defaults
+        else None
+    )
+    resolved_helper_prefix: str | None = None
 
     for target_key, policy in policies.items():
         target_sheet = str(policy.get("target_sheet") or target_key)
         policy_key = str(policy.get("key") or execution_defaults.get("id_field", "id"))
         default_helpers = _list_value(policy.get("default_helpers"))
-        policy_prefix = str(policy.get("helper_prefix", execution_defaults.get("helper_prefix", "_")))
+        policy_allowed = (
+            _list_value(policy.get("allowed_helpers"))
+            if "allowed_helpers" in policy
+            else None
+        )
+        policy_prefix = str(policy.get("helper_prefix", inline_helper_prefix or "_"))
 
-        if "helper_prefix" in execution_defaults and str(execution_defaults["helper_prefix"]) != policy_prefix:
+        if inline_helper_prefix is not None and inline_helper_prefix != policy_prefix:
             raise ValueError(
-                f"Inline helper_prefix {execution_defaults['helper_prefix']!r} conflicts with "
+                f"Inline helper_prefix {inline_helper_prefix!r} conflicts with "
                 f"resolved FK helper policy for target {target_key!r}: {policy_prefix!r}"
             )
-        execution_defaults["helper_prefix"] = policy_prefix
+        if resolved_helper_prefix is None:
+            resolved_helper_prefix = policy_prefix
+        elif resolved_helper_prefix != policy_prefix:
+            raise ValueError(
+                "Resolved FK helper policies define multiple helper_prefix values "
+                f"({resolved_helper_prefix!r}, {policy_prefix!r}); one add_fk_helpers "
+                "execution supports a single helper_prefix"
+            )
+
+        if policy_allowed is not None:
+            disallowed_defaults = [
+                field for field in default_helpers
+                if field not in policy_allowed
+            ]
+            if disallowed_defaults:
+                raise ValueError(
+                    f"default_helpers {disallowed_defaults!r} must be included in "
+                    f"allowed_helpers for FK target {target_key!r}: {policy_allowed!r}"
+                )
 
         _merge_scalar_target_default(
             id_by_target,
@@ -185,6 +214,8 @@ def _defaults_with_fk_policies(
 
     execution_defaults["id_field_by_target"] = id_by_target
     execution_defaults["helper_fields_by_target"] = by_target
+    if resolved_helper_prefix is not None:
+        execution_defaults["helper_prefix"] = resolved_helper_prefix
     if label_by_target:
         execution_defaults["label_field_by_target"] = label_by_target
     return execution_defaults, policies

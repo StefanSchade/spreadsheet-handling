@@ -4,12 +4,12 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.core.indexing import level0_series
-from spreadsheet_handling.pipeline.pipeline import (
+from spreadsheet_handling.pipeline.registry import (
     REGISTRY,
-    StepRegistration,
     build_steps_from_config,
     run_pipeline,
 )
+from spreadsheet_handling.pipeline.types import StepRegistration
 
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-CONFIGURATION-STEPS-P4")
@@ -28,6 +28,12 @@ def _frames() -> dict:
                 "code": ["p1", "p2"],
                 "name": ["Alpha", "Beta"],
                 "category": ["A", "B"],
+            }
+        ),
+        "Suppliers": pd.DataFrame(
+            {
+                "code": ["s1", "s2"],
+                "name": ["North", "South"],
             }
         ),
     }
@@ -113,8 +119,36 @@ def test_add_fk_helpers_rejects_stale_policy_defaults_outside_allowlist() -> Non
 
     steps = build_steps_from_config([{"step": "add_fk_helpers"}])
 
-    with pytest.raises(ValueError, match="not in allowed list"):
+    with pytest.raises(ValueError, match="must be included in allowed_helpers"):
         run_pipeline(frames, steps)
+
+
+def test_add_fk_helpers_rejects_multiple_policy_prefixes() -> None:
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "configure_fk_helpers",
+                "targets": {
+                    "Products": {
+                        "key": "code",
+                        "allowed_helpers": ["name"],
+                        "default_helpers": ["name"],
+                        "helper_prefix": "_",
+                    },
+                    "Suppliers": {
+                        "key": "code",
+                        "allowed_helpers": ["name"],
+                        "default_helpers": ["name"],
+                        "helper_prefix": "__",
+                    },
+                },
+            },
+            {"step": "add_fk_helpers"},
+        ]
+    )
+
+    with pytest.raises(ValueError, match="multiple helper_prefix"):
+        run_pipeline(_frames(), steps)
 
 
 def test_add_fk_helpers_legacy_inline_behavior_remains_supported() -> None:
