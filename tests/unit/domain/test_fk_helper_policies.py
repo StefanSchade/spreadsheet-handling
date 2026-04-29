@@ -51,6 +51,7 @@ def test_configure_fk_helpers_resolves_targets_auto() -> None:
         targets="auto",
         auto={
             "id_column_candidates": ["ID", "id"],
+            "fk_column_pattern": "{key}_fk_{target}",
             "allowed_helpers": {"exclude": ["sort_key"]},
             "default_helpers": {"prefer": ["name"]},
         },
@@ -60,7 +61,7 @@ def test_configure_fk_helpers_resolves_targets_auto() -> None:
     assert policy["key"] == "id"
     assert policy["allowed_helpers"] == ["name", "category", "active"]
     assert policy["default_helpers"] == ["name"]
-    assert policy["fk_column"] == "id_(Products)"
+    assert policy["fk_column"] == "id_fk_Products"
 
 
 def test_configure_fk_helpers_accepts_targets_mapping() -> None:

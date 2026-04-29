@@ -1,0 +1,305 @@
+===== Review: FTR-FK-HELPER-CONFIGURATION-STEPS-P4
+
+*Status:* Reviewed post-implementation.
+*Reviewed:* 2026-04-29
+*Commit:* feb7a2f (`feat(pipeline): add FK helper configuration step`)
+*Overall:* approve with findings
+
+'''
+
+====== Scope check
+
+The FTR delivers the FK-helper configuration step as the counterpart to
+the lookup-helper configuration step (FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4).
+The scope is well-bounded: write FK helper policies to `_meta`, have
+`add_fk_helpers` consume them, detect conflicts, preserve legacy inline
+behavior.
+
+[cols="1,1,3"]
+|===
+| Deliverable | Present | Notes
+
+| `configure_fk_helpers` step
+| yes
+| `domain/helper_policies.py` — extends existing module by ~220 lines. Clean placement next to `configure_lookup_helpers`.
+
+| Runtime registry entry
+| yes
+| `StepRegistration(frames_target)` in `registry.py`. Matches lookup counterpart.
+
+| JSON step registry entry
+| yes
+| `category: configuration`, `subtype: fk_helper_policy`. Complete `meta_contract`, `frame_contract`, and `inverse` blocks.
+
+| Meta registry update
+| yes
+| `helper_policies` producer list extended with `configure_fk_helpers`; consumer updated from "future FK-helper" placeholder to `domain.transformations.fk_helpers.enrich_helpers`.
+
+| Policy-backed `add_fk_helpers`
+| yes
+| `fk_helpers.py` extended with `_defaults_with_fk_policies`, `_fk_policies`, `_validate_fk_policy_usage`, plus merge/conflict helpers.
+
+| Target resolution
+| yes
+| `_resolve_target_frame` resolves both exact sheet names and normalized sheet keys with ambiguity detection.
+
+| `targets: auto` support
+| yes
+| `_auto_fk_policy_specs` infers FK targets from `id_column_candidates`.
+
+| Per-target FK key support
+| yes
+| `id_field_by_target` propagated through `core/fk.py:build_registry`.
+
+| FK column convention
+| yes
+| `_resolve_fk_column` supports `fk_columns.convention` patterns and `auto.fk_column_pattern`.
+
+| Conflict detection
+| yes
+| Six conflict paths: `helper_prefix`, `id_field`, `label_field`, `helper_fields` (global), `helper_fields_by_target`, `helper_fields_by_fk`.
+
+| Stale policy validation
+| yes
+| `_validate_fk_policy_usage` checks each materialized FK helper against the policy's `allowed_helpers` list.
+
+| Unit tests (domain)
+| yes
+| `test_fk_helper_policies.py` — 5 tests covering explicit policy, auto inference, targets mapping, defaults-outside-allowlist, unknown-column rejection.
+
+| Integration tests (pipeline)
+| yes
+| `test_fk_helper_configuration.py` — 5 tests covering registry entry, policy-backed execution, inline conflict, stale policy rejection, legacy inline behavior.
+
+| FTR housekeeping
+| yes
+| FTR moved to `ftrs/done/`, `_ftrs_done.adoc` updated with completion note, `_ftrs_open.adoc` reference removed.
+
+| `core/fk.py` changes
+| yes
+| `build_registry` extended with `id_field_by_target` / `label_field_by_target` support. `normalize_sheet_key` re-exported for `fk_helpers.py`.
+|===
+
+*No scope creep.* 11 files changed, all within FTR scope.
+
+'''
+
+====== Implementation quality
+
+===== Strengths
+
+* *Structural symmetry with lookup counterpart.* `configure_fk_helpers` follows the same pattern as `configure_lookup_helpers`: domain function writes concrete policies to `_meta.helper_policies.fk`, execution step reads them and merges into its defaults. This makes both paths predictable and easy to reason about.
+
+* *`auto` values are never persisted.* Like the lookup counterpart, `configure_fk_helpers` resolves all `auto` specifications to concrete lists before writing to `_meta`. The core invariant holds.
+
+* *Target resolution is robust.* `_resolve_target_frame` handles both exact sheet names and normalized keys, and raises explicit errors for missing targets and ambiguous matches. The `(target_name, target_key)` tuple return gives downstream code both the display name and the canonical key.
+
+* *`_defaults_with_fk_policies` is thorough.* Six distinct conflict paths ensure that no inline default silently overrides resolved policy. The merge functions (`_merge_scalar_target_default`, `_merge_helper_target_default`) handle both sheet-name and sheet-key lookups.
+
+* *`_validate_fk_policy_usage` is a post-detection guard.* It runs after FK detection but before materialization, which means it can catch helper fields that were detected by convention but are not in the policy allowlist. This closes a gap that would otherwise allow stale or manually edited policies to permit unintended helpers.
+
+* *`build_registry` extension is minimal and backward-compatible.* The `id_field_by_target` / `label_field_by_target` support in `core/fk.py` defaults to the global `id_field` / `label_field`, so all existing callers are unaffected.
+
+* *Test coverage is well-structured.* Domain tests cover the configuration step in isolation; pipeline tests cover the full configure→execute sequence. The legacy inline test confirms backward compatibility.
+
+* *Step registry entry uses `inverse.kind: configuration_only`.* This addresses finding F-07 from the lookup review (which noted `validation_only` was misleading for a metadata-producing step). Good follow-through.
+
+===== Findings
+
+====== F-01: `configure_fk_helpers` allows both `target` and `targets` to be `None`
+
+Severity: low
+
+If neither `target` nor `targets` is passed, `_fk_policy_specs` raises `ValueError("configure_fk_helpers needs target or targets")`. This is correct behavior, but the check happens inside the private helper rather than at the API boundary. The early guard `if target is not None and targets is not None` only checks the both-present case.
+
+This is stylistically inconsistent with `configure_lookup_helpers`, which has a mandatory `lookup` parameter.
+
+Recommendation: Accept as-is. The error message is clear, and adding a redundant check would be noise.
+
+====== F-02: `_defaults_with_fk_policies` mutates the `execution_defaults` dict it creates
+
+Severity: low
+
+The function creates `execution_defaults = dict(defaults)` (shallow copy), then repeatedly assigns into it. This is correct because it does not mutate the caller's `defaults`. However, within the loop body, the pattern `execution_defaults["helper_prefix"] = policy_prefix` is set per-target but checked against the same global value. If two targets have different `helper_prefix` values in policy, the second target's check compares against the first target's policy-written value, not the original inline default.
+
+Example: Target A has `helper_prefix: "_"`, Target B has `helper_prefix: "__"`. Target A sets `execution_defaults["helper_prefix"] = "_"`. Target B's conflict check then compares `"_" != "__"` and raises — even though the original inline default might not have specified `helper_prefix` at all.
+
+This is arguably correct (a single `add_fk_helpers` invocation should use one prefix), but the error message says "Inline helper_prefix ... conflicts with resolved FK helper policy" which is misleading when the "inline" value was actually set by a prior target's policy.
+
+Recommendation: Either document that all FK targets in a single `add_fk_helpers` call must agree on `helper_prefix`, or detect the multi-target prefix divergence with a clearer error.
+
+====== F-03: `_fk_policies` validates target existence but `_defaults_with_fk_policies` does not validate `default_helpers` against `allowed_helpers`
+
+Severity: medium
+
+When `add_fk_helpers` reads an FK policy from `_meta`, `_defaults_with_fk_policies` trusts the policy's `default_helpers` and `allowed_helpers` as-is and merges them into execution defaults. The allowlist validation happens later in `_validate_fk_policy_usage` — but only for *detected* FK helpers, not for the *default* helpers from the policy.
+
+Consider: A stale policy has `allowed_helpers: ["name"]` but `default_helpers: ["name", "category"]` (someone edited `_meta` manually or a prior configuration step was buggy). `_defaults_with_fk_policies` merges `default_helpers: ["name", "category"]` into `helper_fields_by_target`. Later, `_validate_fk_policy_usage` checks detected FK defs against the allowlist — but the detected defs are shaped by the merged defaults, so `category` gets detected and the validation catches it.
+
+The test `test_add_fk_helpers_rejects_stale_policy_defaults_outside_allowlist` confirms this flow works end-to-end. The inconsistency between `default_helpers: ["category"]` and `allowed_helpers: ["name"]` is caught.
+
+Verdict: The system is safe. The guard works, but it works by coincidence of detection order rather than by an explicit early check. An explicit `default_helpers ⊆ allowed_helpers` check in `_fk_policies` or `_defaults_with_fk_policies` would be more defensive.
+
+Recommendation: Consider adding an early validation in `_defaults_with_fk_policies` that `default_helpers` is a subset of `allowed_helpers` before merging. This makes the invariant explicit rather than relying on downstream detection.
+
+====== F-04: `_list_value` in `fk_helpers.py` duplicates `_normalize_helper_fields` in `core/fk.py` and `_dedupe` in `helper_policies.py`
+
+Severity: low
+
+Three separate functions do the same thing: normalize a value to a deduplicated `list[str]`:
+
+* `core/fk.py:_normalize_helper_fields`
+* `domain/helper_policies.py:_dedupe`
+* `domain/transformations/fk_helpers.py:_list_value`
+
+All three have identical semantics (None→[], str→[str], list→list, dedup via dict.fromkeys).
+
+Recommendation: Extract to a shared utility if a natural location exists (e.g. `core.fk` or a `utils` module). Not urgent, but the triple duplication will accumulate.
+
+====== F-05: `test_fk_helper_configuration.py` imports from `pipeline.pipeline` facade
+
+Severity: medium (process)
+
+[source,python]
+----
+from spreadsheet_handling.pipeline.pipeline import (
+    REGISTRY,
+    StepRegistration,
+    build_steps_from_config,
+    run_pipeline,
+)
+----
+
+The open FTR-PIPELINE-FACADE-AND-SIMPLE-CLI-CLEANUP-P4A explicitly targets removing `pipeline.pipeline` as a broad re-export facade. This new test creates a fresh dependency on that facade.
+
+When FTR-PIPELINE-FACADE-AND-SIMPLE-CLI-CLEANUP-P4A lands, this import will need to be migrated. The lookup counterpart `test_lookup_helper_configuration.py` has the same issue.
+
+Recommendation: Note as a known migration target for the facade cleanup FTR. Not a blocker for this FTR.
+
+====== F-06: No test for `targets: auto` with `fk_column_pattern`
+
+Severity: low
+
+`_resolve_fk_column` supports `auto.fk_column_pattern` as a format string (e.g. `"{key}_fk_{target}"`). The `targets: auto` test uses the default convention but does not exercise the custom pattern path.
+
+Similarly, `id_field_by_target` propagation through `core/fk.py` is tested indirectly through the policy-backed execution test (which sets `key: "code"`), but there is no explicit test for the `_target_default` helper in `core/fk.py`.
+
+Recommendation: Add a small test for custom `fk_column_pattern` in the domain test file. The `_target_default` function is simple enough that the integration test suffices.
+
+====== F-07: `_auto_helper_config` fallback from `auto.allowed_helpers` to `helper_candidates` is implicit
+
+Severity: low
+
+In `helper_policies.py`:
+
+[source,python]
+----
+def _auto_helper_config(auto: dict[str, Any]) -> dict[str, Any]:
+    helper_candidates = auto.get("helper_candidates")
+    if helper_candidates is None and isinstance(auto.get("allowed_helpers"), dict):
+        helper_candidates = auto["allowed_helpers"]
+----
+
+This maps `auto.allowed_helpers` (when it's a dict, i.e. `{exclude: [...]}`) to `helper_candidates` for consumption by `_resolve_allowed_helpers`. The name mapping (`allowed_helpers` → `helper_candidates`) is a translation between the FK-facing parameter vocabulary and the shared resolution code.
+
+This works correctly but is not immediately obvious without reading both functions. A comment explaining the name mapping would help.
+
+Recommendation: Add a one-line comment explaining why `allowed_helpers` maps to `helper_candidates`.
+
+'''
+
+====== Test coverage
+
+[cols="1,1,3"]
+|===
+| Test file | Count | Assessment
+
+| `test_fk_helper_policies.py`
+| 5
+| Covers explicit target policy, `targets: auto`, `targets` mapping, defaults-outside-allowlist rejection, unknown-column rejection. Good domain-level coverage.
+
+| `test_fk_helper_configuration.py`
+| 5
+| Covers registry entry, policy-backed default execution, inline-target conflict, stale policy rejection, legacy inline behavior. Good end-to-end integration coverage.
+|===
+
+WSL output capture remained unreliable (no output from pytest). Based on code review, all 10 tests should pass. The stale-policy test (`test_add_fk_helpers_rejects_stale_policy_defaults_outside_allowlist`) is particularly valuable — it manually injects an inconsistent policy and confirms the guard catches it.
+
+'''
+
+====== Acceptance criteria check
+
+[cols="1,1"]
+|===
+| Criterion | Met
+
+| `configure_fk_helpers` exists and is registered
+| yes
+
+| Writes resolved `_meta.helper_policies.fk` metadata
+| yes
+
+| `add_fk_helpers` consumes resolved FK policy
+| yes
+
+| `auto` interpreted only in configuration step
+| yes
+
+| Default FK helpers validated against allowed
+| yes (via downstream detection, F-03)
+
+| Inline FK config conflicting with resolved policy fails
+| yes
+
+| Existing inline `add_fk_helpers` behavior preserved
+| yes
+
+| Step registry entry exists
+| yes
+
+| Meta registry updated
+| yes
+
+| Tests cover policy writing, policy-backed execution, conflict, legacy
+| yes
+|===
+
+'''
+
+====== Summary
+
+Solides FTR. Die Implementierung folgt dem Muster des Lookup-Counterparts konsequent, die Conflict-Detection ist gründlich, und die Testabdeckung deckt alle wesentlichen Pfade ab.
+
+Wichtigste Findings:
+
+* *F-02* (helper_prefix multi-target): Spezifikation klären, ob alle FK-Targets denselben Prefix haben müssen.
+* *F-03* (defaults ⊆ allowed frühzeitig prüfen): Funktioniert aktuell korrekt, aber eher zufällig über den Detection-Pfad. Explizite Early-Validation wäre defensiver.
+* *F-04* (dreifache Dedupe-Funktion): Technische Schuld, die sich akkumuliert.
+* *F-05* (Facade-Import in Tests): Bekannter Migration-Target für das Facade-Cleanup-FTR.
+
+Keine Blocker. Approve.
+
+'''
+
+====== Follow-up disposition
+
+Addressed after review:
+
+* F-02: `add_fk_helpers` now reports divergent resolved FK policy
+  `helper_prefix` values explicitly as a multi-policy prefix conflict instead
+  of presenting the second policy value as an inline conflict.
+* F-03: `default_helpers` are now validated against `allowed_helpers` before
+  policy defaults are merged into execution defaults.
+* F-05: the new FK-helper configuration tests and the lookup counterpart import
+  from `pipeline.registry` / `pipeline.types` instead of the broad
+  `pipeline.pipeline` facade.
+* F-06: added domain coverage for `targets: auto` with a custom
+  `auto.fk_column_pattern`.
+* F-07: documented the FK-facing `auto.allowed_helpers` to shared
+  `helper_candidates` translation in code.
+
+Accepted without change:
+
+* F-01: the existing error for missing `target` / `targets` is clear.
+* F-04: helper-list normalization duplication is real but small; defer until a
+  natural shared utility emerges.

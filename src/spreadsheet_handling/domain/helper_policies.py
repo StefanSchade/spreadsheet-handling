@@ -442,6 +442,8 @@ def _resolve_fk_column(
 
 def _auto_helper_config(auto: dict[str, Any]) -> dict[str, Any]:
     helper_candidates = auto.get("helper_candidates")
+    # FK-facing config names this block "allowed_helpers"; the shared lookup
+    # resolver expects the same candidate policy under "helper_candidates".
     if helper_candidates is None and isinstance(auto.get("allowed_helpers"), dict):
         helper_candidates = auto["allowed_helpers"]
     default_helpers = auto.get("default_helpers")
