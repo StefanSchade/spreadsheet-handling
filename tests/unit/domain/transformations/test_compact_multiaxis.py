@@ -172,6 +172,57 @@ def test_compact_multiaxis_sparse_default_keeps_sparse_relations_sparse() -> Non
     ]
 
 
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_display_labels_roundtrip_only_when_configured_as_row_keys() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "feature_label": ["Display label"],
+            "P-001": ["E"],
+        }),
+        "_meta": _legend_meta(),
+    }
+
+    without_label = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        value_columns=["P-001"],
+        allowed_from_legend="status_codes",
+    )
+    without_label_roundtrip = contract_compact_multiaxis(
+        without_label,
+        relation="explicit",
+        output="roundtrip_without_label",
+        row_keys=["feature_id"],
+        allowed_from_legend="status_codes",
+    )
+
+    with_label = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit_with_label",
+        row_keys=["feature_id", "feature_label"],
+        value_columns=["P-001"],
+        allowed_from_legend="status_codes",
+    )
+    with_label_roundtrip = contract_compact_multiaxis(
+        with_label,
+        relation="explicit_with_label",
+        output="roundtrip_with_label",
+        row_keys=["feature_id", "feature_label"],
+        allowed_from_legend="status_codes",
+    )
+
+    assert without_label_roundtrip["roundtrip_without_label"].to_dict(orient="records") == [
+        {"feature_id": "f1", "P-001": "E"},
+    ]
+    assert with_label_roundtrip["roundtrip_with_label"].to_dict(orient="records") == [
+        {"feature_id": "f1", "feature_label": "Display label", "P-001": "E"},
+    ]
+
+
 def test_split_token_multiaxis_roundtrip_uses_canonical_order() -> None:
     frames = {
         "matrix": pd.DataFrame({
@@ -227,6 +278,27 @@ def test_expand_rejects_dense_axes_until_explicitly_implemented() -> None:
             dense_axes={
                 "rows_from": {"frame": "Products", "key": "product_id"},
             },
+        )
+
+
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_missing_legend_block_error_points_to_allowed_from_legend() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "P-001": ["E"],
+        })
+    }
+
+    with pytest.raises(KeyError, match="allowed_from_legend.*status_codes"):
+        expand_compact_multiaxis(
+            frames,
+            matrix="matrix",
+            output="explicit",
+            row_keys=["feature_id"],
+            value_columns=["P-001"],
+            allowed_from_legend="status_codes",
+            group="group",
         )
 
 

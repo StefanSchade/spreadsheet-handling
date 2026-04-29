@@ -76,6 +76,18 @@ def test_invalid_whole_cell_code_is_rejected_when_allowed_codes_are_configured()
         parse_cell_value("X", mode="whole_cell_code", allowed_codes=["E", "S"])
 
 
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_invalid_codec_mode_error_names_explicit_modes() -> None:
+    with pytest.raises(ValueError, match="whole_cell_code.*split_tokens"):
+        parse_cell_value("E-R-K", mode="tokens")
+
+
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_split_tokens_requires_configured_delimiter() -> None:
+    with pytest.raises(ValueError, match="non-empty delimiter"):
+        parse_cell_value("E-R-K", mode="split_tokens", delimiter="")
+
+
 def test_codec_can_source_allowed_values_from_legend_block() -> None:
     meta = {
         "legend_blocks": {
@@ -104,6 +116,17 @@ def test_codec_can_source_allowed_values_from_legend_block() -> None:
             mode="whole_cell_code",
             allowed_from_legend="status_codes",
             meta=meta,
+        )
+
+
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_missing_legend_block_error_points_to_allowed_from_legend() -> None:
+    with pytest.raises(KeyError, match="allowed_from_legend.*status_codes"):
+        parse_cell_value(
+            "E",
+            mode="whole_cell_code",
+            allowed_from_legend="status_codes",
+            meta={},
         )
 
 

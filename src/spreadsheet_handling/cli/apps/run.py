@@ -122,9 +122,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--pipeline-yaml", dest="steps", help=argparse.SUPPRESS)
 
     # path overrides (override selected profile/top-level io)
-    parser.add_argument("--in-kind", help="Override input.kind (e.g., json_dir, csv_dir, xlsx)")
+    parser.add_argument("--in-kind", help="Override input.kind (e.g., json_dir, yaml_dir, xlsx, ods, calc)")
     parser.add_argument("--in-path", help="Override input.path")
-    parser.add_argument("--out-kind", help="Override output.kind (e.g., json_dir, csv_dir, xlsx)")
+    parser.add_argument("--out-kind", help="Override output.kind (e.g., json_dir, yaml_dir, xlsx, ods, calc)")
     parser.add_argument("--out-path", help="Override output.path")
 
     # logging options

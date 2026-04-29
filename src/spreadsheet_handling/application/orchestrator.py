@@ -90,7 +90,7 @@ def orchestrate(
     """
     Unified execution engine for sheets-run and the CLI shims.
 
-    - Loads frames from 'input' backend (json_dir | yaml_dir | xlsx).
+    - Loads frames from 'input' backend (json_dir | yaml_dir | xlsx | ods | calc).
     - Runs the given 'steps' (pure Frames→Frames, optional).
     - Writes frames to 'output' backend.
     - Returns the final frames for in-process reuse/testing.
@@ -98,9 +98,9 @@ def orchestrate(
     Parameters
     ----------
     input : Mapping[str, Any]
-        { kind: "json_dir"|"yaml_dir"|"xlsx", path: str, options?: {...} }
+        { kind: "json_dir"|"yaml_dir"|"xlsx"|"ods"|"calc", path: str, options?: {...} }
     output : Mapping[str, Any]
-        { kind: "json_dir"|"yaml_dir"|"xlsx", path: str, options?: {...} }
+        { kind: "json_dir"|"yaml_dir"|"xlsx"|"ods"|"calc", path: str, options?: {...} }
     steps : Iterable[BoundStep] | None
         List of bound steps (use factories from pipeline to build them).
     header_levels : int

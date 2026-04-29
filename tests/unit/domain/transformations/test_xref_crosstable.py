@@ -199,6 +199,25 @@ def test_roundtrip_does_not_require_visible_labels_for_identity() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_missing_value_columns_error_names_configured_field() -> None:
+    frames = {
+        "matrix": pd.DataFrame({
+            "feature_id": ["f1"],
+            "P-001": ["E"],
+        })
+    }
+
+    with pytest.raises(KeyError, match="configured value_columns"):
+        expand_xref(
+            frames,
+            matrix="matrix",
+            output="long",
+            row_keys=["feature_id"],
+            value_columns=["P-002"],
+        )
+
+
 def test_expand_xref_rejects_multiindex_columns_in_first_slice() -> None:
     frames = {
         "matrix": pd.DataFrame(

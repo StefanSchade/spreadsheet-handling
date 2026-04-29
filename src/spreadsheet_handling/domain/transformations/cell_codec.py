@@ -414,7 +414,10 @@ def _allowed_values(
 
 def _legend_tokens(meta: Mapping[str, Any] | None, legend_name: str) -> tuple[Any, ...]:
     if not isinstance(meta, Mapping):
-        raise KeyError(f"Legend block {legend_name!r} not found")
+        raise KeyError(
+            f"allowed_from_legend references legend block {legend_name!r}, "
+            "but _meta.legend_blocks is missing"
+        )
     raw = meta.get("legend_blocks")
     if isinstance(raw, Mapping):
         spec = raw.get(legend_name)
@@ -431,7 +434,10 @@ def _legend_tokens(meta: Mapping[str, Any] | None, legend_name: str) -> tuple[An
         spec = None
 
     if not isinstance(spec, Mapping):
-        raise KeyError(f"Legend block {legend_name!r} not found")
+        raise KeyError(
+            f"allowed_from_legend references legend block {legend_name!r}, "
+            "but no matching legend block was found in _meta.legend_blocks"
+        )
     entries = spec.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError(f"Legend block {legend_name!r} requires a non-empty entries list")
@@ -462,7 +468,12 @@ def _validate_values(
 
 def _ensure_valid_mode(mode: str) -> None:
     if mode not in _VALID_MODES:
-        raise ValueError(f"Unsupported cell codec mode {mode!r}; expected one of {sorted(_VALID_MODES)!r}")
+        raise ValueError(
+            f"Unsupported cell codec mode {mode!r}; expected one of "
+            f"{sorted(_VALID_MODES)!r}. Use 'whole_cell_code' when punctuation "
+            "such as '-' is part of one code; use 'split_tokens' only with an "
+            "explicit delimiter."
+        )
 
 
 def _ensure_valid_normalizer(normalize_case: str | None) -> None:
@@ -475,7 +486,11 @@ def _ensure_valid_normalizer(normalize_case: str | None) -> None:
 
 def _ensure_delimiter(delimiter: str) -> None:
     if not isinstance(delimiter, str) or delimiter == "":
-        raise ValueError("split_tokens mode requires a non-empty delimiter")
+        raise ValueError(
+            "split_tokens mode requires a non-empty delimiter; punctuation is "
+            "not interpreted as token structure unless mode='split_tokens' and "
+            "delimiter is configured."
+        )
 
 
 def _require_frame(frames: Mapping[str, Any], name: str) -> pd.DataFrame:
