@@ -31,7 +31,7 @@ def expand_xref(
     source = _require_frame(frames, matrix)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
-    _ensure_columns(source, row_key_cols, frame_name=matrix)
+    _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
 
     value_cols = (
@@ -40,7 +40,7 @@ def expand_xref(
         else [col for col in source.columns if col not in row_key_cols]
     )
     _ensure_flat_axis_labels(value_cols, "value_columns")
-    _ensure_columns(source, value_cols, frame_name=matrix)
+    _ensure_columns(source, value_cols, frame_name=matrix, field_name="value_columns")
 
     records: list[dict[Any, Any]] = []
     for _, source_row in source.iterrows():
@@ -91,7 +91,12 @@ def contract_xref(
     source = _require_frame(frames, relation)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
-    _ensure_columns(source, [*row_key_cols, column_key, value], frame_name=relation)
+    _ensure_columns(
+        source,
+        [*row_key_cols, column_key, value],
+        frame_name=relation,
+        field_name="row_keys/column_key/value",
+    )
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
     _ensure_unique_pairs(source, row_key_cols, column_key)
 
@@ -177,10 +182,20 @@ def _ensure_flat_axis_labels(values: Iterable[Any], field_name: str) -> None:
         )
 
 
-def _ensure_columns(df: pd.DataFrame, columns: Iterable[Any], *, frame_name: str) -> None:
+def _ensure_columns(
+    df: pd.DataFrame,
+    columns: Iterable[Any],
+    *,
+    frame_name: str,
+    field_name: str,
+) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
-        raise KeyError(f"Frame {frame_name!r} is missing columns: {missing!r}")
+        raise KeyError(
+            f"Frame {frame_name!r} is missing configured {field_name} columns: "
+            f"{missing!r}. row_keys define identity; display labels only roundtrip "
+            "when they are configured as row_keys or otherwise carried explicitly."
+        )
 
 
 def _ensure_output_names_do_not_collide(

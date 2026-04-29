@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.application.orchestrator import orchestrate
-from spreadsheet_handling.pipeline.pipeline import BoundStep, Frames
+from spreadsheet_handling.pipeline.types import BoundStep, Frames
 
 
 pytestmark = pytest.mark.ftr("FTR-ONE-ORCHESTRATOR")
@@ -98,3 +98,25 @@ def test_orchestrate_supports_ods_backend_kind(tmp_path: Path) -> None:
     assert frames["products"].to_dict(orient="records") == SAMPLE_DATA["products"]
     written = json.loads((out_dir / "products.json").read_text(encoding="utf-8"))
     assert written == SAMPLE_DATA["products"]
+
+
+@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
+def test_orchestrate_supports_calc_backend_alias(tmp_path: Path) -> None:
+    in_dir = tmp_path / "in"
+    calc_path = tmp_path / "products.ods"
+    out_dir = tmp_path / "out"
+    _write_json_dir(in_dir, SAMPLE_DATA)
+
+    orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "calc", "path": str(calc_path)},
+    )
+
+    assert calc_path.exists()
+
+    frames = orchestrate(
+        input={"kind": "calc", "path": str(calc_path)},
+        output={"kind": "json_dir", "path": str(out_dir)},
+    )
+
+    assert frames["products"].to_dict(orient="records") == SAMPLE_DATA["products"]

@@ -285,7 +285,10 @@ def _legend_groups(meta: Mapping[str, Any], legend_name: str) -> dict[Any, Any]:
         spec = None
 
     if not isinstance(spec, Mapping):
-        raise KeyError(f"Legend block {legend_name!r} not found")
+        raise KeyError(
+            f"allowed_from_legend references legend block {legend_name!r}, "
+            "but no matching legend block was found in _meta.legend_blocks"
+        )
     entries = spec.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError(f"Legend block {legend_name!r} requires a non-empty entries list")
@@ -341,7 +344,8 @@ def _reject_dense_axes(dense_axes: Mapping[str, Any] | None) -> None:
     if dense_axes is not None:
         raise NotImplementedError(
             "dense_axes is a future explicit reconstruction contract and is not implemented "
-            "by FTR-COMPACT-MULTIAXIS first slice"
+            "by the current compact-transform slice. Use drop_empty=False for strict "
+            "matrix-shape roundtrips until dense_axes is implemented explicitly."
         )
 
 
