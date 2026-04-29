@@ -78,15 +78,31 @@ def build_registry(
     """
     id_field = str(defaults.get("id_field", "id"))
     label_field = str(defaults.get("label_field", "name"))
+    id_field_by_target = defaults.get("id_field_by_target") or {}
+    label_field_by_target = defaults.get("label_field_by_target") or {}
     reg: Dict[str, Dict[str, Any]] = {}
     for sheet_name, _df in iter_data_frames(frames):
         key = normalize_sheet_key(sheet_name)
         reg[key] = {
             "sheet_name": sheet_name,
-            "id_field": id_field,
-            "label_field": label_field,
+            "id_field": str(
+                _target_default(id_field_by_target, key, sheet_name, id_field)
+            ),
+            "label_field": str(
+                _target_default(label_field_by_target, key, sheet_name, label_field)
+            ),
         }
     return reg
+
+
+def _target_default(mapping: Any, sheet_key: str, sheet_name: str, default: str) -> Any:
+    if not isinstance(mapping, dict):
+        return default
+    if sheet_key in mapping:
+        return mapping[sheet_key]
+    if sheet_name in mapping:
+        return mapping[sheet_name]
+    return default
 
 
 def _first_level_columns(df: pd.DataFrame) -> List[str]:
