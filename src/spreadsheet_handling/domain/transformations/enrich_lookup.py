@@ -21,12 +21,14 @@ def enrich_lookup(
     source: str,
     lookup: str,
     output: str,
+    key: str | None = None,
+    keys: list[str] | None = None,
     on: str | list[str] | None = None,
     helpers: dict[str, Any] | str | None = None,
     order: dict[str, Any] | None = None,
     missing: str | None = None,
 ) -> Frames:
-    """Enrich *source* with helper columns from *lookup* by joining on *on*.
+    """Enrich *source* with helper columns from *lookup* by joining on configured keys.
 
     Parameters
     ----------
@@ -36,8 +38,13 @@ def enrich_lookup(
         Name of the lookup relation in *frames*.
     output:
         Name for the enriched output relation written into *frames*.
+    key:
+        Preferred YAML-safe spelling for one join key.
+    keys:
+        Preferred YAML-safe spelling for multiple join keys.
     on:
-        Join key column(s).  A single string or a list of strings.
+        Legacy join key spelling. In YAML, quote it as ``"on"`` or prefer
+        ``key``/``keys`` because unquoted ``on:`` is boolean-like in YAML 1.1.
     helpers:
         Controls which helper fields are projected from the lookup table.
 
@@ -57,7 +64,13 @@ def enrich_lookup(
         When omitted and a resolved helper policy exists, the policy value is used.
     """
     policy = _resolve_policy(lookup, frames)
-    join_keys = _resolve_join_keys(on, policy, lookup)
+    join_keys = _resolve_join_keys(
+        on=on,
+        key=key,
+        keys=keys,
+        policy=policy,
+        lookup=lookup,
+    )
     missing_mode = _resolve_missing(missing, policy, lookup)
     order_cfg = _resolve_order(order, policy, lookup)
 
@@ -197,17 +210,45 @@ def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:
 
 
 def _resolve_join_keys(
+    *,
     on: str | list[str] | None,
+    key: str | None,
+    keys: list[str] | None,
     policy: dict[str, Any] | None,
     lookup: str,
 ) -> list[str]:
     policy_key = policy.get("key") if policy is not None else None
-    if on is None:
+    configured = {
+        name: value
+        for name, value in {"on": on, "key": key, "keys": keys}.items()
+        if value is not None
+    }
+    if len(configured) > 1:
+        raise ValueError(
+            "Configure add_lookup_helpers join keys with exactly one of "
+            "`key`, `keys`, or quoted legacy `\"on\"`; got "
+            f"{sorted(configured)}"
+        )
+
+    if not configured:
         if policy_key is None:
             raise ValueError(f"No join key configured for lookup {lookup!r}")
         return [policy_key] if isinstance(policy_key, str) else list(policy_key)
 
-    join_keys = [on] if isinstance(on, str) else list(on)
+    if key is not None:
+        if not isinstance(key, str):
+            raise TypeError(
+                "add_lookup_helpers `key` must be a single string; "
+                "use `keys` for multiple keys"
+            )
+        join_keys = [key]
+    elif keys is not None:
+        if isinstance(keys, str):
+            raise TypeError("add_lookup_helpers `keys` must be a list; use `key` for a single key")
+        join_keys = list(keys)
+    else:
+        join_keys = [on] if isinstance(on, str) else list(on or [])
+
     if policy_key is not None:
         policy_keys = [policy_key] if isinstance(policy_key, str) else list(policy_key)
         if join_keys != policy_keys:
