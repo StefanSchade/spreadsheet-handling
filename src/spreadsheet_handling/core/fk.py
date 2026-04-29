@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, NamedTuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple
 
 import pandas as pd
 
@@ -12,6 +12,7 @@ from .indexing import level0_series as _series_from_first_level
 
 
 FK_PATTERN = re.compile(r"^(?P<id_field>[^_]+)_\((?P<sheet_key>[^)]+)\)$")
+HelperValueProvider = Callable[[Any, list[Any]], list[Any]]
 
 
 class FKDef(NamedTuple):
@@ -268,6 +269,7 @@ def apply_fk_helpers(
     id_value_maps: Dict[str, Any],
     levels: int,
     helper_prefix: str = "_",
+    helper_value_provider: HelperValueProvider | None = None,
 ) -> pd.DataFrame:
     if not fk_defs:
         return df
@@ -310,11 +312,13 @@ def apply_fk_helpers(
         fk_series = _series_from_first_level(new_df, fk_col)
         raw_ids = fk_series.tolist()
 
-        # robustes Lookup mit Normalisierung
-        values = []
-        for rid in raw_ids:
-            lbl = value_map.get(_norm_id(rid))
-            values.append(lbl)
+        if helper_value_provider is None:
+            values = []
+            for rid in raw_ids:
+                lbl = value_map.get(_norm_id(rid))
+                values.append(lbl)
+        else:
+            values = helper_value_provider(fk, raw_ids)
 
         # neue Spalte als MultiIndex-Tuple gleicher Länge
         col_tuple = (helper_col,) + ("",) * (levels - 1)

@@ -36,6 +36,7 @@ from spreadsheet_handling.rendering.plan import (
     WriteMeta,
 )
 from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
+from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
 
 
 @dataclass
@@ -54,10 +55,12 @@ class _BufferedSheet:
     name: str
     hidden: bool = False
     cells: dict[tuple[int, int], _BufferedCell] = field(default_factory=dict)
+    headers: dict[str, int] = field(default_factory=dict)
     named_ranges: list[DefineNamedRange] = field(default_factory=list)
     validations: list[AddValidation] = field(default_factory=list)
     autofilter: tuple[int, int, int, int] | None = None
     freeze: tuple[int, int] | None = None
+    data_bounds: tuple[int, int] | None = None
     max_row: int = 0
     max_col: int = 0
 
@@ -146,6 +149,69 @@ def _ods_validation_condition(formula: FormulaSpec) -> str:
     return f"of:cell-content-is-in-list({quoted})"
 
 
+def _ods_string_literal(value: object) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _header_col(
+    sheet_headers: dict[str, dict[str, int]],
+    *,
+    sheet: str,
+    column: str,
+) -> int:
+    try:
+        return sheet_headers[sheet][column]
+    except KeyError as exc:
+        raise KeyError(f"Formula column {column!r} not found on sheet {sheet!r}") from exc
+
+
+def _data_bounds(
+    sheet_data_bounds: dict[str, tuple[int, int]],
+    *,
+    sheet: str,
+) -> tuple[int, int]:
+    try:
+        return sheet_data_bounds[sheet]
+    except KeyError as exc:
+        raise KeyError(f"Formula lookup sheet {sheet!r} has no data block") from exc
+
+
+def _ods_lookup_formula(
+    formula: LookupFormulaSpec,
+    *,
+    current_sheet: str,
+    row: int,
+    sheet_headers: dict[str, dict[str, int]],
+    sheet_data_bounds: dict[str, tuple[int, int]],
+) -> str:
+    source_col = _header_col(
+        sheet_headers,
+        sheet=current_sheet,
+        column=formula.source_key_column,
+    )
+    lookup_key_col = _header_col(
+        sheet_headers,
+        sheet=formula.lookup_sheet,
+        column=formula.lookup_key_column,
+    )
+    lookup_value_col = _header_col(
+        sheet_headers,
+        sheet=formula.lookup_sheet,
+        column=formula.lookup_value_column,
+    )
+    lookup_start, lookup_end = _data_bounds(sheet_data_bounds, sheet=formula.lookup_sheet)
+
+    source_ref = f"[.{_column_letters(source_col)}{row}]"
+    key_range = (
+        f"[{_range_address(formula.lookup_sheet, lookup_start, lookup_key_col, lookup_end, lookup_key_col)}]"
+    )
+    value_range = (
+        f"[{_range_address(formula.lookup_sheet, lookup_start, lookup_value_col, lookup_end, lookup_value_col)}]"
+    )
+    missing = _ods_string_literal(formula.missing)
+    return f"of:=XLOOKUP({source_ref};{key_range};{value_range};{missing})"
+
+
 def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
     sheets: dict[str, _BufferedSheet] = {}
     ordered_names: list[str] = []
@@ -180,10 +246,13 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
         sheet = ensure_sheet(sheet_name)
 
         if isinstance(op, SetHeader):
+            sheet.headers.setdefault(op.text, op.col)
             sheet.ensure_cell(op.row, op.col).value = op.text
             continue
 
         if isinstance(op, WriteDataBlock):
+            if op.data and sheet.data_bounds is None:
+                sheet.data_bounds = (op.r1, op.r1 + len(op.data) - 1)
             for row_offset, row_data in enumerate(op.data):
                 for col_offset, value in enumerate(row_data):
                     sheet.ensure_cell(op.r1 + row_offset, op.c1 + col_offset).value = value
@@ -240,6 +309,8 @@ def _build_table(
     table_style_cache: dict[str, str],
     spreadsheet_validations: ContentValidations | None,
     spreadsheet_database_ranges: DatabaseRanges | None,
+    sheet_headers: dict[str, dict[str, int]],
+    sheet_data_bounds: dict[str, tuple[int, int]],
 ) -> Table:
     table_kwargs: dict[str, Any] = {"name": sheet.name}
     if sheet.hidden:
@@ -320,6 +391,22 @@ def _build_table(
                     attributes["numbercolumnsspanned"] = cell.col_span
 
             value = "" if cell is None else cell.value
+            if isinstance(value, LookupFormulaSpec):
+                formula = _ods_lookup_formula(
+                    value,
+                    current_sheet=sheet.name,
+                    row=row_index,
+                    sheet_headers=sheet_headers,
+                    sheet_data_bounds=sheet_data_bounds,
+                )
+                table_cell = TableCell(
+                    formula=formula,
+                    valuetype="string",
+                    stringvalue="",
+                    attributes=attributes,
+                )
+                row.addElement(table_cell)
+                continue
             if value in (None, ""):
                 table_cell = TableCell(attributes=attributes)
             elif isinstance(value, bool):
@@ -400,6 +487,12 @@ def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
     table_style_cache: dict[str, str] = {}
 
     sheets = _collect_sheets(plan)
+    sheet_headers = {sheet.name: sheet.headers for sheet in sheets}
+    sheet_data_bounds = {
+        sheet.name: sheet.data_bounds
+        for sheet in sheets
+        if sheet.data_bounds is not None
+    }
     spreadsheet_validations = ContentValidations() if any(sheet.validations for sheet in sheets) else None
     spreadsheet_database_ranges = DatabaseRanges() if any(sheet.autofilter for sheet in sheets) else None
     if spreadsheet_validations is not None:
@@ -417,6 +510,8 @@ def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
                 table_style_cache=table_style_cache,
                 spreadsheet_validations=spreadsheet_validations,
                 spreadsheet_database_ranges=spreadsheet_database_ranges,
+                sheet_headers=sheet_headers,
+                sheet_data_bounds=sheet_data_bounds,
             )
         )
         if sheet.freeze:

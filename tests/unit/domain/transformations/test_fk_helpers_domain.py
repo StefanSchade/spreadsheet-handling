@@ -13,6 +13,7 @@ from spreadsheet_handling.domain.transformations.fk_helpers import (
     enrich_helpers,
     drop_helpers,
 )
+from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-DOMAIN-EXTRACTION")
 
@@ -117,6 +118,39 @@ class TestEnrichHelpers:
         assert len(prov) == 2
         assert prov[0]["column"] == "_B_category"
         assert prov[1]["column"] == "_B_name"
+
+    @pytest.mark.ftr("FTR-FORMULA-FK-HELPER-PROVIDERS-P4A")
+    def test_formula_mode_writes_structured_lookup_formula_specs(self):
+        out = enrich_helpers(_frames(), {**DEFAULTS, "helper_value_mode": "formula"})
+
+        helper_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        values = out["A"][helper_col].tolist()
+
+        assert values == [
+            LookupFormulaSpec(
+                source_key_column="id_(B)",
+                lookup_sheet="B",
+                lookup_key_column="id",
+                lookup_value_column="name",
+                missing="",
+            ),
+            LookupFormulaSpec(
+                source_key_column="id_(B)",
+                lookup_sheet="B",
+                lookup_key_column="id",
+                lookup_value_column="name",
+                missing="",
+            ),
+        ]
+        assert not isinstance(values[0], str)
+
+    @pytest.mark.ftr("FTR-FORMULA-FK-HELPER-PROVIDERS-P4A")
+    def test_rejects_unknown_helper_value_mode(self):
+        with pytest.raises(ValueError, match="helper_value_mode"):
+            enrich_helpers(_frames(), {**DEFAULTS, "helper_value_mode": "backend_formula"})
 
 
 # ---------------------------------------------------------------------------
