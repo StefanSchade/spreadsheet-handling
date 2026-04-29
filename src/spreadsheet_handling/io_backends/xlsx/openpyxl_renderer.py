@@ -70,7 +70,13 @@ def _collect_formula_context(
         if isinstance(op, SetHeader):
             sheet_headers.setdefault(op.sheet, {}).setdefault(op.text, op.col)
         elif isinstance(op, WriteDataBlock) and op.data:
-            sheet_data_bounds.setdefault(op.sheet, (op.r1, op.r1 + len(op.data) - 1))
+            start = op.r1
+            end = op.r1 + len(op.data) - 1
+            if op.sheet in sheet_data_bounds:
+                old_start, old_end = sheet_data_bounds[op.sheet]
+                sheet_data_bounds[op.sheet] = (min(old_start, start), max(old_end, end))
+            else:
+                sheet_data_bounds[op.sheet] = (start, end)
     return sheet_headers, sheet_data_bounds
 
 

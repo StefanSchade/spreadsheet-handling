@@ -251,8 +251,14 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
             continue
 
         if isinstance(op, WriteDataBlock):
-            if op.data and sheet.data_bounds is None:
-                sheet.data_bounds = (op.r1, op.r1 + len(op.data) - 1)
+            if op.data:
+                start = op.r1
+                end = op.r1 + len(op.data) - 1
+                if sheet.data_bounds is None:
+                    sheet.data_bounds = (start, end)
+                else:
+                    old_start, old_end = sheet.data_bounds
+                    sheet.data_bounds = (min(old_start, start), max(old_end, end))
             for row_offset, row_data in enumerate(op.data):
                 for col_offset, value in enumerate(row_data):
                     sheet.ensure_cell(op.r1 + row_offset, op.c1 + col_offset).value = value

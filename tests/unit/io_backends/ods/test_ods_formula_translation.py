@@ -94,3 +94,33 @@ def test_ods_renderer_emits_lookup_formula_cells(tmp_path: Path) -> None:
     assert "table:formula='of:=XLOOKUP" in content
     assert "Customers.A2:Customers.A3" in content
     assert "Customers.B2:Customers.B3" in content
+
+
+@pytest.mark.ftr("FTR-FORMULA-FK-HELPER-PROVIDERS-P4A")
+def test_ods_renderer_lookup_range_spans_multiple_data_blocks(tmp_path: Path) -> None:
+    formula = lookup_formula(
+        source_key_column="id_(Customers)",
+        lookup_sheet="Customers",
+        lookup_key_column="id",
+        lookup_value_column="name",
+    )
+    plan = RenderPlan()
+    plan.add(DefineSheet("Orders", 0))
+    plan.add(SetHeader("Orders", 1, 1, "id"))
+    plan.add(SetHeader("Orders", 1, 2, "id_(Customers)"))
+    plan.add(SetHeader("Orders", 1, 3, "_Customers_name"))
+    plan.add(WriteDataBlock("Orders", 2, 1, (("O-1", "C-3", formula),)))
+    plan.add(DefineSheet("Customers", 1))
+    plan.add(SetHeader("Customers", 1, 1, "id"))
+    plan.add(SetHeader("Customers", 1, 2, "name"))
+    plan.add(WriteDataBlock("Customers", 2, 1, (("C-1", "Ada"), ("C-2", "Bob"))))
+    plan.add(WriteDataBlock("Customers", 4, 1, (("C-3", "Cy"), ("C-4", "Dee"))))
+
+    out = tmp_path / "lookup_formula_multiblock.ods"
+    render_workbook(plan, out)
+
+    with ZipFile(out) as archive:
+        content = archive.read("content.xml").decode("utf-8")
+
+    assert "Customers.A2:Customers.A5" in content
+    assert "Customers.B2:Customers.B5" in content
