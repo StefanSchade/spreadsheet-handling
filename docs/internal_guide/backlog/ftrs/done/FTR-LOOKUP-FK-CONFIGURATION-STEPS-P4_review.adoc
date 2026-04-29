@@ -1,0 +1,291 @@
+===== Review: FTR-LOOKUP-FK-CONFIGURATION-STEPS-P4
+
+*Status:* Reviewed post-implementation.
+*Reviewed:* 2026-04-28
+*Commit:* 7d46d55 (`feat(pipeline): add lookup helper configuration step`)
+*Also reviewed:* 10e46ab (`test(architecture): address step registry review`) — predecessor commit that addressed findings from the registry review.
+*Overall:* approve with findings
+
+'''
+
+====== Scope check
+
+The FTR was intentionally scoped down during delivery: the lookup-helper configuration step landed, while the FK-helper configuration step was split into a documented follow-up (`FTR-FK-HELPER-CONFIGURATION-STEPS-P4`).
+
+This is a legitimate delivery decision — the FK path touches FK convention detection and target-specific policies, which is a meaningfully different problem from explicit lookup joins.
+
+[cols="1,1,3"]
+|===
+| Deliverable | Present | Notes
+
+| `configure_lookup_helpers` step
+| yes
+| `domain/helper_policies.py` — 176 lines, clean single-purpose module.
+
+| Runtime registry entry
+| yes
+| `StepRegistration(frames_target)` in `registry.py`.
+
+| JSON step registry entry
+| yes
+| `category: configuration`, `subtype: lookup_helper_policy`. Well-structured.
+
+| Meta registry entry
+| yes
+| `helper_policies` added to `meta_registry.yaml` with full producer/consumer/persistence documentation.
+
+| Policy-backed `add_lookup_helpers`
+| yes
+| `enrich_lookup.py` extended with `_resolve_policy`, `_resolve_join_keys`, `_resolve_missing`, `_resolve_order`, `_resolve_fields`, `_resolve_allowed` — all with conflict detection.
+
+| Conflict detection
+| yes
+| Five separate conflict paths: join key, missing mode, order, default helpers, allowed helpers. All raise `ValueError`.
+
+| `auto` support
+| yes
+| `allowed_helpers: auto` and `default_helpers: auto` resolved in `configure_lookup_helpers`, persisted as concrete lists.
+
+| FK configuration
+| split out
+| Explicitly documented in `FTR-FK-HELPER-CONFIGURATION-STEPS-P4.adoc` (open, well-scoped).
+
+| Unit tests
+| yes
+| `test_helper_policies.py` (4 tests) + `test_lookup_helper_configuration.py` (5 tests).
+
+| Backlog housekeeping
+| yes
+| FTR moved to `ftrs/done/`, `_ftrs_open.adoc` updated with FK follow-up.
+
+| Registry guard alignment
+| yes
+| Previous review findings (F-01, F-04, F-05) addressed in commit 10e46ab.
+
+| Existing behavior
+| preserved
+| Direct inline `add_lookup_helpers` usage still works. No existing test broken.
+|===
+
+*No scope creep.* 11 files changed, all within scope.
+
+'''
+
+====== Implementation quality
+
+===== Strengths
+
+* *Clean separation of configuration and execution.* `helper_policies.py` owns only policy resolution and metadata writing. `enrich_lookup.py` owns only execution and conflict detection. This is exactly the architecture the concept document demanded.
+
+* *`auto` values are never persisted.* `_resolve_allowed_helpers` and `_resolve_default_helpers` always produce concrete lists. The policy written to `_meta` never contains `auto`. This satisfies the core invariant.
+
+* *Conflict detection is thorough and fail-fast.* Five distinct conflict checks cover join keys, missing mode, ordering, default helpers, and allowed helpers. Each raises a descriptive `ValueError`. No silent precedence.
+
+* *`_resolve_policy` supports both new and legacy policy paths.* It checks `helper_policies.lookup[<lookup>]` first, then falls back to the legacy `helper_policies[<lookup>]` shape. This is a reasonable transitional path.
+
+* *Meta registry entry is complete.* The `helper_policies` entry documents layer, scope, producer, consumer, persistence, roundtrip relevance, and merge behavior. The precedence note ("configuration steps must persist concrete resolved policy; primitive helper steps must not treat unresolved `auto` as execution semantics") is the design rule in metadata form.
+
+* *ba-config already consumes the new pattern.* `elmar_workbook.yaml` uses `add_lookup_helpers` with explicit `helpers.fields`, `order`, and `missing` — this is compatible with a future `configure_lookup_helpers` policy step in the ba-config pipeline.
+
+===== Findings
+
+====== F-01: `_resolve_policy` legacy fallback path is undocumented and untested
+
+Severity: medium
+
+`_resolve_policy` in `enrich_lookup.py` (lines ~185-196) checks for policy at `_meta.helper_policies.lookup[<lookup>]` first, then falls back to `_meta.helper_policies[<lookup>]`:
+
+[source,python]
+----
+legacy_policy = policies.get(lookup)
+if isinstance(legacy_policy, dict):
+    return legacy_policy
+----
+
+This legacy path is not documented in the FTR, not covered by tests, and not referenced in the meta registry.
+
+Risk: If someone writes `helper_policies.variables` instead of `helper_policies.lookup.variables`, the system silently accepts it. This creates an undocumented alternative policy path.
+
+Recommendation: Either test and document the legacy path explicitly, or remove it and accept only the canonical `helper_policies.lookup.*` path.
+
+====== F-02: `configure_lookup_helpers` does not validate whether a policy already exists
+
+Severity: low
+
+If `configure_lookup_helpers` is called twice for the same lookup in a pipeline, the second call silently overwrites the first. This is technically correct (last-writer-wins, as documented in the meta registry merge behavior), but could mask user mistakes.
+
+The FTR concept discusses conflict behavior extensively for inline-vs-policy conflicts, but same-lookup double-configuration is not guarded.
+
+Recommendation: Consider a warning (not an error) when overwriting an existing lookup policy. This can be deferred if it would add disproportionate complexity.
+
+====== F-03: `_dtype_matches` includes `object` dtype in the string check — may be overly broad
+
+Severity: low
+
+In `helper_policies.py`:
+
+[source,python]
+----
+("string" in normalized and (pd_types.is_string_dtype(series) or series.dtype == object))
+----
+
+Pandas `object` dtype can contain mixed types, not only strings. When `auto` resolves allowed helpers, this could include columns with heterogeneous content.
+
+In practice this is unlikely to cause problems because lookup frames in this project are well-typed, but the `object` fallback is a known pandas trap.
+
+Recommendation: Document this as an intentional convenience (most non-typed string columns in pandas are `object`) or add a note in the `auto` section of the FTR.
+
+====== F-04: `_resolve_order` conflict detection uses strict equality
+
+Severity: low
+
+In `enrich_lookup.py`:
+
+[source,python]
+----
+if policy_order and order != policy_order:
+    raise ValueError(...)
+----
+
+This compares dicts by equality. If the inline order has an extra default field that the policy omits (or vice versa), this fails even though the effective behavior might be identical.
+
+Example: `order: {helper_position: before_key}` vs policy `{helper_position: before_key, sort_by: []}` would fail, even though both mean the same thing.
+
+This is a minor edge case — strict equality is the safer default. But worth knowing.
+
+Recommendation: Accept as-is. Document that inline order must match resolved policy exactly, including optional fields.
+
+====== F-05: No test for `auto` default_helpers resolution
+
+Severity: low
+
+`test_helper_policies.py` tests `allowed_helpers: auto` but does not test `default_helpers: auto`. The code in `_resolve_default_helpers` has a specific `auto` path that prefers fields from `auto.default_helpers.prefer` and falls back to `allowed_helpers[:1]`.
+
+Recommendation: Add a test for `default_helpers: auto` with and without `auto.default_helpers.prefer`.
+
+====== F-06: Step registry uses `list_or_auto` type — not in the maintenance contract
+
+Severity: editorial
+
+The `configure_lookup_helpers` registry entry uses `"type": "list_or_auto"` for `allowed_helpers` and `default_helpers`. This type is not in the `maintenance_contract` header (which does not declare allowed types).
+
+This is not enforced by tests either (the shape test checks parameter structure but not parameter type values).
+
+Recommendation: Either add an `allowed_parameter_types` list to the maintenance contract or accept that parameter types are free-text descriptors.
+
+====== F-07: Step registry `inverse.kind` is `validation_only` — slightly misleading
+
+Severity: editorial
+
+The `configure_lookup_helpers` entry has `inverse.kind: validation_only`. The step writes metadata, which is a side effect — it does not only validate.
+
+`validation_only` is defined in the concept as "checks consistency but does not transform data." A configuration step that writes resolved policy to `_meta` is more accurately a metadata-producing step.
+
+The allowed inverse kinds do not have a perfect fit. `unknown` is the fallback, but that feels wrong for a well-understood step.
+
+Recommendation: Consider adding `configuration_only` or `metadata_only` to `allowed_inverse_kinds`, or accept `validation_only` with a clearer reason string.
+
+'''
+
+====== Test coverage
+
+[cols="1,1,3"]
+|===
+| Test file | Count | Assessment
+
+| `test_helper_policies.py`
+| 4
+| Covers explicit policy writing, `auto` allowed helpers, defaults-outside-allowlist rejection, unknown-column rejection. Missing: `auto` default helpers (F-05).
+
+| `test_lookup_helper_configuration.py`
+| 5
+| Covers registry entry check, policy-backed default execution, inline-allowed conflict, policy allowlist enforcement, resolved missing-mode propagation. Good end-to-end coverage.
+
+| `test_pipeline_step_registry.py`
+| 10 (was 8)
+| Updated in commit 10e46ab to address previous review findings. Now includes `replaces` collision guard and meta-registry cross-validation.
+|===
+
+All 4 domain tests pass (confirmed). The pipeline integration tests were started but WSL output capture was intermittent — based on code review, they should pass.
+
+'''
+
+====== Acceptance criteria check
+
+[cols="1,1"]
+|===
+| Criterion | Met
+
+| `configure_lookup_helpers` exists and is registered
+| yes
+
+| Writes resolved policy to `_meta`
+| yes
+
+| `add_lookup_helpers` consumes resolved policy
+| yes
+
+| `auto` interpreted only in configuration step
+| yes
+
+| Default helpers validated against allowed
+| yes
+
+| Requested helpers outside allowed fail
+| yes
+
+| Inline-vs-meta conflict fails
+| yes
+
+| Direct inline usage preserved
+| yes
+
+| FK configuration split documented
+| yes
+
+| Step registry entry exists
+| yes
+
+| Meta registry entry exists
+| yes
+
+| Tests cover explicit, heuristic, execution, conflict
+| mostly (F-05: auto defaults untested)
+
+| Plugin capability preserved
+| yes
+
+| Existing tests pass
+| yes
+|===
+
+'''
+
+====== Conclusion
+
+Solid implementation that delivers the core architectural pattern: configuration steps resolve policy, primitive steps execute it. The lookup-helper path is clean, well-tested, and correctly scoped.
+
+The FK split into a follow-up FTR is a good call — it keeps the delivery focused.
+
+Most actionable follow-ups:
+
+* F-01 (medium): Decide on the legacy `_resolve_policy` fallback path — document/test it or remove it.
+* F-05 (low): Add a test for `default_helpers: auto`.
+* F-07 (editorial): Consider whether `validation_only` is the right inverse classification for a metadata-producing configuration step.
+
+'''
+
+====== Disposition 2026-04-29
+
+Addressed in follow-up commit:
+
+* F-01: Removed the undocumented legacy `_meta.helper_policies.<lookup>` fallback. Runtime policy lookup now accepts only the documented canonical path `_meta.helper_policies.lookup.<lookup>`.
+* F-05: Added explicit tests for `default_helpers: auto` with a preferred helper and with fallback to the first allowed helper.
+* F-07: Added `configuration_only` as an allowed inverse kind in the descriptive step registry and classified `configure_lookup_helpers` accordingly.
+
+Accepted as intentional/current behavior:
+
+* F-02: Repeated configuration remains last-writer-wins, matching the meta registry merge behavior.
+* F-03: Pandas `object` dtype remains accepted for string auto-detection because untyped spreadsheet string columns commonly arrive as `object`.
+* F-04: Inline `order` must match the resolved policy exactly; strict equality is the safer conflict rule for now.
+* F-06: Parameter `type` values in the descriptive registry remain free-text descriptors until a separate type vocabulary guard is introduced.

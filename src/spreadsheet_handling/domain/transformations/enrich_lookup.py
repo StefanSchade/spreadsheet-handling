@@ -193,9 +193,6 @@ def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:
     lookup_policies = policies.get("lookup")
     if isinstance(lookup_policies, dict) and isinstance(lookup_policies.get(lookup), dict):
         return lookup_policies[lookup]
-    legacy_policy = policies.get(lookup)
-    if isinstance(legacy_policy, dict):
-        return legacy_policy
     return None
 
 
