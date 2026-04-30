@@ -10,7 +10,6 @@ from spreadsheet_handling.pipeline.pipeline import (
     run_pipeline,
 )
 
-
 RENAMED_PIPELINE_STEPS = {
     "apply_fks": "add_fk_helpers",
     "drop_helpers": "remove_fk_helpers",
@@ -39,9 +38,7 @@ def test_build_steps_from_config_binds_builder_style_domain_step() -> None:
             columns=pd.MultiIndex.from_tuples([("A", ""), ("B", "")]),
         )
     }
-    steps = build_steps_from_config(
-        [{"step": "flatten_headers", "mode": "level0"}]
-    )
+    steps = build_steps_from_config([{"step": "flatten_headers", "mode": "level0"}])
 
     assert steps[0].name == "flatten_headers"
     assert steps[0].config["target"].endswith(":flatten_headers")
@@ -91,11 +88,13 @@ def test_replaced_pipeline_step_names_fail_clearly() -> None:
 
 def test_xref_crosstable_steps_are_config_addressable() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["E"],
-            "P-002": ["S"],
-        })
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+                "P-002": ["S"],
+            }
+        )
     }
     steps = build_steps_from_config(
         [
@@ -129,12 +128,57 @@ def test_xref_crosstable_steps_are_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-SPLIT-BY-DISCRIMINATOR-P4A")
+def test_discriminator_split_steps_are_config_addressable() -> None:
+    frames = {
+        "subject_labels": pd.DataFrame(
+            [
+                {"subject": "sub_1", "label": "Eingang", "sprache": "de"},
+                {"subject": "sub_1", "label": "entrance", "sprache": "en"},
+            ]
+        )
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "split_by_discriminator",
+                "source_frame": "subject_labels",
+                "discriminator_column": "sprache",
+                "target_pattern": "subject_labels_{value}",
+            },
+            {
+                "step": "merge_by_discriminator",
+                "target_frame": "subject_labels",
+                "discriminator_column": "sprache",
+                "source_pattern": "subject_labels_{value}",
+            },
+        ]
+    )
+
+    assert isinstance(REGISTRY["split_by_discriminator"], StepRegistration)
+    assert isinstance(REGISTRY["merge_by_discriminator"], StepRegistration)
+    assert steps[0].config["target"].endswith(":split_by_discriminator")
+    assert steps[1].config["target"].endswith(":merge_by_discriminator")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["subject_labels_de"].to_dict(orient="records") == [
+        {"subject": "sub_1", "label": "Eingang"},
+    ]
+    assert out["subject_labels"].to_dict(orient="records") == [
+        {"subject": "sub_1", "label": "Eingang", "sprache": "de"},
+        {"subject": "sub_1", "label": "entrance", "sprache": "en"},
+    ]
+
+
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["E-R-K"],
-        }),
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E-R-K"],
+            }
+        ),
         "_meta": {
             "legend_blocks": {
                 "status_codes": {
@@ -194,10 +238,12 @@ def test_cell_codec_steps_are_config_addressable() -> None:
 
 def test_compact_multiaxis_steps_are_config_addressable() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["K-E"],
-        })
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["K-E"],
+            }
+        )
     }
     steps = build_steps_from_config(
         [

@@ -80,6 +80,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "xref_crosstable": ("meta_canonical", "canonical_meta"),
         "cell_codecs": ("meta_canonical", "canonical_meta"),
         "compact_multiaxis": ("meta_canonical", "canonical_meta"),
+        "split_by_discriminator": ("meta_canonical", "canonical_meta"),
         "workbook_meta_blob": ("meta_rendering", "carrier_artifact"),
         "options": ("meta_rendering", "derived_operational_view"),
         "__style": ("meta_rendering", "derived_operational_view"),
