@@ -1,0 +1,209 @@
+===== FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A — Bijective sparse collapse/expand for crosstables
+
+*Status:* Open
+*Epic:* Phase 4 — Feature Expansion and Domain Transformations
+*Priority:* High (pre-beta, driven by BA config requirements)
+
+*Depends-on:*
+
+* <<FTR-XREF-CROSSTABLE#,FTR-XREF-CROSSTABLE>>
+
+*Related-to:*
+
+* <<FTR-SPLIT-BY-DISCRIMINATOR-P4A#,FTR-SPLIT-BY-DISCRIMINATOR-P4A>>
+* <<FTR-COMPACT-MULTIAXIS#,FTR-COMPACT-MULTIAXIS>>
+* <<FTR-CELL-CODEC#,FTR-CELL-CODEC>>
+
+'''
+
+====== Purpose
+
+Provide a bijective transform pair (collapse + expand) that suppresses a
+dominant default value in crosstable cells, yielding a sparse representation
+that is easier to read and edit in large spreadsheets. The inverse restores
+the full dense matrix.
+
+This enables the full composition chain. In current pipeline terms, sparse
+collapse sits between `contract_xref` / `expand_xref` and the spreadsheet I/O
+layer.
+`json ↔ sparse-collapse ↔ xref-crosstable ↔ excel`
+
+'''
+
+====== Context
+
+Large crosstables (e.g. feature×product matrices) often have a dominant default
+value — most cells are "nein", "standard", 0, or empty. When rendered to Excel,
+editors must scroll through noise to find the meaningful deviations.
+
+A sparse representation shows only non-default cells; default cells are left
+empty (or show a configurable placeholder). This dramatically improves
+readability for matrices where 80%+ of cells share the same value.
+
+'''
+
+====== Problem statement
+
+Without sparse collapse:
+
+* editors scan large matrices for the few non-default entries
+* risk of accidental edits to default cells increases
+* the visual signal-to-noise ratio is poor for predominantly uniform tables
+* round-trip integrity is still needed — empty cells must reliably expand back
+  to the known default value
+
+'''
+
+====== Goals
+
+. A *collapse* transform that replaces all occurrences of the configured
+  default value with empty/blank cells (sparse form).
+. An *expand* transform that fills all empty/blank cells with the configured
+  default value (dense form).
+. The pair must be *bijective*: `expand(collapse(df)) == df` provided the
+  sentinel/default value does not conflict with intentional blanks.
+. Configurable default sentinel per frame and optional configured columns.
+. A guard that warns or errors if the source data already contains blanks in
+  cells where blank is about to mean "default".
+. Composable with the existing xref-crosstable step.
+
+'''
+
+====== Design sketch
+
+====== Pipeline YAML surface (indicative)
+
+[source,yaml]
+----
+# Collapse direction (json → excel): dense → sparse before rendering
+- step: sparse_collapse
+  frame: feature_product_matrix
+  default_value: "nein"
+  blank_value: ""
+  on_conflict: error
+  # optional: restrict to specific columns
+  # columns: [col_a, col_b, ...]
+
+# Expand direction (excel → json): sparse → dense after parsing
+- step: sparse_expand
+  frame: feature_product_matrix
+  default_value: "nein"
+  blank_value: ""
+----
+
+====== Behavioral contract
+
+* *Collapse direction (dense → sparse):*
+  ** Input: a frame where many cells contain the configured `default_value`.
+  ** Output: same frame with default-value cells replaced by `blank_value`
+     (default empty string).
+  ** Non-default cells are untouched.
+  ** Only configured columns are transformed; if no `columns` list is supplied,
+     the first slice may apply to all non-key/value columns, but that behavior
+     must be explicit in tests and docs.
+  ** Column and row order preserved.
+  ** DataFrame shape and column labels are preserved.
+
+* *Expand direction (sparse → dense):*
+  ** Input: a frame with `blank_value` cells that represent the default.
+  ** Output: same frame with `blank_value` cells filled by `default_value`.
+  ** Cells that were intentionally blank before collapse are
+     indistinguishable — this is the known trade-off, mitigated by:
+     *** choosing a sentinel unlikely to conflict (`<DEFAULT>`, domain value)
+     *** the guard check at collapse time
+  ** Expansion should use the configured columns or metadata from the matching
+     collapse step; it must not guess matrix columns by name similarity.
+
+* *Sentinel conflict guard:*
+  ** At collapse time, if any target cell is already blank/empty and is not the
+     configured `default_value`, emit a warning or error: the roundtrip may be
+     lossy for those cells.
+  ** Configurable behavior: `on_conflict: warn | error | ignore`.
+  ** Blank detection should be explicit and tested for `""`, `None`, `NaN`, and
+     pandas missing values where practical.
+  ** Default comparison must be exact by default; normalization such as
+     case-folding or trimming is a future extension unless explicitly added.
+
+* *Roundtrip guarantee:*
+  ** `expand(collapse(df)) == df` if no pre-existing blanks conflict with
+     the default-value semantics.
+  ** The guarantee is value-level and shape-level; it does not add or remove
+     rows or columns.
+
+'''
+
+====== Meta contract
+
+The collapse step should write metadata under a dedicated root such as
+`sparse_defaults`, keyed by `name` or frame:
+
+* frame
+* configured columns
+* default value
+* blank value
+* conflict policy
+
+The expand step should be able to consume this metadata when configuration is
+omitted, but explicit configuration must remain supported for direct ad-hoc
+pipelines.
+
+'''
+
+====== Composition with xref
+
+Typical full pipeline for large crosstables:
+
+[source]
+----
+JSON (tuple rows)
+  → xref_crosstable (pivot to matrix)
+    → sparse_collapse (suppress defaults)
+      → Excel (sparse, readable matrix)
+
+Excel (edited sparse matrix)
+  → sparse_expand (restore defaults)
+    → xref_long (unpivot to tuples)
+      → JSON
+----
+
+The sparse collapse/expand sits between xref and the I/O layer.
+In the current public step surface, the pivot/unpivot steps are
+`contract_xref` and `expand_xref`.
+
+'''
+
+====== Scope
+
+This FTR includes:
+
+* implement `sparse_collapse` pipeline step
+* implement `sparse_expand` pipeline step
+* sentinel conflict guard with configurable behavior
+* register both steps in the step registry
+* unit tests for collapse, expand, roundtrip identity, blank-value handling,
+  configured-column restriction, and conflict detection
+* integration test composing xref + sparse in a minimal pipeline
+* step-registry documentation entries with inverse-step links
+
+'''
+
+====== Non-goals
+
+* Per-cell default values (one default per frame/column-set is sufficient)
+* Visual formatting of sparse cells (styling is a rendering concern)
+* Automatic default-value detection (explicit config only)
+* Heuristic detection of crosstable axes; use configured columns or metadata
+
+'''
+
+====== Acceptance criteria
+
+. Collapse replaces default-value cells with blanks.
+. Expand fills blank cells with the configured default value.
+. Roundtrip test passes: `expand(collapse(df)) == df` for conflict-free data.
+. Sentinel conflict guard fires on ambiguous input.
+. Composes cleanly with xref-crosstable in a pipeline.
+. Step registry records the inverse relationship between sparse collapse and
+  sparse expand.
+. Expansion does not densify rows/columns beyond the input frame shape.
+. All existing tests continue to pass.
