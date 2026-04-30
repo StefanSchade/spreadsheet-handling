@@ -15,6 +15,7 @@ import pytest
 pytestmark = [
     pytest.mark.ftr("FTR-TEST-CARRIER-BOUNDARY-GUARDS-P4"),
     pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C"),
+    pytest.mark.ftr("FTR-TEST-ARCHIVE-AND-QUARANTINE-RULES-P3C"),
 ]
 
 
@@ -23,6 +24,7 @@ TESTS_ROOT = REPO_ROOT / "tests"
 
 ACTIVE_CARRIER_ROOTS = ("unit", "integration", "architecture", "legacy_pre_hex")
 SUPPORT_CARRIER_ROOTS = ("utils", "data", "experimental")
+QUARANTINE_CARRIER_ROOTS = ("legacy_pre_hex",)
 PATH_OWNED_TOPOLOGY_MARKERS = ("unit", "integ", "arch", "current_state", "legacy", "prehex")
 
 
@@ -38,6 +40,10 @@ def _iter_pytest_style_test_files() -> list[Path]:
 
 def _module_tree(module_path: Path) -> ast.AST:
     return ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
 def _collected_symbol_names(module_path: Path) -> list[str]:
@@ -126,5 +132,27 @@ def test_topology_markers_are_path_owned_not_written_manually():
     assert (
         not violations
     ), "Topology markers are path-owned and should not be written manually:\n" + "\n".join(
+        violations
+    )
+
+
+def test_quarantine_carriers_declare_status_and_explicit_run_target():
+    violations: list[str] = []
+
+    for carrier_name in QUARANTINE_CARRIER_ROOTS:
+        readme = TESTS_ROOT / carrier_name / "README.adoc"
+        if not readme.exists():
+            violations.append(f"{carrier_name}: missing README.adoc")
+            continue
+
+        text = _read_text(readme).lower()
+        required_terms = ("status:", "quarantine", "make test-prehex")
+        missing_terms = [term for term in required_terms if term not in text]
+        if missing_terms:
+            violations.append(f"{carrier_name}: README.adoc missing {missing_terms!r}")
+
+    assert (
+        not violations
+    ), "Quarantine carriers must declare their status and explicit run target:\n" + "\n".join(
         violations
     )
