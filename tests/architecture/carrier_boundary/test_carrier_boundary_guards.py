@@ -4,6 +4,7 @@ These checks keep collected tests inside the known carrier roots, prevent
 support carriers from silently turning into test carriers, and keep topology
 markers path-owned rather than manually encoded in test modules.
 """
+
 from __future__ import annotations
 
 import ast
@@ -11,8 +12,10 @@ from pathlib import Path
 
 import pytest
 
-
-pytestmark = pytest.mark.ftr("FTR-TEST-CARRIER-BOUNDARY-GUARDS-P4")
+pytestmark = [
+    pytest.mark.ftr("FTR-TEST-CARRIER-BOUNDARY-GUARDS-P4"),
+    pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C"),
+]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -42,7 +45,9 @@ def _collected_symbol_names(module_path: Path) -> list[str]:
     names: list[str] = []
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+            "test_"
+        ):
             names.append(node.name)
         elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             names.append(node.name)
@@ -98,10 +103,9 @@ def test_support_carriers_do_not_define_collected_tests():
             rel_path = module_path.relative_to(TESTS_ROOT).as_posix()
             violations.append(f"{rel_path}: {', '.join(collected_symbols)}")
 
-    assert not violations, (
-        "Support carriers must not define collected tests or Test classes:\n"
-        + "\n".join(violations)
-    )
+    assert (
+        not violations
+    ), "Support carriers must not define collected tests or Test classes:\n" + "\n".join(violations)
 
 
 def test_topology_markers_are_path_owned_not_written_manually():
@@ -119,7 +123,8 @@ def test_topology_markers_are_path_owned_not_written_manually():
         if explicit_markers:
             violations.append(f"{rel_path}: {', '.join(explicit_markers)}")
 
-    assert not violations, (
-        "Topology markers are path-owned and should not be written manually:\n"
-        + "\n".join(violations)
+    assert (
+        not violations
+    ), "Topology markers are path-owned and should not be written manually:\n" + "\n".join(
+        violations
     )

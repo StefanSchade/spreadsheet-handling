@@ -5,18 +5,24 @@ the produced workbook shape through the normalizer utility.
 """
 
 from __future__ import annotations
-from spreadsheet_handling.rendering.flow import build_render_plan
-from spreadsheet_handling.rendering.passes import apply_all
-from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
-from tests.utils.xlsx_normalize import normalize_xlsx
+
+import logging
 
 import pandas as pd
-import logging
+import pytest
+
+from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
+from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+from spreadsheet_handling.rendering.flow import build_render_plan
+from spreadsheet_handling.rendering.passes import apply_all
+from tests.utils.xlsx_normalize import normalize_xlsx
 
 logging.basicConfig(level=logging.DEBUG)
 
-def test_p1_smoke_render_flow(tmp_path):
+pytestmark = pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C")
+
+
+def test_xlsx_ir_render_flow_writes_expected_workbook_shape(tmp_path):
     frames = {
         "Sheet1": pd.DataFrame({"A": ["a1"], "B": ["b1"], "C": ["c1"]}),
     }
@@ -32,7 +38,11 @@ def test_p1_smoke_render_flow(tmp_path):
             }
         },
         "constraints": [
-            {"sheet": "Sheet1", "column": "B", "rule": {"type": "in_list", "values": ["A", "B", "C"]}},
+            {
+                "sheet": "Sheet1",
+                "column": "B",
+                "rule": {"type": "in_list", "values": ["A", "B", "C"]},
+            },
         ],
     }
 
