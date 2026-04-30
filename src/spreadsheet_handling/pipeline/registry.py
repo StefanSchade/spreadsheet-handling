@@ -3,6 +3,7 @@
 Maps step names (strings) to factory functions and provides
 config-driven pipeline construction from dicts or YAML.
 """
+
 from __future__ import annotations
 
 import logging
@@ -29,10 +30,13 @@ log = logging.getLogger("sheets.pipeline")
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
+
 def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
     out = frames
     for step in steps:
-        log.debug("-> step: %s config=%s", getattr(step, "name", "<unnamed>"), getattr(step, "config", {}))
+        log.debug(
+            "-> step: %s config=%s", getattr(step, "name", "<unnamed>"), getattr(step, "config", {})
+        )
         out = step(out)
     return out
 
@@ -42,12 +46,12 @@ def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
 # ---------------------------------------------------------------------------
 
 REGISTRY: Dict[str, StepRegistration | StepFactory] = {
-    "identity":         make_identity_step,
-    "validate":         make_validate_step,
-    "add_fk_helpers":      make_apply_fks_step,
-    "remove_fk_helpers":   make_drop_helpers_step,
+    "identity": make_identity_step,
+    "validate": make_validate_step,
+    "add_fk_helpers": make_apply_fks_step,
+    "remove_fk_helpers": make_drop_helpers_step,
     "validate_fk_helpers": make_check_fk_helpers_step,
-    "plugin":           make_plugin_step,
+    "plugin": make_plugin_step,
     "flatten_headers": StepRegistration(
         factory=make_builder_target_step,
         target="spreadsheet_handling.domain.transformations.helpers:flatten_headers",
@@ -84,6 +88,14 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.structured_yaml:write_structured_yaml",
     ),
+    "split_by_discriminator": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.discriminator_split:split_by_discriminator",
+    ),
+    "merge_by_discriminator": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.discriminator_split:merge_by_discriminator",
+    ),
     "expand_xref": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref",
@@ -119,6 +131,7 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
 # Config binding
 # ---------------------------------------------------------------------------
 
+
 def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
     """
     Build steps from a config list like:
@@ -130,6 +143,7 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
       1) registry key (see REGISTRY)
       2) dotted path '<module>:<factory_function>'
     """
+
     def resolve_registration(step_id: str) -> StepRegistration | None:
         entry = REGISTRY.get(step_id)
         if entry:
@@ -186,11 +200,10 @@ def _ensure_string_parameter_keys(step_id: str, spec: Mapping[Any, Any]) -> None
         hint = (
             " This commonly means an unquoted YAML 1.1 boolean-like key such "
             "as `on:` was parsed as True; prefer `key:`/`keys:` or quote the "
-            "legacy spelling as `\"on\":`."
+            'legacy spelling as `"on":`.'
         )
     raise ValueError(
-        f"Step {step_id!r} contains non-string parameter key(s) {non_string_keys!r}."
-        f"{hint}"
+        f"Step {step_id!r} contains non-string parameter key(s) {non_string_keys!r}." f"{hint}"
     )
 
 
