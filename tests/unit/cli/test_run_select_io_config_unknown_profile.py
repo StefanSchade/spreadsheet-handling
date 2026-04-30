@@ -5,7 +5,7 @@ import spreadsheet_handling.cli.apps.run as runmod
 pytestmark = pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C")
 
 
-def test_select_io_config_returns_named_profile():
+def test_select_io_config_unknown_profile_raises():
     cfg = {
         "io": {
             "profiles": {
@@ -16,5 +16,6 @@ def test_select_io_config_returns_named_profile():
             }
         }
     }
-    sel = runmod._select_io_config(cfg, profile="local")
-    assert sel["input"]["kind"] == "json_dir"
+    with pytest.raises(SystemExit) as e:
+        runmod._select_io_config(cfg, profile="nope")
+    assert "Unknown profile 'nope'" in str(e.value)

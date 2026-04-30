@@ -6,13 +6,16 @@ JSON-to-XLSX product runs with workbook and sheet-level metadata.
 
 import json
 
+import pytest
 import yaml
 
 import spreadsheet_handling.application.orchestrator as orch_mod
 import spreadsheet_handling.cli.apps.run as runmod
 
+pytestmark = pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C")
 
-def test_main_with_real_steps_file(tmp_path, monkeypatch):
+
+def test_main_runs_explicit_steps_file(tmp_path, monkeypatch):
     steps_path = tmp_path / "steps.yml"
     steps_path.write_text("pipeline:\n  - step: identity\n")
 
@@ -25,17 +28,26 @@ def test_main_with_real_steps_file(tmp_path, monkeypatch):
     monkeypatch.setattr(orch_mod, "orchestrate", _fake_orchestrate)
     monkeypatch.setattr(runmod, "orchestrate", _fake_orchestrate)
 
-    rc = runmod.main([
-        "--steps", str(steps_path),
-        "--in-kind", "json_dir", "--in-path", "in",
-        "--out-kind", "json_dir", "--out-path", "out",
-    ])
+    rc = runmod.main(
+        [
+            "--steps",
+            str(steps_path),
+            "--in-kind",
+            "json_dir",
+            "--in-path",
+            "in",
+            "--out-kind",
+            "json_dir",
+            "--out-path",
+            "out",
+        ]
+    )
     assert rc == 0
     assert called["input"]["kind"] == "json_dir"
     assert called["output"]["path"] == "out"
 
 
-def test_main_with_top_level_pipeline(tmp_path, monkeypatch):
+def test_main_runs_top_level_pipeline_config(tmp_path, monkeypatch):
     cfg_path = tmp_path / "dummy.yml"
     cfg_path.write_text(
         "io:\n"
@@ -65,17 +77,21 @@ def test_main_run_path_honors_sheet_level_overrides(tmp_path):
     in_dir = tmp_path / "in"
     in_dir.mkdir()
     (in_dir / "product.json").write_text(
-        json.dumps([
-            {"id": "P-1", "name": "Starter", "status": "active"},
-            {"id": "P-2", "name": "Pro", "status": "pilot"},
-        ]),
+        json.dumps(
+            [
+                {"id": "P-1", "name": "Starter", "status": "active"},
+                {"id": "P-2", "name": "Pro", "status": "pilot"},
+            ]
+        ),
         encoding="utf-8",
     )
     (in_dir / "branch.json").write_text(
-        json.dumps([
-            {"id": "B-1", "city": "Berlin"},
-            {"id": "B-2", "city": "Hamburg"},
-        ]),
+        json.dumps(
+            [
+                {"id": "B-1", "city": "Berlin"},
+                {"id": "B-2", "city": "Hamburg"},
+            ]
+        ),
         encoding="utf-8",
     )
 

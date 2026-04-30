@@ -1,3 +1,9 @@
+"""Legend-block roundtrip integration slice.
+
+Guards that rendered legend blocks survive XLSX and ODS roundtrips as metadata
+rather than becoming ordinary data frames.
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -8,9 +14,9 @@ from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
 from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 
-
 pytestmark = [
     pytest.mark.ftr("FTR-LEGEND-BLOCKS"),
+    pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C"),
 ]
 
 
@@ -33,10 +39,12 @@ def _frames_with_legend() -> dict:
         }
     }
     return {
-        "product_matrix": pd.DataFrame({
-            "feature": ["currency", "amount"],
-            "FZ-AD": ["E", "E-R-K"],
-        }),
+        "product_matrix": pd.DataFrame(
+            {
+                "feature": ["currency", "amount"],
+                "FZ-AD": ["E", "E-R-K"],
+            }
+        ),
         "_meta": meta,
     }
 

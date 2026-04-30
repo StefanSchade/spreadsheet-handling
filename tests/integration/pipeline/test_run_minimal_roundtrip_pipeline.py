@@ -5,11 +5,17 @@ with spreadsheet output options.
 """
 
 from pathlib import Path
+
+import pytest
 import yaml
+
 from spreadsheet_handling.pipeline.config import load_app_config
 from spreadsheet_handling.pipeline.runner import run_pipeline
 
-def test_run_json_to_xlsx_smoke(tmp_path: Path):
+pytestmark = pytest.mark.ftr("FTR-TEST-NAMING-AND-CONVENTIONS-P3C")
+
+
+def test_run_pipeline_writes_xlsx_from_json_input(tmp_path: Path):
     # input data
     (tmp_path / "in").mkdir()
     (tmp_path / "in" / "products.json").write_text(
@@ -19,14 +25,14 @@ def test_run_json_to_xlsx_smoke(tmp_path: Path):
     cfg = {
         "io": {
             "inputs": {"primary": {"kind": "json", "path": str(tmp_path / "in")}},
-            "output": {"kind": "xlsx", "path": str(tmp_path / "out.xlsx")}
+            "output": {"kind": "xlsx", "path": str(tmp_path / "out.xlsx")},
         },
         "pipeline": {"steps": []},
-        "excel": {"auto_filter": True, "header_fill_rgb": "DDDDDD", "freeze_header": False}
+        "excel": {"auto_filter": True, "header_fill_rgb": "DDDDDD", "freeze_header": False},
     }
     cfg_path = tmp_path / "sheets.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
     app = load_app_config(str(cfg_path))
-    frames, meta, issues = run_pipeline(app, run_id="it-smoke")
+    _frames, _meta, _issues = run_pipeline(app, run_id="it-smoke")
     assert (tmp_path / "out.xlsx").exists()
