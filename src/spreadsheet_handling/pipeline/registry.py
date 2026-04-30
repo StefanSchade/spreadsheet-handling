@@ -80,6 +80,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.yaml_overrides:load_and_apply_overrides",
     ),
+    "write_structured_yaml": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.structured_yaml:write_structured_yaml",
+    ),
     "expand_xref": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref",
