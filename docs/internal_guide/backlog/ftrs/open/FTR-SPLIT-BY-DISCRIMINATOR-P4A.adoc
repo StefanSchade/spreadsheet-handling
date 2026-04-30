@@ -1,0 +1,206 @@
+===== FTR-SPLIT-BY-DISCRIMINATOR-P4A — Bijective split/merge transform by discriminator column
+
+*Status:* Open
+*Epic:* Phase 4 — Feature Expansion and Domain Transformations
+*Priority:* High (pre-beta, driven by BA config requirements)
+
+*Related-to:*
+
+* <<FTR-XREF-CROSSTABLE#,FTR-XREF-CROSSTABLE>>
+* <<FTR-COMPACT-TRANSFORMS#,FTR-COMPACT-TRANSFORMS>>
+* <<FTR-STRUCTURED-YAML-WRITER-P4#,FTR-STRUCTURED-YAML-WRITER-P4>>
+
+'''
+
+====== Purpose
+
+Provide a pair of bijective transforms (split + merge) that partition a single
+table into multiple sheets by a discriminator column, and reconstitute the
+original table from those sheets. The discriminator value is encoded in the
+sheet name; the discriminator column itself is dropped from the split sheets.
+
+This directly supports the BA config use case where a single logical table
+(e.g. `subject_labels`) contains rows for multiple languages, and editors
+prefer to work on separate per-language sheets.
+
+'''
+
+====== Context
+
+The BA config repository has tables like:
+
+[source]
+----
+subject_labels
+  subject | label     | sprache
+  sub_1   | Eingang   | de
+  sub_1   | entrance  | en
+----
+
+For editing, these should split into:
+
+[source]
+----
+subject_labels_de
+  subject | label
+  sub_1   | Eingang
+
+subject_labels_en
+  subject | label
+  sub_1   | entrance
+----
+
+After editing, the sheets merge back into the original shape with the
+discriminator column restored from the sheet-name suffix.
+
+'''
+
+====== Problem statement
+
+Without a generic split/merge transform pair:
+
+* users must manually maintain multiple sheets and keep them consistent
+* roundtrip pipelines cannot reconstruct the canonical single-table form
+* each project re-invents bespoke splitting logic
+* sheet naming rules become implicit and therefore hard to review
+
+'''
+
+====== Goals
+
+. A *split* transform that partitions a frame by a named discriminator column
+  into N output frames (one per distinct value), removing the discriminator
+  column and encoding it in the output sheet name.
+. A *merge* transform that reconstitutes the original frame from the N sheets,
+  re-deriving the discriminator column from sheet names.
+. The pair must be *bijective* (roundtrip-safe): `merge(split(df)) == df`
+  for any input that satisfies the contract and has not been structurally
+  edited between the two operations.
+. Configurable via pipeline YAML with minimal boilerplate.
+. Flexible naming: the user controls how discriminator values map to sheet
+  names (suffix pattern, separator, explicit mapping).
+. Clear diagnostics for sheet-name collisions, invalid discriminator values,
+  and merge inputs whose names do not invert the configured pattern.
+
+'''
+
+====== Design sketch
+
+====== Pipeline YAML surface (indicative)
+
+[source,yaml]
+----
+- step: split_by_discriminator
+  source_frame: subject_labels
+  discriminator_column: sprache
+  target_pattern: "subject_labels_{value}"
+  preserve_row_order: true
+  # optional: explicit value→sheet mapping override
+  # value_map:
+  #   de: subject_labels_deutsch
+  #   en: subject_labels_english
+
+- step: merge_by_discriminator
+  target_frame: subject_labels
+  discriminator_column: sprache
+  source_pattern: "subject_labels_{value}"
+  preserve_row_order: true
+----
+
+====== Behavioral contract
+
+* *Split direction:*
+  ** Input: one frame with a discriminator column.
+  ** Output: N frames, one per unique discriminator value.
+  ** The discriminator column is removed; its value is recoverable from the
+     sheet name via the configured pattern.
+  ** Column order of remaining columns is preserved.
+  ** Row order within each split is preserved.
+  ** If `preserve_row_order` is enabled, the transform records enough metadata
+     to reconstruct the original global row order during an immediate
+     split/merge roundtrip. New rows added during editing may be appended in
+     deterministic sheet/value order.
+  ** Generated frame names must be unique and must not overwrite existing
+     frames unless an explicit overwrite policy is later added.
+
+* *Merge direction:*
+  ** Input: N frames matching the source pattern.
+  ** Output: one frame with the discriminator column restored.
+  ** Discriminator value is derived from sheet name via pattern inversion.
+  ** Row ordering: use preserved row-order metadata when available; otherwise
+     concatenate sheets in sorted discriminator-value order.
+  ** Column set must be uniform across source sheets (error otherwise).
+  ** Source sheets must not already contain the discriminator column unless a
+     future explicit conflict policy says how to reconcile it.
+  ** Source frame selection must be explicit or pattern-bounded; the transform
+     must not infer related frames by fuzzy name matching.
+
+* *Naming and value contract:*
+  ** `target_pattern` / `source_pattern` must contain exactly one `{value}`
+     placeholder in the first slice.
+  ** Discriminator values must be scalar and non-empty.
+  ** If a value cannot be represented safely as a sheet/frame-name segment, the
+     user must provide `value_map`.
+  ** `value_map` must be one-to-one; duplicate target names are errors.
+
+* *Roundtrip guarantee:*
+  ** `merge(split(df))` reproduces the original frame exactly for
+     contract-valid inputs when row-order metadata is preserved.
+  ** Without row-order metadata, row order is deterministic but grouped by
+     discriminator value; callers that need exact ordering must opt into the
+     metadata-backed path.
+
+'''
+
+====== Meta contract
+
+The split step should write small, reviewable metadata under a dedicated root
+such as `split_by_discriminator`, keyed by `name` or `source_frame`:
+
+* source frame
+* discriminator column
+* target/source pattern
+* value-to-frame mapping
+* original column order
+* optional row-order mapping for strict in-memory roundtrips
+
+The merge step should consume this metadata when present, while still allowing
+fully explicit configuration for ad-hoc pipelines. Metadata must not be the only
+way to run the inverse.
+
+'''
+
+====== Scope
+
+This FTR includes:
+
+* implement `split_by_discriminator` pipeline step
+* implement `merge_by_discriminator` pipeline step
+* register both steps in the step registry
+* unit tests for split, merge, naming collisions, row-order preservation, and
+  roundtrip identity
+* integration test with a minimal YAML pipeline exercising both directions
+* step-registry documentation entries with inverse-step links
+
+'''
+
+====== Non-goals
+
+* Multi-column discriminators (future extension if needed)
+* Hierarchical nesting or directory-tree output
+* Automatic discovery of which frames should be split (explicit config only)
+* Spreadsheet styling or hidden-sheet presentation of the split groups
+
+'''
+
+====== Acceptance criteria
+
+. Split produces correct per-value frames with discriminator column removed.
+. Merge reconstitutes the original frame with discriminator column restored.
+. Strict roundtrip test passes: `merge(split(df)) == df` when row-order
+  metadata is preserved.
+. Pipeline YAML configuration works with `target_pattern` / `source_pattern`.
+. Error raised on non-uniform column sets during merge.
+. Error raised on duplicate generated frame names or non-invertible naming.
+. Step registry records the inverse relationship between split and merge.
+. All existing tests continue to pass.
