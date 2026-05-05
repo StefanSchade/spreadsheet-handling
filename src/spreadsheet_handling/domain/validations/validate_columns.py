@@ -24,14 +24,30 @@ def add_validations(frames: Frames, *, rules: list[dict[str, Any]]) -> Frames:
     constraints = list(meta.get("constraints") or [])
     for r in rules:
         rule = (r.get("rule") or {})
-        if rule.get("type") != "in_list":
+        rule_type = rule.get("type")
+        if rule_type == "in_list":
+            constraint_rule = {
+                "type": "in_list",
+                "values": list(rule.get("values") or []),
+            }
+        elif rule_type == "from_legend":
+            constraint_rule = {
+                "type": "from_legend",
+                "legend": rule.get("legend"),
+            }
+            if "include_empty" in rule:
+                constraint_rule["include_empty"] = bool(rule.get("include_empty"))
+        else:
             raise ValueError(f"unsupported rule.type={rule.get('type')}")
-        constraints.append({
+        constraint = {
             "sheet": r["sheet"],
             "column": r.get("column"),
-            "rule": {"type": "in_list", "values": list(rule.get("values") or [])},
+            "rule": constraint_rule,
             "on_violation": r.get("on_violation", "error"),
-        })
+        }
+        if r.get("area") is not None:
+            constraint["area"] = r.get("area")
+        constraints.append(constraint)
 
     meta["constraints"] = constraints
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
+import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol, Dict, Any, List, Optional
 from ..formulas import list_literal_formula
-from ..ir import WorkbookIR, SheetIR, DataValidationSpec, NamedRange
+from ..ir import WorkbookIR, SheetIR, TableBlock, DataValidationSpec, NamedRange
+
+log = logging.getLogger("sheets.validation")
+_LEGEND_DROPDOWN_WARNING_THRESHOLD = 50
 
 class IRPass(Protocol):
     def apply(self, doc: WorkbookIR) -> WorkbookIR: ...
@@ -81,6 +85,90 @@ class FreezePass:
                     sh.meta["__freeze"] = {"row": 2, "col": 1}
         return doc
 
+
+def _workbook_meta(doc: WorkbookIR) -> dict[str, Any]:
+    meta_sheet: Optional[SheetIR] = doc.hidden_sheets.get("_meta")
+    if not meta_sheet:
+        return {}
+    wb_meta = meta_sheet.meta.get("workbook_meta_blob") or {}
+    return wb_meta if isinstance(wb_meta, dict) else {}
+
+
+def _legend_spec(wb_meta: dict[str, Any], legend_name: str) -> dict[str, Any] | None:
+    raw = wb_meta.get("legend_blocks")
+    if isinstance(raw, dict):
+        spec = raw.get(legend_name)
+        return spec if isinstance(spec, dict) else None
+    if isinstance(raw, list):
+        for index, spec in enumerate(raw, start=1):
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("name") or spec.get("id") or f"legend_{index}")
+            if name == legend_name:
+                return spec
+    return None
+
+
+def _legend_tokens(
+    wb_meta: dict[str, Any],
+    *,
+    legend_name: str,
+    include_empty: bool,
+) -> list[str] | None:
+    spec = _legend_spec(wb_meta, legend_name)
+    if spec is None:
+        log.warning("from_legend validation references unknown legend block %r", legend_name)
+        return None
+
+    entries = spec.get("entries")
+    if not isinstance(entries, list):
+        log.warning("from_legend validation references legend block %r without entries", legend_name)
+        return None
+
+    tokens = [
+        str(entry["token"])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("token") not in (None, "")
+    ]
+    if len(tokens) > _LEGEND_DROPDOWN_WARNING_THRESHOLD:
+        log.warning(
+            "from_legend validation for legend block %r has %d values; Excel dropdown UX may degrade",
+            legend_name,
+            len(tokens),
+        )
+    if include_empty:
+        return ["", *tokens]
+    return tokens
+
+
+def _validation_values(rule: dict[str, Any], wb_meta: dict[str, Any]) -> list[str] | None:
+    rule_type = rule.get("type")
+    if rule_type == "in_list":
+        return [str(v) for v in (rule.get("values") or [])]
+    if rule_type == "from_legend":
+        legend_name = rule.get("legend")
+        if not legend_name:
+            return None
+        return _legend_tokens(
+            wb_meta,
+            legend_name=str(legend_name),
+            include_empty=bool(rule.get("include_empty", False)),
+        )
+    return None
+
+
+def _target_validation_columns(
+    table: TableBlock,
+    *,
+    column_name: Any,
+    area: Any,
+) -> list[int]:
+    if column_name == "*" or (not column_name and area == "data_body"):
+        return sorted(table.header_map.values())
+    col_idx = table.header_map.get(str(column_name))
+    return [col_idx] if col_idx else []
+
+
 @dataclass
 class ValidationPass:
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
@@ -99,32 +187,42 @@ class ValidationPass:
                 sh.validations.append(dv)
 
         # New path: workbook-level constraints (column name based)
-        meta_sheet: Optional[SheetIR] = doc.hidden_sheets.get("_meta")
-        wb_meta = (meta_sheet.meta.get("workbook_meta_blob") or {}) if meta_sheet else {}
-        constraints = wb_meta.get("constraints") or [] if isinstance(wb_meta, dict) else []
+        wb_meta = _workbook_meta(doc)
+        constraints = wb_meta.get("constraints") or []
         for c in constraints:
             if not isinstance(c, dict):
                 continue
             sheet_name = c.get("sheet")
             col_name = c.get("column")
+            area = c.get("area")
             rule = c.get("rule") or {}
-            if not sheet_name or not col_name:
+            if not sheet_name or not isinstance(rule, dict):
                 continue
-            if rule.get("type") != "in_list":
+            values = _validation_values(rule, wb_meta)
+            if values is None:
                 continue
             target = doc.sheets.get(str(sheet_name))
             if not target or not target.tables:
                 continue
             t = target.tables[0]
-            col_idx = t.header_map.get(str(col_name))
-            if not col_idx:
+            column_indices = _target_validation_columns(
+                t,
+                column_name=col_name,
+                area=area,
+            )
+            if not column_indices:
                 continue
             r1 = t.top + t.header_rows
             r2 = max(r1, t.top + t.n_rows - 1)
-            values = [str(v) for v in (rule.get("values") or [])]
             formula = list_literal_formula(values)
-            dv = DataValidationSpec(kind="list", area=(r1, col_idx, r2, col_idx), formula=formula, allow_empty=True)
-            target.validations.append(dv)
+            for col_idx in column_indices:
+                dv = DataValidationSpec(
+                    kind="list",
+                    area=(r1, col_idx, r2, col_idx),
+                    formula=formula,
+                    allow_empty=True,
+                )
+                target.validations.append(dv)
 
         return doc
 

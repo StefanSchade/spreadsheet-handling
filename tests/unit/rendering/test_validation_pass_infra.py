@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from spreadsheet_handling.domain.validations.validate_columns import add_validations
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
@@ -34,6 +35,34 @@ class TestAddValidationsWritesMeta:
         assert constraints[0]["sheet"] == "Kunden"
         assert constraints[0]["rule"]["values"] == ["A", "B", "C"]
 
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_constraints_stored_in_meta_dict_key(self):
+        frames = {"Kunden": pd.DataFrame({"status": ["E", "R"]})}
+        frames["_meta"] = {}
+        add_validations(frames, rules=[{
+            "sheet": "Kunden",
+            "column": "status",
+            "rule": {
+                "type": "from_legend",
+                "legend": "status_codes",
+                "include_empty": True,
+            },
+        }])
+
+        constraints = frames["_meta"]["constraints"]
+        assert constraints == [
+            {
+                "sheet": "Kunden",
+                "column": "status",
+                "rule": {
+                    "type": "from_legend",
+                    "legend": "status_codes",
+                    "include_empty": True,
+                },
+                "on_violation": "error",
+            }
+        ]
+
     def test_multiple_constraints_accumulate(self):
         frames = {"Kunden": pd.DataFrame({"status": ["A"], "typ": ["X"]})}
         frames["_meta"] = {}
@@ -49,10 +78,10 @@ class TestAddValidationsWritesMeta:
 # ---------------------------------------------------------------------------
 
 class TestValidationPassFromConstraints:
-    def _make_ir_with_constraints(self, constraints):
+    def _make_ir_with_constraints(self, constraints, extra_meta=None):
         """Build a WorkbookIR with a Products sheet and stash constraints in _meta."""
         frames = {"Products": pd.DataFrame({"id": [1, 2], "category": ["A", "B"]})}
-        meta = {"constraints": constraints}
+        meta = {"constraints": constraints, **dict(extra_meta or {})}
         ir = compose_workbook(frames, meta)
         return ir
 
@@ -68,6 +97,108 @@ class TestValidationPassFromConstraints:
         dv = ir.sheets["Products"].validations[0]
         assert dv.kind == "list"
         assert formula_list_values(dv.formula) == ("A", "B", "C")
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_constraint_creates_validation_spec(self):
+        ir = self._make_ir_with_constraints(
+            [{
+                "sheet": "Products",
+                "column": "category",
+                "rule": {"type": "from_legend", "legend": "status_codes"},
+            }],
+            extra_meta={
+                "legend_blocks": {
+                    "status_codes": {
+                        "entries": [
+                            {"token": "E", "label": "Editable"},
+                            {"token": "R", "label": "Read-only"},
+                            {"token": "K", "label": "Composite"},
+                        ],
+                    }
+                }
+            },
+        )
+
+        ir = ValidationPass().apply(ir)
+
+        dv = ir.sheets["Products"].validations[0]
+        assert dv.kind == "list"
+        assert formula_list_values(dv.formula) == ("E", "R", "K")
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_include_empty_adds_blank_choice(self):
+        ir = self._make_ir_with_constraints(
+            [{
+                "sheet": "Products",
+                "column": "category",
+                "rule": {
+                    "type": "from_legend",
+                    "legend": "status_codes",
+                    "include_empty": True,
+                },
+            }],
+            extra_meta={
+                "legend_blocks": {
+                    "status_codes": {
+                        "entries": [
+                            {"token": "E", "label": "Editable"},
+                            {"token": "R", "label": "Read-only"},
+                        ],
+                    }
+                }
+            },
+        )
+
+        ir = ValidationPass().apply(ir)
+
+        assert formula_list_values(ir.sheets["Products"].validations[0].formula) == ("", "E", "R")
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_column_wildcard_targets_all_data_columns(self):
+        ir = self._make_ir_with_constraints(
+            [{
+                "sheet": "Products",
+                "column": "*",
+                "rule": {"type": "from_legend", "legend": "status_codes"},
+            }],
+            extra_meta={
+                "legend_blocks": {
+                    "status_codes": {
+                        "entries": [
+                            {"token": "E", "label": "Editable"},
+                            {"token": "R", "label": "Read-only"},
+                        ],
+                    }
+                }
+            },
+        )
+
+        ir = ValidationPass().apply(ir)
+
+        assert [dv.area for dv in ir.sheets["Products"].validations] == [
+            (2, 1, 3, 1),
+            (2, 2, 3, 2),
+        ]
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_warns_for_large_dropdowns(self, caplog):
+        entries = [
+            {"token": f"T{index}", "label": f"Token {index}"}
+            for index in range(51)
+        ]
+        ir = self._make_ir_with_constraints(
+            [{
+                "sheet": "Products",
+                "column": "category",
+                "rule": {"type": "from_legend", "legend": "status_codes"},
+            }],
+            extra_meta={"legend_blocks": {"status_codes": {"entries": entries}}},
+        )
+
+        with caplog.at_level("WARNING", logger="sheets.validation"):
+            ValidationPass().apply(ir)
+
+        assert "Excel dropdown UX may degrade" in caplog.text
 
     def test_unknown_sheet_silently_skipped(self):
         ir = self._make_ir_with_constraints([{
@@ -199,3 +330,50 @@ class TestEndToEndXlsx:
         assert "Data" in shape["validations"]
         dvs = shape["validations"]["Data"]
         assert any(dv["type"] == "list" for dv in dvs)
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_constraint_appears_in_xlsx(self, tmp_path):
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
+        from tests.utils.xlsx_normalize import normalize_xlsx
+
+        frames = {"Data": pd.DataFrame({"id": [1, 2], "code": ["E", "R"]})}
+        meta = {
+            "legend_blocks": {
+                "status_codes": {
+                    "entries": [
+                        {"token": "E", "label": "Editable"},
+                        {"token": "R", "label": "Read-only"},
+                        {"token": "K", "label": "Composite"},
+                    ],
+                }
+            },
+            "constraints": [
+                {
+                    "sheet": "Data",
+                    "column": "code",
+                    "rule": {"type": "from_legend", "legend": "status_codes"},
+                }
+            ],
+        }
+        ir = compose_workbook(frames, meta)
+        ir = apply_all(ir, meta)
+        plan = build_render_plan(ir)
+
+        out = tmp_path / "legend_validation.xlsx"
+        render_workbook(plan, str(out))
+
+        shape = normalize_xlsx(str(out))
+        dvs = shape["validations"]["Data"]
+        assert any(
+            dv["type"] == "list"
+            and dv["sqref"] == "B2:B3"
+            and dv["formula1"] == '"E,R,K"'
+            for dv in dvs
+        )
+
+        workbook = load_workbook(out, data_only=True)
+        try:
+            ws = workbook["Data"]
+            assert [ws["B2"].value, ws["B3"].value] == ["E", "R"]
+        finally:
+            workbook.close()
