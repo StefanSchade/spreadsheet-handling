@@ -127,7 +127,10 @@ def _target_columns_for_collapse(
     else:
         target_columns = _xref_column_keys_for_frame(frames, frame=frame, config_id=config_id)
         if target_columns is None:
-            target_columns = list(source.columns)
+            raise ValueError(
+                "sparse_collapse requires explicit columns when no unambiguous "
+                f"xref_crosstable metadata exists for frame {frame!r}"
+            )
     _ensure_columns(source, target_columns, frame_name=frame)
     return target_columns
 
@@ -144,7 +147,10 @@ def _target_columns_for_expand(
     elif isinstance(meta, Mapping) and isinstance(meta.get("columns"), list):
         target_columns = list(meta["columns"])
     else:
-        target_columns = list(source.columns)
+        raise ValueError(
+            "sparse_expand requires explicit columns when no sparse_defaults "
+            f"metadata exists for frame {frame!r}"
+        )
     _ensure_columns(source, target_columns, frame_name=frame)
     return target_columns
 
@@ -291,12 +297,21 @@ def _xref_column_keys_for_frame(
         column_keys = preferred.get("column_keys")
         return list(column_keys) if isinstance(column_keys, list) else None
 
-    for config in configs.values():
+    matches: list[tuple[Any, list[Any]]] = []
+    for key, config in configs.items():
         if not isinstance(config, Mapping) or config.get("matrix") != frame:
             continue
         column_keys = config.get("column_keys")
         if isinstance(column_keys, list):
-            return list(column_keys)
+            matches.append((key, list(column_keys)))
+    if len(matches) > 1:
+        match_names = [key for key, _ in matches]
+        raise ValueError(
+            f"Ambiguous xref_crosstable metadata for matrix frame {frame!r}: "
+            f"{match_names!r}. Provide sparse columns or name a matching transform."
+        )
+    if len(matches) == 1:
+        return matches[0][1]
     return None
 
 

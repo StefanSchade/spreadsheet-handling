@@ -109,7 +109,7 @@ def test_sparse_collapse_defaults_to_xref_matrix_columns_when_available() -> Non
     ]
 
 
-def test_sparse_collapse_without_columns_or_xref_metadata_applies_to_all_columns() -> None:
+def test_sparse_collapse_requires_columns_when_xref_metadata_is_missing() -> None:
     frames = {
         "matrix": pd.DataFrame(
             {
@@ -119,9 +119,43 @@ def test_sparse_collapse_without_columns_or_xref_metadata_applies_to_all_columns
         )
     }
 
-    out = sparse_collapse(frames, frame="matrix", default_value="nein")
+    with pytest.raises(ValueError, match="requires explicit columns"):
+        sparse_collapse(frames, frame="matrix", default_value="nein")
 
-    assert out["matrix"].to_dict(orient="records") == [{"feature_id": "", "P-001": ""}]
+
+def test_sparse_collapse_rejects_ambiguous_xref_matrix_metadata() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["nein"],
+                "P-002": ["ja"],
+                "P-003": ["nein"],
+            }
+        ),
+        "_meta": {
+            "xref_crosstable": {
+                "product_feature_xref": {
+                    "matrix": "matrix",
+                    "column_keys": ["P-001", "P-002"],
+                },
+                "other_product_feature_xref": {
+                    "matrix": "matrix",
+                    "column_keys": ["P-003"],
+                },
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+        sparse_collapse(frames, frame="matrix", default_value="nein")
+
+
+def test_sparse_expand_requires_columns_when_metadata_is_missing() -> None:
+    frames = {"matrix": pd.DataFrame({"feature_id": ["f1"], "P-001": [""]})}
+
+    with pytest.raises(ValueError, match="requires explicit columns"):
+        sparse_expand(frames, frame="matrix", default_value="nein")
 
 
 def test_sparse_collapse_errors_on_preexisting_blank_conflicts() -> None:
