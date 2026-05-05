@@ -128,6 +128,44 @@ def test_xref_crosstable_steps_are_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A")
+def test_sparse_default_steps_are_config_addressable() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["nein"],
+                "P-002": ["ja"],
+            }
+        )
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "sparse_collapse",
+                "frame": "matrix",
+                "default_value": "nein",
+                "columns": ["P-001", "P-002"],
+            },
+            {
+                "step": "sparse_expand",
+                "frame": "matrix",
+            },
+        ]
+    )
+
+    assert isinstance(REGISTRY["sparse_collapse"], StepRegistration)
+    assert isinstance(REGISTRY["sparse_expand"], StepRegistration)
+    assert steps[0].config["target"].endswith(":sparse_collapse")
+    assert steps[1].config["target"].endswith(":sparse_expand")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["matrix"].to_dict(orient="records") == [
+        {"feature_id": "f1", "P-001": "nein", "P-002": "ja"},
+    ]
+
+
 @pytest.mark.ftr("FTR-SPLIT-BY-DISCRIMINATOR-P4A")
 def test_discriminator_split_steps_are_config_addressable() -> None:
     frames = {

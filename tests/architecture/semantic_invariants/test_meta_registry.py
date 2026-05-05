@@ -66,6 +66,7 @@ def test_meta_registry_seeds_current_known_entries():
         "xref_crosstable",
         "cell_codecs",
         "compact_multiaxis",
+        "sparse_defaults",
         "freeze_header",
         "auto_filter",
         "header_fill_rgb",

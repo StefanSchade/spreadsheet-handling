@@ -104,6 +104,14 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:contract_xref",
     ),
+    "sparse_collapse": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.sparse_defaults:sparse_collapse",
+    ),
+    "sparse_expand": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.sparse_defaults:sparse_expand",
+    ),
     "decode_cell_values": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.cell_codec:decode_cell_values",
