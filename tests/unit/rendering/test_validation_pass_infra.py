@@ -126,6 +126,33 @@ class TestValidationPassFromConstraints:
         assert formula_list_values(dv.formula) == ("E", "R", "K")
 
     @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_supports_list_style_legend_blocks(self):
+        ir = self._make_ir_with_constraints(
+            [{
+                "sheet": "Products",
+                "column": "category",
+                "rule": {"type": "from_legend", "legend": "status_codes"},
+            }],
+            extra_meta={
+                "legend_blocks": [
+                    {
+                        "name": "status_codes",
+                        "entries": [
+                            {"token": "E", "label": "Editable"},
+                            {"token": "R", "label": "Read-only"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+        ir = ValidationPass().apply(ir)
+
+        dv = ir.sheets["Products"].validations[0]
+        assert dv.kind == "list"
+        assert formula_list_values(dv.formula) == ("E", "R")
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
     def test_from_legend_include_empty_adds_blank_choice(self):
         ir = self._make_ir_with_constraints(
             [{
@@ -377,3 +404,39 @@ class TestEndToEndXlsx:
             assert [ws["B2"].value, ws["B3"].value] == ["E", "R"]
         finally:
             workbook.close()
+
+    @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
+    def test_from_legend_xlsx_reimport_preserves_data_cells(self, tmp_path):
+        from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
+
+        meta = {
+            "legend_blocks": {
+                "status_codes": {
+                    "entries": [
+                        {"token": "E", "label": "Editable"},
+                        {"token": "R", "label": "Read-only"},
+                        {"token": "K", "label": "Composite"},
+                    ],
+                }
+            },
+            "constraints": [
+                {
+                    "sheet": "Data",
+                    "column": "code",
+                    "rule": {"type": "from_legend", "legend": "status_codes"},
+                }
+            ],
+        }
+        frames = {
+            "Data": pd.DataFrame({"id": [1, 2], "code": ["E", "R"]}),
+            "_meta": meta,
+        }
+        out = tmp_path / "legend_validation_reimport.xlsx"
+
+        ExcelBackend().write_multi(frames, str(out))
+        back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+        assert back["Data"].to_dict(orient="records") == [
+            {"id": "1", "code": "E"},
+            {"id": "2", "code": "R"},
+        ]
