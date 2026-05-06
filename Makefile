@@ -167,6 +167,10 @@ format: deps-dev ## Auto-fix with Ruff & Black
 lint: deps-dev ## Lint only (Ruff)
 	$(RUFF) check src/spreadsheet_handling
 
+.PHONY: source-style-guards
+source-style-guards: deps-dev ## Run source-style guardrails separately from architecture guards
+	$(PYTHON) tools/check_source_style.py
+
 .PHONY: syntax
 syntax: venv ## Syntax check
 	$(PYTHON) -m compileall -q src/spreadsheet_handling

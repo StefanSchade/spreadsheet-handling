@@ -79,7 +79,7 @@ class CSVBackend(BackendBase):
             df.columns = pd.MultiIndex.from_tuples(tuples)
             out[p.stem] = df
         if not out:
-            raise FileNotFoundError(f"Keine *.csv in {folder} gefunden.")
+            raise FileNotFoundError(f"No *.csv files found in {folder}.")
         return out
 
 
