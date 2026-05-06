@@ -28,22 +28,22 @@ def row_to_obj(paths: list[str | None], values: list[Any]) -> dict[str, Any]:
         if isinstance(v, str) and v.strip() == "":
             continue
         segs = p.split(".")
-        if segs and segs[0].startswith("_"):  # Hilfsspalten nicht zurückschreiben
+        if segs and segs[0].startswith("_"):  # do not write helper columns back
             continue
         set_nested(obj, segs, v)
     return obj
 
 
 def df_to_objects(df: pd.DataFrame) -> list[dict[str, Any]]:
-    # Header-Pfade bauen, leere/Unnamed-Zellen skippen
+    # Build header paths and skip empty/Unnamed cells.
     paths = []
     for col in df.columns:
         segs = [str(s) for s in col if not is_empty_header(s)]
-        if not segs:  # komplett leerer Header -> Spalte ignorieren
+        if not segs:  # ignore columns with completely empty headers
             paths.append(None)
         else:
             paths.append(".".join(segs))
-    # Spalten mit None droppen
+    # Drop columns without paths.
     keep = [i for i, p in enumerate(paths) if p is not None]
     df2 = df.iloc[:, keep]
     paths2 = [paths[i] for i in keep]
@@ -54,5 +54,4 @@ def df_to_objects(df: pd.DataFrame) -> list[dict[str, Any]]:
         if obj:
             out.append(obj)
     return out
-
 

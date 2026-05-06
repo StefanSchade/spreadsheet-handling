@@ -9,10 +9,6 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.core.fk import (
-    build_registry,
-    build_id_label_maps,
-    detect_fk_columns,
-    apply_fk_helpers,
     assert_no_parentheses_in_columns,
 )
 from spreadsheet_handling.core.indexing import level0_series
@@ -188,7 +184,7 @@ class TestDuplicateIdsLastWins:
 class TestParenthesesGuard:
     def test_parentheses_in_non_fk_column_rejected(self):
         df = pd.DataFrame({"x(y)": [1], "id_(Ziel)": [1]})
-        with pytest.raises(ValueError, match="nicht erlaubt"):
+        with pytest.raises(ValueError, match="not allowed"):
             assert_no_parentheses_in_columns(df, "Bestellungen")
 
     def test_fk_column_parentheses_allowed(self):

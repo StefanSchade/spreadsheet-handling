@@ -7,7 +7,7 @@ import pandas as pd
 
 from ..frame_keys import iter_data_frames
 
-# Neu: zentrale Indexing-Helpers verwenden
+# Use the shared indexing helpers.
 from .indexing import level0_series as _series_from_first_level
 
 
@@ -16,15 +16,15 @@ HelperValueProvider = Callable[[Any, list[Any]], list[Any]]
 
 
 class FKDef(NamedTuple):
-    fk_column: str  # z. B. "id_(Guten_Morgen)"
-    id_field: str  # z. B. "id" oder "Schluessel"
-    target_sheet_key: str  # z. B. "Guten_Morgen"
-    helper_column: str  # z. B. "_Guten_Morgen_name"
-    value_field: str  # z. B. "name" oder "category"
+    fk_column: str  # e.g. "id_(Guten_Morgen)"
+    id_field: str  # e.g. "id" or "Schluessel"
+    target_sheet_key: str  # e.g. "Guten_Morgen"
+    helper_column: str  # e.g. "_Guten_Morgen_name"
+    value_field: str  # e.g. "name" or "category"
 
 
 def _norm_id(v) -> str | None:
-    """Normalisiert IDs auf String-Schlüssel; NaN/None -> None."""
+    """Normalize IDs to string keys; NaN/None become None."""
     if v is None:
         return None
     try:
@@ -36,16 +36,16 @@ def _norm_id(v) -> str | None:
 
 
 def normalize_sheet_key(name: str) -> str:
-    """Leerzeichen -> '_'; prüft, dass keine Klammern vorkommen."""
+    """Convert whitespace to '_' and reject parentheses."""
     if "(" in name or ")" in name:
-        raise ValueError(f"Blattname enthält Klammern, nicht erlaubt: {name!r}")
+        raise ValueError(f"Sheet name contains parentheses, not allowed: {name!r}")
     return re.sub(r"\s+", "_", name.strip())
 
 
 def assert_no_parentheses_in_columns(df: pd.DataFrame, sheet_name: str) -> None:
     """
-    Spaltenüberschriften dürfen KEINE Klammern enthalten - mit Ausnahme
-    von korrekt gematchten FK-Spalten gemäß FK_PATTERN (z. B. id_(Guten_Morgen)).
+    Column headers must not contain parentheses, except for valid FK columns
+    matched by FK_PATTERN (for example id_(Guten_Morgen)).
     """
     first = [t[0] if isinstance(t, tuple) else t for t in df.columns.to_list()]
     bad = []
@@ -53,13 +53,14 @@ def assert_no_parentheses_in_columns(df: pd.DataFrame, sheet_name: str) -> None:
         if not isinstance(c, str):
             continue
         if "(" in c or ")" in c:
-            # FK-Spalten sind explizit erlaubt
+            # FK columns are explicitly allowed.
             if FK_PATTERN.match(c):
                 continue
             bad.append(c)
     if bad:
         raise ValueError(
-            f"Spalten mit Klammern in Blatt {sheet_name!r} nicht erlaubt (außer FK-Spalten): {bad}"
+            f"Columns with parentheses on sheet {sheet_name!r} are not allowed "
+            f"except for FK columns: {bad}"
         )
 
 
@@ -67,11 +68,11 @@ def build_registry(
     frames: Dict[str, pd.DataFrame], defaults: Dict[str, Any]
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Registry pro Sheet:
+    Registry per sheet:
     {
       sheet_key: {
-        "sheet_name": originaler Name,
-        "id_field": defaults["id_field"] (später pro Sheet überschreibbar),
+        "sheet_name": original name,
+        "id_field": defaults["id_field"] (later overridable per sheet),
         "label_field": defaults["label_field"]
       }
     }
@@ -151,8 +152,8 @@ def detect_fk_columns(
     defaults: Dict[str, Any] | None = None,
 ) -> List[FKDef]:
     """
-    Findet Spalten wie 'id_(Guten_Morgen)' bzw. 'Schluessel_(Guten_Morgen)'.
-    Prüft, dass target_sheet existiert und (strikt) dass id_field zum Zielblatt passt.
+    Find columns such as 'id_(Guten_Morgen)' or 'Schluessel_(Guten_Morgen)'.
+    Check that the target sheet exists and that id_field matches it strictly.
     """
     fks: List[FKDef] = []
     cols = _first_level_columns(df)
@@ -166,12 +167,11 @@ def detect_fk_columns(
         id_field = m.group("id_field")
         sheet_key = m.group("sheet_key")
         if sheet_key not in known_keys:
-            # FK zeigt auf unbekanntes Blatt -> ignorieren (oder warnen)
+            # FK points at an unknown sheet; ignore it for now.
             continue
         target_id_field = registry[sheet_key]["id_field"]
         if id_field != target_id_field:
-            # Strikt: nur akzeptieren, wenn Prefix zum Zielblatt-id_field passt
-            # (alternativ: akzeptieren & trotzdem target_id_field verwenden)
+            # Strict: only accept matches where the prefix matches the target id_field.
             continue
         helper_fields = _resolve_helper_fields(c, sheet_key, registry, defaults)
         for value_field in helper_fields:
@@ -195,8 +195,8 @@ def build_id_value_maps(
     fields_by_sheet: Dict[str, Iterable[str]] | None = None,
 ) -> Dict[str, Dict[str, Dict[Any, Any]]]:
     """
-    Fuer jedes Sheet verschachtelte Maps: {field_name -> {id_value -> field_value}}.
-    Wenn `fields_by_sheet` gesetzt ist, werden nur die benoetigten Felder erzeugt.
+    Build nested maps per sheet: {field_name -> {id_value -> field_value}}.
+    When `fields_by_sheet` is set, only requested fields are produced.
     """
     maps: Dict[str, Dict[str, Dict[Any, Any]]] = {}
     requested_by_sheet = fields_by_sheet or {}
@@ -241,8 +241,8 @@ def build_id_label_maps(
     frames: Dict[str, pd.DataFrame], registry: Dict[str, Dict[str, Any]]
 ) -> Dict[str, Dict[Any, Any]]:
     """
-    Für jedes Sheet eine Map: {id_value -> label_value}.
-    Nimmt id_field & label_field aus Registry. Fehlende Felder -> leere Map.
+    Build one map per sheet: {id_value -> label_value}.
+    Use id_field and label_field from the registry; missing fields produce empty maps.
     """
     fields_by_sheet = {
         sheet_key: [str(meta["label_field"])] for sheet_key, meta in registry.items()
@@ -259,7 +259,7 @@ def build_id_sets(
     frames: Dict[str, pd.DataFrame],
     registry: Dict[str, Dict[str, Any]],
 ) -> Dict[str, set[str]]:
-    """Fuer jedes Sheet die vorhandenen IDs als normalisierte String-Menge."""
+    """Return existing IDs per sheet as normalized string sets."""
     id_sets: Dict[str, set[str]] = {}
     for sheet_key, meta in registry.items():
         sheet_name = meta["sheet_name"]
@@ -274,9 +274,6 @@ def build_id_sets(
             key for key in (_norm_id(value) for value in ids.tolist()) if key is not None
         }
     return id_sets
-
-
-# in scripts/spreadsheet_handling/src/spreadsheet_handling/core/fk.py
 
 
 def apply_fk_helpers(
@@ -294,9 +291,9 @@ def apply_fk_helpers(
     new_df = df.copy()
 
     for fk in fk_defs:
-        # --- FKDef ODER dict robust unterstützen ---
+        # Support FKDef and legacy dict inputs.
         if isinstance(fk, dict):
-            fk_col = fk["column"]  # z.B. "id_(A)"
+            fk_col = fk["column"]  # e.g. "id_(A)"
             target_key = fk.get("target_key") or fk.get("target_sheet_key")
             value_field = str(fk.get("value_field", "name"))
             helper_col = str(
@@ -307,9 +304,8 @@ def apply_fk_helpers(
             target_key = fk.target_sheet_key
             helper_col = fk.helper_column
             value_field = fk.value_field
-        # -------------------------------------------
 
-        # nicht duplizieren
+        # Avoid duplicates.
         if helper_col in first_cols:
             continue
 
@@ -324,7 +320,7 @@ def apply_fk_helpers(
         else:
             value_map = {}
 
-        # FK-Werte aus Level-0 holen (nicht DataFrame!)
+        # Pull FK values from level 0, not as a DataFrame.
         fk_series = _series_from_first_level(new_df, fk_col)
         raw_ids = fk_series.tolist()
 
@@ -336,7 +332,7 @@ def apply_fk_helpers(
         else:
             values = helper_value_provider(fk, raw_ids)
 
-        # neue Spalte als MultiIndex-Tuple gleicher Länge
+        # Add a new column as a MultiIndex tuple of matching length.
         col_tuple = (helper_col,) + ("",) * (levels - 1)
         new_df[col_tuple] = values
 
