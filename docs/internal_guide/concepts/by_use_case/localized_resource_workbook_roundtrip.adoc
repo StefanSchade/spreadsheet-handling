@@ -1,0 +1,492 @@
+== Use Case: Localized Resource Workbook Roundtrip
+
+=== Status
+
+* Concept note
+* Derived from a prototype consumer discussion
+* Intended to clarify the generic pattern for localized labels, messages, and
+  product- or context-specific text overrides
+
+=== Purpose
+
+This note describes how localized resource texts can be stored canonically as
+tuples, projected into business-friendly spreadsheet matrices, edited there, and
+recomposed into canonical data and target resource files.
+
+Examples of localized resources include:
+
+* variable labels
+* enum labels
+* validation messages
+* error messages
+* general UI texts
+
+The essential shape is generic:
+
+* one resource key identifies the thing being labeled or messaged
+* one locale identifies the language or regional variant
+* one optional context identifies a product, transaction type, module, screen,
+  or other business variation
+* one text value carries the resource
+
+The core library should support the mechanics: tuple relations, locale-based
+sheet splitting, context-based crosstables, fallback/override semantics,
+validations, roundtrip recomposition, and target file writing. It should not
+decide whether a text is linguistically or professionally correct.
+
+=== Problem Statement
+
+Applications often resolve user-facing text through a generic resource lookup:
+
+* find the resource key
+* select the current locale
+* optionally select a product or business context
+* fall back to a default text when no context-specific override exists
+
+Business users, however, may not want to edit this as one long normalized table.
+They often prefer a workbook layout such as:
+
+* one sheet per locale
+* one row per resource key
+* one column for the default value
+* one column per product or context override
+
+For example, the same variable may be displayed as one business term in one
+product and another business term in another product. That variation may exist
+in several locales.
+
+The workbook layout is convenient, but the canonical data model should not be
+derived from sheet names or visible labels by guessing. It should be represented
+as explicit tuples.
+
+=== Canonical Representation
+
+The canonical model should be normalized and explicit.
+
+==== Resource Keys
+
+[source,text]
+----
+resources
+---------
+resource_key          primary key
+resource_type         field_label | enum_label | error_message | validation_message | ui_text
+description           optional maintainer text
+active                optional lifecycle flag
+----
+
+`resource_key` is identity. Visible text must never be used as identity.
+
+==== Locales
+
+[source,text]
+----
+locales
+-------
+locale                primary key, for example de, en, fr
+label                 optional display label
+default_order         optional display order
+----
+
+The locale table may be small, but making it explicit allows validation and
+stable sheet ordering.
+
+==== Contexts
+
+[source,text]
+----
+resource_contexts
+-----------------
+context_id            primary key, for example default, product_a, product_b
+context_type          default | product | module | screen | other
+label                 optional display label
+default_order         optional display order
+----
+
+The default context needs explicit representation. A missing override is not
+the same as an intentionally empty text.
+
+==== Localized Resource Values
+
+[source,text]
+----
+localized_resource_values
+-------------------------
+resource_key          FK -> resources.resource_key
+locale                FK -> locales.locale
+context_id            FK -> resource_contexts.context_id
+text                  localized resource text
+status                optional: draft | reviewed | approved
+comment               optional maintainer or reviewer note
+----
+
+Important constraints:
+
+* `resource_key` must reference `resources`
+* `locale` must reference `locales`
+* `context_id` must reference `resource_contexts`
+* `(resource_key, locale, context_id)` should be unique
+* the configured default context should exist for each required
+  `resource_key`/`locale` pair unless explicitly optional
+
+=== Forward Path To The Workbook
+
+The forward path starts with canonical frames and derives locale-specific
+spreadsheet views.
+
+==== Step 1: Validate Canonical Sources
+
+Run generic table integrity checks first.
+
+[source,yaml]
+----
+- step: validate_references
+  mode: fail
+  rules:
+    - type: primary_key
+      frame: resources
+      columns: [resource_key]
+    - type: primary_key
+      frame: locales
+      columns: [locale]
+    - type: primary_key
+      frame: resource_contexts
+      columns: [context_id]
+    - type: foreign_key
+      frame: localized_resource_values
+      columns: [resource_key]
+      target: resources
+      target_columns: [resource_key]
+    - type: foreign_key
+      frame: localized_resource_values
+      columns: [locale]
+      target: locales
+      target_columns: [locale]
+    - type: foreign_key
+      frame: localized_resource_values
+      columns: [context_id]
+      target: resource_contexts
+      target_columns: [context_id]
+    - type: unique_reference
+      frame: localized_resource_values
+      columns: [resource_key, locale, context_id]
+----
+
+These checks say nothing about text quality. They only protect table integrity.
+
+==== Step 2: Filter Resource Types When Needed
+
+Resource types may become separate workbook sections or separate sheets.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: resources
+  output: label_resources
+  where:
+    column: resource_type
+    equals: field_label
+----
+
+The same can be done for error messages, enum labels, or validation messages.
+
+==== Step 3: Split By Locale
+
+Locale can be projected as one workbook sheet per locale.
+
+[source,yaml]
+----
+- step: split_by_discriminator
+  source: localized_resource_values
+  discriminator: locale
+  target_pattern: localized_resource_values_{value}
+----
+
+This is a view layout decision. Locale remains canonical data in the tuple
+relation.
+
+==== Step 4: Contract Context Overrides Into A Matrix
+
+For each locale-specific frame, context-specific values can be displayed as a
+matrix.
+
+[source,yaml]
+----
+- step: contract_xref
+  relation: localized_resource_values_de
+  output: labels_de_matrix
+  row_keys: [resource_key]
+  column_key: context_id
+  value: text
+  column_keys: [default, product_a, product_b]
+  fill_value: ""
+----
+
+For localized free text, a normal xref matrix is usually a better fit than a
+compact code matrix. The cells contain text, not symbolic role codes.
+
+==== Step 5: Add Display Helpers
+
+Business editors may need resource type or description next to the key.
+
+[source,yaml]
+----
+- step: add_lookup_helpers
+  source: labels_de_matrix
+  lookup: resources
+  output: labels_de_view
+  key: resource_key
+  helpers:
+    fields: [resource_type, description]
+  order:
+    helper_position: before_key
+    sort_by: [resource_type, resource_key]
+----
+
+These helpers are context. They are not the localized text payload.
+
+==== Step 6: Compose Workbook Views
+
+The visible workbook can be declared as locale/resource-type sheets.
+
+[source,yaml]
+----
+- step: compose_workbook_views
+  views:
+    - frame: labels_de_view
+      sheet: Labels_DE
+      editable_columns: [default, product_a, product_b]
+      helper_columns: [resource_type, description]
+    - frame: labels_en_view
+      sheet: Labels_EN
+      editable_columns: [default, product_a, product_b]
+      helper_columns: [resource_type, description]
+----
+
+The sheet names are display names. Reimport must use stored view metadata or
+explicit pipeline configuration to recover locale/context identity.
+
+=== Business-Facing Workbook Representation
+
+The workbook should optimize for maintenance and review.
+
+==== Sheet Per Locale
+
+One common layout is:
+
+[source,text]
+----
+Labels_DE
+---------
+resource_type | description | resource_key | default | product_a | product_b
+
+Labels_EN
+---------
+resource_type | description | resource_key | default | product_a | product_b
+----
+
+This keeps all texts for one locale together and lets editors compare product
+variants horizontally.
+
+==== Sheet Per Resource Type And Locale
+
+If the workbook becomes too large, the view can split further:
+
+[source,text]
+----
+FieldLabels_DE
+FieldLabels_EN
+Errors_DE
+Errors_EN
+ValidationMessages_DE
+ValidationMessages_EN
+----
+
+This is a workbook view choice. The canonical relation can stay the same.
+
+==== Context Columns
+
+The `default` column should represent the fallback value. Product/context
+columns represent overrides.
+
+The meaning of an empty override cell must be configured. Empty could mean:
+
+* no override, use default
+* intentionally empty text
+* delete existing override
+* invalid because text is required
+
+The core needs explicit fallback/override semantics rather than guessing.
+
+=== Reverse Path To Canonical Frames
+
+The reverse path reads edited sheets and turns them back into tuples.
+
+==== Step 1: Read Workbook Frames
+
+The adapter reads visible sheets and workbook metadata.
+
+[source,text]
+----
+Workbook
+-> Labels_DE
+-> Labels_EN
+-> Errors_DE
+-> Errors_EN
+-> _meta
+----
+
+The view metadata or reimport configuration identifies:
+
+* source sheet
+* locale
+* resource type, if sheet-specific
+* context columns
+* helper columns
+* canonical output frame
+
+==== Step 2: Strip Helper Columns
+
+Only the resource key and context columns are authoritative for text values.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: Labels_DE
+  output: labels_de_payload
+  columns: [resource_key, default, product_a, product_b]
+----
+
+Helper columns such as `description` or `resource_type` can be checked against
+the canonical `resources` table, but they should not silently patch canonical
+resource metadata unless configured as editable.
+
+==== Step 3: Expand Context Matrix Back To Tuples
+
+[source,yaml]
+----
+- step: expand_xref
+  matrix: labels_de_payload
+  output: localized_resource_values_de
+  row_keys: [resource_key]
+  value_columns: [default, product_a, product_b]
+  column_key: context_id
+  value: text
+  drop_empty: false
+----
+
+Then add the locale value:
+
+[source,yaml]
+----
+- step: add_constant_columns
+  source: localized_resource_values_de
+  output: localized_resource_values_de_with_locale
+  values:
+    locale: de
+----
+
+If the view is resource-type specific, the reimport path may also validate that
+all resource keys belong to that type.
+
+==== Step 4: Apply Fallback/Override Policy
+
+Before writing canonical tuples, normalize empty cells and overrides.
+
+Potential policies:
+
+* `empty_means_missing_override`: empty non-default context cells delete or omit
+  override tuples
+* `empty_means_empty_text`: empty cells are retained as explicit empty text
+* `default_required`: default context text must be non-empty
+* `override_same_as_default`: either keep explicitly or collapse to default
+
+This policy should be explicit in configuration.
+
+==== Step 5: Merge Locale Frames
+
+All locale-specific frames are merged back into one canonical relation.
+
+[source,text]
+----
+localized_resource_values_de_with_locale
+localized_resource_values_en_with_locale
+localized_resource_values_fr_with_locale
+-> localized_resource_values
+----
+
+The merge is append-like, followed by uniqueness validation over
+`(resource_key, locale, context_id)`.
+
+==== Step 6: Validate Reimported Resources
+
+After recomposition, run standard validations again.
+
+Additional localized-resource validations may include:
+
+* every required resource has a default text for every required locale
+* every override references an existing context
+* no duplicate tuple exists
+* no forbidden empty text exists under the configured policy
+* no sheet introduced an unknown context column unless configured
+
+==== Step 7: Write Target Resource Files
+
+Canonical tuples can be written to target artifacts.
+
+Examples:
+
+[source,text]
+----
+field_de.properties
+field_en.properties
+error_de.properties
+error_en.properties
+validation_de.properties
+validation_en.properties
+----
+
+The writer should be deterministic and should make the selected fallback
+materialization policy explicit.
+
+=== Generic Versus Consumer-Specific
+
+==== Generic
+
+The following belongs in core:
+
+* tuple representation for localized resource values
+* locale-based sheet split and merge
+* context-axis matrix projection and expansion
+* fallback/override policy mechanics
+* validation of keys, references, uniqueness, and required defaults
+* deterministic key-value or properties-style output
+* roundtrip preservation of workbook view metadata
+
+==== Consumer-Specific
+
+The following should stay in consumer configuration or plugins:
+
+* whether a specific text is linguistically correct
+* whether a product-specific term is professionally preferred
+* which exact resource keys the application expects
+* complex fallback order beyond configured axes, if it depends on application
+  semantics
+* special generation rules for proprietary resource formats
+
+=== FTR Gaps
+
+This use case needs three focused core FTRs:
+
+* localized resource matrix roundtrip
+* fallback and override semantics
+* deterministic key-value resource writer
+
+=== Rationale
+
+Localized resources are a strong fit for spreadsheet editing because they are
+small pieces of text with repeated axes: resource key, locale, and context.
+
+The normalized tuple model keeps the repository clean and testable. The
+workbook matrix keeps editing ergonomic. The explicit roundtrip contract keeps
+fallbacks, deletes, and empty texts from becoming accidental behavior.
