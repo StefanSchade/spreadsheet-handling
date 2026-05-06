@@ -1,0 +1,713 @@
+== Use Case: Business-Facing Calculation Configuration Workbook Roundtrip
+
+=== Status
+
+* Concept note
+* Derived from a prototype consumer discussion
+* Intended to clarify the generic modeling pattern before implementing the next
+  pre-beta core FTRs
+
+=== Purpose
+
+This note describes how a normalized configuration model can be presented as a
+business-facing workbook, edited there, and merged back into canonical source
+relations.
+
+The example is intentionally domain-neutral. It uses calculation variables,
+transaction types, role matrices, and calculation operations because those are a
+good stress test for spreadsheet roundtrips:
+
+* there are normalized entities
+* there are many-to-many relations
+* one relation is naturally editable as a crosstable
+* another relation looks more like a mapping from targets to operations
+* business users need readable workbook views rather than raw normalized tables
+
+The core library should support the mechanics: frames, projections, joins,
+crosstables, validations, rendering, and recomposition. It should not encode
+domain meaning such as which calculation operation is economically correct.
+
+=== Problem Statement
+
+A software system may own a declarative calculation configuration. Business
+users need to maintain parts of that configuration in a spreadsheet because the
+workbook is easier to review, filter, discuss, and edit than a set of YAML or
+JSON files.
+
+The data model has several layers:
+
+* variables exist independently of transaction types
+* transaction types describe business cases or products
+* variables can have different roles per transaction type, for example input,
+  output, blocked, helper, or not applicable
+* calculation operations describe callable calculation functions
+* calculation operations can produce one or more output variables
+* transaction types select or restrict which operations and targets are allowed
+
+A tempting workbook model is to put much of this into one large sheet. That is
+easy to inspect at first, but it makes the roundtrip ambiguous:
+
+* which columns are canonical and which are helper/context columns?
+* which cells are editable and which are derived?
+* does a missing row mean deletion, filtering, or simply not visible in that
+  view?
+* how are crosstable markers turned back into normalized relation rows?
+* what happens when two views edit the same canonical field differently?
+
+The preferred model is therefore not one magical sheet. It is a canonical set
+of normalized relations plus declarative workbook views over those relations.
+
+=== Canonical Representation
+
+The repository representation should stay normalized and explicit.
+
+==== Variables
+
+[source,text]
+----
+variables
+---------
+variable_id            primary key
+label                  business label
+component              owning or display component
+data_type              logical data type
+description            optional business text
+active                 optional lifecycle flag
+----
+
+`variables` is the master table for calculation variables. It should not encode
+transaction-specific role meaning directly.
+
+==== Transaction Types
+
+[source,text]
+----
+transaction_types
+-----------------
+transaction_type_id    primary key
+label                  business label
+group                  optional display group
+active                 optional lifecycle flag
+----
+
+`transaction_types` is the axis table used to describe business cases or
+products.
+
+==== Variable Roles Per Transaction Type
+
+[source,text]
+----
+variable_roles
+--------------
+variable_id            FK -> variables.variable_id
+transaction_type_id    FK -> transaction_types.transaction_type_id
+role_code              marker or code from a legend
+note                   optional explanation
+----
+
+This is the canonical relation behind a variable-by-transaction crosstable.
+
+Important constraints:
+
+* `variable_id` must reference `variables`
+* `transaction_type_id` must reference `transaction_types`
+* `(variable_id, transaction_type_id)` should usually be unique
+* `role_code` should be validated against a configured legend
+
+==== Calculation Operations
+
+[source,text]
+----
+calculation_operations
+----------------------
+operation_id           primary key
+label                  business label
+function_name          implementation or routing identifier
+direction              forward, backward, or other configured category
+endpoint               optional technical endpoint or adapter hint
+----
+
+This table describes the callable operations. It should not itself decide when
+an operation is valid for a transaction type.
+
+==== Operation Outputs
+
+[source,text]
+----
+operation_outputs
+-----------------
+operation_id           FK -> calculation_operations.operation_id
+variable_id            FK -> variables.variable_id
+----
+
+This relation captures the one-to-many relation between an operation and the
+variables it can produce.
+
+Important constraints:
+
+* `operation_id` must reference `calculation_operations`
+* `variable_id` must reference `variables`
+* `(operation_id, variable_id)` should usually be unique
+
+==== Transaction Operation Availability
+
+[source,text]
+----
+transaction_calculation_operations
+----------------------------------
+transaction_type_id    FK -> transaction_types.transaction_type_id
+operation_id           FK -> calculation_operations.operation_id
+direction              optional selection category
+default_order          optional ordering or defaulting hint
+----
+
+This relation says which operations are available for which transaction types.
+It may be enough for simple models. More complex models may need a target-level
+relation as well.
+
+==== Calculation Targets
+
+[source,text]
+----
+calculation_targets
+-------------------
+transaction_type_id          FK -> transaction_types.transaction_type_id
+target_variable_id           FK -> variables.variable_id
+operation_id                 FK -> calculation_operations.operation_id
+primary_target_variable_id   optional FK -> variables.variable_id
+secondary_target_variable_id optional FK -> variables.variable_id
+----
+
+This relation answers a more specific question:
+
+For this transaction type and desired target variable, which operation should
+be used, and which additional target variables steer the call?
+
+The exact columns are domain-dependent, but the shape is generic: relation rows
+connect transaction types, variables, and operations.
+
+=== Generic Core Building Blocks
+
+The following core features are useful for this model:
+
+* `contract_compact_multiaxis`: turn `variable_roles` into a compact editable
+  matrix
+* `expand_compact_multiaxis`: turn the edited matrix back into relation rows
+* generic frame extraction: select, rename, filter, and sort frames
+* simple join views: combine entity tables with tuple relations for display
+* standard reference validations: primary keys, foreign keys, uniqueness, and
+  duplicate relation tuples
+* helper-column metadata: mark context columns as derived
+* editable/read-only metadata: decide which view columns may patch canonical
+  data on reimport
+* declarative workbook views: choose visible sheets, names, order, and view
+  metadata
+* workbook-view recomposition: map edited views back to canonical frames
+
+Domain-specific plugins remain useful for business rules that interpret marker
+meaning or calculation semantics.
+
+=== Forward Path To The Business-Facing Workbook
+
+The forward path starts with canonical frames and derives workbook views.
+
+==== Step 1: Validate Canonical Sources
+
+Before rendering, run model-neutral integrity validations.
+
+[source,yaml]
+----
+- step: validate_references
+  mode: fail
+  rules:
+    - type: primary_key
+      frame: variables
+      columns: [variable_id]
+    - type: primary_key
+      frame: transaction_types
+      columns: [transaction_type_id]
+    - type: primary_key
+      frame: calculation_operations
+      columns: [operation_id]
+    - type: foreign_key
+      frame: variable_roles
+      columns: [variable_id]
+      target: variables
+      target_columns: [variable_id]
+    - type: foreign_key
+      frame: variable_roles
+      columns: [transaction_type_id]
+      target: transaction_types
+      target_columns: [transaction_type_id]
+    - type: unique_reference
+      frame: variable_roles
+      columns: [variable_id, transaction_type_id]
+----
+
+These checks do not decide whether a role is economically valid. They only
+ensure that relation mechanics are sound.
+
+==== Step 2: Build The Variable Role Matrix
+
+The canonical tuple relation can be rendered as a crosstable.
+
+[source,yaml]
+----
+- step: contract_compact_multiaxis
+  relation: variable_roles
+  output: variable_role_matrix_raw
+  row_keys: [variable_id]
+  column_key: transaction_type_id
+  code: role_code
+  column_keys: [type_a, type_b, type_c]
+  fill_value: ""
+  allowed_from_legend: variable_role_codes
+  name: variable_role_matrix
+----
+
+The result is still a frame. It is not yet the final visible sheet.
+
+==== Step 3: Add Context Columns
+
+Business users usually need labels and components next to opaque keys.
+
+[source,yaml]
+----
+- step: add_lookup_helpers
+  source: variable_role_matrix_raw
+  lookup: variables
+  output: variable_role_matrix
+  key: variable_id
+  helpers:
+    fields: [label, component, data_type]
+    allowed: [label, component, data_type, description]
+  order:
+    helper_position: before_key
+    sort_by: [component, variable_id]
+  missing: fail
+----
+
+Those helper columns are derived context. They should be marked as helper or
+read-only columns by metadata.
+
+==== Step 4: Derive Operation Views
+
+Some views are simple projections:
+
+[source,yaml]
+----
+- step: extract_frame
+  source: calculation_operations
+  output: visible_calculation_operations
+  columns: [operation_id, label, function_name, direction]
+  sort_by: [direction, operation_id]
+----
+
+Some views need joins:
+
+[source,yaml]
+----
+- step: join_view
+  left: operation_outputs
+  right: variables
+  output: visible_operation_outputs
+  how: left
+  keys:
+    - left: variable_id
+      right: variable_id
+  columns:
+    left: [operation_id, variable_id]
+    right: [label, data_type]
+  sort_by: [operation_id, variable_id]
+----
+
+Some product-specific or axis-specific views may need tuple-driven filtering:
+
+[source,yaml]
+----
+- step: expand_compact_multiaxis
+  matrix: variable_role_matrix
+  output: variable_roles_for_view
+  row_keys: [variable_id]
+  column_key: transaction_type_id
+  code: role_code
+  allowed_from_legend: variable_role_codes
+
+- step: join_view
+  left: variables
+  right: variable_roles_for_view
+  output: output_variables_for_type_a
+  how: semi
+  keys:
+    - left: variable_id
+      right: variable_id
+  where:
+    all:
+      - column: transaction_type_id
+        equals: type_a
+      - column: role_code
+        equals: output
+----
+
+The marker `output` remains a configured value. Core does not interpret its
+business meaning.
+
+==== Step 5: Compose Workbook Views
+
+The final workbook should be declared as a set of visible views.
+
+[source,yaml]
+----
+- step: compose_workbook_views
+  views:
+    - frame: variables
+      sheet: Variables
+      editable: true
+      columns: [variable_id, label, component, data_type, description]
+    - frame: transaction_types
+      sheet: Transaction Types
+      editable: true
+    - frame: variable_role_matrix
+      sheet: Variable Roles Matrix
+      editable_columns: [type_a, type_b, type_c]
+      helper_columns: [label, component, data_type]
+    - frame: visible_calculation_operations
+      sheet: Calculation Operations
+      editable: true
+    - frame: visible_operation_outputs
+      sheet: Operation Outputs
+      editable_columns: [operation_id, variable_id]
+      helper_columns: [label, data_type]
+    - frame: calculation_targets
+      sheet: Calculation Targets
+      editable: true
+----
+
+This step records enough lifecycle and view metadata to support the reverse
+path.
+
+=== Business-Facing Workbook Representation
+
+The generated workbook should be understandable without exposing every
+normalized detail at once.
+
+==== Sheet: Variables
+
+Purpose:
+
+* maintain variable master data
+* provide labels, component grouping, and data types
+
+Typical columns:
+
+* `variable_id`
+* `label`
+* `component`
+* `data_type`
+* `description`
+
+This sheet is canonical master data. Edits may patch `variables`.
+
+==== Sheet: Transaction Types
+
+Purpose:
+
+* maintain the axis used in the role matrix
+
+Typical columns:
+
+* `transaction_type_id`
+* `label`
+* `group`
+* `active`
+
+This sheet is canonical master data. Edits may patch `transaction_types`.
+
+==== Sheet: Variable Roles Matrix
+
+Purpose:
+
+* edit the many-to-many relation between variables and transaction types
+* make per-transaction roles scannable as a matrix
+
+Typical columns:
+
+* helper/context columns: `label`, `component`, `data_type`
+* key column: `variable_id`
+* editable matrix columns: one column per transaction type
+
+Only the matrix role-code cells are authoritative for `variable_roles`. Helper
+columns are context. If a helper column changes, the reimport path should either
+ignore the change or report a conflict, depending on policy.
+
+==== Sheet: Calculation Operations
+
+Purpose:
+
+* maintain callable operation metadata
+
+Typical columns:
+
+* `operation_id`
+* `label`
+* `function_name`
+* `direction`
+
+This sheet patches `calculation_operations`.
+
+==== Sheet: Operation Outputs
+
+Purpose:
+
+* maintain the one-to-many relation from operations to produced variables
+* display variable labels as context
+
+Typical columns:
+
+* `operation_id`
+* `variable_id`
+* helper/context columns: `label`, `data_type`
+
+Only `operation_id` and `variable_id` are authoritative for
+`operation_outputs`.
+
+==== Sheet: Calculation Targets
+
+Purpose:
+
+* maintain which operation is used for a target variable in a transaction type
+* optionally maintain primary and secondary steering targets
+
+Typical columns:
+
+* `transaction_type_id`
+* `target_variable_id`
+* `operation_id`
+* `primary_target_variable_id`
+* `secondary_target_variable_id`
+
+This sheet is a canonical relation view. It should be validated heavily because
+it connects multiple entity tables.
+
+=== Reverse Path To Canonical Frames
+
+The reverse path reads the workbook, validates it, and recomposes canonical
+frames.
+
+==== Step 1: Read Workbook Frames
+
+The adapter reads visible sheets and workbook metadata.
+
+[source,text]
+----
+Workbook
+-> Variables
+-> Transaction Types
+-> Variable Roles Matrix
+-> Calculation Operations
+-> Operation Outputs
+-> Calculation Targets
+-> _meta
+----
+
+The metadata should identify which visible sheet maps to which canonical frame
+or recomposition step.
+
+==== Step 2: Validate Sheet Structure
+
+Before merging, validate that required columns are present.
+
+Examples:
+
+* `Variables` must contain `variable_id`
+* `Variable Roles Matrix` must contain `variable_id`
+* matrix columns must match configured transaction type columns or be explicitly
+  accepted as new axis columns
+* `Operation Outputs` must contain `operation_id` and `variable_id`
+
+Unsupported structural changes should fail early.
+
+==== Step 3: Recompose Master Tables
+
+Canonical master sheets can be patched directly by primary key.
+
+[source,text]
+----
+Variables           -> variables
+Transaction Types   -> transaction_types
+Calculation Ops     -> calculation_operations
+----
+
+Patch rules:
+
+* key columns identify rows
+* only declared editable columns are patched
+* missing rows in filtered views must not imply deletion
+* full canonical views may opt into deletion detection, but only explicitly
+
+==== Step 4: Recompose Matrix Relation
+
+The role matrix is converted back into tuples.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: Variable Roles Matrix
+  output: variable_role_matrix_payload
+  columns: [variable_id, type_a, type_b, type_c]
+
+- step: expand_compact_multiaxis
+  matrix: variable_role_matrix_payload
+  output: variable_roles
+  row_keys: [variable_id]
+  column_key: transaction_type_id
+  code: role_code
+  value_columns: [type_a, type_b, type_c]
+  allowed_from_legend: variable_role_codes
+  drop_empty: true
+----
+
+The helper columns are deliberately not part of the payload. They were only
+context.
+
+==== Step 5: Recompose Relation Sheets
+
+Relation sheets such as `Operation Outputs` can be recomposed by selecting only
+their authoritative columns.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: Operation Outputs
+  output: operation_outputs
+  columns: [operation_id, variable_id]
+
+- step: extract_frame
+  source: Calculation Targets
+  output: calculation_targets
+  columns:
+    - transaction_type_id
+    - target_variable_id
+    - operation_id
+    - primary_target_variable_id
+    - secondary_target_variable_id
+----
+
+Helper/context columns are either ignored or checked for consistency with their
+source tables.
+
+==== Step 6: Run Standard Validations Again
+
+After recomposition, run the same model-neutral validations as in the forward
+path.
+
+Additional checks may be useful:
+
+* no duplicate role tuple for `(variable_id, transaction_type_id)`
+* every `role_code` exists in the legend
+* every operation output references an existing operation and variable
+* every calculation target references existing transaction type, target
+  variable, and operation
+
+==== Step 7: Run Domain-Specific Validations
+
+Only after the generic integrity checks should a consumer-specific plugin
+interpret domain semantics.
+
+Examples:
+
+* a role code is not allowed for a specific transaction type
+* a calculation operation is not a valid route for a target variable
+* a secondary target is required only for some operation categories
+* two edited settings are individually valid but inconsistent together
+
+These rules depend on business meaning and should stay outside the generic core.
+
+==== Step 8: Write Canonical Repository Form
+
+Finally, write the normalized frames back to the repository representation.
+
+[source,text]
+----
+variables.json
+transaction_types.json
+variable_roles.json
+calculation_operations.json
+operation_outputs.json
+calculation_targets.json
+----
+
+If a consumer generates YAML or other configuration files from these canonical
+frames, that generation is a separate downstream step.
+
+=== Conflict Model
+
+The reverse path should fail or report findings for ambiguous edits.
+
+==== Helper Column Changed
+
+If a user changes `label` in `Variable Roles Matrix`, the system should not
+silently patch `variables.label` from that helper column.
+
+Possible policies:
+
+* ignore helper edits
+* warn with a findings frame
+* fail if helper values differ from canonical source values
+
+The first robust default is `warn` or `fail`, not silent merge.
+
+==== Same Canonical Field Edited In Multiple Views
+
+If a canonical field appears editable in multiple workbook views, both views
+may propose different values.
+
+The system should either:
+
+* prohibit overlapping editable columns by configuration
+* require a clear precedence rule
+* fail on conflict
+
+The safest first slice is to fail on conflict.
+
+==== Filtered View Missing Rows
+
+A filtered view is not the whole table. Missing rows in that view must not
+delete canonical rows.
+
+Deletion semantics require an explicit full-table view or an explicit delete
+marker.
+
+==== Tuple Relation Changed By Matrix
+
+When a matrix cell is changed, the canonical relation changes by tuple:
+
+* empty cell may mean no relation row
+* non-empty cell may create or update a relation row
+* duplicate tuple rows after recomposition are invalid
+
+This is mechanical and can be handled generically.
+
+=== Open Design Questions
+
+* Should the core support row deletion markers, or leave deletion to consumer
+  policy?
+* Should helper/context mismatches default to `warn` or `fail`?
+* How should new axis columns in a matrix be handled?
+* Should view recomposition support partial patch output and full replacement
+  output as separate modes?
+* How much lifecycle metadata should be persisted in `_meta` versus supplied by
+  pipeline configuration?
+
+=== Rationale
+
+This modeling pattern keeps the dependency direction clean:
+
+* the core library provides generic spreadsheet mechanics
+* consumer repositories define their model and business rules
+* workbook views are a presentation and editing layer over canonical frames
+* roundtrip recomposition is explicit rather than inferred from sheet layout
+
+The result is less magical than a large hand-shaped workbook, but it is much
+safer. Business users still get a workbook that fits their mental model, while
+the repository keeps a normalized, testable, and mergeable representation.
