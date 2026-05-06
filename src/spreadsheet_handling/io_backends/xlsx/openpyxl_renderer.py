@@ -21,6 +21,7 @@ from spreadsheet_handling.rendering.plan import (
     ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
+    SetColumnWidth,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -252,6 +253,11 @@ def _render_from_plan(plan: RenderPlan, out_path: Path) -> None:
         if isinstance(op, SetFreeze):
             ws = _get_ws(wb, op.sheet)
             ws.freeze_panes = f"{get_column_letter(op.col)}{op.row}"
+            continue
+
+        if isinstance(op, SetColumnWidth):
+            ws = _get_ws(wb, op.sheet)
+            ws.column_dimensions[get_column_letter(op.col)].width = op.width
             continue
 
         if isinstance(op, SetAutoFilter):

@@ -1,7 +1,16 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from typing import List, Any
 from .ir import WorkbookIR, SheetIR, TableBlock
-from .passes.core import IRPass, StylePass, FilterPass, FreezePass, ValidationPass, MetaPass, NamedRangePass
+from .passes.core import (
+    IRPass,
+    StylePass,
+    FilterPass,
+    FreezePass,
+    ColumnWidthPass,
+    ValidationPass,
+    MetaPass,
+    NamedRangePass,
+)
 from .plan import (
     RenderPlan,
     DefineSheet,
@@ -11,6 +20,7 @@ from .plan import (
     ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
+    SetColumnWidth,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -30,6 +40,59 @@ def _header_grid_for_table(sh: SheetIR, table: TableBlock, table_index: int) -> 
     if header_grid and table.header_rows >= 1:
         return header_grid
     return None
+
+
+def _sheet_column_extent(sh: SheetIR) -> int:
+    return max(
+        (table.left + table.n_cols - 1 for table in sh.tables if table.n_cols > 0),
+        default=0,
+    )
+
+
+def _column_key_to_index(key: Any) -> int | None:
+    if isinstance(key, int):
+        return key if key > 0 else None
+
+    text = str(key).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        idx = int(text)
+        return idx if idx > 0 else None
+    if not text.isalpha():
+        return None
+
+    idx = 0
+    for char in text.upper():
+        idx = idx * 26 + (ord(char) - ord("A") + 1)
+    return idx if idx > 0 else None
+
+
+def _column_width_value(spec: Any) -> float | None:
+    raw = spec.get("width") if isinstance(spec, dict) else spec
+    try:
+        width = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return width if width > 0 else None
+
+
+def _column_width_ops(sheet_name: str, sh: SheetIR) -> list[SetColumnWidth]:
+    raw = sh.meta.get("__column_widths")
+    if not isinstance(raw, dict):
+        return []
+
+    max_col = _sheet_column_extent(sh)
+    ops: list[SetColumnWidth] = []
+    for key, spec in raw.items():
+        col = _column_key_to_index(key)
+        width = _column_width_value(spec)
+        if col is None or width is None:
+            continue
+        if max_col and col > max_col:
+            continue
+        ops.append(SetColumnWidth(sheet=sheet_name, col=col, width=width))
+    return sorted(ops, key=lambda op: op.col)
 
 
 def build_render_plan(doc: WorkbookIR) -> RenderPlan:
@@ -98,6 +161,9 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
         if fz:
             plan.add(SetFreeze(sheet=sheet_name, row=int(fz["row"]), col=int(fz["col"])))
 
+        for op in _column_width_ops(sheet_name, sh):
+            plan.add(op)
+
         # Helper column highlighting
         hc = sh.meta.get("__helper_cols")
         if hc and sh.tables:
@@ -138,4 +204,12 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     return plan
 
 def default_p1_passes() -> List[IRPass]:
-    return [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass(), NamedRangePass()]
+    return [
+        MetaPass(),
+        ValidationPass(),
+        StylePass(),
+        FilterPass(),
+        FreezePass(),
+        ColumnWidthPass(),
+        NamedRangePass(),
+    ]

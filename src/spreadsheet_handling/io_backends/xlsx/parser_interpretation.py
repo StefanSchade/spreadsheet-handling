@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Spreadsheet-semantic worksheet interpretation for the XLSX read path."""
+
+from __future__ import annotations
 
 from typing import Any, Mapping
 
@@ -89,6 +89,10 @@ def build_visible_sheet_ir(
 
     if autofilter_ref:
         sh.meta["__autofilter_ref"] = autofilter_ref
+
+    column_widths = meta_hints.get("column_widths")
+    if column_widths:
+        sh.meta["__column_widths"] = column_widths
 
     return sh
 

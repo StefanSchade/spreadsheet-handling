@@ -69,6 +69,7 @@ def test_meta_registry_seeds_current_known_entries():
         "sparse_defaults",
         "freeze_header",
         "auto_filter",
+        "column_widths",
         "header_fill_rgb",
         "helper_fill_rgb",
         "helper_prefix",

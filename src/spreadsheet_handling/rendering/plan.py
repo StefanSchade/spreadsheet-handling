@@ -50,6 +50,12 @@ class SetFreeze:
     col: int
 
 @dataclass(frozen=True)
+class SetColumnWidth:
+    sheet: str
+    col: int
+    width: float
+
+@dataclass(frozen=True)
 class AddValidation:
     sheet: str
     kind: str  # spreadsheet-neutral validation kind, e.g. "list"
@@ -102,6 +108,7 @@ RenderOp = Union[
     ApplyColumnStyle,
     SetAutoFilter,
     SetFreeze,
+    SetColumnWidth,
     AddValidation,
     WriteDataBlock,
     WriteMeta,

@@ -1,5 +1,16 @@
-from . import meta_pass, validation_pass, style_pass
-from .core import StylePass, FilterPass, FreezePass, ValidationPass, MetaPass, NamedRangePass, IRPass
+from . import meta_pass as meta_pass
+from . import style_pass as style_pass
+from . import validation_pass as validation_pass
+from .core import (
+    StylePass,
+    FilterPass,
+    FreezePass,
+    ColumnWidthPass,
+    ValidationPass,
+    MetaPass,
+    NamedRangePass,
+    IRPass,
+)
 from ..ir import WorkbookIR
 
 def apply_all(ir: WorkbookIR, meta: dict) -> WorkbookIR:
@@ -19,7 +30,15 @@ def apply_all(ir: WorkbookIR, meta: dict) -> WorkbookIR:
         if 'workbook_meta_blob' not in meta_sheet.meta:
             meta_sheet.meta['workbook_meta_blob'] = meta
 
-    passes: list[IRPass] = [MetaPass(), ValidationPass(), StylePass(), FilterPass(), FreezePass(), NamedRangePass()]
+    passes: list[IRPass] = [
+        MetaPass(),
+        ValidationPass(),
+        StylePass(),
+        FilterPass(),
+        FreezePass(),
+        ColumnWidthPass(),
+        NamedRangePass(),
+    ]
     for p in passes:
         ir = p.apply(ir)
     return ir

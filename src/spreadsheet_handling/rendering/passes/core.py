@@ -86,6 +86,17 @@ class FreezePass:
         return doc
 
 
+@dataclass
+class ColumnWidthPass:
+    def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        for sh in doc.sheets.values():
+            opts: Dict[str, Any] = sh.meta.get("options", {})
+            widths = opts.get("column_widths") or opts.get("__column_widths")
+            if widths:
+                sh.meta["__column_widths"] = widths
+        return doc
+
+
 def _workbook_meta(doc: WorkbookIR) -> dict[str, Any]:
     meta_sheet: Optional[SheetIR] = doc.hidden_sheets.get("_meta")
     if not meta_sheet:
