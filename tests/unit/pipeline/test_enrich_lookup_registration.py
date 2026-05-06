@@ -6,13 +6,13 @@ import textwrap
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.pipeline import (
+from spreadsheet_handling.pipeline.registry import (
     REGISTRY,
-    StepRegistration,
     build_steps_from_config,
     build_steps_from_yaml,
     run_pipeline,
 )
+from spreadsheet_handling.pipeline.types import StepRegistration
 
 
 pytestmark = [

@@ -7,12 +7,12 @@ import pytest
 import yaml
 
 from spreadsheet_handling.domain.structured_yaml import write_structured_yaml
-from spreadsheet_handling.pipeline.pipeline import (
+from spreadsheet_handling.pipeline.registry import (
     REGISTRY,
-    StepRegistration,
     build_steps_from_config,
     run_pipeline,
 )
+from spreadsheet_handling.pipeline.types import StepRegistration
 
 pytestmark = pytest.mark.ftr("FTR-STRUCTURED-YAML-WRITER-P4")
 

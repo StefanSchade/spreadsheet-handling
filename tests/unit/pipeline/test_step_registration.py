@@ -3,12 +3,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.pipeline import (
+from spreadsheet_handling.pipeline.registry import (
     REGISTRY,
-    StepRegistration,
     build_steps_from_config,
     run_pipeline,
 )
+from spreadsheet_handling.pipeline.types import StepRegistration
 
 RENAMED_PIPELINE_STEPS = {
     "apply_fks": "add_fk_helpers",

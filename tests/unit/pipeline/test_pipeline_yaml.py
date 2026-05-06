@@ -2,7 +2,7 @@ import io
 import textwrap
 import yaml
 import pandas as pd
-from spreadsheet_handling.pipeline.pipeline import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
 
 def make_frames():
     A = pd.DataFrame({"id": ["1", "2"], "name": ["Alpha", "Beta"]})

@@ -45,7 +45,8 @@ class TestPackDefaultPipeline:
 
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
             from spreadsheet_handling.cli.apps.sheets_pack import main
-            main([str(in_dir), "-o", str(out)])
+            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+                main([str(in_dir), "-o", str(out)])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is not None
@@ -59,7 +60,8 @@ class TestPackDefaultPipeline:
 
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
             from spreadsheet_handling.cli.apps.sheets_pack import main
-            main([str(in_dir), "-o", str(out), "--no-defaults"])
+            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+                main([str(in_dir), "-o", str(out), "--no-defaults"])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is None
@@ -74,7 +76,8 @@ class TestPackDefaultPipeline:
 
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
             from spreadsheet_handling.cli.apps.sheets_pack import main
-            main([str(in_dir), "-o", str(out), "--config", str(cfg)])
+            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+                main([str(in_dir), "-o", str(out), "--config", str(cfg)])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is not None
@@ -91,7 +94,8 @@ class TestUnpackBackwardCompat:
 
         with patch("spreadsheet_handling.cli.apps.sheets_unpack.orchestrate") as mock:
             from spreadsheet_handling.cli.apps.sheets_unpack import main
-            main([str(wb), "-o", str(out)])
+            with pytest.warns(DeprecationWarning, match="sheets-unpack is deprecated"):
+                main([str(wb), "-o", str(out)])
 
         kw = mock.call_args.kwargs
         assert "steps" not in kw or kw.get("steps") is None
@@ -108,7 +112,8 @@ class TestPackEndToEnd:
         out = tmp_path / "out.xlsx"
         _write_json_dir(in_dir, SAMPLE)
 
-        main([str(in_dir), "-o", str(out)])
+        with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+            main([str(in_dir), "-o", str(out)])
 
         wb = load_workbook(out)
         ws = wb["products"]

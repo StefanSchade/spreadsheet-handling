@@ -42,7 +42,8 @@ class TestSheetsPack:
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_pack import main
 
-            rc = main([str(in_dir), "-o", str(out_file)])
+            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+                rc = main([str(in_dir), "-o", str(out_file)])
 
         assert rc == 0
         mock_orch.assert_called_once()
@@ -58,7 +59,8 @@ class TestSheetsPack:
         with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_pack import main
 
-            main([str(in_dir), "-o", str(out_file), "--input-kind", "csv_dir"])
+            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
+                main([str(in_dir), "-o", str(out_file), "--input-kind", "csv_dir"])
 
         call_kw = mock_orch.call_args.kwargs
         assert call_kw["input"]["kind"] == "csv_dir"
@@ -74,7 +76,8 @@ class TestSheetsUnpack:
         with patch("spreadsheet_handling.cli.apps.sheets_unpack.orchestrate") as mock_orch:
             from spreadsheet_handling.cli.apps.sheets_unpack import main
 
-            rc = main([str(wb), "-o", str(out_dir)])
+            with pytest.warns(DeprecationWarning, match="sheets-unpack is deprecated"):
+                rc = main([str(wb), "-o", str(out_dir)])
 
         assert rc == 0
         mock_orch.assert_called_once()

@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.pipeline import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-TEST-HARNESS")
 
@@ -25,7 +25,7 @@ def test_dotted_path_step(tmp_path: Path, monkeypatch):
 
             # minimal BoundStep-compatible factory
             def make_keep_columns_step(*, table: str, columns: list[str], name: str = "keep_columns"):
-                from spreadsheet_handling.pipeline.pipeline import BoundStep
+                from spreadsheet_handling.pipeline.types import BoundStep
                 Frames = dict[str, pd.DataFrame]
                 cfg = {"table": table, "columns": columns}
 

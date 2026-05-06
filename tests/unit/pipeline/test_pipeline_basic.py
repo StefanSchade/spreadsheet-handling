@@ -1,11 +1,13 @@
 import pandas as pd
 
-from spreadsheet_handling.pipeline.pipeline import (
+from spreadsheet_handling.pipeline.registry import (
+    build_steps_from_config,
     run_pipeline,
+)
+from spreadsheet_handling.pipeline.steps import (
     make_validate_step,
     make_apply_fks_step,
     make_drop_helpers_step,
-    build_steps_from_config,
 )
 
 # Helpers to build tiny frames

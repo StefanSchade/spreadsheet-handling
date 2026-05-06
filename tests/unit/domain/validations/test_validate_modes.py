@@ -7,10 +7,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.pipeline import (
-    make_validate_step,
-    run_pipeline,
-)
+from spreadsheet_handling.pipeline.registry import run_pipeline
+from spreadsheet_handling.pipeline.steps import make_validate_step
 
 
 def _frames_with_duplicate_ids():
@@ -86,7 +84,7 @@ class TestDetectFkToggle:
             "Ziel": pd.DataFrame([{"id": 1, "name": "Alpha"}]),
             "Q": pd.DataFrame([{"id_(Ziel)": 1}]),
         }
-        from spreadsheet_handling.pipeline.pipeline import make_apply_fks_step
+        from spreadsheet_handling.pipeline.steps import make_apply_fks_step
         step = make_apply_fks_step(defaults={**DEFAULTS, "detect_fk": False})
         out = run_pipeline(frames, [step])
         # no helper columns should have been added

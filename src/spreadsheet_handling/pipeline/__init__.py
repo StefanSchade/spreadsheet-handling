@@ -1,23 +1,14 @@
-# src/spreadsheet_handling/pipeline/__init__.py
-
-from .pipeline import (  # existing re-exports
-    BoundStep,
-    Step,
-    StepRegistration,
-    run_pipeline,
-    build_steps_from_config,
-    build_steps_from_yaml,
+from .config import AppConfig, load_app_config
+from .registry import REGISTRY, build_steps_from_config, build_steps_from_yaml, run_pipeline
+from .steps import (
+    make_apply_fks_step,
+    make_apply_overrides_step,
+    make_bootstrap_meta_step,
+    make_drop_helpers_step,
     make_identity_step,
     make_validate_step,
-    make_apply_fks_step,
-    make_drop_helpers_step,
-    make_bootstrap_meta_step,
-    make_apply_overrides_step,
-    REGISTRY,
 )
-
-# NEW: re-export config API
-from .config import load_app_config, AppConfig  # add others if you like
+from .types import BoundStep, Step, StepRegistration
 
 __all__ = [
     "BoundStep",
@@ -33,7 +24,6 @@ __all__ = [
     "make_bootstrap_meta_step",
     "make_apply_overrides_step",
     "REGISTRY",
-    # NEW
     "load_app_config",
     "AppConfig",
 ]

@@ -1,11 +1,10 @@
 from __future__ import annotations
 import argparse
+import warnings
 
 from spreadsheet_handling.application.orchestrator import orchestrate
-from spreadsheet_handling.pipeline.pipeline import (
-    make_bootstrap_meta_step,
-    build_steps_from_yaml,
-)
+from spreadsheet_handling.pipeline.registry import build_steps_from_yaml
+from spreadsheet_handling.pipeline.steps import make_bootstrap_meta_step
 
 
 _PACK_DEFAULT_STEPS = [
@@ -16,7 +15,10 @@ _PACK_DEFAULT_STEPS = [
 
 
 def _args(argv: list[str] | None = None):
-    p = argparse.ArgumentParser(prog="sheets-pack", description="JSON/CSV -> XLSX")
+    p = argparse.ArgumentParser(
+        prog="sheets-pack",
+        description="Deprecated legacy shim: JSON/CSV -> XLSX. Prefer sheets-run for maintained workflows.",
+    )
     p.add_argument("input_dir", help="Directory with .json or .csv")
     p.add_argument("-o", "--output", required=True, help="Output .xlsx file")
     p.add_argument("--input-kind", default="json", choices=["json", "json_dir", "csv_dir"])
@@ -26,6 +28,11 @@ def _args(argv: list[str] | None = None):
 
 
 def main(argv: list[str] | None = None) -> int:
+    warnings.warn(
+        "sheets-pack is deprecated; prefer sheets-run or treat this command as a legacy example shim.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     a = _args(argv)
 
     if a.config:

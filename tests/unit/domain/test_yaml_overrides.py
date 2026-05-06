@@ -6,12 +6,12 @@ import pytest
 import yaml
 
 from spreadsheet_handling.domain.yaml_overrides import load_overrides, apply_overrides
-from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta, _deep_merge
-from spreadsheet_handling.pipeline.pipeline import (
-    make_apply_overrides_step,
-    build_steps_from_config,
+from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
+from spreadsheet_handling.pipeline.registry import (
     REGISTRY,
+    build_steps_from_config,
 )
+from spreadsheet_handling.pipeline.steps import make_apply_overrides_step
 
 pytestmark = pytest.mark.ftr("FTR-YAML-OVERRIDES")
 
