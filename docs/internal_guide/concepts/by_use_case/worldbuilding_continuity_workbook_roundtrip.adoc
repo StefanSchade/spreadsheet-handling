@@ -1,0 +1,397 @@
+== Use Case: Worldbuilding Continuity Workbook Roundtrip
+
+=== Status
+
+* Concept note
+* Reconnects the original storytelling/worldbuilding motivation with the
+  current generic transformation model
+* Intended as a future demo/documentation use case rather than a domain-specific
+  core feature
+
+=== Purpose
+
+This note describes how story-world continuity data can be maintained in a
+spreadsheet without hard-coding storytelling concepts into the core library.
+
+The motivating example is a series of dinosaur stories where characters,
+species, story episodes, themes, strengths, weaknesses, and character arcs need
+to stay consistent over time. The same mechanics also apply to any continuity
+workbook for serial fiction, games, tabletop campaigns, or long-running content
+planning.
+
+The core library should support the mechanics:
+
+* normalized canonical relations
+* matrix views for editing across stories or timeline points
+* free-text cells as opaque values
+* optional code/legend validation for controlled fields
+* helper columns for readable names and context
+* roundtrip recomposition back into canonical tuples
+
+It should not decide whether a character arc is narratively good.
+
+=== Problem Statement
+
+Continuity data is naturally relational, but authors often want to inspect it
+as a grid:
+
+* one row per character
+* one column per story episode
+* cells describing the role, development, theme, strength, weakness, or notable
+  event for that character in that story
+
+That spreadsheet layout is easy to review. It answers questions like:
+
+* Where was this character last seen?
+* Did a weakness already improve in an earlier story?
+* Which story introduced a theme?
+* Who had a main role versus a side role?
+* Does the timeline contradict itself?
+
+The repository representation should still stay normalized. A workbook view
+may split or pivot the data, but identity should remain explicit in canonical
+keys such as `character_id`, `story_id`, and `aspect`.
+
+=== Canonical Representation
+
+==== Characters
+
+[source,text]
+----
+characters
+----------
+character_id          primary key
+name                  display name
+species_id            optional FK -> species.species_id
+first_story_id        optional FK -> stories.story_id
+description           optional maintainer text
+active                optional lifecycle flag
+----
+
+==== Stories
+
+[source,text]
+----
+stories
+-------
+story_id              primary key
+title                 display title
+sequence_no           timeline or publication order
+arc_id                optional FK -> story_arcs.arc_id
+status                draft | planned | written | reviewed
+----
+
+==== Continuity Aspects
+
+[source,text]
+----
+continuity_aspects
+------------------
+aspect_id             primary key, for example role, strength, weakness, arc_note
+label                 display label
+value_kind            free_text | code | multi_token
+legend_id             optional FK for coded values
+sort_key              display order
+----
+
+==== Character Story Values
+
+[source,text]
+----
+character_story_values
+----------------------
+character_id          FK -> characters.character_id
+story_id              FK -> stories.story_id
+aspect_id             FK -> continuity_aspects.aspect_id
+value                 free text, code, or compact token string
+comment               optional maintainer note
+----
+
+Important constraints:
+
+* `character_id` must reference `characters`
+* `story_id` must reference `stories`
+* `aspect_id` must reference `continuity_aspects`
+* `(character_id, story_id, aspect_id)` should usually be unique
+* coded aspects should be validated against their configured legend
+
+=== Forward Path To The Workbook
+
+==== Step 1: Validate Canonical Sources
+
+Generic reference validation protects the relational shape before rendering.
+
+[source,yaml]
+----
+- step: validate_references
+  mode: fail
+  rules:
+    - type: primary_key
+      frame: characters
+      columns: [character_id]
+    - type: primary_key
+      frame: stories
+      columns: [story_id]
+    - type: primary_key
+      frame: continuity_aspects
+      columns: [aspect_id]
+    - type: foreign_key
+      frame: character_story_values
+      columns: [character_id]
+      target: characters
+      target_columns: [character_id]
+    - type: foreign_key
+      frame: character_story_values
+      columns: [story_id]
+      target: stories
+      target_columns: [story_id]
+    - type: foreign_key
+      frame: character_story_values
+      columns: [aspect_id]
+      target: continuity_aspects
+      target_columns: [aspect_id]
+    - type: unique_reference
+      frame: character_story_values
+      columns: [character_id, story_id, aspect_id]
+----
+
+These checks do not interpret the story. They only make sure the continuity
+tables are mechanically coherent.
+
+==== Step 2: Extract An Aspect View
+
+A workbook can expose one sheet per aspect.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: character_story_values
+  output: character_role_values
+  where:
+    column: aspect_id
+    equals: role
+----
+
+==== Step 3: Contract Story Values Into A Matrix
+
+For free text or one-value cells, plain xref is the right primitive. The cell
+payload is opaque to the core library.
+
+[source,yaml]
+----
+- step: contract_xref
+  relation: character_role_values
+  output: character_roles_matrix_raw
+  row_keys: [character_id]
+  column_key: story_id
+  value: value
+  column_keys: [story_01, story_02, story_03]
+  fill_value: ""
+----
+
+The same shape can be used for strengths, weaknesses, thematic notes, or arc
+notes when each cell contains one free-text value.
+
+==== Step 4: Add Display Helpers
+
+Authors need names and context next to stable keys.
+
+[source,yaml]
+----
+- step: add_lookup_helpers
+  source: character_roles_matrix_raw
+  lookup: characters
+  output: character_roles_matrix
+  key: character_id
+  helpers:
+    fields: [name, species_id]
+  order:
+    helper_position: before_key
+    sort_by: [name]
+----
+
+Helper values are display context. They should not silently patch canonical
+character metadata on reimport unless explicitly configured as editable.
+
+==== Step 5: Use Compact Multiaxis Only For Structured Cell Codes
+
+If a cell needs several short coded facts, compact multiaxis can be useful.
+
+[source,text]
+----
+character_id | story_01        | story_02
+rex          | role=main;fear   | role=side;growth
+trixi        | role=side;clever | role=main;brave
+----
+
+This should be reserved for compact structured markers. Longer prose such as
+"learns that strength is not the same as being loud" should stay plain text in
+an xref matrix or move to a separate aspect.
+
+=== Business-Facing Workbook Representation
+
+A useful workbook might contain:
+
+[source,text]
+----
+Characters
+Stories
+Roles By Story
+Strengths By Story
+Weaknesses By Story
+Arc Notes By Story
+Themes By Story
+----
+
+Example matrix sheet:
+
+[source,text]
+----
+Roles By Story
+--------------
+name | species_id | character_id | story_01 | story_02 | story_03
+Rex  | t_rex      | rex          | main     | side     | 
+Trix | triceratops| trix         | side     | main     | main
+----
+
+For coded aspects such as role, legend validation can constrain allowed values
+such as `main`, `side`, `mentioned`, or empty. For prose aspects, validation
+should usually be structural only.
+
+=== Reverse Path To Canonical Frames
+
+==== Step 1: Read Workbook Views
+
+The adapter reads visible sheets and any workbook metadata.
+
+[source,text]
+----
+Workbook
+-> Characters
+-> Stories
+-> Roles By Story
+-> Strengths By Story
+-> Weaknesses By Story
+-> Arc Notes By Story
+-> _meta
+----
+
+The reimport path must know which visible sheet maps to which aspect. It should
+not infer identity from display labels alone.
+
+==== Step 2: Strip Helper Columns
+
+Only key columns and story columns are authoritative for the matrix relation.
+
+[source,yaml]
+----
+- step: extract_frame
+  source: Roles By Story
+  output: character_roles_payload
+  columns: [character_id, story_01, story_02, story_03]
+----
+
+==== Step 3: Expand Matrix Values Back To Tuples
+
+[source,yaml]
+----
+- step: expand_xref
+  matrix: character_roles_payload
+  output: character_role_values_raw
+  row_keys: [character_id]
+  column_key: story_id
+  value: value
+  value_columns: [story_01, story_02, story_03]
+  drop_empty: true
+----
+
+Then add the aspect identifier:
+
+[source,yaml]
+----
+- step: add_constant_columns
+  source: character_role_values_raw
+  output: character_role_values
+  values:
+    aspect_id: role
+----
+
+The same recomposition pattern applies to strengths, weaknesses, and arc notes.
+
+==== Step 4: Merge Aspect Relations
+
+All aspect-specific tuple frames append into `character_story_values`, followed
+by uniqueness and reference validation.
+
+[source,text]
+----
+character_role_values
+character_strength_values
+character_weakness_values
+character_arc_note_values
+-> character_story_values
+----
+
+==== Step 5: Validate Story Consistency
+
+Generic validations cover keys, references, uniqueness, and coded legends.
+
+Domain-specific story checks remain outside the core. Examples:
+
+* a character cannot have a main role in two simultaneous stories
+* a character must be introduced before being referenced
+* a weakness cannot be resolved before it appears
+* a theme should recur at least once after introduction
+
+Those checks are valuable, but their meaning belongs to the authoring model,
+not to the spreadsheet mechanics.
+
+=== Generic Versus Domain-Specific
+
+==== Generic
+
+The following belongs in core:
+
+* xref contraction and expansion for free text or codes
+* compact multiaxis for short structured cell markers
+* split-by-discriminator if locale, arc, or story phase becomes separate sheets
+* helper-column projection and protection metadata
+* declarative workbook views
+* standard reference and uniqueness validations
+* legend validation for controlled code aspects
+* workbook-view recomposition back to canonical tuples
+
+==== Domain-Specific
+
+The following should stay in configuration or plugins:
+
+* the meaning of a specific story role
+* whether a character arc is emotionally plausible
+* whether two plot events contradict each other
+* custom timeline or lore consistency rules
+* generated story or prose output
+
+=== FTR Coverage
+
+Most of the mechanics are already present or planned:
+
+* `FTR-XREF-CROSSTABLE` supports matrix/tuple roundtrips.
+* `FTR-COMPACT-MULTIAXIS` supports compact coded cell payloads.
+* `FTR-LEGEND-VALIDATION-LISTS-P4A` supports controlled cell values.
+* `FTR-GENERIC-FRAME-EXTRACTIONS-P4A` covers filtered aspect views.
+* `FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A` covers visible workbook composition.
+* `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A` covers the reverse view path.
+* `FTR-STANDARD-REFERENCE-VALIDATIONS-P4A` covers relational integrity.
+
+The main missing piece for future user adoption is not another transform. It is
+good documentation that explains which transform to choose and which parameters
+exist.
+
+=== Rationale
+
+Worldbuilding data is a useful design probe because it stresses the same
+roundtrip mechanics as professional configuration, but with more human prose.
+It proves that the transform model is not limited to short codes or technical
+identifiers: xref cells can carry opaque free text, while codes and compact
+tokens remain available when the editing problem benefits from them.
+
