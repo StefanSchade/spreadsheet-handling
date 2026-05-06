@@ -1,11 +1,12 @@
-from __future__ import annotations
-
 """Spreadsheet backend contract and narrow adapter-facing facade."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+from spreadsheet_handling.rendering.frame_selection import select_render_frames
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.ir import WorkbookIR
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
@@ -31,7 +32,8 @@ def build_spreadsheet_render_plan(
 ) -> RenderPlan:
     """Build the spreadsheet-generic ``RenderPlan`` from frames plus canonical meta."""
     meta_dict = dict(meta or {})
-    ir = compose_workbook(frames, meta_dict)
+    selected_frames = select_render_frames(frames, meta_dict)
+    ir = compose_workbook(selected_frames, meta_dict)
     apply_render_passes(ir, meta_dict)
     return build_render_plan(ir)
 

@@ -28,7 +28,6 @@ META_REGISTRY_PATH = (
 
 PIPELINE_ORCHESTRATION_PATHS = [
     REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "__init__.py",
-    REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "pipeline.py",
     REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "registry.py",
 ]
 
@@ -44,6 +43,7 @@ ALLOWED_PLUGIN_LIFECYCLE_MODES = {
     "plugin_or_caller_owned",
     "declared_lifecycle",
     "caller_owned_lifecycle",
+    "declared_lifecycle_or_caller_owned",
 }
 
 

@@ -53,6 +53,14 @@ def test_expand_compact_multiaxis_produces_generic_long_form_with_legend_group()
     ]
     assert "__compact_multiaxis_feature_product_codes_xref" not in out
     assert out["_meta"]["compact_multiaxis"]["feature_product_codes"]["drop_empty"] is True
+    lifecycle = out["_meta"]["frame_lifecycle"]
+    assert lifecycle["product_matrix"]["role"] == "canonical_source"
+    assert lifecycle["feature_product_codes"]["role"] == "editable_projection"
+    assert lifecycle["feature_product_codes"]["derived_from"] == ["product_matrix"]
+    assert lifecycle["feature_product_codes"]["produced_by"] == {
+        "step": "expand_compact_multiaxis",
+        "name": "feature_product_codes",
+    }
 
 
 def test_expand_compact_multiaxis_can_project_explicit_code_groups_without_legend() -> None:
@@ -137,6 +145,13 @@ def test_compact_multiaxis_whole_cell_roundtrip_can_preserve_empty_cells_when_co
         {"feature_id": "f1", "P-001": "E", "P-002": "E-R-K"},
         {"feature_id": "f2", "P-001": "S", "P-002": ""},
     ]
+    lifecycle = out["_meta"]["frame_lifecycle"]
+    assert lifecycle["product_matrix_roundtrip"]["role"] == "editable_projection"
+    assert lifecycle["product_matrix_roundtrip"]["derived_from"] == ["feature_product_codes"]
+    assert lifecycle["product_matrix_roundtrip"]["produced_by"] == {
+        "step": "contract_compact_multiaxis",
+        "name": "feature_product_codes",
+    }
 
 
 def test_compact_multiaxis_sparse_default_keeps_sparse_relations_sparse() -> None:

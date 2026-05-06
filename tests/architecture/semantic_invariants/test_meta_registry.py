@@ -73,6 +73,8 @@ def test_meta_registry_seeds_current_known_entries():
         "header_fill_rgb",
         "helper_fill_rgb",
         "helper_prefix",
+        "frame_lifecycle",
+        "workbook_view",
         "sheets",
         "workbook_meta_blob",
         "options",

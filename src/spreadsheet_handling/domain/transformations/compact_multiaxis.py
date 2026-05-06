@@ -11,6 +11,11 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain.frame_lifecycle import (
+    mark_source_if_unclassified,
+    write_frame_lifecycle,
+)
+
 from .cell_codec import decode_cell_values, encode_cell_values
 from .xref_crosstable import contract_xref, expand_xref
 
@@ -119,6 +124,7 @@ def expand_compact_multiaxis(
             ),
         },
     )
+    _write_expand_lifecycle(out, matrix=matrix, output=output, config_id=config_id)
     return out
 
 
@@ -208,6 +214,7 @@ def contract_compact_multiaxis(
             ),
         },
     )
+    _write_contract_lifecycle(out, relation=relation, output=output, config_id=config_id)
     return out
 
 
@@ -417,3 +424,45 @@ def _write_multiaxis_meta(
     configs[config_id] = payload
     meta[_META_KEY] = configs
     out["_meta"] = meta
+
+
+def _write_expand_lifecycle(
+    out: dict[str, Any],
+    *,
+    matrix: str,
+    output: str,
+    config_id: str,
+) -> None:
+    mark_source_if_unclassified(out, matrix)
+    write_frame_lifecycle(
+        out,
+        output,
+        role="editable_projection",
+        canonical=False,
+        editable=True,
+        render="visible_by_default",
+        derived_from=[matrix],
+        produced_by={"step": "expand_compact_multiaxis", "name": config_id},
+        consistency_policy={"on_conflict": "fail"},
+    )
+
+
+def _write_contract_lifecycle(
+    out: dict[str, Any],
+    *,
+    relation: str,
+    output: str,
+    config_id: str,
+) -> None:
+    mark_source_if_unclassified(out, relation)
+    write_frame_lifecycle(
+        out,
+        output,
+        role="editable_projection",
+        canonical=False,
+        editable=True,
+        render="visible_by_default",
+        derived_from=[relation],
+        produced_by={"step": "contract_compact_multiaxis", "name": config_id},
+        consistency_policy={"on_conflict": "fail"},
+    )
