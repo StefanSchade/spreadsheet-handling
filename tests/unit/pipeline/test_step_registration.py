@@ -209,6 +209,39 @@ def test_discriminator_split_steps_are_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-GENERIC-FRAME-EXTRACTIONS-P4A")
+def test_extract_frame_step_is_config_addressable() -> None:
+    frames = {
+        "variables": pd.DataFrame(
+            [
+                {"ID": "v2", "label": "Amount", "active": False},
+                {"ID": "v1", "label": "Rate", "active": True},
+            ]
+        )
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "extract_frame",
+                "source": "variables",
+                "output": "active_variables",
+                "columns": ["ID", "label"],
+                "where": {"column": "active", "equals": True},
+                "sort_by": ["ID"],
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["extract_frame"], StepRegistration)
+    assert steps[0].config["target"].endswith(":extract_frame")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["active_variables"].to_dict(orient="records") == [
+        {"ID": "v1", "label": "Rate"},
+    ]
+
+
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
         "matrix": pd.DataFrame(

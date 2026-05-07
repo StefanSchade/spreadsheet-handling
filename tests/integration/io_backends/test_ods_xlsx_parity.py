@@ -21,6 +21,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import (
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
+from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
 
 
 pytestmark = [
@@ -231,6 +232,42 @@ def test_multiheader_roundtrip_is_portable_across_xlsx_and_ods(tmp_path: Path) -
     pd.testing.assert_frame_equal(
         xlsx_back["Orders"],
         ods_back["Orders"],
+        check_dtype=False,
+    )
+    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+
+
+@pytest.mark.ftr("FTR-GENERIC-FRAME-EXTRACTIONS-P4A")
+def test_extracted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> None:
+    frames = extract_frame(
+        {
+            "Variables": pd.DataFrame(
+                [
+                    {"ID": "v2", "label": "Amount", "active": False},
+                    {"ID": "v1", "label": "Rate", "active": True},
+                ]
+            )
+        },
+        source="Variables",
+        output="VisibleVariables",
+        columns=["ID", "label"],
+        where={"column": "active", "equals": True},
+        sort_by=["ID"],
+    )
+
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="extracted-frame")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    pd.testing.assert_frame_equal(
+        xlsx_back["VisibleVariables"],
+        frames["VisibleVariables"],
+        check_dtype=False,
+    )
+    pd.testing.assert_frame_equal(
+        ods_back["VisibleVariables"],
+        frames["VisibleVariables"],
         check_dtype=False,
     )
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
