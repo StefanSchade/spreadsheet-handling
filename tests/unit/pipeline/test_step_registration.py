@@ -393,6 +393,28 @@ def test_join_frames_step_is_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
+def test_configure_workbook_view_step_is_config_addressable() -> None:
+    frames = {"variables_view": pd.DataFrame([{"variable_id": "v1"}])}
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "configure_workbook_view",
+                "sheets": [{"frame": "variables_view", "sheet": "Variables"}],
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["configure_workbook_view"], StepRegistration)
+    assert steps[0].config["target"].endswith(":configure_workbook_view")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["_meta"]["workbook_view"]["sheets"] == [
+        {"frame": "variables_view", "sheet": "Variables", "order": 0}
+    ]
+
+
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
         "matrix": pd.DataFrame(

@@ -22,6 +22,7 @@ from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
+from spreadsheet_handling.domain.workbook_views import configure_workbook_view
 from spreadsheet_handling.domain.transformations.join_views import join_frames
 from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
 
@@ -347,6 +348,56 @@ def test_joined_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> No
     pd.testing.assert_frame_equal(
         ods_back["VariableView"],
         frames["VariableView"],
+        check_dtype=False,
+    )
+    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+
+
+@pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
+def test_configured_workbook_view_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> None:
+    frames = configure_workbook_view(
+        {
+            "variables_view": pd.DataFrame(
+                [
+                    {"variable_id": "v1", "label": "Rate"},
+                ]
+            ),
+            "products_view": pd.DataFrame(
+                [
+                    {"product_id": "P-001", "label": "Annuity"},
+                ]
+            ),
+            "raw_variables": pd.DataFrame(
+                [
+                    {"variable_id": "v1"},
+                ]
+            ),
+        },
+        sheets=[
+            {"frame": "products_view", "sheet": "Products"},
+            {
+                "frame": "variables_view",
+                "sheet": "Variables",
+                "options": {"freeze_header": True},
+            },
+        ],
+    )
+
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="configured-workbook-view")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    assert _visible_sheet_names(xlsx_back) == ["Products", "Variables"]
+    assert _visible_sheet_names(ods_back) == ["Products", "Variables"]
+    pd.testing.assert_frame_equal(
+        xlsx_back["Products"],
+        frames["products_view"],
+        check_dtype=False,
+    )
+    pd.testing.assert_frame_equal(
+        ods_back["Variables"],
+        frames["variables_view"],
         check_dtype=False,
     )
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]

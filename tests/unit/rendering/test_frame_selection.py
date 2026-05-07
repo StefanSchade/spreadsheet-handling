@@ -6,7 +6,6 @@ import pytest
 from spreadsheet_handling.io_backends.spreadsheet_contract import build_spreadsheet_render_plan
 from spreadsheet_handling.rendering.frame_selection import select_render_frames
 
-
 pytestmark = pytest.mark.ftr("FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4")
 
 
@@ -114,3 +113,55 @@ def test_unknown_frame_policy_can_fail_unclassified_frames() -> None:
 
     with pytest.raises(ValueError, match="orders_raw"):
         select_render_frames(_frames_with_meta(meta), meta)
+
+
+@pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
+def test_configured_workbook_view_selects_orders_and_renames_sheets() -> None:
+    frames = {
+        "variables_view": pd.DataFrame({"id": [1]}),
+        "products_view": pd.DataFrame({"id": ["P-001"]}),
+        "raw_variables": pd.DataFrame({"id": [1]}),
+        "_meta": {},
+    }
+    meta = {
+        "workbook_view": {
+            "sheets": [
+                {"frame": "products_view", "sheet": "Products"},
+                {"frame": "variables_view", "sheet": "Variables"},
+            ]
+        }
+    }
+
+    selected = select_render_frames(frames, meta)
+
+    assert list(selected) == ["Products", "Variables", "_meta"]
+    assert selected["Products"] is frames["products_view"]
+    assert selected["Variables"] is frames["variables_view"]
+    assert "raw_variables" not in selected
+
+
+@pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
+def test_configured_workbook_view_fails_for_missing_or_duplicate_sheets() -> None:
+    frames = {
+        "variables_view": pd.DataFrame({"id": [1]}),
+        "products_view": pd.DataFrame({"id": ["P-001"]}),
+    }
+
+    with pytest.raises(KeyError, match="missing frame"):
+        select_render_frames(
+            frames,
+            {"workbook_view": {"sheets": [{"frame": "missing", "sheet": "Missing"}]}},
+        )
+
+    with pytest.raises(ValueError, match="Duplicate workbook view sheet name"):
+        select_render_frames(
+            frames,
+            {
+                "workbook_view": {
+                    "sheets": [
+                        {"frame": "variables_view", "sheet": "Overview"},
+                        {"frame": "products_view", "sheet": "Overview"},
+                    ]
+                }
+            },
+        )

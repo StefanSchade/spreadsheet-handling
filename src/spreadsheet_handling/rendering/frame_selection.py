@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import pandas as pd
 
 RESERVED_FRAME_KEYS = {"_meta"}
 DEFAULT_OMIT_ROLES = {"intermediate", "redundant", "system"}
@@ -24,6 +25,10 @@ def select_render_frames(
     if view is None:
         return dict(frames)
 
+    explicit_sheets = _configured_sheets(view)
+    if explicit_sheets is not None:
+        return _select_configured_sheets(frames, explicit_sheets)
+
     lifecycle = _lifecycle(meta)
     selected: dict[str, Any] = {}
     for raw_name, value in frames.items():
@@ -33,6 +38,58 @@ def select_render_frames(
             continue
         if _should_render_frame(name, lifecycle.get(name), view):
             selected[raw_name] = value
+    return selected
+
+
+def _configured_sheets(view: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    sheets = view.get("sheets")
+    if sheets is None:
+        return None
+    if not isinstance(sheets, list):
+        raise TypeError("workbook_view.sheets must be a list")
+    entries: list[Mapping[str, Any]] = []
+    for index, entry in enumerate(sheets, start=1):
+        if not isinstance(entry, Mapping):
+            raise TypeError(f"workbook_view.sheets entry {index} must be a mapping")
+        entries.append(entry)
+    return entries
+
+
+def _select_configured_sheets(
+    frames: Mapping[str, Any],
+    sheets: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    selected: dict[str, Any] = {}
+    seen_sheets: set[str] = set()
+    for index, entry in enumerate(sheets, start=1):
+        frame = _non_empty_string(entry.get("frame"), f"workbook_view.sheets[{index}].frame")
+        if frame in RESERVED_FRAME_KEYS:
+            raise ValueError(
+                f"workbook_view.sheets entry {index} references reserved frame {frame!r}"
+            )
+        if frame not in frames:
+            raise KeyError(f"workbook_view.sheets entry {index} references missing frame {frame!r}")
+        value = frames[frame]
+        if not isinstance(value, pd.DataFrame):
+            raise TypeError(
+                f"workbook_view.sheets entry {index} frame {frame!r} must be a DataFrame"
+            )
+
+        sheet = _non_empty_string(
+            entry.get("sheet") or frame,
+            f"workbook_view.sheets[{index}].sheet",
+        )
+        if sheet in RESERVED_FRAME_KEYS:
+            raise ValueError(
+                f"workbook_view.sheets entry {index} uses reserved sheet name {sheet!r}"
+            )
+        if sheet in seen_sheets:
+            raise ValueError(f"Duplicate workbook view sheet name {sheet!r}")
+        seen_sheets.add(sheet)
+        selected[sheet] = value
+
+    if "_meta" in frames:
+        selected["_meta"] = frames["_meta"]
     return selected
 
 
@@ -71,14 +128,16 @@ def _should_render_frame(
         return include_debug
 
     include_roles = view.get("include_roles")
-    if isinstance(include_roles, list) and include_roles and role not in set(map(str, include_roles)):
+    if (
+        isinstance(include_roles, list)
+        and include_roles
+        and role not in set(map(str, include_roles))
+    ):
         return False
 
     omit_roles = view.get("omit_roles")
     configured_omit_roles = (
-        set(map(str, omit_roles))
-        if isinstance(omit_roles, list)
-        else set(DEFAULT_OMIT_ROLES)
+        set(map(str, omit_roles)) if isinstance(omit_roles, list) else set(DEFAULT_OMIT_ROLES)
     )
     drop_redundant = bool(view.get("drop_redundant_data")) or str(view.get("mode")) == "editable"
 
@@ -102,3 +161,9 @@ def _unknown_frame_decision(name: str, view: Mapping[str, Any]) -> bool:
     if policy == "fail":
         raise ValueError(f"Frame {name!r} has no frame_lifecycle entry")
     raise ValueError(f"Unsupported unknown_frame_policy {policy!r}")
+
+
+def _non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
