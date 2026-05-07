@@ -157,6 +157,32 @@ def test_unique_reference_detects_duplicate_tuples() -> None:
     assert out["validation_findings"]["row_index"].tolist() == [0, 1]
 
 
+def test_unique_reference_can_be_explicitly_disabled_for_template_rules() -> None:
+    frames = {
+        "usage": pd.DataFrame(
+            [
+                {"variable_id": "v1", "product_id": "p1"},
+                {"variable_id": "v1", "product_id": "p1"},
+            ]
+        )
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "unique_reference",
+                "frame": "usage",
+                "columns": ["variable_id", "product_id"],
+                "allow_duplicates": True,
+            }
+        ],
+    )
+
+    assert out["validation_findings"].empty
+    assert list(out["validation_findings"].columns) == FINDING_COLUMNS
+
+
 def test_fail_mode_raises_from_same_finding_shape() -> None:
     frames = {
         "variables": pd.DataFrame([{"ID": "v1"}]),
@@ -177,6 +203,30 @@ def test_fail_mode_raises_from_same_finding_shape() -> None:
                 }
             ],
         )
+
+
+def test_ignore_mode_does_not_write_findings_frame_or_raise() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"ID": "v1"}]),
+        "variable_codes": pd.DataFrame([{"ID": "missing"}]),
+    }
+
+    out = validate_references(
+        frames,
+        mode="ignore",
+        rules=[
+            {
+                "type": "foreign_key",
+                "frame": "variable_codes",
+                "columns": ["ID"],
+                "target": "variables",
+                "target_columns": ["ID"],
+            }
+        ],
+    )
+
+    assert "validation_findings" not in out
+    assert out["variables"].equals(frames["variables"])
 
 
 def test_successful_warn_mode_writes_empty_findings_frame() -> None:
