@@ -108,6 +108,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.extractions.frame_extract:extract_frame",
     ),
+    "pivot_frame": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.tabular_views:pivot_frame",
+    ),
     "expand_xref": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref",

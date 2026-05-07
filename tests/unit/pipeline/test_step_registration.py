@@ -332,6 +332,39 @@ def test_extract_frame_step_is_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-DECLARATIVE-TABULAR-VIEW-OPS-P4A")
+def test_pivot_frame_step_is_config_addressable() -> None:
+    frames = {
+        "mapping_rows": pd.DataFrame(
+            [
+                {"variable_id": "v1", "mapping_name": "request", "display": "amount"},
+                {"variable_id": "v1", "mapping_name": "response", "display": "result"},
+            ]
+        )
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "pivot_frame",
+                "source": "mapping_rows",
+                "output": "mapping_view",
+                "index_columns": ["variable_id"],
+                "column_key": "mapping_name",
+                "value_column": "display",
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["pivot_frame"], StepRegistration)
+    assert steps[0].config["target"].endswith(":pivot_frame")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["mapping_view"].to_dict(orient="records") == [
+        {"variable_id": "v1", "request": "amount", "response": "result"},
+    ]
+
+
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
         "matrix": pd.DataFrame(

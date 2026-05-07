@@ -22,7 +22,7 @@ from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
-
+from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
 
 pytestmark = [
     pytest.mark.ftr("FTR-ODS-CALC-PARITY-TESTS-P3J"),
@@ -172,8 +172,7 @@ def _supported_workbook_summary(workbook) -> dict[str, Any]:
         "visible_sheets": list(workbook.sheets),
         "hidden_sheets": sorted(workbook.hidden_sheets),
         "sheets": {
-            name: _supported_sheet_summary(sheet)
-            for name, sheet in workbook.sheets.items()
+            name: _supported_sheet_summary(sheet) for name, sheet in workbook.sheets.items()
         },
     }
 
@@ -268,6 +267,44 @@ def test_extracted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) ->
     pd.testing.assert_frame_equal(
         ods_back["VisibleVariables"],
         frames["VisibleVariables"],
+        check_dtype=False,
+    )
+    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+
+
+@pytest.mark.ftr("FTR-DECLARATIVE-TABULAR-VIEW-OPS-P4A")
+def test_pivoted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> None:
+    frames = pivot_frame(
+        {
+            "MappingRows": pd.DataFrame(
+                [
+                    {"variable_id": "v1", "mapping_name": "request", "display": "amount"},
+                    {"variable_id": "v1", "mapping_name": "response", "display": "result"},
+                    {"variable_id": "v2", "mapping_name": "request", "display": "term"},
+                ]
+            )
+        },
+        source="MappingRows",
+        output="MappingView",
+        index_columns=["variable_id"],
+        column_key="mapping_name",
+        value_column="display",
+        column_keys=["request", "response"],
+    )
+
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="pivoted-frame")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    pd.testing.assert_frame_equal(
+        xlsx_back["MappingView"],
+        frames["MappingView"],
+        check_dtype=False,
+    )
+    pd.testing.assert_frame_equal(
+        ods_back["MappingView"],
+        frames["MappingView"],
         check_dtype=False,
     )
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
