@@ -128,6 +128,138 @@ def test_foreign_key_supports_composite_keys() -> None:
     assert out["validation_findings"].loc[0, "target_frame"] == "variable_products"
 
 
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_row_local_when_gates_foreign_key_validation_and_reports_skipped_rows() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"variable_id": "v1"}]),
+        "calculation_targets": pd.DataFrame(
+            [
+                {"secondary_target_variable_id": "missing_but_disabled", "secondary_target_required": False},
+                {"secondary_target_variable_id": "missing_and_enabled", "secondary_target_required": True},
+            ]
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "foreign_key",
+                "frame": "calculation_targets",
+                "columns": ["secondary_target_variable_id"],
+                "target": "variables",
+                "target_columns": ["variable_id"],
+                "when": {"column": "secondary_target_required", "equals": True},
+            }
+        ],
+    )
+
+    assert out["validation_findings"].to_dict(orient="records") == [
+        {
+            "rule_type": "foreign_key",
+            "frame": "calculation_targets",
+            "columns": "secondary_target_variable_id",
+            "row_index": "",
+            "value": "",
+            "target_frame": "",
+            "target_columns": "",
+            "severity": "skipped",
+            "message": "Skipped 1 row(s) because when did not match: secondary_target_required equals True.",
+        },
+        {
+            "rule_type": "foreign_key",
+            "frame": "calculation_targets",
+            "columns": "secondary_target_variable_id",
+            "row_index": 1,
+            "value": "missing_and_enabled",
+            "target_frame": "variables",
+            "target_columns": "variable_id",
+            "severity": "warn",
+            "message": "Foreign key value is not present in target frame.",
+        },
+    ]
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_enabled_when_disabled_rule_emits_auditable_skipped_summary() -> None:
+    frames = {
+        "feature_switches": pd.DataFrame([{"key": "operation_routing", "enabled": False}]),
+        "optional_operation_routes": pd.DataFrame(
+            [
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+            ]
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "unique_reference",
+                "frame": "optional_operation_routes",
+                "columns": ["transaction_type_id", "operation_id"],
+                "enabled_when": {
+                    "frame": "feature_switches",
+                    "key": "operation_routing",
+                    "column": "enabled",
+                    "equals": True,
+                },
+            }
+        ],
+    )
+
+    assert out["validation_findings"].to_dict(orient="records") == [
+        {
+            "rule_type": "unique_reference",
+            "frame": "optional_operation_routes",
+            "columns": "transaction_type_id, operation_id",
+            "row_index": "",
+            "value": "",
+            "target_frame": "",
+            "target_columns": "",
+            "severity": "skipped",
+            "message": "Validation skipped: enabled_when did not match: enabled equals True.",
+        }
+    ]
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_enabled_when_active_rule_runs_validation() -> None:
+    frames = {
+        "feature_switches": pd.DataFrame([{"key": "operation_routing", "enabled": True}]),
+        "optional_operation_routes": pd.DataFrame(
+            [
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+            ]
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "unique_reference",
+                "frame": "optional_operation_routes",
+                "columns": ["transaction_type_id", "operation_id"],
+                "enabled_when": {
+                    "frame": "feature_switches",
+                    "key": "operation_routing",
+                    "column": "enabled",
+                    "equals": True,
+                },
+            }
+        ],
+    )
+
+    assert out["validation_findings"]["severity"].tolist() == ["warn", "warn"]
+    assert out["validation_findings"]["rule_type"].tolist() == [
+        "unique_reference",
+        "unique_reference",
+    ]
+
+
 def test_unique_reference_detects_duplicate_tuples() -> None:
     frames = {
         "usage": pd.DataFrame(
@@ -205,6 +337,68 @@ def test_fail_mode_raises_from_same_finding_shape() -> None:
         )
 
 
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_fail_mode_ignores_skipped_rows_but_fails_active_rows() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"variable_id": "v1"}]),
+        "calculation_targets": pd.DataFrame(
+            [
+                {"secondary_target_variable_id": "missing_but_disabled", "secondary_target_required": False},
+                {"secondary_target_variable_id": "missing_and_enabled", "secondary_target_required": True},
+            ]
+        ),
+    }
+
+    with pytest.raises(ValueError, match="missing_and_enabled"):
+        validate_references(
+            frames,
+            mode="fail",
+            rules=[
+                {
+                    "type": "foreign_key",
+                    "frame": "calculation_targets",
+                    "columns": ["secondary_target_variable_id"],
+                    "target": "variables",
+                    "target_columns": ["variable_id"],
+                    "when": {"column": "secondary_target_required", "equals": True},
+                }
+            ],
+        )
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_disabled_enabled_when_rule_does_not_fail_fail_mode() -> None:
+    frames = {
+        "feature_switches": pd.DataFrame([{"key": "operation_routing", "enabled": False}]),
+        "optional_operation_routes": pd.DataFrame(
+            [
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+                {"transaction_type_id": "t1", "operation_id": "op1"},
+            ]
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        mode="fail",
+        rules=[
+            {
+                "type": "unique_reference",
+                "frame": "optional_operation_routes",
+                "columns": ["transaction_type_id", "operation_id"],
+                "enabled_when": {
+                    "frame": "feature_switches",
+                    "key": "operation_routing",
+                    "column": "enabled",
+                    "equals": True,
+                },
+            }
+        ],
+    )
+
+    assert "validation_findings" not in out
+
+
 def test_ignore_mode_does_not_write_findings_frame_or_raise() -> None:
     frames = {
         "variables": pd.DataFrame([{"ID": "v1"}]),
@@ -227,6 +421,51 @@ def test_ignore_mode_does_not_write_findings_frame_or_raise() -> None:
 
     assert "validation_findings" not in out
     assert out["variables"].equals(frames["variables"])
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_missing_switch_configuration_fails_unless_optional() -> None:
+    frames = {"variables": pd.DataFrame([{"ID": "v1"}])}
+    rule = {
+        "type": "primary_key",
+        "frame": "variables",
+        "columns": ["ID"],
+        "enabled_when": {
+            "frame": "feature_switches",
+            "key": "operation_routing",
+            "column": "enabled",
+            "equals": True,
+        },
+    }
+
+    with pytest.raises(KeyError, match="switch frame 'feature_switches' not found"):
+        validate_references(frames, rules=[rule])
+
+    out = validate_references(
+        frames,
+        rules=[{**rule, "enabled_when": {**rule["enabled_when"], "optional": True}}],
+    )
+
+    assert out["validation_findings"]["severity"].tolist() == ["skipped"]
+    assert "switch frame is missing" in out["validation_findings"].loc[0, "message"]
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_unsupported_condition_predicate_fails_clearly() -> None:
+    frames = {"variables": pd.DataFrame([{"ID": "v1", "active": True}])}
+
+    with pytest.raises(ValueError, match="Unsupported when predicate"):
+        validate_references(
+            frames,
+            rules=[
+                {
+                    "type": "primary_key",
+                    "frame": "variables",
+                    "columns": ["ID"],
+                    "when": {"column": "active", "contains": "yes"},
+                }
+            ],
+        )
 
 
 def test_successful_warn_mode_writes_empty_findings_frame() -> None:

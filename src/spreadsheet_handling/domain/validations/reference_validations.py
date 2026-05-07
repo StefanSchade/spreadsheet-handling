@@ -26,6 +26,7 @@ FINDING_COLUMNS = [
 
 _VALID_MODES = {"warn", "fail", "ignore"}
 _VALID_RULE_TYPES = {"unique", "primary_key", "foreign_key", "unique_reference"}
+_CONDITION_PREDICATES = {"equals", "in", "non_empty", "is_null", "not_null"}
 
 
 @dataclass(frozen=True)
@@ -67,8 +68,9 @@ def validate_references(
     findings_frame = _valid_findings_name(findings)
     validation_findings = _validate_rules(frames, rules=rules, severity=mode)
 
-    if mode == "fail" and validation_findings:
-        raise ValueError(_failure_message(validation_findings, name=name))
+    failures = _failure_findings(validation_findings)
+    if mode == "fail" and failures:
+        raise ValueError(_failure_message(failures, name=name))
 
     if mode != "warn":
         return dict(frames)
@@ -105,6 +107,10 @@ def _validate_rules(
                 f"Unsupported reference validation rule type {rule_type!r}; "
                 f"expected one of {sorted(_VALID_RULE_TYPES)!r}"
             )
+        enabled, skipped = _resolve_enabled_when(frames, rule=rule, rule_type=str(rule_type))
+        findings.extend(skipped)
+        if not enabled:
+            continue
 
         if rule_type == "unique":
             findings.extend(_validate_unique(frames, rule=rule, severity=severity))
@@ -128,14 +134,15 @@ def _validate_unique(
     missing = _missing_rule_columns(frame, columns)
     if frame is None or missing:
         return [_schema_finding("unique", frame_name, columns, missing, severity)]
-    return _duplicate_findings(
+    frame, skipped = _apply_when(frame, rule=rule, rule_type="unique", frame_name=frame_name, columns=columns)
+    return skipped + _duplicate_findings(
         "unique",
         frame_name=frame_name,
         frame=frame,
         columns=columns,
         severity=severity,
         message="Configured columns must be unique.",
-    )
+    ) + skipped
 
 
 def _validate_primary_key(
@@ -149,8 +156,15 @@ def _validate_primary_key(
     missing = _missing_rule_columns(frame, columns)
     if frame is None or missing:
         return [_schema_finding("primary_key", frame_name, columns, missing, severity)]
+    frame, skipped = _apply_when(
+        frame,
+        rule=rule,
+        rule_type="primary_key",
+        frame_name=frame_name,
+        columns=columns,
+    )
 
-    findings: list[ReferenceFinding] = []
+    findings: list[ReferenceFinding] = list(skipped)
     for row_index, key in _row_keys(frame, columns):
         if any(_is_empty_cell(value) for value in key):
             findings.append(
@@ -228,6 +242,14 @@ def _validate_foreign_key(
 
     assert source is not None
     assert target is not None
+    source, skipped = _apply_when(
+        source,
+        rule=rule,
+        rule_type="foreign_key",
+        frame_name=frame_name,
+        columns=columns,
+    )
+    findings.extend(skipped)
     target_keys = {
         _key_token(key)
         for _, key in _row_keys(target, target_columns)
@@ -282,13 +304,215 @@ def _validate_unique_reference(
     missing = _missing_rule_columns(frame, columns)
     if frame is None or missing:
         return [_schema_finding("unique_reference", frame_name, columns, missing, severity)]
-    return _duplicate_findings(
+    frame, skipped = _apply_when(
+        frame,
+        rule=rule,
+        rule_type="unique_reference",
+        frame_name=frame_name,
+        columns=columns,
+    )
+    return skipped + _duplicate_findings(
         "unique_reference",
         frame_name=frame_name,
         frame=frame,
         columns=columns,
         severity=severity,
         message="Reference tuples must not be duplicated.",
+    ) + skipped
+
+
+def _resolve_enabled_when(
+    frames: Mapping[str, Any],
+    *,
+    rule: Mapping[str, Any],
+    rule_type: str,
+) -> tuple[bool, list[ReferenceFinding]]:
+    condition = rule.get("enabled_when")
+    if condition is None:
+        return True, []
+    if not isinstance(condition, Mapping):
+        raise TypeError("enabled_when must be a mapping")
+
+    optional = bool(condition.get("optional", False))
+    switch_frame_name = _condition_string(condition, "frame", context="enabled_when")
+    switch_frame = _optional_frame(frames, switch_frame_name)
+    if switch_frame is None:
+        if optional:
+            return False, [_skipped_rule(rule_type, rule, "enabled_when switch frame is missing")]
+        raise KeyError(f"enabled_when switch frame {switch_frame_name!r} not found")
+
+    key_column = str(condition.get("key_column", "key"))
+    if not key_column.strip():
+        raise ValueError("enabled_when.key_column must be a non-empty string")
+    if key_column not in switch_frame.columns:
+        if optional:
+            return False, [_skipped_rule(rule_type, rule, f"enabled_when key column {key_column!r} is missing")]
+        raise KeyError(
+            f"enabled_when key column {key_column!r} not found in switch frame "
+            f"{switch_frame_name!r}"
+        )
+    if "key" not in condition:
+        raise ValueError("enabled_when.key is required")
+
+    key_value = _plain_value(condition["key"])
+    matches = switch_frame.loc[
+        switch_frame[key_column].map(_plain_value).map(_format_scalar) == _format_scalar(key_value)
+    ]
+    if matches.empty:
+        if optional:
+            return False, [_skipped_rule(rule_type, rule, f"enabled_when key {_format_scalar(key_value)!r} is missing")]
+        raise KeyError(
+            f"enabled_when key {_format_scalar(key_value)!r} not found in "
+            f"{switch_frame_name!r}.{key_column}"
+        )
+    if len(matches.index) > 1:
+        raise ValueError(
+            f"enabled_when key {_format_scalar(key_value)!r} is not unique in "
+            f"{switch_frame_name!r}.{key_column}"
+        )
+
+    mask = _condition_mask(
+        matches,
+        condition,
+        frame_name=switch_frame_name,
+        context="enabled_when",
+        optional_missing=optional,
+    )
+    if mask is None:
+        return False, [_skipped_rule(rule_type, rule, "enabled_when predicate column is missing")]
+    enabled = bool(mask.iloc[0])
+    if enabled:
+        return True, []
+    return False, [_skipped_rule(rule_type, rule, f"enabled_when did not match: {_condition_summary(condition)}")]
+
+
+def _apply_when(
+    frame: pd.DataFrame,
+    *,
+    rule: Mapping[str, Any],
+    rule_type: str,
+    frame_name: str,
+    columns: list[str],
+) -> tuple[pd.DataFrame, list[ReferenceFinding]]:
+    condition = rule.get("when")
+    if condition is None:
+        return frame, []
+    if not isinstance(condition, Mapping):
+        raise TypeError("when must be a mapping")
+    mask = _condition_mask(frame, condition, frame_name=frame_name, context="when")
+    assert mask is not None
+    skipped_count = int((~mask).sum())
+    if skipped_count == 0:
+        return frame.loc[mask].copy(), []
+    return frame.loc[mask].copy(), [
+        ReferenceFinding(
+            rule_type=rule_type,
+            frame=frame_name,
+            columns=columns,
+            row_index=None,
+            value=None,
+            severity="skipped",
+            message=(
+                f"Skipped {skipped_count} row(s) because when did not match: "
+                f"{_condition_summary(condition)}."
+            ),
+        )
+    ]
+
+
+def _condition_mask(
+    frame: pd.DataFrame,
+    condition: Mapping[str, Any],
+    *,
+    frame_name: str,
+    context: str,
+    optional_missing: bool = False,
+) -> pd.Series | None:
+    column = _condition_string(condition, "column", context=context)
+    unsupported = [
+        key
+        for key in condition
+        if key
+        not in {
+            *_CONDITION_PREDICATES,
+            "column",
+            "frame",
+            "key",
+            "key_column",
+            "optional",
+        }
+    ]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported {context} predicate key(s) {unsupported!r}; "
+            f"supported predicates are {sorted(_CONDITION_PREDICATES)!r}"
+        )
+    predicates = [key for key in condition if key in _CONDITION_PREDICATES]
+    if len(predicates) != 1:
+        raise ValueError(
+            f"{context} must configure exactly one predicate among "
+            f"{sorted(_CONDITION_PREDICATES)!r}"
+        )
+    if column not in frame.columns:
+        if optional_missing:
+            return None
+        raise KeyError(f"{context} column {column!r} not found in frame {frame_name!r}")
+
+    predicate = predicates[0]
+    values = frame[column]
+    if predicate == "equals":
+        return values.map(_plain_value).map(_format_scalar) == _format_scalar(
+            _plain_value(condition[predicate])
+        )
+    if predicate == "in":
+        members = condition[predicate]
+        if isinstance(members, (str, bytes)) or not isinstance(members, Iterable):
+            raise TypeError(f"{context}.in must be a list of allowed values, not a scalar")
+        normalized_members = {_format_scalar(_plain_value(member)) for member in members}
+        return values.map(_plain_value).map(_format_scalar).isin(normalized_members)
+    if predicate == "non_empty":
+        _ensure_boolean_predicate(condition[predicate], f"{context}.{predicate}")
+        mask = values.map(lambda value: not _is_empty_cell(value))
+    elif predicate == "is_null":
+        _ensure_boolean_predicate(condition[predicate], f"{context}.{predicate}")
+        mask = values.map(_is_empty_cell)
+    elif predicate == "not_null":
+        _ensure_boolean_predicate(condition[predicate], f"{context}.{predicate}")
+        mask = values.map(lambda value: not _is_empty_cell(value))
+    else:  # pragma: no cover - guarded above
+        raise AssertionError(predicate)
+
+    return ~mask if condition[predicate] is False else mask
+
+
+def _condition_string(condition: Mapping[str, Any], field_name: str, *, context: str) -> str:
+    value = condition.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context}.{field_name} must be a non-empty string")
+    return value
+
+
+def _condition_summary(condition: Mapping[str, Any]) -> str:
+    column = str(condition.get("column", ""))
+    predicate = next((key for key in condition if key in _CONDITION_PREDICATES), "")
+    return f"{column} {predicate} {condition.get(predicate)!r}".strip()
+
+
+def _skipped_rule(
+    rule_type: str,
+    rule: Mapping[str, Any],
+    reason: str,
+) -> ReferenceFinding:
+    frame = str(rule.get("frame") or "")
+    columns = _raw_columns(rule.get("columns"))
+    return ReferenceFinding(
+        rule_type=rule_type,
+        frame=frame,
+        columns=columns,
+        row_index=None,
+        value=None,
+        severity="skipped",
+        message=f"Validation skipped: {reason}.",
     )
 
 
@@ -416,6 +640,14 @@ def _string_list(value: Any, field_name: str) -> list[str]:
     return result
 
 
+def _raw_columns(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable):
+        return [str(item) for item in value]
+    return []
+
+
 def _plain_value(value: Any) -> Any:
     if hasattr(value, "item") and not isinstance(value, (str, bytes)):
         try:
@@ -456,6 +688,15 @@ def _format_scalar(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _ensure_boolean_predicate(value: Any, field_name: str) -> None:
+    if not isinstance(value, bool):
+        raise TypeError(f"{field_name} must be true or false")
+
+
+def _failure_findings(findings: list[ReferenceFinding]) -> list[ReferenceFinding]:
+    return [finding for finding in findings if finding.severity != "skipped"]
 
 
 def _failure_message(findings: list[ReferenceFinding], *, name: str | None) -> str:
