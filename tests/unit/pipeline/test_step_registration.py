@@ -117,6 +117,51 @@ def test_validate_references_step_is_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-GRAPH-REFERENCE-VALIDATIONS-P4A")
+def test_validate_graph_step_is_config_addressable() -> None:
+    frames = {
+        "calculation_operations": pd.DataFrame([{"operation_id": "op1"}]),
+        "variables": pd.DataFrame([{"variable_id": "v1"}]),
+        "operation_outputs": pd.DataFrame([{"operation_id": "missing_op", "variable_id": "v1"}]),
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "validate_graph",
+                "mode": "warn",
+                "graph": "calculation_operation_network",
+                "nodes": [
+                    {
+                        "name": "operations",
+                        "frame": "calculation_operations",
+                        "key": "operation_id",
+                    },
+                    {"name": "variables", "frame": "variables", "key": "variable_id"},
+                ],
+                "edges": [
+                    {
+                        "name": "operation_outputs",
+                        "frame": "operation_outputs",
+                        "source_node": "operations",
+                        "source_column": "operation_id",
+                        "target_node": "variables",
+                        "target_column": "variable_id",
+                        "unique": True,
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["validate_graph"], StepRegistration)
+    assert steps[0].config["target"].endswith(":validate_graph")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["graph_validation_findings"].loc[0, "rule_type"] == "graph_endpoint"
+    assert out["graph_validation_findings"].loc[0, "value"] == "missing_op"
+
+
 @pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")
 def test_pipeline_registry_uses_normalized_helper_step_names() -> None:
     for old_name, new_name in RENAMED_PIPELINE_STEPS.items():
