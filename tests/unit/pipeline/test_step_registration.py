@@ -365,6 +365,34 @@ def test_pivot_frame_step_is_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-SIMPLE-JOIN-VIEWS-P4A")
+def test_join_frames_step_is_config_addressable() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
+        "metadata": pd.DataFrame([{"variable_id": "v1", "component": "cashflow"}]),
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "join_frames",
+                "left": "variables",
+                "right": "metadata",
+                "output": "variable_view",
+                "key": "variable_id",
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["join_frames"], StepRegistration)
+    assert steps[0].config["target"].endswith(":join_frames")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["variable_view"].to_dict(orient="records") == [
+        {"variable_id": "v1", "label": "Rate", "component": "cashflow"},
+    ]
+
+
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
         "matrix": pd.DataFrame(

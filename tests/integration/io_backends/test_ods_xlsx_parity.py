@@ -22,6 +22,7 @@ from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
+from spreadsheet_handling.domain.transformations.join_views import join_frames
 from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
 
 pytestmark = [
@@ -305,6 +306,47 @@ def test_pivoted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> N
     pd.testing.assert_frame_equal(
         ods_back["MappingView"],
         frames["MappingView"],
+        check_dtype=False,
+    )
+    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+
+
+@pytest.mark.ftr("FTR-SIMPLE-JOIN-VIEWS-P4A")
+def test_joined_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> None:
+    frames = join_frames(
+        {
+            "Variables": pd.DataFrame(
+                [
+                    {"variable_id": "v1", "label": "Rate"},
+                    {"variable_id": "v2", "label": "Amount"},
+                ]
+            ),
+            "Metadata": pd.DataFrame(
+                [
+                    {"variable_id": "v1", "component": "cashflow"},
+                ]
+            ),
+        },
+        left="Variables",
+        right="Metadata",
+        output="VariableView",
+        key="variable_id",
+        how="left",
+    )
+
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="joined-frame")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    pd.testing.assert_frame_equal(
+        xlsx_back["VariableView"],
+        frames["VariableView"],
+        check_dtype=False,
+    )
+    pd.testing.assert_frame_equal(
+        ods_back["VariableView"],
+        frames["VariableView"],
         check_dtype=False,
     )
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]

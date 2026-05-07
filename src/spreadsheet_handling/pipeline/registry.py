@@ -112,6 +112,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.tabular_views:pivot_frame",
     ),
+    "join_frames": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.join_views:join_frames",
+    ),
     "expand_xref": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref",
