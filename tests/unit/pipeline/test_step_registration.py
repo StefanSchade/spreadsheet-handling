@@ -72,6 +72,51 @@ def test_apply_overrides_generic_registration_binds_frames_first_step() -> None:
     assert out["_meta"]["auto_filter"] is True
 
 
+@pytest.mark.ftr("FTR-STANDARD-REFERENCE-VALIDATIONS-P4A")
+def test_validate_references_step_is_config_addressable() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"ID": "v1"}]),
+        "variable_codes": pd.DataFrame([{"ID": "missing"}]),
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "validate_references",
+                "mode": "warn",
+                "findings": "reference_findings",
+                "rules": [
+                    {
+                        "type": "foreign_key",
+                        "frame": "variable_codes",
+                        "columns": ["ID"],
+                        "target": "variables",
+                        "target_columns": ["ID"],
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["validate_references"], StepRegistration)
+    assert steps[0].config["target"].endswith(":validate_references")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["reference_findings"].to_dict(orient="records") == [
+        {
+            "rule_type": "foreign_key",
+            "frame": "variable_codes",
+            "columns": "ID",
+            "row_index": 0,
+            "value": "missing",
+            "target_frame": "variables",
+            "target_columns": "ID",
+            "severity": "warn",
+            "message": "Foreign key value is not present in target frame.",
+        }
+    ]
+
+
 @pytest.mark.ftr("FTR-PIPELINE-STEP-NAMING-P4")
 def test_pipeline_registry_uses_normalized_helper_step_names() -> None:
     for old_name, new_name in RENAMED_PIPELINE_STEPS.items():
