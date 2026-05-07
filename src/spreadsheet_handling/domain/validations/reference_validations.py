@@ -142,7 +142,7 @@ def _validate_unique(
         columns=columns,
         severity=severity,
         message="Configured columns must be unique.",
-    ) + skipped
+    )
 
 
 def _validate_primary_key(
@@ -318,7 +318,7 @@ def _validate_unique_reference(
         columns=columns,
         severity=severity,
         message="Reference tuples must not be duplicated.",
-    ) + skipped
+    )
 
 
 def _resolve_enabled_when(

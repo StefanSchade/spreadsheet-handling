@@ -61,6 +61,35 @@ def test_unique_detects_arbitrary_duplicate_columns() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_row_local_when_adds_one_skipped_summary_for_unique_rules() -> None:
+    frames = {
+        "labels": pd.DataFrame(
+            [
+                {"resource": "rate", "locale": "de", "active": False},
+                {"resource": "rate", "locale": "de", "active": True},
+                {"resource": "rate", "locale": "de", "active": True},
+            ]
+        )
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "unique",
+                "frame": "labels",
+                "columns": ["resource", "locale"],
+                "when": {"column": "active", "equals": True},
+            }
+        ],
+    )
+
+    findings = out["validation_findings"]
+    assert findings["severity"].tolist() == ["skipped", "warn", "warn"]
+    assert findings["severity"].tolist().count("skipped") == 1
+
+
 def test_foreign_key_detects_dangling_references() -> None:
     frames = {
         "variables": pd.DataFrame([{"ID": "v1"}, {"ID": "v2"}]),
@@ -287,6 +316,35 @@ def test_unique_reference_detects_duplicate_tuples() -> None:
         "unique_reference",
     ]
     assert out["validation_findings"]["row_index"].tolist() == [0, 1]
+
+
+@pytest.mark.ftr("FTR-CONDITIONAL-VALIDATION-RULES-P4A")
+def test_row_local_when_adds_one_skipped_summary_for_unique_reference_rules() -> None:
+    frames = {
+        "usage": pd.DataFrame(
+            [
+                {"variable_id": "v1", "product_id": "p1", "enabled": False},
+                {"variable_id": "v1", "product_id": "p1", "enabled": True},
+                {"variable_id": "v1", "product_id": "p1", "enabled": True},
+            ]
+        )
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "unique_reference",
+                "frame": "usage",
+                "columns": ["variable_id", "product_id"],
+                "when": {"column": "enabled", "equals": True},
+            }
+        ],
+    )
+
+    findings = out["validation_findings"]
+    assert findings["severity"].tolist() == ["skipped", "warn", "warn"]
+    assert findings["severity"].tolist().count("skipped") == 1
 
 
 def test_unique_reference_can_be_explicitly_disabled_for_template_rules() -> None:
