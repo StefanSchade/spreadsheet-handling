@@ -10,6 +10,7 @@ from .passes.core import (
     ValidationPass,
     MetaPass,
     NamedRangePass,
+    ProtectionPass,
 )
 from .plan import (
     RenderPlan,
@@ -25,6 +26,8 @@ from .plan import (
     WriteDataBlock,
     WriteMeta,
     DefineNamedRange,
+    SetSheetProtection,
+    ApplyCellLock,
 )
 
 def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
@@ -196,6 +199,27 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
                 r1=nr.area[0], c1=nr.area[1], r2=nr.area[2], c2=nr.area[3],
             ))
 
+        # Sheet protection
+        prot = sh.meta.get("__protection")
+        if prot and sh.tables:
+            t = sh.tables[0]
+            data_start = t.top + t.header_rows
+            data_end = t.top + t.n_rows - 1
+            all_start = t.top  # include headers
+            if data_end >= data_start:
+                for col_idx in prot["unlocked_cols"]:
+                    plan.add(ApplyCellLock(
+                        sheet=sheet_name,
+                        col=col_idx,
+                        from_row=all_start,
+                        to_row=data_end,
+                        locked=False,
+                    ))
+                plan.add(SetSheetProtection(
+                    sheet=sheet_name,
+                    password=prot.get("password"),
+                ))
+
     for sheet_name, sh in doc.hidden_sheets.items():
         hidden = bool(sh.meta.get("_hidden", True))
         kv = {k: v for k, v in sh.meta.items() if k != "_hidden"}
@@ -208,6 +232,7 @@ def default_p1_passes() -> List[IRPass]:
         MetaPass(),
         ValidationPass(),
         StylePass(),
+        ProtectionPass(),
         FilterPass(),
         FreezePass(),
         ColumnWidthPass(),

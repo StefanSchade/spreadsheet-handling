@@ -14,6 +14,7 @@ OPTION_HINT_KEYS = (
     "helper_fill_rgb",
     "helper_columns",
     "helper_prefix",
+    "protection",
 )
 
 

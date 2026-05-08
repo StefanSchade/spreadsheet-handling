@@ -100,6 +100,24 @@ class DefineNamedRange:
     r2: int
     c2: int
 
+
+@dataclass(frozen=True)
+class SetSheetProtection:
+    """Enable sheet protection so locked cells cannot be edited."""
+    sheet: str
+    password: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ApplyCellLock:
+    """Set the locked/unlocked state for a column range of cells."""
+    sheet: str
+    col: int          # 1-based column index
+    from_row: int     # first row (header or data)
+    to_row: int       # last row
+    locked: bool = True
+
+
 RenderOp = Union[
     DefineSheet,
     SetHeader,
@@ -113,6 +131,8 @@ RenderOp = Union[
     WriteDataBlock,
     WriteMeta,
     DefineNamedRange,
+    SetSheetProtection,
+    ApplyCellLock,
 ]
 
 # ----- Render Plan -----

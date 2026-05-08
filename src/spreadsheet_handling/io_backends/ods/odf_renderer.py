@@ -25,6 +25,7 @@ from spreadsheet_handling.rendering.plan import (
     AddValidation,
     ApplyColumnStyle,
     ApplyHeaderStyle,
+    ApplyCellLock,
     DefineNamedRange,
     DefineSheet,
     MergeCells,
@@ -32,6 +33,7 @@ from spreadsheet_handling.rendering.plan import (
     SetAutoFilter,
     SetFreeze,
     SetHeader,
+    SetSheetProtection,
     WriteDataBlock,
     WriteMeta,
 )
@@ -303,6 +305,12 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
         if isinstance(op, SetFreeze):
             sheet.freeze = (op.row, op.col)
             continue
+
+        if isinstance(op, SetSheetProtection):
+            continue  # ODS protection not implemented in this slice
+
+        if isinstance(op, ApplyCellLock):
+            continue  # ODS cell locking not implemented in this slice
 
     return [sheets[name] for name in ordered_names]
 

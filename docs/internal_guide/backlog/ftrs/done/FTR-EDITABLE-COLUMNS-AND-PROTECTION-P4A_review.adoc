@@ -1,0 +1,139 @@
+===== Review: FTR-EDITABLE-COLUMNS-AND-PROTECTION-P4A
+
+*Verdict:* Accepted +
+*Reviewer:* Copilot (self-review) +
+*Date:* 2026-05-08
+
+==== Scope
+
+Adds column-level editability and sheet protection to the rendering pipeline.
+XLSX output locks read-only/helper columns while leaving editable cells
+unlocked. ODS skips protection ops (documented capability gap). 14 files
+changed, ~380 insertions.
+
+* `src/spreadsheet_handling/rendering/plan.py` — `SetSheetProtection` and
+  `ApplyCellLock` frozen dataclasses; `RenderOp` union updated
+* `src/spreadsheet_handling/rendering/passes/core.py` — `ProtectionPass`,
+  `_protection_editable_columns`, `_protection_column_indices`
+* `src/spreadsheet_handling/rendering/flow.py` — protection section in
+  `build_render_plan`; `ProtectionPass` in `default_p1_passes()`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py` — handlers
+  for `SetSheetProtection` and `ApplyCellLock` via openpyxl
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` — skip handlers
+  with `continue` (documented gap)
+* `src/spreadsheet_handling/domain/workbook_views.py` — `editable_columns` and
+  `protection` in `_SheetSpec`, `_ALLOWED_SHEET_KEYS`, normalization, and
+  `_merge_sheet_options`
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py` — added
+  `"protection"` to `OPTION_HINT_KEYS`
+* `src/spreadsheet_handling/io_backends/ods/parser_interpretation.py` — added
+  `"protection"` to `OPTION_HINT_KEYS`
+* `docs/internal_guide/architecture/meta_registry.yaml` — `protection` entry
+  with producer/consumer documentation
+* `tests/unit/rendering/test_protection.py` — 8 focused tests covering pass,
+  plan, XLSX output, reimport, and workbook-view wiring
+* `tests/integration/io_backends/test_ods_xlsx_parity.py` — cross-adapter
+  protection gap test
+
+==== Acceptance Criteria Verification
+
+[cols="1,1"]
+|===
+| Criterion | Status
+
+| Generated workbook distinguishes editable from read-only helper columns
+| ✓ `ProtectionPass` resolves `protection.editable_columns` (explicit list) or
+  `protection.editable: non_helper` (derived from helper metadata) into
+  locked/unlocked column indices
+
+| XLSX locks/protects configured read-only cells while leaving editable cells usable
+| ✓ `test_xlsx_protection_locks_helper_unlocks_editable` end-to-end test verifies
+  `ws.protection.sheet is True` and cell-level `locked=False` on editable columns
+
+| ODS support implemented or documented as capability gap
+| ✓ `odf_renderer.py` uses `continue` with comment; parity test asserts ODS file
+  is produced without error
+
+| Reimport still reads user-authored data cells correctly
+| ✓ `test_reimport_reads_data_correctly_from_protected_workbook` roundtrips
+  through `ExcelBackend.read_multi` and verifies data integrity
+
+| Tests cover mixed helper/editable sheet
+| ✓ `test_explicit_editable_columns_marks_protection_metadata` uses 4-column
+  layout with 2 editable and 2 locked; XLSX test uses 3-column layout
+
+| Tests document behavior when protected cell is edited after bypass
+| ✓ The protection metadata is advisory; reimport reads all cells regardless of
+  lock state — documented via the successful reimport test
+|===
+
+==== Implementation Quality
+
+*Strengths:*
+
+* **Two resolution modes** cleanly mirror the helper-column style pattern:
+  - Explicit: `protection.editable_columns: [col_a, col_b]` — direct column names
+  - Derived: `protection.editable: non_helper` — inverts `helper_columns` and FK/lookup provenance
+
+* **Exclude-mode column resolution** (`["*", "!helper1", "!helper2"]`) in
+  `_protection_column_indices` elegantly handles the "everything except helpers"
+  case without special-casing the pass logic
+
+* **Reuse of `_helper_column_names_from_value` and `_derived_helper_column_names`**
+  avoids duplicating the helper-resolution logic already proven in `StylePass`
+
+* **Workbook-view integration** keeps protection orthogonal to helper-column
+  styling: `editable_columns` is a convenience shorthand that writes into
+  `protection.editable_columns`; a full `protection: {...}` mapping is also
+  accepted directly
+
+* **Render-plan emission** correctly unlocks _before_ enabling sheet protection,
+  matching openpyxl semantics (all cells default to locked when protection is
+  activated)
+
+* **`ApplyCellLock(locked=False)`** applied to the full column range (header +
+  data rows) ensures users can edit headers of editable columns if needed
+
+* **Frozen dataclasses** for both render ops — immutable, hashable, safe
+
+*Minor observations (non-blocking):*
+
+* The `password` field is passed through as plain text to openpyxl's
+  `ws.protection.password`. This is acceptable given the FTR's explicit non-goal
+  "Do not make spreadsheet protection a security boundary." The password is
+  a UI deterrent, not encryption.
+
+* `_protection_column_indices` returns `([], [])` when `editable_columns` is
+  empty. The pass only writes `__protection` when the resolution produces
+  columns. A sheet with `protection: {}` (no editable policy) is therefore
+  silently ignored — reasonable default.
+
+* ODS protection support is a natural follow-up when/if `odfpy` gains
+  table-protection API coverage.
+
+==== Architectural Observations
+
+The implementation correctly extends the IR-pass → render-op → backend
+dispatch chain:
+
+----
+configure_workbook_view (editable_columns / protection)
+  → meta.sheets.<sheet>.protection
+    → ProtectionPass (IR annotation: __protection)
+      → build_render_plan (ApplyCellLock, SetSheetProtection)
+        → openpyxl_renderer (cell.protection + ws.protection)
+        → odf_renderer (skip)
+----
+
+The pass ordering — `ProtectionPass` after `StylePass` — is correct: style
+annotations and protection annotations are independent; neither reads the
+other's output.
+
+Parser `OPTION_HINT_KEYS` inclusion ensures that `protection` options survive
+parse-render-parse roundtrips through the `_meta` carrier.
+
+==== Verdict
+
+Implementation is architecturally sound, correctly layered, well-tested, and
+follows the established IR-pass/render-op patterns. All acceptance criteria
+are met. Accepted without required modifications.

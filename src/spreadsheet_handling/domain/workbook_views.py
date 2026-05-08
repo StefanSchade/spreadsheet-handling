@@ -19,9 +19,11 @@ _RESERVED_FRAME_KEYS = {"_meta"}
 _ALLOWED_SHEET_KEYS = {
     "frame",
     "sheet",
+    "editable_columns",
     "helper_columns",
     "lifecycle",
     "options",
+    "protection",
     "role",
     "canonical",
     "editable",
@@ -44,7 +46,9 @@ _TRANSFORMATION_KEYS = {
 class _SheetSpec:
     frame: str
     sheet: str
+    editable_columns: list[str] | None
     helper_columns: list[str] | None
+    protection: Mapping[str, Any] | None
     lifecycle: Mapping[str, Any]
     options: Mapping[str, Any] | None
 
@@ -139,6 +143,13 @@ def _normalize_sheet_specs(
             raw.get("helper_columns"),
             f"sheets[{index}].helper_columns",
         )
+        editable_columns = _optional_string_list(
+            raw.get("editable_columns"),
+            f"sheets[{index}].editable_columns",
+        )
+        protection = raw.get("protection")
+        if protection is not None and not isinstance(protection, Mapping):
+            raise TypeError(f"sheets entry {index} protection must be a mapping")
         options = raw.get("options")
         if options is not None and not isinstance(options, Mapping):
             raise TypeError(f"sheets entry {index} options must be a mapping")
@@ -146,7 +157,9 @@ def _normalize_sheet_specs(
             _SheetSpec(
                 frame=frame,
                 sheet=sheet,
+                editable_columns=editable_columns,
                 helper_columns=helper_columns,
+                protection=protection,
                 lifecycle=lifecycle,
                 options=options,
             )
@@ -239,6 +252,12 @@ def _merge_sheet_options(meta: dict[str, Any], sheets: list[_SheetSpec]) -> None
                         "helper_columns in top-level sheet spec and options"
                     )
             sheet_options["helper_columns"] = sheet.helper_columns
+        if sheet.editable_columns is not None:
+            protection = dict(sheet_options.get("protection") or sheet.protection or {})
+            protection["editable_columns"] = sheet.editable_columns
+            sheet_options["protection"] = protection
+        elif sheet.protection is not None:
+            sheet_options["protection"] = dict(sheet.protection)
         if not sheet_options:
             continue
         configured[sheet.sheet] = {

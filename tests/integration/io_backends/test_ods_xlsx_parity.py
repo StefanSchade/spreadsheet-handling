@@ -453,3 +453,52 @@ def test_freeze_parse_hint_difference_is_an_explicit_accepted_gap(tmp_path: Path
 
     assert "__freeze" not in xlsx_ir.sheets["Summary"].meta
     assert "__freeze" not in ods_ir.sheets["Summary"].meta
+
+
+@pytest.mark.ftr("FTR-EDITABLE-COLUMNS-AND-PROTECTION-P4A")
+def test_protection_is_xlsx_only_ods_documented_gap(tmp_path: Path) -> None:
+    """XLSX applies protection ops; ODS skips them (documented capability gap)."""
+    from openpyxl import load_workbook
+    from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+    from spreadsheet_handling.rendering.flow import (
+        apply_ir_passes,
+        build_render_plan,
+        default_p1_passes,
+    )
+    from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import (
+        render_workbook as render_xlsx,
+    )
+    from spreadsheet_handling.io_backends.ods.odf_renderer import (
+        render_workbook as render_ods,
+    )
+
+    frames = {
+        "data": pd.DataFrame(
+            [{"id": "v1", "value": 42, "helper_note": "auto"}]
+        )
+    }
+    meta = {
+        "sheets": {
+            "data": {
+                "protection": {"editable_columns": ["value"]},
+            }
+        }
+    }
+    ir = compose_workbook(frames, meta)
+    apply_ir_passes(ir, default_p1_passes())
+    plan = build_render_plan(ir)
+
+    xlsx_path = tmp_path / "protected.xlsx"
+    ods_path = tmp_path / "protected.ods"
+    render_xlsx(plan, xlsx_path)
+    render_ods(plan, ods_path)
+
+    # XLSX: protection applied
+    wb = load_workbook(xlsx_path)
+    ws = wb.active
+    assert ws.protection.sheet is True
+    assert ws.cell(row=2, column=2).protection.locked is False
+
+    # ODS: file produced without error (protection is a documented gap)
+    assert ods_path.exists()
+

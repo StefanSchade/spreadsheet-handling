@@ -27,6 +27,8 @@ from spreadsheet_handling.rendering.plan import (
     WriteDataBlock,
     WriteMeta,
     DefineNamedRange,
+    SetSheetProtection,
+    ApplyCellLock,
 )
 from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
 from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
@@ -309,6 +311,21 @@ def _execute_render_op(
 
     if isinstance(op, DefineNamedRange):
         _define_named_range(op, wb)
+        return
+
+    if isinstance(op, SetSheetProtection):
+        ws = _get_ws(wb, op.sheet)
+        ws.protection.sheet = True
+        ws.protection.password = op.password
+        return
+
+    if isinstance(op, ApplyCellLock):
+        ws = _get_ws(wb, op.sheet)
+        from openpyxl.styles import Protection as CellProtection
+
+        prot = CellProtection(locked=op.locked)
+        for r in range(op.from_row, op.to_row + 1):
+            ws.cell(row=r, column=op.col).protection = prot
         return
 
 
