@@ -9,6 +9,7 @@ from .core import (
     ValidationPass,
     MetaPass,
     NamedRangePass,
+    ProtectionPass,
     IRPass,
 )
 from ..ir import WorkbookIR
@@ -34,6 +35,7 @@ def apply_all(ir: WorkbookIR, meta: dict) -> WorkbookIR:
         MetaPass(),
         ValidationPass(),
         StylePass(),
+        ProtectionPass(),
         FilterPass(),
         FreezePass(),
         ColumnWidthPass(),

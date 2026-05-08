@@ -13,11 +13,14 @@ from spreadsheet_handling.domain.frame_lifecycle import (
     mark_source_if_unclassified,
     write_frame_lifecycle,
 )
+from spreadsheet_handling.rendering.formulas import lookup_formula
 
 Frames = dict[str, Any]
 
 _VALID_HELPER_POSITIONS = {"after_data", "before_key"}
 _VALID_MISSING_MODES = {"fail", "empty"}
+_VALUE_MODES = {"value", "values"}
+_FORMULA_MODES = {"formula", "formulas"}
 
 
 def enrich_lookup(
@@ -32,6 +35,7 @@ def enrich_lookup(
     helpers: dict[str, Any] | str | None = None,
     order: dict[str, Any] | None = None,
     missing: str | None = None,
+    helper_value_mode: str | None = None,
 ) -> Frames:
     """Enrich *source* with helper columns from *lookup* by joining on configured keys.
 
@@ -67,6 +71,11 @@ def enrich_lookup(
         ``"fail"`` raises on unmatched rows.
         ``"empty"`` fills missing helper values with ``""``.
         When omitted and a resolved helper policy exists, the policy value is used.
+    helper_value_mode:
+        ``"values"`` (default) merges copied helper values via join.
+        ``"formula"`` stores backend-neutral ``LookupFormulaSpec`` objects as
+        cell values so the rendered workbook shows live XLOOKUP formulas
+        referencing the lookup sheet.
     """
     policy = _resolve_policy(lookup, frames)
     join_keys = _resolve_join_keys(
@@ -78,6 +87,7 @@ def enrich_lookup(
     )
     missing_mode = _resolve_missing(missing, policy, lookup)
     order_cfg = _resolve_order(order, policy, lookup)
+    value_mode = _resolve_value_mode(helper_value_mode, policy)
 
     if missing_mode not in _VALID_MISSING_MODES:
         raise ValueError(
@@ -105,12 +115,27 @@ def enrich_lookup(
             _check_allowed(projection_fields, allowed, lookup)
         _check_column_conflict(source_df, join_keys, projection_fields, source)
 
-    helper_cols = _build_helper_projection(lookup_df, join_keys, projection_fields)
+    use_formulas = value_mode in _FORMULA_MODES
 
-    enriched = source_df.merge(helper_cols, on=join_keys, how="left")
+    if use_formulas and sort_by:
+        lookup_sort_cols = [c for c in sort_by if c not in source_df.columns]
+        if lookup_sort_cols:
+            raise ValueError(
+                f"sort_by columns {lookup_sort_cols} from the lookup frame "
+                "cannot be used with helper_value_mode='formula'; "
+                "sort_by is only supported for source-frame columns in formula mode"
+            )
 
-    if missing_mode == "fail":
-        _check_unmatched_rows(enriched, source_df, join_keys, fields, source, lookup)
+    if use_formulas and fields is not None:
+        enriched = _build_formula_enrichment(
+            source_df, lookup, join_keys, fields, missing_mode,
+        )
+    else:
+        helper_cols = _build_helper_projection(lookup_df, join_keys, projection_fields)
+        enriched = source_df.merge(helper_cols, on=join_keys, how="left")
+
+        if missing_mode == "fail":
+            _check_unmatched_rows(enriched, source_df, join_keys, fields, source, lookup)
 
     helper_position = order_cfg.get("helper_position", "after_data")
     if helper_position not in _VALID_HELPER_POSITIONS:
@@ -127,7 +152,8 @@ def enrich_lookup(
     if helper_position == "before_key" and fields is not None:
         enriched = _reorder_helpers_before_key(enriched, join_keys, fields)
 
-    enriched = enriched.where(pd.notnull(enriched), "")
+    if not use_formulas:
+        enriched = enriched.where(pd.notnull(enriched), "")
 
     out = dict(frames)
     out[output] = enriched
@@ -425,6 +451,43 @@ def _build_helper_projection(
         return lookup_df.loc[:, join_keys].copy()
     cols = list(dict.fromkeys(join_keys + fields))
     return lookup_df.loc[:, cols].copy()
+
+
+def _resolve_value_mode(
+    inline: str | None,
+    policy: dict[str, Any] | None,
+) -> str:
+    policy_mode = policy.get("helper_value_mode") if policy is not None else None
+    mode = str(inline or policy_mode or "values").lower()
+    valid = _VALUE_MODES | _FORMULA_MODES
+    if mode not in valid:
+        raise ValueError(
+            f"helper_value_mode must be one of {sorted(valid)}; got {mode!r}"
+        )
+    return mode
+
+
+def _build_formula_enrichment(
+    source_df: pd.DataFrame,
+    lookup: str,
+    join_keys: list[str],
+    fields: list[str],
+    missing_mode: str,
+) -> pd.DataFrame:
+    """Build an enriched frame with LookupFormulaSpec objects as cell values."""
+    enriched = source_df.copy()
+    source_key = join_keys[0]
+    missing = "" if missing_mode == "empty" else ""
+    for field in fields:
+        formula = lookup_formula(
+            source_key_column=source_key,
+            lookup_sheet=lookup,
+            lookup_key_column=source_key,
+            lookup_value_column=field,
+            missing=missing,
+        )
+        enriched[field] = [formula for _ in range(len(enriched))]
+    return enriched
 
 
 def _reorder_helpers_before_key(

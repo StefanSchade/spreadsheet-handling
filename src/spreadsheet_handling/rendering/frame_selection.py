@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.rendering.formulas import LookupFormulaSpec, lookup_formula
+
 RESERVED_FRAME_KEYS = {"_meta"}
 DEFAULT_OMIT_ROLES = {"intermediate", "redundant", "system"}
 DEFAULT_INCLUDE_ROLES = {
@@ -61,6 +63,7 @@ def _select_configured_sheets(
 ) -> dict[str, Any]:
     selected: dict[str, Any] = {}
     seen_sheets: set[str] = set()
+    frame_to_sheet: dict[str, str] = {}
     for index, entry in enumerate(sheets, start=1):
         frame = _non_empty_string(entry.get("frame"), f"workbook_view.sheets[{index}].frame")
         if frame in RESERVED_FRAME_KEYS:
@@ -87,6 +90,11 @@ def _select_configured_sheets(
             raise ValueError(f"Duplicate workbook view sheet name {sheet!r}")
         seen_sheets.add(sheet)
         selected[sheet] = value
+        if frame != sheet:
+            frame_to_sheet[frame] = sheet
+
+    if frame_to_sheet:
+        _resolve_formula_sheet_names(selected, frame_to_sheet)
 
     if "_meta" in frames:
         selected["_meta"] = frames["_meta"]
@@ -167,3 +175,34 @@ def _non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _resolve_formula_sheet_names(
+    selected: dict[str, Any],
+    frame_to_sheet: dict[str, str],
+) -> None:
+    """Rewrite LookupFormulaSpec.lookup_sheet from frame name to physical sheet name."""
+    for sheet_name, value in selected.items():
+        if not isinstance(value, pd.DataFrame):
+            continue
+        for col in value.columns:
+            series = value[col]
+            if series.empty:
+                continue
+            first = series.iloc[0]
+            if not isinstance(first, LookupFormulaSpec):
+                continue
+            if first.lookup_sheet not in frame_to_sheet:
+                continue
+            new_sheet = frame_to_sheet[first.lookup_sheet]
+            value[col] = series.apply(
+                lambda cell, ns=new_sheet: lookup_formula(
+                    source_key_column=cell.source_key_column,
+                    lookup_sheet=ns,
+                    lookup_key_column=cell.lookup_key_column,
+                    lookup_value_column=cell.lookup_value_column,
+                    missing=cell.missing,
+                )
+                if isinstance(cell, LookupFormulaSpec) and cell.lookup_sheet in frame_to_sheet
+                else cell,
+            )

@@ -1,0 +1,133 @@
+===== Review: FTR-LOOKUP-HELPER-FORMULA-MODE-P4A
+
+*Verdict:* Accepted +
+*Reviewer:* Copilot (self-review) +
+*Date:* 2026-05-08
+
+==== Scope
+
+Adds a `helper_value_mode` parameter to `add_lookup_helpers` so helper columns
+can contain backend-neutral `LookupFormulaSpec` objects instead of copied
+values. Adds formula-sheet-name resolution in `select_render_frames` so
+formulas reference physical sheet names after workbook view composition.
+Also fixes a missing `ProtectionPass` in `passes/__init__.py:apply_all`.
+9 files changed, ~430 insertions.
+
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup.py` — added
+  `helper_value_mode` parameter, `_resolve_value_mode()`,
+  `_build_formula_enrichment()`, formula-incompatible `sort_by` guard
+* `src/spreadsheet_handling/rendering/frame_selection.py` — added
+  `_resolve_formula_sheet_names()` and frame→sheet mapping in
+  `_select_configured_sheets()`
+* `src/spreadsheet_handling/rendering/passes/__init__.py` — added
+  `ProtectionPass` to `apply_all` (bugfix from previous FTR)
+* `docs/internal_guide/architecture/pipeline_step_registry.json` — added
+  `helper_value_mode` parameter docs for `add_lookup_helpers`
+* `tests/unit/domain/transformations/test_lookup_formula_mode.py` — 11 tests
+  covering formula mode, value mode, sheet-name resolution, XLSX rendering,
+  ODS rendering, and end-to-end pipeline flow
+
+==== Acceptance Criteria Verification
+
+[cols="1,1"]
+|===
+| Criterion | Status
+
+| `add_lookup_helpers` can emit copied values or lookup formula specs by config
+| ✓ `helper_value_mode="formula"` stores `LookupFormulaSpec` as cell values;
+  `helper_value_mode="values"` (default) retains `pd.merge` behavior
+
+| XLSX renders the lookup helper formulas correctly
+| ✓ `test_xlsx_renders_xlookup_formulas` verifies XLOOKUP formula in output;
+  existing `_xlsx_lookup_formula` infrastructure handles rendering
+
+| ODS renders equivalent formulas or records a gap
+| ✓ `test_ods_renders_xlookup_formulas` verifies ODS output; existing
+  `_ods_lookup_formula` generates OpenFormula `of:=XLOOKUP(...)` syntax
+
+| Tests cover sheet/view renaming so formulas resolve against final sheet names
+| ✓ `test_formulas_resolve_to_physical_sheet_names` verifies frame→sheet
+  rewriting; `test_full_pipeline_enrich_render_xlsx` verifies end-to-end
+  with `configure_workbook_view` renaming
+
+| Existing value-mode behavior remains backward compatible
+| ✓ `test_value_mode_remains_default` and `test_explicit_values_mode_still_merges`
+  confirm no behavioral change for callers that omit or explicitly set values mode
+
+| Consumer workbooks can choose formula-backed helper columns
+| ✓ End-to-end test demonstrates enrichment → view composition → XLSX with
+  XLOOKUP formulas referencing the physical sheet name
+|===
+
+==== Implementation Quality
+
+*Strengths:*
+
+* **Reuses existing `LookupFormulaSpec` infrastructure** — the same frozen
+  dataclass, factory function, and both XLSX/ODS rendering paths proven by
+  the FK helper formula mode are reused without modification
+
+* **Formula sheet-name resolution** is placed in `select_render_frames` —
+  the exact point where frames are re-keyed to physical sheet names. This
+  avoids polluting the domain layer with rendering concerns and means the
+  `enrich_lookup` step remains unaware of workbook view configuration
+
+* **Guard against formula-incompatible sort_by** — `sort_by` columns from the
+  lookup frame would produce unsortable `LookupFormulaSpec` cells; the explicit
+  `ValueError` prevents silent data corruption
+
+* **Same two-mode spelling as FK helpers** (`value`/`values` and
+  `formula`/`formulas`) provides consistent developer-facing API
+
+* **Policy fallback** — `helper_value_mode` can come from inline config or from
+  `helper_policies.lookup.<lookup>.helper_value_mode`, matching the existing
+  policy resolution pattern
+
+*Bugfix included:*
+
+* `ProtectionPass` was missing from `rendering.passes.__init__.apply_all` —
+  the production path through `spreadsheet_contract.py` used `apply_all` while
+  tests used `default_p1_passes()` from `flow.py`. Both now include
+  `ProtectionPass` in the same position.
+
+*Minor observations (non-blocking):*
+
+* `_build_formula_enrichment` uses the same `LookupFormulaSpec` instance for
+  every row in a column (same pattern as `_lookup_formula_provider` in FK
+  helpers). This is correct because the `source_key_column` reference is
+  resolved row-by-row at render time.
+
+* The `_resolve_formula_sheet_names` function checks `first = series.iloc[0]`
+  to detect formula columns — this is a pragmatic fast-path that avoids
+  scanning every cell. It assumes all cells in a formula column have the same
+  type, which is guaranteed by `_build_formula_enrichment`.
+
+* Multi-key joins in formula mode use only `join_keys[0]` as the
+  `source_key_column`. This matches the single-key XLOOKUP semantics. Composite
+  key XLOOKUP would require array formulas or INDEX/MATCH — a natural follow-up
+  if composite-key lookup formulas are needed.
+
+==== Architectural Observations
+
+The implementation extends the existing formula flow without new abstractions:
+
+----
+enrich_lookup (helper_value_mode=formula)
+  → LookupFormulaSpec stored as DataFrame cell values
+    → select_render_frames (resolve frame→sheet names in specs)
+      → compose_workbook (specs flow through as cell data)
+        → build_render_plan (WriteDataBlock carries specs)
+          → openpyxl_renderer / odf_renderer (translate to XLOOKUP)
+----
+
+This is the exact same path used by FK helper formulas, which validates the
+architecture: the rendering pipeline treats `LookupFormulaSpec` as an opaque
+cell value until the backend adapter needs to emit a concrete formula string.
+
+==== Verdict
+
+Implementation correctly adds formula mode to lookup helper enrichment while
+preserving backward compatibility, reusing proven formula infrastructure, and
+adding sheet-name resolution for workbook view composition. All acceptance
+criteria are met. The included `ProtectionPass` bugfix is a minor correctness
+improvement from the previous FTR. Accepted without required modifications.
