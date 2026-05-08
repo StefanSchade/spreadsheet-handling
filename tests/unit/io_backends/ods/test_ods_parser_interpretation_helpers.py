@@ -10,7 +10,6 @@ from spreadsheet_handling.io_backends.ods.parser_interpretation import (
 from spreadsheet_handling.rendering.formulas import list_literal_formula
 from spreadsheet_handling.rendering.ir import DataValidationSpec
 
-
 pytestmark = pytest.mark.ftr("FTR-ODS-CALC-ADAPTER-IMPLEMENTATION-P3J")
 
 
@@ -23,6 +22,7 @@ def test_build_sheet_meta_hints_merges_workbook_defaults_and_sheet_overrides():
             "Products": {
                 "freeze_header": False,
                 "header_fill_rgb": "#CCE5FF",
+                "helper_columns": ["data_type"],
             }
         },
     }
@@ -34,6 +34,7 @@ def test_build_sheet_meta_hints_merges_workbook_defaults_and_sheet_overrides():
         "auto_filter": True,
         "helper_prefix": "_",
         "header_fill_rgb": "#CCE5FF",
+        "helper_columns": ["data_type"],
     }
 
 

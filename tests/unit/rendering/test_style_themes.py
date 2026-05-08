@@ -5,6 +5,7 @@ Covers:
 - build_render_plan emits ApplyHeaderStyle and ApplyColumnStyle ops
 - Full IR path renders XLSX with configured header fill, autofilter, freeze, helper highlight
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,6 +38,7 @@ pytestmark = pytest.mark.ftr("FTR-STYLE-THEMES")
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_ir(
     headers: list[str],
     n_data_rows: int = 3,
@@ -65,6 +67,7 @@ def _make_ir(
 # ---------------------------------------------------------------------------
 # StylePass unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestStylePass:
 
@@ -105,6 +108,70 @@ class TestStylePass:
         assert set(hc["cols"]) == {2, 3}
         assert hc["fill"] == "#FFCC00"
 
+    @pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+    def test_explicit_helper_columns_from_options(self) -> None:
+        ir = _make_ir(
+            ["ID", "value_label_de", "data_type"],
+            options={
+                "helper_columns": ["value_label_de", "data_type"],
+                "helper_fill_rgb": "#FFF2CC",
+            },
+        )
+        StylePass().apply(ir)
+
+        hc = ir.sheets["data"].meta["__helper_cols"]
+        assert hc["cols"] == [2, 3]
+        assert hc["fill"] == "#FFF2CC"
+
+    @pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+    def test_helper_columns_from_lookup_provenance(self) -> None:
+        ir = _make_ir(["ID", "value_label_de", "editable_value"])
+        ir.hidden_sheets["_meta"] = SheetIR(
+            name="_meta",
+            meta={
+                "workbook_meta_blob": {
+                    "derived": {
+                        "sheets": {
+                            "data": {"enrich_lookup": {"helper_columns": ["value_label_de"]}}
+                        }
+                    }
+                }
+            },
+        )
+        StylePass().apply(ir)
+
+        hc = ir.sheets["data"].meta["__helper_cols"]
+        assert hc["cols"] == [2]
+
+    @pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+    def test_helper_columns_from_renamed_workbook_view_provenance(self) -> None:
+        ir = _make_ir(["ID", "value_label_de", "editable_value"])
+        sheet = ir.sheets.pop("data")
+        sheet.name = "Variables"
+        sheet.tables[0].frame_name = "Variables"
+        ir.sheets["Variables"] = sheet
+        ir.hidden_sheets["_meta"] = SheetIR(
+            name="_meta",
+            meta={
+                "workbook_meta_blob": {
+                    "workbook_view": {
+                        "sheets": [{"frame": "variables_view", "sheet": "Variables", "order": 0}]
+                    },
+                    "derived": {
+                        "sheets": {
+                            "variables_view": {
+                                "enrich_lookup": {"helper_columns": ["value_label_de"]}
+                            }
+                        }
+                    },
+                }
+            },
+        )
+        StylePass().apply(ir)
+
+        hc = ir.sheets["Variables"].meta["__helper_cols"]
+        assert hc["cols"] == [2]
+
     def test_no_helper_cols_when_none_present(self) -> None:
         ir = _make_ir(["id", "name", "value"])
         StylePass().apply(ir)
@@ -121,6 +188,7 @@ class TestStylePass:
 # ---------------------------------------------------------------------------
 # FilterPass and FreezePass
 # ---------------------------------------------------------------------------
+
 
 class TestFilterAndFreezePass:
 
@@ -156,6 +224,7 @@ class TestFilterAndFreezePass:
 # RenderPlan generation
 # ---------------------------------------------------------------------------
 
+
 class TestBuildRenderPlan:
 
     def test_header_style_ops_emitted(self) -> None:
@@ -175,9 +244,9 @@ class TestBuildRenderPlan:
 
         col_ops = [op for op in plan.ops if isinstance(op, ApplyColumnStyle)]
         assert len(col_ops) == 1
-        assert col_ops[0].col == 2         # _helper_name is column 2
-        assert col_ops[0].from_row == 2    # data starts at row 2
-        assert col_ops[0].to_row == 6      # 5 data rows → row 2..6
+        assert col_ops[0].col == 2  # _helper_name is column 2
+        assert col_ops[0].from_row == 2  # data starts at row 2
+        assert col_ops[0].to_row == 6  # 5 data rows → row 2..6
         assert col_ops[0].fill_rgb == "#E8F0FE"
 
     def test_autofilter_op_emitted(self) -> None:
@@ -210,6 +279,7 @@ class TestBuildRenderPlan:
 # XLSX output verification (end-to-end through IR path)
 # ---------------------------------------------------------------------------
 
+
 class TestXlsxStyleOutput:
     def test_header_bold_and_fill_in_xlsx(self, tmp_path: Path) -> None:
         """Verify that header cells in the output workbook have bold font and fill."""
@@ -229,6 +299,7 @@ class TestXlsxStyleOutput:
         ws = wb.active
         assert ws.cell(row=1, column=1).font.bold is True
         assert ws.cell(row=1, column=1).fill.fgColor.rgb is not None
+
     def test_autofilter_present(self, tmp_path: Path) -> None:
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
         from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
@@ -245,6 +316,7 @@ class TestXlsxStyleOutput:
         wb = load_workbook(out)
         ws = wb.active
         assert ws.auto_filter.ref is not None
+
     def test_helper_column_fill_in_xlsx(self, tmp_path: Path) -> None:
         """Verify helper columns get a distinct fill color in the output."""
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
@@ -252,10 +324,12 @@ class TestXlsxStyleOutput:
         from openpyxl import load_workbook
 
         frames = {
-            "products": pd.DataFrame([
-                {"id": "a", "name": "Alpha", "_helper": "h1"},
-                {"id": "b", "name": "Bravo", "_helper": "h2"},
-            ])
+            "products": pd.DataFrame(
+                [
+                    {"id": "a", "name": "Alpha", "_helper": "h1"},
+                    {"id": "b", "name": "Bravo", "_helper": "h2"},
+                ]
+            )
         }
         ir = compose_workbook(frames, None)
         apply_ir_passes(ir, default_p1_passes())
@@ -272,3 +346,39 @@ class TestXlsxStyleOutput:
         # helper cell should have fill, normal data cell should not
         assert helper_cell.fill.fgColor.rgb != "00000000"  # not default/empty
         assert normal_cell.fill.fgColor.rgb == "00000000"  # default/empty
+
+    @pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+    def test_explicit_helper_column_fill_in_xlsx(self, tmp_path: Path) -> None:
+        from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
+        from openpyxl import load_workbook
+
+        frames = {
+            "products": pd.DataFrame(
+                [
+                    {"id": "a", "label": "Alpha", "data_type": "string"},
+                    {"id": "b", "label": "Bravo", "data_type": "string"},
+                ]
+            )
+        }
+        meta = {
+            "sheets": {
+                "products": {
+                    "helper_columns": ["data_type"],
+                    "helper_fill_rgb": "#FFF2CC",
+                }
+            }
+        }
+        ir = compose_workbook(frames, meta)
+        apply_ir_passes(ir, default_p1_passes())
+        plan = build_render_plan(ir)
+
+        out = tmp_path / "explicit-helper.xlsx"
+        render_workbook(plan, out)
+
+        wb = load_workbook(out)
+        ws = wb.active
+        helper_cell = ws.cell(row=2, column=3)
+        normal_cell = ws.cell(row=2, column=2)
+        assert helper_cell.fill.fgColor.rgb == "00FFF2CC"
+        assert normal_cell.fill.fgColor.rgb == "00000000"

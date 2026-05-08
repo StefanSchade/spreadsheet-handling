@@ -403,6 +403,41 @@ def test_configured_workbook_view_renders_portably_across_xlsx_and_ods(tmp_path:
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
 
 
+@pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+def test_explicit_helper_column_style_metadata_is_portable(tmp_path: Path) -> None:
+    frames = {
+        "Variables": pd.DataFrame(
+            [
+                {"ID": "v1", "value_label_de": "Rate", "editable_value": "x"},
+            ]
+        ),
+        "_meta": {
+            "sheets": {
+                "Variables": {
+                    "helper_columns": ["value_label_de"],
+                    "helper_fill_rgb": "#FFF2CC",
+                }
+            }
+        },
+    }
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="explicit-helper-style")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    pd.testing.assert_frame_equal(
+        xlsx_back["Variables"],
+        frames["Variables"],
+        check_dtype=False,
+    )
+    pd.testing.assert_frame_equal(
+        ods_back["Variables"],
+        frames["Variables"],
+        check_dtype=False,
+    )
+    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+
+
 def test_freeze_parse_hint_difference_is_an_explicit_accepted_gap(tmp_path: Path) -> None:
     frames = _supported_frames()
     xlsx_path, ods_path = _write_both(frames, tmp_path, stem="freeze-gap")

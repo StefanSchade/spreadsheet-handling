@@ -3,13 +3,13 @@
 These checks keep the registry structurally well-formed and preserve the
 reviewed maintenance contract that separates canonical and rendering-side meta.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 import yaml
-
 
 pytestmark = [
     pytest.mark.ftr("FTR-META-REGISTRY-P3H"),
@@ -73,6 +73,7 @@ def test_meta_registry_seeds_current_known_entries():
         "header_fill_rgb",
         "helper_fill_rgb",
         "helper_prefix",
+        "helper_columns",
         "frame_lifecycle",
         "workbook_view",
         "sheets",

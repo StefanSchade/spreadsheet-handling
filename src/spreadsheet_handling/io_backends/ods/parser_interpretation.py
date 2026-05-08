@@ -1,18 +1,18 @@
-from __future__ import annotations
-
 """Spreadsheet-semantic table interpretation for the ODS read path."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from spreadsheet_handling.rendering.ir import DataValidationSpec, SheetIR, TableBlock
 
-
 OPTION_HINT_KEYS = (
     "freeze_header",
     "auto_filter",
     "header_fill_rgb",
     "helper_fill_rgb",
+    "helper_columns",
     "helper_prefix",
 )
 
@@ -32,11 +32,7 @@ def build_sheet_meta_hints(
     sheet_name: str,
 ) -> dict[str, Any]:
     """Merge workbook defaults with sheet-local overrides for one visible sheet."""
-    meta_hints = {
-        key: workbook_meta[key]
-        for key in OPTION_HINT_KEYS
-        if key in workbook_meta
-    }
+    meta_hints = {key: workbook_meta[key] for key in OPTION_HINT_KEYS if key in workbook_meta}
     sheet_meta_hints = (workbook_meta.get("sheets") or {}).get(sheet_name, {})
     if isinstance(sheet_meta_hints, dict):
         meta_hints.update(sheet_meta_hints)
@@ -123,10 +119,9 @@ def _parse_table_block(
     header_map = {header: idx + 1 for idx, header in enumerate(headers)}
     data: list[list[Any]] = []
     for row in range(data_start_row, data_start_row + n_data_rows):
-        data.append([
-            str(_grid_value(parsed, row, col) or "")
-            for col in range(left, left + n_cols)
-        ])
+        data.append(
+            [str(_grid_value(parsed, row, col) or "") for col in range(left, left + n_cols)]
+        )
 
     return TableBlock(
         frame_name=frame_name,

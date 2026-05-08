@@ -3,6 +3,7 @@
 These guards verify that reviewed registry entries resolve to permitted layers,
 classifications, and code references instead of drifting silently.
 """
+
 from __future__ import annotations
 
 from importlib import import_module
@@ -10,7 +11,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 
 pytestmark = pytest.mark.ftr("FTR-META-REGISTRY-HARDENING-P3I")
 
@@ -75,7 +75,10 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "header_fill_rgb": ("meta_canonical", "canonical_meta"),
         "helper_fill_rgb": ("meta_canonical", "canonical_meta"),
         "helper_prefix": ("meta_canonical", "canonical_meta"),
+        "helper_columns": ("meta_canonical", "canonical_meta"),
         "helper_policies": ("meta_canonical", "canonical_meta"),
+        "frame_lifecycle": ("meta_canonical", "canonical_meta"),
+        "workbook_view": ("meta_canonical", "canonical_meta"),
         "constraints": ("meta_canonical", "canonical_meta"),
         "legend_blocks": ("meta_canonical", "canonical_meta"),
         "xref_crosstable": ("meta_canonical", "canonical_meta"),
@@ -95,8 +98,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
     }
 
     actual_profiles = {
-        entry["name"]: (entry["layer"], entry["classification"])
-        for entry in registry["entries"]
+        entry["name"]: (entry["layer"], entry["classification"]) for entry in registry["entries"]
     }
 
     assert actual_profiles == expected_profiles

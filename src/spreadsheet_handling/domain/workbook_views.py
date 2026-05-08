@@ -19,6 +19,7 @@ _RESERVED_FRAME_KEYS = {"_meta"}
 _ALLOWED_SHEET_KEYS = {
     "frame",
     "sheet",
+    "helper_columns",
     "lifecycle",
     "options",
     "role",
@@ -43,6 +44,7 @@ _TRANSFORMATION_KEYS = {
 class _SheetSpec:
     frame: str
     sheet: str
+    helper_columns: list[str] | None
     lifecycle: Mapping[str, Any]
     options: Mapping[str, Any] | None
 
@@ -133,6 +135,10 @@ def _normalize_sheet_specs(
         seen_sheets.add(sheet)
 
         lifecycle = _lifecycle_mapping(raw, index=index)
+        helper_columns = _optional_string_list(
+            raw.get("helper_columns"),
+            f"sheets[{index}].helper_columns",
+        )
         options = raw.get("options")
         if options is not None and not isinstance(options, Mapping):
             raise TypeError(f"sheets entry {index} options must be a mapping")
@@ -140,6 +146,7 @@ def _normalize_sheet_specs(
             _SheetSpec(
                 frame=frame,
                 sheet=sheet,
+                helper_columns=helper_columns,
                 lifecycle=lifecycle,
                 options=options,
             )
@@ -218,9 +225,26 @@ def _write_sheet_lifecycle(out: dict[str, Any], sheet: _SheetSpec) -> None:
 def _merge_sheet_options(meta: dict[str, Any], sheets: list[_SheetSpec]) -> None:
     configured = dict(meta.get("sheets") or {})
     for sheet in sheets:
-        if sheet.options is None:
+        sheet_options = dict(sheet.options or {})
+        if sheet.helper_columns is not None:
+            existing = sheet_options.get("helper_columns")
+            if existing is not None:
+                existing_columns = _string_list(
+                    existing,
+                    f"sheets.{sheet.sheet}.options.helper_columns",
+                )
+                if existing_columns != sheet.helper_columns:
+                    raise ValueError(
+                        f"sheets entry for {sheet.sheet!r} defines conflicting "
+                        "helper_columns in top-level sheet spec and options"
+                    )
+            sheet_options["helper_columns"] = sheet.helper_columns
+        if not sheet_options:
             continue
-        configured[sheet.sheet] = {**dict(configured.get(sheet.sheet) or {}), **dict(sheet.options)}
+        configured[sheet.sheet] = {
+            **dict(configured.get(sheet.sheet) or {}),
+            **sheet_options,
+        }
     if configured:
         meta["sheets"] = configured
 
@@ -242,3 +266,9 @@ def _string_list(values: Iterable[str], field_name: str) -> list[str]:
     if invalid:
         raise ValueError(f"{field_name} must contain non-empty strings: {invalid!r}")
     return result
+
+
+def _optional_string_list(value: Any, field_name: str) -> list[str] | None:
+    if value is None:
+        return None
+    return _string_list(value, field_name)

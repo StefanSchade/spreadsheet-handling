@@ -88,6 +88,32 @@ def test_configure_workbook_view_accepts_mapping_shorthand() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
+def test_configure_workbook_view_writes_helper_columns_to_sheet_options() -> None:
+    frames = {
+        "variables_view": pd.DataFrame(
+            [{"ID": "v1", "value_label_de": "Rate", "data_type": "amount"}]
+        )
+    }
+
+    out = configure_workbook_view(
+        frames,
+        sheets=[
+            {
+                "frame": "variables_view",
+                "sheet": "Variables",
+                "helper_columns": ["value_label_de", "data_type"],
+                "options": {"helper_fill_rgb": "#FFF2CC"},
+            }
+        ],
+    )
+
+    assert out["_meta"]["sheets"]["Variables"] == {
+        "helper_columns": ["value_label_de", "data_type"],
+        "helper_fill_rgb": "#FFF2CC",
+    }
+
+
 def test_configure_workbook_view_rejects_missing_duplicate_and_transform_specs() -> None:
     frames = {
         "variables_view": pd.DataFrame([{"variable_id": "v1"}]),
@@ -114,6 +140,19 @@ def test_configure_workbook_view_rejects_missing_duplicate_and_transform_specs()
                     "frame": "variables_view",
                     "sheet": "Variables",
                     "where": {"column": "active", "equals": True},
+                }
+            ],
+        )
+
+    with pytest.raises(ValueError, match="conflicting helper_columns"):
+        configure_workbook_view(
+            frames,
+            sheets=[
+                {
+                    "frame": "variables_view",
+                    "sheet": "Variables",
+                    "helper_columns": ["value_label_de"],
+                    "options": {"helper_columns": ["data_type"]},
                 }
             ],
         )

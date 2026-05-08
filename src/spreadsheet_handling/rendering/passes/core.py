@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Mapping
 import logging
 import re
 from dataclasses import dataclass
@@ -9,8 +10,105 @@ from ..ir import WorkbookIR, SheetIR, TableBlock, DataValidationSpec, NamedRange
 log = logging.getLogger("sheets.validation")
 _LEGEND_DROPDOWN_WARNING_THRESHOLD = 50
 
+
 class IRPass(Protocol):
     def apply(self, doc: WorkbookIR) -> WorkbookIR: ...
+
+
+def _helper_column_names_from_value(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, Mapping):
+        if "columns" in raw:
+            return _helper_column_names_from_value(raw.get("columns"))
+        if "column" in raw:
+            return _helper_column_names_from_value(raw.get("column"))
+        return []
+
+    try:
+        values = list(raw)
+    except TypeError:
+        return []
+
+    names: list[str] = []
+    for value in values:
+        if isinstance(value, Mapping):
+            value = value.get("column") or value.get("name")
+        if value is None:
+            continue
+        text = str(value)
+        if text.strip():
+            names.append(text)
+    return list(dict.fromkeys(names))
+
+
+def _sheet_source_candidates(
+    workbook_meta: Mapping[str, Any],
+    *,
+    sheet_name: str,
+    frame_name: str,
+) -> list[str]:
+    candidates = [sheet_name, frame_name]
+    view = workbook_meta.get("workbook_view")
+    if isinstance(view, Mapping):
+        sheets = view.get("sheets")
+        if isinstance(sheets, list):
+            for entry in sheets:
+                if not isinstance(entry, Mapping):
+                    continue
+                rendered_sheet = str(entry.get("sheet") or entry.get("frame") or "")
+                source_frame = entry.get("frame")
+                if rendered_sheet == sheet_name and source_frame is not None:
+                    candidates.append(str(source_frame))
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def _derived_helper_column_names(
+    workbook_meta: Mapping[str, Any],
+    *,
+    sheet_name: str,
+    frame_name: str,
+) -> list[str]:
+    derived = workbook_meta.get("derived")
+    if not isinstance(derived, Mapping):
+        return []
+    derived_sheets = derived.get("sheets")
+    if not isinstance(derived_sheets, Mapping):
+        return []
+
+    names: list[str] = []
+    for candidate in _sheet_source_candidates(
+        workbook_meta,
+        sheet_name=sheet_name,
+        frame_name=frame_name,
+    ):
+        sheet_meta = derived_sheets.get(candidate)
+        if not isinstance(sheet_meta, Mapping):
+            continue
+        names.extend(_helper_column_names_from_value(sheet_meta.get("helper_columns")))
+        enrich_lookup = sheet_meta.get("enrich_lookup")
+        if isinstance(enrich_lookup, Mapping):
+            names.extend(_helper_column_names_from_value(enrich_lookup.get("helper_columns")))
+    return list(dict.fromkeys(names))
+
+
+def _helper_column_indices(
+    table: TableBlock,
+    *,
+    explicit_columns: list[str],
+    helper_prefix: Any,
+) -> list[int]:
+    explicit = set(explicit_columns)
+    prefix = "" if helper_prefix is None else str(helper_prefix)
+    indices: list[int] = []
+    for name, idx in table.header_map.items():
+        text = str(name)
+        if text in explicit or (prefix and text.startswith(prefix)):
+            indices.append(idx)
+    return sorted(set(indices))
+
 
 @dataclass
 class StylePass:
@@ -20,6 +118,7 @@ class StylePass:
     helper_prefix: str = "_"
 
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
+        workbook_meta = _workbook_meta(doc)
         for sh in doc.sheets.values():
             opts: Dict[str, Any] = sh.meta.get("options", {})
 
@@ -42,10 +141,19 @@ class StylePass:
             prefix = opts.get("helper_prefix", self.helper_prefix)
             if helper_fill and sh.tables:
                 t = sh.tables[0]
-                helper_cols = [
-                    idx for name, idx in t.header_map.items()
-                    if str(name).startswith(prefix)
-                ]
+                explicit_columns = _helper_column_names_from_value(opts.get("helper_columns"))
+                explicit_columns.extend(
+                    _derived_helper_column_names(
+                        workbook_meta,
+                        sheet_name=sh.name,
+                        frame_name=t.frame_name,
+                    )
+                )
+                helper_cols = _helper_column_indices(
+                    t,
+                    explicit_columns=list(dict.fromkeys(explicit_columns)),
+                    helper_prefix=prefix,
+                )
                 if helper_cols:
                     sh.meta["__helper_cols"] = {
                         "cols": helper_cols,
@@ -53,6 +161,7 @@ class StylePass:
                     }
 
         return doc
+
 
 @dataclass
 class FilterPass:
@@ -71,6 +180,7 @@ class FilterPass:
                 "bottom_right": (t.top + t.n_rows - 1, t.left + t.n_cols - 1),
             }
         return doc
+
 
 @dataclass
 class FreezePass:
@@ -133,7 +243,9 @@ def _legend_tokens(
 
     entries = spec.get("entries")
     if not isinstance(entries, list):
-        log.warning("from_legend validation references legend block %r without entries", legend_name)
+        log.warning(
+            "from_legend validation references legend block %r without entries", legend_name
+        )
         return None
 
     tokens = [
@@ -194,7 +306,9 @@ class ValidationPass:
                 r2 = int(spec.get("to_row", r1))
                 values = list(map(str, spec.get("values", [])))
                 formula = list_literal_formula(values)
-                dv = DataValidationSpec(kind="list", area=(r1, col, r2, col), formula=formula, allow_empty=True)
+                dv = DataValidationSpec(
+                    kind="list", area=(r1, col, r2, col), formula=formula, allow_empty=True
+                )
                 sh.validations.append(dv)
 
         # New path: workbook-level constraints (column name based)
@@ -237,17 +351,20 @@ class ValidationPass:
 
         return doc
 
+
 @dataclass
 class MetaPass:
     minimal_fields: Optional[List[str]] = None
+
     def __post_init__(self):
         if self.minimal_fields is None:
             self.minimal_fields = ["version", "exported_at", "author"]
+
     def apply(self, doc: WorkbookIR) -> WorkbookIR:
         meta: SheetIR = doc.hidden_sheets.get("_meta") or SheetIR(name="_meta", meta={})
         if "_meta" not in doc.hidden_sheets:
             doc.hidden_sheets["_meta"] = meta
-        for f in (self.minimal_fields or []):
+        for f in self.minimal_fields or []:
             meta.meta.setdefault(f, "")
         meta.meta["_hidden"] = True
         return doc
@@ -255,7 +372,7 @@ class MetaPass:
 
 def _safe_name(s: str) -> str:
     """Sanitise a string for use in the current spreadsheet-safe defined-name subset."""
-    return re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_').lower() or "unnamed"
+    return re.sub(r"[^A-Za-z0-9_]", "_", s).strip("_").lower() or "unnamed"
 
 
 @dataclass
@@ -266,30 +383,43 @@ class NamedRangePass:
                 prefix = _safe_name(sh.name) + "_" + _safe_name(tbl.frame_name)
 
                 # Full table (headers + data)
-                sh.named_ranges.append(NamedRange(
-                    name=f"{prefix}_table",
-                    sheet=sh.name,
-                    area=(tbl.top, tbl.left,
-                          tbl.top + tbl.n_rows - 1, tbl.left + tbl.n_cols - 1),
-                ))
+                sh.named_ranges.append(
+                    NamedRange(
+                        name=f"{prefix}_table",
+                        sheet=sh.name,
+                        area=(
+                            tbl.top,
+                            tbl.left,
+                            tbl.top + tbl.n_rows - 1,
+                            tbl.left + tbl.n_cols - 1,
+                        ),
+                    )
+                )
 
                 # Header area
                 if tbl.header_rows >= 1:
-                    sh.named_ranges.append(NamedRange(
-                        name=f"{prefix}_header",
-                        sheet=sh.name,
-                        area=(tbl.top, tbl.left,
-                              tbl.top + tbl.header_rows - 1, tbl.left + tbl.n_cols - 1),
-                    ))
+                    sh.named_ranges.append(
+                        NamedRange(
+                            name=f"{prefix}_header",
+                            sheet=sh.name,
+                            area=(
+                                tbl.top,
+                                tbl.left,
+                                tbl.top + tbl.header_rows - 1,
+                                tbl.left + tbl.n_cols - 1,
+                            ),
+                        )
+                    )
 
                 # Data body (below headers)
                 data_top = tbl.top + tbl.header_rows
                 data_bot = tbl.top + tbl.n_rows - 1
                 if data_bot >= data_top:
-                    sh.named_ranges.append(NamedRange(
-                        name=f"{prefix}_body",
-                        sheet=sh.name,
-                        area=(data_top, tbl.left,
-                              data_bot, tbl.left + tbl.n_cols - 1),
-                    ))
+                    sh.named_ranges.append(
+                        NamedRange(
+                            name=f"{prefix}_body",
+                            sheet=sh.name,
+                            area=(data_top, tbl.left, data_bot, tbl.left + tbl.n_cols - 1),
+                        )
+                    )
         return doc

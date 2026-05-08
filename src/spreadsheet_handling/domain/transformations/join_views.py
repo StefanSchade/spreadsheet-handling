@@ -75,11 +75,12 @@ def join_frames(
         if left_columns is not None
         else list(left_df.columns)
     )
-    right_selected = (
-        _string_list(right_columns, "right_columns")
-        if right_columns is not None
-        else ([] if how == "semi" else _default_right_columns(right_df, right_join_keys))
-    )
+    if right_columns is not None:
+        right_selected = _string_list(right_columns, "right_columns")
+    elif how == "semi":
+        right_selected = []
+    else:
+        right_selected = _default_right_columns(right_df, right_join_keys)
     _ensure_columns(left_df, left_selected, frame_name=left, field_name="left_columns")
     _ensure_columns(right_df, right_selected, frame_name=right, field_name="right_columns")
 

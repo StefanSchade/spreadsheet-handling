@@ -9,12 +9,12 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from spreadsheet_handling.rendering.ir import DataValidationSpec, SheetIR, TableBlock
 
-
 OPTION_HINT_KEYS = (
     "freeze_header",
     "auto_filter",
     "header_fill_rgb",
     "helper_fill_rgb",
+    "helper_columns",
     "helper_prefix",
 )
 
@@ -25,11 +25,7 @@ def build_sheet_meta_hints(
     sheet_name: str,
 ) -> dict[str, Any]:
     """Merge workbook defaults with sheet-local overrides for one visible sheet."""
-    meta_hints = {
-        key: workbook_meta[key]
-        for key in OPTION_HINT_KEYS
-        if key in workbook_meta
-    }
+    meta_hints = {key: workbook_meta[key] for key in OPTION_HINT_KEYS if key in workbook_meta}
 
     sheet_meta_hints = (workbook_meta.get("sheets") or {}).get(sheet_name, {})
     if isinstance(sheet_meta_hints, dict):
