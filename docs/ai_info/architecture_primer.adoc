@@ -1,0 +1,185 @@
+== Architecture Primer
+
+=== Layer Map
+
+[source,text]
+----
+CLI  (cli/apps/)
+ |
+ v
+Pipeline / Application  (pipeline/, application/orchestrator.py)
+ |                     |
+ v                     v
+Domain  (domain/)    Render IR  (rendering/)
+ |                     |
+ v                     v
+Core  (core/)        IO Backends  (io_backends/)
+ ^                     ^
+ |_____________________|
+----
+
+[cols="1,2,2"]
+|===
+| Layer | Source path | Responsibility
+
+| CLI
+| `cli/apps/`
+| Entry points, argument parsing, exit codes. No business logic.
+
+| Pipeline
+| `pipeline/`, `application/orchestrator.py`
+| Wires I/O, steps, and domain calls. Passes payloads through without interpreting semantics.
+  Step registry maps YAML step names to factory closures.
+
+| Domain
+| `domain/`
+| All business rules and transformation semantics.
+  Sub-packages: `transformations/`, `validations/`, `extractions/`;
+  `meta_bootstrap.py` merges meta from all sources.
+
+| Core
+| `core/`
+| Stateless leaf utilities (FK detection, indexing, DataFrame construction, cell-ref math).
+  No inward dependencies.
+
+| Render IR
+| `rendering/`
+| Translates domain output into a backend-neutral `RenderPlan` for spreadsheet adapters.
+  Spreadsheet-only — JSON/CSV/YAML backends bypass this layer entirely.
+
+| IO Backends
+| `io_backends/`
+| Concrete adapters. `router.py` dispatches by `kind` string.
+  `spreadsheet_contract.py` defines the narrow generic API for spreadsheet adapters.
+|===
+
+`orchestrator.py` at the package root is a backward-compatibility shim → `application/orchestrator.py`.
+
+=== Two Data Flows (terminology matters)
+
+Use "**Pipeline**" exclusively for the domain transformation flow.
+Use "**Render-Flow**" exclusively for the IR rendering path.
+Mixing the terms causes confusion in PRs and architecture tests.
+
+==== Domain Pipeline flow (all formats)
+
+[source,text]
+----
+AppConfig (YAML)
+  -> pipeline/runner.py
+  -> router.get_loader(kind)  -> Frames
+  -> pipeline/registry.py: build_steps_from_config()  -> [BoundStep]
+  -> run_pipeline(frames, bound_steps)  -> Frames
+  -> router.get_saver(kind)  -> output file
+----
+
+Steps execute in declared order; no branching or conditional routing at pipeline level.
+
+==== IR Render-Flow (spreadsheet outputs only)
+
+[source,text]
+----
+Frames + meta_canonical
+  ① compose_workbook()           rendering/composer/layout_composer.py
+      -> WorkbookIR  (one TableBlock per visible sheet)
+  ② apply_render_passes()        rendering/passes/__init__.py
+      MetaPass -> ValidationPass -> StylePass -> FilterPass -> FreezePass -> NamedRangePass
+      -> WorkbookIR  (enriched with render-driving annotations)
+  ③ build_render_plan()          rendering/flow.py
+      -> RenderPlan  (ordered list of backend-neutral RenderOp values)
+  ④ render_workbook()            io_backends/xlsx/openpyxl_renderer.py (or ODS equivalent)
+      -> .xlsx / .ods file
+----
+
+Parse direction (read path):
+
+[source,text]
+----
+workbook file
+  -> format-specific parser (e.g. openpyxl_parser.py)  -> WorkbookIR
+  -> workbookir_to_frames()   rendering/workbook_projection.py
+  -> Frames + persisted _meta payload
+----
+
+=== Key Types
+
+[cols="1,3"]
+|===
+| Type | Role
+
+| `Frames`
+| `Dict[str, DataFrame]` — the universal data carrier between all layers
+
+| `WorkbookIR`
+| Container for visible `sheets` (list of `SheetIR`) and hidden sheets
+
+| `SheetIR`
+| Per-sheet: `tables`, `validations`, `named_ranges`, pass annotations in `meta`
+
+| `TableBlock`
+| One logical table with geometry, headers, and data block
+
+| `RenderPlan`
+| Ordered list of frozen `RenderOp` dataclasses (`DefineSheet`, `SetHeader`, `AddValidation`, `WriteMeta`, ...)
+
+| `meta_canonical`
+| Source of truth for persistence and roundtrip; produced by domain/input/parse
+
+| `meta_rendering`
+| Derived by IR passes from `meta_canonical`; determines current write-path render behavior only
+|===
+
+=== meta_canonical vs meta_rendering — key invariants
+
+These invariants are guarded by architecture tests. Do not violate them:
+
+* After IR derivation, `meta_canonical` must no longer directly influence render output —
+  `meta_rendering` (derived by passes) is the only active render source.
+* Roundtrip must not depend on `meta_rendering` alone — everything needed for reconstruction
+  must be in `meta_canonical` or stably persisted from it.
+* Adapters execute the `RenderPlan`; they do not re-interpret `meta_canonical` to produce render behavior.
+* Generic meta rules (inheritance, merge, priority) belong in the IR layer, not in Domain or Adapters.
+
+=== Where new code belongs
+
+[cols="1,3"]
+|===
+| Task | Where
+
+| New domain transformation
+| `domain/transformations/` + register factory in `pipeline/registry.py`
+
+| New validation check
+| `domain/validations/` returning `List[Finding]`; caller applies `apply_severity_policy()`
+
+| New pipeline step (YAML-driven)
+| Factory in `pipeline/steps.py` or domain module; register in `pipeline/registry.py`
+
+| New render behavior
+| Pass in `rendering/passes/`; communicate via `SheetIR.meta` dunder keys, not adapter callbacks
+
+| New IR datatype
+| `rendering/ir.py`
+
+| New spreadsheet backend
+| `io_backends/<format>/`; implement `SpreadsheetParser` → `WorkbookIR`;
+  hook into `spreadsheet_contract.py`; register kind in `router.py`
+
+| New simple format backend (JSON/CSV style)
+| `io_backends/<format>_backend.py`; register kind in `router.py`
+|===
+
+=== Architecture guardrails
+
+Architecture tests in `tests/architecture/` enforce layer boundaries automatically.
+When a guardrail test fails, do not move code to silence it — that defeats the purpose.
+Instead, understand which boundary was crossed and find the correct layer for the code.
+
+Detailed rationale lives in:
+
+* `docs/internal_guide/architecture/ARCH-LAYERS.adoc` — full layer spec with FK-helper example trace
+* `docs/internal_guide/architecture/generic_ir.adoc` — meta_canonical/meta_rendering model (German)
+* `docs/internal_guide/architecture/pipeline_semantics.adoc` — step categories and config contracts
+* `docs/internal_guide/architecture/spreadsheet_parse_contract.adoc` — read-path boundary
+* `docs/human_info/adr/adr-006_render_chain.adoc` — render chain data flow (write path, authoritative)
+* `docs/human_info/adr/ADR-RENDER-FLOW-VS-DOMAIN-PIPELINE.adoc` — terminology decision
