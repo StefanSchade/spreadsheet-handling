@@ -1,0 +1,520 @@
+= Code Review: Adapter, CLI & Orchestrator
+:date: 2026-05-11
+:reviewer: Claude Opus 4.7
+:phase: 3 von 4
+:status: complete
+:predecessor-1: review-domain-core.adoc
+:predecessor-2: review-ir-pipeline.adoc
+
+== Offene Findings aus Vorphasen
+
+* *D-001* [CRITICAL] — `domain/` importiert `rendering/formulas.py`. Wurzelursache:
+  `formulas.py` liegt im falschen Layer; Fix = nach `core/` verschieben.
+* *IR-002* [SHOULD-FIX] — `rendering/formulas.py` → `core/` (deckungsgleich mit D-001).
+* *IR-006* [SHOULD-FIX] — Render-Pfad mutiert Eingaben: `layout_composer._add_legend_blocks`
+  schreibt `spec["resolved"]` in Aufrufer-meta; `frame_selection._resolve_formula_sheet_names`
+  mutiert Eingabe-Frames in-place. In Phase 3 zu prüfen: ob `application/orchestrator.py`
+  dieselben `frames`/`meta` mehrfach weitergibt.
+* *IR-008* [SHOULD-FIX] — `WriteMeta.kv` persistiert meta als `str(dict)` (Python-repr),
+  Read-Pfad liest per `ast.literal_eval`. In Phase 3 zu prüfen: openpyxl/odf Renderer + Parser.
+* *IR-013* [NICE-TO-HAVE] — `MetaPass` reserviert `exported_at`, befüllt es nie.
+  In Phase 3 zu prüfen: ob CLI/orchestrator den Zeitstempel setzt — und ob deterministisch.
+
+== Schritt 1 — Strukturanalyse
+
+=== io_backends/ Module
+
+[cols="2,1,1,3", options="header"]
+|===
+|Datei |LOC |Vermuteter Typ |Anmerkung
+
+|`_interfaces.py` |7 |Legacy-Shim |Re-Export von `SpreadsheetParser`/`SpreadsheetRenderer` aus `spreadsheet_contract`. *Wird nirgendwo importiert* — toter Code.
+|`errors.py` |18 |Fehlertypen |`DeprecatedAdapterError(NotImplementedError)`. Sauber, schmal.
+|`base.py` |81 |Adapter-ABC (DataFrame-Ebene) |`BackendBase` (`read`/`write`/`read_multi`/`write_multi` über `pd.DataFrame`), `BackendOptions`-Dataclass, `coerce_backend_options`. Das ist der „klassische" Adapter-Kontrakt der einfachen Backends.
+|`spreadsheet_contract.py` |55 |Kontrakt + Render-Flow-Einstieg (IR-Ebene) |`SpreadsheetParser`/`SpreadsheetRenderer`-Protocols über `WorkbookIR`/`RenderPlan`; `build_spreadsheet_render_plan()` = `select_render_frames` → `compose_workbook` → `apply_render_passes` → `build_render_plan`; `read_spreadsheet_frames()` = `parser(path)` → `workbookir_to_frames`. Der einzige Ort, der `rendering/` betritt.
+|`router.py` |62 |Backend-Dispatch #1 (Funktions-Registry) |`LOADERS`/`SAVERS`: Dict `str → Callable`. xlsx/ods via `_lazy_callable` (lazy import). `get_loader`/`get_saver`. Genutzt von `pipeline/runner.py`.
+|`__init__.py` |62 |Backend-Dispatch #2 (Klassen-Registry) |`_BACKEND_SPECS`: Dict `str → Klasse/(modul,attr)`; `make_backend(kind)`; `__getattr__` für lazy `ExcelBackend`/`OdsBackend`-Export. Nur von Tests genutzt.
+|`json_backend.py` |166 |Einfaches Backend |`JSONBackend` + `read_json_dir`/`write_json_dir`.
+|`csv_backend.py` |105 |Einfaches Backend |`CSVBackend` + `load_csv_dir`/`save_csv_dir`.
+|`yaml_backend.py` |88 |Einfaches Backend |Nur `load_yaml_dir`/`save_yaml_dir` — *keine* `YAMLBackend`-Klasse (Asymmetrie zu json/csv/xml).
+|`xml_backend.py` |200 |Einfaches Backend |`XMLBackend` + `read_xml_dir`/`write_xml_dir`.
+|`xlsx/openpyxl_renderer.py` |359 |Spreadsheet-Renderer |Führt `RenderPlan` aus, schreibt `.xlsx` (openpyxl).
+|`xlsx/openpyxl_parser.py` |335 |Spreadsheet-Parser |Liest `.xlsx` → `WorkbookIR` (vermutet).
+|`xlsx/parser_interpretation.py` |284 |Parser-Hilfslogik |Interpretationsschicht zwischen openpyxl-Rohdaten und IR.
+|`xlsx/xlsx_backend.py` |111 |Backend-Fassade |`ExcelBackend`, `load_xlsx`/`save_xlsx` — verdrahtet Parser+Renderer mit `spreadsheet_contract`.
+|`ods/odf_renderer.py` |540 |Spreadsheet-Renderer |Grösste Datei im Adapter-Layer. `.ods` via odfpy.
+|`ods/odf_parser.py` |419 |Spreadsheet-Parser |Liest `.ods` → `WorkbookIR`.
+|`ods/parser_interpretation.py` |265 |Parser-Hilfslogik |Pendant zu `xlsx/parser_interpretation.py`.
+|`ods/ods_backend.py` |84 |Backend-Fassade |`OdsBackend`, `load_ods`/`save_ods`.
+|===
+
+=== application/ + cli/ + orchestrator.py
+
+[cols="2,1,1,3", options="header"]
+|===
+|Datei |LOC |Vermuteter Typ |Anmerkung
+
+|`orchestrator.py` (Top-Level) |~10 |Backward-Compat-Shim |Re-Export `orchestrate`, `IODesc` aus `application.orchestrator`. Begründung im Docstring: „external consumers". Intern nirgends importiert.
+|`application/orchestrator.py` |126 |Orchestrator (echte Logik) |`orchestrate(input, output, steps, header_levels)`: lädt Frames → `run_pipeline` → schreibt Frames → returnt Frames. Eigene `_load_frames`/`_save_frames` if/elif-Dispatch (Backend-Dispatch #3) — nutzt *nicht* `router.py` und *nicht* `make_backend`.
+|`application/__init__.py` |0 |Paket-Marker |—
+|`cli/__init__.py` |16 |CLI-Paket |—
+|`cli/runtime.py` |36 |CLI-Laufzeit-Helfer |Vermutet: Arg-Parsing / Setup gemeinsam für die Apps.
+|`cli/logging_utils.py` |16 |CLI-Logging |—
+|`cli/apps/run.py` |178 |CLI-App `sheets-run` |Grösste CLI-Datei — vermutlich YAML-Konfig-Reader + Orchestrator-Aufruf.
+|`cli/apps/sheets_pack.py` |54 |CLI-App `sheets-pack` |JSON-Dir → Spreadsheet (vermutet).
+|`cli/apps/sheets_unpack.py` |33 |CLI-App `sheets-unpack` |Spreadsheet → JSON-Dir (vermutet).
+|===
+
+=== Relevante Architecture- & Integration-Tests
+
+[cols="2,2,1", options="header"]
+|===
+|Test-Modul |Was wird getestet (vermutet) |Relevanz
+
+|`architecture/parse_contract/test_spreadsheet_parse_contract.py` |Parser darf nicht über `WorkbookIR` hinaus (kein direktes `Frames`-Erzeugen) |HOCH
+|`architecture/parse_contract/test_xlsx_parser_modularization.py` |openpyxl-Parser sauber in parser + interpretation getrennt |MITTEL
+|`architecture/parse_contract/test_ods_parser_modularization.py` |dito für ODS |MITTEL
+|`architecture/dependency_guards/test_adapter_alignment.py` |Alle Backends gegen dieselbe Interface-Definition |HOCH
+|`architecture/spreadsheet_contract/test_adapter_contract_boundary_guards.py` |Adapter halten Kontrakt-Grenze (rendering/-Zugriff nur via `spreadsheet_contract`) |HOCH
+|`architecture/spreadsheet_contract/test_ir_call_chain.py` |Render-Flow-Aufrufkette (`build_spreadsheet_render_plan` → compose → passes → plan) |HOCH
+|`architecture/formula_boundary/test_raw_formula_boundary_guards.py` |Rohe Formel-Strings nur in xlsx/ods |MITTEL
+|`architecture/semantic_invariants/test_ir_writepath_semantics.py` |Write-Pfad-Semantik (IR-006/IR-008-Kontext) |HOCH
+|`integration/io_backends/test_ods_xlsx_parity.py` |xlsx- und ods-Backend liefern äquivalente Ergebnisse |HOCH
+|`integration/io_backends/xlsx/test_ir_golden.py` |Golden-File-Vergleich xlsx-Render |HOCH
+|`integration/io_backends/xlsx/test_ir_render_flow_p1.py` |Render-Flow-Phase-1-Verhalten |MITTEL
+|`integration/io_backends/xlsx/test_column_width_roundtrip.py` |Spaltenbreiten überleben Roundtrip |NIEDRIG
+|`integration/io_backends/ods/test_ods_adapter_roundtrip.py` |ODS Roundtrip + `make_backend("ods")` |MITTEL
+|`integration/io_backends/json/test_json_roundtrip.py`, `yaml/test_yaml_roundtrip.py` |Einfache-Backend-Roundtrips |NIEDRIG
+|`integration/roundtrip/test_parse_ir_roundtrip.py` |Parse → IR → … Roundtrip |HOCH
+|`integration/roundtrip/test_meta_persistence.py` |Meta-Blob überlebt Write→Read (IR-008-Kern!) |HOCH
+|`integration/roundtrip/test_legend_blocks.py` |Legend-Blocks Roundtrip (IR-006-Kontext) |MITTEL
+|`integration/spreadsheet_contract/test_ir_readpath.py` |Read-Pfad `WorkbookIR` → Frames |HOCH
+|`integration/pipeline/test_cli_orchestrator_end_to_end.py` |CLI → Orchestrator E2E |HOCH
+|`integration/pipeline/test_orchestrator_meta_contract.py`, `test_orchestrator_smoke.py` |Orchestrator-Verhalten + Meta-Kontrakt |HOCH
+|===
+
+=== spreadsheet_contract vs. _interfaces vs. base
+
+Drei *unterschiedliche* Abstraktionsebenen — aber mit einer toten Überlappung:
+
+* `base.py` — *DataFrame-Ebene*. `BackendBase` ist die ABC der **einfachen** Backends
+  (`read`/`write`/`*_multi` über `pd.DataFrame`) plus `BackendOptions`. Hier endet die Welt
+  bei `pandas` — kein Bezug zu `WorkbookIR` oder `RenderPlan`.
+* `spreadsheet_contract.py` — *IR-Ebene*. `SpreadsheetParser`/`SpreadsheetRenderer`
+  (Protocols über `WorkbookIR`/`RenderPlan`) plus die zwei Flow-Funktionen
+  `build_spreadsheet_render_plan` / `read_spreadsheet_frames`. Das ist der **einzige**
+  Modul, das `rendering/` betritt — die kontrollierte Schleuse.
+* `_interfaces.py` — *kein eigener Inhalt*. 7-Zeilen-Re-Export von `SpreadsheetParser`/
+  `SpreadsheetRenderer` aus `spreadsheet_contract`, mit Kommentar „Legacy internal
+  re-exports". Wird von keiner Datei in `src/` oder `tests/` importiert.
+
+Befund (vorläufig): saubere Schichtung zwischen `base` und `spreadsheet_contract`, aber
+`_interfaces.py` ist ersatzlos löschbar. Offene Frage für Schritt 3: implementieren die
+einfachen Backends *wirklich* `BackendBase`, und ist dokumentiert/erzwungen, welcher der
+beiden Kontrakte für ein neues Backend gilt?
+
+=== router.py — Open/Closed-Analyse (Struktur)
+
+Es gibt **drei** parallele Backend-Dispatch-Mechanismen, alle mit *statischen Dict-Literalen*
+— keiner ist ohne Code-Änderung erweiterbar (kein Entry-Point-Plugin-System, keine
+Klassen-Selbstregistrierung):
+
+. `io_backends/router.py` — `LOADERS`/`SAVERS`: `str → Callable`. xlsx/ods lazy-importiert
+  via `_lazy_callable`. Genutzt von `pipeline/runner.py`.
+. `io_backends/__init__.py` — `_BACKEND_SPECS`: `str → Klasse | (modul, attr)`; `make_backend(kind)`.
+  Nur von Tests genutzt.
+. `application/orchestrator.py` — `_load_frames`/`_save_frames`: hartkodierte `if kind in {...}`-Ketten.
+  Nutzt weder (1) noch (2).
+
+`json`/`csv`/`yaml`/`xml` registrieren sich gar nicht — sie sind als Funktions-/Klassen-Referenzen
+direkt in den Dicts eingetragen. xlsx/ods werden lazy importiert; das ist *Absicht* — Umgebungen,
+die nur einen der beiden Spreadsheet-Adapter (bzw. keinen) nutzen, sollen `openpyxl` bzw. `odfpy`
+nicht zwangsweise importieren müssen. Dieses Designziel ist bisher nur implizit im Code (`_lazy_callable`,
+`__getattr__`) erkennbar — gehört an geeigneter Stelle dokumentiert (ADR „Optionale Spreadsheet-Adapter
+werden lazy importiert"), damit eine spätere Registry-Konsolidierung das Lazy-Verhalten nicht versehentlich
+zurückbaut.
+
+Befund (vorläufig): *SHOULD-FIX-Kandidat*. Die drei Registries duplizieren die `kind`→Backend-Wissen
+mit leicht abweichenden Schlüsselmengen (`json` vs. `json_dir`, `excel`/`calc`-Aliase, `ods` als
+Loader-`calc`). Ein einziger Registry-Punkt würde Drift verhindern. Ob „Open/Closed" überhaupt ein
+Ziel ist (Plugin-Backends von Drittanbietern), klärt `interfaces_and_gates.adoc` — falls nein, reicht
+*eine* statische Registry; das ist trotzdem besser als drei.
+
+=== Hypothesen
+
+* *H1 (IR-006 → konkret)* — `application.orchestrator.orchestrate()` returnt `frames` *nach*
+  `_save_frames`. Für `xlsx`/`ods` läuft das durch `build_spreadsheet_render_plan` →
+  `select_render_frames`/`compose_workbook`, die laut Phase 2 Eingaben in-place mutieren.
+  Wenn ein Aufrufer (Test, CLI, E2E) die zurückgegebenen Frames danach weiterverwendet oder
+  in zwei Outputs schreibt, ist das ein realer Bug. → in Schritt 3 an `run.py` + E2E-Tests prüfen.
+* *H2 (IR-008)* — `WriteMeta.kv` wird in `openpyxl_renderer.py`/`odf_renderer.py` als `str(dict)`
+  geschrieben, in den Parsern per `ast.literal_eval` gelesen. → Quelltextstellen in Schritt 3 finden;
+  `test_meta_persistence.py` als Wahrheitsreferenz nutzen.
+* *H3 (IR-013)* — `exported_at` wird (wenn überhaupt) in `cli/apps/run.py` oder `cli/runtime.py`
+  via `datetime.now()` gesetzt → Determinismus-Bruch. → in Schritt 3 grep nach `exported_at`/`datetime`.
+* *H4 (Shim)* — Top-Level `orchestrator.py` ist ein reiner Re-Export ohne internen Nutzer.
+  Ob er entfernbar ist, hängt an `interfaces_and_gates.adoc` (dokumentierter öffentlicher Import-Pfad?).
+* *H5 (_interfaces.py)* — ersatzlos löschbar (kein Importer).
+* *H6 (Dispatch-Triplikat)* — Konsolidierung der drei Backend-Registries auf eine ist eine
+  risikoarme Verbesserung; `make_backend` (nur Test-Nutzer) und `router` (Pipeline-Nutzer)
+  könnten auf eine gemeinsame Quelle zeigen. *Randbedingung:* das beabsichtigte Lazy-Import-Verhalten
+  für xlsx/ods muss erhalten bleiben (siehe ADR-Hinweis oben).
+* *H7 (yaml-Asymmetrie)* — `yaml_backend.py` hat keine `YAMLBackend`-Klasse, nur `*_dir`-Funktionen;
+  `test_adapter_alignment` müsste das auffangen — oder YAML ist absichtlich ausgenommen. In Schritt 2 klären.
+
+=== Modularisierung & Token-Effizienz (Schritt 1)
+
+* `ods/odf_renderer.py` (540 LOC) ist die grösste Datei im Layer — Kandidat für Aufteilung
+  (z.B. Style-/Layout-Schreiben vs. Zell-/Formel-Schreiben), damit ein Agent nur den relevanten
+  Teil laden muss.
+* Die `parser` + `parser_interpretation`-Trennung in `xlsx/` und `ods/` ist bereits ein gutes Muster
+  (und durch `test_*_parser_modularization` abgesichert) — als Vorbild für den Renderer geeignet.
+* Die drei Backend-Registries auf eine zu reduzieren senkt die kognitive Last spürbar: aktuell muss
+  man drei Dateien lesen, um zu wissen, welche `kind`-Strings gültig sind.
+* `_interfaces.py` löschen — ein toter Re-Export weniger, den ein Agent fälschlich für relevant hält.
+* Klare Ein-Satz-Modul-Docstrings: `cli/runtime.py`, `cli/apps/*` haben kurze/keine Purpose-Zeilen —
+  in Schritt 3 prüfen, ob jeder dieser Module-Header den Zweck eindeutig nennt.
+
+== Schritt 2 — Erwartungsmodell (aus Tests)
+
+=== Parser-Grenze: WorkbookIR
+
+Die Grenze ist scharf und durch mehrere Guards abgesichert:
+
+* `openpyxl_parser.py` / `odf_parser.py` *dürfen* `openpyxl`/`odf` und `rendering.ir` (= `WorkbookIR`)
+  importieren, plus ihr lokales `parser_interpretation`-Modul. Sie *dürfen nicht* `rendering.parse_ir`,
+  `rendering.workbook_projection`, `rendering.composer/passes/flow/plan`, `domain` oder `pipeline`
+  importieren (`test_adapter_alignment.py`, `test_adapter_contract_boundary_guards.py`).
+* Der Parser endet beim `WorkbookIR` — er erzeugt *keine* `Frames`. Die Projektion `WorkbookIR → Frames`
+  passiert generisch in `rendering.workbook_projection.workbookir_to_frames`, aufgerufen von
+  `spreadsheet_contract.read_spreadsheet_frames(path, parser=...)`. `test_read_spreadsheet_frames_stops_at_workbook_ir`
+  fixiert die Aufrufreihenfolge `parse → project`, und `ExcelBackend.read_multi` muss exakt diesen
+  Kontrakt nutzen (`test_excel_backend_read_multi_uses_read_spreadsheet_frames_contract`,
+  `test_xlsx_backend_uses_spreadsheet_contract_for_read`).
+* Carrier-Hints im IR (`__autofilter_ref`, `__freeze`, `__header_merges`, `__header_grid`, `options`)
+  bleiben *im IR* und werden bei der Projektion nach `_meta` *nicht* hochgereicht — nur das kanonische
+  `_meta` (bzw. `workbook_meta_blob`) überlebt (`test_parse_contract_roundtrips_canonical_meta_payload_without_promoting_carrier_hints`).
+* Renderer-Seite spiegelbildlich: `openpyxl_renderer.py` / `odf_renderer.py` *dürfen nur* `rendering.plan`
+  (= `RenderPlan`) importieren, *nicht* `spreadsheet_contract`, `workbook_projection`, `composer/passes/flow/ir`,
+  `domain` oder `pipeline`. Die Aufrufkette `build_spreadsheet_render_plan → render_workbook` ist fixiert
+  (`test_*_backend_stops_at_render_plan`, `test_ir_call_chain.py`).
+
+=== Adapter-Alignment
+
+*Wichtige Einschränkung:* „Adapter-Alignment" deckt nur die **Spreadsheet**-Backends (xlsx, ods) ab,
+nicht die einfachen Backends. Konkret:
+
+* `test_adapter_alignment.py` (trotz generischem Namen) ist XLSX-spezifisch: es prüft, dass `rendering/`
+  frei von `openpyxl`/`io_backends.xlsx` bleibt und der openpyxl-Parser seinen Read-Pfad lokal besitzt.
+* `test_adapter_contract_boundary_guards.py` prüft Backend-Entrypoints (`xlsx_backend.py`, `ods_backend.py`),
+  Renderer und Parser auf Importgrenzen — wieder nur xlsx + ods.
+* `test_ir_call_chain.py` prüft beide Spreadsheet-Backends gegen `build_spreadsheet_render_plan` /
+  `read_spreadsheet_frames` per Monkeypatch.
+* *Keine* Architektur-/Alignment-Tests für `json_backend.py` / `csv_backend.py` / `yaml_backend.py` /
+  `xml_backend.py` gegen `BackendBase`. Es gibt keinen Test, der erzwingt, dass alle einfachen Backends
+  dieselbe `read`/`write`/`*_multi`-Signatur erfüllen — die `yaml`-Asymmetrie (keine `YAMLBackend`-Klasse)
+  würde von keinem Guard erwischt.
+
+=== Roundtrip-Abdeckung
+
+[cols="1,2,1", options="header"]
+|===
+|Szenario |Abgedeckt durch |Lücke?
+
+|JSON ↔ XLSX ↔ JSON (Daten + `_meta`) |`test_meta_persistence.py::TestCrossBackendRoundtrip`, `test_ir_readpath.py::TestJSONXLSXJSONRoundtrip` |nein
+|XLSX → IR → Frames (Spalten/Werte/Geometrie/Header-Merges/Validierungen) |`test_parse_ir_roundtrip.py`, `test_ir_readpath.py` |nein
+|XLSX vs. ODS Parität (Frames, `_meta`, Parser-Semantik, MultiHeader, abgeleitete Frames, Schutz, Freeze-Hint-Gap) |`test_ods_xlsx_parity.py` (sehr umfangreich) |nein
+|Legend-Blocks als Metadaten (XLSX + ODS) |`test_legend_blocks.py` |nein
+|Spaltenbreiten-Roundtrip (XLSX) |`test_column_width_roundtrip.py` |nein
+|JSON `_meta.yaml`-Sidecar Write/Read + Provenance |`test_meta_persistence.py::TestJSONSidecar`, `test_json_roundtrip.py` |nein
+|YAML-Roundtrip (eigenständig) |`test_yaml_roundtrip.py` |nur Self-Roundtrip, kein YAML↔XLSX
+|XLSX Golden-File |`test_ir_golden.py` |nein
+|CSV-Roundtrip |— |*ja* — kein Integrationstest für `csv_backend.py`
+|XML-Roundtrip |— |*ja* — `xml_backend.py` (200 LOC) hat keinen Roundtrip-Test
+|Determinismus (zweimal schreiben → byteidentisch / normalisiert gleich) |— (nur Golden-File-Snapshot, kein „render-twice") |*ja* — keine explizite Idempotenz-Prüfung
+|`exported_at` gesetzt/weggelassen |— |*ja* — kein Test (siehe IR-013)
+|ODS → IR → Frames eigenständig (außerhalb Parität) |`test_ods_adapter_roundtrip.py` (knapp) |dünn
+|CLI-Argv-Pfad (`sheets-pack`/`-unpack`/`sheets-run` über echte Kommandozeile) |`test_main_with_top_level_pipeline.py` / `test_consumer_smoke.py` (in Schritt 3 zu verifizieren) |evtl. — `test_cli_orchestrator_end_to_end.py` ruft *nicht* die CLI, nur `orchestrate()`
+|===
+
+=== Lücken in der Test-Abdeckung
+
+* Einfache Backends (`csv`, `xml`) ohne Roundtrip-Integrationstest; `yaml` nur Self-Roundtrip.
+* Kein Architektur-Guard, der `BackendBase`-Konformität der einfachen Backends erzwingt.
+* Keine Determinismus-/Idempotenz-Prüfung (Spec-Versprechen „deterministisch") außer dem statischen Golden-File.
+* `exported_at` wird nirgends gesetzt *und* nirgends getestet — der reservierte Slot ist faktisch tot
+  (nur `rendering/passes/core.py:454` listet ihn in `minimal_fields`; `test_ir_render_flow_p1.py` reicht
+  ihn lediglich als Eingabe-Meta durch).
+* IR-008-Format (repr vs. JSON für `workbook_meta_blob`) wird von keinem Test *explizit* geprüft —
+  die Roundtrip-Tests würden auch eine repr-basierte Serialisierung durchgehen lassen, solange
+  `ast.literal_eval` die Strukturen zurückgewinnt.
+* Top-Level `orchestrator.py`-Shim: kein Test, der seine öffentliche Existenz absichert (Hinweis darauf,
+  dass er evtl. doch entfernbar ist).
+
+=== Hypothesen-Update
+
+* *H1 (IR-006)* — bleibt offen, aber Tests geben einen Hinweis: `orchestrate()` returnt `frames` *nach*
+  `_save_frames`; mehrere Tests (`test_orchestrate_with_step`, `test_orchestrate_returns_meta_sidecar_after_generic_steps`)
+  verwenden das Ergebnis weiter. Wenn der Output ein Spreadsheet-Backend war, lief `frames` durch
+  `build_spreadsheet_render_plan` → `select_render_frames`/`compose_workbook`. Ob diese tatsächlich
+  in-place mutieren (und ob ein realer Aufrufer danach noch liest), entscheidet sich beim Codelesen
+  von `frame_selection.py` / `layout_composer.py` in Schritt 3.
+* *H2 (IR-008)* — bestätigungsbedürftig: `test_ir_writepath_semantics.py` zeigt, dass `workbook_meta_blob`
+  als Schlüssel in `meta_sheet.meta` existiert; `test_meta_persistence`/`test_ods_xlsx_parity` zeigen,
+  dass tief verschachteltes `_meta` (Listen, verschachtelte Dicts) den Roundtrip überlebt. Das Serialisierungs-
+  *format* ist in Schritt 3 in `openpyxl_renderer.py`/`odf_renderer.py` + Parser zu identifizieren.
+* *H3 (IR-013)* — *bestätigt*: `exported_at` wird in `cli/`, `application/orchestrator.py` und allen
+  `io_backends/` *nicht* gesetzt (grep leer). Kein Determinismus-Bruch in dieser Schicht; aber: reservierter,
+  nie befüllter Slot → entweder befüllen (injizierbar!) oder aus `minimal_fields` entfernen.
+* *H4 (Top-Level-Shim)* — verstärkt: kein interner Nutzer, kein Test. Entfernbarkeit hängt nur an
+  `interfaces_and_gates.adoc` (dokumentierter öffentlicher Pfad?).
+* *H5 (_interfaces.py)* — unverändert: ersatzlos löschbar.
+* *H6 (Dispatch-Triplikat)* — unverändert; zusätzlich: Tests nageln `make_backend` (nur Tests) und die
+  `orchestrate()`-`kind`-Strings (`json_dir`, `xlsx`, `ods`, `calc`, `excel`) je separat fest — eine
+  Konsolidierung müsste alle drei Schlüsselmengen vereinen.
+* *H7 (yaml-Asymmetrie)* — *bestätigt als ungeschützte Lücke*: kein Guard erzwingt `BackendBase`-Konformität;
+  `yaml` ist nur über Funktionen erreichbar. Entweder bewusst dokumentieren oder `YAMLBackend` ergänzen.
+* *H8 (neu — CLI-Argv ungetestet?)* — `test_cli_orchestrator_end_to_end.py` testet die CLI *nicht* über
+  argv, sondern `orchestrate()` direkt. In Schritt 3: prüfen, ob `test_main_with_top_level_pipeline.py` /
+  `test_consumer_smoke.py` die echten Entry-Points (`sheets-pack`, `sheets-unpack`, `sheets-run`) abdecken.
+
+== Schritt 3 — Findings
+
+=== Zusammenfassung
+
+Die Spreadsheet-Adapter (`xlsx/`, `ods/`) sind sauber geschnitten: `*_backend.py` (Fassade) →
+`spreadsheet_contract` (generische Schleuse) → `*_parser.py`/`*_renderer.py` (Backend-Libs), mit
+`parser_interpretation.py` als nützlichem Interpretationsseam, und das ist durch dichte Architektur-
+Guards abgesichert. Die *Schwächen* liegen nicht in der Spreadsheet-Schicht, sondern drumherum:
+es gibt drei parallele Backend-Dispatch-Tabellen und zwei Orchestrator-Einstiegspunkte mit
+abweichenden `kind`-Schlüsseln, uneinheitliche `_meta`-Behandlung in den einfachen Writern, eine
+Python-`repr`-basierte Meta-Serialisierung (IR-008) und einen CLI-Fehler-UX-Wrapper, der im echten
+`console_scripts`-Pfad gar nicht greift.
+
+=== Verifikation offener Vorphasen-Findings
+
+[cols="1,3,1", options="header"]
+|===
+|Finding |Befund in dieser Schicht |Status
+
+|D-001 / IR-002 (formulas.py-Pfad)
+|`io_backends/xlsx/openpyxl_renderer.py`, `ods/odf_renderer.py`, `xlsx/openpyxl_parser.py`,
+ `ods/odf_parser.py` und `rendering/frame_selection.py` importieren `spreadsheet_handling.rendering.formulas`.
+ Das ist *erlaubt* (rendering→adapter ist die richtige Richtung; verboten war nur domain→rendering.formulas).
+ Beim geplanten Move `formulas.py → core/` müssen diese 5 Importe nachgezogen werden — kein eigenes Finding,
+ nur Migrations-Footprint.
+|n/a (Kontext)
+
+|IR-006 (Eingabe-Mutation)
+|*Bestätigt* in `rendering/frame_selection.py::_resolve_formula_sheet_names`:
+ `value[col] = series.apply(...)` mutiert die *Eingabe*-DataFrames in-place (sie sind dasselbe Objekt
+ wie in `frames`), sobald `workbook_view` Frames umbenennt und eine Spalte `LookupFormulaSpec`-Zellen trägt.
+ `application/orchestrator.py::orchestrate()` gibt `frames` *nach* `_save_frames` zurück → ein Aufrufer,
+ der dieselben Frames danach in ein zweites Ziel schreibt, sieht die umgeschriebenen Specs. Idempotent
+ (zweites Umschreiben ist No-op), also *keine* Akkumulation — aber Kontraktbruch: `select_render_frames`
+ darf seine Eingabe nicht verändern. Kein interner Aufrufer triggert es heute.
+|*bestätigt* (latent)
+
+|IR-008 (repr vs. JSON)
+|*Bestätigt.* `rendering/composer/layout_composer.py:308` und `rendering/passes/__init__.py:32` setzen
+ `meta_sheet.meta["workbook_meta_blob"] = meta` (das *dict*). `rendering/flow.py:226` baut
+ `WriteMeta(kv={str(k): str(v) for ...})` → `str(dict)` = Python-`repr`. Beide Renderer schreiben
+ `str(value)` (`openpyxl_renderer._write_meta`, `odf_renderer._collect_sheets`). Beide Parser
+ (`_read_meta_sheet`, `_read_meta_payload`) versuchen `json.loads`, fallen dann auf `ast.literal_eval`
+ zurück — funktioniert für literal-only-Meta, scheitert *still* bei Nicht-Literalen (z.B. `float('nan')`
+ → `repr` = `'nan'` → `ast.literal_eval` wirft `ValueError` → Parser liefert die rohen KV-Strings statt
+ des Dicts). Empfehlung: Write-Pfad auf `json.dumps` umstellen (deckt sich mit dem, was
+ `openpyxl_parser._store_workbook_meta` bereits tut).
+|*bestätigt*
+
+|IR-013 (exported_at)
+|*Bestätigt.* `grep exported_at` über `cli/`, `application/`, `io_backends/` ist leer — niemand setzt
+ den Wert. Erwähnt nur in `rendering/passes/core.py:454` (`minimal_fields = ["version", "exported_at", "author"]`)
+ und in `test_ir_render_flow_p1.py`, wo er als Eingabe-Meta durchgereicht wird. Kein Determinismus-Bruch
+ in dieser Schicht. Empfehlung: entweder aus `minimal_fields` entfernen oder über einen injizierbaren
+ Parameter befüllen (nie `datetime.now()` im Render-/Pipeline-Pfad).
+|*bestätigt*
+|===
+
+=== CRITICAL — Beheben vor nächstem Release
+
+_Keine CRITICAL-Findings in dieser Schicht._ (IR-008 ist real, aber durch den Doppel-Decode der Parser
+heute funktionsfähig; ich stufe es als SHOULD-FIX ein.)
+
+=== SHOULD-FIX — Technische Schuld
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|A-001
+|*Dreifache Backend-Dispatch-Tabelle + Doppel-Orchestrator.* (1) `io_backends/router.py`
+ (`LOADERS`/`SAVERS`), genutzt von `pipeline/runner.py`; (2) `io_backends/__init__.py`
+ (`_BACKEND_SPECS`/`make_backend`), nur von Tests genutzt; (3) `application/orchestrator.py`
+ (`_load_frames`/`_save_frames`, if/elif), genutzt von der CLI. Dazu zwei Orchestratoren:
+ `orchestrate()` (CLI) und `pipeline.runner.run_pipeline(AppConfig)` (Smoke-Tests/Consumer).
+ Die Schlüsselmengen divergieren — z.B. `csv_dir` lädt über `router`/`runner`, aber `orchestrate()`
+ kennt kein `csv`/`csv_dir` (`_load_frames` hat keinen CSV-Zweig).
+|`io_backends/router.py`, `io_backends/__init__.py`, `application/orchestrator.py`, `pipeline/runner.py`
+|Auf *eine* Registry konsolidieren (`router` als kanonische Quelle anbietet sich), `_load_frames`/`_save_frames`
+ und `make_backend` darauf umstellen, einen der beiden Orchestratoren als dünnen Adapter über den anderen
+ legen. Das beabsichtigte Lazy-Import-Verhalten für xlsx/ods erhalten (→ ADR, siehe Schritt 1).
+
+|A-002
+|*`sheets-pack --input-kind csv_dir` ist kaputt.* `sheets_pack._args` bietet `choices=["json","json_dir","csv_dir"]`
+ an, ruft dann `orchestrate(input={"kind": a.input_kind, ...})` — `csv_dir` fällt durch alle Zweige in
+ `_load_frames` → `ValueError("Unsupported input kind: 'csv_dir'")`.
+|`cli/apps/sheets_pack.py:24`, `application/orchestrator.py:47-58`
+|Entweder `csv_dir` aus den `choices` entfernen oder (besser, im Zuge von A-001) `orchestrate()` den
+ CSV-Zweig geben. Da `sheets-pack` ein deprecierter Shim ist: minimal die Choice entfernen.
+
+|A-003
+|*Uneinheitliche `_meta`-Behandlung in den einfachen Writern.* `JSONBackend.write_multi` und `save_csv_dir`
+ überspringen `_meta`; `XMLBackend.write_multi` und `save_yaml_dir` *nicht* → bei vorhandenem `_meta`-Dict
+ wirft `df.where(...)` bzw. `df.to_dict(...)` `AttributeError` (`'dict' object has no attribute 'where'/'to_dict'`).
+ D.h. `sheets-run --out-kind yaml_dir|xml_dir` mit einer meta-erzeugenden Pipeline crasht. XML liest zudem
+ gar kein Meta-Sidecar (asymmetrisch zu JSONs `_meta.yaml`).
+|`io_backends/xml_backend.py:152`, `io_backends/yaml_backend.py:76`
+|`_meta` in beiden Writern überspringen (wie JSON/CSV); optional XML ein `_meta.yaml`-Sidecar geben oder
+ bewusst dokumentieren, dass XML/YAML reine Datenexporte sind.
+
+|A-004
+|*IR-008 — `workbook_meta_blob` wird als Python-`repr` persistiert.* Siehe Verifikationstabelle oben.
+ Funktioniert heute via `ast.literal_eval`-Fallback, ist aber fragil (NaN/Nicht-Literale brechen still).
+|`rendering/flow.py:226`, `rendering/composer/layout_composer.py:308`, `rendering/passes/__init__.py:32`;
+ Read: `io_backends/xlsx/openpyxl_parser.py:_read_meta_sheet`, `io_backends/ods/odf_parser.py:_read_meta_payload`
+|Write-Pfad auf `json.dumps(meta)` umstellen (Read-Pfad versucht `json.loads` bereits zuerst). Den
+ `ast.literal_eval`-Fallback als Legacy-Lesepfad behalten.
+
+|A-005
+|*CLI-Fehler-UX-Wrapper greift im echten Pfad nicht.* `pyproject.toml [project.scripts]` zeigt alle drei
+ Kommandos direkt auf `...:main` — nicht auf einen Wrapper. `run_cli(main)` (mit „Error: …"-Zeile und
+ `--debug`-Tracebacks) läuft nur bei `python cli/apps/run.py`; das installierte `sheets-run` umgeht es.
+ `sheets-pack`/`sheets-unpack` haben überhaupt keinen Wrapper (`raise SystemExit(main())`). Der `--debug`-Flag
+ in `run.py` ist im Installations-Pfad faktisch tot.
+|`pyproject.toml:31-34`, `cli/runtime.py`, `cli/apps/run.py:177`, `cli/apps/sheets_pack.py:53`, `cli/apps/sheets_unpack.py:32`
+|`console_scripts` auf eine Wrapper-Funktion zeigen lassen (z.B. `run_cli`-umschlossene Entry-Points),
+ oder den try/except aus `run_cli` in jede `main()` ziehen. Einheitlich für alle drei Kommandos.
+|===
+
+=== NICE-TO-HAVE — Verbesserungsvorschläge
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|A-006
+|`_interfaces.py` ist toter Code — 7-Zeilen-Legacy-Re-Export von `SpreadsheetParser`/`SpreadsheetRenderer`,
+ von keiner Datei in `src/` oder `tests/` importiert.
+|`io_backends/_interfaces.py`
+|Ersatzlos löschen.
+
+|A-007
+|`coerce_backend_options(None)` liefert `cast(BackendOptions, {})` — ein dict, das als `BackendOptions`
+ ausgegeben wird; jeder spätere Attributzugriff (`options.levels`) würde `AttributeError` werfen. Funktioniert
+ nur, weil alle Aufrufer Truthiness/`in`-Checks machen.
+|`io_backends/base.py:35-43`
+|`return BackendOptions()` statt `cast(..., {})`.
+
+|A-008
+|JSON-Roundtrip ist für MultiIndex-Frames nicht symmetrisch: `write_multi` emittiert verschachteltes JSON,
+ `read_multi` ignoriert `header_levels` und baut keinen MultiIndex zurück (man bekommt eine Spalte mit Dicts).
+ Evtl. Absicht („unflatten_headers edge step"), aber im Klassen-Docstring nicht erwähnt.
+|`io_backends/json_backend.py:71-93`
+|Verhalten dokumentieren oder Read-Pfad symmetrisch machen.
+
+|A-009
+|`CSVBackend.read` vs. `read_multi` inkonsistent: `read` respektiert `header_levels` (`pd.read_csv(header=range(...))`),
+ `read_multi` liest immer `header=0` und füllt auf einen Fake-MultiIndex mit `header_levels-1` Leerebenen auf —
+ echte Multi-Header-CSV-Verzeichnisse verlieren ihre Headerstruktur.
+|`io_backends/csv_backend.py:50-83`
+|`read_multi` dieselbe `header`-Logik wie `read` geben.
+
+|A-010
+|`pipeline.runner.run_pipeline(AppConfig)` überschattet `pipeline.registry.run_pipeline(frames, steps)` —
+ gleicher Name, andere Signatur; `pipeline/__init__.py` exportiert die `registry`-Variante. Verwirrend.
+|`pipeline/runner.py:11`
+|Eine der beiden umbenennen (z.B. `run_app` für die `AppConfig`-Variante) — fällt ohnehin in A-001.
+|===
+
+=== Modularisierung & Lesbarkeit (Schritt 3)
+
+* `ods/odf_renderer.py` (540 LOC): aufteilen in (a) Adress-/Style-Helfer, (b) `_BufferedSheet`-Modell +
+  `_collect_sheets`, (c) `_build_table`, (d) `_add_freeze_settings`. `_collect_sheets` ist eine ~90-Zeilen-
+  if/elif-Kette über Op-Typen — auf table-driven Dispatch (`dict[type, handler]`) umstellen, analog zu
+  `openpyxl_renderer._execute_render_op`; dann sind die Renderer auch strukturell vergleichbar.
+* Der grösste Verständlichkeits-Hemmschuh ist *nicht* die Spreadsheet-Schicht, sondern die Dreifach-Dispatch-/
+  Doppel-Orchestrator-Lage (A-001): ein Neueinsteiger kann nicht erkennen, welcher Pfad kanonisch ist. Eine
+  Konsolidierung zahlt sich doppelt aus — weniger Code *und* eine eindeutige „so registriert man ein Backend"-Story.
+* `_interfaces.py` löschen (A-006) — ein toter Re-Export weniger, den Mensch/KI fälschlich für relevant halten.
+* `cli/apps/run.py` hat keinen Modul-Docstring (die anderen Apps beschreiben sich über die argparse-`description`);
+  einen Ein-Zeiler ergänzen. `runtime.py`/`logging_utils.py` sind klar.
+* Die `parser` + `parser_interpretation`-Trennung in `xlsx/` und `ods/` ist vorbildlich und durch
+  `test_*_parser_modularization` abgesichert — gutes Muster, beibehalten.
+
+=== Hypothesen-Verifikation
+
+* *H1 (IR-006)* — *bestätigt* als latenter Bug in `frame_selection._resolve_formula_sheet_names`; aktuell
+  von keinem internen Aufrufer mit Zweit-Output ausgelöst. → A-001-unabhängiges SHOULD-FIX im rendering-Layer.
+* *H2 (IR-008)* — *bestätigt*: `repr`-basierte Serialisierung beim Schreiben, Doppel-Decode (`json.loads` →
+  `ast.literal_eval`) beim Lesen. → A-004.
+* *H3 (IR-013)* — *bestätigt*: `exported_at` nirgends gesetzt; kein Determinismus-Bruch.
+* *H4 (Top-Level-`orchestrator.py`)* — *aufgelöst*: `interfaces_and_gates.adoc` listet
+  `from spreadsheet_handling.orchestrator import orchestrate` als dokumentierten öffentlichen Import-Pfad
+  → der Shim ist ein gegateter Public-Surface, *nicht* entfernen. Er ist dünn und in Ordnung.
+* *H5 (_interfaces.py)* — *bestätigt* tot. → A-006.
+* *H6 (Triple-Dispatch)* — *bestätigt* + erweitert um den Doppel-Orchestrator und die divergierenden
+  `kind`-Schlüssel. → A-001.
+* *H7 (yaml-Asymmetrie)* — *bestätigt* + erweitert: betrifft nicht nur die fehlende `YAMLBackend`-Klasse,
+  sondern die uneinheitliche `_meta`-Sicherheit der einfachen Writer. → A-003.
+* *H8 (CLI-Argv ungetestet)* — *teilweise widerlegt*: `tests/unit/cli/test_cli_delegation.py` und
+  `test_cli_default_pipelines.py` rufen `cli.apps.*.main(argv)` (mit gemocktem `orchestrate`). Argv-Parsing
+  *ist* abgedeckt; ungetestet bleibt nur der `run_cli`-Wrapper-Pfad (der ohnehin im Installations-Pfad nicht
+  greift, A-005) und ein CLI→echte-IO-E2E.
+
+== Session-Handoff
+
+:next-session: review-consolidation
+:next-focus: Alle Findings aus Phase 1-3 konsolidieren
+
+=== Was wurde reviewed
+
+`io_backends/` vollständig (`_interfaces.py`, `base.py`, `errors.py`, `spreadsheet_contract.py`, `router.py`,
+`__init__.py`, `json_backend.py`, `csv_backend.py`, `yaml_backend.py`, `xml_backend.py`, `xlsx/*`, `ods/*`),
+`application/orchestrator.py`, das Top-Level-`orchestrator.py`-Shim, `cli/*` (inkl. `apps/run.py`,
+`apps/sheets_pack.py`, `apps/sheets_unpack.py`, `runtime.py`, `logging_utils.py`), plus die relevanten
+Architecture-/Integration-Tests und — für die IR-006/IR-008-Verifikation — `rendering/frame_selection.py`,
+`rendering/composer/layout_composer.py`, `rendering/flow.py`, `rendering/passes/__init__.py`, `pipeline/runner.py`.
+
+=== Top-3 Findings dieser Session
+
+. *A-001* — drei parallele Backend-Dispatch-Tabellen + zwei Orchestrator-Einstiegspunkte mit divergierenden
+  `kind`-Schlüsseln (`csv_dir` funktioniert nur über einen davon); auf eine Registry konsolidieren.
+. *A-004 (= IR-008)* — `workbook_meta_blob` wird als Python-`repr` geschrieben und per `ast.literal_eval`
+  zurückgelesen; bricht still bei Nicht-Literalen (NaN). Write-Pfad auf `json.dumps` umstellen.
+. *A-005* — der CLI-Fehler-UX-Wrapper `run_cli` und damit `--debug` greifen im installierten
+  `console_scripts`-Pfad gar nicht; alle drei Kommandos zeigen direkt auf `:main`.
+
+=== Gesamtbild nach 3 Phasen
+
+Der Kern (domain/, rendering/IR, pipeline/, Spreadsheet-Adapter) ist architektonisch sauber geschnitten und
+ungewöhnlich dicht durch Architektur-Guards abgesichert — die Layer-Invarianten (`pipeline ⊥ rendering`,
+`rendering ⊥ domain`, `rendering ⊥ Backend-Libs`, Formula-Boundary, Parser stoppt bei `WorkbookIR`) halten.
+Die offenen Hebel sind durchweg *Rand*-Themen: (a) ein echter Layer-Verstoß (`domain → rendering.formulas`,
+D-001, Fix = `formulas.py → core/`); (b) drei Generationen von Backend-Routing nebeneinander (A-001) — der
+grösste Hebel für weniger Code und klarere Onboarding-Story; (c) zwei Stellen, an denen der Render-Pfad seine
+Eingaben mutiert (IR-006); (d) eine `repr`-statt-JSON-Serialisierung der Meta-Payload (IR-008); (e) kleinere
+Inkonsistenzen in den einfachen Backends und der CLI-Fehlerbehandlung. Nichts davon ist release-blockierend,
+aber A-001 + D-001 zusammen würden die Codebasis spürbar kohärenter machen.
+
+=== Input für Phase 4 (Konsolidierung)
+
+* *CRITICAL (Gesamt-Übersicht):* D-001 (`domain → rendering.formulas`) — einziger echter Architektur-Verstoß.
+* *SHOULD-FIX:* IR-002 (= D-001-Fix), IR-006 (`frame_selection`/`layout_composer` mutieren Eingaben),
+  IR-008 / A-004 (repr→JSON für `workbook_meta_blob`), A-001 (Dispatch-/Orchestrator-Konsolidierung),
+  A-002 (`sheets-pack --input-kind csv_dir` kaputt), A-003 (`_meta`-Sicherheit XML/YAML-Writer),
+  A-005 (CLI-`console_scripts` umgehen `run_cli`).
+* *NICE-TO-HAVE:* IR-013 / A-? (`exported_at` befüllen oder aus `minimal_fields` streichen),
+  A-006 (`_interfaces.py` löschen), A-007 (`coerce_backend_options(None)`), A-008/A-009 (JSON/CSV
+  Read/Write-Asymmetrie), A-010 (`run_pipeline`-Namenskollision), `odf_renderer.py`-Split,
+  Modul-Docstring `cli/apps/run.py`.

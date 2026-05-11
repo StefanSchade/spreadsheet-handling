@@ -1,0 +1,638 @@
+= Code Review: Konsolidierung
+:date: 2026-05-11
+:reviewer: Claude Opus 4.7
+:phase: 4 von 4
+:status: complete
+:covers: review-domain-core.adoc, review-ir-pipeline.adoc, review-adapters-cli.adoc
+
+== Rohliste aller Findings
+
+_Alle Findings aus Phase 1–3, unverändert übernommen. Schwere-Spalte wie im
+Quelldokument (Phase 4-Re-Priorisierung folgt in Schritt 2). Doppelungen sind
+markiert: A-004 ≡ IR-008 (gleiches Problem aus Adapter-Sicht); D-001 + IR-002
+sind Problem + Fix-Ort desselben Sachverhalts._
+
+[cols="1,1,1,3,1", options="header"]
+|===
+|ID |Phase |Schwere |Problem (Kurzform) |Betroffene Schicht
+
+|D-001 |1 |CRITICAL |Hexagonale Grenzverletzung: `domain/transformations/{enrich_lookup,fk_helpers}.py` importieren `rendering.formulas` (`lookup_formula`). Kein Guard fängt es (L1). |domain → rendering
+|D-002 |1 |SHOULD-FIX |`core/fk.py` (339 Z.) trägt FK-Namenskonvention (`FK_PATTERN`) + FK-Helper-Primitive — Domänenlogik in einem Blatt-Layer; `core/__init__.py` re-exportiert sie. |core → domain
+|D-003 |1 |SHOULD-FIX |Dreifache Namensüberlappung `core/fk.py` / `domain/transformations/fk_helpers.py` / `domain/validations/fk_helpers.py` (+ `transformations/helpers.py`). |core / domain
+|D-004 |1 |SHOULD-FIX |Neun Module > 440 Z. (Spitzen 725/631/567/562/562) — keine KI erfasst sie in einem Read-Window. |domain
+|D-005 |1 |SHOULD-FIX |Zwei parallele Finding-Modelle (`Finding`+`apply_severity_policy` vs `ReferenceFinding`+`mode`); uneinheitliches Fehlermodell. |domain/validations
+|D-006 |1 |SHOULD-FIX |Paradigmen-Mix in `transformations/helpers.py` (einziges Closure-Factory-Modul) + Grab-Bag ohne einen Zweck. |domain/transformations
+|D-007 |1 |SHOULD-FIX |Cross-Modul-Import privater Symbole: `yaml_overrides.py` importiert `_deep_merge`/`_get_meta`/`_set_meta` aus `meta_bootstrap`. |domain
+|D-008 |1 |SHOULD-FIX |Mislabeltes Modul: `validations/validate_columns.py` validiert nichts, es hängt Constraints an `_meta.constraints` (`add_validations`). |domain/validations
+|D-009 |1 |SHOULD-FIX |Backward-Compat-Reste: `core/fk.py::apply_fk_helpers` (legacy dict inputs), `core/refs.py::add_helper_columns` mit blankem `except Exception`. |core
+|D-010 |1 |SHOULD-FIX |Leere/inkonsistente Paket-Oberflächen: `domain/__init__.py`, `domain/transformations/__init__.py` leer; `domain/validations/__init__.py` exportiert nur die Reference/Graph-Hälfte. |domain
+|D-011 |1 |SHOULD-FIX |Domain macht Datei-I/O + hängt direkt an `pyyaml`: `structured_yaml.py` (`Path.open("w")`, `mkdir`, `import yaml`), `yaml_overrides.py` liest YAML-Datei. Kein Guard (L2). |domain
+|D-012 |1 |NICE-TO-HAVE |Keine Modul-Header-Konvention (Purpose/Layer/erlaubte Imports) in `domain/`+`core/`. |domain / core
+|D-013 |1 |NICE-TO-HAVE |"Dual-Interface"-Shim (`hasattr(frames,"meta")` vs `frames["_meta"]`, toter `where=="temp"`-Zweig) in `meta_bootstrap.py` + `validate_columns.py`. |domain
+|D-014 |1 |SHOULD-FIX |Unvollendete Implementierung: `enrich_lookup._build_formula_enrichment` setzt `missing = "" if missing_mode=="empty" else ""` — beide Zweige `""`, `missing_mode` ist No-op im Formel-Modus. |domain/transformations
+
+|IR-001 |2 |— |Kein eigenes Finding — in `rendering/` + `pipeline/` keine release-blockierende Verletzung gefunden; die CRITICAL bleibt D-001, ihr Fix-Ort ist IR-002. |—
+|IR-002 |2 |SHOULD-FIX |`rendering/formulas.py` (72 Z.) liegt im falschen Layer — rein backend-neutrale `*FormulaSpec`-Wertobjekte + Factories; deshalb *muss* `domain/` über die Grenze greifen (= Wurzel von D-001). |rendering → core
+|IR-003 |2 |SHOULD-FIX |`passes/`-Paket strukturell irreführend + toter Code: `formula_pass.py`/`post_pass.py` leer, `meta_pass.py`/`style_pass.py` No-op-Stubs, `validation_pass.py` (80 Z.) veraltete Parallel-Impl — echte Logik (8 Passes, 518 Z.) gebündelt in `core.py`. |rendering/passes
+|IR-004 |2 |SHOULD-FIX |Zwei manuell synchron gehaltene Pass-Pipelines: `passes/__init__.py::apply_all` vs `flow.py::default_p1_passes` — kein Test prüft Gleichheit. |rendering
+|IR-005 |2 |SHOULD-FIX |`derived`-Meta-Kanal umgeht `meta_registry.yaml`: `domain/transformations/{enrich_lookup,fk_helpers}.py` schreiben `_meta["derived"]["sheets"]`, `rendering/passes/core.py` liest es — kein Registry-Eintrag, kein `producer`/`consumer`-Vertrag, `test_meta_registry` fängt es nicht. |domain → rendering / meta-registry
+|IR-006 |2 |SHOULD-FIX |Render-Pfad mutiert seine Eingaben: `layout_composer._add_legend_blocks` schreibt `spec["resolved"]` in den Aufrufer-`meta`; `frame_selection._resolve_formula_sheet_names` mutiert Eingabe-Frames in-place. |rendering
+|IR-007 |2 |SHOULD-FIX |Tote/doppelte Pipeline-Step-Factories: `make_flatten_headers_step`/`make_unflatten_headers_step` nirgends benutzt; mehrere dünne Wrapper duplizieren `target`-Strings aus `REGISTRY`. |pipeline
+|IR-008 |2 |SHOULD-FIX |Asymmetrische `workbook_meta_blob`-Persistenz: Write-Pfad `WriteMeta(kv={str(k):str(v)})` → `str(dict)` (Python-`repr`, kein JSON); Read-Pfad `json.loads` → Fallback `ast.literal_eval`. Fragil bei Nicht-Literalen. (≡ A-004) |rendering ↔ io_backends
+|IR-009 |2 |NICE-TO-HAVE |`rendering/__init__.py` leer — IR-Layer ohne öffentliche Oberfläche; Konsumenten kennen tiefe Pfade. |rendering
+|IR-010 |2 |NICE-TO-HAVE |`pipeline/registry.py` (261 Z.) mischt `REGISTRY`-Mapping + YAML→`BoundStep`-Bauprozess + redundanten `run_pipeline`-Re-Export. |pipeline
+|IR-011 |2 |NICE-TO-HAVE |Namens-Inkonsistenzen aus der FK-Step-Umbenennungswelle: `make_apply_fks_step` ↔ Key `add_fk_helpers`, `make_drop_helpers_step` ↔ `remove_fk_helpers`, `make_check_fk_helpers_step` ↔ `validate_fk_helpers`. |pipeline
+|IR-012 |2 |NICE-TO-HAVE |`pipeline/config.py` definiert ein zweites Config-Modell (`AppConfig`/`PipelineConfig`/`StepRef.dotted`) parallel zur `step:`-basierten `build_steps_from_config`-Welt; zwei YAML-Dialekte. |pipeline
+|IR-013 |2 |NICE-TO-HAVE |`MetaPass.minimal_fields` reserviert `exported_at`, befüllt es aber nie (`setdefault(...,"")`) — toter Platzhalter oder ungeklärte Lücke. |rendering
+|IR-014 |2 |NICE-TO-HAVE |Keine Modul-Header-Konvention in `rendering/`+`pipeline/` (`flow.py`/`plan.py`/`ir.py`/`config.py` ohne Docstring). |rendering / pipeline
+
+|A-001 |3 |SHOULD-FIX |Dreifache Backend-Dispatch-Tabelle (`router.py` `LOADERS`/`SAVERS`; `io_backends/__init__.py` `_BACKEND_SPECS`/`make_backend`; `application/orchestrator.py` if/elif) + zwei Orchestrator-Einstiegspunkte (`orchestrate()` vs `pipeline.runner.run_pipeline`) mit divergierenden `kind`-Schlüsseln. |io_backends / application / pipeline
+|A-002 |3 |SHOULD-FIX |`sheets-pack --input-kind csv_dir` kaputt: `choices` bietet `csv_dir`, `orchestrate()::_load_frames` hat keinen CSV-Zweig → `ValueError`. |cli / application
+|A-003 |3 |SHOULD-FIX |Uneinheitliche `_meta`-Behandlung in einfachen Writern: `JSONBackend`/`save_csv_dir` überspringen `_meta`, `XMLBackend.write_multi`/`save_yaml_dir` nicht → `AttributeError` bei meta-erzeugender Pipeline (`sheets-run --out-kind yaml_dir|xml_dir` crasht). |io_backends
+|A-004 |3 |SHOULD-FIX |`workbook_meta_blob` wird als Python-`repr` persistiert, per `ast.literal_eval` zurückgelesen — bricht still bei NaN/Nicht-Literalen. (≡ IR-008) |rendering / io_backends
+|A-005 |3 |SHOULD-FIX |CLI-Fehler-UX-Wrapper greift im echten Pfad nicht: `pyproject.toml [project.scripts]` zeigt alle drei Kommandos direkt auf `:main`; `run_cli(main)` (Error-Zeile, `--debug`-Traceback) läuft nur bei `python cli/apps/run.py`. `--debug` ist im Installations-Pfad tot. |cli / pyproject
+|A-006 |3 |NICE-TO-HAVE |`io_backends/_interfaces.py` toter Code — 7-Zeilen-Legacy-Re-Export, von keiner Datei importiert. |io_backends
+|A-007 |3 |NICE-TO-HAVE |`coerce_backend_options(None)` liefert `cast(BackendOptions, {})` (ein dict) statt `BackendOptions()` — Attributzugriff würde `AttributeError` werfen. |io_backends
+|A-008 |3 |NICE-TO-HAVE |JSON-Roundtrip nicht symmetrisch für MultiIndex-Frames: `write_multi` emittiert verschachteltes JSON, `read_multi` ignoriert `header_levels`. |io_backends
+|A-009 |3 |NICE-TO-HAVE |`CSVBackend.read` respektiert `header_levels`, `read_multi` liest immer `header=0` und füllt Fake-MultiIndex auf — echte Multi-Header-CSV verliert Struktur. |io_backends
+|A-010 |3 |NICE-TO-HAVE |`pipeline.runner.run_pipeline(AppConfig)` überschattet `pipeline.registry.run_pipeline(frames,steps)` — gleicher Name, andere Signatur; `pipeline/__init__.py` exportiert die Registry-Variante. |pipeline
+|===
+
+=== Beobachtungen zur Rohliste
+
+* *Doppelungen / Cluster bereits erkennbar:*
+  ** D-001 ≡ IR-002 — derselbe Sachverhalt: D-001 ist der *Symptom-Ort* (`domain` importiert `rendering`), IR-002 der *Fix-Ort* (`rendering/formulas.py` ist falsch platziert).
+  ** A-004 ≡ IR-008 — identisches Problem, einmal aus IR-Sicht (Phase 2), einmal aus Adapter-Sicht (Phase 3). In Schritt 2 als *ein* Finding behandeln.
+  ** D-003 + D-002 — FK-Namensüberlappung und FK-Domänenlogik im Core hängen zusammen (gemeinsamer Fix: `domain/fk/`-Paket).
+  ** IR-003 + IR-004 — `passes/`-Aufräumen löst auch die doppelte Pass-Pipeline.
+* *Schichten-Verteilung:* Phase 1 (`domain`/`core`) trägt die einzige echte hexagonale Verletzung + den Großteil der Hygiene-Schuld (überlange Module, FK-Wildwuchs, leere `__init__`). Phase 2 (`rendering`/`pipeline`) ist architektonisch sauber — fast nur Struktur/Hygiene. Phase 3 (`io_backends`/`cli`/`application`) trägt die Funktions-Bugs (A-002, A-003) und die Dispatch-Triplikat-Schuld (A-001).
+* *Querschnitt-Themen:* (a) Modul-Header-Konvention fehlt überall (D-012, IR-014); (b) `meta_registry.yaml` ist unvollständig (`derived` fehlt, IR-005); (c) `exported_at`-Platzhalter zieht sich durch alle drei Phasen (IR-013, A-? in Phase 3).
+
+== Priorisierte Gesamt-Übersicht
+
+_Re-Priorisierung nach den Phase-4-Kriterien (Korrektheit/Roundtrip/Release vs.
+technische Schuld vs. Hygiene vs. nice-to-have). Weicht bewusst von der
+Schwere-Spalte der Einzelreviews ab, wo der Gesamtblick es nahelegt — z. B. werden
+die zwei echten Funktions-Bugs aus Phase 3 (A-002, A-003) hochgestuft, D-001
+bleibt CRITICAL, ist aber als "architektonisch", nicht "user-facing" markiert._
+
+=== CRITICAL
+
+[cols="1,3,2,1", options="header"]
+|===
+|ID(s) |Problem |Empfehlung |Cluster
+
+|D-001 + IR-002
+|*Einziger echter hexagonaler Layer-Verstoß:* `domain/transformations/{enrich_lookup,fk_helpers}.py` importieren `rendering.formulas`. Wurzelursache: `rendering/formulas.py` enthält rein backend-neutrale Wertobjekte, liegt aber im Render-Layer. Kein Guard fängt es (Lücke L1). _CRITICAL "architektonisch" — kein user-facing Bug, aber bricht das Kernversprechen "hexagonal sauber"._
+|`rendering/formulas.py` → `core/formulas.py`; 7 Importe nachziehen (2× `domain/`, 5× `rendering/` + 4× `io_backends/`); danach Guard `test_domain_modules_do_not_import_rendering_or_io_backends` ergänzen → schließt L1.
+|C1
+
+|IR-008 + A-004
+|*Fragile Roundtrip-Serialisierung:* `workbook_meta_blob` wird als `str(dict)` (Python-`repr`, kein JSON) in die `WriteMeta`-Op geschrieben; Read-Pfad versucht `json.loads`, fällt auf `ast.literal_eval` zurück. Bricht *still* bei Nicht-Literalen (z. B. `float('nan')` → `'nan'` → `ValueError` → Parser liefert rohe KV-Strings). Für eine roundtrip-zentrierte Bibliothek ein Korrektheitsrisiko.
+|Write-Pfad auf `json.dumps(meta)` umstellen (`rendering/flow.py:226`, `composer/layout_composer.py:308`, `passes/__init__.py:32`); `ast.literal_eval`-Fallback als Legacy-Lesepfad behalten. Expliziten Roundtrip-Test mit NaN/verschachtelten Strukturen ergänzen.
+|C4
+
+|A-003
+|*`sheets-run --out-kind yaml_dir\|xml_dir` crasht* bei einer meta-erzeugenden Pipeline: `XMLBackend.write_multi` / `save_yaml_dir` reichen das `_meta`-Dict an `df.where(...)` / `df.to_dict(...)` → `AttributeError`. `JSONBackend`/`save_csv_dir` überspringen `_meta` korrekt — die Behandlung ist uneinheitlich.
+|`_meta` in `xml_backend.py:152` und `yaml_backend.py:76` überspringen (wie JSON/CSV). Optional: XML-`_meta.yaml`-Sidecar oder dokumentieren, dass XML/YAML reine Datenexporte sind.
+|C5
+|===
+
+=== SHOULD-FIX
+
+[cols="1,3,2,1", options="header"]
+|===
+|ID(s) |Problem |Empfehlung |Cluster
+
+|D-002 + D-003 + D-009
+|*FK-Wildwuchs:* `core/fk.py` (339 Z.) trägt die FK-Namenskonvention (`FK_PATTERN` = Domänenregel) + FK-Helper-Primitive (`build_registry`, `detect_fk_columns`, `apply_fk_helpers`, …), `core/__init__.py` re-exportiert sie nach außen — der FK-Architektur-Guard nennt mehrere davon ausdrücklich "gehört nach `domain.transformations.fk_helpers`". Dazu dreifache Namensüberlappung `core/fk.py` / `domain/transformations/fk_helpers.py` / `domain/validations/fk_helpers.py` und Backward-Compat-Reste in `apply_fk_helpers` + ein blankes `except Exception` in `core/refs.py::add_helper_columns`.
+|`domain/fk/`-Paket: `columns.py` (Konvention/Detection), `helpers.py` (Spalten-Anreicherung/Provenance), `checks.py` (Validierungen). `core/fk.py` auflösen; `core/__init__.py` ausdünnen; tote Kompat-Pfade entfernen; FK-Guard auf die neue Struktur anpassen.
+|C2
+
+|IR-003 + IR-004
+|*`passes/`-Paket irreführend + toter Code + doppelte Pass-Pipeline:* `formula_pass.py`/`post_pass.py` leer, `meta_pass.py`/`style_pass.py` No-op-Stubs, `validation_pass.py` (80 Z.) veraltete Parallel-Impl — echte Logik (8 Pass-Klassen, 518 Z.) gebündelt in `core.py`. Zusätzlich halten `passes/__init__.py::apply_all` und `flow.py::default_p1_passes` zwei manuell synchrone Pass-Listen.
+|`core.py` entlang der schon vorhandenen Dateinamen aufspalten (`_base.py` für `IRPass`+Helfer, `style_pass.py`, `protection_pass.py`, `filter_pass.py`, `freeze_pass.py`, `column_width_pass.py`, `validation_pass.py`, `meta_pass.py`, `named_range_pass.py`); `__init__.py` re-exportiert; tote Stubs löschen; *eine* `default_passes()`-Quelle; `test_ir_architecture_clarity`-Whitelist anpassen; Test "apply_all-Reihenfolge == default_passes()".
+|C3
+
+|IR-005
+|*`derived`-Meta-Kanal ohne Vertrag:* `domain/transformations/{enrich_lookup,fk_helpers}.py` schreiben `_meta["derived"]["sheets"]`, `rendering/passes/core.py::_derived_helper_column_names` liest es — `derived` hat keinen Eintrag in `meta_registry.yaml`, also keine `producer`/`consumer`-Refs, keine Layer-Klassifikation, und `test_meta_registry` prüft es nicht.
+|`derived` als `meta_rendering`/`derived_operational_view` (transient — `drop_helpers` `pop`t es) in `meta_registry.yaml` eintragen, mit `producer`/`consumer`-Refs. Alternativ: expliziter Allowlist-Kommentar + Begründung im Register.
+|C6
+
+|IR-006
+|*Render-Pfad mutiert seine Eingaben:* `layout_composer._add_legend_blocks` schreibt `spec["resolved"]` in den Aufrufer-`meta` (bei wiederholtem Aufruf mit demselben `meta` akkumulierend, da `spreadsheet_contract` nur flach `dict(meta)` kopiert); `frame_selection._resolve_formula_sheet_names` schreibt `value[col] = series.apply(...)` auf Eingabe-DataFrames. Heute von keinem internen Aufrufer mit Zweit-Output ausgelöst — latenter Bug.
+|`compose_workbook` auf `deepcopy` der `legend_blocks`-Specs arbeiten lassen (oder `resolved` auf `TableBlock`/`SheetIR` statt im Eingabe-Meta ablegen); `_resolve_formula_sheet_names` auf einer Kopie der betroffenen Frames. Mindestens: dokumentieren, dass `build_spreadsheet_render_plan` die Eingaben konsumiert.
+|—
+
+|A-001 + A-010
+|*Dreifache Backend-Dispatch-Tabelle + Doppel-Orchestrator:* `router.py` (`LOADERS`/`SAVERS`, von `pipeline/runner.py` genutzt), `io_backends/__init__.py` (`_BACKEND_SPECS`/`make_backend`, nur Tests), `application/orchestrator.py` (`_load_frames`/`_save_frames` if/elif, von der CLI) — divergierende `kind`-Schlüssel (`csv_dir` lädt nur über `router`, nicht über `orchestrate()`). Dazu `pipeline.runner.run_pipeline(AppConfig)` ↔ `pipeline.registry.run_pipeline(frames,steps)` — Namenskollision.
+|Auf *eine* Registry konsolidieren (`router` als kanonische Quelle); `_load_frames`/`_save_frames` und `make_backend` darauf umstellen; einen Orchestrator-Einstieg als dünnen Adapter über den anderen; die `AppConfig`-Variante umbenennen (`run_app`). *Lazy-Import für xlsx/ods erhalten* → ADR (s. u.).
+|C5
+
+|A-002
+|*`sheets-pack --input-kind csv_dir` ist kaputt:* `choices` bietet `csv_dir`, `orchestrate()::_load_frames` hat keinen CSV-Zweig → `ValueError`. (`sheets-pack` ist ein deprecierter Shim.)
+|Minimal: `csv_dir` aus den `choices` entfernen. Im Zuge von A-001: `orchestrate()` einen CSV-Zweig geben.
+|C5
+
+|A-005
+|*CLI-Fehler-UX greift im echten Pfad nicht:* `pyproject.toml [project.scripts]` zeigt alle drei Kommandos direkt auf `:main`; `run_cli(main)` (Error-Zeile, `--debug`-Traceback) läuft nur bei `python cli/apps/run.py`. `--debug` ist im Installations-Pfad faktisch tot; `sheets-pack`/`sheets-unpack` haben gar keinen Wrapper.
+|`console_scripts` auf Wrapper-Funktionen zeigen lassen (`run_cli`-umschlossene Entry-Points) oder den `try/except` aus `run_cli` in jede `main()` ziehen — einheitlich für alle drei Kommandos.
+|—
+
+|D-005
+|*Zwei parallele Finding-Modelle + uneinheitliches Fehlermodell:* `validations/findings.py` (`Finding` + `apply_severity_policy`, Caller-Policy, von den FK-Helper-Checks genutzt) vs `reference_validations.py`+`graph_validations.py` (`ReferenceFinding` + `findings_to_frame` + `mode`-Parameter, intern raised/Frame geschrieben).
+|Auf *ein* Finding-Modell konvergieren: entweder durchgängig "Checks liefern Findings, Caller entscheidet Policy" oder durchgängig `mode`-getrieben.
+|—
+
+|D-004
+|*Neun Module > 440 Z.* (Spitzen 725/631/567/562/562) — plus `ods/odf_renderer.py` (540 Z.) im Adapter-Layer. Keine KI erfasst sie in einem Read-Window.
+|In kohärente Pakete zerlegen (`cell_codec/{parse,serialize,decode_encode,legend}.py`, `reference_validations/{rules,conditions,findings_frame}.py`, …); `odf_renderer.py` in Adress-/Style-Helfer + `_BufferedSheet` + `_build_table` + Freeze-Settings + table-driven Op-Dispatch. Ziel: keine Datei > ~300 Z.
+|C7
+
+|D-006
+|*Paradigmen-Mix in `transformations/helpers.py`:* einziges `transformations/`-Modul im Closure-Factory-Stil (`mark_helpers(...) -> Step`), zugleich Grab-Bag (mark/clean/flatten/unflatten/reorder) mit "can be integrated later"-Kommentar.
+|Stil angleichen (direkte `(frames,**cfg)->frames`-Funktionen) oder die Step-Factory-Variante nach `pipeline/steps.py` ziehen; nach Zweck aufteilen.
+|—
+
+|D-007
+|*Cross-Modul-Import privater Symbole:* `yaml_overrides.py` importiert `_deep_merge`/`_get_meta`/`_set_meta` aus `meta_bootstrap`.
+|Diese Helfer als öffentliche Namen in ein gemeinsames Meta-Merge-Modul heben.
+|—
+
+|D-008
+|*Mislabeltes Modul:* `validations/validate_columns.py` validiert nichts — `add_validations` hängt Constraints an `_meta.constraints`. Eher eine Configuration-Transformation.
+|Datei/Modul umbenennen (`add_validations.py`); ggf. nach `domain/transformations/` oder einen Configuration-Bereich verschieben.
+|—
+
+|D-011
+|*Domain macht Datei-I/O + hängt direkt an `pyyaml`:* `structured_yaml.py` (`Path.open("w")`, `mkdir`, `stat`, `import yaml`), `yaml_overrides.py` liest YAML-Datei. Kein Guard verhindert es (L2).
+|Datenformung in der Domain belassen, das Schreiben/Lesen über eine schmale io-Naht (io_backend oder Pipeline-Schritt) führen. Mindestens: dokumentieren, dass `yaml` hier bewusst geduldet ist + Allowlist-Guard.
+|—
+
+|D-014
+|*Unvollendete Implementierung:* `enrich_lookup._build_formula_enrichment` setzt `missing = "" if missing_mode=="empty" else ""` — `missing_mode` ist im Formel-Modus ein No-op.
+|`missing_mode` echt umsetzen (z. B. Fehler bei `"fail"`) oder den toten Zweig entfernen + Verhalten dokumentieren.
+|C1 (touches `enrich_lookup.py` — günstig im selben PR)
+
+|IR-007
+|*Tote/doppelte Pipeline-Step-Factories:* `make_flatten_headers_step`/`make_unflatten_headers_step` nirgends benutzt (auch nicht öffentlich — `test_public_import_surface` stellt das sicher) und hardcoden `target`-Strings parallel zu `REGISTRY`; weitere dünne Wrapper duplizieren `target`-Konstanten.
+|`make_flatten_headers_step`/`make_unflatten_headers_step` löschen; bei den test-genutzten Wrappern die `target`-Konstante aus `REGISTRY` wiederverwenden oder Tests über `build_steps_from_config` fahren.
+|—
+|===
+
+=== HYGIENE
+
+[cols="1,3,2,1", options="header"]
+|===
+|ID(s) |Problem |Empfehlung |Cluster
+
+|D-012 + IR-014
+|*Keine Modul-Header-Konvention* in `domain/`, `core/`, `rendering/`, `pipeline/` — manche Module haben einen Zweck-Docstring, viele (`flow.py`, `plan.py`, `ir.py`, `config.py`, `cli/apps/run.py`) gar keinen. `head -5` orientiert weder Mensch noch KI.
+|1–3-Zeilen-Header je `*.py`: "Purpose / Layer / darf importieren: …". Lässt sich teil-skripten (Layer aus Pfad ableiten).
+|C8
+
+|D-010 + IR-009
+|*Leere/inkonsistente Paket-Oberflächen:* `domain/__init__.py`, `domain/transformations/__init__.py`, `rendering/__init__.py` leer; `domain/validations/__init__.py` exportiert nur die Reference/Graph-Hälfte. Aufrufer/Agenten müssen tiefe Pfade kennen.
+|Stabiles `__all__` pro Sub-Paket (`domain.transformations`, `domain.validations`, `rendering`): die wenigen öffentlichen Symbole exportieren. Voraussetzung für D-004 (Refactorings innerhalb des Pakets werden unsichtbar).
+|C7
+
+|IR-010
+|*`pipeline/registry.py` (261 Z.) mischt drei Dinge:* `REGISTRY`-Mapping, YAML→`BoundStep`-Bauprozess, redundanter `run_pipeline`-Re-Export (das in `runner.py` liegt).
+|Trennen: `registry.py` = `REGISTRY` + `resolve_registration`; `build.py` = `build_steps_from_config`/`build_steps_from_yaml`; `run_pipeline` nur an einer Stelle.
+|C5 (überlappt mit der Orchestrator-/Dispatch-Konsolidierung)
+
+|IR-011
+|*FK-Step-Namens-Inkonsistenzen:* `make_apply_fks_step` ↔ Key `add_fk_helpers`, `make_drop_helpers_step` ↔ `remove_fk_helpers`, `make_check_fk_helpers_step` ↔ `validate_fk_helpers` — Funktionsname ≠ sichtbarer Step-Name.
+|Factory-Namen an die Registry-Keys angleichen; mit dem `pipeline_step_registry.json`-Naming abstimmen.
+|C2 (FK-adjacent — günstig zusammen mit der FK-Konsolidierung)
+
+|IR-012
+|*Zwei Config-Modelle:* `pipeline/config.py` (`AppConfig`/`PipelineConfig`/`StepRef.dotted`) parallel zur `step:`-basierten `build_steps_from_config`-Welt; zwei YAML-Dialekte; `runner.py` brückt dazwischen.
+|Auf einen YAML-Dialekt konvergieren (der `step:`-basierte ist reicher und Guard-geprüft); `config.AppConfig` nur noch für I/O-Endpoints + Excel-Optionen.
+|C5
+
+|D-013
+|*"Dual-Interface"-Shim* in `meta_bootstrap.py` + `validate_columns.py` (`hasattr(frames,"meta")` vs `frames["_meta"]`, toter `where=="temp"`-Zweig) — der Rest der Domain nutzt nur das `Frames = dict`-Modell.
+|Auf das `Frames = dict[str, ...]`-Carrier-Modell festlegen; Attr-Pfad + `temp`-Zweig entfernen.
+|—
+
+|A-006
+|`io_backends/_interfaces.py` ist toter Code — 7-Zeilen-Legacy-Re-Export, von keiner Datei in `src/` oder `tests/` importiert.
+|Ersatzlos löschen.
+|—
+
+|A-007
+|`coerce_backend_options(None)` liefert `cast(BackendOptions, {})` (ein dict) statt `BackendOptions()` — funktioniert nur, weil alle Aufrufer Truthiness-Checks machen.
+|`return BackendOptions()`.
+|—
+|===
+
+=== NICE-TO-HAVE
+
+[cols="1,3,2,1", options="header"]
+|===
+|ID(s) |Problem |Empfehlung |Cluster
+
+|IR-013
+|`MetaPass.minimal_fields` reserviert `exported_at`, befüllt es aber nie (`setdefault(...,"")`); im ganzen Paket setzt nichts einen Zeitstempel.
+|Entscheiden: `exported_at` aus `minimal_fields` entfernen *oder* dokumentieren, wer es setzt (CLI/Orchestrator) — und dann über einen *injizierbaren* Clock-Wert, nie `datetime.now()` direkt (Determinismus).
+|—
+
+|A-008
+|JSON-Roundtrip nicht symmetrisch für MultiIndex-Frames: `write_multi` emittiert verschachteltes JSON, `read_multi` ignoriert `header_levels` und baut keinen MultiIndex zurück.
+|Verhalten dokumentieren oder Read-Pfad symmetrisch machen.
+|—
+
+|A-009
+|`CSVBackend.read` respektiert `header_levels` (`pd.read_csv(header=range(...))`), `read_multi` liest immer `header=0` und füllt einen Fake-MultiIndex auf — echte Multi-Header-CSV-Verzeichnisse verlieren ihre Struktur.
+|`read_multi` dieselbe `header`-Logik wie `read` geben.
+|—
+|===
+
+=== Cluster-Übersicht
+
+[cols="1,2,3,1", options="header"]
+|===
+|Cluster |Findings |Warum zusammen |Geschätzter Aufwand
+
+|C1 — `formulas.py` → `core/` + Guard
+|D-001, IR-002, (D-014)
+|`formulas.py` verschieben löst den einzigen Layer-Verstoß; der Move berührt `enrich_lookup.py`, wo auch D-014 (toter `missing_mode`-Zweig) sitzt — günstig im selben PR.
+|~½ Tag (mechanischer Move, 11 Importe, neuer Guard)
+
+|C2 — FK-Konsolidierung
+|D-002, D-003, D-009, IR-011
+|`domain/fk/`-Paket aufzubauen verschiebt die Domänenlogik aus `core/`, beseitigt die dreifache Namensüberlappung, räumt die Compat-Reste in `core/fk.py` auf und ist der natürliche Moment, auch die FK-Step-Namen anzugleichen. Berührt den FK-Architektur-Guard.
+|~1–1½ Tage (viele Aufrufstellen + Guard-Anpassung)
+
+|C3 — `passes/`-Aufräumen
+|IR-003, IR-004
+|`core.py` entlang der vorhandenen Dateinamen aufspalten beseitigt die toten Stubs *und* macht "wo ist Pass X" auffindbar; im selben Zug die doppelte Pass-Liste auf eine Quelle ziehen.
+|~½–1 Tag
+
+|C4 — Meta-Blob-Serialisierung
+|IR-008, A-004
+|Identisches Finding aus zwei Phasen — Write-Pfad auf `json.dumps`, Read-Pfad behält den Legacy-Fallback.
+|~2 h + Roundtrip-Test
+
+|C5 — Backend-Dispatch / Orchestrator / einfache Writer
+|A-001, A-002, A-003, A-010, IR-010, IR-012
+|Alles "wie registriert/dispatcht man ein Backend, und warum sind die Pfade uneinheitlich" — eine Registry, ein Orchestrator-Einstieg, ein YAML-Dialekt, konsistente `_meta`-Behandlung. A-003 ist auch standalone machbar (Quick-Win-Teil).
+|~1½–2 Tage (Lazy-Import + Test-Schlüsselmengen erhalten)
+
+|C6 — `meta_registry.yaml` vervollständigen
+|IR-005
+|`derived` (und ggf. weitere nicht-registrierte Kanäle) eintragen, damit `test_meta_registry` greift.
+|~1 h
+
+|C7 — Modularisierung / Paket-Oberflächen
+|D-004, D-010, IR-009
+|Stabile `__all__` zuerst (macht Splits unsichtbar), dann große Module zerlegen. Inkrementell, datei-für-datei.
+|mehrere Tage, gut portionierbar
+
+|C8 — Modul-Header-Konvention
+|D-012, IR-014
+|Eine einheitliche Konvention für alle vier Quell-Layer; teil-skriptbar.
+|~2–3 h
+|===
+
+=== Quick Wins (<30 min, hoher Nutzen)
+
+* *A-006* — `io_backends/_interfaces.py` löschen. Toter Re-Export weg; ein Modul weniger, das ein Agent fälschlich für relevant hält.
+* *A-007* — `coerce_backend_options(None)` auf `return BackendOptions()` ändern. Beseitigt einen latenten `AttributeError`-Pfad; Einzeiler.
+* *A-002* — `csv_dir` aus den `sheets-pack`-`choices` entfernen. Repariert eine beworbene, aber crashende CLI-Option; Einzeiler.
+* *A-003 (Teil)* — `_meta` in `xml_backend.py:152` und `yaml_backend.py:76` überspringen (wie JSON/CSV). ~2 Zeilen je Writer; behebt einen `AttributeError`-Crash auf `--out-kind yaml_dir\|xml_dir`. (Sidecar-Frage separat.)
+* *IR-007* — `make_flatten_headers_step`/`make_unflatten_headers_step` löschen. Ungenutzte Factories + Drift-Risiko durch hartkodierte `target`-Strings weg.
+* *D-007* — `_deep_merge`/`_get_meta`/`_set_meta` in `meta_bootstrap.py` öffentlich machen und in `yaml_overrides.py` so importieren. ~20 min; beseitigt einen Cross-Modul-Privatimport.
+* *IR-013 (Teilentscheidung)* — falls man sich für "raus" entscheidet: `exported_at` aus `MetaPass.minimal_fields` streichen. ~10 min (Entscheidung vorausgesetzt).
+
+=== Abhängigkeitsgraph
+
+_"X vor Y" — was zuerst behoben sein muss, damit Y sauber/sinnvoll ist:_
+
+* *IR-002 (Move `formulas.py`) vor* dem neuen `domain ⊥ rendering/io_backends`-Guard (= Abschluss von D-001) — der Guard würde sonst rot starten.
+* *D-002 (`core/fk.py` → `domain/fk/`) vor / zusammen mit D-009* — D-002 löst `core/fk.py` ggf. ganz auf; der Compat-Reste-Fix wäre dann gegenstandslos.
+* *D-002/D-003 (FK-Paket) vor IR-011 (FK-Step-Namen)* — die Step-Factories sollten auf die neue `domain/fk/`-Struktur zeigen, bevor man ihre Namen angleicht.
+* *IR-003 (`passes/`-Split) vor IR-004 (eine `default_passes()`-Quelle)* — erst die echten Pass-Module, dann die Listen-Deduplizierung darauf.
+* *D-010/IR-009 (stabile `__all__`) vor D-004 (große Module zerlegen)* — stabile Sub-Paket-Oberflächen machen die internen Splits für Aufrufer (und Agenten) unsichtbar; Phase 1 nennt D-010 ausdrücklich "Voraussetzung".
+* *A-001 (eine Registry) vor dem Voll-Fix von A-002* (`orchestrate()` einen CSV-Zweig geben) und *vor A-010* (`run_pipeline` umbenennen) — beide fallen in dieselbe Konsolidierung. Der *minimale* A-002-Fix (Choice entfernen) hängt von nichts ab.
+* *IR-005 (`derived` registrieren) vor* jedem Refactor, der den `derived`-Kanal anfasst (C2 berührt `fk_helpers.py`, das `derived` schreibt) — sonst refactort man gegen einen undokumentierten Vertrag.
+* *Unabhängig (keine Vorbedingungen):* C4 (Meta-Blob), C6 (Registry-Eintrag), C8 (Modul-Header), A-003-Teil, A-006, A-007, D-014, IR-007.
+
+== Architektur-Doku-Abgleich
+
+_Geprüft: `docs/ai_info/architecture_primer.adoc`, `interfaces_and_gates.adoc`,
+`project_context.adoc`, `conventions.adoc` — gegen die konsolidierten Findings.
+Frage: beschreibt die Doku den **Ist**-Zustand korrekt, oder einen **Soll**-Zustand,
+und wo würde sie einen KI-Agenten in die Irre führen?_
+
+=== Primer vs. Ist-Zustand
+
+[cols="2,2,1,2", options="header"]
+|===
+|Primer-Aussage |Ist-Befund (aus Reviews) |Delta |Empfehlung
+
+|Layer Map: Kante `Pipeline / Application → Render IR`.
+|Diese Kante existiert im Code *nicht*. `pipeline/` importiert nichts aus `rendering/`; `application/orchestrator.py` ruft nur `_save_frames` → Backend-Saver → `io_backends/spreadsheet_contract.build_spreadsheet_render_plan` → `rendering/`. Der Render-Flow wird *ausschließlich* vom Spreadsheet-Saver angestoßen, nie von der Pipeline. (Phase 2, "Schichtgrenze Pipeline/Rendering"; bestätigt in Phase 3.)
+|*Ja* — irreführend
+|Layer Map korrigieren: die Kante in den Render-Flow geht von `io_backends/spreadsheet_contract.py` aus, nicht von `pipeline/application`. Den "zwei Flüsse"-Text (der es richtig sagt) und das Diagramm in Einklang bringen.
+
+|Render-Flow-Diagramm: Pass-Reihenfolge `MetaPass → ValidationPass → StylePass → FilterPass → FreezePass → NamedRangePass`.
+|Tatsächliche Reihenfolge (Phase 2, aus `passes/__init__.py::apply_all` + `flow.py::default_p1_passes`): `MetaPass → ValidationPass → StylePass → ProtectionPass → FilterPass → FreezePass → ColumnWidthPass → NamedRangePass`. `ProtectionPass` und `ColumnWidthPass` fehlen im Primer.
+|*Ja* — unvollständig
+|Pass-Liste im Diagramm vervollständigen. Hinweis: nach C3 (IR-003/IR-004) wird es *eine* `default_passes()`-Quelle geben — den Primer dann darauf verweisen lassen statt die Liste zu duplizieren.
+
+|`core/`: "Stateless leaf utilities (FK detection, indexing, DataFrame construction, cell-ref math). No inward dependencies."
+|`core/fk.py` (339 Z.) trägt die FK-*Namenskonvention* (`FK_PATTERN` = Domänenregel) + FK-Helper-Primitive; der FK-Architektur-Guard selbst sagt, mehrere davon "gehören nach `domain.transformations.fk_helpers`". `core/__init__.py` re-exportiert `detect_fk_columns`/`apply_fk_helpers`. (Phase 1, D-002.)
+|*Ja* — beschreibt einen falschen Ist-Zustand als korrekt
+|"FK detection" aus der `core/`-Beschreibung streichen (jetzt schon, als bekannte Fehlplatzierung markiert; nach C2 endgültig). `core/` = nur mechanik-neutrale Hilfen.
+
+|"New IR datatype → `rendering/ir.py`"; `rendering/` "Translates domain output into a backend-neutral `RenderPlan`".
+|`rendering/formulas.py` (72 Z.) ist 100 % backend-neutral (`ListLiteralFormulaSpec`/`LookupFormulaSpec` + Factories), wird von `domain/` *und* `rendering/` *und* `io_backends/` konsumiert — es gehört nach `core/`. Ein neuer struktureller `*FormulaSpec` würde nach der Primer-Regel fälschlich in `rendering/ir.py` landen. (Phase 1 D-001, Phase 2 IR-002.)
+|*Ja* — würde nach C1 in die Irre führen
+|Nach C1: "New structural formula spec → `core/formulas.py`" ergänzen. Schon jetzt einen Hinweis aufnehmen, dass `*FormulaSpec` backend-neutral ist und verschoben wird.
+
+|"New render behavior → Pass in `rendering/passes/`; communicate via `SheetIR.meta` dunder keys".
+|Das `passes/`-Paket suggeriert per Dateinamen ein Modul-pro-Pass-Layout, *aber* alle 8 echten Passes liegen gebündelt in `passes/core.py`; `formula_pass.py`/`post_pass.py` sind leer, `meta_pass.py`/`style_pass.py` sind No-op-Stubs, `validation_pass.py` ist eine veraltete Parallel-Impl. `__init__.py`/`flow.py` ziehen die Klassen aus `core.py`. Ein Agent, der `rendering/passes/my_pass.py` anlegt, wird *nicht* verdrahtet. (Phase 2, IR-003.)
+|*Ja* — irreführend (Ist ≠ vom Primer implizierte Struktur)
+|Entweder den Primer ehrlich machen ("alle Passes in `passes/core.py`, dort ergänzen") *oder* — besser — C3 umsetzen (Split nach Dateinamen) und den Primer dann auf die echte Struktur zeigen lassen.
+
+|`orchestrator.py` (Top-Level) "is a backward-compatibility shim".
+|Es ist ein *gegateter Public-Surface* — `interfaces_and_gates.adoc` listet `from spreadsheet_handling.orchestrator import orchestrate` als dokumentierten öffentlichen Import-Pfad; nicht entfernbar. (Phase 3, H4 aufgelöst.)
+|*Ja* — Wortwahl verleitet zum Löschen
+|Umformulieren: "intentional public re-export → `application/orchestrator.py`; gated, do not remove (siehe `interfaces_and_gates.adoc`)".
+
+|"`meta_bootstrap.py` merges meta from all sources" + (separat) "Generic meta rules (inheritance, merge, priority) belong in the IR layer, not in Domain".
+|Beides stimmt, aber liest sich widersprüchlich. Phase-1-Klärung (H5): `meta_bootstrap` macht *Precedence-Merge canonischer Quellen* (Persistence/Profile/CLI), keine *Render*-Vererbung/-Priorisierung — Letzteres ist die IR-Pass-Sache. Korrekt platziert, nur erklärungsbedürftig.
+|*Teilweise* — potenziell verwirrend
+|Einen klärenden Halbsatz: "Domain merged *canonische* Meta-Quellen nach Precedence; *Render*-Vererbung/-Priorität leiten die IR-Passes ab."
+
+|"Architecture tests in `tests/architecture/` enforce layer boundaries automatically." (impliziert: vollständig)
+|Mehrere Layer-Kanten sind *nicht* geguarded: `domain → rendering`/`io_backends` (L1 — genau D-001 schlüpft durch), `domain → Third-Party-Libs` (L2 — `pyyaml` in `domain/`, D-011), Determinismus (L3), Domain-interne Schichtung (L5), Rückwärtskante `rendering → domain` (Phase 2 L1). (Phase 1, "Lücken in der Architecture-Test-Abdeckung".)
+|*Ja* — überstellt die Abdeckung als lückenlos
+|Den Satz relativieren: "…enforce *the boundaries listed below*; gaps are tracked in `review-domain-core.adoc` (L1–L8) and `review-ir-pipeline.adoc`". Nach den Guard-Ergänzungen (C1, ggf. L2/L3) die Liste fortschreiben.
+
+|"New spreadsheet backend → … register kind in `router.py`" / "New simple format backend → register kind in `router.py`".
+|Es gibt *drei* parallele Dispatch-Tabellen mit divergierenden `kind`-Schlüsseln: `router.py` (`LOADERS`/`SAVERS`), `io_backends/__init__.py` (`_BACKEND_SPECS`/`make_backend`), `application/orchestrator.py` (`_load_frames`/`_save_frames`). Ein nur in `router.py` registriertes Backend ist über `make_backend` und `orchestrate()` *nicht* erreichbar. (Phase 3, A-001.) Zusätzlich crashen `XMLBackend`/`save_yaml_dir` bei `_meta`-Dicts (A-003) — ein neues "simple backend" nach Vorbild XML würde dasselbe Problem erben.
+|*Ja* — unvollständig/irreführend
+|Bis C5 umgesetzt ist: Primer-Hinweis "kind muss in `router.py` *und* `io_backends/__init__.py._BACKEND_SPECS` *und* (für die CLI) `application/orchestrator.py` eingetragen werden". Nach C5: nur noch die eine Registry nennen. Zusätzlich: "`_meta` in simple Writern überspringen" als Konvention aufnehmen.
+
+|"New domain transformation → `domain/transformations/` + register factory in `pipeline/registry.py`"; "New pipeline step → … register in `pipeline/registry.py`".
+|Korrekt, aber unvollständig: das Review-Artefakt `docs/internal_guide/architecture/pipeline_step_registry.json` muss synchron gehalten werden (`test_pipeline_step_registry` erzwingt `set(entries) == set(REGISTRY)`), und persistente Meta-Wurzeln müssen einen `meta_canonical`-Eintrag in `meta_registry.yaml` haben. (Phase 2, Erwartungsmodell.)
+|*Teilweise* — unvollständig
+|Ergänzen: "…und den Step in `pipeline_step_registry.json` eintragen; gelesene/geschriebene Meta-Wurzeln in `meta_registry.yaml` registrieren."
+
+|`spreadsheet_contract.py` "defines the narrow generic API for spreadsheet adapters".
+|Stimmt — aber understated: es ist der *einzige* Modul, der `rendering/` betritt; `build_spreadsheet_render_plan()` ist *der* Einstiegspunkt in den Render-Flow, von den Spreadsheet-Savern aufgerufen. (Phase 3.)
+|*Teilweise* — unvollständig
+|Ergänzen: "…und ist die einzige Naht in den Render-Flow: `build_spreadsheet_render_plan()` (compose → passes → plan) wird hier aufgerufen, nicht in `pipeline/`."
+|===
+
+=== Fehlende Dokumentation
+
+_Was in `ai_info/` fehlt und ergänzt werden sollte:_
+
+* *Der `derived`-Meta-Kanal (IR-005)* — `domain/transformations/{enrich_lookup,fk_helpers}.py` schreiben `_meta["derived"]["sheets"]`, `rendering/passes/core.py` liest es; weder im Primer noch in `meta_registry.yaml` erwähnt. Sollte als transienter `meta_rendering`/`derived_operational_view`-Kanal beschrieben *und* registriert werden (C6).
+* *`workbook_meta_blob`-Serialisierungsformat (IR-008/A-004)* — der Primer nennt die `WriteMeta`-Op, aber nicht, dass der canonical-Blob heute als Python-`repr` (`str(dict)`) persistiert und per `ast.literal_eval` zurückgelesen wird (fragil bei NaN/Nicht-Literalen). Verdient eine eigene ADR ("Meta-Blob-Persistenz: JSON, kein `repr`") + einen Satz im Primer/`generic_ir.adoc`.
+* *`exported_at`-Status (IR-013)* — der canonical-Meta-Key wird von `MetaPass` reserviert, aber nie befüllt. Der Primer enumeriert die `meta_canonical`-Keys nicht (das tut `meta_registry.yaml`), aber wenn `exported_at` bleibt, gehört dokumentiert *wer* ihn setzt (CLI/Orchestrator) und *dass über einen injizierbaren Clock-Wert* — Determinismus.
+* *`meta_registry.yaml` als Pflicht-Artefakt* — der Primer verweist nur indirekt (`generic_ir.adoc`-Pointer). Es fehlt die explizite Regel in "Where new code belongs": jede gelesene/geschriebene Meta-Wurzel braucht einen Registry-Eintrag mit *importierbaren* `producer`/`consumer`-Refs, Layer (`meta_canonical`/`meta_rendering`) und Klassifikation.
+* *Lazy-Import der optionalen Spreadsheet-Adapter* — `router._lazy_callable` / `io_backends/__init__.__getattr__` importieren `openpyxl`/`odfpy` erst bei Bedarf; das ist *Absicht* (Umgebungen ohne einen der beiden Adapter sollen die Lib nicht zwangsimportieren), steht aber nur implizit im Code. Verdient eine ADR ("Optionale Spreadsheet-Adapter werden lazy importiert"), damit eine spätere Registry-Konsolidierung (C5) das nicht versehentlich zurückbaut.
+* *Modul-Header-Konvention (D-012/IR-014)* — `conventions.adoc` regelt Funktions-Größe, aber nicht Modul-Header (Purpose/Layer/erlaubte Imports) und nicht Modul-Größe. Sollte ergänzt werden (C8).
+* *Erlaubte Import-Richtungen als ausführbare Regel* — aktuell Prosa (Layer Map) + verstreute Tests. Es fehlt ein konsolidierter "wer-darf-wen"-Block (idealerweise generiert aus den `dependency_guards`-Tests), den ein Agent vor einer Änderung liest, ohne die Tests zu öffnen.
+* *`sheets-run` als gegateter Surface?* — `interfaces_and_gates.adoc` listet `sheets-pack`/`sheets-unpack`, nicht aber `sheets-run` (die Haupt-CLI-App, 178 Z.). Klären, ob `sheets-run` + seine Flags ebenfalls Produkt-API sind, und ergänzen.
+
+=== Irreführende Stellen für KI-Agenten
+
+_Stellen, die einen Agenten zu falschen Entscheidungen verleiten — Kurzliste, Details in der Tabelle oben:_
+
+. *"New render behavior → Pass in `rendering/passes/`"* — ein neu angelegtes `passes/<name>.py` wird nicht verdrahtet (alles läuft über `core.py`). Höchstes Irreführungspotenzial.
+. *Layer Map `Pipeline/Application → Render IR`* — verleitet zu der Annahme, ein Pipeline-Step dürfe `compose_workbook` aufrufen. Tut keiner; soll auch keiner.
+. *`core/` "FK detection"* — endorst eine bekannte Fehlplatzierung; ein Agent würde neue FK-Heuristik nach `core/` legen statt nach `domain/`.
+. *"New IR datatype → `rendering/ir.py`"* — für einen strukturellen `*FormulaSpec` falsch (gehört nach `core/formulas.py` nach C1).
+. *"register kind in `router.py`"* (Backends) — unvollständig wegen des Dispatch-Triplikats (A-001); das Backend wäre über zwei der drei Pfade unsichtbar.
+. *`orchestrator.py` "backward-compatibility shim"* — ein Agent könnte es als entfernbaren Cruft einstufen; es ist gegateter Public-Surface.
+. *"Architecture tests … enforce layer boundaries automatically"* — suggeriert Vollständigkeit; ein Agent könnte annehmen, ein `domain → rendering`-Import sei ok, weil "die Tests würden's ja fangen" (tun sie nicht — L1).
+
+=== Nicht betroffen
+
+_Was der Primer korrekt und vollständig beschreibt — gegen die Reviews bestätigt:_
+
+* Die *"zwei Flüsse"-Trennung als Konzept* (Pipeline ⊥ Render-Flow): im Code strikt eingehalten — `pipeline/` ⊥ `rendering/`, der Render-Flow startet im Backend-Saver. (Nur das *Diagramm* hat die Phantomkante; der erläuternde Text stimmt.)
+* *`meta_canonical → meta_rendering`-Invarianten* ("nach IR-Derivation beeinflusst `meta_canonical` das Render-Ergebnis nicht mehr direkt"; "Adapter führen den `RenderPlan` aus, re-interpretieren `meta_canonical` nicht"): test-verifiziert sauber (Phase 2 — `__`-Keys-Ableitung, `test_visible_render_result_is_stable_without_hidden_meta_payload…`). Einzige Trübung: der nicht-registrierte `derived`-Kanal (IR-005) — der bricht keine Invariante, ist aber undokumentiert.
+* *CLI "no business logic"* und *Pipeline "passes payloads through without interpreting semantics"*: bestätigt — `pipeline/runner.py` ruft nur `step(out)` in einer Schleife; `pipeline/__init__.py`/`registry.py` enthalten keine Workbook-Meta-Routing-Tokens.
+* *"Steps execute in declared order; no branching"*: bestätigt.
+* *"JSON/CSV/YAML backends bypass [the rendering] layer entirely"*: bestätigt — `application/orchestrator.py` und die einfachen Backends importieren nichts aus `rendering/`.
+* *Parser stoppt bei `WorkbookIR`; Projektion (`workbookir_to_frames`) ist generisch*: bestätigt + dicht geguarded.
+* *Key-Types-Tabelle* (`Frames`, `WorkbookIR`, `SheetIR`, `TableBlock`, `RenderPlan`, `meta_canonical`/`meta_rendering`): inhaltlich korrekt.
+* *`conventions.adoc`* insgesamt: konsistent mit den Reviews — einzige *Lücke* (kein *Fehler*) ist die fehlende Modul-Header-/Modul-Größen-Regel; einzige *Spannung* ist "prefer immutability" vs. der Render-Pfad-Mutation (IR-006), aber das ist ein Code-Bug gegen die Konvention, kein Doku-Fehler.
+* *`project_context.adoc`*: korrekt; minimal unvollständig ("JSON/CSV ↔ XLSX/ODS" — XML- und YAML-Backends existieren ebenfalls), aber nicht irreführend.
+
+== Doku-Änderungsvorschläge
+
+_Jeder Vorschlag ist mit einer Art-Kategorie versehen:_
+
+* *(a) Sofort korrigieren* — die Doku beschreibt den **Ist**-Zustand *falsch*; die Änderung ist eine reine Korrektheits-Reparatur, unabhängig von jeder Code-Arbeit.
+* *(b) Soll-Zustand + Ist-Vermerk* — die Doku beschreibt den **Soll**-Zustand *korrekt*, aber der Code weicht ab. Soll-Beschreibung *behalten*, einen Hinweis `Status: ausstehend — tracked als <Finding-ID>` ergänzen; nach Umsetzung des Findings den Hinweis entfernen.
+* *(c) Neu dokumentieren* — fehlt komplett.
+
+_Kein fertiger Text — Stichpunkte, sodass ein nachfolgender Agent/Mensch es direkt umsetzen kann._
+
+=== docs/ai_info/architecture_primer.adoc
+
+[cols="1,1,1,3", options="header"]
+|===
+|Abschnitt |Art |Priorität |Was soll stehen
+
+|`=== Layer Map` (Diagramm + Tabelle, Z. 5–19)
+|(a) Sofort korrigieren
+|hoch
+|Die Kante `Pipeline / Application → Render IR` aus dem ASCII-Diagramm entfernen bzw. ersetzen: in den Render-Flow geht es von `io_backends/spreadsheet_contract.py` (genauer: `build_spreadsheet_render_plan`, aufgerufen vom Spreadsheet-Saver). `pipeline/`/`application/` haben *keine* direkte Kante nach `rendering/`. Diagramm so zeichnen, dass `rendering/` "unter" `io_backends/spreadsheet_contract` hängt, nicht unter `pipeline/`. (Begründung: Phase 2 — `pipeline/` ⊥ `rendering/` im Code.)
+
+|`=== Layer Map`, `core/`-Zeile (Z. 40–43)
+|(a) Sofort korrigieren
+|hoch
+|"FK detection" aus der Aufzählung der `core/`-Verantwortlichkeiten streichen — `core/fk.py` trägt eine Domänenregel (`FK_PATTERN`) und FK-Helper-Primitive, die der FK-Architektur-Guard selbst der Domain zuordnet. Übergangstext: "FK-Konvention/-Helper liegen historisch in `core/fk.py`, gehören aber nach `domain/` — tracked als D-002/C2." (Streng genommen (a)+(b): die Beschreibung ist *falsch*, der Korrektur-Code steht aber noch aus → Ist-Vermerk mitgeben.)
+
+|`=== Layer Map`, `orchestrator.py`-Satz (Z. 56)
+|(a) Sofort korrigieren
+|mittel
+|"backward-compatibility shim" → "intentional public re-export of `application/orchestrator.py` (`orchestrate`, `IODesc`); a gated consumer surface — see `interfaces_and_gates.adoc`; do not remove." (Phase 3, H4.)
+
+|`==== IR Render-Flow`, Schritt ②-Pass-Liste (Z. 86)
+|(a) Sofort korrigieren
+|mittel
+|Pass-Reihenfolge vollständig: `MetaPass → ValidationPass → StylePass → ProtectionPass → FilterPass → FreezePass → ColumnWidthPass → NamedRangePass`. Nach C3: stattdessen "siehe `default_passes()` in `rendering/passes/__init__.py` (single source)" — keine duplizierte Liste mehr.
+
+|`==== Domain Pipeline flow` / "Two Data Flows" (Z. 58–92)
+|(b) Soll + Ist-Vermerk
+|niedrig
+|Den erläuternden Text (Pipeline ⊥ Render-Flow) behalten — er ist korrekt. Nur konsistent zum korrigierten Diagramm machen. Ein Satz: "Der Render-Flow wird ausschließlich vom Spreadsheet-Saver über `io_backends/spreadsheet_contract.build_spreadsheet_render_plan` angestoßen — nie von einem Pipeline-Step."
+
+|`=== Where new code belongs`, Zeile "New render behavior" (Z. 159)
+|(b) Soll + Ist-Vermerk
+|hoch
+|Soll-Text ("Pass in `rendering/passes/`, communicate via `SheetIR.meta` dunder keys") behalten. Ist-Vermerk: "Status: heute liegen *alle* Passes gebündelt in `rendering/passes/core.py`; die per-Pass-Dateien sind leer/No-op-Stubs. Bis C3 (IR-003) umgesetzt ist: neuen Pass *in `core.py`* ergänzen und in `apply_all` einreihen — nicht in einem neuen `passes/<name>.py`."
+
+|`=== Where new code belongs`, Zeile "New IR datatype" (Z. 161–162)
+|(b) Soll + Ist-Vermerk
+|mittel
+|Zeile differenzieren: "New IR *container/op* type → `rendering/ir.py` / `rendering/plan.py`. New *backend-neutral structural formula spec* → heute `rendering/formulas.py`, nach C1 (IR-002) `core/formulas.py` — Status: Move ausstehend, tracked als D-001/IR-002."
+
+|`=== Where new code belongs`, Zeilen "New spreadsheet backend" / "New simple format backend" (Z. 164–169)
+|(b) Soll + Ist-Vermerk
+|hoch
+|Soll-Text ("register kind in `router.py`") behalten als Ziel. Ist-Vermerk: "Status: derzeit drei parallele Dispatch-Tabellen — `router.py` (`LOADERS`/`SAVERS`), `io_backends/__init__.py` (`_BACKEND_SPECS`), `application/orchestrator.py` (`_load_frames`/`_save_frames`). Bis C5 (A-001) umgesetzt ist: in *allen drei* eintragen, sonst ist das Backend über `make_backend`/`orchestrate()` unsichtbar." Zusätzlich für simple Backends: "`_meta`-Sheets im Writer überspringen (wie `JSONBackend`/`save_csv_dir`) — sonst Crash bei meta-erzeugenden Pipelines (A-003)."
+
+|`=== Where new code belongs`, Zeilen "New domain transformation" / "New pipeline step" (Z. 149–157)
+|(c) Neu dokumentieren (Ergänzung)
+|mittel
+|Ergänzen: "…und den Step in `docs/internal_guide/architecture/pipeline_step_registry.json` eintragen (`test_pipeline_step_registry` erzwingt Deckungsgleichheit mit der Laufzeit-`REGISTRY`). Jede vom Step gelesene/geschriebene persistente Meta-Wurzel braucht einen Eintrag in `docs/internal_guide/architecture/meta_registry.yaml` mit importierbaren `producer`/`consumer`-Refs, Layer und Klassifikation."
+
+|`=== Layer Map`, Tabellenzeile `IO Backends` / neuer Satz zu `spreadsheet_contract.py` (Z. 51–53)
+|(c) Neu dokumentieren (Ergänzung)
+|mittel
+|Ergänzen: "`spreadsheet_contract.py` ist die *einzige* Naht in den Render-Flow: `build_spreadsheet_render_plan()` (compose → passes → plan) und `read_spreadsheet_frames()` (parse → project) werden hier aufgerufen; kein anderes Modul betritt `rendering/`."
+
+|`=== meta_canonical vs meta_rendering` (Z. 132–141)
+|(c) Neu dokumentieren (Ergänzung)
+|mittel
+|Einen Absatz zum `derived`-Kanal: "`_meta["derived"]["sheets"]` ist ein transienter `meta_rendering`-Nebenkanal: `domain/transformations/{enrich_lookup,fk_helpers}.py` schreiben Helfer-Provenienz hinein, `StylePass`/`ProtectionPass` lesen sie, `drop_helpers` entfernt sie wieder. Status: noch *nicht* in `meta_registry.yaml` registriert — tracked als IR-005/C6." Außerdem klärender Halbsatz zu `meta_bootstrap`: "Domain merged *canonische* Meta-Quellen nach Precedence; *Render*-Vererbung/-Priorität leiten die IR-Passes ab — kein Widerspruch zur Regel 'generic meta rules belong in the IR layer'."
+
+|`=== Architecture guardrails` (Z. 172–186)
+|(a) Sofort korrigieren
+|mittel
+|"enforce layer boundaries automatically" relativieren: "…enforce *the boundaries enumerated in `docs/internal_guide/architecture/architecture_guard_inventory.adoc`*. Known uncovered edges (as of 2026-05): `domain → rendering`/`io_backends` (L1 — Quelle von D-001), `domain → third-party libs` (L2 — `pyyaml` in `domain/`), determinism (L3), `domain`-internal layering (L5), backward edge `rendering → domain`. Tracked in `review-domain-core.adoc` / `review-ir-pipeline.adoc`." Nach C1 die L1-Zeile streichen.
+
+|`=== Key Types`, neuer `exported_at`-Hinweis (Z. 126–130, oder in `generic_ir.adoc`)
+|(c) Neu dokumentieren
+|niedrig
+|Wenn `exported_at` als reservierter Key bleibt: "`exported_at` wird von `MetaPass` reserviert, aber nicht befüllt; falls ein Aufrufer ihn setzt, *injizierbaren* Clock-Wert verwenden, nie `datetime.now()` im Render-/Pipeline-Pfad (Determinismus)." Alternativ — wenn die Entscheidung "raus" fällt (IR-013) — diesen Hinweis weglassen und nichts dokumentieren.
+|===
+
+=== docs/ai_info/interfaces_and_gates.adoc
+
+[cols="1,1,1,3", options="header"]
+|===
+|Abschnitt |Art |Priorität |Was soll stehen
+
+|`=== Consumer-facing surface`, Bullet "CLI entry points and flags" (Z. 7)
+|(c) Neu dokumentieren
+|mittel
+|Klären und ergänzen, ob `sheets-run` (Haupt-CLI-App, 178 Z. — liest YAML-Config, ruft den Orchestrator) ebenfalls Produkt-API ist; aktuell nur `sheets-pack`/`sheets-unpack` genannt. Wenn ja: `sheets-run` + seine Flags + die `pipeline:`/`io:`-YAML-Keys in die Liste aufnehmen.
+
+|`=== Actions that require explicit approval`, allgemein
+|(c) Neu dokumentieren (Querverweis)
+|niedrig
+|Konkreten Hinweis aufnehmen, dass A-002 (`sheets-pack --input-kind csv_dir` entfernen) unter "rename or removal of public CLI flags" fällt → braucht Nutzer-Freigabe, *bevor* der Quick-Win-Fix gemacht wird. (Steht jetzt schon implizit drin; der Cross-Link zum Finding macht es handlungsleitend.)
+
+|gesamtes Dokument
+|(b) Soll + Ist-Vermerk — *keine Änderung nötig*
+|—
+|Inhaltlich korrekt und mit den Reviews konsistent (H4 bestätigte den `orchestrator`-Import-Pfad als gegateten Surface). Nur der `sheets-run`-Punkt oben offen.
+|===
+
+=== docs/ai_info/conventions.adoc
+
+[cols="1,1,1,3", options="header"]
+|===
+|Abschnitt |Art |Priorität |Was soll stehen
+
+|`=== Python`, neuer Unterpunkt "Module headers"
+|(c) Neu dokumentieren
+|mittel
+|"Jedes `*.py` startet mit einem 1–3-Zeilen-Modul-Docstring: *Purpose* (ein Satz), *Layer* (`core`/`domain`/`rendering`/`pipeline`/`io_backends`/`cli`), *darf importieren* (die erlaubten projektinternen Pakete). Damit orientiert `head -5` Mensch und KI ohne den Body." (D-012/IR-014; Cluster C8.)
+
+|`=== Python`, Unterpunkt "Functions small enough to review…" (Z. 12) — Ergänzung "module size"
+|(c) Neu dokumentieren
+|niedrig
+|Ergänzen: "Auch Module klein genug halten, dass ein Reviewer/Agent sie in einem Stück erfasst (Richtwert ~300 Z.); überlange Module in kohärente Pakete zerlegen (nicht mechanisch zerschneiden, um einen Source-Style-Guard ruhigzustellen)." (D-004; verbindet sich mit dem schon vorhandenen Satz "Do not split code mechanically…".)
+
+|`=== Python`, Unterpunkt "Dataclasses for value objects; prefer immutability" (Z. 8) — Ist-Vermerk
+|(b) Soll + Ist-Vermerk
+|niedrig
+|Soll behalten. Optional ein Hinweis (oder besser in der Review-Notiz, nicht in `conventions.adoc`): "Bekannte Verletzung: der Render-Pfad mutiert Eingaben (`compose_workbook`/`select_render_frames`) — tracked als IR-006." (Tendenz: *nicht* in `conventions.adoc` aufnehmen — die Konvention ist richtig; die Verletzung gehört ins Finding/Backlog, nicht in die Konventionsdatei.)
+
+|`=== Source-style guards`, "Active rules" (Z. 39–42)
+|(c) Neu dokumentieren (optional)
+|niedrig
+|Falls ein Modul-Header-Guard oder ein Determinismus-Guard (kein `datetime.now()`/`random`/`uuid` in `domain`/`core`/`rendering`/`pipeline`) eingeführt wird (L3): hier als aktive Regel listen. Vorerst nur als "geplant" vermerken.
+|===
+
+=== docs/ai_info/agent_rules.adoc
+
+[cols="1,1,1,3", options="header"]
+|===
+|Abschnitt |Art |Priorität |Was soll stehen
+
+|`=== Canonical sources`, Bullet "Relevant ADR(s) under `docs/internal_guide/architecture_decision_records/`" (Z. 44)
+|(a) Sofort korrigieren
+|hoch
+|Pfad ist falsch — die ADRs liegen unter `docs/human_info/adr/`. Korrigieren. (Reiner Doku-Bug; fiel beim Doku-Abgleich auf, ist kein Code-Finding.)
+|===
+
+=== docs/ai_info/project_context.adoc
+
+[cols="1,1,1,3", options="header"]
+|===
+|Abschnitt |Art |Priorität |Was soll stehen
+
+|`=== Identity and Scope`, Bullet 1 (Z. 4)
+|(a) Sofort korrigieren (minor)
+|niedrig
+|"converts JSON/CSV ↔ XLSX/ODS" → auch YAML- und XML-Backends existieren; entweder "JSON/CSV/YAML/XML ↔ XLSX/ODS" oder "tabellarische Formate (JSON, CSV, YAML, XML) ↔ XLSX/ODS". (Nicht irreführend, nur unvollständig.)
+|===
+
+=== Empfohlene neue ADR(s)
+
+[cols="1,3,2", options="header"]
+|===
+|ADR-Titel |Kontext / Entscheidung |Auslösendes Finding
+
+|ADR — `*FormulaSpec` ist backend-neutral und lebt in `core/`
+|Strukturelle Formel-Intent-Objekte (`ListLiteralFormulaSpec`, `LookupFormulaSpec`) + ihre Factories sind backend-neutral und werden von `domain/`, `rendering/` und `io_backends/` konsumiert. Entscheidung: sie liegen in `core/formulas.py` (Blatt-Layer, von allen importierbar); `domain → rendering` ist und bleibt verboten und wird durch einen neuen Guard abgesichert. (Verhältnis zu ADR-006 Render-Chain klären — ergänzt diese, ersetzt sie nicht.)
+|D-001, IR-002 (C1)
+
+|ADR — Persistierung des `workbook_meta_blob`: JSON, nicht Python-`repr`
+|Der canonical-Meta-Blob wird in der `WriteMeta`-Op als `json.dumps(meta)` persistiert und mit `json.loads` zurückgelesen; der `ast.literal_eval`-Pfad bleibt als Legacy-Lesefallback. Begründung: `str(dict)` ist kein stabiles Serialisierungsformat (bricht still bei NaN/Nicht-Literalen) — für eine roundtrip-zentrierte Bibliothek inakzeptabel.
+|IR-008, A-004 (C4)
+
+|ADR — Optionale Spreadsheet-Adapter werden lazy importiert
+|`openpyxl`/`odfpy` werden erst beim ersten Zugriff importiert (`router._lazy_callable`, `io_backends/__init__.__getattr__`). Umgebungen, die nur einen oder keinen der Spreadsheet-Adapter nutzen, müssen die jeweilige Lib nicht installiert haben. Eine Registry-Konsolidierung (C5) muss dieses Verhalten erhalten. Festschreiben, damit es nicht versehentlich zurückgebaut wird.
+|A-001 (C5), Phase-3-Schritt-1-Hinweis
+
+|ADR (optional) — `derived` ist ein transienter `meta_rendering`-Nebenkanal
+|`_meta["derived"]` trägt Helfer-Provenienz vom Domain-Layer zu den Render-Passes, ist nicht roundtrip-relevant (`drop_helpers` entfernt es), und wird in `meta_registry.yaml` als `derived_operational_view` mit `producer`/`consumer`-Refs registriert. (Kann auch nur eine Registry-Ergänzung + ein Absatz in `generic_ir.adoc` sein — ADR nur, wenn man die "transient, nicht persistiert"-Entscheidung formal festhalten will.)
+|IR-005 (C6)
+
+|ADR (optional) — Eine kanonische Backend-Registry
+|`io_backends/router.py` ist die *einzige* `kind → Backend`-Registry; `make_backend` und der Orchestrator-Dispatch leiten daraus ab. Begründung: drei divergierende Tabellen sind eine wiederkehrende Drift-Quelle (`csv_dir` funktioniert nur über einen Pfad). "Open/Closed für Drittanbieter-Plugins" ist *kein* Ziel — eine statische Registry genügt. (ADR nur, wenn C5 tatsächlich angegangen wird.)
+|A-001, A-010 (C5)
+|===
+
+== Gesamtfazit
+
+=== Architektur-Qualität in 3 Sätzen
+
+Der Kern (`domain/`, `rendering/`-IR, `pipeline/`, Spreadsheet-Adapter) ist hexagonal sauber geschnitten und ungewöhnlich dicht durch Architektur-Guards abgesichert — die zentralen Layer-Invarianten (`pipeline ⊥ rendering`, `rendering ⊥ Backend-Libs`, Formula-Boundary, Parser stoppt bei `WorkbookIR`, `meta_canonical → meta_rendering`) halten im Code. Es gibt genau *eine* echte hexagonale Verletzung (`domain → rendering.formulas`, D-001), deren Wurzel eine Fehlplatzierung ist und deren Fix mechanisch ist; der Rest sind Hygiene-/Struktur-Themen (FK-Wildwuchs, `passes/`-Stubs, drei Backend-Registries, überlange Module) und zwei reale Funktions-Bugs in den *Rand*-Schichten (YAML/XML-Writer crashen bei `_meta`; `sheets-pack --input-kind csv_dir`). Die echten Risiken sind nicht "kaputte Architektur", sondern (1) die fragile `repr`-Serialisierung der Meta-Payload, die einen stillen Roundtrip-Bruch bei NaN/Nicht-Literalen erlaubt, und (2) die Doku, die an mehreren Stellen den Ist-Zustand falsch beschreibt und einen KI-Agenten in die Irre führt.
+
+=== Die 5 wichtigsten nächsten Schritte
+
+. *C1 — `rendering/formulas.py` → `core/formulas.py` + `domain ⊥ rendering`-Guard.* Behebt die einzige echte Layer-Verletzung (D-001), ist mechanisch (~½ Tag), und schließt Lücke L1. Höchster Architektur-Hebel pro Aufwand.
+. *Quick Wins bündeln (1 PR, <2 h):* `_interfaces.py` löschen (A-006), `coerce_backend_options(None) → BackendOptions()` (A-007), `_meta`-Skip in `xml_backend`/`yaml_backend` (A-003-Teil — behebt einen echten Crash), tote Step-Factories löschen (IR-007), `_deep_merge` & Co. öffentlich machen (D-007). `csv_dir`-Choice aus `sheets-pack` (A-002) *nur nach Nutzer-Freigabe* (gegateter CLI-Flag).
+. *C4 — `workbook_meta_blob` auf JSON umstellen* (~2 h + NaN-Roundtrip-Test) und die zugehörige ADR schreiben. Beseitigt das stille-Roundtrip-Bruch-Risiko.
+. *Doku-Sofortkorrekturen (a)-Kategorie* in `architecture_primer.adoc` + der falsche ADR-Pfad in `agent_rules.adoc` (~1 h). Verhindert, dass KI-Agenten weiter auf Basis falscher Layer-/Pfad-Angaben arbeiten — billig, hoher Hebel für die KI-gestützte Weiterentwicklung.
+. *C3 — `passes/core.py` entlang der Dateinamen aufspalten + tote Stubs löschen + eine `default_passes()`-Quelle* (~½–1 Tag). Größter Lesbarkeits-Hebel im Render-Layer (für Mensch *und* KI) und beseitigt die irreführendste Primer-Stelle ("Pass in `rendering/passes/`").
+
+_(Danach, mittelfristig: C2 FK-Konsolidierung, C5 Backend-Registry, C6 `meta_registry.yaml`-Vervollständigung, C7 Modularisierung/`__all__`, C8 Modul-Header.)_
+
+=== Zustand für PyPI-Beta
+
+Vertretbar für Beta-Nutzer. Die hexagonale Architektur ist real und getestet; die offene Layer-Verletzung (D-001) ist *intern* und für Konsumenten unsichtbar. Was Beta-Nutzer treffen *könnte*: A-003 (`sheets-run --out-kind yaml_dir|xml_dir` crasht bei meta-erzeugenden Pipelines) und A-002 (`sheets-pack --input-kind csv_dir` → `ValueError`) — beides schmale, schnell behebbare Funktions-Bugs auf wenig genutzten Pfaden. Vor einem *Stable*-Release sollten behoben sein: A-003 + A-002 (echte Bugs), C4/IR-008 (Roundtrip-Robustheit — Kernversprechen der Bibliothek), C1/D-001 (sonst zementiert sich der Layer-Verstoß), und die A-005-Inkonsistenz (CLI-Fehler-UX greift im installierten Pfad nicht). Die Hygiene-Cluster (C2/C3/C7/C8) sind kein Release-Blocker, aber je länger sie offen sind, desto teurer wird KI-gestützte Weiterentwicklung.
+
+=== Empfehlung für KI-gestützte Weiterentwicklung
+
+* *`architecture_primer.adoc` ist das wichtigste Steuerdokument für Agenten — und enthält die meisten irreführenden Stellen.* Die (a)-Korrekturen (Layer-Map-Kante, `core/` "FK detection", `orchestrator.py`-Rolle, Pass-Reihenfolge, Guard-Vollständigkeit) sofort umsetzen; die (b)-Vermerke (`Status: ausstehend — tracked als …`) bei "New render behavior", "New IR datatype", "New … backend" ergänzen, damit ein Agent den Soll-Zustand kennt *und* weiß, dass der Code noch abweicht.
+* *Den falschen ADR-Pfad in `agent_rules.adoc` (Z. 44) korrigieren* — ein Agent, der den "canonical sources"-Block befolgt, findet die ADRs sonst nicht.
+* *Modul-Header-Konvention (C8) einführen und in `conventions.adoc` festschreiben* — der mit Abstand günstigste Hebel für token-effizientes Arbeiten: `head -5` statt "ganzes Modul lesen". Kombiniert mit stabilen `__all__` pro Sub-Paket (D-010) wird ein großer Teil der "Agent muss zu viel Kontext laden"-Last erschlagen.
+* *Die nicht-geguardeten Layer-Kanten (L1–L8) in `architecture_guard_inventory.adoc` als bekannte Lücken führen* — damit ein Agent nicht fälschlich annimmt, "die Tests fangen das schon". Nach C1 (L1 geschlossen), und idealerweise zusätzlich ein `domain ⊥ third-party-libs`-Guard (L2) und ein Determinismus-Guard (L3).
+* *Beim Schreiben neuer Steps/Meta-Keys den Doppel-Eintrag (`pipeline_step_registry.json` + `meta_registry.yaml`) explizit in die "Where new code belongs"-Tabelle aufnehmen* — die Guards erzwingen ihn, der Primer erwähnt ihn aber nicht; ein Agent läuft sonst in einen Test-Fehler, dessen Ursache er erst suchen muss.

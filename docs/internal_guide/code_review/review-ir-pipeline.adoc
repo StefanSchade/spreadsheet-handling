@@ -1,0 +1,712 @@
+= Code Review: IR-Layer & Pipeline-Engine
+:date: 2026-05-11
+:reviewer: Claude Opus 4.7
+:phase: 2 von 4
+:status: complete
+:predecessor: review-domain-core.adoc
+
+== Offene Hypothesen aus Phase 1
+
+_Aus Session-Handoff von `review-domain-core.adoc` übernommen — in dieser Session zu prüfen:_
+
+* *P1-A — `exported_at` (canonical-Meta-Key, Zeitstempel) wird in `rendering/passes/core.py` erzeugt.*
+  Konkretes Determinismus-Risiko im Render-Layer; prüfen, ob es seedbar/injizierbar ist.
+* *P1-B — Rückwärtskante `rendering -> domain`?* L1-Gegenstück aus Phase 1: `domain -> rendering`
+  existiert (D-001). Importiert umgekehrt `rendering/` irgendwo `domain/`? Das wäre eine
+  Rückwärtskante, nicht von den vorhandenen Guards abgedeckt (die prüfen nur openpyxl/odf/
+  io_backends.xlsx in `rendering/`).
+* *P1-C — `rendering/formulas.py` ist nach D-001 ein Wanderkandidat.* Klären, welche Teile
+  backend-neutrale Wertobjekte sind (→ neutrale Schicht, damit `domain/` legitim darauf
+  zugreifen kann) und welche render-spezifisch sind.
+* *P1-D — `meta_canonical -> meta_rendering`-Ableitung sauber?* Die Domain schreibt canonical
+  Meta (`frame_lifecycle`, `workbook_view`, `helper_policies`, `cell_codecs`, `xref_crosstable`,
+  `compact_multiaxis`, `split_by_discriminator`, `sparse_defaults`, `constraints`, `derived`*).
+  Verifizieren, dass die Passes daraus `meta_rendering` ableiten und `meta_canonical` danach
+  nicht mehr direkt das Render-Ergebnis beeinflusst.
+  (* `derived` ist *nicht* im `meta_registry.yaml` registriert, obwohl `enrich_lookup`/
+  `fk_helpers` es schreiben — prüfen, ob Absicht (transient) oder Registry-Lücke.)
+* *P1-E — Pipeline-Steps delegieren an Domain?* Der FK-Guard prüft nur `pipeline.steps`;
+  verifizieren, dass die Step-Factories tatsächlich an `domain.transformations.fk_helpers.
+  enrich_helpers`/`drop_helpers` delegieren und nirgends doch wieder `core.fk` direkt anfassen.
+
+== Schritt 1 — Strukturanalyse
+
+=== rendering/ Module
+
+[cols="2,1,1,2", options="header"]
+|===
+|Datei |LOC |Vermuteter Typ |Anmerkung
+
+|rendering/__init__.py |0 |Package-Init |Leer — der Render-Layer hat *keine* öffentliche Paket-Oberfläche; Konsumenten müssen tiefe Pfade kennen.
+|rendering/ir.py |61 |Value Objects / Datenklassen |Klein — vermutlich `WorkbookIR`/`SheetIR`/`TableBlock` als reine Container. Der "Vertrag" zwischen Composer, Passes, Flow, Adaptern.
+|rendering/plan.py |152 |Value Objects (+ Builder?) |`RenderPlan` + frozen `RenderOp`-Dataclasses (`DefineSheet`, `SetHeader`, `AddValidation`, `WriteMeta`, …) laut Primer.
+|rendering/flow.py |240 |Service / Orchestrator |`build_render_plan()` + `default_p1_passes`; steuert den Render-Flow (Schritt ③ im Primer). Mittelgroß.
+|rendering/frame_selection.py |208 |Service |Auswahl der zu rendernden Frames (sichtbare vs. versteckte Sheets, `_meta`-Sheet).
+|rendering/formulas.py |72 |Value Objects + Factory |`*FormulaSpec` (strukturelle Formel-Intent) + `lookup_formula()`. *D-001-Wanderkandidat* — backend-neutral, wird heute auch von `domain/` importiert.
+|rendering/workbook_projection.py |65 |Service |`workbookir_to_frames()` — Read-Path-Projektion (`WorkbookIR` → `Frames` + persistiertes `_meta`).
+|rendering/composer/__init__.py |0 |Package-Init |Leer.
+|rendering/composer/layout_composer.py |310 |Service |`compose_workbook()` — `Frames` + `meta_canonical` → `WorkbookIR` (Schritt ① im Primer). Größtes Composer-Modul.
+|rendering/passes/__init__.py |46 |Orchestrator |`apply_all(ir, meta)` — feste Pass-Reihenfolge; importiert die `*Pass`-Klassen *aus `core.py`*, nicht aus den gleichnamigen Modulen.
+|rendering/passes/core.py |518 |Service / Pass-Sammlung |*Größte Datei der Phase.* Pass-Infrastruktur + *alle* echten Passes (`MetaPass`, `ValidationPass`, `StylePass`, `ProtectionPass`, `FilterPass`, `FreezePass`, `ColumnWidthPass`, `NamedRangePass`). Enthält vermutlich `exported_at` (P1-A).
+|rendering/passes/validation_pass.py |80 |Pass |`ValidationPass`-Infrastruktur (separat — der Rest liegt in `core.py`). Inkonsistent zur sonstigen "alles in `core.py`"-Struktur.
+|rendering/passes/meta_pass.py |6 |Stub / Dead Code |`apply(ir, meta) -> ir` No-op. Echte `MetaPass` lebt in `core.py`. Toter Platzhalter.
+|rendering/passes/style_pass.py |8 |Stub / Dead Code |`apply(ir, meta) -> ir` No-op ("add styles later"). Echte `StylePass` lebt in `core.py`. Toter Platzhalter.
+|rendering/passes/formula_pass.py |0 |Leerdatei |Komplett leer. Kein Inhalt, kein Import.
+|rendering/passes/post_pass.py |0 |Leerdatei |Komplett leer.
+|===
+
+*Strukturbeobachtung:* Das `passes/`-Paket suggeriert per Dateinamen ein Ein-Modul-pro-Pass-Layout
+(`meta_pass`, `style_pass`, `formula_pass`, `post_pass`, `validation_pass`), aber die echte Logik
+sitzt gebündelt in `core.py` (518 Z.); vier der Pass-Dateien sind leer oder No-op-Stubs. Das ist
+genau die Art Struktur, die Mensch und KI in die Irre führt (man liest `meta_pass.py` und findet
+nichts). Erster Modularisierungs-Kandidat.
+
+=== pipeline/ Module
+
+[cols="2,1,1,2", options="header"]
+|===
+|Datei |LOC |Vermuteter Typ |Anmerkung
+
+|pipeline/__init__.py |29 |Package-Init / Public Surface |Re-exportiert `AppConfig`, `REGISTRY`, `run_pipeline`, `build_steps_*`, sechs `make_*_step`-Factories, `BoundStep`/`Step`/`StepRegistration`. Anders als `rendering/__init__.py`: *hat* eine Oberfläche.
+|pipeline/types.py |77 |Typen / Contracts |`Step`, `BoundStep`, `StepRegistration` — die Pipeline-Kontrakte.
+|pipeline/config.py |71 |Config |`AppConfig` + `load_app_config()` — YAML-Step-Konfiguration.
+|pipeline/registry.py |261 |Registry |`REGISTRY` (YAML-Name → Factory) + `build_steps_from_config`/`build_steps_from_yaml` + `run_pipeline`-Re-Export. Größtes Pipeline-Modul.
+|pipeline/steps.py |274 |Step-Implementierungen |`make_identity_step`, `make_validate_step`, `make_apply_fks_step`, `make_drop_helpers_step`, `make_bootstrap_meta_step`, `make_apply_overrides_step` u. a.
+|pipeline/runner.py |41 |Runner |`run_pipeline(frames, bound_steps) -> frames` — linearer Durchlauf, keine Verzweigung.
+|===
+
+=== Relevante Architecture-Tests
+
+[cols="2,2,1", options="header"]
+|===
+|Test-Modul |Was wird getestet (vermutet) |Relevanz
+
+|dependency_guards/test_spreadsheet_boundary_guards.py |Hexagonale Schichtgrenzen: generisches Rendering ⊥ Backend-Libs (openpyxl/odf), `pipeline/runner.py`+`registry.py` ⊥ Payload-Semantik, `pipeline/__init__.py`+`registry.py` ⊥ Workbook-Meta-Routing-Tokens. |Hoch
+|dependency_guards/test_ir_architecture_clarity.py |Erlaubte Abhängigkeiten des IR-Layers; generischer Write-Path/Rendering bleibt openpyxl-frei; `spreadsheet_contract` nutzt nur generische `workbook_projection`. |Hoch
+|pipeline_semantics/test_pipeline_semantics_guards.py |Step-Kategorien & Config-Kontrakte; `auto`-Parameter nur in `configuration`-Steps; Meta-Lese/Schreib-Referenzen zeigen auf `meta_registry.yaml`. |Hoch
+|formula_boundary/test_raw_formula_boundary_guards.py |Rohe backend-spezifische Formel-Strings (`=VLOOKUP(`, `of:=`, A1-Refs) nur in `io_backends/xlsx`+`io_backends/ods`; generische Schichten kennen nur strukturelle `*FormulaSpec`. |Hoch
+|semantic_invariants/test_ir_writepath_semantics.py |`meta_canonical` vs `meta_rendering` auf dem Write-Path; Render-Ergebnis identisch mit/ohne `workbook_meta_blob` nach IR-Derivation. |Hoch
+|dependency_guards/test_pipeline_step_registry.py |Laufzeit-`REGISTRY` spiegelt `docs/internal_guide/architecture/pipeline_step_registry.json`; Steps deklarieren Kategorie/Frame-Kontrakt/Meta-Kontrakt/Inverse/Aliases. |Hoch
+|semantic_invariants/test_meta_carrier_boundary_guards.py |Canonical Workbook-Meta getrennt von Carrier-/Rendering-Meta (`__`-Präfix, `workbook_meta_blob`, `options`, `_hidden`); `workbookir_to_frames` bevorzugt canonical Payload. |Mittel
+|spreadsheet_contract/test_ir_call_chain.py |Aufrufkette IR → Adapter; Renderer konsumieren nur `RenderPlan`, Parser stoppen bei `WorkbookIR`. |Mittel
+|dependency_guards/test_architecture_guard_fk_helpers.py |`pipeline.steps` importiert keine FK-Helper-Primitive (`build_registry`, `detect_fk_columns`, `apply_fk_helpers`) und fasst kein `_meta`/`derived`/`helper_columns` an — delegiert an `domain.transformations.fk_helpers`. |Mittel (P1-E)
+|semantic_invariants/test_meta_registry.py + ..._hardening.py |Meta-Register: jeder Eintrag hat importierbare `producer`/`consumer`-Referenzen, Layer (`meta_canonical`/`meta_rendering`), Klassifikation. |Mittel (P1-D)
+|===
+
+=== Schichtgrenze Pipeline / Rendering
+
+_Erste Hypothese aus Struktur + Primer:_
+
+Laut Primer sind das *zwei getrennte Datenflüsse*: die *Pipeline* (`pipeline/`, `application/
+orchestrator.py`) treibt die *Domain*-Transformationen über `Frames` (alle Ausgabeformate), der
+*Render-Flow* (`rendering/`) übersetzt `Frames` + `meta_canonical` → `WorkbookIR` → `RenderPlan`
+→ Datei (nur Spreadsheet-Ausgaben; JSON/CSV/YAML umgehen `rendering/` komplett).
+
+Die Naht müsste also sein: *die Pipeline ruft `rendering/` nicht direkt auf* — der Render-Flow
+wird vom Saver (`io_backends/router.py` → Spreadsheet-Backend) angestoßen, nicht vom
+`pipeline/runner.py`. In Schritt 3 zu verifizieren:
+
+* Importiert `pipeline/` (`steps.py`, `registry.py`, `runner.py`) irgendetwas aus `rendering/`?
+  Erwartung: nein.
+* Wo genau wird `compose_workbook()` / `build_render_plan()` aufgerufen — im Backend, im
+  `application/orchestrator.py`, oder doch in einem Pipeline-Step? (Letzteres wäre eine
+  Vermischung der beiden Flows.)
+* Übergabe-Objekt: bekommt der Render-Flow ein sauberes `(Frames, meta_canonical)`-Paar, oder
+  greift er auf Pipeline-internen Zustand zu?
+
+=== Hypothesen
+
+_H1–Hn: vermutete Problemstellen für Schritt 3_
+
+* *H1 — `passes/` ist strukturell irreführend.* Vier von sieben Pass-Dateien sind leer
+  (`formula_pass.py`, `post_pass.py`) oder No-op-Stubs (`meta_pass.py`, `style_pass.py`); die
+  echte Pass-Logik (8 Passes, ~518 Z.) sitzt gesammelt in `core.py`. `validation_pass.py` (80 Z.)
+  ist halb-ausgelagert. Ein Agent, der "den StylePass" sucht, liest `style_pass.py` und findet
+  einen No-op. → Modularisierungs- *und* Dead-Code-Befund.
+* *H2 — `passes/core.py` zu groß / mehrzweckig.* 518 Z. mit Pass-Basisklasse + 8 konkreten
+  Passes. Über der Schwelle, ab der eine KI das Modul "in einem Stück" erfasst; vermutlich auch
+  Ort von `exported_at` (P1-A) und sonstigen Render-Annotationen.
+* *H3 — `exported_at` = `datetime.now()` im Render-Pfad (P1-A).* Canonical-Meta-Key mit
+  Zeitstempel; wenn nicht injizierbar/seedbar, bricht das den Determinismus-Anspruch ("roundtrip-
+  fähig, deterministisch") und kein Guard fängt es (L3 aus Phase 1).
+* *H4 — Rückwärtskante `rendering -> domain` (P1-B).* `layout_composer.py`/`passes/core.py`
+  könnten `domain/`-Symbole importieren (z. B. `Finding`, `apply_severity_policy` für den
+  ValidationPass, oder `helper_policies`). Das wäre eine Aufwärtskante gegen die Layer-Map; kein
+  Guard prüft es.
+* *H5 — `rendering/formulas.py` falsch platziert (P1-C, D-001).* Wenn der Inhalt rein
+  backend-neutrale `*FormulaSpec`-Wertobjekte + eine Factory ist, gehört er in eine neutrale
+  Schicht (`core/` oder `domain/`), nicht in `rendering/` — sonst bleibt der `domain -> rendering`-
+  Import aus Phase 1 (D-001) "legitim aussehend", obwohl er die Layer-Map verletzt.
+* *H6 — `meta_canonical` leckt in den Render-Pfad (P1-D).* Passes könnten `meta_canonical`
+  direkt lesen *und* danach noch das Render-Ergebnis davon abhängen lassen, statt sauber ein
+  `meta_rendering` abzuleiten. `derived` (von `enrich_lookup`/`fk_helpers` geschrieben, *nicht*
+  in `meta_registry.yaml`) ist ein konkreter Verdachtspunkt.
+* *H7 — Pipeline ruft Rendering direkt auf.* Ein Pipeline-Step (`steps.py`) oder `registry.py`
+  könnte `compose_workbook`/`build_render_plan` aufrufen und damit die beiden Flows vermischen.
+  (Struktur-Hypothese; in Schritt 3 per Import-Grep zu klären.)
+* *H8 — Registry/Steps-Drift.* `registry.py` (261 Z.) mappt YAML-Namen → Factories;
+  `steps.py` (274 Z.) implementiert Factories; das JSON-Artefakt `pipeline_step_registry.json`
+  muss beides spiegeln. Verdacht auf Steps in `steps.py` ohne Registry-Eintrag (oder umgekehrt)
+  bzw. Drift gegen das JSON. Open/Closed: ist die Registry ohne Code-Änderung erweiterbar
+  (Plugin-Pfad — es gibt `test_plugins_dotted_path.py`)?
+* *H9 — `pipeline/runner.py` oder `registry.py` inspiziert Payload-Semantik.* Der Guard
+  verbietet `_meta`/`derived`/`helper_columns`/`workbook_view`-Tokens dort; zu verifizieren,
+  dass die Pipeline `Frames` wirklich nur durchreicht.
+
+=== Modularisierung & Token-Effizienz (Schritt 1)
+
+_Vorschläge für sauberere Modulgrenzen aus reiner Struktursicht — Reihenfolge ≈ Aufwand/Nutzen:_
+
+. *`passes/` aufräumen (höchster Nutzen, mittlerer Aufwand).* Entweder die leeren/No-op-Module
+  (`formula_pass.py`, `post_pass.py`, `meta_pass.py`, `style_pass.py`) *löschen* und ehrlich
+  "alle Passes in `core.py`" dokumentieren — oder, besser, `core.py` *tatsächlich* nach den
+  vorhandenen Dateinamen aufspalten: `meta_pass.py`, `style_pass.py`, `protection_pass.py`,
+  `filter_pass.py`, `freeze_pass.py`, `column_width_pass.py`, `named_range_pass.py`, plus
+  `_base.py` für `IRPass`. `__init__.py` re-exportiert dann aus den echten Modulen. Danach ist
+  "wo ist Pass X" per Dateiname auffindbar — für Mensch *und* KI.
+. *`rendering/__init__.py` mit Oberfläche füllen.* Stabiles `__all__` (`WorkbookIR`, `SheetIR`,
+  `TableBlock`, `RenderPlan`, `RenderOp`-Typen, `compose_workbook`, `apply_render_passes`,
+  `build_render_plan`, `workbookir_to_frames`). Konsumenten (Adapter, Tests, Agenten) importieren
+  von dort statt `rendering.composer.layout_composer` etc. Refactorings innerhalb des Layers
+  werden dadurch unsichtbar.
+. *`pipeline/registry.py` entzerren.* 261 Z. mischen vermutlich (a) die Registry-Datenstruktur,
+  (b) den YAML→BoundStep-Bauprozess und (c) den `run_pipeline`-Re-Export. Trennen in
+  `registry.py` (nur das `REGISTRY`-Mapping + Lookup) und `build.py` (`build_steps_from_config/
+  yaml`). Macht "welche Steps gibt es" (= Registry lesen) unabhängig vom Bau-Code.
+. *Modul-Header-Konvention auch hier.* Jedes `rendering/*.py` und `pipeline/*.py` startet mit
+  1–3 Zeilen "Purpose / Layer / darf importieren: …" (gleiche Konvention wie für `domain/`/`core/`
+  in Phase 1 vorgeschlagen). `head -5 passes/core.py` sagt dann sofort, was drinsteckt.
+. *Den `rendering -> ?`-Import-Korridor als Guard sichtbar machen.* Aktuell prüft `test_ir_
+  architecture_clarity` nur "kein openpyxl/odf in `rendering/`". Ergänzen um "kein `domain/`-,
+  `pipeline/`-, `cli/`-Import in `rendering/`" (Aufwärtskanten) — dann ist die erlaubte
+  Abhängigkeitsrichtung des IR-Layers ausführbar dokumentiert, statt nur im Primer zu stehen.
+
+== Antworten auf die Leitfragen (Schritt 1)
+
+*1. Rolle von `ir.py`?* Mit 61 Z. zu klein für einen Builder — vermutlich reine
+Value-Object-/Dataclass-Definitionen (`WorkbookIR`, `SheetIR`, `TableBlock`, ggf.
+`ValidationSpec`/`NamedRange`). Der Bau passiert woanders (`compose_workbook` im Composer, die
+Anreicherung in den Passes). `ir.py` ist damit der *Vertrag*, nicht die *Fabrik* — gut so, sofern
+in Schritt 3 bestätigt, dass es keine Logik/Seiteneffekte enthält und seine Consumer (Adapter,
+Writer) nicht kennt.
+
+*2. `plan.py` vs. `flow.py`?* Vermutlich keine "Was/Wann"-Trennung im klassischen Sinn, sondern
+*Datenstruktur vs. Erzeugung*: `plan.py` (152 Z.) definiert `RenderPlan` + die frozen
+`RenderOp`-Werte (das *Ergebnis*); `flow.py` (240 Z.) ist der Orchestrator, der `compose_workbook`
+→ `apply_all` → `build_render_plan` verkettet (der *Prozess*, Schritt ①–③ im Primer). "Plan" ist
+hier also das Produkt des "Flow", nicht eine separate Planungsphase. In Schritt 3 zu prüfen, ob
+`flow.py` evtl. zu viel macht (Komposition + Pass-Ausführung + Plan-Bau in einem Modul).
+
+*3. Was machen die `passes/`?* Strukturell unklar — die Dateinamen versprechen ein
+Compiler-Pass-Layout (ein Modul pro Pass), aber `__init__.py` zeigt das echte Muster: acht
+`*Pass`-Klassen aus `core.py`, jede mit `apply(ir) -> ir`, in fester Reihenfolge angewandt
+(`MetaPass → ValidationPass → StylePass → ProtectionPass → FilterPass → FreezePass →
+ColumnWidthPass → NamedRangePass`). Das *ist* das klassische Pass-Muster (Input IR → angereicherte
+IR), aber implementiert als Mutation/Rückgabe derselben `WorkbookIR`, nicht als Output-Format-
+Schreiben — gut. Implizite Reihenfolge-Abhängigkeiten (z. B. ColumnWidthPass nach StylePass?) in
+Schritt 3 zu klären. Die leeren/No-op-Module sind toter Code (H1).
+
+*4. `pipeline/` vs. `rendering/` — wo endet die Pipeline, wo beginnt das Rendering?* Laut Primer
+zwei disjunkte Flüsse (siehe "Schichtgrenze" oben): `pipeline/` treibt Domain-Transformationen
+über `Frames` für *alle* Formate und reicht Payloads durch, ohne sie zu interpretieren;
+`rendering/` ist der Spreadsheet-spezifische Übersetzungspfad `Frames + meta_canonical →
+WorkbookIR → RenderPlan`. Die Pipeline endet bei "fertige `Frames`"; das Rendering beginnt, wenn
+ein Spreadsheet-*Saver* (über `io_backends/router.py`) `compose_workbook` aufruft — *nicht* die
+Pipeline selbst. Ob diese Trennung im Code wirklich hält (kein `rendering`-Import in `pipeline/`,
+kein Pipeline-Step der `compose_workbook` ruft), ist H7.
+
+*5. Relevante Architecture-Tests:* `test_spreadsheet_boundary_guards`, `test_ir_architecture_
+clarity`, `test_pipeline_semantics_guards`, `test_raw_formula_boundary_guards`, `test_ir_writepath_
+semantics`, `test_pipeline_step_registry` (Hoch); `test_meta_carrier_boundary_guards`,
+`test_ir_call_chain`, `test_architecture_guard_fk_helpers`, `test_meta_registry(_hardening)`
+(Mittel) — siehe Tabelle oben. Lücken: keine Aufwärtskanten-Prüfung für `rendering/` (→ H4),
+kein Determinismus-Guard (→ H3), keine Modulgrößen-/Dead-Code-Prüfung in `passes/` (→ H1/H2).
+
+*6. Modularisierung für token-effiziente Entwicklung:* siehe Abschnitt "Modularisierung &
+Token-Effizienz" oben — Kernpunkte: (a) `passes/core.py` nach den schon vorhandenen Dateinamen
+aufspalten und die Stubs ersetzen statt liegenzulassen; (b) `rendering/__init__.py` als stabile
+Layer-Oberfläche füllen; (c) `pipeline/registry.py` in Registry-Daten vs. Bau-Code trennen;
+(d) Modul-Header-Konvention; (e) erlaubte Import-Richtung des IR-Layers als Guard kodieren.
+
+== Schritt 2 — Erwartungsmodell (aus Architecture-Tests)
+
+=== IR-Layer: erlaubte Abhängigkeiten
+
+Was die Tests *tatsächlich* prüfen — und was nicht:
+
+* `test_ir_architecture_clarity.py` + `test_spreadsheet_boundary_guards.py::test_generic_*`:
+  *alle* `rendering/**`-Module plus `io_backends/spreadsheet_contract.py` und `io_backends/
+  _interfaces.py` dürfen **kein** `openpyxl`, **kein** `odf`, **kein** `io_backends.xlsx`,
+  **kein** `io_backends.ods` importieren. Der `_GENERIC_WRITEPATH_MODULES`-Whitelist in
+  `test_ir_architecture_clarity` listet die Module sogar einzeln auf (inkl.
+  `passes/meta_pass.py`, `passes/style_pass.py`, `passes/validation_pass.py` — aber *nicht*
+  `passes/post_pass.py`/`passes/formula_pass.py`, weil die leer sind).
+* `test_ir_call_chain.py` + `test_adapter_contract_boundary_guards.py`: die Backends erreichen
+  generischen Code **nur** über `io_backends.spreadsheet_contract` — `xlsx_backend.py`/
+  `ods_backend.py` dürfen `rendering.composer`/`rendering.passes`/`rendering.flow`/
+  `rendering.plan`/`rendering.workbook_projection`/`rendering.ir` **nicht** direkt importieren;
+  Renderer (`openpyxl_renderer.py`) importiert **nur** `rendering.plan`; Parser
+  (`openpyxl_parser.py`) importiert **nur** `rendering.ir`. Damit ist die *Ausgangs*-Naht von
+  `rendering/` eng definiert.
+* *Was NICHT geprüft wird* — die *Eingangs*-Seite: kein Test verbietet einen Import von
+  `domain/`, `pipeline/`, `cli/`, `application/` *in* `rendering/`. Eine Rückwärtskante
+  `rendering -> domain` (oder `-> pipeline`) wäre unsichtbar. (Lücke L1, s. u.)
+
+Soll-Richtung für diese Phase (rekonstruiert):
+
+----
+io_backends/spreadsheet_contract.py  -> rendering/ (compose, passes, flow, plan, projection, ir)
+io_backends/<fmt>/                    -> rendering/ir (Parser),  rendering/plan (Renderer)   — sonst nichts
+rendering/                            -> core/ , stdlib , pandas                              — KEIN domain/pipeline/cli
+pipeline/                             -> domain/ , io_backends/router , core/ , stdlib        — KEIN rendering/  (faktisch keiner)
+----
+
+Befund vorab: `rendering/` importiert tatsächlich nichts aus `domain`/`pipeline`/`cli`/
+`application` (per Grep), und `pipeline/` importiert nichts aus `rendering/`. Die Layer-Map-Kante
+`pipeline -> rendering` existiert im Code *gar nicht* — der Render-Flow wird ausschließlich von
+`io_backends/spreadsheet_contract.py::build_spreadsheet_render_plan` angestoßen, das die
+Spreadsheet-Saver (`xlsx_backend`, `ods_backend`) aufrufen. Die "zwei Flüsse"-Trennung aus dem
+Primer hält also strikt.
+
+=== Pipeline: Step-Kategorien & erlaubte Imports
+
+`test_pipeline_semantics_guards.py` + `test_pipeline_step_registry.py` arbeiten gegen *zwei*
+Artefakte: die Laufzeit-`REGISTRY` (in `pipeline/registry.py`) und das Review-Dokument
+`docs/internal_guide/architecture/pipeline_step_registry.json` (`runtime_binding: forbidden` —
+es ist eine *Beschreibung*, kein Binding). Der `set(entries) == set(REGISTRY)`-Check erzwingt,
+dass beide *exakt* deckungsgleich sind.
+
+[cols="1,2,2", options="header"]
+|===
+|Kategorie |Beschreibung |Auflagen / erlaubte Imports
+
+|`primitive`
+|Ein elementarer Step (eine Domain-Factory oder ein eingebauter Closure).
+|`auto`-Parameter *verboten* (`test_auto_parameters_remain_configuration_owned`). FK-Helper-Primitive (`build_registry`, `detect_fk_columns`, `apply_fk_helpers`) dürfen *nicht* in `pipeline.steps` importiert werden; kein `_meta`/`derived`/`helper_columns`-Zugriff dort (`test_architecture_guard_fk_helpers`).
+|`composite`
+|Wrappt ausschließlich `primitive`-Steps; deklariert öffentliche Outputs, interne Frames (`__`-Präfix), `composite_metadata_policy` ∈ {`preserve_public`,`nested`,`suppressed`,`none`,`current_state_unknown`}.
+|`wrapped_steps` müssen alle `primitive` sein.
+|`configuration`
+|Steps die Heuristik/Policy auflösen (`auto`-Parameter ausschließlich hier).
+|—
+|`plugin`
+|Genau ein Eintrag namens `plugin`; `factory_shape == plugin_factory`; `may_change_frame_set == True`; liest/schreibt `dynamic_plugin_owned`.
+|Lifecycle ∈ {`plugin_or_caller_owned`,`declared_lifecycle`,`caller_owned_lifecycle`,`declared_lifecycle_or_caller_owned`}.
+|===
+
+* `pipeline/__init__.py` + `pipeline/registry.py` dürfen die String-Literale `"_meta"`,
+  `"frame_lifecycle"`, `"workbook_view"`, `"workbook_views"` **nicht** enthalten
+  (`test_pipeline_orchestration_does_not_route_on_workbook_payload_metadata`) — Pipeline bleibt
+  linear, kein Verzweigen auf Payload-Meta.
+* `pipeline/runner.py` + `pipeline/registry.py` dürfen die *Quelltext*-Muster `"_meta"`,
+  `["derived"]`, `["helper_columns"]` nicht enthalten
+  (`test_pipeline_runner_and_registry_stay_out_of_payload_semantics`).
+* Persistente Meta-Wurzeln, die ein Step liest/schreibt, müssen auf einen `meta_canonical`-Eintrag
+  in `meta_registry.yaml` zeigen (`registry_ref == root`, `layer == meta_canonical`,
+  `classification == canonical_meta`).
+
+=== Formula Boundary
+
+`test_raw_formula_boundary_guards.py`: in `core/`, `domain/`, `pipeline/`, `rendering/` und
+`io_backends/spreadsheet_contract.py` darf **keine zeilenweise** sichtbare Backend-Formel-Syntax
+vorkommen — Regex auf `=XLOOKUP(`, `=VLOOKUP(`, `=SUM(`, `=IF(`, A1-Sheet-Refs (`Sheet!$A$1`),
+`of:=`, `table:formula`, `openformula`, `oooc:`, `msoxl:`. Erlaubte Zonen: nur `io_backends/xlsx`,
+`io_backends/ods`, `tests/architecture/current_state`.
+
+Generische Schichten kennen Formeln also ausschließlich als *strukturelle Intent-Objekte*:
+`ListLiteralFormulaSpec` (Liste von Token) und `LookupFormulaSpec` (Same-Row-Lookup: Quellspalte,
+Lookup-Sheet, Lookup-Key-Spalte, Lookup-Value-Spalte, Missing-Wert). Diese leben in
+`rendering/formulas.py`. *Schwäche des Guards:* nur Quelltext-Regex — eine Funktion, die einen
+Formel-String dynamisch zusammensetzt (`"=" + fn + "("`), entgeht ihm (L7 aus Phase 1; in
+`rendering/` ist keine solche Stelle vorhanden).
+
+=== meta_canonical vs. meta_rendering
+
+* `meta_canonical` (Quelle der Wahrheit, roundtrip-relevant): `version`, `author`, `exported_at`,
+  `sheets`, `column_widths`, `freeze_header`, `auto_filter`, `header_fill_rgb`, `helper_fill_rgb`,
+  `helper_prefix`, `helper_columns`, `protection`, `helper_policies`, `frame_lifecycle`,
+  `workbook_view`, `constraints`, `legend_blocks`, `xref_crosstable`, `split_by_discriminator`,
+  `sparse_defaults`, `cell_codecs`, `compact_multiaxis` — alle ohne `_`-Präfix.
+* `meta_rendering` / `derived_operational_view` (von den IR-Passes aus canonical abgeleitet, nur
+  für den aktuellen Write-Path aktiv): `workbook_meta_blob` (der gestashte canonical-Blob),
+  `options` (canonical defaults + `sheets[<name>]`-Overrides), `__style`, `__helper_cols`,
+  `__autofilter`, `__autofilter_ref`, `__freeze`, `__legend_blocks`, `_hidden`.
+* Verankert in: `compose_workbook` stasht den canonical-`meta`-Dict als `_meta.workbook_meta_blob`;
+  die Passes (`StylePass`, `FilterPass`, `FreezePass`, `ColumnWidthPass`, `ProtectionPass`,
+  `ValidationPass`, `NamedRangePass`) lesen `workbook_meta_blob` + `options` und schreiben **nur**
+  `__`-Schlüssel bzw. `SheetIR.validations`/`SheetIR.named_ranges`; `build_render_plan` liest
+  **nur** die `__`-Schlüssel + `validations`/`named_ranges` (canonical `workbook_meta_blob` fließt
+  ausschließlich unverändert in die `WriteMeta`-Op zur Persistenz). Genau das prüft
+  `test_visible_render_result_is_stable_without_hidden_meta_payload_after_ir_derivation`.
+
+=== Lücken in der Architecture-Test-Abdeckung
+
+* *L1 — keine Aufwärtskanten-Prüfung für `rendering/`.* `domain -> rendering` ist bekannt (D-001
+  aus Phase 1); `rendering -> domain` / `-> pipeline` / `-> cli` würde von keinem Guard erkannt.
+  Faktisch sauber, aber ungeschützt.
+* *L2 — `derived` ist nicht im `meta_registry.yaml`.* `domain/transformations/{enrich_lookup,
+  fk_helpers}.py` schreiben `_meta["derived"]["sheets"]`; `rendering/passes/core.py::
+  _derived_helper_column_names` liest es. Ein kompletter Domain→Rendering-Meta-Kanal, der weder im
+  Register steht noch von `test_meta_registry` (das nur registrierte Einträge prüft) erfasst wird.
+* *L3 — keine Prüfung, dass `passes/` mit den Pass-Dateinamen übereinstimmt.* Die leeren/No-op-
+  Module (`formula_pass.py`, `post_pass.py`, `meta_pass.py`, `style_pass.py`) und der halb-
+  ausgelagerte `validation_pass.py` werden von keinem Test als "tot" markiert; im Gegenteil, der
+  Whitelist in `test_ir_architecture_clarity` zementiert sie.
+* *L4 — `flow.py::default_p1_passes` vs. `passes/__init__.py::apply_all`* sind zwei manuell
+  synchron gehaltene Pass-Listen; kein Test prüft, dass sie identisch bleiben.
+* *L5 — kein Determinismus-Guard im Render-Pfad.* `MetaPass` setzt `exported_at` per
+  `setdefault(..., "")` — der Wert ist im gesamten Paket *nie* mit einem Zeitstempel belegt; kein
+  `datetime.now()`/`random`/`uuid` in `rendering/` oder `pipeline/`. Risiko aktuell null, aber
+  ungeschützt.
+* *L6 — keine Reinheitsprüfung der Render-Eingaben.* `compose_workbook`/`select_render_frames`
+  mutieren den übergebenen `meta`-Dict (`legend_blocks[<name>]["resolved"]`) bzw. die übergebenen
+  Frame-DataFrames (`_resolve_formula_sheet_names`); kein Test fängt diese Seiteneffekte.
+
+=== Hypothesen-Update (nach Schritt 2)
+
+* H1 (`passes/` irreführend) — *gestützt*: der Test-Whitelist nennt `meta_pass.py`/`style_pass.py`/
+  `validation_pass.py` einzeln, obwohl `__init__.py` die Klassen aus `core.py` zieht → die Stubs
+  sind faktisch tot, werden aber durch den Guard "geschützt". Verifikation in Schritt 3.
+* H3 (`exported_at` = `datetime.now()`) — *vorab verworfen*: Grep zeigt nur den `setdefault`-
+  Platzhalter; kein Zeitstempel-Code im Paket.
+* H4 (Rückwärtskante `rendering -> domain`) — *vorab verworfen*: kein solcher Import.
+* H5 (`formulas.py` falsch platziert) — *gestützt*: Inhalt ist 100 % backend-neutral
+  (`*FormulaSpec` + Factories), wird von `domain/`, `rendering/ir.py`, `rendering/plan.py`,
+  `rendering/passes`, `rendering/frame_selection.py` benutzt — gehört nicht unter `rendering/`.
+* H6 (`meta_canonical` leckt in Render) — *teilweise*: der `__`-Ableitungspfad ist sauber (Test
+  bestätigt), *aber* der `derived`-Kanal (L2) ist ein nicht-registrierter Domain→Rendering-Meta-
+  Fluss. Verifikation in Schritt 3.
+* H7 (Pipeline ruft Rendering) — *vorab verworfen*: `pipeline/` importiert nichts aus `rendering/`;
+  der Render-Flow startet im Backend-Saver über `spreadsheet_contract`.
+* H8 (Registry/Steps-Drift) — offen für Schritt 3 (Code-Vergleich `REGISTRY` ↔ `steps.py`).
+* H9 (`runner`/`registry` inspiziert Payload) — *vorab verworfen* per Code-Lesung (s. Schritt 3).
+
+== Schritt 3 — Findings
+
+=== Zusammenfassung
+
+`rendering/` und `pipeline/` sind architektonisch *sauberer* als die Domain: keine Backend-Lib-
+Importe, keine Aufwärtskanten, keine Determinismus-Risiken, die "zwei Flüsse"-Trennung hält
+strikt (Pipeline ⊥ Rendering im Code), die `meta_canonical → meta_rendering`-Ableitung ist
+korrekt verankert, die Pipeline reicht `Frames` durch ohne sie zu interpretieren, und die
+Step-Factories delegieren brav an `domain/` (nie an `core.fk`). Die Schwächen sind *Struktur- und
+Hygiene*-Themen, kein kaputter Layer: das `passes/`-Paket ist durch tote Stub-Dateien
+irreführend und konzentriert ~520 Z. echte Logik in `core.py`; `rendering/formulas.py` ist im
+falschen Layer (das ist die Wurzel von D-001 aus Phase 1); `flow.py` hält eine zweite, nur von
+Tests genutzte Pass-Pipeline parallel; einige Pipeline-Step-Factories sind tot oder doppelt; und
+der Render-Pfad mutiert seine Eingaben. Eine echte hexagonale Verletzung *in dieser Phase* gibt
+es nicht — die einzige (D-001) sitzt auf der `domain/`-Seite und wurde in Phase 1 erfasst.
+
+=== Verifikation der Hypothesen aus Phase 1
+
+[cols="1,3,1", options="header"]
+|===
+|Hypothese (P1-Handoff) |Befund |Status
+
+|P1-A — `exported_at`/`datetime.now()` im Render-Pfad
+|`MetaPass.minimal_fields = ["version","exported_at","author"]`, gesetzt per `meta.setdefault(f, "")`. Im *gesamten* Paket kein `datetime.now`/`utcnow`/`time.time()`/`uuid`/`random`. `exported_at` ist ein leerer Platzhalter, der nirgends befüllt wird.
+|verworfen (Determinismus-Risiko); Nebenbefund IR-013 (toter Platzhalter)
+|P1-B — Rückwärtskante `rendering -> domain`
+|`rendering/**` importiert nichts aus `spreadsheet_handling.domain`/`.pipeline`/`.cli`/`.application` (AST-Grep über alle 16 Module).
+|verworfen
+|P1-C — `rendering/formulas.py` Wanderkandidat
+|72 Z., ausschließlich `@dataclass(frozen=True)` `ListLiteralFormulaSpec`/`LookupFormulaSpec` + `list_literal_formula`/`lookup_formula`/`formula_list_values`. Null Rendering-Spezifik. Konsumiert von `domain/transformations/{enrich_lookup,fk_helpers}.py` *und* `rendering/{ir,plan,frame_selection,passes/core,passes/validation_pass}.py`.
+|bestätigt → IR-002 (= Fix-Ort für D-001)
+|P1-D — `meta_canonical -> meta_rendering` sauber; `derived` registriert?
+|Ableitung sauber (Passes schreiben nur `__`-Keys/`validations`/`named_ranges`; `build_render_plan` liest nur die; Test `…stable_without_hidden_meta_payload…` bestätigt). ABER `derived` ist *nicht* in `meta_registry.yaml`; Domain schreibt es, `passes/core.py` liest es → ungeprüfter Cross-Layer-Meta-Kanal.
+|teilweise → IR-005 (`derived` nicht registriert)
+|P1-E — Pipeline-Steps delegieren an `domain.transformations.fk_helpers`, nicht `core.fk`
+|`make_apply_fks_step` → `domain.transformations.fk_helpers.enrich_helpers`; `make_drop_helpers_step` → `…fk_helpers.drop_helpers`; `make_validate_step`/`make_check_fk_helpers_step` → `domain.validations.fk_helpers` + `domain.validations.findings`. Kein `core.fk`-Import in `pipeline/`. Reorder-Steps → `domain.transformations.helpers`.
+|bestätigt (sauber)
+|===
+
+=== CRITICAL — Beheben vor nächstem Release
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|IR-001
+|*Keine* — in `rendering/` + `pipeline/` wurde in diesem Review keine release-blockierende
+Architektur- oder Korrektheitsverletzung gefunden. Die einzige CRITICAL bleibt D-001 aus Phase 1
+(`domain -> rendering.formulas`); ihr *Fix-Ort* ist IR-002 (s. SHOULD-FIX).
+|—
+|—
+|===
+
+=== SHOULD-FIX — Technische Schuld
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|IR-002
+|*`rendering/formulas.py` liegt im falschen Layer* — reine backend-neutrale Wertobjekte
+(`ListLiteralFormulaSpec`, `LookupFormulaSpec`) + Factories, ohne jede Rendering-Spezifik. Weil
+sie unter `rendering/` liegen, *muss* `domain/` über die Layer-Grenze greifen, um sie zu benutzen
+(= D-001). Das ist die Wurzelursache der einzigen offenen CRITICAL.
+|`src/spreadsheet_handling/rendering/formulas.py`; Konsumenten `domain/transformations/
+enrich_lookup.py:16`, `domain/transformations/fk_helpers.py:20`, `rendering/ir.py:5`,
+`rendering/plan.py:5`, `rendering/passes/core.py:7`, `rendering/passes/validation_pass.py:4`,
+`rendering/frame_selection.py:8`
+|Modul nach `core/formulas.py` (oder `domain/formulas.py`) verschieben — `core/` ist Blatt und
+darf von allen importiert werden. Danach `domain -> rendering`-Guard ergänzen (schließt L1 aus
+Phase 1). `from .formulas import …` in `rendering/` wird zu `from ..core.formulas import …`.
+
+|IR-003
+|*`passes/`-Paket ist strukturell irreführend + enthält toten Code.* `passes/formula_pass.py`
+und `passes/post_pass.py` sind komplett leer. `passes/meta_pass.py` (`apply(ir,meta)->ir` No-op),
+`passes/style_pass.py` (`apply(ir,meta)->ir` No-op, "add styles later") und `passes/
+validation_pass.py` (80 Z., eigenständige, *veraltete* `apply(ir,meta)`-Implementierung, die nur
+`in_list` kennt — der echte `ValidationPass` in `core.py` kann zusätzlich `from_legend` und
+`_p1_validations`) werden von `passes/__init__.py` zwar als Module importiert (`from . import
+meta_pass as meta_pass` …), aber **nie aufgerufen** — `__init__.py` und `flow.py` benutzen die
+`*Pass`-Klassen aus `core.py`. Ein Agent (oder Mensch), der "den StylePass" sucht, öffnet
+`style_pass.py` und findet einen No-op. Gleichzeitig sitzt die echte Logik (8 Pass-Klassen + ~10
+Helfer, 518 Z.) gebündelt in `core.py`.
+|`src/spreadsheet_handling/rendering/passes/{__init__,core,meta_pass,style_pass,
+validation_pass,formula_pass,post_pass}.py`; Test-Whitelist `tests/architecture/dependency_guards/
+test_ir_architecture_clarity.py:16-26`
+|Entscheiden: (a) *Minimal* — die vier toten Module löschen, im `passes/`-Docstring ehrlich "alle
+Passes in `core.py`" notieren, Test-Whitelist anpassen; oder (b) *besser* — `core.py` entlang der
+schon vorhandenen Dateinamen aufspalten (`_base.py` für `IRPass` + `_workbook_meta`/Helfer,
+`style_pass.py`, `protection_pass.py`, `filter_pass.py`, `freeze_pass.py`, `column_width_pass.py`,
+`validation_pass.py`, `meta_pass.py`, `named_range_pass.py`), `__init__.py` re-exportiert aus den
+echten Modulen. Danach ist "wo ist Pass X" per Dateiname auffindbar. Ziel: keine Pass-Datei
+> ~150 Z., `core.py` verschwindet.
+
+|IR-004
+|*Zwei manuell synchron gehaltene Pass-Pipelines.* `passes/__init__.py::apply_all` baut die Liste
+`[MetaPass, ValidationPass, StylePass, ProtectionPass, FilterPass, FreezePass, ColumnWidthPass,
+NamedRangePass]` inline; `flow.py::default_p1_passes()` baut *dieselbe* Liste nochmal; der
+`apply_all`-Docstring sagt selbst "same as default_p1_passes in flow.py". `default_p1_passes` +
+`flow.py::apply_ir_passes` werden ausschließlich von Tests benutzt (Produktion: `apply_all` via
+`spreadsheet_contract`). Driftet eine Liste, merkt es kein Test.
+|`src/spreadsheet_handling/rendering/passes/__init__.py:33-44`, `src/spreadsheet_handling/
+rendering/flow.py:33-36,230-240`
+|Eine Quelle: `default_passes()` (oder eine Konstante) an *einer* Stelle definieren, beide
+Einstiegspunkte rufen sie. `apply_ir_passes` kann durch `apply_all` ersetzt werden, falls die
+Test-DTO-Variante nicht wirklich gebraucht wird. Mindestens: einen Test, der `apply_all`s
+Reihenfolge == `default_p1_passes()` prüft.
+
+|IR-005
+|*`derived`-Meta umgeht das `meta_registry.yaml`.* `domain/transformations/enrich_lookup.py:523`
+und `domain/transformations/fk_helpers.py:323-439` schreiben `_meta["derived"]["sheets"][...]`
+(Helfer-Provenienz); `rendering/passes/core.py:68-94` (`_derived_helper_column_names`, von
+`StylePass` und `ProtectionPass` benutzt) liest es. `derived` hat *keinen* Eintrag in
+`meta_registry.yaml` — also weder `producer`/`consumer`-Referenzen noch eine Layer-Klassifikation,
+und `test_meta_registry` prüft es nicht (es prüft nur registrierte Einträge). Ein vollständiger
+Domain→Rendering-Meta-Kanal ohne Vertrag.
+|`docs/internal_guide/architecture/meta_registry.yaml`; Produzenten/Konsument wie oben
+|`derived` als `meta_rendering`/`derived_operational_view` (transient, nicht roundtrip-relevant —
+`drop_helpers` `pop`t es ja) im Register eintragen, mit `producer`/`consumer`-Refs. Damit greift
+`test_meta_registry` und der Kanal ist dokumentiert. (Alternativ: wenn es bewusst *nicht*
+registriert sein soll, einen expliziten Allowlist-Kommentar + Begründung im Register.)
+
+|IR-006
+|*Render-Pfad mutiert seine Eingaben.* (a) `layout_composer.py::_add_legend_blocks` schreibt
+`spec["resolved"] = {...}` in `meta["legend_blocks"][<name>]` — Mutation des Aufrufer-`meta`.
+`spreadsheet_contract.build_spreadsheet_render_plan` macht nur `dict(meta or {})` (flach), die
+verschachtelten `legend_blocks`-Dicts bleiben geteilt → zwei Aufrufe mit demselben `meta`
+akkumulieren `resolved`. (b) `frame_selection.py::_resolve_formula_sheet_names` schreibt
+`value[col] = series.apply(...)` auf DataFrames, die direkt aus dem Aufrufer-`frames` stammen →
+Mutation der Eingabe-Frames.
+|`src/spreadsheet_handling/rendering/composer/layout_composer.py:229-237`,
+`src/spreadsheet_handling/rendering/frame_selection.py:180-208`
+|`compose_workbook` sollte ein `deepcopy` der `legend_blocks`-Specs bearbeiten (oder `resolved`
+auf der `TableBlock`/`SheetIR` statt im Eingabe-Meta ablegen). `_resolve_formula_sheet_names`
+sollte auf einer Kopie der betroffenen Frames arbeiten. Mindestens: dokumentieren, dass
+`build_spreadsheet_render_plan` die Eingaben konsumiert/mutiert.
+
+|IR-007
+|*Tote / doppelte Pipeline-Step-Factories.* `pipeline/steps.py::make_flatten_headers_step` und
+`make_unflatten_headers_step` werden nirgends benutzt (nicht in `REGISTRY`, nicht in
+`pipeline/__init__.py`, nicht in Tests — `test_public_import_surface.py` stellt sogar sicher, dass
+sie *nicht* öffentlich sind) und hardcoden dieselben `target`-Strings, die `REGISTRY` schon hat
+(Drift-Risiko). `make_add_validations_step`/`make_reorder_helpers_step` sind ebenfalls dünne
+Wrapper über `make_*_target_step` + `target`-String, parallel zu `REGISTRY` (immerhin
+test-genutzt).
+|`src/spreadsheet_handling/pipeline/steps.py:192-217,241-246`
+|`make_flatten_headers_step`/`make_unflatten_headers_step` löschen. Für die test-genutzten Wrapper:
+entweder die `target`-Konstante aus `REGISTRY` wiederverwenden statt sie zu duplizieren, oder die
+Tests direkt über `build_steps_from_config([{"step": "..."}])` fahren lassen.
+
+|IR-008
+|*Asymmetrische `workbook_meta_blob`-Persistenz / fragiles Roundtrip.* Auf dem Write-Path stasht
+`compose_workbook` `meta` als **Dict** in `_meta.workbook_meta_blob`; `build_render_plan` baut
+daraus eine `WriteMeta`-Op mit `kv={str(k): str(v) …}` → der Blob wird als `str(dict)` (Python-
+`repr`, *kein* JSON) persistiert. Auf dem Read-Path versucht `workbookir_to_frames` zuerst
+`json.loads` (scheitert bei `repr`-Form), dann `ast.literal_eval` (funktioniert). Roundtrip hängt
+also an `ast.literal_eval` einer `repr`-Serialisierung — bricht bei Typen ohne `repr`-Roundtrip
+und ist schwer nachvollziehbar.
+|`src/spreadsheet_handling/rendering/composer/layout_composer.py:305-308`,
+`src/spreadsheet_handling/rendering/flow.py:223-226`, `src/spreadsheet_handling/rendering/
+workbook_projection.py:40-61`
+|Eine Serialisierung festlegen — den Blob beim Schreiben als `json.dumps(meta)` ablegen (oder
+zumindest `WriteMeta` so bauen, dass der Blob-Wert nicht durch `str()` läuft), Read-Path nur noch
+`json.loads`. Der `ast.literal_eval`-Fallback kann dann nach einer Übergangszeit weg.
+|===
+
+=== NICE-TO-HAVE — Verbesserungsvorschläge
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|IR-009
+|`rendering/__init__.py` ist leer — der IR-Layer hat keine öffentliche Oberfläche; Konsumenten
+(Adapter, Tests, Agenten) importieren tiefe Pfade (`rendering.composer.layout_composer`,
+`rendering.passes`, `rendering.flow`, …).
+|`src/spreadsheet_handling/rendering/__init__.py`
+|Stabiles `__all__`: `WorkbookIR`, `SheetIR`, `TableBlock`, `RenderPlan` + die `RenderOp`-Typen,
+`compose_workbook`, `apply_all`, `build_render_plan`, `workbookir_to_frames`, `select_render_frames`.
+
+|IR-010
+|`pipeline/registry.py` (261 Z.) mischt drei Dinge: das `REGISTRY`-Mapping, den
+YAML→`BoundStep`-Bauprozess (`build_steps_from_config` mit `try/except TypeError`-Fallback) und
+`run_pipeline` (das obendrein redundant zu `runner.py::run_pipeline` ist, das es nur re-exportiert).
+|`src/spreadsheet_handling/pipeline/registry.py`
+|Trennen: `registry.py` = nur `REGISTRY` + `resolve_registration`; `build.py` =
+`build_steps_from_config`/`build_steps_from_yaml`. `run_pipeline` nur an *einer* Stelle (`runner.py`),
+`registry.py` re-exportiert nicht.
+
+|IR-011
+|Namens-Inkonsistenzen aus der FK-Step-Umbenennungswelle: Factory `make_apply_fks_step` ↔
+Registry-Key `add_fk_helpers` ↔ `name="add_fk_helpers"`; `make_drop_helpers_step` ↔
+`remove_fk_helpers`; `make_check_fk_helpers_step` ↔ `validate_fk_helpers`. Funktionsname und
+sichtbarer Step-Name stimmen nicht überein — erschwert "welche Factory baut Step X".
+|`src/spreadsheet_handling/pipeline/steps.py:154-189,220-238`, `registry.py:48-54`
+|Factory-Namen an die Registry-Keys angleichen (`make_add_fk_helpers_step` etc.) oder umgekehrt;
+in einem Aufwasch mit dem `pipeline_step_registry.json`-Naming abstimmen.
+
+|IR-012
+|`pipeline/config.py` definiert ein zweites Config-Modell (`AppConfig`/`PipelineConfig`/`StepRef`
+mit `dotted`-Feld) parallel zu `registry.py`s `step`-basierter `build_steps_from_config`-Welt;
+`runner.py` brückt zwischen beiden (`StepRef.dotted` ← `s.get("factory") or s.get("dotted")`).
+Zwei YAML-Dialekte (`pipeline.steps[].factory/dotted/args` vs. `pipeline: [{step: …, <kwargs>}]`).
+|`src/spreadsheet_handling/pipeline/config.py`, `runner.py:27-29`, `registry.py:167-222`
+|Auf einen YAML-Dialekt konvergieren (der `step:`-basierte ist der reichere und der von den Guards
+geprüfte); `config.AppConfig` nur noch für I/O-Endpoints + Excel-Optionen, die Step-Liste über
+`build_steps_from_config` führen.
+
+|IR-013
+|`MetaPass` reserviert das canonical-Feld `exported_at`, befüllt es aber nie (`setdefault(…, "")`);
+im ganzen Paket setzt nichts einen Zeitstempel. Entweder toter Platzhalter oder eine bewusst dem
+Aufrufer überlassene Lücke — unklar.
+|`src/spreadsheet_handling/rendering/passes/core.py:448-463`
+|Entweder `exported_at` aus `minimal_fields` entfernen (wenn niemand es setzt) oder dokumentieren,
+wer es setzen soll (CLI/Orchestrator) — und dann beim Setzen einen injizierbaren Clock-Wert
+verwenden, nicht `datetime.now()` direkt (Determinismus).
+
+|IR-014
+|Keine Modul-Header-Konvention in `rendering/`/`pipeline/` — manche Module haben einen
+Zweck-Docstring (`types.py`, `registry.py`, `workbook_projection.py`), `flow.py`/`plan.py`/`ir.py`/
+`config.py` gar keinen. `head -5` orientiert nicht.
+|`src/spreadsheet_handling/{rendering,pipeline}/**`
+|1–3-Zeilen-Header je Datei "Purpose / Layer / darf importieren: …" (dieselbe Konvention wie für
+`domain/`/`core/` in Phase 1 vorgeschlagen, D-012).
+|===
+
+=== Modularisierung & Lesbarkeit (Schritt 3)
+
+* *`rendering/passes/core.py` (518 Z.)* — mit Abstand der größte Brocken der Phase und der
+  wichtigste Split-Kandidat (IR-003 Variante b). Enthält: `IRPass`-Protokoll, `_workbook_meta`,
+  ~8 Helfer rund um Helper-Spalten/`derived`-Auflösung/Legend-Token, und 8 Pass-Klassen
+  (`StylePass`, `ProtectionPass`, `FilterPass`, `FreezePass`, `ColumnWidthPass`, `ValidationPass`,
+  `MetaPass`, `NamedRangePass`). Jede Pass-Klasse ist für sich klein und klar; das Problem ist nur
+  die Bündelung. Nach dem Split passt jeder Pass + seine Helfer in ein < ~150-Z.-Modul, das eine
+  KI in einem Read-Window erfasst.
+* *`rendering/flow.py` (240 Z.)* — macht zwei Dinge: `build_render_plan` (IR → `RenderPlan`, der
+  Hauptzweck, ~130 Z. mit den `_column_width_*`/`_header_grid_*`-Helfern) *und* die test-only
+  `apply_ir_passes`/`default_p1_passes`-Variante (IR-004). Nach IR-004-Fix bleibt `flow.py` ein
+  fokussiertes "IR → RenderPlan"-Modul; ein klarer Header würde helfen.
+* *`rendering/frame_selection.py` (208 Z.)* — ein klarer Zweck (Sicht-Auswahl), aber dicht
+  verschachtelte Policy-Logik (`_should_render_frame` mit ~10 Verzweigungen über `render`/`role`/
+  `mode`/`include_roles`/`omit_roles`/`drop_redundant`). Vertretbar; ein paar benannte
+  Zwischenwerte (`include_debug`, `drop_redundant`) sind schon da. `_resolve_formula_sheet_names`
+  gehört thematisch eher zu `formulas`/Workbook-View-Auflösung als zur Frame-Auswahl — Kandidat
+  zum Ausgliedern.
+* *`pipeline/`* — durchweg klein und gut verständlich (`types.py` 77, `config.py` 71, `runner.py`
+  41, `steps.py` 274 sind nur viele kleine Factories, `registry.py` 261 ist überwiegend die
+  flache `REGISTRY`-Tabelle). Hauptthemen sind die *Doppelungen* (IR-007, IR-010, IR-012), nicht
+  Modulgröße. `steps.py` ist eine reine Factory-Sammlung mit klarem Zweck — ok.
+* *`rendering/ir.py` (61 Z.) / `plan.py` (152 Z.)* — vorbildlich: reine `@dataclass`-Verträge,
+  `plan.py` zusätzlich nur `RenderPlan.add/extend`. Genau das, was der "IR = Vertrag, keine
+  Logik"-Anspruch verlangt. (Einzige Mini-Kopplung: beide importieren `formulas.FormulaSpec` —
+  nach IR-002 wird das `core.formulas.FormulaSpec`.)
+
+=== Hypothesen-Verifikation
+
+* *H1 (`passes/` irreführend + toter Code)* — *bestätigt* → IR-003.
+* *H2 (`passes/core.py` zu groß)* — *bestätigt* → IR-003 (Variante b).
+* *H3 (`exported_at` = `datetime.now()`)* — *verworfen*; nur leerer Platzhalter → IR-013.
+* *H4 (Rückwärtskante `rendering -> domain`)* — *verworfen*.
+* *H5 (`formulas.py` falsch platziert)* — *bestätigt* → IR-002 (Fix-Ort für D-001).
+* *H6 (`meta_canonical` leckt in Render)* — *teilweise*: `__`-Ableitung sauber; der nicht-
+  registrierte `derived`-Kanal ist die echte Lücke → IR-005.
+* *H7 (Pipeline ruft Rendering direkt)* — *verworfen*; `pipeline/` ⊥ `rendering/` im Code, der
+  Render-Flow startet im Backend-Saver über `io_backends/spreadsheet_contract.py`.
+* *H8 (Registry/Steps-Drift)* — *teilweise*: `REGISTRY` ↔ `steps.py` sind konsistent (jede
+  Registry-Factory existiert), aber `steps.py` hat *zusätzliche* tote/doppelte Wrapper → IR-007.
+  Erweiterbarkeit (Open/Closed): ja — `build_steps_from_config` akzeptiert `<modul>:<factory>`-
+  Pfade ohne Registry-Eintrag (`test_plugins_dotted_path.py`).
+* *H9 (`runner`/`registry` inspiziert Payload)* — *verworfen*: `runner.py` ruft nur `step(out)` in
+  einer Schleife; `registry.py` bindet nur Factories; keine `_meta`/`derived`/`helper_columns`-
+  Berührung; `pipeline/__init__.py` enthält keine Workbook-Meta-Routing-Tokens.
+
+== Session-Handoff
+
+:next-session: review-adapters-cli
+:next-focus: io_backends/ + cli/ + orchestrator.py + application/
+
+=== Was wurde reviewed
+
+`src/spreadsheet_handling/rendering/` (alle 16 Module: `ir.py`, `plan.py`, `flow.py`,
+`formulas.py`, `frame_selection.py`, `workbook_projection.py`, `composer/layout_composer.py`,
+`passes/{__init__,core,meta_pass,style_pass,validation_pass,formula_pass,post_pass}.py`) und
+`src/spreadsheet_handling/pipeline/` (alle 6 Module) vollständig gelesen; die relevanten
+Architecture-Tests (`test_ir_architecture_clarity`, `test_pipeline_semantics_guards`,
+`test_raw_formula_boundary_guards`, `test_ir_writepath_semantics`, `test_meta_carrier_boundary_guards`,
+`test_ir_call_chain`, `test_spreadsheet_boundary_guards`, `test_pipeline_step_registry`) als
+Erwartungsreferenz; `io_backends/spreadsheet_contract.py` als Naht-Klärung gestreift.
+
+=== Top-3 Findings dieser Session
+
+1. *IR-002 (SHOULD-FIX, = Fix für die Phase-1-CRITICAL D-001):* `rendering/formulas.py` ist rein
+   backend-neutral und gehört nach `core/` — erst dadurch wird der `domain -> rendering`-Import
+   überflüssig; danach kann ein `domain ⊥ rendering`-Guard ergänzt werden.
+2. *IR-003 (SHOULD-FIX):* das `passes/`-Paket ist durch vier tote/No-op-Stub-Dateien irreführend,
+   die echte Logik (8 Passes, 518 Z.) steckt gebündelt in `core.py` — entweder Stubs löschen oder
+   `core.py` entlang der vorhandenen Dateinamen aufspalten (höchster Hebel für KI-Lesbarkeit hier).
+3. *Gesamtbild:* `rendering/` + `pipeline/` sind hexagonal *sauber* (keine Backend-Libs, keine
+   Aufwärtskanten, deterministisch, "zwei Flüsse" strikt getrennt, Steps delegieren an `domain/`) —
+   die Arbeit liegt in Hygiene/Struktur (IR-003..IR-008), nicht in Layer-Reparaturen.
+
+=== Offene Hypothesen für nächste Session (Adapters / CLI / Orchestrator)
+
+* *Wo wird der canonical-Meta-Blob serialisiert?* IR-008: `WriteMeta.kv` läuft durch `str()` →
+  `str(dict)`; `workbookir_to_frames` liest per `ast.literal_eval`. Im Adapter-Review klären, ob
+  `openpyxl_renderer.py`/`odf_renderer.py` die `WriteMeta`-Op so persistieren und ob der Parser
+  (`openpyxl_parser.py`) den Blob als String zurückgibt — und ob `json` hier nicht der sauberere
+  Träger wäre.
+* *`exported_at`* (IR-013): setzt der CLI/Orchestrator den Zeitstempel? Wenn ja — über `datetime.now()`
+  direkt (Determinismus-Bruch) oder injizierbar? Im `application/orchestrator.py`-Review prüfen.
+* *`backward-compat shim`* `src/spreadsheet_handling/orchestrator.py` → `application/orchestrator.py`
+  (laut Primer): prüfen, ob der Shim noch nötig ist oder ein Rest-Kompat-Pfad.
+* *`io_backends/router.py`* dispatcht per `kind`-String — Open/Closed? Wie registrieren sich
+  JSON/CSV/YAML-Backends, und umgehen die wirklich `rendering/` komplett (Primer-Behauptung)?
+* *`spreadsheet_contract.py` vs. `_interfaces.py`* — zwei Contract-Definitionen? Verhältnis klären.
+* *Render-Eingaben-Mutation (IR-006)* — falls der Orchestrator dieselben `frames`/`meta` nach dem
+  Schreiben weiterverwendet (z. B. für einen zweiten Output oder Roundtrip-Check), ist die
+  In-Place-Mutation durch `compose_workbook`/`select_render_frames` ein konkreter Bug-Vektor.
+
+=== Empfohlener Einstieg Session 3
+
+"Lies `tests/architecture/parse_contract/*` und `tests/architecture/spreadsheet_contract/*` als
+Erwartungsmodell, dann `src/spreadsheet_handling/io_backends/` vollständig (Router, contract,
+_interfaces, xlsx/{backend,parser,parser_interpretation,renderer}, ods/{…}, plus die simplen
+JSON/CSV/YAML-Backends) und `src/spreadsheet_handling/application/orchestrator.py` +
+`src/spreadsheet_handling/cli/`. Fokus: (a) bleiben Parser bei `WorkbookIR` und Renderer bei
+`RenderPlan` stehen (b) ist die `WriteMeta`-Persistenz JSON-sauber oder `repr`-fragil (IR-008)
+(c) setzt der Orchestrator `exported_at`/andere Zeitstempel und ist das deterministisch (IR-013)
+(d) umgehen die Nicht-Spreadsheet-Backends `rendering/` wirklich (e) ist `router.py` Open/Closed."

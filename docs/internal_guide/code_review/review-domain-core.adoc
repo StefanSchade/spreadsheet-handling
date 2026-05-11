@@ -1,0 +1,619 @@
+= Code Review: Domain & Core Layer
+:date: 2026-05-11
+:reviewer: Claude Opus 4.7
+:phase: 1 von 4
+:status: complete
+
+== Schritt 1 — Strukturanalyse
+
+=== domain/ Module
+
+[cols="2,1,2", options="header"]
+|===
+|Datei |Vermuteter Typ |Anmerkung
+
+|domain/__init__.py |Package-Init |Leer (0 Zeilen).
+|domain/frame_lifecycle.py |Service |95 Z. — Lebenszyklus-Operationen auf `Frames` (Erzeugen/Abräumen/Normalisieren?).
+|domain/helper_policies.py |Service / Policy |455 Z. — groß; vermutlich Regeln, welche Helper-Spalten erzeugt/erhalten/verworfen werden.
+|domain/meta_bootstrap.py |Service |73 Z. — merged Meta aus mehreren Quellen (laut Architektur-Primer).
+|domain/structured_yaml.py |Service / Codec |479 Z. — strukturiertes YAML <-> Datenmodell; YAML-Bibliothek wahrscheinlich involviert.
+|domain/workbook_views.py |Service |293 Z. — baut Workbook-Sichten; "Workbook" ist Spreadsheet-Vokabular -> Grenzverdacht.
+|domain/yaml_overrides.py |Service |99 Z. — wendet YAML-Overrides an.
+|domain/extractions/__init__.py |Package-Init |3 Z.
+|domain/extractions/frame_extract.py |Transformation / Service |290 Z. — Auswahl/Extraktion von Teil-Frames.
+|domain/transformations/__init__.py |Package-Init |Leer.
+|domain/transformations/cell_codec.py |Service / Codec |631 Z. — größte Datei; Zell-Werte enkodieren/dekodieren; Lib-Typen (openpyxl-Zellen?) möglich.
+|domain/transformations/compact_multiaxis.py |Transformation |468 Z. — kompaktiert Mehr-Achsen-Tabellen.
+|domain/transformations/discriminator_split.py |Transformation |562 Z. — Split nach Diskriminator-Spalte.
+|domain/transformations/enrich_lookup.py |Transformation |562 Z. — Anreicherung via Lookup.
+|domain/transformations/fk_helpers.py |Transformation |440 Z. — FK-Helper-Spalten erzeugen; Namenskollision mit `validations/fk_helpers.py` und `core/fk.py`.
+|domain/transformations/helpers.py |Service / Utility |267 Z. — Helper-Spalten-Manipulation (clean/drop/provenance).
+|domain/transformations/join_views.py |Transformation |567 Z. — Join-Sichten.
+|domain/transformations/sparse_defaults.py |Transformation |339 Z. — Defaults für dünn besetzte Spalten.
+|domain/transformations/tabular_views.py |Transformation |412 Z. — tabellarische Sichten.
+|domain/transformations/xref_crosstable.py |Transformation |294 Z. — Cross-Reference-Kreuztabelle.
+|domain/validations/__init__.py |Package-Init |15 Z.
+|domain/validations/findings.py |Value Object / Model |80 Z. — `Finding`-Typ + Severity-Policy.
+|domain/validations/fk_helpers.py |Service |251 Z. — FK-Hilfen für Validierung; dritte "fk_helpers/fk"-Variante.
+|domain/validations/graph_validations.py |Validation-Service |446 Z. — graphbasierte Checks (Zyklen/Erreichbarkeit?).
+|domain/validations/reference_validations.py |Validation-Service |725 Z. — größte Validierungsdatei; Referenz-Checks.
+|domain/validations/validate_columns.py |Validation-Service |59 Z. — Spalten-Validierung.
+|===
+
+=== core/ Module
+
+[cols="2,1,2", options="header"]
+|===
+|Datei |Vermuteter Typ |Anmerkung
+
+|core/__init__.py |Package-Init |12 Z.
+|core/df_build.py |Utility |30 Z. — DataFrame-Konstruktion.
+|core/fk.py |Utility (?) |339 Z. — FK-"Erkennung". Auffällig groß für ein "stateless leaf utility"; Verdacht auf fachliche FK-Semantik.
+|core/flatten.py |Utility |19 Z. — Verschachtelte Strukturen flach machen.
+|core/indexing.py |Utility |44 Z. — Index-Hilfen.
+|core/paths.py |Utility |7 Z. — Pfad-Hilfen (Key-Pfade?).
+|core/refs.py |Utility |23 Z. — Zell-Referenz-Arithmetik.
+|core/unflatten.py |Utility |57 Z. — Gegenstück zu flatten.
+|===
+
+Beobachtung: `core/` ist mit Ausnahme von `fk.py` durchgängig klein und leaf-artig.
+`fk.py` ist der einzige Kandidat für ein fehlplatziertes fachliches Konzept (FK-Erkennung
+könnte Konvention/Heuristik = Domänenregel sein, nicht reine Mechanik).
+
+=== Architecture-Tests Übersicht
+
+[cols="2,2,1", options="header"]
+|===
+|Test-Modul |Was wird getestet (vermutet) |Relevanz für diese Phase
+
+|carrier_boundary/test_carrier_boundary_guards.py |`Frames`-Carrier wird zwischen Schichten durchgereicht, nicht interpretiert. |Hoch
+|current_state/test_spreadsheet_meta_semantics.py |Snapshot der aktuellen Spreadsheet-Meta-Semantik. |Niedrig
+|dependency_guards/test_adapter_alignment.py |Adapter folgen dem Contract. |Niedrig
+|dependency_guards/test_architecture_guard_fk_helpers.py |FK-Helper liegen in der richtigen Schicht (core vs domain/transformations vs domain/validations). |Sehr hoch
+|dependency_guards/test_ir_architecture_clarity.py |IR-Layer-Abhängigkeitsrichtung/Klarheit. |Mittel
+|dependency_guards/test_pipeline_step_registry.py |Step-Registry-Konsistenz (YAML-Name -> Factory). |Niedrig
+|dependency_guards/test_spreadsheet_boundary_guards.py |Spreadsheet-spezifischer Code bleibt jenseits der Domain-Grenze. |Hoch
+|formula_boundary/test_raw_formula_boundary_guards.py |Rohe Formel-Strings überqueren eine Grenze nicht (Domain kennt keine A1-Formeln?). |Hoch
+|parse_contract/test_ods_parser_modularization.py |ODS-Parser ist modular zerlegt. |Niedrig
+|parse_contract/test_spreadsheet_parse_contract.py |Read-Path-Grenzkontrakt (Parser -> WorkbookIR). |Mittel
+|parse_contract/test_xlsx_parser_modularization.py |XLSX-Parser ist modular zerlegt. |Niedrig
+|pipeline_semantics/test_pipeline_semantics_guards.py |Step-Kategorien & Config-Kontrakte. |Mittel
+|semantic_invariants/test_ir_writepath_semantics.py |meta_canonical vs meta_rendering auf dem Write-Path. |Mittel
+|semantic_invariants/test_meta_carrier_boundary_guards.py |Meta wird als Carrier durchgereicht, nicht in Domain/Adapter neu interpretiert. |Hoch
+|semantic_invariants/test_meta_registry.py |Meta-Registry (Schlüssel/Regeln) konsistent. |Mittel
+|semantic_invariants/test_meta_registry_hardening.py |Härtung der Meta-Registry (verbotene Schlüssel/Mutationen?). |Mittel
+|semantic_invariants/test_spreadsheet_semantic_invariants.py |Spreadsheet-spezifische Invarianten. |Niedrig
+|spreadsheet_contract/test_adapter_contract_boundary_guards.py |Adapter-Contract-Grenzen. |Niedrig
+|spreadsheet_contract/test_ir_call_chain.py |Aufrufkette IR -> Adapter. |Niedrig
+|===
+
+=== Hypothesen
+
+_Liste der vermuteten Problemstellen — werden in Schritt 3 verifiziert_
+
+* *H1 — Dreifaches FK-Konzept.* `core/fk.py` (339 Z.), `domain/transformations/fk_helpers.py`
+  (440 Z.), `domain/validations/fk_helpers.py` (251 Z.). Der dedizierte Architektur-Test
+  `test_architecture_guard_fk_helpers.py` signalisiert, dass diese Grenze historisch
+  umkämpft war. Verdacht: überlappende Logik, unklare Verantwortungsteilung, evtl.
+  Re-Implementierungen statt geteilter Helfer.
+* *H2 — `core/fk.py` enthält Domänenlogik.* Für ein "stateless leaf utility" auffällig
+  groß; FK-Erkennung per Namenskonvention/Heuristik ist eine fachliche Regel und gehörte
+  ggf. nach `domain/`.
+* *H3 — Framework-Leak in Domain via YAML/Cell-Codecs.* `domain/structured_yaml.py`,
+  `domain/yaml_overrides.py`, `domain/transformations/cell_codec.py` könnten direkt von
+  `yaml`/`openpyxl`-Typen abhängen — hexagonale Grenzverletzung (Domain -> Bibliothek).
+* *H4 — Spreadsheet-Vokabular in Domain.* `domain/workbook_views.py` und ggf.
+  `workbook`-/`sheet`-Begriffe in `tabular_views.py`/`join_views.py` koppeln Domain an
+  Spreadsheet-/IR-Konzepte, die laut Layer-Map erst oberhalb der Domain leben.
+* *H5 — Meta-Regeln in der falschen Schicht.* `domain/meta_bootstrap.py` merged Meta;
+  der Architektur-Primer sagt aber "generische Meta-Regeln (inheritance, merge, priority)
+  gehören in den IR-Layer, nicht in Domain oder Adapter". Grenzfall prüfen.
+* *H6 — Große Module schaden Verständlichkeit (Mensch + KI).* `reference_validations.py`
+  (725), `cell_codec.py` (631), `join_views.py` (567), `discriminator_split.py` (562),
+  `enrich_lookup.py` (562), `compact_multiaxis.py` (468), `helper_policies.py` (455),
+  `graph_validations.py` (446), `fk_helpers.py`/transformations (440). Mehrere Dateien
+  über der Schwelle, ab der ein Agent nicht mehr "in einem Stück" arbeiten kann.
+* *H7 — Determinismus-Risiken.* Transformationen arbeiten auf Dicts/`Frames`; Verdacht auf
+  unsortierte Dict-/Set-Iteration, evtl. `datetime.now()` in Provenance-Pfaden. In
+  Schritt 3 gegen `semantic_invariants`-Tests prüfen.
+* *H8 — Fehlermodell uneinheitlich.* `validations/` liefert `Finding`-Listen (Result-artig),
+  `transformations/` wirft vermutlich Exceptions — zu klären, ob Domain-spezifische
+  Exception-Typen existieren oder generische `ValueError`/`KeyError` verwendet werden.
+
+=== Antworten auf die Leitfragen (Schritt 1)
+
+*1. Was lebt in `domain/`?* Drei klar getrennte Sub-Pakete — `transformations/`
+(Pipeline-Schritte, die `Frames` umformen), `validations/` (Checks, die `Finding`-Listen
+liefern, plus `findings.py` als Value Object/Policy), `extractions/` (Teil-Frame-Auswahl).
+Daneben Top-Level-Services: `frame_lifecycle`, `helper_policies`, `meta_bootstrap`,
+`structured_yaml`, `workbook_views`, `yaml_overrides`. Echte Entities/Value Objects gibt es
+kaum — `findings.py` ist der einzige offensichtliche VO-Träger; ansonsten ist die Domain
+funktions-/serviceorientiert (Transformationen über dem universellen `Frames`-Carrier).
+Ports/Interfaces sind in der Dateiliste nicht sichtbar — Verdacht, dass die Domain keine
+eigenen abstrakten Ports definiert (in Schritt 3 verifizieren).
+
+*2. Was lebt in `core/`?* Durchweg kleine, zustandslose Hilfen: `flatten`/`unflatten`,
+`df_build`, `indexing`, `paths`, `refs`. Das passt zur "leaf utility"-Beschreibung. Einzige
+Ausnahme: `fk.py` (339 Z.) — Umfang und Thema (FK-Erkennung) deuten auf fachliche Logik hin,
+die in `domain/` besser aufgehoben wäre (H2).
+
+*3. Welche Architecture-Tests existieren?* Vier Cluster: (a) *dependency_guards* — wer darf
+wen importieren, inkl. des FK-Helper-Sonderfalls; (b) *carrier_boundary* /
+*semantic_invariants/meta_carrier* — `Frames` und Meta werden durchgereicht, nicht von
+Zwischenschichten interpretiert; (c) *formula_boundary* — rohe Formel-Strings bleiben
+diesseits einer Grenze; (d) *parse_contract* / *spreadsheet_contract* / *pipeline_semantics*
+— Read-Path-, Adapter- und Step-Kontrakte. Für diese Phase zählen vor allem (a) und (b)
+sowie `formula_boundary`.
+
+*4. Erste Hypothesen zu Grenzverletzungen:* siehe H1–H5 oben — Schwerpunkt auf
+FK-Schichtung, YAML-/Cell-Codec-Framework-Leaks, Spreadsheet-Vokabular in der Domain und
+Meta-Merge in der falschen Schicht.
+
+*5. Modularisierung für token-effiziente Entwicklung.* Vorschläge (Reihenfolge = Aufwand/Nutzen):
+
+** *Modul-Header-Konvention erzwingen* — jedes `*.py` startet mit 1–3 Zeilen Docstring
+   "Purpose / Layer / darf importieren: …". Ein Agent erfährt per `head -5`, was ein Modul
+   tut, ohne es zu lesen. Günstig, sofort wirksam.
+** *Pro-Sub-Paket-Index* — `domain/transformations/_ai_info.adoc` (oder `CLAUDE.md`), das
+   nur die Schritte dieses Pakets und ihre Kontrakte listet. Ein Agent, der einen
+   Transformations-Step ändert, lädt diesen Index statt des ganzen Domain-Verzeichnisses.
+** *Stabile öffentliche Sub-Paket-API* — `domain/transformations/__init__.py` und
+   `domain/validations/__init__.py` exportieren die wenigen öffentlichen Symbole; Aufrufer
+   (und Agenten) importieren von dort statt tiefer Pfade. Reduziert die Oberfläche, die ein
+   Agent verstehen muss, und macht Refactorings innerhalb des Pakets unsichtbar.
+** *Große Dateien in Pakete zerlegen* — `cell_codec.py` -> `cell_codec/` mit
+   `encode.py`/`decode.py`/`types.py`; analog `reference_validations.py`, `join_views.py`,
+   `discriminator_split.py`, `enrich_lookup.py`. Ziel: keine Datei > ~300 Zeilen, damit ein
+   Agent ein Modul in einem Read-Window vollständig erfasst. Höchster Aufwand, höchster
+   Langzeit-Nutzen.
+** *FK-Konzepte disambiguieren* — entweder unter einem Namespace bündeln (`fk/detect.py`,
+   `fk/helper_columns.py`, `fk/checks.py`) oder eindeutig umbenennen
+   (`core/fk_detect.py`, `domain/transformations/fk_helper_columns.py`,
+   `domain/validations/fk_checks.py`). Beseitigt die wiederkehrende Verwechslung dreier
+   gleichnamiger Module — sowohl für Menschen als auch für die KI-Suche.
+** *Architektur-Grenzen als ausführbare Regel sichtbar machen* — die `dependency_guards`-Tests
+   so dokumentieren/benennen, dass ein Agent vor einer Änderung weiß, welche Imports erlaubt
+   sind, ohne den Test zu lesen.
+
+== Schritt 3 — Findings
+
+=== Zusammenfassung
+
+`domain/` ist überwiegend sauber: funktional/serviceorientiert, deterministisch (keine
+`datetime.now()`/`random`/`uuid` in `domain` oder `core`; Dict-Iteration konsequent
+first-seen oder explizit `sorted(...)`), gut testabgedeckt, ein klarer Zweck pro Modul.
+Es gibt aber *eine echte hexagonale Verletzung* — zwei Domain-Module importieren
+`spreadsheet_handling.rendering.formulas` — die von keinem Architektur-Guard erkannt wird
+(Lücke L1). `core/` ist bis auf `core/fk.py` echtes Blatt-Utility; `core/fk.py` trägt die
+FK-Namenskonvention (eine Domänenregel) und die FK-Helper-Primitive — genau das, was der
+FK-Guard selbst "gehört nach `domain.transformations.fk_helpers`" nennt. Daneben:
+mehrere überlange Dateien, dreifache `fk_helpers`/`fk`-Namensüberlappung, zwei parallele
+Finding-Modelle, ein paar mislabelte Module und Rest-Kompat-Shims.
+
+=== CRITICAL — Beheben vor nächstem Release
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|D-001
+|*Hexagonale Grenzverletzung `domain -> rendering`.* Zwei Domain-Transformationen importieren
+`spreadsheet_handling.rendering.formulas` (`lookup_formula`). Domain darf nichts aus dem
+Render-Layer kennen. Kein Architektur-Test fängt das (L1: nur `domain -> pipeline` ist geprüft).
+Die strukturellen `*FormulaSpec`-Wertobjekte sind backend-neutral und konzeptuell Domäne,
+nicht Rendering.
+|`domain/transformations/enrich_lookup.py:16`, `domain/transformations/fk_helpers.py:20`
+|`*FormulaSpec`-Wertobjekte + `lookup_formula()`-Factory in eine neutrale Schicht verschieben
+(`core/formulas.py` oder neues `domain/formulas.py`); `rendering/passes` und Adapter
+konsumieren von dort. Danach Guard `test_domain_modules_do_not_import_rendering_or_io_backends`
+ergänzen (schließt L1). Der DI-Mechanismus ist bereits da — `core/fk.py::apply_fk_helpers`
+nimmt einen `helper_value_provider`-Callback; nur die Provider-Konstruktion in
+`domain/transformations/fk_helpers.py` hängt am falschen Layer.
+|===
+
+=== SHOULD-FIX — Technische Schuld
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|D-002
+|*`core/fk.py` enthält Domänenlogik.* `FK_PATTERN` (FK-Spalten-Namenskonvention =
+Domänenregel), `build_registry`, `detect_fk_columns`, `build_id_value_maps`,
+`build_id_label_maps`, `build_id_sets`, `apply_fk_helpers`, `normalize_sheet_key`,
+`assert_no_parentheses_in_columns` — der FK-Architektur-Guard nennt mehrere davon
+ausdrücklich als "gehört nach `domain.transformations.fk_helpers`". `core/__init__.py`
+re-exportiert sogar `detect_fk_columns`/`apply_fk_helpers` — ein Blatt-Layer, der
+Domänenlogik nach außen reicht.
+|`src/spreadsheet_handling/core/fk.py` (339 Z.), `src/spreadsheet_handling/core/__init__.py`
+|FK-Konvention + FK-Helper-Primitive nach `domain/` verschieben (z. B. `domain/fk/`-Paket);
+in `core/` nur rein mechanische, fachneutrale Helfer behalten (oder `core/fk.py` ganz auflösen).
+`core/__init__.py` entsprechend ausdünnen.
+
+|D-003
+|*Dreifache Namensüberlappung.* `core/fk.py`, `domain/transformations/fk_helpers.py`,
+`domain/validations/fk_helpers.py` — plus `transformations/helpers.py` vs `validations`-Helpers.
+Verwirrend für Mensch und KI-Suche; erschwert "welches `fk_helpers` ist gemeint".
+|`core/fk.py`, `domain/transformations/fk_helpers.py`, `domain/validations/fk_helpers.py`
+|Disambiguieren: z. B. `domain/fk/columns.py` (Konvention/Detection), `domain/fk/helpers.py`
+(Spalten-Anreicherung/Provenance), `domain/fk/checks.py` (Validierungen) unter einem Namespace.
+
+|D-004
+|*Überlange Module schaden Lesbarkeit (Mensch + KI).* Neun Dateien > 440 Z., Spitzenwerte
+725/631/567/562/562. Eine KI kann sie nicht "in einem Read-Window" erfassen.
+|`validations/reference_validations.py` (725), `transformations/cell_codec.py` (631),
+`transformations/join_views.py` (567), `transformations/discriminator_split.py` (562),
+`transformations/enrich_lookup.py` (562), `transformations/compact_multiaxis.py` (468),
+`domain/helper_policies.py` (455), `validations/graph_validations.py` (446),
+`transformations/fk_helpers.py` (440)
+|In kohärente Pakete zerlegen (z. B. `cell_codec/{parse,serialize,decode_encode,legend}.py`,
+`reference_validations/{rules,conditions,findings_frame}.py`). Ziel: keine Datei > ~300 Z.
+
+|D-005
+|*Zwei parallele Finding-Modelle + uneinheitliches Fehlermodell.* `validations/findings.py`
+hat `Finding` + `apply_severity_policy` (Caller wendet Policy an, von den FK-Helper-Checks
+genutzt). `validations/reference_validations.py`+`graph_validations.py` haben `ReferenceFinding`
++ `findings_to_frame` + `mode`-Parameter, der intern raised/ein Findings-Frame schreibt.
+|`domain/validations/findings.py`, `domain/validations/reference_validations.py`,
+`domain/validations/graph_validations.py`, `domain/validations/fk_helpers.py`
+|Auf ein Finding-Modell konvergieren; entweder durchgängig "Checks liefern Findings, Caller
+entscheidet Policy" oder durchgängig `mode`-getrieben.
+
+|D-006
+|*Paradigmen-Mix in `transformations/helpers.py`.* Einziges `transformations/`-Modul im
+Closure-Factory-Stil (`mark_helpers(...) -> Step`); alle anderen sind direkte
+`(frames, **cfg) -> frames`-Funktionen. Zudem Grab-Bag (mark/clean/flatten/unflatten/reorder)
+ohne einen Zweck und ein Rest-Kommentar "can be integrated later".
+|`src/spreadsheet_handling/domain/transformations/helpers.py`
+|Stil angleichen (direkte Funktionen) oder die Step-Factory-Variante nach `pipeline/steps.py`
+ziehen; nach Zweck aufteilen.
+
+|D-007
+|*Cross-Modul-Import privater Symbole.* `yaml_overrides.py` importiert `_deep_merge`,
+`_get_meta`, `_set_meta` aus `meta_bootstrap`.
+|`src/spreadsheet_handling/domain/yaml_overrides.py:32`
+|Diese Helfer als öffentliche Namen in ein gemeinsames Meta-Merge-Modul heben.
+
+|D-008
+|*Mislabeltes Modul.* `domain/validations/validate_columns.py` validiert keine Spalten —
+es hängt Validierungs-*Constraints* an `_meta.constraints` an (Funktion `add_validations`).
+Es ist eher eine Configuration-Transformation als eine Validation.
+|`src/spreadsheet_handling/domain/validations/validate_columns.py`
+|Datei/Modul umbenennen (`add_validations.py`); ggf. nach `domain/transformations/` oder
+einem Configuration-Bereich verschieben.
+
+|D-009
+|*Backward-Compat-Reste.* `core/fk.py::apply_fk_helpers` ("legacy dict inputs",
+"older callers that still pass a flat id->label map"); `core/refs.py::add_helper_columns`
+mit `except Exception: r[hp] = ""` (schluckt echte Bugs).
+|`src/spreadsheet_handling/core/fk.py:295-322`, `src/spreadsheet_handling/core/refs.py:18-21`
+|Tote Kompat-Pfade entfernen; das blanke `except` in `refs.py` durch gezielte Behandlung
+ersetzen oder ganz fallen lassen (das Modul wird laut Grep kaum genutzt).
+
+|D-010
+|*Leere/inkonsistente Paket-Oberflächen.* `domain/__init__.py` und
+`domain/transformations/__init__.py` leer; `domain/validations/__init__.py` exportiert nur
+die Reference/Graph-Hälfte (nicht `Finding`, `apply_severity_policy`, `validate_fk_helpers`,
+`check_*`). Aufrufer/Agenten müssen tiefe Pfade kennen.
+|`domain/__init__.py`, `domain/transformations/__init__.py`, `domain/validations/__init__.py`
+|Stabile `__all__` pro Sub-Paket definieren; das ist auch die Voraussetzung für die
+token-effiziente Modularisierung aus Schritt 1.
+
+|D-011
+|*Domain macht Datei-I/O + hängt an `pyyaml`.* `structured_yaml.py` öffnet/schreibt Dateien
+(`Path.open("w")`, `mkdir`, `stat`) und importiert `yaml`; `yaml_overrides.py` liest eine
+YAML-Datei. Datei-I/O ist Adapter-Sache; kein Guard verhindert das (L2).
+|`src/spreadsheet_handling/domain/structured_yaml.py`, `src/spreadsheet_handling/domain/yaml_overrides.py`
+|Datenformung in der Domain belassen, das eigentliche Schreiben/Lesen über eine schmale
+io-Naht (io_backend oder Pipeline-Schritt) führen. Mindestens dokumentieren, dass `yaml` hier
+bewusst geduldet ist, und einen entsprechenden Guard/Allowlist anlegen.
+
+|D-014
+|*Unvollendete Implementierung.* `enrich_lookup._build_formula_enrichment` setzt
+`missing = "" if missing_mode == "empty" else ""` — beide Zweige liefern `""`, die
+`missing_mode`-Unterscheidung ist im Formel-Modus ein No-op.
+|`src/spreadsheet_handling/domain/transformations/enrich_lookup.py:480`
+|Entweder `missing_mode` im Formel-Modus echt umsetzen (z. B. Fehler bei `"fail"`/anderer
+Default) oder den toten Zweig entfernen und das Verhalten dokumentieren.
+|===
+
+=== NICE-TO-HAVE — Verbesserungsvorschläge
+
+[cols="1,3,3,3", options="header"]
+|===
+|ID |Problem |Ort |Empfehlung
+
+|D-012
+|Keine Modul-Header-Konvention — manche Module haben einen Zweck-Docstring, andere gar keinen.
+|`src/spreadsheet_handling/{domain,core}/**`
+|1–3-Zeilen-Header je Datei: "Purpose / Layer / darf importieren: …". `head -5` orientiert dann
+Mensch und KI ohne den ganzen Body.
+
+|D-013
+|`meta_bootstrap.py` + `validate_columns.py` benutzen ein "Dual-Interface"-Shim
+(`hasattr(frames, "meta")` vs `frames["_meta"]`, plus toter `where == "temp"`-Zweig).
+|`domain/meta_bootstrap.py`, `domain/validations/validate_columns.py`
+|Auf das eine `Frames = dict[str, ...]`-Carrier-Modell festlegen (der Rest der Domain tut das);
+den Attr-Pfad und den `temp`-Zweig entfernen.
+|===
+
+=== Antworten auf die Leitfragen (Schritt 3)
+
+*1. Hexagonale Grenzverletzungen.* Genau eine, dafür eindeutig: `domain/transformations/enrich_lookup.py`
+und `.../fk_helpers.py` importieren `rendering.formulas` (D-001). Sonst keine Importe von
+`io_backends`/`rendering`/`pipeline` aus `domain/`; `core/` ist sauberes Blatt. Direkte
+Framework-Abhängigkeiten in `domain/`: `pandas` (überall, ok — `Frames`=DataFrame) und `yaml`
+in zwei Modulen, die zugleich Datei-I/O machen (D-011).
+
+*2. Fehlplatzierte Konzepte.* `core/fk.py` trägt die FK-Namenskonvention + FK-Helper-Primitive,
+die fachlich in `domain/` gehören (D-002) — der einzige klare Fall in dieser Richtung. Umgekehrt
+(Utilities in `domain/`, die nach `core/` sollten): keiner; `domain/transformations/helpers.py`
+ist eher eine Stil-/Schnittfrage (D-006) als eine Layer-Frage.
+
+*3. Port-Konsistenz.* Die Domain definiert *keine* eigenen abstrakten Ports/Interfaces. Sie
+referenziert auch keine Adapter-Implementierungen — *außer* dem `rendering.formulas`-Import
+(D-001). Der saubere Mechanismus existiert (`core/fk.py` injiziert einen
+`helper_value_provider`-Callback statt selbst zu rendern); er ist nur in
+`domain/transformations/fk_helpers.py` an die falsche Seite verdrahtet.
+
+*4. Determinismus-Risiken.* Keine in `domain/` oder `core/`: kein `datetime.now()`, `random`,
+`uuid`; Dict-Iteration ist konsequent first-seen (`dict.fromkeys`, `to_dict(orient="records")`
+über geordnete DataFrames) oder explizit `sorted(...)` mit stabilen Tie-Breakern; `sort_values`
+nutzt teils `kind="mergesort"`. Der einzige Zeitstempel-Meta-Key `exported_at` wird in
+`rendering/passes/core.py` erzeugt — außerhalb dieser Phase, aber Notiz für Session 2.
+
+*5. Fehlermodell.* `transformations/` und `extractions/` werfen generische
+`ValueError`/`KeyError`/`TypeError` (keine domänenspezifische Exception-Hierarchie — für eine
+Bibliothek dieser Größe vertretbar, aber erschwert gezieltes Fangen durch Konsumenten).
+`validations/` ist gespalten: `Finding`+`apply_severity_policy` (Caller-Policy) vs
+`ReferenceFinding`+`mode`-Parameter (intern raised/Frame geschrieben) — D-005.
+
+*6. Schnitt/Verständlichkeit der Files.* Überwiegend gut: ein klarer Zweck pro Modul,
+sprechende Namen, konsistenter Stil *innerhalb* eines Moduls. Abzüge: neun Dateien > 440 Z.
+(D-004), dreifache `fk_helpers`/`fk`-Namen (D-003), `transformations/helpers.py` als Grab-Bag
+(D-006), mislabeltes `validate_columns.py` (D-008), leere `__init__.py`s erzwingen tiefe
+Importe (D-010), keine Modul-Header-Konvention (D-012).
+
+=== Hypothesen-Verifikation
+
+* *H1 (dreifaches FK-Konzept)* — *bestätigt* → D-002, D-003.
+* *H2 (`core/fk.py` = Domänenlogik)* — *bestätigt* → D-002.
+* *H3 (Framework-Leak via YAML/Cell-Codecs)* — *teilweise*: `cell_codec.py` ist sauber (nur
+  pandas); der Leak ist YAML+Datei-I/O in `structured_yaml.py`/`yaml_overrides.py` → D-011.
+* *H4 (Spreadsheet-Vokabular in Domain)* — *weitgehend verworfen*: `workbook_views.py` schreibt
+  nur `workbook_view`/`sheets`-Meta (registriertes canonical Konzept), keine IR-/Spreadsheet-
+  Implementierungskopplung. Der reale Domain→Präsentation-Leak ist `formulas` (D-001).
+* *H5 (Meta-Merge in falscher Schicht)* — *verworfen*: `meta_bootstrap.py` macht nur
+  Precedence-Merge canonischer Meta-Quellen (Persistence/Profile/CLI), keine Render-Vererbung/
+  -Priorisierung. Bleibt korrekt in `domain/`.
+* *H6 (große Module)* — *bestätigt* → D-004.
+* *H7 (Determinismus)* — *verworfen* für `domain/`+`core/` (s. Leitfrage 4).
+* *H8 (Fehlermodell)* — *teilweise bestätigt*: generische Exceptions in Transformationen, zwei
+  Finding-Modelle in Validierungen → D-005; keine domänenspezifische Exception-Hierarchie.
+* *H9 ("Formula-Mode" in `enrich_lookup`)* — *bestätigt sauber* gegenüber dem Regex-Guard:
+  `_build_formula_enrichment` / `_lookup_formula_provider` bauen `LookupFormulaSpec`-*Objekte*
+  (keine `=VLOOKUP`-Strings) via `rendering.formulas.lookup_formula` — strukturelle-Intent-
+  Design hält. Kosten: der `domain -> rendering`-Import (D-001). Nebenbefund: toter
+  `missing_mode`-Zweig (D-014).
+
+== Session-Handoff
+
+:next-session: review-ir-pipeline
+:next-focus: IR-Layer (rendering/) + Pipeline-Engine (pipeline/)
+
+=== Was wurde reviewed
+
+`src/spreadsheet_handling/domain/` (alle 25 Module) und `src/spreadsheet_handling/core/`
+(alle 8 Module) vollständig gelesen; `tests/architecture/` (19 Module) als Erwartungsreferenz.
+`rendering/`, `pipeline/`, `io_backends/`, `application/`, `cli/` nur soweit gestreift, wie
+es für die Layer-Grenzen nötig war.
+
+=== Top-3 Findings dieser Session
+
+1. *D-001 (CRITICAL):* `domain/transformations/enrich_lookup.py` und `.../fk_helpers.py`
+   importieren `rendering.formulas` — die einzige echte hexagonale Verletzung, von keinem
+   Architektur-Guard erkannt; Fix = `*FormulaSpec`+`lookup_formula()` in eine neutrale Schicht
+   verschieben und einen `domain ⊥ rendering/io_backends`-Guard ergänzen.
+2. *D-002 (SHOULD-FIX):* `core/fk.py` (339 Z.) trägt die FK-Namenskonvention + FK-Helper-
+   Primitive, die fachlich nach `domain/` gehören — der FK-Guard selbst sagt das; `core/__init__.py`
+   re-exportiert sie sogar nach außen.
+3. *D-004/D-003 (SHOULD-FIX):* Neun Dateien > 440 Z. plus dreifache `fk_helpers`/`fk`-Namens­
+   überlappung — der größte Hebel für token-effizientes Mensch+KI-Arbeiten ist hier (Pakete
+   zerlegen, Namespace disambiguieren, stabile `__init__`-Oberflächen).
+
+=== Offene Hypothesen für nächste Session (IR-Layer / Pipeline)
+
+* `exported_at` (canonical-Meta-Key, Zeitstempel) wird in `rendering/passes/core.py` erzeugt
+  → konkretes Determinismus-Risiko im Render-Layer; prüfen, ob es seedbar/injizierbar ist.
+* L1-Gegenstück: `rendering/` importiert legitim `io_backends/` (generisch) — aber importiert
+  `rendering/` irgendwo `domain/`? Das wäre eine Rückwärtskante; nicht von den vorhandenen
+  Guards abgedeckt (die prüfen nur openpyxl/odf/io_backends.xlsx in `rendering/`).
+* `rendering/formulas.py` ist nach D-001 ein Wanderkandidat — beim IR-Review klären, welche
+  Teile davon backend-neutrale Wertobjekte (→ neutrale Schicht) und welche render-spezifisch sind.
+* `meta_canonical` vs `meta_rendering`: die Domain schreibt canonical Meta (`frame_lifecycle`,
+  `workbook_view`, `helper_policies`, `cell_codecs`, `xref_crosstable`, `compact_multiaxis`,
+  `split_by_discriminator`, `sparse_defaults`, `constraints`, `derived`*) — beim IR-Review
+  verifizieren, dass die Passes daraus `meta_rendering` ableiten und `meta_canonical` danach
+  nicht mehr direkt das Render-Ergebnis beeinflusst. (* `derived` ist *nicht* im
+  `meta_registry.yaml` registriert, obwohl `enrich_lookup`/`fk_helpers` es schreiben — prüfen,
+  ob das Absicht (transient) oder eine Registry-Lücke ist.)
+* Pipeline-Steps: der FK-Guard prüft nur `pipeline.steps`; verifizieren, dass die
+  Step-Factories tatsächlich an `domain.transformations.fk_helpers.enrich_helpers`/`drop_helpers`
+  delegieren und nirgends doch wieder `core.fk` direkt anfassen.
+
+=== Empfohlener Einstieg Session 2
+
+"Lies `tests/architecture/dependency_guards/test_ir_architecture_clarity.py`,
+`semantic_invariants/test_ir_writepath_semantics.py` und `spreadsheet_contract/test_ir_call_chain.py`
+erneut als Erwartungsmodell, dann `src/spreadsheet_handling/rendering/` vollständig — Fokus:
+(a) keine Rückwärtskante `rendering -> domain`, (b) `meta_canonical -> meta_rendering`-Ableitung
+sauber, (c) Klärung, ob `rendering/formulas.py` (siehe D-001 aus Session 1) ganz oder teilweise
+in eine neutrale Schicht gehört, (d) `exported_at`/`datetime.now()`-Determinismus im Render-Pfad."
+
+(Verifikation und Priorisierung dieser Vorschläge erfolgt in Schritt 3 nach dem Code-Review.)
+
+== Schritt 2 — Erwartungsmodell (aus Architecture-Tests)
+
+=== Intendierte Abhängigkeitsrichtung
+
+_Wer darf wen importieren — aus den Tests abgeleitet_
+
+Direkt belegt durch `dependency_guards/test_spreadsheet_boundary_guards.py`:
+
+* `core/` ist *Blatt*: darf nichts aus `domain`, `pipeline`, `rendering`, `io_backends`
+  importieren (`test_core_modules_remain_leaf_only`).
+* `domain/` darf *`pipeline`* nicht importieren (`test_domain_modules_do_not_import_pipeline_layer`).
+  -> *Auffällig:* der Test verbietet **nur** `spreadsheet_handling.pipeline`. `rendering` und
+  `io_backends` werden für `domain/` **nicht** geprüft. Importe von `domain -> rendering` oder
+  `domain -> io_backends` würden durch keinen Guard auffallen (Lücke L1, s. u.).
+* `pipeline/runner.py` und `pipeline/registry.py` dürfen Payload-Semantik nicht inspizieren
+  (`"_meta"`, `["derived"]`, `["helper_columns"]` als Quelltext-Muster verboten) —
+  Pipeline reicht `Frames` durch, interpretiert sie nicht.
+* `pipeline/__init__.py` + `registry.py` dürfen nicht auf Workbook-Meta verzweigen
+  (`pipeline_semantics/...`: String-Literale `_meta`, `frame_lifecycle`, `workbook_view`,
+  `workbook_views` verboten) — Pipeline bleibt linear und config-getrieben.
+* Generischer Render-/IR-Code (`rendering/**`, `spreadsheet_contract.py`, `_interfaces.py`)
+  bleibt frei von `openpyxl`, `odf`, `io_backends.xlsx`, `io_backends.ods`.
+* Backends (`xlsx_backend.py`, `ods_backend.py`) erreichen generischen Code **nur** über
+  `io_backends.spreadsheet_contract`; Parser stoppen bei `WorkbookIR`; Renderer konsumieren
+  nur `RenderPlan`. (Für diese Phase nachrangig, aber Teil des Gesamtbilds.)
+
+Belegt durch `dependency_guards/test_architecture_guard_fk_helpers.py`:
+
+* FK-Helper-*Domänenlogik* (`build_registry`, `build_id_value_maps`, `detect_fk_columns`,
+  `apply_fk_helpers`) gehört nach `domain.transformations.fk_helpers` — `pipeline.steps`
+  darf diese Symbole **nicht** importieren und **kein** `_meta`/`derived`/`helper_columns`
+  manipulieren. Ein Step ruft eine Domain-Factory auf, nicht die Primitive direkt.
+
+Daraus rekonstruierte Soll-Schichtung (Imports nur "nach unten"):
+
+----
+cli/ -> pipeline/ , application/
+pipeline/ , application/ -> domain/ , rendering/
+domain/ -> core/                       (+ stdlib, pandas; KEIN pipeline/rendering/io_backends)
+rendering/ -> io_backends/ (generisch)  (KEIN openpyxl/odf)
+core/ -> (nichts projektinternes)       echtes Blatt
+io_backends/<fmt>/ -> spreadsheet_contract -> rendering/ (generisch)
+----
+
+=== Getestete Grenzen
+
+[cols="1,2,2", options="header"]
+|===
+|Test-Modul |Fachliche Bedeutung |Abgedeckte Invariante
+
+|carrier_boundary/test_carrier_boundary_guards.py
+|*Trotz des Namens nicht der `Frames`-Carrier*, sondern die *Test-Suite-Topologie*: Pytest-Tests nur unter bekannten Carrier-Roots, Support-Carrier definieren keine Tests, Topologie-Marker sind pfad-besessen, Quarantäne-Carrier deklarieren Status.
+|Test-Sammlung bleibt in `unit/integration/architecture/legacy_pre_hex`. *Kein* Bezug zur Domain/Core-Schichtung.
+
+|formula_boundary/test_raw_formula_boundary_guards.py
+|Backend-spezifische Formel-Syntax (XLSX `=VLOOKUP(`/`=IF(`/A1-Refs, ODS `of:=`/`table:formula`) ist ein Adapter-Detail; generische Schichten kennen nur *strukturelle* Formel-Intent (z. B. `ListLiteralFormulaSpec`).
+|`core/`, `domain/`, `pipeline/`, `rendering/`, `spreadsheet_contract.py` enthalten **keine** rohen Formel-Strings. Erlaubt nur in `io_backends/xlsx`, `io_backends/ods`, `tests/architecture/current_state`. *(Regex auf Quelltext — dynamisch zusammengebaute Formeln entgehen dem Guard.)*
+
+|dependency_guards/test_architecture_guard_fk_helpers.py
+|FK-Erkennung/-Helper-Spalten/-Provenance ist Domänenlogik, kein Pipeline-Verdrahtungsdetail.
+|`pipeline.steps` importiert keine FK-Helper-Primitive und fasst kein `_meta`/`derived`/`helper_columns` an — diese Logik lebt in `domain.transformations.fk_helpers`.
+
+|dependency_guards/test_spreadsheet_boundary_guards.py
+|Hexagonale Schichtgrenzen: `core` = Blatt, `domain` ⊥ `pipeline`, generisches Rendering ⊥ Backend-Libs, Backends nur über den Contract, Pipeline-Verdrahtung ohne Payload-Semantik.
+|Siehe Abhängigkeitsrichtung oben. *Wichtigster Guard für diese Phase.*
+
+|dependency_guards/test_adapter_alignment.py + test_ir_architecture_clarity.py
+|XLSX-Adapter-Naht: generischer Write-Path/Rendering bleibt openpyxl-frei; XLSX-Parser besitzt seinen Read-Path lokal; `spreadsheet_contract` nutzt nur die generische `workbook_projection`.
+|Nur `rendering/`/`io_backends/` betroffen — für Domain/Core nachrangig.
+
+|dependency_guards/test_pipeline_step_registry.py + pipeline_semantics/test_pipeline_semantics_guards.py
+|`docs/internal_guide/architecture/pipeline_step_registry.json` ist ein *manuelles Review-Artefakt* (kein Runtime-Binding), das die Laufzeit-`REGISTRY` exakt spiegelt; Steps deklarieren Kategorie, Frame-Kontrakt, Meta-Kontrakt, Inverse, Aliases.
+|Step-Inventar, Meta-Lese/Schreib-Referenzen zeigen auf `meta_registry.yaml`-Einträge, Composite-Steps wrappen nur Primitive, `auto`-Parameter nur in `configuration`-Steps. *Indirekt relevant: nennt die Domain-Steps und ihre Meta-Roots.*
+
+|semantic_invariants/test_meta_carrier_boundary_guards.py
+|*Canonical* Workbook-Meta (persistenz-/roundtrip-relevant) ist getrennt von *Carrier-/Rendering*-Meta (`__`-präfigierte Render-Hints, `workbook_meta_blob`, `options`, `_hidden`).
+|Carrier-/Rendering-Schlüssel sind im Registry als `meta_rendering` klassifiziert; canonical Einträge liegen in `meta_canonical`, haben **keinen** `_`-Präfix; `workbookir_to_frames` bevorzugt canonical Payload vor Carrier-Hints. *Relevant: Domain-erzeugte Meta muss canonical-förmig sein.*
+
+|semantic_invariants/test_meta_registry.py + test_meta_registry_hardening.py
+|Das Meta-Register ist ein review-pflichtiges Artefakt; jeder Eintrag hat `producer`/`consumer`-Code-Referenzen, Layer (`meta_canonical`/`meta_rendering`) und Klassifikation.
+|`producer`/`consumer`-Referenzen müssen als `spreadsheet_handling.<ref>` *importierbar* sein. *Relevant: in Schritt 3 prüfen, ob die im Register genannten Domain-Symbole (`helper_policies`, `frame_lifecycle`, `xref_crosstable`, `cell_codecs`, `compact_multiaxis`, `split_by_discriminator`, `sparse_defaults`, …) tatsächlich an den referenzierten Stellen existieren.*
+
+|semantic_invariants/test_ir_writepath_semantics.py + test_spreadsheet_semantic_invariants.py + current_state/test_spreadsheet_meta_semantics.py
+|Sichtbares Spreadsheet-Verhalten wird aus IR-Semantik abgeleitet, nicht aus dem versteckten `_meta`-Carrier; canonical Meta roundtrippt ohne Render-Annotationen; Validierungs-Intent ist strukturell.
+|Render-Ergebnis identisch mit/ohne `workbook_meta_blob` nach IR-Derivation; `read_multi(...)["_meta"] == meta`. *Domain liefert die canonical Meta, die hier roundtrippt — Determinismus-relevant.*
+
+|parse_contract/*, spreadsheet_contract/*
+|Read-Path stoppt bei `WorkbookIR`; Projektion ist backend-neutral; Backends nutzen die `spreadsheet_contract`-Fassade; Parser delegieren Sichtbares-Sheet-Interpretation an adapter-lokale Helfer.
+|Reine `io_backends/`+`rendering/`-Grenzen — für Domain/Core ohne direkten Bezug.
+|===
+
+=== Lücken in der Architecture-Test-Abdeckung
+
+_Bereiche ohne Architecture-Tests — relevant für Domain & Core_
+
+* *L1 — `domain -> rendering` / `domain -> io_backends` ist nicht verboten.*
+  Nur `domain -> pipeline` wird geprüft. Gerade die Verdachtsfälle H3/H4
+  (`workbook_views.py`, `cell_codec.py`, `structured_yaml.py`) lägen außerhalb jeder
+  Guard-Abdeckung. In Schritt 3 explizit prüfen.
+* *L2 — `domain -> Third-Party-Bibliotheken` ist nicht eingegrenzt.* Kein Test sagt
+  "`domain/` darf `yaml`/`openpyxl`/`odf` nicht importieren". `domain/structured_yaml.py` +
+  `domain/yaml_overrides.py` können ungestraft direkt von `pyyaml` abhängen; `cell_codec.py`
+  kann openpyxl-Zelltypen verwenden. (pandas gilt als überall erlaubt — `Frames` = DataFrame.)
+* *L3 — Kein Determinismus-Guard.* Nichts erkennt `datetime.now()`, `random`, `uuid` ohne
+  Seed oder unsortierte Dict-/Set-Iteration in der Domain. Der canonical-Meta-Schlüssel
+  `exported_at` (Zeitstempel!) ist ein Determinismus-Geruch, den kein Test fängt.
+* *L4 — Kein "core bleibt klein/einzweckig"-Guard.* `core/fk.py` (339 Z.) könnte
+  Domänenlogik anziehen, ohne dass ein Test reagiert — der einzige Core-Guard prüft nur
+  Import-Richtung.
+* *L5 — Domain-interne Schichtung ungeschützt.* Nichts verhindert, dass
+  `domain/validations/` aus `domain/transformations/` importiert (oder umgekehrt) oder dass
+  die drei `fk_helpers`-Module sich gegenseitig importieren / zyklisch werden.
+* *L6 — Kein Fehlermodell-Guard.* Nichts erzwingt domänenspezifische Exception-Typen statt
+  generischer `ValueError`/`KeyError`.
+* *L7 — `formula_boundary` ist nur Quelltext-Regex.* Eine Domain-Funktion, die einen
+  Formel-String *programmatisch* zusammenbaut (`"=" + fn + "(" + ...`), entgeht dem Guard.
+  Daher in Schritt 3 `enrich_lookup.py` (es gibt `test_lookup_formula_mode.py`!) manuell
+  auf "formula mode" prüfen.
+* *L8 — `Frames`-Carrier wird nicht direkt geschützt.* Es gibt keinen Test, der zusichert,
+  dass Zwischenschichten `Frames` unverändert durchreichen — nur die indirekten
+  `_meta`/`derived`-String-Checks auf `pipeline/runner.py|registry.py|steps.py`.
+
+=== Würden aktuell Tests fehlschlagen?
+
+Nur als Hypothese aus der Teststruktur (ohne Lauf): Die vorhandenen Guards sind eng
+geschnitten und vermutlich grün — sie schützen genau die Nähte, die in den jeweiligen FTRs
+"schmal" gehalten werden sollten. Das *Risiko* liegt damit nicht in fehlschlagenden Tests,
+sondern in den **ungeprüften Bereichen L1–L8**. Konkrete Erwartung für Schritt 3:
+
+* H3/H4 (Framework-/Spreadsheet-Leak in `domain/`) wären *echte* Verstöße gegen die
+  hexagonale Idee, würden aber von **keinem** aktuellen Guard erkannt → CRITICAL/SHOULD-FIX-Kandidaten
+  *und* gleichzeitig Vorschlag für einen neuen Guard.
+* `exported_at` legt nahe, dass irgendwo in der Domain (oder darüber) `datetime.now()`
+  aufgerufen wird → Determinismus-Finding (H7).
+
+=== Hypothesen-Update
+
+* *H1 (dreifaches FK-Konzept)* — gestützt: ein eigener Architektur-Guard adressiert genau die
+  FK-Helper-Grenze; das `pipeline_step_registry`-Replace-Mapping (`add_fk_helpers -> apply_fks`,
+  `validate_fk_helpers -> check_fk_helpers`, …) zeigt eine kürzliche Umbenennungs-/Konsolidierungs­welle.
+  Verdacht auf historisch gewachsene Doppelung bleibt bestehen.
+* *H2 (`core/fk.py` = Domänenlogik)* — teilweise gestützt: `detect_fk_columns` wird vom
+  FK-Guard ausdrücklich der Domain (`domain.transformations.fk_helpers`) zugeordnet, nicht dem
+  Core. Falls `detect_fk_columns` (oder Äquivalent) in `core/fk.py` lebt, ist das genau die
+  Fehlplatzierung. In Schritt 3 verifizieren.
+* *H3 (Framework-Leak via YAML/Cell-Codecs)* — Risiko *erhöht*, weil L1/L2 zeigen, dass kein
+  Guard das verhindert. Priorität für Schritt 3.
+* *H4 (Spreadsheet-Vokabular in Domain)* — gestützt durch `workbook_view`/`workbook_views`
+  als verbotene Pipeline-Routing-Tokens und durch `frame_lifecycle`/`workbook_view` als
+  canonical-Meta-Keys: "Workbook-View" *ist* offiziell ein Domänenkonzept (Meta-getrieben),
+  also evtl. legitim — aber zu prüfen, ob `domain/workbook_views.py` dabei IR-/Spreadsheet-
+  *Implementierungs*details berührt statt nur Meta zu produzieren.
+* *H5 (Meta-Regeln in falscher Schicht)* — verfeinert: generische Meta-*Merge/Priority*-Regeln
+  gehören laut Primer in den IR-Layer; `domain/meta_bootstrap.py` darf Meta aus Quellen
+  *einsammeln* (canonical), aber keine Render-Vererbung/-Priorisierung vorwegnehmen. Grenze
+  in Schritt 3 am Code prüfen.
+* *H6 (große Module)* — unverändert; kein Guard adressiert Modulgröße.
+* *H7 (Determinismus)* — *verschärft*: `exported_at` als canonical-Meta-Key ist ein
+  konkreter Hinweis auf `datetime.now()`-Nutzung. Gezielt suchen.
+* *H8 (Fehlermodell)* — unverändert; keine Guard-Abdeckung, in Schritt 3 am Code beurteilen.
+* *H9 (neu) — "Formula-Mode" in `enrich_lookup`* — `test_lookup_formula_mode.py` +
+  `test_validation_formula_intent_is_structural_not_backend_syntax` legen nahe, dass die
+  Domain Lookups optional als Formel-Intent (strukturell) ausdrücken kann. Zu prüfen: bleibt
+  das wirklich backend-neutral oder steckt irgendwo eine `=VLOOKUP`/`=XLOOKUP`-Schablone
+  (ggf. dynamisch zusammengebaut, daher vom Regex-Guard unentdeckt)?
