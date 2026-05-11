@@ -1,0 +1,75 @@
+===== FTR-REVIEW-001-META-BLOB-JSON-P3 — Fix `workbook_meta_blob` serialization: `str(dict)` → `json.dumps`
+
+*Status:* Open
+*Priority:* P3
+*Area:* rendering / io_backends
+*Kind:* Bugfix
+*Review source:* REVIEW-001, Cluster C4, Finding IDs: IR-008, A-004
+
+==== Purpose
+
+The `workbook_meta_blob` is written as a Python `repr` string (`str(dict)`) into the
+`WriteMeta` operation and read back with `json.loads` falling back to `ast.literal_eval`.
+This silently breaks for any value that is not a Python literal — most importantly
+`float('nan')`, which round-trips through `repr` as the string `'nan'`, causing
+`json.loads` to fail and `ast.literal_eval` to return a raw string rather than raising,
+silently corrupting the meta payload. For a roundtrip-centred library this is a
+correctness risk at the core of its persistence path.
+
+==== Current State (verified)
+
+* `rendering/flow.py:226` — writes `WriteMeta(kv={str(k): str(v)})` where the blob
+  value is `str(dict(...))` — Python `repr`, not JSON. (IR-008)
+* `rendering/composer/layout_composer.py:308` — same pattern. (IR-008)
+* `rendering/passes/__init__.py:32` — same pattern. (IR-008)
+* Read path in `io_backends/` — `json.loads(blob)` with `except` fallback to
+  `ast.literal_eval(blob)`. (A-004)
+* `ast.literal_eval` silently coerces `'nan'` to string `'nan'` instead of raising,
+  corrupting roundtrips that contain `float('nan')` values. (A-004)
+* The three write sites are the only callers that produce `workbook_meta_blob` content.
+
+==== Scope
+
+. `rendering/flow.py:226` — change blob write to `json.dumps(meta_dict)`. Ensure
+  `meta_dict` is JSON-serializable at the call site; if non-JSON types are possible,
+  add a narrow serialization helper or document the constraint.
+. `rendering/composer/layout_composer.py:308` — same change.
+. `rendering/passes/__init__.py:32` — same change.
+. In the read path — keep the `ast.literal_eval` fallback as a legacy compatibility
+  shim for XLSX files written with the old format; annotate it with a `# legacy:
+  pre-JSON repr format` comment.
+. Add a roundtrip integration test: a pipeline that produces a meta payload containing
+  `float('nan')` and a nested dict value must round-trip correctly through write → XLSX
+  read → verify blob contents. Confirm the NaN case no longer silently corrupts.
+. Write `docs/human_info/adr/ADR-META-BLOB-SERIALIZATION.adoc`: records the decision to
+  use `json.dumps`, the `ast.literal_eval` legacy read fallback and its rationale, and
+  the breaking scenario (NaN / non-literal values).
+
+==== Non-Goals
+
+* Do not remove the `ast.literal_eval` legacy read path — existing XLSX files written
+  with `repr` must remain readable.
+* Do not change the `WriteMeta` op type or its key/value schema.
+* Do not alter `meta_canonical` key structure.
+
+==== Dependencies
+
+None. Fully standalone.
+
+==== Risk
+
+Low. Three bounded write sites; read path change is additive only (fallback retained).
+The NaN roundtrip test added in Scope step 5 is the primary regression guard.
+
+==== Acceptance
+
+* `grep -n "str(dict" src/spreadsheet_handling/rendering/flow.py
+  src/spreadsheet_handling/rendering/composer/layout_composer.py
+  src/spreadsheet_handling/rendering/passes/__init__.py` returns no matches at the
+  three write sites.
+* `grep -n 'json.dumps' src/spreadsheet_handling/rendering/` returns ≥3 matches at
+  those sites.
+* Roundtrip integration test with `float('nan')` meta value passes.
+* `docs/human_info/adr/ADR-META-BLOB-SERIALIZATION.adoc` exists and references IR-008
+  and A-004.
+* Full test suite passes.
