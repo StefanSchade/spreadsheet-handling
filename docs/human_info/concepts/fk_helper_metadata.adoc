@@ -1,0 +1,159 @@
+[[concept-fk-helper-metadata]]
+== FK Helper Metadata
+
+_Helper columns are redundant, spreadsheet-only columns that materialize fields
+from a referenced table next to a foreign-key column; they make editing easier
+but must not become normal payload in the normalized repository form._
+
+Status: working concept for the next small helper-column slices. It is *not* a
+full metadata model. Some of the metadata shapes below ("target-side helper
+capability", first-class persisted helper provenance) are the *direction*, not
+yet the current implementation. Related backlog: `FTR-DOMAIN-CONSOLIDATION`
+(the FK-helper domain extraction) and the consolidation review clusters C2
+(D-002/D-003) and C6 (IR-005).
+
+=== Why this matters
+
+Helper columns sit between two concerns — spreadsheet usability and
+normalized, roundtrip-safe data. They are neither pure rendering decoration nor
+ordinary domain payload, and treating them as either causes drift: on the second
+or third roundtrip, a workbook whose helper columns were materialized by
+heuristics (and not persisted) can be interpreted differently because the
+carrier state changed. The fix is to make the distinction explicit.
+
+This concept uses the vocabulary of
+<<concept-metadata-canonical-vs-derived,Canonical vs. Derived Metadata>>: here
+`derived` does not mean "freshly computed this run" — it means "describing the
+current materialized workbook state rather than stable model intent".
+
+=== Running example
+
+The `desks` table contains a foreign-key column `id_(employees)` pointing to
+`employees.id`. The spreadsheet-facing `desks` sheet may then also show helper
+columns such as `_employees_first_name`, `_employees_last_name`,
+`_employees_birth_date`. These help a human editing `desks`, but they are
+redundant and should not survive into the normalized form unchanged.
+
+=== Two questions that must not be mixed
+
+. *What may be used as helper source data?* — this belongs to the **target
+  table** (`employees` in the example): which column is its PK, which columns
+  may be exposed as helper fields, which fields are the defaults if no
+  FK-specific override is given. This is *canonical* helper intent.
+. *Which concrete columns on the current sheet are helper columns?* — this
+  belongs to the **table containing the FK** (`desks`): `_employees_first_name`
+  is a helper column, it belongs to FK column `id_(employees)`, it points to
+  target `employees`, it materializes source field `first_name`. This is
+  *derived* operational metadata, not canonical sheet intent.
+
+=== Minimal metadata shapes
+
+Target-side helper capability (canonical):
+
+[source,yaml]
+----
+sheets:
+  employees:
+    fk_helpers:
+      available_fields: [first_name, last_name, birth_date]
+      default_fields: [first_name, last_name]
+----
+
+Derived operational helper columns on the FK sheet:
+
+[source,yaml]
+----
+_meta:
+  derived:
+    sheets:
+      desks:
+        helper_columns:
+          - column: _employees_first_name
+            fk_column: id_(employees)
+            target: employees
+            value_field: first_name
+          - column: _employees_last_name
+            fk_column: id_(employees)
+            target: employees
+            value_field: last_name
+----
+
+The important point: the derived shape lives under the `_meta` carrier in a
+*derived* namespace, not under canonical sheet intent such as `_meta["sheets"]`.
+The canonical `fk_helpers` shape under `_meta["sheets"][...]` is the *direction*
+and is not fully implemented today.
+
+=== What is true today, and what is not
+
+Already true: helper enrichment and cleanup exist as real pipeline steps;
+multiple helper columns per FK are supported; helper-field order is configurable
+and stable; there is step-specific precedence in helper-field resolution; and
+`bootstrap_meta` has its own precedence model.
+
+Not yet true: helper cleanup is not yet driven by first-class persisted
+helper-column metadata; helper identification still depends mainly on prefixes
+and naming conventions; helper provenance is not yet a durable explicit
+structure in working metadata; sheet rename and helper-column rename are not
+supported operations.
+
+Current behaviour (operational path): `add_fk_helpers` detects FK columns and
+adds helper columns; helper-field selection is driven by step defaults
+(`helper_fields_by_fk`, `helper_fields_by_target` by normalized sheet key, then
+by original sheet name, `helper_fields`, `label_field` as legacy fallback);
+`remove_fk_helpers` removes helper columns by prefix; validation and styling
+rely on helper prefixes and materialized column names. `bootstrap_meta` is part
+of the broader workbook-metadata direction (precedence: `profile_defaults` →
+persisted metadata → `cli_overrides`) but is *not yet* the active source of
+helper-field resolution inside `add_fk_helpers`.
+
+=== Precedence is per step
+
+There is no single universal precedence ladder. `add_fk_helpers` resolves from
+its own step defaults; `bootstrap_meta` has its own model. A blanket statement
+like "user input always wins" would be too crude and is already false for some
+cases. The most useful *general* guardrail: heuristics may fill gaps, but
+heuristics must not silently contradict existing metadata.
+
+=== Naming conventions: two different jobs
+
+* *FK naming* (`id_(employees)`) helps the system detect that a column is
+  intended as a foreign key.
+* *Helper naming* (`_employees_first_name`) helps distinguish derived helper
+  columns from ordinary payload and helps cleanup avoid collisions.
+
+Both are conventions, but they solve different problems and should not be merged
+into one vague rule. Neither is the final model; both are practical detection
+aids for the current phase.
+
+=== First conservative policy
+
+For the next slice a restrictive contract is acceptable: helper columns present
+redundant information for easier editing; manual edits to helper *values* are
+not treated as source truth; helper values may be ignored or overwritten on
+re-enrichment; renaming helper columns is unsupported; renaming relevant sheets
+is unsupported. Not great UX, but a feasible first contract.
+
+Cleanup direction: `remove_fk_helpers` removing by prefix is good enough for
+now but is the main conceptual weakness; longer term, cleanup should trust
+explicit helper-column metadata first and keep prefixes as fallback aids.
+
+=== How it connects
+
+* Vocabulary: <<concept-metadata-canonical-vs-derived,Canonical vs. Derived
+  Metadata>>.
+* The transposed form of "helper fields on an axis" appears in
+  <<concept-crosstab-binary-xref,Crosstab for Editing Binary Cross
+  References>> (row/column label helpers).
+* Code: `add_fk_helpers`, `remove_fk_helpers`, `bootstrap_meta` (currently in
+  `pipeline/steps.py` delegating to `domain/transformations/fk_helpers.py`);
+  the FK naming convention currently lives in `core/fk.py` (`FK_PATTERN`), which
+  the consolidation review (D-002/C2) recommends moving into `domain/fk/`.
+
+=== Further reading
+
+* `docs/ai_info/concepts_fk_helpers.adoc` — agent-facing rules and the derived
+  `helper_columns` shape
+* `docs/internal_guide/architecture/ARCH-LAYERS.adoc` — the FK-helper layer
+  trace
+* `docs/internal_guide/code_review/review-consolidation.adoc` — D-002, D-003,
+  IR-005, IR-011 and clusters C2/C6

@@ -1,0 +1,124 @@
+[[concept-pipeline-step-registration]]
+== Pipeline Step Registration
+
+_How YAML step names should map to executable pipeline steps without letting the
+`pipeline` package accumulate feature-specific binding code: keep a
+factory-based registry as the extension point, and add a generic binding path
+for ordinary domain-addressable steps._
+
+Status: *transitional* working concept for an in-flight normalization slice —
+not a full workflow-engine design. The "first migration candidates" list and the
+relationship to the FK-helper domain extraction live in the backlog —
+see `docs/general_info/backlog/REVIEW-roundtrip-and-step-registration-transitional-notes.adoc`
+and `docs/general_info/backlog/FTR-DOMAIN-CONSOLIDATION.adoc`. Related
+consolidation-review findings: IR-007, IR-011 (cluster C2/C5).
+
+=== Why this matters
+
+The architecture already says `pipeline` should stay a linear sequencing and
+transport layer, and that is mostly true in `run_pipeline()`. The weak point is
+one layer earlier — step registration, config binding, step construction. Today
+the registry mainly maps YAML step names to bespoke `make_*_step()` factories;
+because no generic binding path exists, every step that needs to reach a domain
+function either embeds the call inline or builds its own wrapper. So
+feature-specific business logic accumulates in `pipeline` not by design but by
+default — there is no better place yet. That is the root cause of two visible
+problems: `pipeline.steps` contains factories that thematically belong in
+domain, and some of those factories have grown fat with domain logic precisely
+because the generic delegation path was missing.
+
+=== Deliberate simplicity
+
+This concept does *not* introduce routing, branching, or process-engine
+behaviour. The intended model stays: YAML declares a linear sequence of steps;
+the orchestrator builds a list of bound steps; `run_pipeline()` executes them in
+order. If orchestration-level routing metadata is ever added later, it must be a
+separate explicit control channel — it must not arise by letting the pipeline
+inspect workbook payload or `_meta`.
+
+=== What stays true
+
+The registry stays factory-based — that keeps open the option that future step
+kinds may need different binding behaviour. So this concept does *not* say
+"remove factories" or "force every step into one permanent callable signature".
+It says: keep factories as the extension point, and add a more generic *normal
+path* for ordinary domain-addressable steps:
+
+----
+YAML step name → registry registration → generic binding factory → domain target callable → BoundStep
+----
+
+In that model a registry entry can carry both the factory to use and the
+intended domain target to bind. A minimal registration descriptor along these
+lines:
+
+[source,python]
+----
+@dataclass(frozen=True)
+class StepRegistration:
+    factory: Callable[..., BoundStep]
+    target: str | Callable[..., Any] | None = None
+----
+
+Exact field names matter less than the role split: `factory` defines how a step
+is bound; `target` identifies the underlying domain callable when the step
+follows the generic path.
+
+=== Supported shapes in the next slice
+
+The next slice only needs a solid generic path for the common step forms already
+present: builder-style domain callables `(...config) -> Step`, and frames-first
+domain callables `(frames, **config) -> Frames`. Special step kinds may stay
+explicit for now: plugin steps, validation/reporting steps, and helper-heavy
+legacy steps that still need separate extraction work.
+
+=== The migration criterion: thematic ownership, not line count
+
+A step is a migration candidate because it is thematically domain behaviour that
+happens to live in the pipeline package today — not because it is short. Fat
+factories such as `add_fk_helpers` / `remove_fk_helpers` are thematically wrong
+in `pipeline` too, but extracting them requires first moving their domain logic
+out (that is the job of the FK-helper domain extraction; once done, those
+factories can use the generic path like any other). Keeping a fat factory in
+`pipeline` intentionally requires a positive justification — the absence of a
+better place is not a justification.
+
+Extraction path for a fat factory (mechanical):
+
+. move the domain logic into a focused domain function;
+. let the factory become a thin delegate that binds config and calls that
+  function;
+. if the resulting thin factory fits the generic path, register it that way.
+
+Whether the newly extracted domain function itself needs algorithmic cleanup is
+a separate question for a separate ticket.
+
+=== Concrete example
+
+`flatten_headers` is a migration candidate not because it is short but because
+it is thematically domain behaviour that currently lives in the pipeline
+package. In the consolidation review, IR-007 also flags that the corresponding
+`make_flatten_headers_step` / `make_unflatten_headers_step` factories are
+currently dead (not in `REGISTRY`, not public), and IR-011 flags that several FK
+step factory names diverge from their registry keys — both are natural to fix in
+the same normalization slice.
+
+=== How it connects
+
+* `docs/ai_info/architecture_primer.adoc` — § "Where new code belongs" (a new
+  step must also be registered in
+  `docs/internal_guide/architecture/pipeline_step_registry.json`, and any
+  read/written meta root must be registered in
+  `docs/internal_guide/architecture/meta_registry.yaml`).
+* <<concept-fk-helper-metadata,FK Helper Metadata>> — the fat-factory case that
+  drives the extraction.
+* `docs/internal_guide/architecture/pipeline_semantics.adoc` — step categories
+  and config contracts.
+* Code: `pipeline/registry.py`, `pipeline/steps.py`, `pipeline/types.py`,
+  `pipeline/runner.py`.
+
+=== Further reading
+
+* `docs/internal_guide/code_review/review-consolidation.adoc` — IR-007, IR-010,
+  IR-011, IR-012 and clusters C2/C5
+* `docs/general_info/backlog/FTR-DOMAIN-CONSOLIDATION.adoc`

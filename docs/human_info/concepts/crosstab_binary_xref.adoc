@@ -1,0 +1,161 @@
+[[concept-crosstab-binary-xref]]
+== Crosstab for Editing Binary Cross References
+
+_The first concrete slice of the compact-transform chain: edit a binary relation
+between two entity sets as a matrix (`X` or empty cells), while the repository
+form stays a normalized PK-pair link table._
+
+Status: first slice — intentionally narrow. It is the binary specialization of
+the generic `XREF-CROSSTABLE` step described in
+<<concept-compact-transforms,Compact Transforms>>. Related backlog:
+`FTR-COMPACT-XREF-USE-CASE-SLICE-P4A2`, `FTR-XREF-AXIS-MAPPINGS-P4A2`. The
+hands-on companion walkthrough is
+`docs/internal_guide/concepts/by_use_case/helper_columns.adoc`.
+
+=== Why this matters
+
+A normalized link table (PK pairs only) is the right storage form, but a human
+maintaining "which feature is available in which market" wants a grid, not a
+list of pairs. This slice gives a *safe* first version of that grid: a strict,
+fail-fast contract that proves the matrix ⇄ relation transform without
+overdesigning a broader metadata system.
+
+=== Generic base vs. binary first slice
+
+This use case sits on top of a more generic transform — `matrix → relation`
+and `relation → matrix` — that operates on row identity, column identity, and
+cell values *without* binary semantics. The binary `X`-or-empty behaviour
+belongs only to this first specialization; the base abstraction must not
+hardcode it, because later stages need the same matrix machinery for
+value-bearing relations and for `COMPACT-MULTIAXIS`. The slice uses the existing
+vocabulary `expand_xref` (relation → matrix) and `contract_xref` (matrix →
+relation).
+
+=== Concrete example
+
+Three tables — two master tables and one normalized link table:
+
+[source,json]
+----
+// features (master, PK feature_id)
+[ {"feature_id": "f1", "product": "server app",      "feature": "sap bridge"},
+  {"feature_id": "f2", "product": "server app",      "feature": "containerized deployment"},
+  {"feature_id": "f3", "product": "web application", "feature": "admin console"} ]
+
+// markets (master, PK market_id)
+[ {"market_id": "m1", "region": "EMEA",    "country": "Belgium"},
+  {"market_id": "m2", "region": "EMEA",    "country": "France"},
+  {"market_id": "m3", "region": "Pacific", "country": "Indonesia"} ]
+
+// feature_market_links (link table — PK pairs only, no embedded business objects)
+[ {"feature_id": "f1", "market_id": "m1"},
+  {"feature_id": "f1", "market_id": "m2"},
+  {"feature_id": "f3", "market_id": "m3"} ]
+----
+
+Minimal config shape:
+
+[source,yaml]
+----
+xref:
+  row_source: features
+  row_pk: feature_id
+  row_label_fields: [product, feature]
+  column_source: markets
+  column_pk: market_id
+  column_label_fields: [region, country]
+  link_table: feature_market_links
+  marker: "X"
+----
+
+=== Axis identity vs. axis labels
+
+Axis *identity* comes from the primary keys of the two master tables — row
+identity from `features.feature_id`, column identity from `markets.market_id`.
+*Display labels* are derived from selected helper fields (e.g. row label from
+`product` + `feature`, column label from `region` + `country`) and are *not* the
+identity. In the first slice visible labels must be unique on their axis; if the
+selected helper fields do not yield unique labels, the transform fails rather
+than repairing them. Flattened multi-field labels (`EMEA.Belgium`) are a display
+convention only — the separator is not identity-bearing, helper values may
+themselves contain it, and labels must never be parsed during reimport.
+
+Reimport relies on persisted axis-identity mappings, not on visible strings:
+
+[source,yaml]
+----
+_meta:
+  xref_maps:
+    feature_market_links:
+      row_pks: [f1, f2, f3]      # data row index 0 → f1, ...
+      column_pks: [m1, m2, m3]   # data column index 0 → m1, ...
+----
+
+Forbidden in the first slice: parsing labels such as `EMEA.Belgium`,
+reconstructing identity from flattened display strings, treating visible helper
+labels as hidden PK surrogates.
+
+=== Cell value contract
+
+Accepted: exact `X`, or an empty cell. Rejected (import fails): `x`, `X ` (with
+trailing space), whitespace-only content, `1`, `true`, checkmarks, other
+symbols. The importer must not normalize, trim, or reinterpret cell values in
+the first slice. An empty cell has exactly one technical meaning — *no relation
+exists*; whatever it means in the user's head ("not yet maintained",
+"forgotten") is irrelevant to import.
+
+=== Input contract
+
+Users may edit cell contents only — not create new rows or columns directly in
+the matrix. New features are created in the `features` table; new markets in the
+`markets` table. The master tables remain the source of truth for axis identity
+and helper content; the matrix is only the compact editing view for the relation
+itself.
+
+=== Roundtrip
+
+. read `features`, `markets`, `feature_market_links`;
+. `expand_xref` → render the crosstab; persist row/column PK mappings in hidden
+  metadata;
+. user edits `X` / empty cells;
+. read the matrix together with the persisted axis mappings; `contract_xref` →
+  normalized PK pairs;
+. write a new `feature_market_links` table.
+
+=== Validation and error policy — fail fast
+
+Failure cases: a link row references a missing PK; the link table contains the
+same PK pair more than once; visible row labels are not unique; visible column
+labels are not unique; a matrix cell contains any non-empty value other than
+exact `X`. For the first safe contract, fail-fast is preferred over tolerant
+repair.
+
+=== Later expansion stages (not in the first slice)
+
+* *Stage 2 — Codec + Legend*: a cell encodes a tuple instead of presence/
+  absence (`feature × market → availability_type`); the legend becomes part of
+  the contract, not just a note.
+* *Stage 3 — Multi-axis compact view*: several relations on the same axes are
+  stacked into one compact matrix; the repository form may then hold several
+  triple tables. This is the `XREF-CROSSTABLE → COMPACT-MULTIAXIS` path.
+
+Non-goals of the first slice: tuple codec in the cell, editable legend, stacked
+relations, direct creation of row/column entities inside the matrix, multi-row
+spreadsheet headers, tolerant auto-repair of inconsistent labels or links.
+
+=== How it connects
+
+* <<concept-compact-transforms,Compact Transforms>> — the generic family this
+  is the first slice of.
+* <<concept-fk-helper-metadata,FK Helper Metadata>> — row/column label helpers
+  are the transposed form of FK helper columns.
+* <<concept-sparse-relation-dense-axis,Sparse Relation / Dense Axis
+  Reconstruction>> — why the matrix shape must not be reconstructed from
+  visible labels.
+* Code: `domain/transformations/xref_crosstable.py`.
+
+=== Further reading
+
+* `docs/internal_guide/concepts/by_use_case/helper_columns.adoc` — hands-on
+  walkthrough
+* `docs/internal_guide/architecture/spreadsheet_meta_semantics.adoc`
