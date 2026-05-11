@@ -305,7 +305,7 @@ def test_pipeline_runner_and_registry_stay_out_of_payload_semantics():
         "['helper_columns']",
     )
     checked_modules = [
-        PIPELINE_ROOT / "pipeline.py",
+        PIPELINE_ROOT / "runner.py",
         PIPELINE_ROOT / "registry.py",
     ]
 

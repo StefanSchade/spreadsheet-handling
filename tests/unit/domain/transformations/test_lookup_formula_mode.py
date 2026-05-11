@@ -341,7 +341,8 @@ class TestEndToEndFormulaEnrichment:
 
         wb = load_workbook(out)
         ws = wb["Matrix"]
-        cell = ws.cell(row=2, column=2)
+        # Matrix columns: variable_id (1), P-001 (2), label_de helper (3)
+        cell = ws.cell(row=2, column=3)
         formula_text = str(cell.value)
         assert "XLOOKUP" in formula_text
         # Formula should reference 'Entities' (physical sheet name), not 'variables'

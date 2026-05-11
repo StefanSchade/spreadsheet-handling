@@ -316,7 +316,8 @@ def _execute_render_op(
     if isinstance(op, SetSheetProtection):
         ws = _get_ws(wb, op.sheet)
         ws.protection.sheet = True
-        ws.protection.password = op.password
+        if op.password is not None:
+            ws.protection.password = op.password
         return
 
     if isinstance(op, ApplyCellLock):

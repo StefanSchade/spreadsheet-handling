@@ -77,6 +77,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "helper_prefix": ("meta_canonical", "canonical_meta"),
         "helper_columns": ("meta_canonical", "canonical_meta"),
         "helper_policies": ("meta_canonical", "canonical_meta"),
+        "protection": ("meta_canonical", "canonical_meta"),
         "frame_lifecycle": ("meta_canonical", "canonical_meta"),
         "workbook_view": ("meta_canonical", "canonical_meta"),
         "constraints": ("meta_canonical", "canonical_meta"),
