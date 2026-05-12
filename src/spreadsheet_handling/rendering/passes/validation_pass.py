@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-from ..formulas import list_literal_formula
+from spreadsheet_handling.core.formulas import list_literal_formula
 from ..ir import DataValidationSpec
 from ..ir import WorkbookIR, SheetIR, TableBlock
 

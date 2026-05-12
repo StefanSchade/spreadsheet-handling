@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from spreadsheet_handling.rendering.formulas import (
+from spreadsheet_handling.core.formulas import (
     ListLiteralFormulaSpec,
     LookupFormulaSpec,
     formula_list_values,

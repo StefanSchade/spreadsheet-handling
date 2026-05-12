@@ -18,6 +18,7 @@ pytestmark = [
     pytest.mark.ftr("FTR-SPREADSHEET-BOUNDARY-GUARDS-P3I"),
     pytest.mark.ftr("FTR-ARCHITECTURE-FITNESS-GUARDS-P4X"),
     pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3"),
+    pytest.mark.ftr("FTR-REVIEW-001-FORMULAS-CORE-MOVE-P3"),
 ]
 
 
@@ -281,6 +282,19 @@ def test_domain_modules_do_not_import_pipeline_layer():
 
     for module_path in _package_modules(DOMAIN_ROOT):
         _assert_no_import_prefixes(module_path, forbidden_prefixes=forbidden_prefixes)
+
+
+def test_domain_modules_do_not_import_rendering_or_io_backends():
+    forbidden_prefixes = (
+        "rendering",
+        "io_backends",
+        "spreadsheet_handling.rendering",
+        "spreadsheet_handling.io_backends",
+    )
+
+    for root in (DOMAIN_ROOT, CORE_ROOT):
+        for module_path in _package_modules(root):
+            _assert_no_import_prefixes(module_path, forbidden_prefixes=forbidden_prefixes)
 
 
 def test_core_modules_remain_leaf_only():

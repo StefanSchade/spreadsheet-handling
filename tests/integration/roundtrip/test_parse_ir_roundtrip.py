@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from pathlib import Path
 
-from spreadsheet_handling.rendering.formulas import formula_list_values
+from spreadsheet_handling.core.formulas import formula_list_values
 from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 

@@ -16,7 +16,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
-from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
+from spreadsheet_handling.core.formulas import LookupFormulaSpec
 
 pytestmark = pytest.mark.ftr("FTR-LOOKUP-HELPER-FORMULA-MODE-P4A")
 
@@ -78,6 +78,22 @@ class TestFormulaMode:
             cell = df[field].iloc[0]
             assert isinstance(cell, LookupFormulaSpec)
             assert cell.lookup_value_column == field
+
+    @pytest.mark.ftr("FTR-REVIEW-001-FORMULAS-CORE-MOVE-P3")
+    def test_formula_mode_rejects_fail_missing_mode(self) -> None:
+        frames = _frames()
+
+        with pytest.raises(ValueError, match="missing='fail'"):
+            enrich_lookup(
+                frames,
+                source="matrix_raw",
+                lookup="variables",
+                output="matrix",
+                key="variable_id",
+                helpers={"fields": ["label_de"]},
+                missing="fail",
+                helper_value_mode="formula",
+            )
 
     def test_value_mode_remains_default(self) -> None:
         frames = _frames()

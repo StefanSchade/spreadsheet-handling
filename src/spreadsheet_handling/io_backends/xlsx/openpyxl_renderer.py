@@ -30,8 +30,8 @@ from spreadsheet_handling.rendering.plan import (
     SetSheetProtection,
     ApplyCellLock,
 )
-from spreadsheet_handling.rendering.formulas import FormulaSpec, ListLiteralFormulaSpec
-from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
+from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
+from spreadsheet_handling.core.formulas import LookupFormulaSpec
 
 
 # --------------------------------------------------------------------------------------

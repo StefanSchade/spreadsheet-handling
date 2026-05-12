@@ -19,7 +19,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import (
     parse_workbook as parse_xlsx_workbook,
 )
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
-from spreadsheet_handling.rendering.formulas import FormulaSpec, formula_list_values
+from spreadsheet_handling.core.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
 from spreadsheet_handling.domain.workbook_views import configure_workbook_view

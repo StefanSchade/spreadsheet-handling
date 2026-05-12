@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Union, Iterable
 
-from .formulas import FormulaSpec
+from spreadsheet_handling.core.formulas import FormulaSpec
 
 # ----- Render Operations -----
 

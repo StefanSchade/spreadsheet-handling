@@ -13,7 +13,7 @@ from spreadsheet_handling.domain.frame_lifecycle import (
     mark_source_if_unclassified,
     write_frame_lifecycle,
 )
-from spreadsheet_handling.rendering.formulas import lookup_formula
+from spreadsheet_handling.core.formulas import lookup_formula
 
 Frames = dict[str, Any]
 
@@ -475,16 +475,20 @@ def _build_formula_enrichment(
     missing_mode: str,
 ) -> pd.DataFrame:
     """Build an enriched frame with LookupFormulaSpec objects as cell values."""
+    if missing_mode == "fail":
+        raise ValueError(
+            "missing='fail' cannot be enforced with helper_value_mode='formula'; "
+            "use missing='empty' or value mode"
+        )
     enriched = source_df.copy()
     source_key = join_keys[0]
-    missing = "" if missing_mode == "empty" else ""
     for field in fields:
         formula = lookup_formula(
             source_key_column=source_key,
             lookup_sheet=lookup,
             lookup_key_column=source_key,
             lookup_value_column=field,
-            missing=missing,
+            missing="",
         )
         enriched[field] = [formula for _ in range(len(enriched))]
     return enriched

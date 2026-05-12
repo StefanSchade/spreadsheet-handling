@@ -10,7 +10,7 @@ from spreadsheet_handling.rendering.composer.layout_composer import compose_work
 from spreadsheet_handling.rendering.passes.core import ValidationPass
 from spreadsheet_handling.rendering.passes import apply_all
 from spreadsheet_handling.rendering.flow import build_render_plan
-from spreadsheet_handling.rendering.formulas import formula_list_values
+from spreadsheet_handling.core.formulas import formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR, WorkbookIR
 
 pytestmark = pytest.mark.ftr("FTR-VALIDATION-PASS-INFRA")

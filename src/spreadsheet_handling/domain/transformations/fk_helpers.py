@@ -17,7 +17,7 @@ from ...core.fk import (
     apply_fk_helpers as _apply_fk_helpers,
 )
 from ...frame_keys import copy_reserved_frames, iter_data_frames
-from ...rendering.formulas import lookup_formula
+from spreadsheet_handling.core.formulas import lookup_formula
 
 Frames = dict[str, Any]
 

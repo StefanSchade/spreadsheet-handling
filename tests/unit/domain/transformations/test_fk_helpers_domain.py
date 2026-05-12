@@ -13,7 +13,7 @@ from spreadsheet_handling.domain.transformations.fk_helpers import (
     enrich_helpers,
     drop_helpers,
 )
-from spreadsheet_handling.rendering.formulas import LookupFormulaSpec
+from spreadsheet_handling.core.formulas import LookupFormulaSpec
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-DOMAIN-EXTRACTION")
 

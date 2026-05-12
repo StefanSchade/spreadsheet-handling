@@ -34,7 +34,7 @@ from spreadsheet_handling.rendering.ir import (
     SheetIR,
     WorkbookIR,
 )
-from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
+from spreadsheet_handling.core.formulas import ListLiteralFormulaSpec
 
 
 def _column_index(letters: str) -> int:

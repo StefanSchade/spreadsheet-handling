@@ -14,7 +14,7 @@ import pytest
 from spreadsheet_handling.io_backends import make_backend
 from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook
 from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
-from spreadsheet_handling.rendering.formulas import formula_list_values
+from spreadsheet_handling.core.formulas import formula_list_values
 
 
 pytestmark = pytest.mark.ftr("FTR-ODS-CALC-ADAPTER-IMPLEMENTATION-P3J")

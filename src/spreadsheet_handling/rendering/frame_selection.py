@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from spreadsheet_handling.rendering.formulas import LookupFormulaSpec, lookup_formula
+from spreadsheet_handling.core.formulas import LookupFormulaSpec, lookup_formula
 
 RESERVED_FRAME_KEYS = {"_meta"}
 DEFAULT_OMIT_ROLES = {"intermediate", "redundant", "system"}

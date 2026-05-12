@@ -11,7 +11,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import (
     _xlsx_validation_formula,
     render_workbook,
 )
-from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec, lookup_formula
+from spreadsheet_handling.core.formulas import ListLiteralFormulaSpec, lookup_formula
 from spreadsheet_handling.rendering.plan import DefineSheet, RenderPlan, SetHeader, WriteDataBlock
 
 

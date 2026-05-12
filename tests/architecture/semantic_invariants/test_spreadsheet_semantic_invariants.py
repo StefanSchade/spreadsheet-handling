@@ -19,7 +19,7 @@ from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
-from spreadsheet_handling.rendering.formulas import ListLiteralFormulaSpec
+from spreadsheet_handling.core.formulas import ListLiteralFormulaSpec
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
 from spreadsheet_handling.rendering.plan import (
     AddValidation,

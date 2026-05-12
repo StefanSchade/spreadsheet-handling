@@ -6,7 +6,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol, Dict, Any, List, Optional
-from ..formulas import list_literal_formula
+from spreadsheet_handling.core.formulas import list_literal_formula
 from ..ir import WorkbookIR, SheetIR, TableBlock, DataValidationSpec, NamedRange
 
 log = logging.getLogger("sheets.validation")
