@@ -1,0 +1,223 @@
+= Review: FTR-REVIEW-001-META-BLOB-JSON-P3
+:date: 2026-05-12
+:reviewer: Claude Sonnet 4.6
+:commit: bd27b57
+:status: complete
+
+== Verdict
+
+*Pass with minor notes.* No blockers; one important note; three minor notes.
+
+---
+
+== Scope
+
+Reviewed commit `bd27b57` (14 files, +173/−13). All 21 affected tests pass.
+
+---
+
+== Did the implementation find all write paths?
+
+*Partially.* The FTR identified three write sites in the rendering layer — all three
+are fixed. However, a fourth write site exists and was not addressed:
+
+`src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:179` —
+`_store_workbook_meta` (called from `parse_workbook` when `width_meta_changed`):
+
+[source,python]
+----
+meta_sheet.meta["workbook_meta_blob"] = json.dumps(workbook_meta)
+----
+
+This site:
+* was pre-existing before this commit (introduced with the column-width parser feature);
+* uses `json.dumps(workbook_meta)` *without* the canonical kwargs
+  (`ensure_ascii=False, sort_keys=True, separators=(",", ":")`) used by all
+  three fixed write sites;
+* is in the parser direction (XLSX → IR, not IR → XLSX), and runs only when
+  parsed column widths are merged into embedded meta (`width_meta_changed=True`);
+* the blob it stores in the IR eventually flows through `build_render_plan` →
+  `_dump_workbook_meta_blob`, which re-parses and re-serializes with the
+  canonical kwargs — so final XLSX output is canonical regardless.
+
+The FTR's "Current State" claim — *"The three write sites are the only callers
+that produce `workbook_meta_blob` content"* — is therefore incorrect.
+
+The functional impact is low (final output is canonical), but the inconsistency
+is real and should be addressed before C2/FK consolidation adds more parsing
+paths. See Important findings below.
+
+---
+
+== Are new writes deterministic JSON, not Python `repr` / literal strings?
+
+Yes, at all three targeted write sites. `grep -n "str(dict"` returns no matches
+at the three rendering locations. The `sort_keys=True` flag ensures
+deterministic key order; `separators=(",", ":")` removes whitespace.
+
+---
+
+== Is the read path JSON-first?
+
+Yes, at all four read locations:
+
+* `openpyxl_parser.py::_read_meta_sheet` — JSON → ast fallback ✅
+* `odf_parser.py::_read_meta_payload` — JSON → ast fallback ✅
+* `rendering/passes/core.py::_workbook_meta` — JSON → ast fallback ✅ (new)
+* `rendering/workbook_projection.py::workbookir_to_frames` — JSON → ast fallback ✅ (updated)
+
+---
+
+== Is `ast.literal_eval` retained only as legacy fallback?
+
+Yes. In all four read paths, `ast.literal_eval` is in a second `try/except` block
+reached only after `json.loads` fails. All legacy fallback sites are annotated
+with `# legacy: pre-JSON repr format`. `TypeError` is now included in both
+except clauses (consistent, prevents unexpected propagation from type coercion).
+
+---
+
+== Does invalid/corrupt blob handling remain safe?
+
+Yes. In `_workbook_meta` (core.py), if both `json.loads` and `ast.literal_eval`
+fail, the function returns `{}` (empty dict), not an exception. The same pattern
+holds in all read paths.
+
+One clarification: the FTR stated that the old behavior "silently coerces `'nan'`
+to string `'nan'`." The actual old failure mode was different: `str(dict(...nan...))`
+produced `"{'key': nan}"` → `json.loads` fails (single quotes, not valid JSON) →
+`ast.literal_eval("{'key': nan}")` fails (bare `nan` is not a Python literal) →
+the entire blob was silently dropped and `{}` returned, losing all meta. The
+description in the FTR is slightly inaccurate but the fix is correct regardless.
+
+---
+
+== Are roundtrip semantics unchanged except for carrier encoding?
+
+Yes. The canonical `_meta` key structure is unchanged. The only observable
+difference for a caller is that `ir.hidden_sheets["_meta"].meta["workbook_meta_blob"]`
+is now a JSON *string* instead of a dict; `workbookir_to_frames` and
+`_workbook_meta` correctly deserialize it. The existing
+`test_validation_formula_intent_is_structural_not_backend_syntax` was updated
+to call `json.loads(workbook_meta_blob)["constraints"]…` — correct.
+
+---
+
+== NaN carrier encoding
+
+`json.dumps(float("nan"))` produces bare `NaN` (not quoted), which is technically
+non-standard JSON but is accepted by Python's `json.loads` (both use `allow_nan=True`
+by default). The ADR acknowledges this: *"Python's JSON reader/writer remains
+responsible for existing numeric semantics such as NaN."* The test
+`test_workbook_meta_blob_roundtrips_nan_and_nested_dict` confirms the roundtrip
+works. This is an acceptable trade-off for Python-to-Python roundtrips; a strict
+JSON validator would reject the blob.
+
+---
+
+== Test coverage
+
+[cols="1,1,2"]
+|===
+|Scenario |Covered |Notes
+
+|JSON blob written to XLSX cell
+|✅ `test_workbook_meta_blob_is_written_as_json`
+|Opens raw XLSX with openpyxl; checks `"'version'" not in blob`.
+
+|JSON readback
+|✅ same test + roundtrip tests
+|`json.loads(blob) == _SAMPLE_META` asserted.
+
+|Legacy Python-literal blob readback
+|✅ `test_legacy_python_literal_meta_blob_is_still_read`
+|Writes a raw XLSX with single-quote repr blob; confirms it reads back correctly.
+
+|NaN + nested dict roundtrip
+|✅ `test_workbook_meta_blob_roundtrips_nan_and_nested_dict`
+|Asserts `math.isnan(meta["metrics"]["missing"])` after full write → read cycle.
+
+|Malformed / corrupt blob
+|❌ Not tested
+|Current behavior: silently returns `{}`. No test verifies this is stable.
+
+|ODS roundtrip
+|❌ Not tested
+|ODS parser fallback was also touched; no ODS-specific integration test.
+|===
+
+---
+
+== ADR: accurate and not overclaiming?
+
+Yes — the ADR is accurate and well-scoped. It does not introduce a meta model
+or schema. One understatement: bare `NaN` in the JSON carrier is technically
+non-standard JSON (a Python extension), but the ADR's framing ("Python's JSON
+reader/writer remains responsible") covers this without overclaiming.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+*`_store_workbook_meta` (openpyxl_parser.py:179) uses non-canonical
+`json.dumps`.*
+
+`json.dumps(workbook_meta)` without `ensure_ascii=False, sort_keys=True,
+separators=(",", ":")` produces non-deterministic key order and includes
+whitespace. While the final XLSX output is canonical (because
+`_dump_workbook_meta_blob` normalizes it), the intermediate IR blob is
+inconsistent with the three fixed write sites. The FTR's "Current State"
+correctly did not list this site, but the "only three callers" statement is
+now on record as inaccurate.
+
+*Recommended fix* — apply canonical kwargs at the write site:
+
+[source,python]
+----
+# openpyxl_parser.py:179
+meta_sheet.meta["workbook_meta_blob"] = json.dumps(
+    workbook_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+)
+----
+
+This does not change any test outcomes (the normalization in
+`_dump_workbook_meta_blob` already absorbs the difference) but removes the
+inconsistency before C5/parser-path work touches this file.
+
+=== Minor
+
+*1. No malformed-blob test.*
+
+The behavior when the blob is neither valid JSON nor valid Python literal is
+"return `{}`" — silently dropping meta. This is the same behavior as before
+the fix and is safe, but there is no explicit test asserting it remains stable.
+
+Recommended (optional): add a test that writes a XLSX with a garbage blob value
+and asserts that `ExcelBackend().read_multi(...)["_meta"]` is either `{}` or
+the raw kv fallback — not an exception.
+
+*2. No ODS integration roundtrip test.*
+
+The ODS parser fallback was touched (`TypeError` added to except clause);
+there is no ODS-specific test covering blob read. The XLSX tests cover the
+shared logic well, but a single ODS read test with a legacy blob would close
+the gap if ODS is an actively supported path.
+
+*3. Bare `NaN` in JSON carrier is not standard JSON.*
+
+The ADR's formulation is correct but understated. Callers who inspect the raw
+blob (as in `test_workbook_meta_blob_is_written_as_json`) and try to parse it
+with a strict JSON validator (e.g., `jq`, a non-Python client) would get a
+parse error. Recommend adding one sentence to the ADR:
+
+____
+Note: bare `NaN` is a Python-specific JSON extension and will be rejected by
+strict validators; this is acceptable because the blob is consumed exclusively
+by Python tooling.
+____
