@@ -12,7 +12,10 @@ from spreadsheet_handling.pipeline.registry import REGISTRY
 from spreadsheet_handling.pipeline.types import StepRegistration
 
 
-pytestmark = pytest.mark.ftr("FTR-PIPELINE-STEP-REGISTRY-P4")
+pytestmark = [
+    pytest.mark.ftr("FTR-PIPELINE-STEP-REGISTRY-P4"),
+    pytest.mark.ftr("FTR-REVIEW-001-META-REGISTRY-DERIVED-P3"),
+]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -223,3 +226,16 @@ def test_pipeline_step_registry_meta_contract_references_meta_registry() -> None
                             ref,
                         )
                     assert "reason" in ref and ref["reason"], (entry["name"], direction, ref)
+
+
+def test_pipeline_step_registry_derived_meta_refs_are_registered_transient_refs() -> None:
+    entries = _entries_by_name()
+
+    for entry in entries.values():
+        for direction in ("reads", "writes"):
+            for ref in entry["meta_contract"][direction]:
+                if ref["root"] != "derived":
+                    continue
+
+                assert ref["persistence"] == "transient", (entry["name"], direction, ref)
+                assert ref["registry_ref"] == "derived", (entry["name"], direction, ref)

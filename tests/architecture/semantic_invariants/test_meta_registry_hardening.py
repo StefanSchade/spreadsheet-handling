@@ -12,7 +12,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-pytestmark = pytest.mark.ftr("FTR-META-REGISTRY-HARDENING-P3I")
+pytestmark = [
+    pytest.mark.ftr("FTR-META-REGISTRY-HARDENING-P3I"),
+    pytest.mark.ftr("FTR-REVIEW-001-META-REGISTRY-DERIVED-P3"),
+]
 
 
 def _load_registry() -> dict:
@@ -96,6 +99,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "__autofilter_ref": ("meta_rendering", "read_path_hint"),
         "__legend_blocks": ("meta_rendering", "read_path_hint"),
         "_hidden": ("meta_rendering", "carrier_artifact"),
+        "derived": ("meta_rendering", "derived_operational_view"),
     }
 
     actual_profiles = {

@@ -14,6 +14,7 @@ import yaml
 pytestmark = [
     pytest.mark.ftr("FTR-META-REGISTRY-P3H"),
     pytest.mark.ftr("FTR-META-REGISTRY-HARDENING-P3I"),
+    pytest.mark.ftr("FTR-REVIEW-001-META-REGISTRY-DERIVED-P3"),
 ]
 
 
@@ -86,7 +87,24 @@ def test_meta_registry_seeds_current_known_entries():
         "__autofilter_ref",
         "__legend_blocks",
         "_hidden",
+        "derived",
     } <= names
+
+
+def test_meta_registry_registers_derived_channel_contract():
+    registry = _load_registry()
+    entries = {entry["name"]: entry for entry in registry["entries"]}
+
+    derived = entries["derived"]
+
+    assert derived["layer"] == "meta_rendering"
+    assert derived["classification"] == "derived_operational_view"
+    assert derived["lifecycle"] == "transient"
+    assert derived["producer"]
+    assert derived["consumer"]
+    assert "domain.transformations.enrich_lookup._write_provenance" in derived["producer"]
+    assert "domain.transformations.fk_helpers._write_helper_provenance" in derived["producer"]
+    assert "rendering.passes.core._derived_helper_column_names" in derived["consumer"]
 
 
 def test_meta_registry_exposes_maintenance_contract():
