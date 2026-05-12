@@ -1,0 +1,196 @@
+= Review: FTR-REVIEW-001-META-REGISTRY-DERIVED-P3
+:date: 2026-05-12
+:reviewer: Claude Sonnet 4.6
+:commit: 5756c2d
+:status: complete
+
+== Verdict
+
+*Pass with minor notes.* No blockers; one important note; two minor notes.
+
+---
+
+== Scope
+
+Reviewed commit `5756c2d` (10 files, +85/−35). No runtime code changes — only
+`meta_registry.yaml`, `pipeline_step_registry.json`, three doc files, and four
+test files touched. All 19 affected architecture tests pass.
+
+---
+
+== Did the change really close IR-005?
+
+Yes. The three parts of IR-005 are all resolved:
+
+* `meta_registry.yaml` — `derived` entry added with `layer`, `classification`,
+  `lifecycle`, `producer`, `consumer`, and full prose fields.
+* `test_meta_registry` — new `test_meta_registry_registers_derived_channel_contract`
+  asserts the entry exists and names the correct producer functions and the
+  rendering consumer.
+* `architecture_primer.adoc` — `Status: not yet registered` replaced by
+  `Status: registered`; `grep 'not yet registered' docs/ai_info/architecture_primer.adoc`
+  returns zero matches.
+* All four `Status:` markers across `concepts_fk_helpers.adoc`,
+  `fk_helper_metadata.adoc`, and `metadata_canonical_vs_derived.adoc` are
+  cleared consistently.
+
+---
+
+== Is `derived` correctly classified?
+
+Yes.
+
+* `layer: meta_rendering` — correct; the channel is written and read entirely
+  within the current pipeline run by domain transforms and rendering passes; it
+  is never persisted to XLSX output.
+* `classification: derived_operational_view` — correct; consistent with the
+  other `__style`/`__helper_cols`/`__autofilter`/`__freeze` entries that follow
+  the same pattern.
+* `lifecycle: transient` — correct; `drop_helpers` in `fk_helpers.py` (and
+  `_write_helper_provenance` itself, which prunes stale sheets) remove the key
+  before output.
+* `roundtrip_relevance: not authoritative` — correct; provenance is recomputed
+  by helper-enrichment steps on each pipeline run.
+
+The `precedence_notes` text is well-scoped and does not overclaim.
+
+---
+
+== Are meta_registry.yaml and pipeline_step_registry.json aligned?
+
+Yes, and the alignment is now enforced by a new test.
+
+All four `derived`-root entries in `pipeline_step_registry.json`
+(`add_fk_helpers` reads, `drop_helpers` reads, `drop_helpers` writes,
+`enrich_with_lookup` reads) were changed from `current_state_gap /
+registry_ref: null` to `transient / registry_ref: "derived"`. The removed
+`follow_up_ftr` and `review_condition` fields are correctly absent.
+
+The new test
+`test_pipeline_step_registry_derived_meta_refs_are_registered_transient_refs`
+iterates all steps and asserts that every `derived`-root meta-contract entry
+has `persistence == "transient"` and `registry_ref == "derived"`. This guard
+fires automatically when a new step writes to `derived` without the correct
+annotation — good forward protection.
+
+---
+
+== Did the guards become more accurate without becoming brittle?
+
+Mostly yes. The new guards are appropriate for this type of architecture test:
+
+* `test_meta_registry_registers_derived_channel_contract` pins specific private
+  function names (`_write_provenance`, `_write_helper_provenance`,
+  `_derived_helper_column_names`) via string assertions in the test. When any of
+  these is renamed in a future refactor, the test fails — intentionally forcing a
+  registry update. This is the right behavior.
+* The existing `test_meta_registry_code_references_resolve_or_are_explicitly_narrative`
+  (hardening test) validates that all named producer/consumer refs are actually
+  importable. This runs against the new `derived` entry too, confirmed passing.
+* `test_meta_registry_current_seed_profiles_stay_explicit` — the seed profile
+  dict now includes `"derived": ("meta_rendering", "derived_operational_view")`,
+  keeping the exhaustive layer/classification snapshot accurate.
+
+---
+
+== Did the change avoid runtime behavior changes?
+
+Yes. Zero changes to `src/`. No `_meta["derived"]` read or write paths were
+touched.
+
+---
+
+== Did it avoid a new meta engine / registry abstraction?
+
+Yes. The YAML entry is a plain data document. The tests use direct dict lookups,
+not a new registry API. No new abstraction was introduced.
+
+---
+
+== Any misleading documentation or overclaim?
+
+One documentation inconsistency (important):
+
+The primer now reads: "`StylePass` / `ProtectionPass` read it". The
+`_derived_helper_column_names` function is called from lines 148 and 219 of
+`rendering/passes/core.py`, inside `StylePass._process` and
+`ProtectionPass._process`. The primer statement is accurate for the current
+code. However, the *registry* consumer list only names
+`rendering.passes.core._derived_helper_column_names` (the private helper), not
+`StylePass` or `ProtectionPass`. This is correct — the registered consumer is
+the concrete function, not the pass class. No overclaim.
+
+One very minor documentation issue: the FTR acceptance criterion says `key:
+derived`, but the registry YAML field is `name: derived`. This is a terminology
+inconsistency in the FTR itself, not in the code. The test and the registry both
+use `name` consistently.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+*Sub-key distinction not captured in the registry.*
+
+The two producers write into different children of the `derived.sheets.*`
+namespace:
+
+* `enrich_lookup._write_provenance` → `derived.sheets[<sheet>]["enrich_lookup"]`
+* `fk_helpers._write_helper_provenance` → `derived.sheets[<sheet>]["helper_columns"]`
+
+The registry entry describes `scope: workbook namespace with sheet-local
+children under 'derived.sheets[<sheet>]'` but does not distinguish the two
+sub-keys. This is fine for now. The risk: when C2 (FK consolidation) touches
+`fk_helpers.py`, a refactor agent might not notice that `enrich_lookup` also
+writes to `derived.sheets` under a *different* sub-key, and may assume the
+channel is FK-only.
+
+*Recommended fix* (before C2 starts): extend the `scope` field or add an
+explicit note:
+
+[source,yaml]
+----
+scope: |
+  Workbook namespace with sheet-local children under `derived.sheets[<sheet>]`.
+  Two independent sub-keys exist:
+    - `helper_columns` — written by fk_helpers._write_helper_provenance
+    - `enrich_lookup`  — written by enrich_lookup._write_provenance
+  Consumers must treat each sub-key independently.
+----
+
+This pre-empts a silent cross-producer assumption during C2.
+
+=== Minor
+
+*1. `test_meta_registry_registers_derived_channel_contract` does not assert
+`drop_helpers` as a named consumer.*
+
+The test checks:
+
+[source,python]
+----
+assert "rendering.passes.core._derived_helper_column_names" in derived["consumer"]
+----
+
+But it does not assert `"domain.transformations.fk_helpers.drop_helpers" in derived["consumer"]`.
+The hardening test validates that the listed ref is resolvable — but does not
+guarantee `drop_helpers` remains listed if someone removes it. Low risk (the
+registry entry is obvious), but a one-line addition would complete the contract
+verification symmetrically.
+
+*Recommended fix* (optional, low priority):
+
+[source,python]
+----
+assert "domain.transformations.fk_helpers.drop_helpers" in derived["consumer"]
+----
+
+*2. FTR acceptance criterion uses `key: derived`; registry field is `name: derived`.*
+
+Cosmetic inconsistency in the FTR document. No code impact. Can be corrected in
+the FTR as a housekeeping edit or left as-is.
