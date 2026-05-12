@@ -1,7 +1,7 @@
 """Application orchestrator smoke integration slice.
 
 Runs the public orchestrator over a minimal real JSON filesystem path to guard
-the maintained pack/unpack orchestration surface.
+the maintained conversion orchestration surface.
 """
 
 from __future__ import annotations

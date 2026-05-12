@@ -1,6 +1,6 @@
 # Spreadsheet Handling
 
-**Spreadsheet Handling** is a Python toolkit for packing/unpacking and orchestrating tabular data.  
+**Spreadsheet Handling** is a Python toolkit for converting and orchestrating tabular data.  
 It converts between JSON, CSV, and Excel (XLSX/ODS) while preserving relationships such as foreign keys, indexes, and hierarchies.  
 The goal is to make complex spreadsheet models easier to validate, transform, and round-trip into structured formats.
 
@@ -29,16 +29,17 @@ make setup
 
 ## Usage
 
-### Pack JSON into Excel:
+### Run a configurable pipeline:
 
 ```bash
-sheets-pack examples/roundtrip_start.json -o demo.xlsx --levels 3
+sheets-run --config sheets.yaml --profile demo
 ```
 
-### Unpack Excel back into JSON:
+### Try the reference shortcut commands:
 
 ```bash
-sheets-unpack demo.xlsx -o demo_out --levels 3
+sheets-example-json-to-xlsx examples/json -o demo.xlsx
+sheets-example-xlsx-to-json demo.xlsx -o demo_out
 ```
 
 ### Run full test suite:
@@ -61,5 +62,4 @@ according to the [JetBrains Developer Ecosystem 2025 survey published by *Golem.
 
 This project is licensed under the terms of the MIT License.
 See [LICENCE](LICENSE) for details.
-
 

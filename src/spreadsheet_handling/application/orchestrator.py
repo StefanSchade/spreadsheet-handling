@@ -88,7 +88,7 @@ def orchestrate(
     header_levels: int = 1,
 ) -> Frames:
     """
-    Unified execution engine for sheets-run and the CLI shims.
+    Unified execution engine for sheets-run and reference shortcut commands.
 
     - Loads frames from 'input' backend (json_dir | yaml_dir | xlsx | ods | calc).
     - Runs the given 'steps' (pure Frames→Frames, optional).

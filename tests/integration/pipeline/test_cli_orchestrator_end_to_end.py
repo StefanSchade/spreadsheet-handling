@@ -35,8 +35,8 @@ SAMPLE_DATA = {
 }
 
 
-def test_pack_json_to_json_via_orchestrate(tmp_path: Path) -> None:
-    """End-to-end: sheets-pack-style call through the real orchestrate()."""
+def test_json_to_json_via_orchestrate(tmp_path: Path) -> None:
+    """End-to-end: shortcut-style call through the real orchestrate()."""
     in_dir = tmp_path / "in"
     out_dir = tmp_path / "out"
     _write_json_dir(in_dir, SAMPLE_DATA)

@@ -1,12 +1,12 @@
-# tests/unit/cli/test_cli_default_pipelines.py
 """
-FTR-CLI-DEFAULT-PIPELINES — Pack/Unpack with predefined default pipelines.
+FTR-CLI-DEFAULT-PIPELINES — Example shortcut commands with predefined defaults.
 
 Acceptance:
-- sheets-pack produces XLSX with header styling and AutoFilter without explicit YAML.
-- sheets-unpack remains backward compatible (no steps needed).
-- sheets-pack --config custom.yaml overrides the default pipeline.
-- sheets-pack --no-defaults suppresses the default pipeline.
+- the JSON-to-XLSX example produces XLSX with header styling and AutoFilter
+  without explicit YAML.
+- the XLSX-to-JSON example delegates without steps.
+- the JSON-to-XLSX example --config custom.yaml overrides the default pipeline.
+- the JSON-to-XLSX example --no-defaults suppresses the default pipeline.
 """
 from __future__ import annotations
 
@@ -16,7 +16,10 @@ from unittest.mock import patch
 
 import pytest
 
-pytestmark = pytest.mark.ftr("FTR-CLI-DEFAULT-PIPELINES")
+pytestmark = [
+    pytest.mark.ftr("FTR-CLI-DEFAULT-PIPELINES"),
+    pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3"),
+]
 
 
 def _write_json_dir(path: Path, data: dict) -> None:
@@ -35,38 +38,38 @@ SAMPLE = {
 }
 
 
-class TestPackDefaultPipeline:
+class TestExampleJsonToXlsxDefaultPipeline:
 
-    def test_pack_passes_default_steps(self, tmp_path: Path):
-        """Without --config or --no-defaults, pack passes default steps."""
+    def test_example_passes_default_steps(self, tmp_path: Path):
+        """Without --config or --no-defaults, the example passes default steps."""
         in_dir = tmp_path / "in"
         out = tmp_path / "out.xlsx"
         _write_json_dir(in_dir, SAMPLE)
 
-        with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
-            from spreadsheet_handling.cli.apps.sheets_pack import main
-            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
-                main([str(in_dir), "-o", str(out)])
+        with patch("spreadsheet_handling.cli.apps.example_json_to_xlsx.orchestrate") as mock:
+            from spreadsheet_handling.cli.apps.example_json_to_xlsx import main
+
+            main([str(in_dir), "-o", str(out)])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is not None
         assert len(kw["steps"]) >= 1
         assert kw["steps"][0].name == "bootstrap_meta"
 
-    def test_pack_no_defaults_suppresses_steps(self, tmp_path: Path):
+    def test_example_no_defaults_suppresses_steps(self, tmp_path: Path):
         in_dir = tmp_path / "in"
         out = tmp_path / "out.xlsx"
         in_dir.mkdir()
 
-        with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
-            from spreadsheet_handling.cli.apps.sheets_pack import main
-            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
-                main([str(in_dir), "-o", str(out), "--no-defaults"])
+        with patch("spreadsheet_handling.cli.apps.example_json_to_xlsx.orchestrate") as mock:
+            from spreadsheet_handling.cli.apps.example_json_to_xlsx import main
+
+            main([str(in_dir), "-o", str(out), "--no-defaults"])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is None
 
-    def test_pack_config_overrides_defaults(self, tmp_path: Path):
+    def test_example_config_overrides_defaults(self, tmp_path: Path):
         in_dir = tmp_path / "in"
         out = tmp_path / "out.xlsx"
         in_dir.mkdir()
@@ -74,46 +77,45 @@ class TestPackDefaultPipeline:
         cfg = tmp_path / "pipe.yaml"
         cfg.write_text("pipeline:\n  - step: identity\n", encoding="utf-8")
 
-        with patch("spreadsheet_handling.cli.apps.sheets_pack.orchestrate") as mock:
-            from spreadsheet_handling.cli.apps.sheets_pack import main
-            with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
-                main([str(in_dir), "-o", str(out), "--config", str(cfg)])
+        with patch("spreadsheet_handling.cli.apps.example_json_to_xlsx.orchestrate") as mock:
+            from spreadsheet_handling.cli.apps.example_json_to_xlsx import main
+
+            main([str(in_dir), "-o", str(out), "--config", str(cfg)])
 
         kw = mock.call_args.kwargs
         assert kw["steps"] is not None
         assert kw["steps"][0].name == "identity"
 
 
-class TestUnpackBackwardCompat:
+class TestExampleXlsxToJson:
 
-    def test_unpack_still_passes_no_steps(self, tmp_path: Path):
-        """Unpack remains backward compatible — no steps."""
+    def test_example_passes_no_steps(self, tmp_path: Path):
+        """The XLSX-to-JSON example delegates without steps."""
         wb = tmp_path / "in.xlsx"
         out = tmp_path / "out"
         wb.touch()
 
-        with patch("spreadsheet_handling.cli.apps.sheets_unpack.orchestrate") as mock:
-            from spreadsheet_handling.cli.apps.sheets_unpack import main
-            with pytest.warns(DeprecationWarning, match="sheets-unpack is deprecated"):
-                main([str(wb), "-o", str(out)])
+        with patch("spreadsheet_handling.cli.apps.example_xlsx_to_json.orchestrate") as mock:
+            from spreadsheet_handling.cli.apps.example_xlsx_to_json import main
+
+            main([str(wb), "-o", str(out)])
 
         kw = mock.call_args.kwargs
         assert "steps" not in kw or kw.get("steps") is None
 
 
-class TestPackEndToEnd:
+class TestExampleEndToEnd:
 
-    def test_pack_produces_styled_xlsx(self, tmp_path: Path):
-        """End-to-end: pack produces XLSX with AutoFilter without explicit YAML."""
+    def test_example_produces_styled_xlsx(self, tmp_path: Path):
+        """End-to-end: the example produces XLSX with AutoFilter."""
         from openpyxl import load_workbook
-        from spreadsheet_handling.cli.apps.sheets_pack import main
+        from spreadsheet_handling.cli.apps.example_json_to_xlsx import main
 
         in_dir = tmp_path / "in"
         out = tmp_path / "out.xlsx"
         _write_json_dir(in_dir, SAMPLE)
 
-        with pytest.warns(DeprecationWarning, match="sheets-pack is deprecated"):
-            main([str(in_dir), "-o", str(out)])
+        main([str(in_dir), "-o", str(out)])
 
         wb = load_workbook(out)
         ws = wb["products"]
