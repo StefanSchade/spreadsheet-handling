@@ -176,7 +176,9 @@ def _merge_column_width_meta(
 def _store_workbook_meta(ir: WorkbookIR, workbook_meta: dict[str, Any]) -> None:
     meta_sheet = ir.hidden_sheets.setdefault("_meta", SheetIR(name="_meta"))
     meta_sheet.meta["_hidden"] = True
-    meta_sheet.meta["workbook_meta_blob"] = json.dumps(workbook_meta)
+    meta_sheet.meta["workbook_meta_blob"] = json.dumps(
+        workbook_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _legend_table_hints(
