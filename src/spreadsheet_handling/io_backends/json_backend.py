@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,8 @@ import yaml
 from .base import BackendBase, BackendOptions, coerce_backend_options
 
 Frames = Dict[str, pd.DataFrame]
+
+_JSON_FORMAT_KEYS = ("pretty", "indent", "sort_keys", "ensure_ascii")
 
 
 def _is_empty_header_segment(x: Any) -> bool:
@@ -63,6 +66,14 @@ def _records_nested_from_multiindex(df: pd.DataFrame) -> list[dict[str, Any]]:
     return out
 
 
+def _json_format_overrides(options: BackendOptions | Mapping[str, Any] | None) -> dict[str, Any]:
+    if options is None:
+        return {}
+    if isinstance(options, BackendOptions):
+        return {key: options.extra[key] for key in _JSON_FORMAT_KEYS if key in options.extra}
+    return {key: options[key] for key in _JSON_FORMAT_KEYS if key in options}
+
+
 class JSONBackend(BackendBase):
     """
     Backend for a directory of JSON files, one file per sheet (e.g. products.json).
@@ -110,8 +121,7 @@ class JSONBackend(BackendBase):
                 "sort_keys": False,     # preserve DataFrame column order
                 "ensure_ascii": False,
         }
-        if options:
-            fmt.update({k: options[k] for k in ("pretty", "indent", "sort_keys", "ensure_ascii") if k in options})
+        fmt.update(_json_format_overrides(options))
 
         for name, df in frames.items():
             if name == "_meta":

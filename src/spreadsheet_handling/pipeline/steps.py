@@ -189,25 +189,6 @@ def make_drop_helpers_step(
     return BoundStep(name=name, config=cfg, fn=run)
 
 
-def make_flatten_headers_step(*, sheet: str | None = None, mode: str = "first_nonempty", sep: str = "", name: str = "flatten_headers") -> BoundStep:
-    return make_builder_target_step(
-        target="spreadsheet_handling.domain.transformations.helpers:flatten_headers",
-        name=name,
-        sheet=sheet,
-        mode=mode,
-        sep=sep,
-    )
-
-
-def make_unflatten_headers_step(*, sheet: str | None = None, sep: str = ".", name: str = "unflatten_headers") -> BoundStep:
-    return make_builder_target_step(
-        target="spreadsheet_handling.domain.transformations.helpers:unflatten_headers",
-        name=name,
-        sheet=sheet,
-        sep=sep,
-    )
-
-
 def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_fk_helpers") -> BoundStep:
     return make_builder_target_step(
         target="spreadsheet_handling.domain.transformations.helpers:reorder_helpers_next_to_fk",

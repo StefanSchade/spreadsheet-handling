@@ -17,6 +17,7 @@ import pytest
 pytestmark = [
     pytest.mark.ftr("FTR-SPREADSHEET-BOUNDARY-GUARDS-P3I"),
     pytest.mark.ftr("FTR-ARCHITECTURE-FITNESS-GUARDS-P4X"),
+    pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3"),
 ]
 
 
@@ -29,7 +30,6 @@ PIPELINE_ROOT = PKG_ROOT / "pipeline"
 IO_BACKENDS_ROOT = PKG_ROOT / "io_backends"
 
 CONTRACT_PATH = IO_BACKENDS_ROOT / "spreadsheet_contract.py"
-INTERFACES_PATH = IO_BACKENDS_ROOT / "_interfaces.py"
 XLSX_BACKEND_PATH = IO_BACKENDS_ROOT / "xlsx" / "xlsx_backend.py"
 XLSX_PARSER_PATH = IO_BACKENDS_ROOT / "xlsx" / "openpyxl_parser.py"
 XLSX_INTERPRETATION_PATH = IO_BACKENDS_ROOT / "xlsx" / "parser_interpretation.py"
@@ -69,7 +69,7 @@ def _package_modules(root: Path) -> list[Path]:
 
 def test_generic_spreadsheet_modules_stay_free_of_xlsx_and_openpyxl_dependencies():
     generic_modules = _package_modules(RENDERING_ROOT)
-    generic_modules.extend([CONTRACT_PATH, INTERFACES_PATH])
+    generic_modules.append(CONTRACT_PATH)
 
     forbidden_prefixes = (
         "openpyxl",

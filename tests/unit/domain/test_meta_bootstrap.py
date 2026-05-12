@@ -4,12 +4,15 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta, _deep_merge
+from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta, deep_merge
 from spreadsheet_handling.pipeline.registry import REGISTRY, build_steps_from_config
 from spreadsheet_handling.pipeline.steps import make_bootstrap_meta_step
 from spreadsheet_handling.rendering.ir import SheetIR
 
-pytestmark = pytest.mark.ftr("FTR-META-BOOTSTRAP")
+pytestmark = [
+    pytest.mark.ftr("FTR-META-BOOTSTRAP"),
+    pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3"),
+]
 
 
 
@@ -38,35 +41,35 @@ def _attr_frames(**meta_kw):
 
 
 # ---------------------------------------------------------------------------
-# _deep_merge
+# deep_merge
 # ---------------------------------------------------------------------------
 
 class TestDeepMerge:
     def test_empty_base(self):
-        assert _deep_merge({}, {"a": 1}) == {"a": 1}
+        assert deep_merge({}, {"a": 1}) == {"a": 1}
 
     def test_empty_overlay(self):
-        assert _deep_merge({"a": 1}, {}) == {"a": 1}
+        assert deep_merge({"a": 1}, {}) == {"a": 1}
 
     def test_scalar_overwrite(self):
-        assert _deep_merge({"a": 1}, {"a": 2}) == {"a": 2}
+        assert deep_merge({"a": 1}, {"a": 2}) == {"a": 2}
 
     def test_nested_merge(self):
         base = {"style": {"header_fill_rgb": "#F2F2F2", "bold": True}}
         overlay = {"style": {"header_fill_rgb": "#00FF00"}}
-        result = _deep_merge(base, overlay)
+        result = deep_merge(base, overlay)
         assert result == {"style": {"header_fill_rgb": "#00FF00", "bold": True}}
 
     def test_list_replaces(self):
-        assert _deep_merge({"a": [1]}, {"a": [2, 3]}) == {"a": [2, 3]}
+        assert deep_merge({"a": [1]}, {"a": [2, 3]}) == {"a": [2, 3]}
 
     def test_disjoint_keys(self):
-        assert _deep_merge({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}
+        assert deep_merge({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}
 
     def test_does_not_mutate_base(self):
         base = {"a": {"x": 1}}
         overlay = {"a": {"y": 2}}
-        result = _deep_merge(base, overlay)
+        result = deep_merge(base, overlay)
         assert "y" not in base["a"]
         assert result["a"] == {"x": 1, "y": 2}
 
@@ -191,13 +194,13 @@ class TestSheetIRMetaFaultTolerance:
 # ---------------------------------------------------------------------------
 
 class TestStepLocalMergePattern:
-    """Verify that step-local code can use _deep_merge to append lists."""
+    """Verify that step-local code can use deep_merge to append lists."""
 
     def test_helper_list_replacement(self):
-        """Per spec: lists replace (append is step-local logic, not _deep_merge)."""
+        """Per spec: lists replace (append is step-local logic, not deep_merge)."""
         base = {"non_essential": ["_col1"]}
         overlay = {"non_essential": ["_col1", "_col2"]}
-        result = _deep_merge(base, overlay)
+        result = deep_merge(base, overlay)
         assert result["non_essential"] == ["_col1", "_col2"]
 
     def test_step_can_append_via_explicit_code(self):

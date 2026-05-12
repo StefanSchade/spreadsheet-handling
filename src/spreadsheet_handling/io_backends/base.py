@@ -33,7 +33,7 @@ def coerce_backend_options(
     Otherwise preserve the mapping so backend-specific keys still flow through.
     """
     if opts is None:
-        return cast(BackendOptions, {})
+        return BackendOptions()
     if isinstance(opts, BackendOptions):
         return opts
     if is_dataclass(BackendOptions):

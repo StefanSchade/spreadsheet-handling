@@ -150,6 +150,8 @@ class XMLBackend(BackendBase):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for name, df in frames.items():
+            if name == "_meta":
+                continue
             p = out_dir / f"{name}.xml"
             clean = df.where(pd.notnull(df), "")
             root = Element(_sanitize_tag(name))

@@ -74,6 +74,8 @@ def save_yaml_dir(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for sheet, df in frames.items():
+        if sheet == "_meta":
+            continue
         file = out_dir / f"{sheet}.yml"
         records: List[dict] = (
             df.to_dict(orient="records") if not df.empty else []

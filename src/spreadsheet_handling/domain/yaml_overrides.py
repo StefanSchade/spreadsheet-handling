@@ -29,7 +29,7 @@ from typing import Any, Dict
 
 import yaml
 
-from .meta_bootstrap import _deep_merge, _get_meta, _set_meta
+from .meta_bootstrap import deep_merge, get_meta, set_meta
 
 
 def load_overrides(path: str | Path) -> Dict[str, Any]:
@@ -60,12 +60,12 @@ def apply_overrides(
 
     Returns *frames* (mutated in place).
     """
-    meta = _get_meta(frames)
+    meta = get_meta(frames)
 
     # Workbook-level defaults
     defaults = overrides.get("defaults")
     if defaults and isinstance(defaults, dict):
-        meta = _deep_merge(meta, defaults)
+        meta = deep_merge(meta, defaults)
 
     # Per-sheet overrides
     sheet_cfgs = overrides.get("sheets")
@@ -75,9 +75,9 @@ def apply_overrides(
             if not isinstance(sheet_opts, dict):
                 continue
             existing = sheets_meta.get(sheet_name, {})
-            sheets_meta[sheet_name] = _deep_merge(existing, sheet_opts)
+            sheets_meta[sheet_name] = deep_merge(existing, sheet_opts)
 
-    _set_meta(frames, meta)
+    set_meta(frames, meta)
     return frames
 
 

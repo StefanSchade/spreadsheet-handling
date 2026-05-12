@@ -1,0 +1,282 @@
+= Review: FTR-REVIEW-001-QUICK-WINS-P3
+:date: 2026-05-12
+:reviewer: Claude Sonnet 4.6
+:status: complete
+:covers: A-006, A-007, A-003 (partial), IR-007, D-007
+:excluded: A-002 (requires explicit developer approval — gated CLI surface)
+
+== Scope und Methodik
+
+Geprüft wurde der vollständige uncommitted Diff (10 Dateien, +49 /−58 Zeilen)
+gegen die FTR-Checkliste und die Originalbefunde aus `review-consolidation.adoc`.
+Leitfragen je Finding:
+
+. *Wurde die eigentliche Ursache behoben?* (nicht nur das Symptom)
+. *Wurde nur verschoben oder wirklich entkoppelt?*
+. *Entstanden neue Layer-Verletzungen?*
+. *Ist das ein sinnvoller evolutionärer Schritt oder premature abstraction?*
+
+---
+
+== A-006 — `_interfaces.py` löschen
+
+=== Befund
+
+*Umgesetzt.* Datei gelöscht; Referenz in
+`test_spreadsheet_boundary_guards.py` (`INTERFACES_PATH`-Konstante + der
+`generic_modules.extend([CONTRACT_PATH, INTERFACES_PATH])`-Aufruf) bereinigt.
+
+=== Bewertung
+
+* *Ursache behoben?* Ja — toter Re-Export ist weg, kein Import-Pfad zeigt
+  noch auf das Modul.
+* *Verschoben?* Nein.
+* *Layer-Verletzungen?* Nein.
+* *Evolutionärer Schritt?* Ja, eindeutig.
+
+=== Nebenbeobachtung
+
+`src/spreadsheet_handling.egg-info/SOURCES.txt` referenziert noch
+`_interfaces.py`. Das ist ein Build-Artefakt (regeneriert beim nächsten
+`pip install -e .`) — kein Code-Problem, kein Handlungsbedarf.
+
+---
+
+== A-007 — `coerce_backend_options(None)` → `BackendOptions()`
+
+=== Befund
+
+*Umgesetzt — mit einem undokumentierten, aber notwendigen Nachzieh-Fix.*
+
+Die `base.py`-Änderung ist korrekt: `return BackendOptions()` statt
+`cast(BackendOptions, {})`.
+
+Gleichzeitig wurde `json_backend.py` angefasst:
+
+* neues Modul-Level-Konstante `_JSON_FORMAT_KEYS`
+* neue Hilfsfunktion `_json_format_overrides(options) -> dict`
+* der Aufruf `fmt.update(...)` delegiert jetzt an diese Funktion
+
+Dieser json_backend-Fix ist *nicht* im FTR beschrieben, aber er war
+*zwingend erforderlich*. Ohne ihn würde A-007 einen neuen Bug einführen:
+`BackendOptions()` ist (als Dataclass-Instanz) immer truthy. Der
+ursprüngliche Code `if options: fmt.update({k: options[k] for k in ...})`
+hätte nach dem Fix `options[k]` auf einer `BackendOptions`-Instanz
+versucht — die keinen `__getitem__` hat → `TypeError`.
+
+=== Bewertung
+
+* *Ursache behoben?* Für den `None`-Pfad vollständig. Die letzte Zeile in
+  `coerce_backend_options` (`return cast(BackendOptions, dict(opts))`) ist
+  unverändert und gibt für Mappings mit fremden Keys (z. B. `{"pretty": False}`)
+  weiterhin ein plain dict zurück. Das ist pre-existing und liegt außerhalb
+  des A-007-Scopes; `_json_format_overrides` behandelt diesen Mapping-Zweig
+  korrekt.
+
+* *Verschoben?* Nein. Die Typ-Lüge (`cast`) im Fallback existiert weiter,
+  aber das ist D-007-orthogonal und wurde auch vom Originalreview nicht A-007
+  zugeordnet.
+
+* *Layer-Verletzungen?* Nein.
+
+* *Evolutionärer Schritt?* Die `_json_format_overrides`-Funktion ist die
+  richtige Lösung — sauberer als ein Inline-`isinstance`-Block, und sie macht
+  das Protokoll (BackendOptions vs. Mapping) explizit sichtbar. Keine premature
+  Abstraction.
+
+=== Offene Frage / Annotation für Codex
+
+NOTE: Die anderen einfachen Writer (XML, YAML) rufen intern `coerce_backend_options`
+auf (z. B. `save_xml_dir` in `xml_backend.py:202`), greifen danach aber *nicht*
+mit `options[key]` auf Backend-spezifische Format-Keys zu. Dort gibt es kein
+vergleichbares Problem. Sollte ein zukünftiger einfacher Writer Format-Optionen
+aus `BackendOptions.extra` lesen wollen, muss er dem Muster von
+`_json_format_overrides` folgen — das sollte in `conventions.adoc` oder als
+Kommentar in `BackendBase` festgehalten werden (nicht Scope dieses FTR).
+
+---
+
+== A-003 (partial) — `_meta` in XMLBackend und `save_yaml_dir` überspringen
+
+=== Befund
+
+*Umgesetzt.* Beide Writer erhalten dasselbe `if name/sheet == "_meta": continue`-Guard,
+das `JSONBackend` / `save_csv_dir` bereits hatten.
+
+=== Bewertung
+
+* *Ursache behoben?* Für den unmittelbaren Crash-Pfad ja.
+  Technisch war die Ursache: `_meta` ist ein plain dict, kein DataFrame —
+  `df.where(pd.notnull(df), "")` auf einem dict → `AttributeError`.
+  Der Skip behebt das vollständig für diese Writer.
+
+* *Verschoben?* Die Frage "was passiert mit `_meta` beim Schreiben nach
+  YAML/XML" ist eine Designentscheidung (Sidecar oder ignorieren). Das FTR
+  schließt den Sidecar-Ansatz explizit als Non-Goal aus. Der Fix ist
+  konsistent mit dem JSON-Backend, das eine separate Sidecar-Logik hat
+  (`_meta.yaml`). *Diese Parität fehlt noch in XML/YAML* — ist aber nicht
+  Scope dieses FTR (korrekt ausgeschlossen).
+
+* *Layer-Verletzungen?* Nein.
+
+* *Evolutionärer Schritt?* Ja. Der Pattern ist jetzt über alle vier einfachen
+  Writer konsistent.
+
+=== Annotation für Codex
+
+NOTE: Ein Test, der tatsächlich eine meta-erzeugende Pipeline gegen `--out-kind
+yaml_dir` / `xml_dir` fährt und den Nicht-Crash nachweist, fehlt noch. Das
+FTR-Akzeptanzkriterium fordert diesen, der Diff enthält ihn nicht. Dies ist ein
+offenes Item vor dem Close des FTR.
+
+---
+
+== IR-007 — Ungenutzte Step-Factories löschen
+
+=== Befund
+
+*Umgesetzt.* `make_flatten_headers_step` und `make_unflatten_headers_step`
+sind aus `pipeline/steps.py` entfernt.
+
+Der `test_public_import_surface.py`-Assert `assert "make_flatten_headers_step" not in public_names`
+(Zeile 29) ist noch vorhanden und trivially true (die Funktion existiert nicht
+mehr). Kein Fehler, aber die Assertion ist jetzt bedeutungslos.
+
+=== Bewertung
+
+* *Ursache behoben?* Ja — toter Code und der damit verbundene hartkodierte
+  `target`-String-Drift-Vektor sind weg.
+
+* *Verschoben?* Nein.
+
+* *Layer-Verletzungen?* Nein.
+
+* *Evolutionärer Schritt?* Ja.
+
+=== Annotation für Codex
+
+NOTE: `assert "make_flatten_headers_step" not in public_names` in
+`test_public_import_surface.py:29` kann entfernt oder in eine positive Aussage
+(`assert not hasattr(module, "make_flatten_headers_step")` mit einem
+erklärenden Kommentar "deleted in FTR-REVIEW-001-QUICK-WINS-P3") umgewandelt
+werden. So bleibt die Review-Entscheidung im Test-Corpus sichtbar. Niedrige
+Priorität.
+
+---
+
+== D-007 — `_deep_merge`, `_get_meta`, `_set_meta` öffentlich machen
+
+=== Befund
+
+*Umgesetzt.* Die drei Funktionen wurden in `meta_bootstrap.py` umbenannt
+(`deep_merge`, `get_meta`, `set_meta`). `yaml_overrides.py` importiert die
+öffentlichen Namen. Tests aktualisiert.
+
+=== Bewertung
+
+* *Ursache behoben?* Ja — der Cross-Modul-Import privater Symbole ist weg.
+
+* *Verschoben?* Teilweise. Die *eigentliche* strukturelle Spannung, die D-007
+  sichtbar gemacht hat, ist: `yaml_overrides.py` und `meta_bootstrap.py` teilen
+  Meta-Merge-Logik ohne ein gemeinsames Utility-Modul — das macht sie implizit
+  gekoppelt. Dieses Problem ist durch das Öffentlich-Machen *gemindert* (der
+  Import ist jetzt stabil), aber nicht aufgelöst: die Logik sitzt weiterhin in
+  `meta_bootstrap`, das eigentlich für Bootstrap-Semantik zuständig ist, nicht
+  für generisches Meta-Merging. Das Originalreview empfahl "ein gemeinsames
+  Meta-Merge-Modul" — dieser Schritt geht in die richtige Richtung, kommt aber
+  nicht dort an.
+
+* *Layer-Verletzungen?* Nein.
+
+* *Evolutionärer Schritt?* Ja — korrekt priorisiert. Ein eigenständiges
+  Meta-Merge-Modul ist eine größere Refactoring-Einheit, die hier nicht
+  angemessen wäre.
+
+=== Kritische Interaktion: D-007 ↔ D-013
+
+`get_meta` und `set_meta` tragen den "Dual-Interface"-Shim aus D-013
+(`hasattr(frames, "meta")` vs. `frames["_meta"]`) — das sagen auch ihre
+Docstrings explizit ("using the dual-interface convention"). Durch das
+Öffentlich-Machen werden diese Funktionen jetzt zu einem Teil der internen
+Semi-API.
+
+Das ist kein Fehler in diesem FTR — D-013 ist ein separates HYGIENE-Finding
+mit eigenem Scope. Aber:
+
+* Wenn D-013 später bereinigt wird (Attr-Pfad entfernen, nur `dict`-Carrier),
+  muss `get_meta`/`set_meta` geändert werden. Diese Änderung betrifft dann
+  potenziell öffentliche Aufrufer.
+* Solange D-013 offen ist, verbietet sich ein `__all__`-Export dieser
+  Funktionen aus `domain/` (sie sind nur interne Utilities, kein stabiler
+  Consumer-Surface).
+
+=== Annotation für Codex
+
+NOTE: `get_meta` und `set_meta` sollten explizit *nicht* in `domain/__init__.py`
+exportiert werden, bis D-013 abgeschlossen ist. Ein Kommentar in
+`meta_bootstrap.py` wäre hilfreich: "internal — not part of the public domain
+surface; shape may change with D-013 cleanup."
+
+---
+
+== A-002 — Ausgeschlossen
+
+Korrekt nicht umgesetzt. Die FTR-Bedingung (explizite Entwickler-Freigabe für
+das Entfernen einer beworbenen CLI-Option) ist noch offen. Die `csv_dir`-Choice
+in `sheets_pack.py:24` ist unverändert.
+
+---
+
+== Gesamtbewertung
+
+[cols="1,1,3", options="header"]
+|===
+|Finding |Status |Qualität
+
+|A-006 |✅ Erledigt |Sauber. Kein Befund.
+
+|A-007 |✅ Erledigt |Korrekt — aber der notwendige json_backend-Nachzieh-Fix
+fehlt im FTR. Ohne ihn wäre A-007 regressiv (TypeError bei `BackendOptions()["pretty"]`).
+Der Fix ist gut, er muss nur als bewusste Entscheidung dokumentiert sein.
+
+|A-003 (partial) |✅ Erledigt |Korrekt und konsistent. Fehlt: Test für den
+Nicht-Crash-Pfad (FTR-Kriterium).
+
+|IR-007 |✅ Erledigt |Sauber. Surface-Test-Assertion jetzt trivially true;
+kann optional bereinigt werden.
+
+|D-007 |✅ Erledigt |Korrekt im Scope. Interaktion mit D-013 beachten;
+`get_meta`/`set_meta` nicht in `__all__` exportieren, bis D-013 bereinigt ist.
+
+|A-002 |⏭️ Ausgeschlossen |Korrekt zurückgestellt.
+|===
+
+=== Blockers vor FTR-Close
+
+. *A-003-Test fehlt* — der Diff enthält keinen Test, der `--out-kind yaml_dir`
+  / `xml_dir` mit einer meta-erzeugenden Pipeline ausführt. Das FTR-Kriterium
+  fordert ihn explizit. Entweder Kriterium in der FTR-Checkliste anpassen
+  (wenn ein Integrations-Test zu aufwändig ist) oder Test ergänzen.
+
+=== Keine Blockers, aber Annotations
+
+. `_json_format_overrides` im FTR nachführen (kurze Notiz "json_backend angepasst,
+  um BackendOptions-Instanzen zu unterstützen") — damit der Diff für spätere
+  Reviewer verständlich bleibt.
+. `test_public_import_surface.py:29` (`assert "make_flatten_headers_step" not in public_names`)
+  kann bereinigt oder in eine positivere Aussage umgeformt werden (niedrige Priorität).
+. `get_meta`/`set_meta` nicht in `domain/__init__.py` exportieren (pending D-013).
+
+== Codex Follow-up vom 2026-05-12
+
+* Der `json_backend`-Nachziehfix über `_json_format_overrides` ist bewusst Teil
+  von A-007: Seit `coerce_backend_options(None)` korrekt `BackendOptions()`
+  zurückgibt, muss der JSON-Writer Formatoptionen aus `BackendOptions.extra`
+  oder aus Mapping-Optionen lesen können, ohne `BackendOptions` wie ein Mapping
+  zu indexieren.
+* Der fehlende A-003-Nicht-Crash-Test wurde als fokussierter Orchestrator-Test
+  ergänzt: Eine Pipeline erzeugt `_meta`, schreibt nach `yaml_dir` und
+  `xml_dir`, und verifiziert, dass sichtbare Daten geschrieben werden, ohne
+  YAML/XML-Sidecar-Meta einzuführen.
+* Die triviale `make_flatten_headers_step`-Negative-Assertion wurde in eine
+  Ownermodul-Assertion umgeformt, die die gelöschten Factories direkt absichert.
