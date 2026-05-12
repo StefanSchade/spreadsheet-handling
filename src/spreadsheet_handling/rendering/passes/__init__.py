@@ -1,3 +1,5 @@
+import json
+
 from . import meta_pass as meta_pass
 from . import style_pass as style_pass
 from . import validation_pass as validation_pass
@@ -29,7 +31,9 @@ def apply_all(ir: WorkbookIR, meta: dict) -> WorkbookIR:
         from ..ir import SheetIR
         meta_sheet = ir.hidden_sheets.setdefault('_meta', SheetIR(name='_meta'))
         if 'workbook_meta_blob' not in meta_sheet.meta:
-            meta_sheet.meta['workbook_meta_blob'] = meta
+            meta_sheet.meta['workbook_meta_blob'] = json.dumps(
+                meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
 
     passes: list[IRPass] = [
         MetaPass(),

@@ -7,7 +7,7 @@ spreadsheet-meta behavior. Durable spreadsheet-semantics invariants live in
 
 from __future__ import annotations
 
-import ast
+import json
 
 import pandas as pd
 import pytest
@@ -17,7 +17,10 @@ from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.passes import apply_all as apply_render_passes
 from spreadsheet_handling.rendering.plan import WriteMeta
 
-pytestmark = pytest.mark.ftr("FTR-SPREADSHEET-META-SEMANTICS-P3H")
+pytestmark = [
+    pytest.mark.ftr("FTR-SPREADSHEET-META-SEMANTICS-P3H"),
+    pytest.mark.ftr("FTR-REVIEW-001-META-BLOB-JSON-P3"),
+]
 
 
 def _sample_frames() -> dict[str, pd.DataFrame]:
@@ -61,4 +64,4 @@ def test_current_hidden_meta_payload_carrier_is_reconstructible():
     assert len(meta_ops) == 1
     assert meta_ops[0].sheet == "_meta"
     assert meta_ops[0].hidden is True
-    assert ast.literal_eval(meta_ops[0].kv["workbook_meta_blob"]) == meta
+    assert json.loads(meta_ops[0].kv["workbook_meta_blob"]) == meta

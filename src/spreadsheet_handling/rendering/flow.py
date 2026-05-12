@@ -1,4 +1,6 @@
 from __future__ import annotations
+import ast
+import json
 from typing import List, Any
 from .ir import WorkbookIR, SheetIR, TableBlock
 from .passes.core import (
@@ -34,6 +36,27 @@ def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
     for p in passes:
         doc = p.apply(doc)
     return doc
+
+
+def _dump_workbook_meta_blob(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                # legacy: normalize pre-JSON repr blobs when re-rendering parsed IR.
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError, TypeError):
+                parsed = value
+        if isinstance(parsed, dict):
+            value = parsed
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _meta_cell_value(key: str, value: Any) -> str:
+    if key == "workbook_meta_blob":
+        return _dump_workbook_meta_blob(value)
+    return str(value)
 
 
 def _header_grid_for_table(sh: SheetIR, table: TableBlock, table_index: int) -> Any:
@@ -223,7 +246,13 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     for sheet_name, sh in doc.hidden_sheets.items():
         hidden = bool(sh.meta.get("_hidden", True))
         kv = {k: v for k, v in sh.meta.items() if k != "_hidden"}
-        plan.add(WriteMeta(sheet=sheet_name, kv={str(k): str(v) for k, v in kv.items()}, hidden=hidden))
+        plan.add(
+            WriteMeta(
+                sheet=sheet_name,
+                kv={str(k): _meta_cell_value(str(k), v) for k, v in kv.items()},
+                hidden=hidden,
+            )
+        )
 
     return plan
 

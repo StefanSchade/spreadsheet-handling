@@ -8,6 +8,7 @@ Acceptance:
   - Pure-data adapters ignore meta unless enabled
 """
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -169,6 +170,68 @@ class TestXLSXMeta:
         meta = back["_meta"]
         # At minimum the version field should survive
         assert meta.get("version") or meta.get("workbook_meta_blob")
+
+    @pytest.mark.ftr("FTR-REVIEW-001-META-BLOB-JSON-P3")
+    def test_workbook_meta_blob_is_written_as_json(self, tmp_path: Path):
+        out = tmp_path / "meta-json.xlsx"
+        ExcelBackend().write_multi(_sample_frames(), str(out))
+
+        from openpyxl import load_workbook
+
+        wb = load_workbook(out, data_only=True)
+        ws = wb["_meta"]
+        values = {
+            str(row[0]): row[1]
+            for row in ws.iter_rows(min_col=1, max_col=2, values_only=True)
+            if row[0] is not None
+        }
+        wb.close()
+
+        blob = values["workbook_meta_blob"]
+        assert isinstance(blob, str)
+        assert json.loads(blob) == _SAMPLE_META
+        assert "'version'" not in blob
+
+    @pytest.mark.ftr("FTR-REVIEW-001-META-BLOB-JSON-P3")
+    def test_workbook_meta_blob_roundtrips_nan_and_nested_dict(self, tmp_path: Path):
+        out = tmp_path / "meta-nan.xlsx"
+        frames = _sample_frames()
+        frames["_meta"] = {
+            **_SAMPLE_META,
+            "metrics": {"missing": float("nan"), "nested": {"value": 7}},
+        }
+
+        ExcelBackend().write_multi(frames, str(out))
+        back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+        meta = back["_meta"]
+        assert meta["metrics"]["nested"] == {"value": 7}
+        assert math.isnan(meta["metrics"]["missing"])
+
+    @pytest.mark.ftr("FTR-REVIEW-001-META-BLOB-JSON-P3")
+    def test_legacy_python_literal_meta_blob_is_still_read(self, tmp_path: Path):
+        from openpyxl import Workbook
+
+        out = tmp_path / "legacy-meta.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "products"
+        ws.append(["sku"])
+        ws.append(["P-1"])
+        meta_ws = wb.create_sheet("_meta")
+        meta_ws.sheet_state = "hidden"
+        meta_ws.append(
+            [
+                "workbook_meta_blob",
+                "{'version': 'legacy', 'nested': {'enabled': True}}",
+            ]
+        )
+        wb.save(out)
+        wb.close()
+
+        back = ExcelBackend().read_multi(str(out), header_levels=1)
+
+        assert back["_meta"] == {"version": "legacy", "nested": {"enabled": True}}
 
     def test_derived_helper_provenance_roundtrip_xlsx(self, tmp_path: Path):
         """FTR-FK-HELPER-PROVENANCE-CLEANUP: derived helper provenance survives XLSX hidden-sheet roundtrip."""

@@ -101,10 +101,11 @@ def _read_meta_sheet(wb: openpyxl.Workbook) -> dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             pass
         try:
+            # legacy: pre-JSON repr format
             result = ast.literal_eval(blob_str)
             if isinstance(result, dict):
                 return result
-        except (ValueError, SyntaxError):
+        except (ValueError, SyntaxError, TypeError):
             pass
 
     return kv

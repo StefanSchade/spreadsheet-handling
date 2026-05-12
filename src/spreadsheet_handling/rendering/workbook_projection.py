@@ -49,10 +49,11 @@ def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
                 pass
             if "_meta" not in frames:
                 try:
+                    # legacy: pre-JSON repr format
                     meta_dict = ast.literal_eval(blob)
                     if isinstance(meta_dict, dict):
                         frames["_meta"] = meta_dict
-                except (ValueError, SyntaxError):
+                except (ValueError, SyntaxError, TypeError):
                     pass
         if "_meta" not in frames:
             kv = {k: v for k, v in meta_sh.meta.items() if k != "_hidden"}

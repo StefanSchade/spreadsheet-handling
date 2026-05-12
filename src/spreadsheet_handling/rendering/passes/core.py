@@ -1,5 +1,7 @@
 from __future__ import annotations
+import ast
 from collections.abc import Mapping
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -305,7 +307,21 @@ def _workbook_meta(doc: WorkbookIR) -> dict[str, Any]:
     if not meta_sheet:
         return {}
     wb_meta = meta_sheet.meta.get("workbook_meta_blob") or {}
-    return wb_meta if isinstance(wb_meta, dict) else {}
+    if isinstance(wb_meta, dict):
+        return wb_meta
+    if isinstance(wb_meta, str):
+        try:
+            parsed = json.loads(wb_meta)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            # legacy: pre-JSON repr format
+            parsed = ast.literal_eval(wb_meta)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, SyntaxError, TypeError):
+            pass
+    return {}
 
 
 def _legend_spec(wb_meta: dict[str, Any], legend_name: str) -> dict[str, Any] | None:

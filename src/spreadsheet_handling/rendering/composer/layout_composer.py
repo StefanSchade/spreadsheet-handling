@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from typing import Dict, Mapping, Any
 import pandas as pd
 
@@ -305,6 +306,8 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
     # stash the domain meta so meta_pass can persist it (unchanged from your version)
     if meta:
         meta_sheet = wb.hidden_sheets.setdefault("_meta", SheetIR(name="_meta"))
-        meta_sheet.meta["workbook_meta_blob"] = meta
+        meta_sheet.meta["workbook_meta_blob"] = json.dumps(
+            meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
 
     return wb

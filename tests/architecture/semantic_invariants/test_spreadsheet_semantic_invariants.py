@@ -8,6 +8,7 @@ shape.
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -111,7 +112,8 @@ def test_validation_formula_intent_is_structural_not_backend_syntax():
     ir = compose_workbook(_sample_frames(), meta)
     ir = apply_render_passes(ir, meta)
 
-    canonical_rule = ir.hidden_sheets["_meta"].meta["workbook_meta_blob"]["constraints"][0]["rule"]
+    workbook_meta_blob = ir.hidden_sheets["_meta"].meta["workbook_meta_blob"]
+    canonical_rule = json.loads(workbook_meta_blob)["constraints"][0]["rule"]
     assert canonical_rule == {"type": "in_list", "values": ["new", "done"]}
 
     plan = build_render_plan(ir)

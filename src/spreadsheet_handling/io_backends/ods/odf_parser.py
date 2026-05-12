@@ -201,10 +201,11 @@ def _read_meta_payload(sheet: SheetIR) -> dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             pass
         try:
+            # legacy: pre-JSON repr format
             result = ast.literal_eval(str(blob))
             if isinstance(result, dict):
                 return result
-        except (ValueError, SyntaxError):
+        except (ValueError, SyntaxError, TypeError):
             pass
     return {key: value for key, value in sheet.meta.items() if key != "_hidden"}
 
