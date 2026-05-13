@@ -86,8 +86,10 @@ class CSVBackend(BackendBase):
 def load_csv_dir(
     path: str,
     options: BackendOptions | None = None,
+    *,
+    header_levels: int = 1,
 ) -> dict[str, pd.DataFrame]:
-    return CSVBackend().read_multi(path, header_levels=1, options=options)
+    return CSVBackend().read_multi(path, header_levels=header_levels, options=options)
 
 
 def save_csv_dir(

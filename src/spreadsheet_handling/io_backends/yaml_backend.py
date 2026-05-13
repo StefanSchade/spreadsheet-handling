@@ -20,6 +20,8 @@ def _glob_yaml_files(root: Path) -> Iterable[Path]:
 def load_yaml_dir(
     path: str,
     options: BackendOptions | None = None,
+    *,
+    header_levels: int = 1,
 ) -> Frames:
     """
     Read a folder of YAML files into frames:

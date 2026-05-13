@@ -10,6 +10,40 @@ import pytest
 pytestmark = pytest.mark.ftr("FTR-COLUMN-WIDTH-ROUNDTRIP-P4")
 
 
+@pytest.mark.ftr("FTR-REVIEW-001-BACKEND-DISPATCH-P4A")
+def test_package_import_does_not_load_spreadsheet_backend_modules():
+    script = textwrap.dedent(
+        """
+        import sys
+
+        import spreadsheet_handling.io_backends as backends
+
+        assert callable(backends.make_backend)
+
+        loaded = [
+            name
+            for name in sys.modules
+            if name == "openpyxl"
+            or name.startswith("openpyxl.")
+            or name == "odf"
+            or name.startswith("odf.")
+            or name.startswith("spreadsheet_handling.io_backends.xlsx")
+            or name.startswith("spreadsheet_handling.io_backends.ods")
+        ]
+        assert loaded == [], loaded
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_xlsx_import_paths_do_not_require_optional_odf_dependency():
     script = textwrap.dedent(
         """

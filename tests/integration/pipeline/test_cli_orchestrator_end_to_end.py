@@ -27,12 +27,37 @@ def _write_json_dir(path: Path, data: dict[str, list[dict]]) -> None:
         )
 
 
+def _write_csv_dir(path: Path, data: dict[str, list[dict]]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for name, records in data.items():
+        columns = list(records[0]) if records else []
+        rows = [",".join(columns)]
+        rows.extend(",".join(str(record[column]) for column in columns) for record in records)
+        (path / f"{name}.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
 SAMPLE_DATA = {
     "products": [
         {"id": "a", "name": "Alpha"},
         {"id": "b", "name": "Bravo"},
     ]
 }
+
+
+@pytest.mark.ftr("FTR-REVIEW-001-BACKEND-DISPATCH-P4A")
+def test_csv_dir_to_json_via_orchestrate(tmp_path: Path) -> None:
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    _write_csv_dir(in_dir, SAMPLE_DATA)
+
+    frames = orchestrate(
+        input={"kind": "csv_dir", "path": str(in_dir)},
+        output={"kind": "json_dir", "path": str(out_dir)},
+    )
+
+    assert "products" in frames
+    written = json.loads((out_dir / "products.json").read_text(encoding="utf-8"))
+    assert written == SAMPLE_DATA["products"]
 
 
 def test_json_to_json_via_orchestrate(tmp_path: Path) -> None:

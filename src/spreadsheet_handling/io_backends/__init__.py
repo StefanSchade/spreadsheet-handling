@@ -3,19 +3,9 @@ from .csv_backend import CSVBackend
 from .json_backend import JSONBackend
 from .xml_backend import XMLBackend
 from .errors import DeprecatedAdapterError
+from .router import get_backend_factory as _get_backend_factory
 from .spreadsheet_contract import SpreadsheetParser, SpreadsheetRenderer
 
-
-_BACKEND_SPECS = {
-    'xlsx': ('spreadsheet_handling.io_backends.xlsx.xlsx_backend', 'ExcelBackend'),
-    'ods': ('spreadsheet_handling.io_backends.ods.ods_backend', 'OdsBackend'),
-    'csv': CSVBackend,
-    'json': JSONBackend,
-    'xml': XMLBackend,
-    # aliases:
-    'excel': ('spreadsheet_handling.io_backends.xlsx.xlsx_backend', 'ExcelBackend'),
-    'calc': ('spreadsheet_handling.io_backends.ods.ods_backend', 'OdsBackend'),
-}
 
 _EXPORT_SPECS = {
     'ExcelBackend': ('spreadsheet_handling.io_backends.xlsx.xlsx_backend', 'ExcelBackend'),
@@ -33,11 +23,7 @@ def _resolve_spec(spec):
 
 
 def make_backend(kind: str) -> BackendBase:
-    try:
-        backend_cls = _resolve_spec(_BACKEND_SPECS[kind.lower()])
-    except KeyError:
-        raise ValueError(f"Unknown backend: {kind}. Available: {', '.join(sorted(_BACKEND_SPECS))}")
-    return backend_cls()
+    return _get_backend_factory(kind)()
 
 
 def __getattr__(name: str):

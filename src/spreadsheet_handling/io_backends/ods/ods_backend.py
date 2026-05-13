@@ -71,8 +71,10 @@ def save_ods(
 def load_ods(
     path: str,
     options: BackendOptions | None = None,
+    *,
+    header_levels: int = 1,
 ) -> Dict[str, pd.DataFrame]:
-    return OdsBackend().read_multi(path, header_levels=1, options=options)
+    return OdsBackend().read_multi(path, header_levels=header_levels, options=options)
 
 
 def _ensure_dataframe(obj: Any) -> pd.DataFrame:

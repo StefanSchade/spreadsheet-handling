@@ -86,9 +86,11 @@ def save_xlsx(
 def load_xlsx(
     path: str,
     options: BackendOptions | None = None,
+    *,
+    header_levels: int = 1,
 ) -> Dict[str, pd.DataFrame]:
     """Router-facing reader: read all sheets, assume single header row."""
-    return ExcelBackend().read_multi(path, header_levels=1, options=options)
+    return ExcelBackend().read_multi(path, header_levels=header_levels, options=options)
 
 
 def _ensure_dataframe(obj: Any) -> pd.DataFrame:
