@@ -1,0 +1,182 @@
+= Review: FTR-REVIEW-001-BACKEND-DISPATCH-P4A-SLICE02 — Pipeline registry split + `run_app` rename
+:date: 2026-05-13
+:reviewer: Claude Sonnet 4.6
+:commit: 0a0d172
+:status: complete
+
+== Verdict
+
+*Pass with minor notes.* No blockers; no important findings; three minor notes.
+Full test suite: 708 passed (up from 704 — four new tests added).
+
+---
+
+== Acceptance criteria
+
+All seven acceptance criteria from the slice02 FTR are satisfied:
+
+* `pipeline/registry.py` contains only `REGISTRY` + `resolve_registration` —
+  no build functions, no `run_pipeline` re-export. ✓
+* `pipeline/build.py` exists with `build_steps_from_config` /
+  `build_steps_from_yaml` (and the private `_ensure_string_parameter_keys` helper). ✓
+* `grep -rn 'run_pipeline.*AppConfig' src/` returns no matches. ✓
+* `from spreadsheet_handling.pipeline import run_app` resolves and is callable. ✓
+* `pipeline/__init__.py` exports `run_app`; `pipeline.runner.run_pipeline` no longer
+  exists. ✓
+* `pipeline/config.py::AppConfig` removes `StepRef` / `PipelineConfig`;
+  `app.pipeline` now carries the canonical step: spec list directly. ✓
+* Full test suite passes. ✓
+
+---
+
+== Module split clean?
+
+Yes. The single 261-line `registry.py` is decomposed into four single-responsibility modules:
+
+* `pipeline/registry.py` (146 lines) — `REGISTRY` table + `resolve_registration`.
+  No build logic, no execution loop, no logger.
+* `pipeline/build.py` (87 lines, new) — `build_steps_from_config`,
+  `build_steps_from_yaml`, `_ensure_string_parameter_keys`.
+* `pipeline/execution.py` (22 lines, new) — `run_pipeline(frames, steps)` only.
+  The 5-line execution loop now stands alone with its own logger.
+* `pipeline/runner.py` (45 lines) — exposes `run_app(AppConfig)` as the application
+  entry; imports from `build` and `execution`, not `registry`.
+
+The orchestrator's import was updated from
+`from ..pipeline.registry import run_pipeline` to
+`from ..pipeline.execution import run_pipeline`. The frame-level
+`run_pipeline(frames, steps)` is now properly owned by `execution.py`, and the
+old runner-shadow `run_pipeline(AppConfig)` is gone.
+
+---
+
+== Drift prevention?
+
+Strong. Three new tests close the door on regressions:
+
+* `test_pipeline_registry_runtime_authority_is_separated_from_build_and_execution`
+  (architecture/dependency_guards) — asserts `registry` does not re-acquire
+  `build_steps_from_config`, `build_steps_from_yaml`, or `run_pipeline`, and that
+  `build` and `execution` keep their respective members.
+* `test_registry_and_runner_do_not_reintroduce_shadowed_entry_points`
+  (unit/pipeline/test_public_import_surface) — asserts `runner` does not expose
+  `run_pipeline` anymore; only `run_app`.
+* `test_app_config_uses_canonical_step_pipeline_list` /
+  `test_app_config_rejects_legacy_pipeline_steps_dialect` (unit/pipeline) —
+  asserts the canonical YAML dialect is enforced and `StepRef`/`PipelineConfig`
+  are gone from the config module.
+
+Plus the existing semantic-invariants guard
+`test_pipeline_orchestration_does_not_route_on_workbook_payload_metadata` was
+extended to scan the new `build.py`, `execution.py`, and `runner.py` modules
+alongside `registry.py` and `__init__.py`.
+
+---
+
+== `AppConfig` dialect convergence handled cleanly?
+
+Yes. The migration is one-way:
+
+* `StepRef` and `PipelineConfig` dataclasses are deleted from `config.py`.
+* `AppConfig.pipeline` is now `list[dict[str, Any]]` (the `step:`-based spec list)
+  with `default_factory=list`.
+* `load_app_config` reads `cfg.get("pipeline")` and raises `ValueError("YAML key
+  'pipeline' must be a step list using the canonical step: dialect.")` if the YAML
+  contains the legacy `pipeline: {steps: [...]}` shape.
+
+The error message names the problem precisely, which is the right substitute for
+a deprecation warning in a pre-beta project.
+
+Callers were updated consistently: ten test files migrated to
+`spreadsheet_handling.pipeline.{REGISTRY, build_steps_from_config, ...}`;
+`tests/unit/io_backends/test_xlsx_writer_styling.py` removed its `PipelineConfig`
+import. Two integration tests renamed assertions to use the new `run_app` name.
+
+---
+
+== Lazy-optional-import behaviour still preserved?
+
+Yes. `test_package_import_does_not_load_spreadsheet_backend_modules` still
+passes; the pipeline rearrangement didn't touch the `io_backends/router.py`
+deferred imports of openpyxl/odfpy. `pipeline/runner.py` imports
+`get_loader, get_saver` from the router (same as slice01), so the lazy chain
+is unchanged.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+*1. `run_app` does not forward `header_levels` to the loader.*
+
+Slice01 standardized loaders to accept a keyword-only `header_levels: int = 1`.
+The orchestrator's `_load_frames` passes `header_levels=header_levels` from
+its public parameter. `run_app` calls `loader(inp.path, options=...)` without
+forwarding it, so `AppConfig`-driven workflows always read at one header row.
+This matches the old `runner.run_pipeline(AppConfig)` behaviour (no regression),
+but the asymmetry between the two entry points is worth either fixing or
+documenting:
+
+* Cheapest: add `header_levels: int = 1` to `IOEndpoint` (default 1, kept off the
+  YAML schema for now) and forward it in `run_app`.
+* Alternative: document in `AppConfig` / `run_app` that multi-header input is
+  only reachable via `orchestrate(...)`.
+
+Not blocking; mirrors prior behavior.
+
+*2. `run_app` does not wrap `ValueError` like the orchestrator does.*
+
+`_load_frames` in `orchestrator.py` wraps router `ValueError("Unknown loader
+kind: X")` into `ValueError("Unsupported input kind: 'X'")` for better
+diagnostics. `run_app` calls `get_loader(inp.kind)` directly, so a typo in
+`AppConfig.io.inputs[*].kind` surfaces as the lower-level message without the
+AppConfig context. One-liner polish:
+
+[source,python]
+----
+try:
+    loader = get_loader(inp.kind)
+except ValueError as exc:
+    raise ValueError(f"Unsupported input kind: {inp.kind!r}") from exc
+----
+
+(same for `get_saver`). Trivial; not blocking.
+
+*3. Legacy YAML dialect rejection is sharp but undocumented at the surface.*
+
+The new `load_app_config` raises `ValueError` if it sees the old
+`pipeline: {steps: [...]}` dialect. The error message is good. The
+slice02 FTR's Implementation Result notes the change but there's no
+end-user-facing release note / CHANGELOG entry; for pre-beta this is acceptable,
+but if any consumer outside the repo still ships the old dialect, they'll see
+the ValueError without a migration hint pointing at the canonical form.
+
+Cheapest fix: extend the error message to show a 2-line example of the new form:
+
+[source,python]
+----
+raise ValueError(
+    "YAML key 'pipeline' must be a step list using the canonical step: "
+    "dialect. Example:\n  pipeline:\n    - step: identity"
+)
+----
+
+Not blocking; current message already identifies the symptom and the dialect name.
+
+---
+
+== Confirmed out-of-scope items still outstanding
+
+The slice01 review's Minor 2 and Minor 3 — `LOADERS`/`SAVERS` vs. `BACKENDS`
+keyspace divergence and the missing `application/`-doesn't-bypass-router
+architecture guard — were not part of slice02 acceptance and remain candidates
+for a separate hygiene FTR. Not regressions; flagged for visibility only.
