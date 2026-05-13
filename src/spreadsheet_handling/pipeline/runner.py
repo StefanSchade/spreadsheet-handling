@@ -4,11 +4,12 @@ from __future__ import annotations
 from typing import Any
 
 from ..io_backends.router import get_loader, get_saver
+from .build import build_steps_from_config
 from .config import AppConfig
-from .registry import run_pipeline as _run_pipeline, build_steps_from_config
+from .execution import run_pipeline as _run_pipeline
 
 
-def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+def run_app(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
     Run I/O and optional pipeline steps.
     Returns: (frames, meta, issues)
@@ -25,7 +26,7 @@ def run_pipeline(app: AppConfig, run_id: str | None = None, **_: object) -> tupl
     frames = loader(inp.path, options=getattr(inp, "options", None))
 
     # --- Bind steps (may be empty) ---
-    step_specs = (app.pipeline.steps if app.pipeline else []) or []
+    step_specs = app.pipeline or []
     bound_steps = build_steps_from_config(step_specs) if step_specs else []
 
     # --- Execute only when steps are present ---

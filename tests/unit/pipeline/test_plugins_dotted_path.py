@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-TEST-HARNESS")
 

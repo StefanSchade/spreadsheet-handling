@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from spreadsheet_handling.pipeline.config import load_app_config
-from spreadsheet_handling.pipeline.runner import run_pipeline
+from spreadsheet_handling.pipeline.runner import run_app
 
 pytestmark = pytest.mark.ftr("FTR-DEMO-FREEZE")
 
@@ -34,7 +34,7 @@ def _make_config(in_dir: Path, out_path: Path, steps: list | None = None) -> dic
             "inputs": {"primary": {"kind": "json", "path": str(in_dir)}},
             "output": {"kind": "json", "path": str(out_path)},
         },
-        "pipeline": {"steps": steps or []},
+        "pipeline": steps or [],
     }
 
 
@@ -45,12 +45,12 @@ def _make_config(in_dir: Path, out_path: Path, steps: list | None = None) -> dic
 def test_consumer_import_surface():
     """Core public imports must resolve without error."""
     from spreadsheet_handling.pipeline.config import load_app_config  # noqa: F811
-    from spreadsheet_handling.pipeline.runner import run_pipeline  # noqa: F811
+    from spreadsheet_handling.pipeline.runner import run_app  # noqa: F811
     from spreadsheet_handling.pipeline import build_steps_from_config
     from spreadsheet_handling.application.orchestrator import orchestrate
 
     assert callable(load_app_config)
-    assert callable(run_pipeline)
+    assert callable(run_app)
     assert callable(build_steps_from_config)
     assert callable(orchestrate)
 
@@ -65,7 +65,7 @@ def test_consumer_roundtrip_json_to_json(tmp_path: Path):
     cfg_file.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
     app = load_app_config(str(cfg_file))
-    frames, meta, issues = run_pipeline(app, run_id="demo-smoke")
+    frames, meta, issues = run_app(app, run_id="demo-smoke")
 
     assert "products" in frames
     assert frames["products"].shape[0] == 1
@@ -80,7 +80,7 @@ def test_consumer_roundtrip_json_to_xlsx(tmp_path: Path):
             "inputs": {"primary": {"kind": "json", "path": str(in_dir)}},
             "output": {"kind": "xlsx", "path": str(out_xlsx)},
         },
-        "pipeline": {"steps": []},
+        "pipeline": [],
         "excel": {
             "auto_filter": True,
             "header_fill_rgb": "DDDDDD",
@@ -91,7 +91,7 @@ def test_consumer_roundtrip_json_to_xlsx(tmp_path: Path):
     cfg_file.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
     app = load_app_config(str(cfg_file))
-    frames, meta, issues = run_pipeline(app, run_id="demo-smoke")
+    frames, meta, issues = run_app(app, run_id="demo-smoke")
 
     assert out_xlsx.exists()
     assert out_xlsx.stat().st_size > 0

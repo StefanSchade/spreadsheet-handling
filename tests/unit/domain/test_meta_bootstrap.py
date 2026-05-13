@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta, deep_merge
-from spreadsheet_handling.pipeline.registry import REGISTRY, build_steps_from_config
+from spreadsheet_handling.pipeline import REGISTRY, build_steps_from_config
 from spreadsheet_handling.pipeline.steps import make_bootstrap_meta_step
 from spreadsheet_handling.rendering.ir import SheetIR
 

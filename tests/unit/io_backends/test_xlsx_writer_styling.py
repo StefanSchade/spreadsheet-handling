@@ -4,13 +4,13 @@ import pandas as pd
 import pytest
 from pathlib import Path
 from openpyxl import load_workbook
-from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, PipelineConfig, ExcelOptions
+from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint, ExcelOptions
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import write_xlsx
 
 def _ctx(tmp_path: Path):
     app = AppConfig(
         io=IOConfig(inputs={"primary": IOEndpoint(kind="json", path="unused")}, output=IOEndpoint(kind="xlsx", path=str(tmp_path/"out.xlsx"))),
-        pipeline=PipelineConfig(steps=[]),
+        pipeline=[],
         excel=ExcelOptions(auto_filter=True, header_fill_rgb="DDDDDD", freeze_header=False, helper_fill_rgb="FFF5CC"),
         strict=True,
     )

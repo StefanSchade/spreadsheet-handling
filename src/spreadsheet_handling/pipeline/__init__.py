@@ -1,5 +1,8 @@
 from .config import AppConfig, load_app_config
-from .registry import REGISTRY, build_steps_from_config, build_steps_from_yaml, run_pipeline
+from .build import build_steps_from_config, build_steps_from_yaml
+from .execution import run_pipeline
+from .registry import REGISTRY
+from .runner import run_app
 from .steps import (
     make_apply_fks_step,
     make_apply_overrides_step,
@@ -15,6 +18,7 @@ __all__ = [
     "Step",
     "StepRegistration",
     "run_pipeline",
+    "run_app",
     "build_steps_from_config",
     "build_steps_from_yaml",
     "make_identity_step",

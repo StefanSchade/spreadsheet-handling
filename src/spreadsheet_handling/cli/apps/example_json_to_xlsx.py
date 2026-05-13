@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from spreadsheet_handling.application.orchestrator import orchestrate
-from spreadsheet_handling.pipeline.registry import build_steps_from_yaml
+from spreadsheet_handling.pipeline import build_steps_from_yaml
 from spreadsheet_handling.pipeline.steps import make_bootstrap_meta_step
 
 

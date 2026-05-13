@@ -28,7 +28,10 @@ META_REGISTRY_PATH = (
 
 PIPELINE_ORCHESTRATION_PATHS = [
     REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "__init__.py",
+    REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "build.py",
+    REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "execution.py",
     REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "registry.py",
+    REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "runner.py",
 ]
 
 ALLOWED_COMPOSITE_METADATA_POLICIES = {

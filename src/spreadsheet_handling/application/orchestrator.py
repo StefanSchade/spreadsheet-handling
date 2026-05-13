@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, Mapping
 import logging
 
 from ..io_backends.router import get_loader, get_saver
-from ..pipeline.registry import run_pipeline
+from ..pipeline.execution import run_pipeline
 from ..pipeline.types import BoundStep, Frames
 
 log = logging.getLogger("sheets.orchestrator")

@@ -5,7 +5,7 @@ import pytest
 
 from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.workbook_views import configure_workbook_view
-from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
 

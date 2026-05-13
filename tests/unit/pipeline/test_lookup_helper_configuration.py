@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.registry import REGISTRY, build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import REGISTRY, build_steps_from_config, run_pipeline
 from spreadsheet_handling.pipeline.types import StepRegistration
 
 

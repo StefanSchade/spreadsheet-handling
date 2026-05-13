@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 
 def test_pipeline_steps_preserve_meta_sidecar_and_skip_reserved_keys() -> None:

@@ -1,6 +1,6 @@
 import pandas as pd
 
-from spreadsheet_handling.pipeline.registry import (
+from spreadsheet_handling.pipeline import (
     build_steps_from_config,
     run_pipeline,
 )

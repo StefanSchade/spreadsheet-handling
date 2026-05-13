@@ -1,16 +1,15 @@
-"""Step registry and configuration binding.
+"""Step registry authority for canonical pipeline step names.
 
-Maps step names (strings) to factory functions and provides
-config-driven pipeline construction from dicts or YAML.
+Maps step names (strings) to factory functions or registrations. Binding
+configuration into executable steps lives in pipeline/build.py.
 """
 
 from __future__ import annotations
 
-import logging
 import importlib
-from typing import Any, Dict, Iterable, Mapping
+from typing import Dict
 
-from .types import BoundStep, Frames, Step, StepFactory, StepRegistration
+from .types import StepFactory, StepRegistration
 
 from .steps import (
     make_builder_target_step,
@@ -22,28 +21,6 @@ from .steps import (
     make_check_fk_helpers_step,
     make_plugin_step,
 )
-
-log = logging.getLogger("sheets.pipeline")
-
-
-# ---------------------------------------------------------------------------
-# Pipeline runner
-# ---------------------------------------------------------------------------
-
-
-def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
-    out = frames
-    for step in steps:
-        log.debug(
-            "-> step: %s config=%s", getattr(step, "name", "<unnamed>"), getattr(step, "config", {})
-        )
-        out = step(out)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
 
 REGISTRY: Dict[str, StepRegistration | StepFactory] = {
     "identity": make_identity_step,
@@ -159,103 +136,15 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Config binding
-# ---------------------------------------------------------------------------
-
-
-def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
-    """
-    Build steps from a config list like:
-      - step: validate
-        mode_duplicate_ids: warn
-      - step: my_project.steps:make_extract_subset_step
-        table: Orders
-    Supported 'step' values:
-      1) registry key (see REGISTRY)
-      2) dotted path '<module>:<factory_function>'
-    """
-
-    def resolve_registration(step_id: str) -> StepRegistration | None:
-        entry = REGISTRY.get(step_id)
-        if entry:
-            return entry if isinstance(entry, StepRegistration) else StepRegistration(factory=entry)
-        if ":" in step_id:
-            mod_name, func_name = step_id.split(":", 1)
-            mod = importlib.import_module(mod_name)
-            factory = getattr(mod, func_name, None)
-            if factory is None:
-                raise AttributeError(f"Factory '{func_name}' not found in module '{mod_name}'")
-            return StepRegistration(factory=factory)
-        return None
-
-    steps: list[BoundStep] = []
-    for raw in step_specs:
-        spec = dict(raw)
-        step_id = spec.pop("step", None)
-        if not step_id:
-            raise ValueError(f"Step spec missing 'step': {raw}")
-        _ensure_string_parameter_keys(step_id, spec)
-
-        registration = resolve_registration(step_id)
-        if not registration:
-            raise KeyError(f"Unknown step '{step_id}'. Known registry keys: {list(REGISTRY)}")
-
-        name = spec.pop("name", None)
-        factory_kwargs = dict(spec)
-        if registration.target is not None:
-            factory_kwargs["target"] = registration.target
-        if name is not None:
-            factory_kwargs["name"] = name
-        elif registration.target is not None:
-            factory_kwargs["name"] = step_id
-
-        try:
-            bound = registration.factory(**factory_kwargs)  # type: ignore[arg-type]
-        except TypeError:
-            if name is not None:
-                tmp = registration.factory(**spec)  # type: ignore[arg-type]
-                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
-            else:
-                raise
-        steps.append(bound)
-    return steps
-
-
-def _ensure_string_parameter_keys(step_id: str, spec: Mapping[Any, Any]) -> None:
-    non_string_keys = [key for key in spec if not isinstance(key, str)]
-    if not non_string_keys:
-        return
-
-    hint = ""
-    if step_id == "add_lookup_helpers" and True in non_string_keys:
-        hint = (
-            " This commonly means an unquoted YAML 1.1 boolean-like key such "
-            "as `on:` was parsed as True; prefer `key:`/`keys:` or quote the "
-            'legacy spelling as `"on":`.'
-        )
-    raise ValueError(
-        f"Step {step_id!r} contains non-string parameter key(s) {non_string_keys!r}." f"{hint}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# YAML convenience
-# ---------------------------------------------------------------------------
-
-try:
-    import yaml
-except Exception:  # pragma: no cover
-    yaml = None  # type: ignore[assignment]
-
-
-def build_steps_from_yaml(path: str) -> list[BoundStep]:
-    """Load a pipeline spec from YAML (expects top-level key 'pipeline': [...])."""
-    if yaml is None:
-        raise RuntimeError("PyYAML not installed; install with [dev] or add pyyaml to deps.")
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    specs = cfg.get("pipeline")
-    if not isinstance(specs, list):
-        raise ValueError(f"YAML missing 'pipeline' list: {path}")
-    return build_steps_from_config(specs)
+def resolve_registration(step_id: str) -> StepRegistration | None:
+    entry = REGISTRY.get(step_id)
+    if entry:
+        return entry if isinstance(entry, StepRegistration) else StepRegistration(factory=entry)
+    if ":" in step_id:
+        mod_name, func_name = step_id.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        factory = getattr(mod, func_name, None)
+        if factory is None:
+            raise AttributeError(f"Factory '{func_name}' not found in module '{mod_name}'")
+        return StepRegistration(factory=factory)
+    return None

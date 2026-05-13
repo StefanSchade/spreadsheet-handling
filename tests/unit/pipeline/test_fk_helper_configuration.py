@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.core.indexing import level0_series
-from spreadsheet_handling.pipeline.registry import (
+from spreadsheet_handling.pipeline import (
     REGISTRY,
     build_steps_from_config,
     run_pipeline,

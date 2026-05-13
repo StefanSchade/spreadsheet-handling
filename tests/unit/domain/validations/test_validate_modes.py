@@ -7,7 +7,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.registry import run_pipeline
+from spreadsheet_handling.pipeline import run_pipeline
 from spreadsheet_handling.pipeline.steps import make_validate_step
 
 

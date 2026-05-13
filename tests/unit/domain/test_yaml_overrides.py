@@ -7,7 +7,7 @@ import yaml
 
 from spreadsheet_handling.domain.yaml_overrides import load_overrides, apply_overrides
 from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
-from spreadsheet_handling.pipeline.registry import (
+from spreadsheet_handling.pipeline import (
     REGISTRY,
     build_steps_from_config,
 )

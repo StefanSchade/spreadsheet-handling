@@ -5,7 +5,7 @@ import pytest
 
 from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.transformations.join_views import join_frames
-from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-SIMPLE-JOIN-VIEWS-P4A")
 

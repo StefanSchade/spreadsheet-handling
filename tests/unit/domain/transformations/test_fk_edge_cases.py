@@ -12,7 +12,7 @@ from spreadsheet_handling.core.fk import (
     assert_no_parentheses_in_columns,
 )
 from spreadsheet_handling.core.indexing import level0_series
-from spreadsheet_handling.pipeline.registry import run_pipeline
+from spreadsheet_handling.pipeline import run_pipeline
 from spreadsheet_handling.pipeline.steps import (
     make_apply_fks_step,
     make_reorder_helpers_step,

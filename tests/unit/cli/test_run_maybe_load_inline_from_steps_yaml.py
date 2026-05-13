@@ -15,8 +15,8 @@ def test_maybe_load_inline_config_keeps_io_and_pipeline_keys(tmp_path):
                     "input": {"kind": "json_dir", "path": "in"},
                     "output": {"kind": "json_dir", "path": "out"},
                 },
-                "pipelines": {"clean": [{"factory": "p.mod:make", "args": {}}]},
-                "pipeline": [{"factory": "p.mod:make", "args": {}}],
+                "pipelines": {"clean": [{"step": "identity"}]},
+                "pipeline": [{"step": "identity"}],
             }
         ),
         encoding="utf-8",

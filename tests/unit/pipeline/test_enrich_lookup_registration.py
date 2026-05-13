@@ -6,7 +6,7 @@ import textwrap
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.pipeline.registry import (
+from spreadsheet_handling.pipeline import (
     REGISTRY,
     build_steps_from_config,
     build_steps_from_yaml,

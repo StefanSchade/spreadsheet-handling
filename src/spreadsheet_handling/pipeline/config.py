@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import yaml
 
 
@@ -24,19 +24,9 @@ class IOConfig:
     output: IOEndpoint
 
 @dataclass
-class StepRef:
-    name: Optional[str]
-    dotted: str
-    args: Dict[str, Any] | None = None
-
-@dataclass
-class PipelineConfig:
-    steps: List[StepRef]
-
-@dataclass
 class AppConfig:
     io: IOConfig
-    pipeline: PipelineConfig
+    pipeline: list[dict[str, Any]] = field(default_factory=list)
     excel: ExcelOptions = field(default_factory=ExcelOptions)
     strict: bool = False
 
@@ -49,23 +39,16 @@ def load_app_config(path: str) -> AppConfig:
     inputs_cfg = io_cfg.get("inputs", {}) or {}
     output_cfg = io_cfg.get("output", {}) or {}
 
-    steps_cfg = ((cfg.get("pipeline", {}) or {}).get("steps", [])) or []
+    pipeline_cfg = cfg.get("pipeline") or []
+    if not isinstance(pipeline_cfg, list):
+        raise ValueError("YAML key 'pipeline' must be a step list using the canonical step: dialect.")
 
     return AppConfig(
         io=IOConfig(
             inputs={k: IOEndpoint(**v) for k, v in inputs_cfg.items()},
             output=IOEndpoint(**output_cfg),
         ),
-        pipeline=PipelineConfig(
-            steps=[
-                StepRef(
-                    name=s.get("name"),
-                    dotted=(s.get("factory") or s.get("dotted")),
-                    args=s.get("args") or {},
-                )
-                for s in steps_cfg
-            ]
-        ),
+        pipeline=[dict(step) for step in pipeline_cfg],
         excel=ExcelOptions(**(cfg.get("excel") or {})),
         strict=bool(cfg.get("strict", False)),
     )

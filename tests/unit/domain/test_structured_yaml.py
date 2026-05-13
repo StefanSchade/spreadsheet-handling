@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from spreadsheet_handling.domain.structured_yaml import write_structured_yaml
-from spreadsheet_handling.pipeline.registry import (
+from spreadsheet_handling.pipeline import (
     REGISTRY,
     build_steps_from_config,
     run_pipeline,

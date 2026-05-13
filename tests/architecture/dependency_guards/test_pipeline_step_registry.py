@@ -8,6 +8,9 @@ from typing import Any
 import pytest
 import yaml
 
+import spreadsheet_handling.pipeline.build as build_module
+import spreadsheet_handling.pipeline.execution as execution_module
+import spreadsheet_handling.pipeline.registry as registry_module
 from spreadsheet_handling.pipeline.registry import REGISTRY
 from spreadsheet_handling.pipeline.types import StepRegistration
 
@@ -78,6 +81,19 @@ def test_pipeline_step_registry_covers_runtime_registry_exactly() -> None:
     assert len(entries) == len(registry["entries"])
     assert set(entries) == set(REGISTRY)
     assert {entry["runtime_name"] for entry in entries.values()} == set(REGISTRY)
+
+
+@pytest.mark.ftr("FTR-REVIEW-001-BACKEND-DISPATCH-P4A-SLICE02")
+def test_pipeline_registry_runtime_authority_is_separated_from_build_and_execution() -> None:
+    assert hasattr(registry_module, "REGISTRY")
+    assert hasattr(registry_module, "resolve_registration")
+    assert not hasattr(registry_module, "build_steps_from_config")
+    assert not hasattr(registry_module, "build_steps_from_yaml")
+    assert not hasattr(registry_module, "run_pipeline")
+
+    assert callable(build_module.build_steps_from_config)
+    assert callable(build_module.build_steps_from_yaml)
+    assert callable(execution_module.run_pipeline)
 
 
 def test_pipeline_step_registry_entries_have_required_shape_and_enums() -> None:

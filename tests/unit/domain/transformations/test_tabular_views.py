@@ -5,7 +5,7 @@ import pytest
 
 from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
-from spreadsheet_handling.pipeline.registry import build_steps_from_config, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-DECLARATIVE-TABULAR-VIEW-OPS-P4A")
 

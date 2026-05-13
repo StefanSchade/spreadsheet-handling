@@ -33,26 +33,26 @@ def test_steps_yaml_path_takes_precedence(patch_builders):
 
 
 def test_named_pipeline_builds_steps_from_config(patch_builders):
-    cfg = {"pipelines": {"clean": [{"factory": "x", "args": {}}]}}
+    cfg = {"pipelines": {"clean": [{"step": "identity"}]}}
     out = runmod._select_pipeline_steps(cfg, pipeline_name="clean", steps_yaml=None, profile=None)
     assert out == ["S:cfg"]
-    assert patch_builders["config"] == [{"factory": "x", "args": {}}]
+    assert patch_builders["config"] == [{"step": "identity"}]
 
 
 def test_profile_pipeline_builds_steps_from_config(patch_builders):
     cfg = {
         "io": {"profiles": {"local": {"pipeline": "clean"}}},
-        "pipelines": {"clean": [{"factory": "x", "args": {}}]},
+        "pipelines": {"clean": [{"step": "identity"}]},
     }
     out = runmod._select_pipeline_steps(cfg, pipeline_name=None, steps_yaml=None, profile="local")
     assert out == ["S:cfg"]
 
 
 def test_top_level_pipeline_is_used_when_no_pipeline_name_is_selected(patch_builders):
-    cfg = {"pipeline": [{"factory": "y", "args": {"a": 1}}]}
+    cfg = {"pipeline": [{"step": "validate", "mode_duplicate_ids": "warn"}]}
     out = runmod._select_pipeline_steps(cfg, pipeline_name=None, steps_yaml=None, profile=None)
     assert out == ["S:cfg"]
-    assert patch_builders["config"] == [{"factory": "y", "args": {"a": 1}}]
+    assert patch_builders["config"] == [{"step": "validate", "mode_duplicate_ids": "warn"}]
 
 
 def test_unknown_named_pipeline_raises():

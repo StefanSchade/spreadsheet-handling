@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from spreadsheet_handling.pipeline.registry import build_steps_from_yaml, run_pipeline
+from spreadsheet_handling.pipeline import build_steps_from_yaml, run_pipeline
 
 
 pytestmark = pytest.mark.ftr("FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A")
