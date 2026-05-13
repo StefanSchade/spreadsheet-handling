@@ -1,0 +1,177 @@
+= Review: FTR-REVIEW-001-FORMULAS-CORE-MOVE-P3
+:date: 2026-05-12
+:reviewer: Claude Sonnet 4.6
+:commits: 773325c → a829990
+:status: complete
+
+== Verdict
+
+*Pass with minor notes.* No blockers; one important note; two minor notes.
+Full test suite: 700 passed.
+
+---
+
+== D-001 / IR-002 — Layer violation closed?
+
+Yes, completely.
+
+* `rendering/formulas.py` moved to `core/formulas.py` via `git mv` — file history
+  preserved.
+* All import sites updated (25 references in `src/` and `tests/`).
+* `grep -r 'from.*rendering.formulas' src/` returns zero matches (only the
+  stale `SOURCES.txt` egg-info artifact remains — build artifact, not a code issue).
+* The new guard `test_domain_modules_do_not_import_rendering_or_io_backends` covers
+  both `domain/` and `core/` and passes on all 13 boundary guard tests.
+* `architecture_guard_inventory.adoc` updated to mention the L1 guard.
+* `architecture_primer.adoc` updated with "New backend-neutral structural formula
+  intent → `core/formulas.py`" in the "Where new code belongs" table.
+
+---
+
+== D-014 — Dead `missing_mode` branch removed?
+
+Yes. The original dead code:
+
+[source,python]
+----
+missing = "" if missing_mode == "empty" else ""   # both branches ""
+----
+
+is replaced by an explicit early `ValueError` for `missing="fail"` in formula
+mode and a direct `missing=""` for all other modes. The two branches are now
+distinct and the dead assignment is gone.
+
+Test `test_formula_mode_rejects_fail_missing_mode` exercises the new error path.
+
+---
+
+== Is `core.formulas` neutral?
+
+Yes. The module is pure stdlib (`dataclasses`, `typing`). No openpyxl, no odfpy,
+no rendering logic, no backend syntax. The four exported types
+(`ListLiteralFormulaSpec`, `LookupFormulaSpec`, `FormulaSpec`, factory functions)
+are frozen dataclasses carrying intent only.
+
+---
+
+== Do rendering and adapter layers still own backend translation?
+
+Yes. `odf_renderer.py` and `openpyxl_renderer.py` import `FormulaSpec` from
+`core.formulas` and translate it to backend formula strings. `core.formulas`
+has no knowledge of Excel/ODS formula syntax. The separation is unchanged.
+
+---
+
+== Is removal without compatibility alias acceptable?
+
+Yes. Pre-beta policy; `interfaces_and_gates.adoc` does not list
+`rendering.formulas` as a gated consumer surface. Removing the alias
+immediately enforces the L1 guard — keeping an alias would have required
+a guard exclusion and deferred the cleanup.
+
+---
+
+== Is the guard strong enough without becoming brittle?
+
+Largely yes, with one minor precision note (see below).
+
+The guard iterates `_package_modules(root)` for both `DOMAIN_ROOT` and
+`CORE_ROOT` and calls `_assert_no_import_prefixes` — the same static
+source-scan approach used by all other boundary guards. Including `core/`
+alongside `domain/` is correct because `core/` is the leaf layer; the
+existing `test_core_modules_remain_leaf_only` already prevents `core →
+domain`, and the new guard adds `core → rendering/io_backends`. The guard
+is consistent with the overall architecture test pattern.
+
+---
+
+== `missing='fail'` rejection — justified?
+
+Yes. In formula mode, the lookup formula runs in the spreadsheet engine at
+render time. There is no Python-side mechanism to check for unmatched rows
+(the formula just returns `missing=""` when no row is found). Raising
+`ValueError` is correct and the error message is clear:
+
+----
+missing='fail' cannot be enforced with helper_value_mode='formula';
+use missing='empty' or value mode
+----
+
+The prior behavior was silent: the `missing_mode` parameter was a complete
+no-op in formula mode (both branches of the dead ternary produced `""`).
+The new behavior is a pre-beta breaking change from "silently accepted" to
+"explicit error." See important finding below.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+*`missing="fail"` with formula mode is a behavioral breaking change not
+documented in the FTR.*
+
+The old behavior: `enrich_lookup(missing="fail", helper_value_mode="formula")`
+completed without error (missing_mode was silently a no-op). The new
+behavior: `ValueError` is raised.
+
+This is the *correct* fix for D-014. However:
+
+* The FTR does not call this a breaking change — it only says "make the two
+  branches distinct." A caller who relied on the silent acceptance (intentionally
+  or not) will now get a runtime error without any migration path.
+* The error surfaces *late* — `_VALID_MISSING_MODES = {"fail", "empty"}`
+  still includes "fail", so the top-level mode validation at line 92 passes.
+  The `ValueError` only fires inside `_build_formula_enrichment`, which is
+  several frames deeper. This is unintuitive: the caller sees that "fail" is
+  an accepted mode string, then gets an error later.
+
+*Recommended fix* — raise early in `enrich_lookup` when the incompatible
+combination is detected, before dispatching to `_build_formula_enrichment`:
+
+[source,python]
+----
+# in enrich_lookup, after resolving use_formulas and missing_mode
+if use_formulas and missing_mode == "fail":
+    raise ValueError(
+        "missing='fail' cannot be enforced with helper_value_mode='formula'; "
+        "use missing='empty' or value mode"
+    )
+----
+
+Then remove the duplicate check inside `_build_formula_enrichment`. This
+makes the validation visible at the entry point and removes a private function
+that silently knows about public-parameter constraints.
+
+The existing test already covers the error; only the location moves.
+
+=== Minor
+
+*1. Guard prefix "rendering" is slightly under-specified.*
+
+The `forbidden_prefixes` tuple includes both `"rendering"` and
+`"spreadsheet_handling.rendering"`. The short form `"rendering"` would
+spuriously match a hypothetical `rendering_helper.py` file placed in `domain/`
+or `core/`. In practice no such file exists and the static scanner is
+import-string based (not filename based), so this is not a real issue today.
+If the guard is extended in future, using only fully-qualified prefixes
+(`"spreadsheet_handling.rendering"`, `"spreadsheet_handling.io_backends"`)
+would be more precise.
+
+*2. `architecture_primer.adoc` guardrails section does not reflect L1 closure.*
+
+Line 208 still reads "Architecture tests in `tests/architecture/` enforce layer
+boundaries automatically" without enumerating which edges are covered or which
+remain open (L2, L3, L5 etc.). This was flagged as a category-(a) correction
+in `review-consolidation.adoc` (recommending "enforce *the boundaries enumerated
+in `architecture_guard_inventory.adoc`*; known uncovered edges as of 2026-05:
+…"). Closing L1 makes this more urgent — the list of open gaps has shrunk by
+one and the primer should reflect the current state.
+
+This is pre-existing and not introduced by this FTR; it belongs to the
+category-(a) doc-fix backlog from the review. Low immediate impact since
+`architecture_guard_inventory.adoc` was correctly updated.

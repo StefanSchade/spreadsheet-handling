@@ -117,6 +117,12 @@ def enrich_lookup(
 
     use_formulas = value_mode in _FORMULA_MODES
 
+    if use_formulas and missing_mode == "fail":
+        raise ValueError(
+            "missing='fail' cannot be enforced with helper_value_mode='formula'; "
+            "use missing='empty' or value mode"
+        )
+
     if use_formulas and sort_by:
         lookup_sort_cols = [c for c in sort_by if c not in source_df.columns]
         if lookup_sort_cols:
@@ -475,11 +481,6 @@ def _build_formula_enrichment(
     missing_mode: str,
 ) -> pd.DataFrame:
     """Build an enriched frame with LookupFormulaSpec objects as cell values."""
-    if missing_mode == "fail":
-        raise ValueError(
-            "missing='fail' cannot be enforced with helper_value_mode='formula'; "
-            "use missing='empty' or value mode"
-        )
     enriched = source_df.copy()
     source_key = join_keys[0]
     for field in fields:
