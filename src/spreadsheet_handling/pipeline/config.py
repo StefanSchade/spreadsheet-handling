@@ -17,6 +17,7 @@ class IOEndpoint:
     kind: str
     path: str
     options: Dict[str, Any] | None = None
+    header_levels: int = 1
 
 @dataclass
 class IOConfig:
@@ -41,7 +42,10 @@ def load_app_config(path: str) -> AppConfig:
 
     pipeline_cfg = cfg.get("pipeline") or []
     if not isinstance(pipeline_cfg, list):
-        raise ValueError("YAML key 'pipeline' must be a step list using the canonical step: dialect.")
+        raise ValueError(
+            "YAML key 'pipeline' must be a step list using the canonical step: dialect. "
+            "Example: pipeline: - step: identity"
+        )
 
     return AppConfig(
         io=IOConfig(

@@ -20,10 +20,17 @@ def run_app(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dic
     if not io.inputs:
         raise SystemExit("No inputs configured.")
     inp_name, inp = next(iter(io.inputs.items()))
-    loader = get_loader(inp.kind)
+    try:
+        loader = get_loader(inp.kind)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported input kind: {inp.kind!r}") from exc
 
     # Loaders may accept 'options'; backends handle None themselves.
-    frames = loader(inp.path, options=getattr(inp, "options", None))
+    frames = loader(
+        inp.path,
+        options=getattr(inp, "options", None),
+        header_levels=getattr(inp, "header_levels", 1),
+    )
 
     # --- Bind steps (may be empty) ---
     step_specs = app.pipeline or []
@@ -35,7 +42,10 @@ def run_app(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dic
 
     # --- Write output ---
     out = io.output
-    saver = get_saver(out.kind)
+    try:
+        saver = get_saver(out.kind)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported output kind: {out.kind!r}") from exc
     saver(frames, out.path, options=getattr(out, "options", None))
 
     # Meta/issues are still empty; keep the API stable.
