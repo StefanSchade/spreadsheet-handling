@@ -1,0 +1,188 @@
+= Review: FTR-REVIEW-001-BACKEND-DISPATCH-P4A — Slice 01 (backend-dispatch only)
+:date: 2026-05-13
+:reviewer: Claude Sonnet 4.6
+:commit: 573b428
+:status: complete
+
+== Scope of this review
+
+Commit `573b428` implements only the backend-dispatch slice of the original FTR.
+The following original-FTR items are *explicitly deferred to a follow-up FTR*
+(`FTR-REVIEW-001-BACKEND-DISPATCH-P4A_slice02.adoc`) and are not assessed here:
+
+* `pipeline/registry.py` split into `registry.py` + `build.py` (IR-010).
+* `pipeline/runner.py::run_pipeline(AppConfig)` → `run_app(AppConfig)` rename (A-010).
+* `AppConfig` dialect cleanup / convergence on `step:`-based YAML (IR-012).
+* dotted-path / plugin mechanism changes.
+* broader Python public API cleanup.
+
+== Verdict
+
+*Pass with minor notes.* No blockers; no important findings; three minor notes.
+Full test suite: 704 passed (up from 702 — two new tests added).
+
+---
+
+== Acceptance criteria addressed by this slice
+
+* `grep -rn '_BACKEND_SPECS' src/` → no matches. ✓
+* `orchestrator.py::_load_frames` / `_save_frames` no longer have hardcoded
+  if/elif kind branches; both use `get_loader` / `get_saver`. ✓
+* `orchestrate(input={"kind": "csv_dir", ...})` completes — new integration test
+  `test_csv_dir_to_json_via_orchestrate` exercises it end-to-end. ✓
+* Lazy-import test added: `test_package_import_does_not_load_spreadsheet_backend_modules`
+  asserts that `openpyxl`, `odf`, and the `io_backends.xlsx` / `io_backends.ods`
+  submodules are absent from `sys.modules` after `import spreadsheet_handling.io_backends`. ✓
+* Full test suite passes. ✓
+
+Items deferred (see slice02 FTR): `pipeline/registry.py` split,
+`run_app` rename, `AppConfig` dialect convergence.
+
+---
+
+== Single canonical backend-dispatch owner?
+
+Yes. `io_backends/router.py` now owns the dispatch with three tables:
+
+* `LOADERS: dict[str, Callable]` — kind → loader function (existing).
+* `SAVERS: dict[str, Callable]` — kind → saver function (existing).
+* `BACKENDS: dict[str, BackendSpec]` — kind → factory (new; replaces the old
+  `_BACKEND_SPECS` from `io_backends/__init__.py`).
+
+`io_backends/__init__.py::make_backend` is now a one-liner delegating to
+`router.get_backend_factory(kind)`. The `_BACKEND_SPECS` table is gone.
+`grep -rn 'BACKENDS' src/spreadsheet_handling/io_backends/` returns matches only
+inside `router.py`.
+
+The orchestrator's old eager imports (`JSONBackend`, `OdsBackend`, `XMLBackend`,
+`ExcelBackend`, `_yaml_load`, `_yaml_save`) are removed; only
+`get_loader, get_saver` are imported from router. This is a hidden bonus of
+this slice: orchestrator import no longer drags in the optional backend modules.
+
+---
+
+== Lazy-optional-import behaviour preserved?
+
+Yes, and verified by a new test.
+
+* `BACKENDS` table uses the tuple form `("...xlsx_backend", "ExcelBackend")` for
+  xlsx/excel/ods/calc; `_resolve_backend_spec` calls `import_module` only when
+  `make_backend(kind)` is invoked.
+* `LOADERS`/`SAVERS` still wrap xlsx/ods loaders/savers in `_lazy_callable`.
+* `router.py` itself eagerly imports `CSVBackend`, `JSONBackend`, `XMLBackend`,
+  and `load_yaml_dir`/`save_yaml_dir` — none of these pull in `openpyxl` or `odf`.
+  Verified by the new lazy test.
+
+The new test `test_package_import_does_not_load_spreadsheet_backend_modules`
+adds protection one level deeper than the pre-existing
+`test_xlsx_import_paths_do_not_require_optional_odf_dependency`: it asserts that
+even `io_backends.xlsx` / `io_backends.ods` subpackage modules are not loaded by
+the bare package import. This is the right regression guard for this refactor.
+
+---
+
+== Loader signature changes minimal and safe?
+
+Yes. Each loader gained a keyword-only `header_levels: int = 1` parameter:
+
+* `load_csv_dir`, `load_xlsx`, `load_ods` — previously hardcoded
+  `header_levels=1` inside the body; now accept the kwarg and forward it.
+* `load_yaml_dir` — accepts the kwarg but ignores it (YAML has no header concept).
+
+All four are backward-compatible: existing positional callers
+(`saver(frames, path, options=...)`) still work. The orchestrator passes
+`header_levels=header_levels` through `get_loader(...)` to all loaders uniformly,
+which is the point of the change.
+
+See Minor 1 for the cosmetic note on `load_yaml_dir`.
+
+---
+
+== `make_backend` public-API stable?
+
+Yes. `io_backends.__init__.make_backend` keeps the same signature
+(`make_backend(kind: str) -> BackendBase`) and same accepted kind set
+(`xlsx`, `excel`, `ods`, `calc`, `csv`, `json`, `xml`). Existing callers
+(`tests/integration/io_backends/ods/test_ods_adapter_roundtrip.py`,
+`tests/unit/io_backends/test_adapter_deprecation_stubs.py`) continue to pass
+without modification. Error message format ("Unknown backend: kind. Available: …")
+is preserved.
+
+`_EXPORT_SPECS` and the module `__getattr__` lazy attribute resolver for
+`ExcelBackend`/`OdsBackend` are untouched — `from spreadsheet_handling.io_backends
+import ExcelBackend` still works lazily.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+*1. `load_yaml_dir` accepts but ignores `header_levels`.*
+
+Adding the kwarg gives uniform call-shape across all loaders, which is what the
+orchestrator needs. YAML files have no concept of header rows, so the parameter
+is silently dropped. Acceptable for signature uniformity, but readers may wonder.
+Either (a) drop the parameter and special-case yaml in the orchestrator —
+unattractive because it brings back kind-aware dispatch — or (b) add a one-line
+docstring note: "`header_levels` is accepted for router compatibility and ignored —
+YAML has no header concept." Option (b) is the cheapest fix.
+
+*2. `BACKENDS` keyspace differs from `LOADERS` / `SAVERS` keyspace.*
+
+`BACKENDS` keys are `{xlsx, excel, ods, calc, csv, json, xml}` (from the old
+`_BACKEND_SPECS`). `LOADERS` / `SAVERS` keys are `{csv_dir, ods, calc, xlsx,
+excel, json_dir, json, yaml_dir, yaml, xml_dir, xml}`. So:
+
+* `make_backend("csv_dir")` → ValueError (only `"csv"` works).
+* `make_backend("yaml")` / `make_backend("yaml_dir")` → ValueError (no entries).
+* `get_loader("csv")` → ValueError (only `"csv_dir"` works).
+
+The split pre-existed; this commit preserves it for backward compatibility. The
+two APIs serve different callers (`make_backend` returns a class instance;
+`get_loader`/`get_saver` returns module-level functions). Long-term cleanup
+candidate — would require deciding on a single kind vocabulary. Worth a
+follow-up note in slice02 or a separate hygiene FTR, not blocking here.
+
+*3. No architecture guard prevents `application/` from importing backend
+implementations directly again.*
+
+The commit removes orchestrator's direct imports of `JSONBackend`, `ExcelBackend`,
+etc., but nothing in `tests/architecture/` forbids them from coming back. The
+lazy-import test catches the openpyxl/odf eager-load symptom, but not the more
+general "orchestrator-bypasses-router" pattern (e.g., importing `CSVBackend`
+directly does not trigger any optional dependency and would slip past the lazy
+test). Consider adding a guard along the lines of
+`test_application_routes_io_through_router`: assert that
+`src/spreadsheet_handling/application/orchestrator.py` does not contain any
+`from spreadsheet_handling.io_backends.{csv,json,xml,yaml,xlsx,ods}` import.
+Low priority; would freeze the new boundary explicitly.
+
+---
+
+== Deferred to slice02 (not findings against this commit)
+
+The following original-FTR items remain *open* and are captured in a new
+`FTR-REVIEW-001-BACKEND-DISPATCH-P4A_slice02.adoc`:
+
+* Split `pipeline/registry.py` (261 lines) into `registry.py` (REGISTRY +
+  `resolve_registration` only) and a new `pipeline/build.py`
+  (`build_steps_from_config`, `build_steps_from_yaml`). IR-010.
+* Rename `pipeline/runner.py::run_pipeline(AppConfig)` → `run_app(AppConfig)`;
+  export `run_app` from `pipeline/__init__.py`; remove the shadowing with
+  `pipeline.registry.run_pipeline(frames, steps)`. A-010.
+* Trim `AppConfig` (in `pipeline/config.py`) to I/O endpoints + Excel options
+  only; converge on the `step:`-based YAML dialect as the canonical form. IR-012.
+* Update internal callers, architecture guard whitelists, and any tests
+  referencing the old `run_pipeline(AppConfig)` name as part of the rename.
+
+These are coherent as a separate slice: they touch the `pipeline/` subsystem
+exclusively and are independent of the dispatch consolidation completed here.

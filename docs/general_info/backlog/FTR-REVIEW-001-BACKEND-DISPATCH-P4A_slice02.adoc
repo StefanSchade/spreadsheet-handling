@@ -1,0 +1,116 @@
+===== FTR-REVIEW-001-BACKEND-DISPATCH-P4A-SLICE02 — Pipeline registry split, `run_app` rename, `AppConfig` dialect cleanup
+
+*Status:* Open
+*Priority:* P4A
+*Area:* pipeline / application
+*Kind:* Refactoring / Architecture
+*Review source:* REVIEW-001, Cluster C5, Finding IDs: A-010, IR-010, IR-012
+*Parent slice:* `FTR-REVIEW-001-BACKEND-DISPATCH-P4A` (slice01 completed in commit 573b428)
+
+==== Purpose
+
+Slice01 of the parent FTR consolidated backend dispatch into a single owner
+(`io_backends/router.py`) and routed the orchestrator through it. The
+`pipeline/` subsystem remains structurally unchanged from the pre-refactor state:
+
+* Two `run_pipeline` definitions with incompatible signatures shadow each other
+  (`pipeline/runner.py::run_pipeline(AppConfig)` and
+  `pipeline/registry.py::run_pipeline(frames, steps)`); `pipeline/__init__.py`
+  re-exports the registry variant. (A-010)
+* `pipeline/registry.py` (261 lines) mixes the `REGISTRY` dispatch table,
+  `build_steps_from_config` / `build_steps_from_yaml` build logic, and the
+  `run_pipeline` re-export — three responsibilities in one module. (IR-010)
+* `pipeline/config.py::AppConfig` / `PipelineConfig` / `StepRef.dotted` defines
+  a parallel dialect to the `step:`-based YAML used by `build_steps_from_config`;
+  `runner.py` bridges between them. (IR-012)
+
+This slice removes the shadowing, splits the registry module by responsibility,
+and converges on a single YAML dialect.
+
+==== Current State (verified)
+
+* `pipeline/runner.py::run_pipeline(app: AppConfig, run_id=None, **_)` —
+  application-level entry point. (A-010)
+* `pipeline/registry.py::run_pipeline(frames: Frames, steps: Iterable[Step])` —
+  pure frames-→-frames executor used by `application/orchestrator.py`. (A-010)
+* `pipeline/__init__.py` re-exports `run_pipeline` from `registry.py`. (A-010)
+* `pipeline/registry.py` (261 lines) — `REGISTRY`, `resolve_registration`,
+  `build_steps_from_config`, `build_steps_from_yaml`, and the `run_pipeline`
+  re-export coexist in one file. (IR-010)
+* `pipeline/config.py` — `AppConfig`, `PipelineConfig`, `StepRef` with
+  `dotted` form; parallel to the `step:`-based YAML consumed by
+  `build_steps_from_config`. (IR-012)
+
+==== Scope
+
+. Split `pipeline/registry.py`:
+  * `pipeline/registry.py` — keep `REGISTRY` mapping and `resolve_registration`
+    only. Remove the `run_pipeline` re-export.
+  * `pipeline/build.py` (new) — move `build_steps_from_config` and
+    `build_steps_from_yaml` here.
+. Rename `pipeline/runner.py::run_pipeline(AppConfig)` → `run_app(AppConfig)`.
+  Update internal callers (search for `run_pipeline(AppConfig` and any imports
+  of `pipeline.runner.run_pipeline`).
+. Update `pipeline/__init__.py`:
+  * Export `run_app` from `runner.py`.
+  * Export the frames-step `run_pipeline` directly from `registry.py` (or rename
+    it too, e.g. `apply_steps`, if naming clarity warrants — decide during
+    implementation).
+. Trim `pipeline/config.py::AppConfig` to I/O endpoints and Excel options
+  (the surface actually consumed by `runner.run_app`); converge on the
+  `step:`-based YAML dialect as the single canonical form. Migrate any
+  remaining callers that depend on the `dotted` `StepRef` path.
+. Update internal callers, test imports, and any architecture guard whitelists
+  referencing the old `run_pipeline(AppConfig)` name or the old
+  `registry.py` shape.
+. Run full test suite including the roundtrip integration tests.
+
+==== Non-Goals
+
+* Do not change the backend-dispatch design completed in slice01.
+* Do not remove `orchestrate()` public surface — `interfaces_and_gates.adoc`
+  gates it.
+* Do not delete `AppConfig` — only trim it.
+* Do not change the `step:`-based YAML schema; the convergence is one-way
+  (drop the parallel dialect, keep the dominant one).
+
+==== Dependencies
+
+* Slice01 of the parent FTR (commit 573b428) — *done*. The orchestrator now
+  routes through `io_backends/router`, so this slice can move `pipeline/`
+  without touching dispatch.
+
+==== Risk
+
+Medium — touches `pipeline/registry.py`, `pipeline/runner.py`, `pipeline/__init__.py`,
+`pipeline/config.py`, plus all callers of `run_pipeline(AppConfig)` and any
+YAML configs using the `dotted` `StepRef` dialect. Mitigation: work one item
+per commit; keep `orchestrate()` signature unchanged; the existing end-to-end
+tests in `tests/integration/pipeline/` are the regression guard.
+
+==== Acceptance
+
+* `pipeline/registry.py` contains only `REGISTRY` + `resolve_registration`
+  (no build functions, no `run_pipeline` re-export).
+* `pipeline/build.py` exists and contains `build_steps_from_config` /
+  `build_steps_from_yaml`.
+* `grep -rn 'run_pipeline.*AppConfig' src/` returns no matches.
+* `from spreadsheet_handling.pipeline import run_app` resolves and is callable.
+* `pipeline/__init__.py` exports `run_app`; the `pipeline.runner.run_pipeline`
+  name no longer exists.
+* `pipeline/config.py::AppConfig` no longer references the deprecated
+  `dotted` `StepRef` dialect; only the `step:`-based path remains.
+* Full test suite passes.
+
+==== Implementation Notes
+
+* Slice01 review (`FTR-REVIEW-001-BACKEND-DISPATCH-P4A_review_slice01.adoc`)
+  also flagged two cross-cutting items that may be addressed alongside this
+  slice or in a separate hygiene FTR:
+  * `LOADERS`/`SAVERS` vs. `BACKENDS` keyspace divergence (`csv_dir` vs `csv`,
+    `json_dir` vs `json`, missing `yaml` in `BACKENDS`).
+  * Architecture guard ensuring `application/orchestrator.py` does not import
+    backend implementation classes directly (today only the lazy-import test
+    catches the openpyxl/odf symptom, not the broader pattern).
+  These are deferred to a separate decision and are not required for this
+  slice's acceptance.
