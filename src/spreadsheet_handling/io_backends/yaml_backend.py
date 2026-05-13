@@ -28,6 +28,7 @@ def load_yaml_dir(
       - each file maps to one sheet
       - each file contains a list of objects (List[Dict[str, Any]])
       - empty files/lists become empty DataFrames with 0 columns
+      - header_levels is accepted for router compatibility; YAML has no header rows
     """
     in_dir = Path(path)
     frames: Frames = {}
