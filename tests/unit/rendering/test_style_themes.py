@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock
-from spreadsheet_handling.rendering.passes.core import (
+from spreadsheet_handling.rendering.passes import (
     StylePass,
     FilterPass,
     FreezePass,

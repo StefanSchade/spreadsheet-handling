@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock
-from spreadsheet_handling.rendering.passes.core import ProtectionPass
+from spreadsheet_handling.rendering.passes import ProtectionPass
 from spreadsheet_handling.rendering.flow import (
     apply_ir_passes,
     build_render_plan,

@@ -7,7 +7,7 @@ from openpyxl import load_workbook
 
 from spreadsheet_handling.domain.validations.validate_columns import add_validations
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-from spreadsheet_handling.rendering.passes.core import ValidationPass
+from spreadsheet_handling.rendering.passes import ValidationPass
 from spreadsheet_handling.rendering.passes import apply_all
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.core.formulas import formula_list_values

@@ -3,16 +3,9 @@ import ast
 import json
 from typing import List, Any
 from .ir import WorkbookIR, SheetIR, TableBlock
-from .passes.core import (
+from .passes import (
+    default_passes,
     IRPass,
-    StylePass,
-    FilterPass,
-    FreezePass,
-    ColumnWidthPass,
-    ValidationPass,
-    MetaPass,
-    NamedRangePass,
-    ProtectionPass,
 )
 from .plan import (
     RenderPlan,
@@ -257,13 +250,4 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     return plan
 
 def default_p1_passes() -> List[IRPass]:
-    return [
-        MetaPass(),
-        ValidationPass(),
-        StylePass(),
-        ProtectionPass(),
-        FilterPass(),
-        FreezePass(),
-        ColumnWidthPass(),
-        NamedRangePass(),
-    ]
+    return default_passes()

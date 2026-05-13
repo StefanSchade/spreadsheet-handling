@@ -11,7 +11,7 @@ import pytest
 from openpyxl import load_workbook
 
 from spreadsheet_handling.rendering.ir import WorkbookIR, SheetIR, TableBlock, NamedRange
-from spreadsheet_handling.rendering.passes.core import NamedRangePass
+from spreadsheet_handling.rendering.passes import NamedRangePass
 from spreadsheet_handling.rendering.flow import build_render_plan
 from spreadsheet_handling.rendering.plan import DefineNamedRange
 from spreadsheet_handling.rendering.passes import apply_all

@@ -246,7 +246,7 @@ class TestComposerIntegration:
 class TestEndToEnd:
     def test_yaml_defaults_reach_render_plan(self, tmp_path):
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-        from spreadsheet_handling.rendering.passes.core import StylePass, FilterPass, FreezePass
+        from spreadsheet_handling.rendering.passes import StylePass, FilterPass, FreezePass
         from spreadsheet_handling.rendering.flow import apply_ir_passes, build_render_plan
 
         ov_path = tmp_path / "overrides.yaml"
@@ -279,7 +279,7 @@ class TestEndToEnd:
 
     def test_yaml_overrides_reach_render_plan(self, tmp_path):
         from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
-        from spreadsheet_handling.rendering.passes.core import StylePass, FilterPass, FreezePass
+        from spreadsheet_handling.rendering.passes import StylePass, FilterPass, FreezePass
         from spreadsheet_handling.rendering.flow import apply_ir_passes, build_render_plan
 
         # Write overrides YAML

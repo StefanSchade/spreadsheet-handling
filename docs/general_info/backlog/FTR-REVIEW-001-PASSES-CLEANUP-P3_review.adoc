@@ -1,0 +1,179 @@
+= Review: FTR-REVIEW-001-PASSES-CLEANUP-P3
+:date: 2026-05-13
+:reviewer: Claude Sonnet 4.6
+:status: complete
+
+== Verdict
+
+*Pass with minor notes.* No blockers; no important findings; two minor notes.
+Full test suite: 702 passed.
+
+---
+
+== Acceptance criteria
+
+All six acceptance criteria from the FTR are satisfied:
+
+* `rendering/passes/core.py` deleted. ✓
+* `rendering/passes/formula_pass.py` and `post_pass.py` deleted. ✓
+* Eight distinct per-pass modules, one `Pass` class each. ✓
+* `passes/__init__.py` defines exactly one `default_passes()`. ✓
+* `flow.py::default_p1_passes()` delegates to `default_passes()` — no separate list. ✓
+* `test_apply_all_order_equals_default_passes` exists and passes. ✓
+
+---
+
+== Pass ordering preserved?
+
+Yes. The old `apply_all` list and the old `flow.py::default_p1_passes()` list were
+both `MetaPass → ValidationPass → StylePass → ProtectionPass → FilterPass →
+FreezePass → ColumnWidthPass → NamedRangePass`. The new `default_passes()` returns
+the same eight instances in the same order. The architecture_primer and adr-006
+diagrams previously showed only six of the eight passes (ProtectionPass and
+ColumnWidthPass were omitted); both docs are now corrected.
+
+---
+
+== Pass implementations behaviorally identical?
+
+Yes, verified by line-by-line comparison against the deleted `core.py` for all
+eight pass classes. The `apply()` method bodies are character-for-character
+identical. Two small decorator additions that are not behavioral:
+
+* `StylePass` and `FilterPass` gained `@dataclass` in the new modules (old `core.py`
+  omitted it; both still had annotated class attributes with defaults). Result:
+  `__init__`, `__repr__`, `__eq__` are now generated, but `apply()` is unchanged.
+  The production path always calls `StylePass()` with no arguments.
+
+---
+
+== Is `default_passes()` the single canonical source?
+
+Yes. Both call sites now use it:
+
+* `passes/__init__.py::apply_all` — calls `default_passes()` in the loop.
+* `rendering/flow.py::default_p1_passes` — returns `default_passes()`.
+
+The old two-list duplication is eliminated. The ordering test
+(`test_default_passes_order` + `test_apply_all_order_equals_default_passes`)
+locks both against drift. The monkeypatch approach in `test_apply_all_order_equals_default_passes`
+is strong: it patches `passes_module.default_passes` and verifies `apply_all`
+respects whatever the function returns, making the link explicit.
+
+---
+
+== Architecture guard updated correctly?
+
+Yes. `_GENERIC_WRITEPATH_MODULES` now lists all nine `passes/` files (eight pass
+modules plus `_base.py`); `core.py` is absent. The guard still forbids `openpyxl`
+and `io_backends.xlsx` imports in all listed modules, and it passes.
+
+---
+
+== Historical references vs. active references
+
+Correctly handled. The FTR itself (`FTR-REVIEW-001-PASSES-CLEANUP-P3.adoc`),
+`FTR-REVIEW-001-META-REGISTRY-DERIVED-P3.adoc`, `meta_registry.yaml`,
+`concepts_fk_helpers.adoc`, both ADRs, and the architecture_primer all updated
+to reference `_base.py` instead of `core.py`. The original review documents
+(`review-consolidation.adoc`, `review-ir-pipeline.adoc`, etc.) retain their
+historical `core.py` references — correct, as they describe the pre-refactor state.
+
+The review documents from earlier sessions (`FTR-REVIEW-001-META-BLOB-JSON-P3_review.adoc`
+line 66, `FTR-REVIEW-001-META-REGISTRY-DERIVED-P3_review.adoc` lines 116–177) still
+reference `rendering/passes/core.py`; these are historical records and should remain
+unchanged.
+
+---
+
+== `IRPass` definition in `_base.py`
+
+The new `_base.py` defines `class IRProtocol(Protocol)` and then aliases
+`IRPass = IRProtocol`. The old `core.py` defined `class IRPass(Protocol)` directly.
+`IRPass` is still the exported name via `passes/__init__.py`; the intermediate name
+`IRProtocol` is unused outside `_base.py`. See Minor 1.
+
+---
+
+== Circular import risk?
+
+None introduced. Import chain:
+
+----
+passes/__init__.py
+  ← ._base          (← ..ir)
+  ← .meta_pass      (← ._base)
+  ← .validation_pass (← ._base, spreadsheet_handling.core.formulas)
+  ← .style_pass     (← ._base)
+  ← .protection_pass (← ._base)
+  ← .filter_pass    (← ._base)
+  ← .freeze_pass    (← ._base)
+  ← .column_width_pass (← ._base)
+  ← .named_range_pass (← ._base)
+  ← ..ir
+----
+
+`ir.py` does not import from `passes/`. `flow.py` imports `default_passes` and
+`IRPass` from `.passes` — no cycle.
+
+The one lazy import inside `apply_all` (`from ..ir import SheetIR`) is safe and
+pre-existed.
+
+---
+
+== Findings
+
+=== Blocker
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+*1. `IRPass = IRProtocol` indirection is needlessly roundabout.*
+
+`_base.py` introduces an intermediate Protocol name `IRProtocol` and then aliases
+it as `IRPass`. The alias is what `passes/__init__.py` re-exports. The old `core.py`
+defined `class IRPass(Protocol)` directly and there is no reason to differ here.
+
+Recommended fix — in `_base.py`, rename `IRProtocol` → `IRPass` and remove the alias:
+
+[source,python]
+----
+class IRPass(Protocol):
+    def apply(self, doc: WorkbookIR) -> WorkbookIR: ...
+----
+
+Then remove `IRPass = IRProtocol`. The exported name and behavior are unchanged;
+the indirection disappears.
+
+*2. Three stub-era test names are stale after the class migration.*
+
+`test_meta_pass_keeps_hidden_meta_sheet`, `test_style_pass_is_noop_for_now`, and
+`test_validation_pass_is_noop_for_now` were written against the old module-level
+stub `apply()` functions. They now call the real class `apply()` method, which is
+correct. However:
+
+* `test_style_pass_is_noop_for_now` — asserts `ir.sheets["S"].styles == []` after
+  `StylePass().apply(ir)`. The assertion passes because `StylePass` modifies
+  `sh.meta["__style"]` (not `sh.styles`), so the struct field happens to remain
+  empty. The test neither exercises real `StylePass` behavior nor documents any
+  meaningful invariant. The name "is_noop_for_now" is now false — the real pass is
+  not a no-op.
+
+* `test_validation_pass_is_noop_for_now` — asserts `ir.sheets["S"].validations == []`
+  after `ValidationPass().apply(ir)`. Passes because the empty sheet has no
+  `_p1_validations` or `constraints`. Again, the name implies stub behavior.
+
+* `test_meta_pass_keeps_hidden_meta_sheet` — this one is fine: it meaningfully tests
+  that an existing `_meta` sheet is not discarded.
+
+The stale tests are not dangerous (real behavior is covered by `test_style_themes.py`,
+`test_validation_pass_infra.py`, and the integration suite), but they are misleading
+noise. Recommended fix: rename or replace the two stale tests with minimal assertions
+on real class behavior (e.g., that `StylePass` sets `__style` in `sh.meta`, that
+`ValidationPass` appends a `DataValidationSpec` for a sheet with a `_p1_validations`
+entry).
