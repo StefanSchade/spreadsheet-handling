@@ -1,0 +1,118 @@
+===== FTR-KEY-VALUE-RESOURCE-WRITER-P4A Review: Minimal Key-Value Writer Slice
+
+*Reviewed Commit:* `d30c858`
+*Review Date:* 2026-05-14
+*Verdict:* BLOCK - do not merge as-is
+
+==== Findings
+
+===== 1. Deterministic partition/file ordering is not explicit
+
+`src/spreadsheet_handling/domain/key_value_writer.py:70-91` and
+`src/spreadsheet_handling/domain/key_value_writer.py:123-135` write partitions
+in first-seen `groupby(sort=False)` order after an optional row sort. That makes
+the generated-file order and report-frame order depend on upstream row ordering,
+not on a canonical partition ordering derived from the partition columns.
+
+This is a real determinism gap because the FTR promises deterministic output.
+Two semantically identical source frames with different input row order can
+produce a different file/report ordering even when the file contents are the
+same. The implementation needs an explicit stable partition ordering rule.
+
+===== 2. Newline handling is platform dependent
+
+`src/spreadsheet_handling/domain/key_value_writer.py:89-91` writes text via
+`Path.write_text(..., encoding=encoding)` without fixing the newline policy.
+That leaves line ending translation to the host platform. The same logical
+output will therefore have different bytes on Unix vs. Windows, and the
+`bytes` field in the report frame will drift accordingly.
+
+This conflicts with the stated deterministic writer goal and with the FTR text
+claiming a configurable newline policy. The implementation currently exposes no
+newline parameter and no explicit `\n`/`\r\n` contract.
+
+==== Boundary Review
+
+===== Architectural Boundaries Mostly Respected
+
+The implementation stays inside the intended scope:
+
+* no fallback or override semantics are implemented here
+* no matrix/crosstable logic is introduced
+* no workbook/XLSX/ODS behavior is present
+* no template/plugin framework overreach is visible
+* the writer remains a generic key/value serializer with explicit column names
+
+That boundary is clean. The blocking issues are about determinism, not scope
+creep.
+
+===== Path Safety Looks Sound
+
+Output paths are resolved against `output_dir` and rejected when absolute or
+escaping the configured root. The placeholder expansion path is checked after
+formatting, which is the right place to catch traversal attempts.
+
+No blocking path-safety defect was found.
+
+===== Escaping Semantics Are Reasonable
+
+The implementation distinguishes `unicode` and `utf-8` modes and applies a
+consistent escape set for backslashes, control characters, and key separators.
+Java `.properties` compatibility is documented in the FTR and is mostly
+reasonable for the minimal slice.
+
+One follow-up would still be useful: add an explicit newline contract alongside
+the escaping modes so the bytes on disk are reproducible across platforms.
+
+===== Duplicate And Validation Behavior Is Clear
+
+Duplicate keys are rejected per generated file, and missing required columns
+fail clearly. Partition grouping behavior is deterministic only to the extent
+that input row order is stable; that is the determinism gap noted above.
+
+===== Generated Artifact Reporting Is Provisional
+
+The report frame is minimal and coherent for this slice: `path`, `frame`,
+`rows`, `bytes`. That is acceptable as a temporary writer-local report, but it
+is not yet the shared manifest shape defined by
+`FTR-GENERATED-ARTIFACT-MANIFEST-P4A`.
+
+This is not a blocker by itself because the FTR explicitly defers manifest
+alignment, but it should stay clearly documented as provisional until the
+manifest FTR lands.
+
+==== Tests
+
+The test file covers the main acceptance criteria well:
+
+* partitioned file output
+* ordering with `sort_by`
+* unicode vs UTF-8 escaping
+* duplicate key failure
+* path traversal rejection
+* report-frame emission
+* pipeline registration smoke coverage
+
+Missing cases that matter for this review:
+
+* repeated runs with the same logical rows in a different input order
+* newline/line-ending behavior across platforms
+* report-frame ordering stability when input row order changes
+
+Those are the tests that would close the determinism gap.
+
+==== Suggested Follow-Ups
+
+* Add an explicit newline policy parameter and write with a fixed line-ending
+  contract.
+* Sort generated partitions by a stable canonical key rather than by first
+  occurrence.
+* Add regression tests for reordered input rows and for stable report ordering.
+* Keep the generated-file report shape provisional until
+  `FTR-GENERATED-ARTIFACT-MANIFEST-P4A` defines the shared manifest contract.
+
+==== Decision
+
+The commit should not remain as-is because the writer does not yet satisfy the
+deterministic ordering contract in a platform-independent way.
+
