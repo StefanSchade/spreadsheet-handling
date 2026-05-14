@@ -88,7 +88,8 @@ def write_key_value_resources(
 
         content = _render_properties_content(group_df, key_col=key, value_col=value, escaping=properties_escaping)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(content, encoding=encoding)
+        with target_path.open("w", encoding=encoding, newline="\n") as fh:
+            fh.write(content)
 
         reports.append({
             "path": path_label,
@@ -127,7 +128,7 @@ def _partition_groups(
     if not partition_cols:
         return [((), df)]
     groups: list[tuple[tuple[Any, ...], pd.DataFrame]] = []
-    for key_vals, group_df in df.groupby(partition_cols, sort=False, dropna=False):
+    for key_vals, group_df in df.groupby(partition_cols, sort=True, dropna=False):
         if isinstance(key_vals, tuple):
             groups.append((key_vals, group_df))
         else:

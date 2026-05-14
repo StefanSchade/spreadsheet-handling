@@ -255,3 +255,75 @@ def test_step_is_config_addressable(tmp_path: pytest.TempPathFactory) -> None:
     assert "title=Hello" in content
     assert "body=World" in content
     assert "key_value_resource_files" in out
+
+
+def test_reordered_input_rows_produce_identical_file_contents(tmp_path: pytest.TempPathFactory) -> None:
+    rows = [
+        {"locale": "de", "key": "greeting", "value": "Hallo"},
+        {"locale": "en", "key": "greeting", "value": "Hello"},
+        {"locale": "de", "key": "farewell", "value": "Tschüss"},
+        {"locale": "en", "key": "farewell", "value": "Goodbye"},
+    ]
+    frames_a = {"res": pd.DataFrame(rows)}
+    frames_b = {"res": pd.DataFrame(list(reversed(rows)))}
+
+    kwargs = dict(
+        source="res",
+        output_dir=str(tmp_path / "a"),
+        file_pattern="{locale}.properties",
+        key="key",
+        value="value",
+        sort_by="key",
+    )
+    write_key_value_resources(frames_a, **kwargs)
+    write_key_value_resources(frames_b, **{**kwargs, "output_dir": str(tmp_path / "b")})
+
+    for locale in ("en", "de"):
+        content_a = (tmp_path / "a" / f"{locale}.properties").read_text(encoding="utf-8")
+        content_b = (tmp_path / "b" / f"{locale}.properties").read_text(encoding="utf-8")
+        assert content_a == content_b, f"{locale}: contents differ between orderings"
+
+
+def test_report_frame_order_is_stable_regardless_of_input_row_order(tmp_path: pytest.TempPathFactory) -> None:
+    rows = [
+        {"locale": "fr", "key": "a", "value": "1"},
+        {"locale": "en", "key": "a", "value": "2"},
+        {"locale": "de", "key": "a", "value": "3"},
+    ]
+    frames_a = {"res": pd.DataFrame(rows)}
+    frames_b = {"res": pd.DataFrame(list(reversed(rows)))}
+
+    out_a = write_key_value_resources(
+        frames_a, source="res", output_dir=str(tmp_path / "a"),
+        file_pattern="{locale}.properties", key="key", value="value",
+    )
+    out_b = write_key_value_resources(
+        frames_b, source="res", output_dir=str(tmp_path / "b"),
+        file_pattern="{locale}.properties", key="key", value="value",
+    )
+
+    paths_a = list(out_a["key_value_resource_files"]["path"])
+    paths_b = list(out_b["key_value_resource_files"]["path"])
+    assert paths_a == paths_b
+
+
+def test_output_uses_unix_line_endings(tmp_path: pytest.TempPathFactory) -> None:
+    frames = {
+        "resources": pd.DataFrame([
+            {"key": "a", "value": "1"},
+            {"key": "b", "value": "2"},
+        ])
+    }
+
+    write_key_value_resources(
+        frames,
+        source="resources",
+        output_dir=tmp_path,
+        file_pattern="out.properties",
+        key="key",
+        value="value",
+    )
+
+    raw = (tmp_path / "out.properties").read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.endswith(b"\n")
