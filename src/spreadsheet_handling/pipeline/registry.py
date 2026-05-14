@@ -140,6 +140,13 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup",
     ),
+    "write_key_value_resources": StepRegistration(
+        factory=make_frames_target_step,
+        target=(
+            "spreadsheet_handling.domain.key_value_writer:"
+            "write_key_value_resources"
+        ),
+    ),
 }
 
 
