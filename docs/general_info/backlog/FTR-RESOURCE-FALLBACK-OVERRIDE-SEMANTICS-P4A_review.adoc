@@ -1,0 +1,269 @@
+===== FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A Review: Minimal Normalization Slice
+
+*Reviewed Commit:* `451a139`
+*Review Date:* 2026-05-14
+*Verdict:* ACCEPT (no blocking issues)
+
+==== Summary
+
+The minimal FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A slice implements
+`normalize_resource_overrides` as a pure domain primitive for value semantics on
+long-form tuple frames.  The scope is tightly bounded: it owns empty-cell policy,
+default-context validation, and override collapsing — nothing more.  No blocking
+issues were found.  The commit can remain as-is.
+
+==== 1. Scope / Architecture ✅
+
+===== Generic over Configured Column Names ✅
+
+Production code uses `row_keys`, `discriminator_column`, `context_column`, and
+`value_column` exclusively.  Localized-resource terminology (`resource_key`,
+`locale`, `context_id`, `text`) appears only in test fixtures.
+`test_production_api_uses_configured_column_names` (line 178) explicitly exercises
+a completely different column vocabulary (`message_id`, `variant`, `scope`,
+`payload`) to prove genericity.
+
+===== No Hard-Coded Localized-Resource Semantics ✅
+
+Module docstring line 4: *"This module owns value semantics only.  It does not
+infer dense axes, workbook views, locale meanings, or generated artifact output."*
+There is no locale detection, no i18n logic, and no reference to the
+localized-resource pipeline.
+
+===== No Dense-Axis / Matrix-Shape Logic ✅
+
+Neither `contract_xref`, `expand_xref`, nor any dense-axis concept appears
+anywhere in the implementation.  The function receives a flat long-form tuple
+frame and returns a flat long-form tuple frame.  The FTR scope boundary note is
+correctly stated and implemented.
+
+===== No Artifact Export ✅
+
+No `.properties` writer, no file output, no artifact manifest logic.  The
+`Non-goals` section of the FTR explicitly states this and the implementation is
+consistent.
+
+===== Pure Domain Primitive + Thin Pipeline Registration ✅
+
+`normalize_resource_override_frame` is a testable pure function that accepts a
+`pd.DataFrame` and returns `ResourceOverrideNormalizationResult`.
+`normalize_resource_overrides` is the thin frames-first wrapper.  The pipeline
+step registration is two lines in `registry.py`.  No new abstraction layer was
+introduced.
+
+==== 2. Policy Correctness ✅
+
+===== Default Context Behavior ✅
+
+Lines 393-394 correctly identify default vs.\ non-default contexts:
+`_values_equal(context, policy.default_context)`.  Default-context rows are
+always retained and their values are passed through (after marker normalization).
+
+===== Empty Override Handling ✅
+
+`_should_omit_empty_override` (line 452-453) returns True only when
+`empty_override == "omit_tuple"` AND the (normalized) value is empty.  The guard
+`and not explicit_empty` at line 394 prevents the explicit-empty-marker case from
+being silently dropped.
+
+The `keep_tuple` path is exercised indirectly in
+`test_normalizes_expanded_matrix_output_without_owning_matrix_shape` (the default
+policy is `omit_tuple`; there is no direct `keep_tuple` test — see non-blocking
+concerns).
+
+===== Explicit Empty Marker ✅
+
+The marker is detected before normalization (line 391), normalization converts it
+to `""` (line 441), and then the `explicit_empty` flag prevents both omission
+(line 394) and default-collapse (line 397).  The net result is that an explicit
+marker produces an empty string in output with the tuple retained — exactly what
+the FTR requires.
+
+===== Collapse Override Equal to Default ✅
+
+Lines 397-403: collapse happens only when `not explicit_empty`, `policy.collapse_override_equal_to_default`,
+`default_value is not None`, and values are equal.  Setting
+`collapse_override_equal_to_default=False` correctly retains the override
+(tested at line 87).
+
+===== Required Defaults Validated per Identity ✅
+
+`_missing_default_findings` groups by `(row_keys + discriminator_column)` and
+checks each group for the presence of a default-context row and a non-empty
+default value.  Empty defaults without `allow_empty_default=True` also produce a
+finding (lines 355-365).
+
+===== Optional Empty Values ✅
+
+`allow_empty_default=True` suppresses the `empty_required_default` finding (tested
+at line 129).
+
+===== Duplicate/Conflicting Tuples ✅
+
+`_duplicate_findings` (line 269) distinguishes `conflicting_tuple` (same key,
+different values) from `duplicate_tuple` (same key, same value).  The
+`conflicting_tuple` path is tested (line 141).  See non-blocking concerns for the
+non-conflicting duplicate path.
+
+==== 3. Boundary with Dense Axes ✅
+
+===== Tuple Frame Assumption is Correct ✅
+
+The implementation receives and returns long-form tuple frames.  It makes no
+assumption about how those frames were produced — whether from a dense-axis
+`contract_xref` output or from a direct data source.
+
+===== No Touch to contract_xref / expand_xref ✅
+
+Neither function is imported or referenced.  The diff adds only one new production
+file (`resource_overrides.py`) and a registry entry.  Dense-axis semantics remain
+cleanly owned by FTR-XREF-DENSE-AXES-P4A2.
+
+===== Boundary Test ✅
+
+`test_normalizes_expanded_matrix_output_without_owning_matrix_shape` (line 160)
+explicitly documents the boundary: the function receives expanded matrix output
+and normalizes values without claiming to own matrix shape construction.
+
+==== 4. API / Pipeline Surface ✅
+
+===== Function Naming ✅
+
+`normalize_resource_override_frame` (domain primitive) and
+`normalize_resource_overrides` (pipeline step wrapper) are clear and consistent
+with the established `<verb>_<noun>_frame` / `<verb>_<noun>s` naming pattern.
+
+===== Pipeline Step Configuration ✅
+
+Policy can be supplied either as a `resource_override_policy` mapping (YAML-friendly)
+or as individual keyword arguments (programmatic use).  Both paths merge correctly
+in `_resource_override_policy`.  The pipeline registry JSON documents all
+parameters accurately.
+
+===== Conservative Defaults ✅
+
+`mode` defaults to `"fail"`.  `default_required` defaults to `True`.
+`empty_override` defaults to `"omit_tuple"`.  `collapse_override_equal_to_default`
+defaults to `True`.  All defaults are strict — appropriate for business-editing
+workflows where silent data loss is a bigger risk than a noisy failure.
+
+===== `del name` Pattern (Observation, Non-Blocking)
+
+Line 89: `del name` silently discards the `name` parameter that is accepted for
+API consistency with metadata-producing steps like `contract_xref`.
+`normalize_resource_overrides` does not write to `_meta`.  This is intentional
+and harmless, but a brief inline comment explaining the API-compatibility purpose
+would help future readers.
+
+===== Findings Frame Only Written in Warn Mode (Observation, Non-Blocking)
+
+When `mode="warn"`, the findings frame is written to `out[findings]`.  When
+`mode="ignore"`, findings are silently discarded even if the caller configured a
+`findings` name.  This is defensible behavior (ignore means ignore) but is not
+tested and could surprise a caller who expects a frame regardless of severity.
+
+==== 5. Tests ✅ with Minor Gaps
+
+===== FTR Acceptance Coverage
+
+[cols="2,1,2"]
+|===
+| FTR Acceptance Criterion | Covered? | Test
+
+| omit_tuple for empty override
+| ✅
+| `test_empty_override_is_omitted_when_policy_says_omit_tuple`
+
+| explicit_empty_marker keeps tuple with empty text
+| ✅
+| `test_explicit_empty_marker_keeps_override_with_empty_text`
+
+| override equal to default collapses when configured
+| ✅
+| `test_override_equal_to_default_collapses_when_configured`
+
+| override equal to default retained when not configured
+| ✅
+| `test_override_equal_to_default_is_retained_when_configured`
+
+| required default missing → finding + pipeline failure
+| ✅
+| `test_required_default_missing_produces_finding_and_pipeline_failure`
+
+| optional empty text valid when configured
+| ✅
+| `test_empty_default_text_is_valid_when_configured`
+
+| duplicate/conflicting tuples rejected
+| ✅
+| `test_duplicate_conflicting_tuples_produce_clear_validation_error`
+
+| policy can be used by localized resource matrix recomposition
+| ✅
+| `test_normalizes_expanded_matrix_output_without_owning_matrix_shape`
+
+| generic column names (not localized-resource-specific)
+| ✅
+| `test_production_api_uses_configured_column_names`
+
+| pipeline step config-addressable
+| ✅
+| `test_normalize_resource_overrides_step_is_config_addressable`
+|===
+
+===== Missing Tests (Non-Blocking)
+
+The following are gaps in coverage but not blockers for acceptance:
+
+. *`keep_tuple` behavior* — No direct test of `empty_override="keep_tuple"`.
+  The `_should_omit_empty_override` path that returns False is not exercised.
+  Add: a test with an empty override cell and `empty_override="keep_tuple"` to
+  confirm the tuple is retained.
+
+. *Non-conflicting duplicate tuples* — `rule_type="duplicate_tuple"` (same key,
+  same value) is produced by `_duplicate_findings` but not tested.  The
+  `conflicting_tuple` path is tested.  Add: a case with two rows sharing the same
+  key and same value to confirm `duplicate_tuple` finding appears.
+
+. *`mode="warn"` findings frame* — When mode is warn, findings are written to a
+  named frame.  This path is not tested.  Add: a test that triggers a
+  `missing_default` finding in warn mode and asserts the findings frame is present
+  with the expected row.
+
+. *`mode="ignore"` suppression* — Not tested.  Add: a case with a policy violation
+  and `mode="ignore"` confirming no exception is raised and no findings frame is
+  emitted.
+
+. *Multi-column `row_keys`* — The API accepts a list for `row_keys` but all tests
+  use a single key.  Add: a test with two-column row identity to confirm grouping
+  is correct.
+
+==== Overall Assessment
+
+No blocking issues.  The implementation is:
+
+* **Correctly scoped** — value semantics only, no shape reconstruction, no
+  artifact output
+* **Properly generic** — column names are configured, not hard-coded
+* **Correctly bounded** — does not touch dense-axis machinery
+* **Well-validated** — policy constraints are checked early, errors are clear
+* **Adequately tested** — all FTR acceptance cases covered; missing tests are for
+  secondary code paths that work correctly by construction
+
+==== Decision
+
+*The commit can remain as-is.*
+
+The non-blocking gaps (missing tests for `keep_tuple`, non-conflicting duplicates,
+warn/ignore modes, and multi-column row_keys) are defensive additions that can be
+addressed in a focused follow-up commit.  They do not indicate defects in the
+shipped behavior.
+
+==== Related FTRs
+
+* **FTR-XREF-DENSE-AXES-P4A2:** Boundary is clean.  That FTR owns matrix-shape
+  materialization; this FTR owns the value policy applied after expansion.
+* **FTR-LOCALIZED-RESOURCE-MATRIX-ROUNDTRIP-P4A (completed):** Deliberately treats
+  empty cells mechanically; this FTR provides the policy layer on top.
+* **FTR-KEY-VALUE-RESOURCE-WRITER-P4A:** Still deferred; does not depend on this
+  FTR being implemented first.
