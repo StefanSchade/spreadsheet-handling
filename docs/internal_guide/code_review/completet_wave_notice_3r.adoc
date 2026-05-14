@@ -1,50 +1,214 @@
 = Completed Wave Notice 3r
 :date: 2026-05-13
+:review-wave: REVIEW-001 Architecture Hygiene
+:status: completed-scope-record
 
-This note records what the REVIEW-001 Architecture Hygiene wave already
-addressed so later review waves can avoid re-opening the same ground.
+This note records the substance of the REVIEW-001 Architecture Hygiene follow-up wave.
+It is not a replacement for the individual FTRs or reviews. Its purpose is narrower:
+to make later agents understand what was already changed, what architectural direction
+was chosen, and which original review topics must not be rediscovered as fresh work.
 
-== Already addressed in the consolidated follow-up FTRs
+== Executive summary
 
-* `FTR-REVIEW-001-META-REGISTRY-DERIVED-P3` — the transient `derived` meta
-  channel is now registered with explicit scope, lifecycle, producer, and
-  consumer contract entries.
-* `FTR-REVIEW-001-META-BLOB-JSON-P3` — `workbook_meta_blob` now writes as JSON
-  deterministically, while legacy literal reads remain accepted as a fallback.
-* `FTR-REVIEW-001-FORMULAS-CORE-MOVE-P3` — formula-intent types moved out of
-  the rendering layer into a neutral core module so domain code no longer
-  imports rendering formula types.
-* `FTR-REVIEW-001-PASSES-CLEANUP-P3` — rendering passes were split into real
-  per-pass modules, the dead stub-era files were removed, and a single
-  canonical `default_passes()` source now defines ordering.
-* `FTR-REVIEW-001-QUICK-WINS-P3` — the remaining small review items stay
-  tracked separately and should not be duplicated in future waves.
+The wave converted a broad architecture review into bounded consolidation work.
+The main result is not a new subsystem. The result is a cleaner ownership map:
 
-== Wave-3r context already consolidated
+* formula intent moved to a neutral core contract instead of living in rendering;
+* transient derived metadata is now explicitly registered instead of being an undocumented domain-to-rendering channel;
+* workbook metadata persistence moved from Python repr strings to deterministic JSON;
+* rendering passes now have a real module-per-pass structure and a single pass-order source;
+* backend dispatch now routes through the backend router instead of three divergent dispatch mechanisms;
+* pipeline registry, step building, execution, and AppConfig execution were separated;
+* the app-level runner is now named `run_app`, while `run_pipeline` means linear frame-step execution;
+* the user-facing surfaces were sharpened: CLI commands, YAML pipeline/config, dotted callable extension, and a deliberately small Python import surface.
 
-The following were already folded into the backlog, review notes, or archived
-history and should be treated as existing context, not new work:
+The wave is therefore best understood as architecture consolidation: hidden or misleading coupling was made explicit, duplicated ownership was reduced, and transitional names/stubs were either removed or made honest.
 
-* architecture / layering consolidation notes in `docs/general_info/project_evolution_narrative.adoc`
-* meta-registry and meta-blob review follow-ups in cold storage
-* pass-structure cleanup and architecture guards in the rendering layer
-* AI workflow guidance that completed FTRs and review follow-ups must be
-  committed immediately as separate Conventional Commits
+== Closed review clusters
 
-== Active review context after wave 3r
+=== C1 — Formula intent moved out of rendering
 
-The REVIEW-001 offensive is not fully closed yet. Remaining open items are
-tracked in the active backlog and should be checked before proposing new work
-in the same area:
+Closed by `FTR-REVIEW-001-FORMULAS-CORE-MOVE-P3`.
 
-* `FTR-REVIEW-001-QUICK-WINS-P3`
-* `FTR-REVIEW-001-BACKEND-DISPATCH-P4A`
-* `FTR-REVIEW-001-MODULARIZATION-P4A`
-* `FTR-REVIEW-001-MODULE-HEADERS-P5`
+The original problem was a real layer violation: domain code needed formula-intent value objects, but those objects lived under `rendering.formulas`. The fix moved `FormulaSpec`, `ListLiteralFormulaSpec`, `LookupFormulaSpec`, and factories to `spreadsheet_handling.core.formulas`.
 
-== Usage note
+Outcome:
 
-When a later wave touches the same architectural area, first consult the
-archived REVIEW-001 FTRs and this notice. If a concern is already covered by
-one of the completed FTRs above, reference that FTR instead of duplicating the
-finding or deriving a new ticket.
+* `domain/` no longer imports formula types from `rendering/`;
+* formula intent remains backend-neutral;
+* XLSX/ODS adapters still own backend-specific formula-string translation;
+* no compatibility alias for `rendering.formulas` was kept, because the project is pre-beta and the old path was not a documented public surface;
+* a boundary guard now protects `domain` and `core` from importing `rendering` or `io_backends`.
+
+The related formula-mode bug was also made explicit: `missing="fail"` is rejected in formula mode because that behavior cannot be enforced by Python once the lookup is delegated to spreadsheet formulas.
+
+=== C4 — Workbook meta blob writes JSON, not Python repr
+
+Closed by `FTR-REVIEW-001-META-BLOB-JSON-P3`.
+
+The old write path persisted `workbook_meta_blob` through Python stringification of dict-like structures. The read path already tried JSON first and then accepted Python-literal fallback. That made roundtrip behavior work in common cases but left the carrier fragile and hard to reason about.
+
+Outcome:
+
+* new `workbook_meta_blob` writes are deterministic JSON;
+* legacy Python-literal reads remain accepted as a compatibility fallback;
+* JSON-first behavior is now intentional and tested;
+* NaN/nested metadata roundtrip behavior is covered;
+* the carrier decision is documented as serialization policy, not as a new metadata model.
+
+Important boundary: this did not change canonical metadata semantics. It changed the persistence carrier.
+
+=== C6 — `derived` metadata channel registered
+
+Closed by `FTR-REVIEW-001-META-REGISTRY-DERIVED-P3`.
+
+The original review found a real undocumented coupling: domain transformations wrote `_meta.derived.sheets.*`, and rendering passes consumed it, but `derived` was absent from `meta_registry.yaml`.
+
+Outcome:
+
+* `derived` is now registered as transient `meta_rendering` / `derived_operational_view`;
+* producers and consumers are explicit and guard-tested;
+* the channel is documented as operational provenance, not canonical roundtrip semantics;
+* the registry distinguishes the independent subkeys under `derived.sheets.*`: `helper_columns` and `enrich_lookup`;
+* `drop_helpers` cleanup is part of the documented transient lifecycle.
+
+This is an example of the registry's role in this codebase: it does not make the coupling loose. It documents a deliberate deep coupling so that later refactors cannot accidentally treat it as implicit local knowledge.
+
+=== C3 — Rendering passes made structurally honest
+
+Closed by `FTR-REVIEW-001-PASSES-CLEANUP-P3`.
+
+The old `rendering/passes/` package had misleading stub-era files while the actual pass logic lived in one large `core.py`. There were also two pass-order lists that had to stay manually synchronized.
+
+Outcome:
+
+* `core.py`, `formula_pass.py`, and `post_pass.py` were removed;
+* each real pass now lives in a per-pass module;
+* shared pass helpers live in `_base.py`;
+* `passes.default_passes()` is the single canonical pass-order source;
+* `apply_all` and `flow.default_p1_passes()` both use that source;
+* ordering drift is covered by tests;
+* architecture documentation now names the full pass chain, including `ProtectionPass` and `ColumnWidthPass`.
+
+No pass semantics were intentionally changed. The fix made the existing architecture match the file structure it had long implied.
+
+=== C5 slice 01 — Backend dispatch centralized
+
+Closed by `FTR-REVIEW-001-BACKEND-DISPATCH-P4A` slice 01.
+
+The original review found three backend-dispatch mechanisms: router-level loader/saver tables, `io_backends.__init__` backend factory specs, and application-orchestrator if/elif dispatch. Those mechanisms had diverging key vocabularies and made `csv_dir` work in some paths but not others.
+
+Outcome:
+
+* `io_backends.router` is now the canonical backend dispatch owner;
+* `io_backends.__init__.make_backend` delegates to router-owned factory resolution;
+* `application.orchestrator` uses `get_loader` and `get_saver`;
+* `csv_dir` works through `orchestrate(...)`;
+* loader signatures were minimally normalized for router-compatible calls;
+* lazy optional imports for XLSX/ODS remain protected.
+
+The remaining vocabulary mismatch between backend class keys and loader/saver keys is deliberately not solved here. It belongs to a later user-interface/kind-vocabulary cleanup, not to the dispatch-centralization slice.
+
+=== C5 slice 02 — Pipeline ownership split
+
+Closed by `FTR-REVIEW-001-BACKEND-DISPATCH-P4A_slice02`.
+
+The original review also found that `pipeline/registry.py` mixed runtime registry data, config-to-step building, YAML loading, and pure pipeline execution. In parallel, `pipeline.runner.run_pipeline(AppConfig)` had the same name as the linear frame-step executor.
+
+Outcome:
+
+* `pipeline.registry` owns `REGISTRY` and registration resolution;
+* `pipeline.build` owns config/YAML-to-`BoundStep` construction;
+* `pipeline.execution` owns linear `run_pipeline(frames, steps)`;
+* `pipeline.runner` owns `run_app(AppConfig)`;
+* the app-level `run_pipeline(AppConfig)` shadow was removed;
+* `AppConfig` now uses the canonical step-list dialect;
+* legacy `pipeline: {steps: [...]}` config is rejected with a clear migration hint;
+* `run_app` forwards `header_levels` and wraps unsupported input/output kinds with app-level diagnostics.
+
+The dotted-path extension surface remains intentional. Supported extension forms continue to be the `plugin` step with a dotted callable and direct `step: module:function` pipeline specs. The cleanup removed a parallel legacy config dialect; it did not remove the extension mechanism.
+
+=== Quick wins and API-surface cleanup
+
+Closed by `FTR-REVIEW-001-QUICK-WINS-P3` and related follow-up commits.
+
+Small findings were fixed where they reduced ambiguity or removed latent bugs without expanding architecture:
+
+* obsolete/deprecated CLI wrapper names were replaced by explicit example shortcut commands;
+* the shortcut-command pattern remains intentional, but `sheets-pack` / `sheets-unpack` are no longer treated as meaningful product names;
+* user-facing surfaces were documented as CLI, YAML config/pipeline, dotted callable extension, and small explicit Python imports;
+* simple `_meta` writer crash paths were fixed;
+* `coerce_backend_options(None)` and similar low-risk defects were cleaned up;
+* completed FTR and review-follow-up commits are now required as separate Conventional Commits in AI workflow guidance.
+
+== What this wave did not try to solve
+
+The wave deliberately avoided turning the project into a new framework layer.
+
+Non-goals that remain important:
+
+* no new generic metadata engine;
+* no registry-of-registry abstraction;
+* no workflow engine or lifecycle-driven pipeline routing;
+* no removal of dotted-path plugin support;
+* no broad Python public API expansion;
+* no compatibility aliases where the old path was misleading and pre-beta removal was acceptable;
+* no attempt to fix all remaining domain/FK/module-size concerns in the same wave.
+
+The consistent rule was: consolidate ownership and make existing coupling explicit; do not generalize merely because shapes look similar.
+
+== Remaining review-derived work
+
+The following topics were not closed by this wave and should remain visible as active or future backlog work:
+
+* FK/domain consolidation: `core.fk`, FK helper naming, FK helper ownership, and related compatibility residue;
+* render-input mutation: `layout_composer` and `frame_selection` still need a focused purity/consumption decision;
+* finding-model consolidation in domain validations;
+* larger domain and ODS renderer modularization;
+* package public surfaces and `__all__` design beyond the surfaces explicitly documented;
+* simple-backend kind vocabulary: `BACKENDS` vs `LOADERS` / `SAVERS` key mismatch;
+* CSV/JSON/XML/YAML multi-header and roundtrip asymmetries;
+* CLI error-wrapper and console-script polish if not already covered by later CLI work;
+* exported-at policy: remove the placeholder or define an injected timestamp source.
+
+These are not regressions from the wave. They are either deferred review findings or later hygiene candidates.
+
+== Architectural effect of the wave
+
+Before the wave, several areas had transitional ambiguity:
+
+* formula intent looked render-owned although domain needed it;
+* `derived` metadata crossed layers without a registry contract;
+* meta persistence worked through Python repr fallback rather than a declared carrier;
+* pass modules suggested one structure while execution used another;
+* backend dispatch lived in multiple places;
+* pipeline registry, build, execution, and app runner responsibilities overlapped;
+* old CLI names implied a historical JSON-to-XLSX product model that no longer matched the library.
+
+After the wave, the system is more explicit:
+
+* neutral value objects live in neutral layers;
+* registries describe intentional cross-layer metadata channels;
+* serialization carriers are named and tested;
+* module layout matches runtime ownership;
+* dispatch ownership is centralized;
+* the pipeline/app-runner naming now distinguishes frame execution from application execution;
+* shortcut commands are documented as a supported pattern, not as legacy product direction.
+
+This should reduce friction for the next P4A feature wave. New feature FTRs should be checked against the post-wave structure before implementation, especially if they mention old paths such as `rendering.formulas`, `rendering/passes/core.py`, `pipeline.registry.run_pipeline`, `pipeline.runner.run_pipeline`, or direct orchestrator backend dispatch.
+
+== Guidance for later review waves
+
+Later review waves should not reopen the completed items above unless new evidence appears.
+
+Recommended checks before deriving new FTRs:
+
+. If a finding references old paths, first verify whether it predates this wave.
+. If a finding proposes a new abstraction, check whether a local ownership fix is enough.
+. If a finding touches registries, ask whether the registry documents an intentional coupling or accidentally creates a new one.
+. If a finding touches CLI/config, preserve the documented user surfaces: CLI, YAML pipeline/config, dotted callable extension, and small explicit Python imports.
+. If a finding touches pipeline execution, preserve the invariant: the pipeline remains linear and does not route on lifecycle or workbook metadata.
+
+== Source notes
+
+This notice summarizes the REVIEW-001 derived FTRs and their reviews archived under `docs/cold_storage/backlog/historic_tickets/ftrs/`, plus the original review consolidation documents under `docs/internal_guide/code_review/`. The original completed-wave notice mainly listed references; this version records the architectural content and remaining boundaries more explicitly. Source context: current notice excerpt and review-derived FTR archive entries. :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
