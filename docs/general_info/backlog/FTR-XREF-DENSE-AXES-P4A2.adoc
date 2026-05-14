@@ -1,0 +1,133 @@
+===== FTR-XREF-DENSE-AXES-P4A2 -- Dense-axis reconstruction for sparse XRef matrices
+
+*Status:* New
+*Priority:* P4A2
+*Area:* Domain transformations / XRef matrix shape materialization
+
+==== Purpose
+
+Enable transformation of sparse or empty tuple relations into full-shape crosstables by explicitly configuring the complete row and column axis space from external sources. This allows business users to create and edit matrices even when the underlying relation has no tuples or only partial tuples for certain row/column combinations.
+
+==== Context
+
+`FTR-XREF-CROSSTABLE` (first slice, implemented) defers dense-axis reconstruction in its "Future Dense Axis Contract" section. The current implementation:
+
+* `contract_xref` accepts an optional `column_keys` parameter and produces all specified columns, filling missing cells with `fill_value`.
+* `contract_xref` extracts row identities only from tuples present in the source relation.
+* No mechanism exists to reconstruct missing rows from an external row-axis source.
+
+Business users face a structural blockers:
+* "I have 50 products and 10 features but only 5 tuples populated. How do I create a 50×10 matrix to fill in the rest?"
+* "I edited the matrix and removed some rows. On re-import, how does the system know the full row set to restore?"
+
+Additionally, `compact_multiaxis` and related transforms accept a `dense_axes` parameter but explicitly reject it (`_reject_dense_axes()` raises NotImplementedError), pending this FTR.
+
+Axis mappings (identity, labels, grouping, ordering) are deferred to `FTR-XREF-AXIS-MAPPINGS-P4A2`. This FTR focuses on the mechanical problem of materializing full matrix shape from configured axis sources.
+
+==== Current Gaps in xref_crosstable.py
+
+* Row identities are derived only from `_ordered_row_identities(relation, row_keys)` — no external row-axis source is consulted.
+* Metadata writes `row_keys` (column names) but not row-axis configuration or source reference.
+* No support for materializing missing (row, column) combinations from external frame keys.
+
+==== Proposed Dense Axes Configuration
+
+[source,yaml]
+----
+contract_xref:
+  relation: localized_values     # May be empty or sparse
+  output: localized_matrix
+  row_keys: [resource_key]
+  column_key: context_id
+  value: text
+
+  # Future dense_axes configuration (this FTR):
+  dense_axes:
+    rows_from:
+      frame: resources           # External source frame
+      key: resource_id           # Column to read row identities from
+    columns_from:
+      frame: contexts            # External source frame
+      key: context_id            # Column to read column identities from
+
+  fill_value: ""                 # Value for missing (row, column) cells
+
+# For expand_xref, inverse metadata:
+expand_xref:
+  matrix: localized_matrix       # May be full-shape from contraction above
+  output: expanded_tuples
+  row_keys: [resource_key]
+  value_columns: [default, product_a, product_b]
+
+  # Metadata from contract_xref supplies implicit knowledge:
+  # - which columns came from dense_axes and can be reconstructed
+  # - how to preserve shape on roundtrip
+
+  drop_empty: false              # Preserve shape
+----
+
+==== Two Implementation Slices
+
+===== Slice 1: Dense Matrix Construction
+
+* Accept explicit `dense_axes` configuration in `contract_xref` (and later `contract_compact_multiaxis`).
+* Read row identities from configured `rows_from.frame` using `rows_from.key` column.
+* Read column identities from configured `columns_from.frame` using `columns_from.key` column (alternative to explicit `column_keys`).
+* Construct full Cartesian product of (rows, columns).
+* Fill all cells: if (row, column) pair exists in relation, use its value; otherwise use `fill_value`.
+* Write `dense_axes` configuration to metadata for roundtrip support.
+
+===== Slice 2: Dense Roundtrip Preservation
+
+* `expand_xref` reads dense_axes metadata from prior `contract_xref` call.
+* When `drop_empty=false` and dense_axes metadata exists, preserve the full row set.
+* `contract_xref` on reimport uses metadata to reconstruct the same full shape without requiring all tuples to re-exist.
+* Metadata allows a business user to edit a subset of cells in a dense matrix and re-import with full shape intact.
+
+==== Goals
+
+* Materialize the full configured matrix axis space (rows × columns) from explicit external sources, even when the tuple relation is sparse or empty.
+* Support both `expand_xref` and `contract_xref` (and later multi-axis transforms).
+* Store dense-axis configuration in metadata to enable lossless roundtrips.
+* Preserve matrix shape through a full cycle: sparse relation → dense matrix → business edits → re-import.
+* Keep the feature generic and independent of domain semantics (locales, products, etc.).
+* Fail clearly if axis sources are missing or misconfigured.
+
+==== Non-Goals
+
+* Do not infer axis sources from visible labels, grouped headers, table position, or frame-name similarity.
+* Do not implement axis hierarchies, grouping, or multi-level headers (that belongs to `FTR-XREF-GROUPED-COLUMNS-P4A2` and `FTR-XREF-AXIS-MAPPINGS-P4A2`).
+* Do not interpret the meaning of empty cells or apply fallback logic (that is `FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A`).
+* Do not automatically select axis sources; they must be explicitly configured.
+* Do not support nested JSON or fan-out within a single cell.
+
+==== Dependencies
+
+* Requires: `FTR-XREF-CROSSTABLE` (base matrix ↔ relation transformation)
+* Informed by: `FTR-XREF-AXIS-MAPPINGS-P4A2` (axis identity and metadata model)
+* Coordinate with: `FTR-COMPACT-MULTIAXIS` (dense_axes parameter already stubbed out, waiting for this FTR)
+
+==== Relationships to Other FTRs
+
+* **FTR-XREF-AXIS-MAPPINGS-P4A2:** That FTR handles rich axis metadata (labels, grouping, ordering). This FTR handles the simpler problem of materializing rows/columns from explicit frame keys. Both may eventually use the same metadata schema, but this FTR is about *shape*, not *metadata*.
+
+* **FTR-XREF-GROUPED-COLUMNS-P4A2:** Grouped columns (product family → variants) assume the full column axis is already known. This FTR ensures the axis is materialized; grouped-columns then applies structure on top.
+
+* **FTR-COMPACT-XREF-USE-CASE-SLICE-P4A2:** That usage example uses complete relations (all tuples present). This FTR enables the same pattern with sparse relations.
+
+* **FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A:** Fallback handles empty-cell *meaning* (omit or default). Dense axes handles empty-cell *structure* (which rows/columns exist). No direct dependency, but both operate on matrices: fallback on the values, dense axes on the shape.
+
+* **FTR-LOCALIZED-RESOURCE-MATRIX-ROUNDTRIP-P4A (completed):** Was implemented without dense axes support. This FTR retroactively enables the same roundtrip pattern for sparse resource relations.
+
+==== Acceptance
+
+* Dense contraction with explicit `rows_from`/`columns_from` produces rows and columns from axis sources, even if the relation is empty.
+* All (row, column) combinations are present in the output matrix; missing cells are filled with `fill_value`.
+* Metadata stores dense_axes configuration for later reconstruction.
+* Expand with `drop_empty=false` and dense_axes metadata preserves the full row set from the original configuration.
+* Roundtrip `sparse_relation -> dense_matrix -> edits -> expand -> contract` restores full matrix shape.
+* Tests cover: empty relation, sparse relation (partial tuples), full-shape preservation, metadata roundtrip.
+* Error messages clearly indicate when axis sources are missing, misconfigured, or have duplicate/missing keys.
+* Existing tests (complete relations without dense_axes) continue to pass without modification.
+* Feature is backend-neutral and works identically for XLSX, ODS, and frame-based workflows.
+
