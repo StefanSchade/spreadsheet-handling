@@ -113,6 +113,13 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.sparse_defaults:sparse_expand",
     ),
+    "normalize_resource_overrides": StepRegistration(
+        factory=make_frames_target_step,
+        target=(
+            "spreadsheet_handling.domain.transformations.resource_overrides:"
+            "normalize_resource_overrides"
+        ),
+    ),
     "decode_cell_values": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.cell_codec:decode_cell_values",

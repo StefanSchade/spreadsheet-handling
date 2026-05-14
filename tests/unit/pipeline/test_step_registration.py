@@ -256,6 +256,57 @@ def test_sparse_default_steps_are_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A")
+def test_normalize_resource_overrides_step_is_config_addressable() -> None:
+    frames = {
+        "localized_values": pd.DataFrame([
+            {
+                "resource_key": "greeting",
+                "locale": "en",
+                "context_id": "default",
+                "text": "Hello",
+            },
+            {
+                "resource_key": "greeting",
+                "locale": "en",
+                "context_id": "product_a",
+                "text": "",
+            },
+        ])
+    }
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "normalize_resource_overrides",
+                "source": "localized_values",
+                "output": "normalized_values",
+                "row_keys": ["resource_key"],
+                "discriminator_column": "locale",
+                "context_column": "context_id",
+                "value_column": "text",
+                "resource_override_policy": {
+                    "default_context": "default",
+                    "empty_override": "omit_tuple",
+                },
+            }
+        ]
+    )
+
+    assert isinstance(REGISTRY["normalize_resource_overrides"], StepRegistration)
+    assert steps[0].config["target"].endswith(":normalize_resource_overrides")
+
+    out = run_pipeline(frames, steps)
+
+    assert out["normalized_values"].to_dict(orient="records") == [
+        {
+            "resource_key": "greeting",
+            "locale": "en",
+            "context_id": "default",
+            "text": "Hello",
+        }
+    ]
+
+
 @pytest.mark.ftr("FTR-SPLIT-BY-DISCRIMINATOR-P4A")
 def test_discriminator_split_steps_are_config_addressable() -> None:
     frames = {
