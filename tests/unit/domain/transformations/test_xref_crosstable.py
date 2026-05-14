@@ -541,3 +541,52 @@ def test_contract_xref_rejects_tuples_outside_configured_dense_axes() -> None:
                 "columns_from": {"frame": "contexts", "key": "context_id"},
             },
         )
+
+
+@DENSE_FTR
+def test_contract_xref_dense_multicolumn_row_keys() -> None:
+    frames = {
+        "products": pd.DataFrame({
+            "region": ["NA", "EMEA"],
+            "category": ["A", "B"],
+        }),
+        "contexts": pd.DataFrame({"context_id": ["default", "product_a"]}),
+        "values": pd.DataFrame([
+            {
+                "region": "NA",
+                "category": "A",
+                "context_id": "default",
+                "text": "NA-A Default",
+            },
+        ]),
+    }
+
+    out = contract_xref(
+        frames,
+        relation="values",
+        output="matrix",
+        row_keys=["region", "category"],
+        column_key="context_id",
+        value="text",
+        dense_axes={
+            "rows_from": {"frame": "products", "keys": ["region", "category"]},
+            "columns_from": {"frame": "contexts", "key": "context_id"},
+        },
+        name="multicolumn_dense",
+    )
+
+    assert out["matrix"].to_dict(orient="records") == [
+        {"region": "NA", "category": "A", "default": "NA-A Default", "product_a": ""},
+        {"region": "EMEA", "category": "B", "default": "", "product_a": ""},
+    ]
+    assert out["_meta"]["xref_crosstable"]["multicolumn_dense"]["dense_axes"] == {
+        "rows_from": {"frame": "products", "keys": ["region", "category"]},
+        "columns_from": {"frame": "contexts", "key": "context_id"},
+        "resolved": {
+            "row_identities": [
+                {"region": "NA", "category": "A"},
+                {"region": "EMEA", "category": "B"},
+            ],
+            "column_keys": ["default", "product_a"],
+        },
+    }
