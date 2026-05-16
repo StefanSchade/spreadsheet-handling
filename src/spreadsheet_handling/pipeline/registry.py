@@ -154,6 +154,13 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
             "write_artifact_manifest"
         ),
     ),
+    "apply_derived_column_policy": StepRegistration(
+        factory=make_frames_target_step,
+        target=(
+            "spreadsheet_handling.domain.transformations.derived_column_policy:"
+            "apply_derived_column_policy"
+        ),
+    ),
 }
 
 
