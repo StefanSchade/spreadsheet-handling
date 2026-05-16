@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pandas as pd
@@ -80,8 +80,7 @@ def write_artifact_manifest(
         _ensure_path_column(df, frame_name=frame_name)
         all_rows.extend(_normalize_report_rows(df, frame_name=frame_name, writer_step=writer_step, artifact_kind=artifact_kind))
 
-    if out_dir is not None:
-        all_rows = _validate_and_normalize_paths(all_rows, output_dir=out_dir)
+    all_rows = _validate_and_normalize_paths(all_rows, output_dir=out_dir)
 
     all_rows.sort(key=lambda r: (r["path"], r["writer_step"]))
 
@@ -157,22 +156,38 @@ def _normalize_report_rows(
 def _validate_and_normalize_paths(
     rows: list[dict[str, Any]],
     *,
-    output_dir: Path,
+    output_dir: Path | None,
 ) -> list[dict[str, Any]]:
-    """Validate that all reported paths are relative and stay within output_dir.
+    """Validate reported paths are portable and optionally root-contained.
 
-    Normalizes paths using the same _safe_target_path rule applied to manifest_path.
-    Returns rows with normalized (relative) path values.
+    Reported artifact paths must be stable relative manifest paths even when no
+    filesystem output root is configured.  When output_dir is configured, apply
+    the stronger root containment rule used for manifest_path.
     """
     validated: list[dict[str, Any]] = []
     for row in rows:
-        path_str = row["path"]
-        target = _safe_target_path(output_dir, path_str)
-        normalized_path = str(target.relative_to(output_dir))
+        path_text = str(row["path"])
+        if output_dir is not None:
+            _safe_target_path(output_dir, path_text)
+        normalized_path = _portable_relative_path(path_text)
+        if output_dir is not None:
+            target = _safe_target_path(output_dir, normalized_path)
+            normalized_path = target.relative_to(output_dir).as_posix()
         validated_row = dict(row)
         validated_row["path"] = normalized_path
         validated.append(validated_row)
     return validated
+
+
+def _portable_relative_path(path_label: str) -> str:
+    path_text = str(path_label)
+    win_path = PureWindowsPath(path_text)
+    posix_path = PurePosixPath(path_text.replace("\\", "/"))
+    if win_path.is_absolute() or win_path.drive or posix_path.is_absolute():
+        raise ValueError(f"Artifact path {path_text!r} must be relative")
+    if ".." in posix_path.parts:
+        raise ValueError(f"Artifact path {path_text!r} must not contain '..'")
+    return posix_path.as_posix()
 
 
 def _check_duplicate_paths(rows: list[dict[str, Any]]) -> None:

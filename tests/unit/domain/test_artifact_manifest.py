@@ -219,6 +219,28 @@ def test_manifest_path_requires_output_dir() -> None:
         write_artifact_manifest(frames, reports=["r"], manifest_path="manifest.yml")
 
 
+def test_absolute_reported_artifact_path_is_rejected_without_output_dir(tmp_path: Path) -> None:
+    frames = {"r": _make_kv_report(str(tmp_path / "outside.txt"))}
+
+    with pytest.raises(ValueError, match="must be relative"):
+        write_artifact_manifest(frames, reports=["r"])
+
+
+def test_parent_segment_reported_artifact_path_is_rejected_without_output_dir() -> None:
+    frames = {"r": _make_kv_report("../outside.txt")}
+
+    with pytest.raises(ValueError, match="must not contain"):
+        write_artifact_manifest(frames, reports=["r"])
+
+
+def test_normal_relative_reported_artifact_path_works_without_output_dir() -> None:
+    frames = {"r": _make_kv_report("nested/out.properties")}
+
+    out = write_artifact_manifest(frames, reports=["r"])
+
+    assert list(out["generated_artifacts"]["path"]) == ["nested/out.properties"]
+
+
 def test_reported_artifact_path_traversal_is_rejected_with_checksum(tmp_path: Path) -> None:
     frames = {"r": _make_kv_report("../outside.txt")}
 
@@ -244,8 +266,8 @@ def test_reported_artifact_path_traversal_is_rejected_without_checksum(tmp_path:
 
 def test_duplicate_detection_catches_normalized_equivalent_paths(tmp_path: Path) -> None:
     frames = {
-        "r1": _make_kv_report("x.txt"),
-        "r2": _make_kv_report("a/../x.txt"),
+        "r1": _make_kv_report("nested/x.txt"),
+        "r2": _make_kv_report("nested\\x.txt"),
     }
 
     with pytest.raises(ValueError, match="Duplicate artifact path"):
