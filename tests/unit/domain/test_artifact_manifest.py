@@ -219,6 +219,39 @@ def test_manifest_path_requires_output_dir() -> None:
         write_artifact_manifest(frames, reports=["r"], manifest_path="manifest.yml")
 
 
+def test_reported_artifact_path_traversal_is_rejected_with_checksum(tmp_path: Path) -> None:
+    frames = {"r": _make_kv_report("../outside.txt")}
+
+    with pytest.raises(ValueError, match="escapes output_dir"):
+        write_artifact_manifest(
+            frames,
+            reports=["r"],
+            output_dir=tmp_path,
+            checksum="sha256",
+        )
+
+
+def test_reported_artifact_path_traversal_is_rejected_without_checksum(tmp_path: Path) -> None:
+    frames = {"r": _make_kv_report("../outside.txt")}
+
+    with pytest.raises(ValueError, match="escapes output_dir"):
+        write_artifact_manifest(
+            frames,
+            reports=["r"],
+            output_dir=tmp_path,
+        )
+
+
+def test_duplicate_detection_catches_normalized_equivalent_paths(tmp_path: Path) -> None:
+    frames = {
+        "r1": _make_kv_report("x.txt"),
+        "r2": _make_kv_report("a/../x.txt"),
+    }
+
+    with pytest.raises(ValueError, match="Duplicate artifact path"):
+        write_artifact_manifest(frames, reports=["r1", "r2"], output_dir=tmp_path)
+
+
 def test_step_is_config_addressable(tmp_path: Path) -> None:
     frames = {
         "yaml_report": _make_yaml_report("config.yml"),

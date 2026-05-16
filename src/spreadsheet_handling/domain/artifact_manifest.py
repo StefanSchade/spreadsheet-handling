@@ -80,6 +80,9 @@ def write_artifact_manifest(
         _ensure_path_column(df, frame_name=frame_name)
         all_rows.extend(_normalize_report_rows(df, frame_name=frame_name, writer_step=writer_step, artifact_kind=artifact_kind))
 
+    if out_dir is not None:
+        all_rows = _validate_and_normalize_paths(all_rows, output_dir=out_dir)
+
     all_rows.sort(key=lambda r: (r["path"], r["writer_step"]))
 
     _check_duplicate_paths(all_rows)
@@ -149,6 +152,27 @@ def _normalize_report_rows(
             "status": "success",
         })
     return rows
+
+
+def _validate_and_normalize_paths(
+    rows: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+) -> list[dict[str, Any]]:
+    """Validate that all reported paths are relative and stay within output_dir.
+
+    Normalizes paths using the same _safe_target_path rule applied to manifest_path.
+    Returns rows with normalized (relative) path values.
+    """
+    validated: list[dict[str, Any]] = []
+    for row in rows:
+        path_str = row["path"]
+        target = _safe_target_path(output_dir, path_str)
+        normalized_path = str(target.relative_to(output_dir))
+        validated_row = dict(row)
+        validated_row["path"] = normalized_path
+        validated.append(validated_row)
+    return validated
 
 
 def _check_duplicate_paths(rows: list[dict[str, Any]]) -> None:
