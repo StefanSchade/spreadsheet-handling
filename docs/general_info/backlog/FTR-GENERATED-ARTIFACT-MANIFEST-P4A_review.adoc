@@ -1,0 +1,115 @@
+= Review: FTR-GENERATED-ARTIFACT-MANIFEST-P4A
+
+Date: 2026-05-16
+
+Reviewed commit: `6f1f555`
+
+== Verdict
+
+Blocked.
+
+The implementation is directionally aligned with the FTR boundary: it is an observational manifest/report aggregation step, keeps writers provisional, does not introduce build orchestration, and avoids lifecycle, publish, cleanup, dependency-graph, workbook, matrix, and resource-semantics behavior.
+
+However, the commit should not remain as-is because two blocking issues remain:
+
+* reported artifact paths are not path-safety validated before checksum resolution or manifest inclusion;
+* the pipeline step registry entry uses an inverse kind that is not accepted by the registry contract.
+
+== Blocking Issues
+
+=== 1. Reported artifact paths can escape `output_dir`
+
+`src/spreadsheet_handling/domain/artifact_manifest.py:77` to `src/spreadsheet_handling/domain/artifact_manifest.py:90` normalizes report rows, sorts them, and computes checksums by joining `output_dir / row["path"]`.
+
+Only `manifest_path` is validated through `_safe_target_path` at `src/spreadsheet_handling/domain/artifact_manifest.py:94` to `src/spreadsheet_handling/domain/artifact_manifest.py:98` and `src/spreadsheet_handling/domain/artifact_manifest.py:212` to `src/spreadsheet_handling/domain/artifact_manifest.py:221`.
+
+The artifact `path` values coming from report frames are only checked for column presence at `src/spreadsheet_handling/domain/artifact_manifest.py:203` to `src/spreadsheet_handling/domain/artifact_manifest.py:205`. A report row such as `../outside.txt` can therefore be emitted into the manifest and, when checksum is enabled, resolved and read outside `output_dir`.
+
+This violates the FTR goal that reported paths stay inside configured output roots. The same relative-path validation used for `manifest_path` should be applied to every reported artifact path before checksum computation and before manifest output.
+
+=== 2. Registry entry uses an unsupported inverse kind
+
+`docs/internal_guide/architecture/pipeline_step_registry.json:1457` declares `write_artifact_manifest` with inverse kind `aggregation`.
+
+The registry contract currently allows only the inverse kinds listed at `docs/internal_guide/architecture/pipeline_step_registry.json:54` to `docs/internal_guide/architecture/pipeline_step_registry.json:63`; `aggregation` is not one of them. The architecture guard asserts this at `tests/architecture/dependency_guards/test_pipeline_step_registry.py:126` to `tests/architecture/dependency_guards/test_pipeline_step_registry.py:127`.
+
+Focused verification result:
+
+----
+make test-file FILE=tests/architecture/dependency_guards/test_pipeline_step_registry.py
+----
+
+Result: failed in `test_pipeline_step_registry_entries_have_required_shape_and_enums` for `write_artifact_manifest` because `aggregation` is not an allowed inverse kind.
+
+The fix should either use an existing valid inverse kind that matches the step semantics or deliberately extend the registry contract if `aggregation` is now a first-class inverse classification.
+
+== Architectural Decision Review
+
+=== 1. Normalization at the manifest boundary, not in writers
+
+Validated for this slice.
+
+Keeping writer report shapes provisional and converging them at the manifest boundary matches the FTR boundary and avoids forcing all writers into a shared report contract immediately. This does not introduce build orchestration or a writer plugin framework.
+
+Migration caution: the current normalizer handles provisional `frame` to `source_frames` and `rows` to `row_count`, but it does not yet prefer already-converged `row_count`, `artifact_kind`, `writer_step`, `checksum`, or `status` columns when present. That is acceptable for the minimal slice but should be addressed when writer-native report convergence happens.
+
+=== 2. `source_frames` is always a list
+
+Validated.
+
+The implementation preserves list-like `source_frames` values and wraps provisional single-frame `frame` values into a one-element list. This keeps provenance shallow and avoids introducing a provenance DAG.
+
+=== 3. `manifest_path` must be relative and path-safety validated
+
+Validated for `manifest_path`.
+
+Absolute manifest paths and traversal outside `output_dir` are rejected. This boundary is clear and consistent with the FTR.
+
+This does not cover reported artifact `path` values; that gap is the first blocking issue above.
+
+=== 4. `output_dir` is required for checksum and `manifest_path`
+
+Validated.
+
+Requiring `output_dir` for checksum generation and manifest-file output avoids implicit workspace roots. Checksums are resolved relative to the configured output root.
+
+The reported artifact path validation gap still needs to be closed before this is path-safe end to end.
+
+=== 5. Writer report shape convergence is deferred
+
+Validated with a follow-up.
+
+Deferring writer-native convergence is consistent with the FTR and avoids premature manifest framework design. The manifest step is a reasonable merge-time convergence point for this slice.
+
+Future convergence should remain shallow: prefer already-converged report columns when present, continue accepting provisional writer report columns during migration, and avoid introducing lifecycle state or dependency graph semantics.
+
+== Non-Blocking Concerns
+
+* Unsupported manifest filename suffixes currently fall through to YAML output. This may be acceptable, but a future tightening could explicitly accept `.yaml`, `.yml`, and `.json` or document the fallback behavior.
+* Duplicate path detection is deterministic but currently operates on raw path strings. After report-path normalization is added, duplicate detection should run on normalized relative paths so equivalent spellings cannot bypass it.
+* Serialization is deterministic enough for the current records: rows are sorted by `(path, writer_step)`, JSON uses stable input order, YAML preserves record key order, UTF-8 is explicit, and manifest files are written with LF newlines.
+* Checksum behavior is correctly byte-based and platform-independent once the path-safety issue is fixed.
+
+== Deferred Follow-Ups
+
+* Add tests for reported artifact path traversal, both with checksum enabled and without checksum.
+* Add a test for duplicate detection after path normalization, for example `a/../x.txt` versus `x.txt`.
+* Add migration tests for already-converged writer report columns when writer-native report convergence is implemented.
+* Decide whether `aggregation` should become an allowed registry inverse kind or whether `write_artifact_manifest` should use an existing classification.
+
+== Test Coverage Assessment
+
+The unit tests cover the main FTR acceptance points: deterministic merge ordering, duplicate paths, missing report frames, provisional `frame` to `source_frames` normalization, annotated report specs, checksum generation, YAML/JSON manifest output, LF newline behavior, `manifest_path` traversal rejection, absolute `manifest_path` rejection, `output_dir` requirements, and pipeline invocation.
+
+Missing coverage that matters now:
+
+* reported artifact path traversal rejection;
+* registry contract validation for the new pipeline step.
+
+The focused registry guard currently fails for this commit, as noted above.
+
+== Commit Disposition
+
+The implementation should not remain as-is.
+
+After the two blocking issues are fixed, the core design can remain narrow and aligned with the FTR: an observational manifest/report aggregation step with conservative report-shape normalization and no build-system responsibilities.
