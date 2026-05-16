@@ -1,0 +1,260 @@
+===== FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A -- Formalize the _meta.derived provenance lifecycle
+
+*Status:* Open
+*Priority:* P4A
+*Area:* Pipeline / metadata lifecycle
+
+==== Purpose
+
+Make the lifecycle of the `_meta.derived` channel explicit and operational:
+who writes it, who consumes it, who prunes it, when it is gone, and what
+"stale" or "orphaned" provenance means. This formalizes concerns surfaced
+during `FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A` and its follow-up
+review/fix cycle, plus the earlier transient-vs-persisted helper-provenance
+discussions.
+
+This FTR is narrow and operational. It documents and tightens an existing
+contract. It does not introduce a metadata governance framework, does not
+redesign workbook reimport, and does not add heuristic reconciliation as core
+pipeline behavior.
+
+==== Background — current behavior (grounded in code)
+
+`_meta.derived` is registered in
+`docs/internal_guide/architecture/meta_registry.yaml` as transient
+`meta_rendering` / `derived_operational_view` metadata. The
+`architecture_primer.adoc` invariant is that roundtrip must not depend on
+`meta_rendering` alone; everything required for reconstruction must live in
+`meta_canonical` or be stably persisted from it.
+
+Producers (write `_meta.derived.sheets[<sheet>]`):
+
+* `domain.transformations.fk_helpers._write_helper_provenance` — writes the
+  `helper_columns` sub-key. It *also* prunes: it removes `helper_columns` for
+  sheets with no current FK defs and for sheets no longer in frames, and prunes
+  the empty `derived` namespace. A producer therefore also performs cleanup.
+* `domain.transformations.enrich_lookup._write_provenance` — writes the
+  `enrich_lookup` sub-key (`{lookup, on, helper_columns}`). It performs a
+  key-selective `setdefault` merge and does **not** stale-remove its own
+  entries.
+
+Consumers (read `_meta.derived`):
+
+* `rendering.passes._base._derived_helper_column_names` — reads both
+  `helper_columns` and `enrich_lookup.helper_columns`; already `isinstance`-guarded.
+* `domain.transformations.fk_helpers.drop_helpers` — reads `helper_columns`
+  to choose columns to drop (prefix fallback when absent).
+* `domain.transformations.derived_column_policy.apply_derived_column_policy`
+  — reads both sub-keys for identity; value-checks `enrich_lookup` only.
+
+Pruning / cleanup sites (three, in two modules, with no single owner):
+
+* `fk_helpers._clean_helper_provenance` (via `drop_helpers`): always pops
+  `helper_columns`; pops `enrich_lookup` only when none of its helper columns
+  remain in the cleaned frame; prunes empty containers; writes meta back.
+* The pruning block embedded inside the `_write_helper_provenance` producer
+  (described above).
+* `derived_column_policy._strip_consumed_provenance`: on source replacement,
+  strips both `helper_columns` and `enrich_lookup` for the replaced frame and
+  prunes empty containers.
+
+Persistence asymmetry (important):
+
+* The XLSX write path persists only canonical metadata (`RenderPlan.kv` is the
+  "concrete persisted representation of canonical workbook metadata");
+  `_meta.derived` is a separate `meta_rendering` channel consumed by passes and
+  is not part of canonical `kv`.
+* The JSON-directory backend writes a `_meta.yaml` sidecar by serializing the
+  *entire* in-memory `frames["_meta"]`, with no filter that strips `derived`.
+
+Consequence: absence of `derived` from persisted output is a *consequence of
+cleanup-step ordering having run earlier in the pipeline*, not of a
+serialization-time filter. If a pipeline serializes before cleanup (JSON
+sidecar path), residual `derived` provenance can leak into persisted output.
+
+==== Lifecycle model (to formalize)
+
+State the canonical lifecycle explicitly:
+
+. *Produced* by helper-enrichment steps (`add_fk_helpers` →
+  `_write_helper_provenance`; `add_lookup_helpers` → `_write_provenance`)
+  during a single pipeline run.
+. *Consumed* by rendering passes and by reimport/cleanup steps within the same
+  run.
+. *Pruned* when the columns it describes are removed (`drop_helpers`,
+  `apply_derived_column_policy` replacement) or when the producer detects its
+  own entries are no longer applicable.
+. *Absent* thereafter. `_meta.derived` must not be relied upon after cleanup,
+  and roundtrip reconstruction must not depend on it (existing
+  `architecture_primer` invariant).
+
+Document the explicit ordering constraints:
+
+* `apply_derived_column_policy` consumes `_meta.derived` before `drop_helpers`.
+* Serialization that must not leak `derived` (notably the JSON `_meta.yaml`
+  sidecar) must run after cleanup, or the serializer must explicitly exclude
+  the transient `derived` channel. This FTR should decide which of these two
+  is the contract and document it; it should not silently assume ordering.
+
+==== Ownership model (to formalize)
+
+* Each sub-key has exactly one *producer* responsible for writing it.
+* Cleanup ownership must be named, not emergent. Today cleanup is spread
+  across three functions and one producer. Decide and document the owner(s):
+  ** either a single cleanup owner per consumption path (e.g. the step that
+     removes the columns owns removing their provenance), or
+  ** an explicit named cleanup contract that each participating step satisfies.
+* The `enrich_lookup` producer currently has no stale-removal for its own
+  sub-key, unlike the FK producer. Document whether symmetric producer-side
+  stale-removal is required or whether cleanup is consumer-owned only.
+
+==== Cleanup semantics (to formalize)
+
+* Pruning must remove a sub-key only when the columns it describes are no
+  longer present in the corresponding frame (the "presence-checked prune"
+  rule already used for `enrich_lookup` in `_clean_helper_provenance`). This
+  rule should be stated as the general contract so present columns are never
+  left without provenance and removed columns never retain it.
+* Container pruning (`derived.sheets[sheet]` → `derived.sheets` → `derived`)
+  must be consistent across all cleanup sites.
+* Nested `_meta` mutation hygiene: cleanup/producer code must not mutate the
+  caller's input metadata in place. Today `_write_helper_provenance`,
+  `enrich_lookup._write_provenance`, and `drop_helpers` use
+  `dict(meta)` + `setdefault` / shared nested references and mutate nested
+  `derived`/`sheets` dicts that may be shared with the caller's input;
+  only `_strip_consumed_provenance` copies along the mutated path. The
+  contract should require copy-along-the-mutated-path semantics for any step
+  that prunes or rewrites nested `_meta` paths.
+
+==== Orphan / stale provenance handling (to formalize)
+
+Define behavior for each scenario; default posture is *safe and explicit*, not
+silent repair:
+
+* *Helper column removed, provenance retained* — must be pruned by the
+  removing step (now handled for `drop_helpers` /
+  `apply_derived_column_policy`; document as the rule, not an incident fix).
+* *Absent helper columns referenced by provenance* — safe no-op for consumers;
+  presence-checked prune removes the stale entry. Already test-covered for the
+  policy step; generalize the expectation.
+* *Column rename / sheet rename* — provenance keyed by the old name is
+  orphaned. Renaming helper columns or their sheets is currently unsupported
+  (`concepts_fk_helpers.adoc`). This FTR documents it as a *known orphan
+  class*, detected/reported, not silently reconciled.
+* *Missing lookup frame for `enrich_lookup`* — already produces an explicit
+  finding in `apply_derived_column_policy`; document as the contract.
+* *Partial metadata loss* (e.g. a hand-edited `_meta.yaml` sidecar) — must
+  fail clearly or be an explicit no-op, never silent guesswork.
+
+==== Deterministic vs heuristic boundary (explicit)
+
+The deterministic business pipeline consumes *explicit* metadata. Inference or
+recovery of derived provenance must not happen silently inside ordinary
+business steps.
+
+* Any reconstruction, reconciliation, or orphan-repair of derived provenance
+  must be: explicit, opt-in, a *separate* step, metadata/finding-producing,
+  and reviewable/debuggable.
+* The existing prefix-based fallback in `drop_helpers` (drop `_`-prefixed
+  columns when no provenance exists) is the canonical example of an *implicit
+  heuristic inside a normal step*. This FTR documents it as the bounded
+  anti-pattern. Whether to gate it behind explicit opt-in is a deferred
+  decision (see Deferred Concerns); this FTR does not remove it.
+
+==== Possible future reconciliation step (concept only)
+
+A future, explicitly invoked step (concept name e.g.
+`reconcile_derived_provenance`) could detect orphan/stale provenance
+(rename-induced orphans, absent columns, partial loss) and emit
+validation-style findings without mutating canonical data and without silent
+repair. This is captured as a *concept and boundary*, not designed here. No
+acceptance criterion below depends on building it.
+
+==== Scope
+
+* Document the `_meta.derived` lifecycle, ownership, and cleanup semantics as a
+  written contract in the appropriate canonical location (extend
+  `meta_registry.yaml` notes and/or `metadata_canonical_vs_derived.adoc`;
+  exact location is an implementation detail of this FTR).
+* State the persistence/serialization contract for the transient `derived`
+  channel, including the JSON `_meta.yaml` sidecar path.
+* State the presence-checked prune rule and the nested-`_meta` copy-hygiene
+  rule as general contracts.
+* Enumerate orphan/stale classes and their required (safe, explicit) behavior.
+* Draw the deterministic-vs-heuristic boundary explicitly.
+
+==== Non-goals
+
+* No metadata governance framework, registry engine, or generic provenance
+  graph.
+* No workbook reimport architecture redesign (owned by
+  `FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A`).
+* No automatic heuristic reconciliation as core/default behavior.
+* No durable persistence of derived provenance through workbook output as
+  canonical metadata in this slice.
+* No removal of the existing prefix fallback in this slice.
+* No change to FK-helper value-check scope (still owned/deferred by the
+  reimport-policy FTR).
+
+==== Residual review findings folded in
+
+From the `FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A` review/fix cycle,
+carried here as lifecycle concerns (non-blocking there, in-scope to *document*
+here):
+
+* Nested `_meta` mutation hygiene across producers and `drop_helpers`
+  (shared-reference mutation of caller input).
+* Stale `enrich_lookup` provenance edge cases, including the producer having
+  no stale-removal and cross-step ordering effects.
+* Malformed-metadata hardening gaps *above* `_meta.derived` (the policy step is
+  now hardened at/below the sheet level; `drop_helpers` and producers do not
+  uniformly validate `_meta.derived` shape and could raise on malformed input).
+* Cleanup ordering semantics and the absence of a single named cleanup owner.
+
+==== Acceptance
+
+* A written, canonical lifecycle contract for `_meta.derived` exists covering:
+  produced → consumed → pruned → absent, with the explicit ordering constraints.
+* The persistence/serialization contract for the transient `derived` channel is
+  stated, including an explicit decision for the JSON `_meta.yaml` sidecar path
+  (cleanup-before-serialize ordering vs. serializer-side exclusion).
+* The presence-checked prune rule and the nested-`_meta` copy-hygiene rule are
+  documented as general contracts that all producing/pruning steps must meet.
+* Orphan/stale classes (column rename, sheet rename, absent columns, missing
+  lookup frame, partial metadata loss) are enumerated with required safe,
+  explicit behavior.
+* The deterministic-vs-heuristic boundary is documented, naming the existing
+  `drop_helpers` prefix fallback as the bounded anti-pattern.
+* Cross-references to the related FTRs/reviews and the metadata concept docs
+  are in place.
+* No code behavior change is required to satisfy this FTR; any tightening that
+  follows is tracked as its own follow-up with its own tests.
+
+==== Deferred concerns
+
+* Whether the `drop_helpers` prefix fallback should become explicit/opt-in.
+* Symmetric producer-side stale-removal for `enrich_lookup`.
+* Building the explicit `reconcile_derived_provenance` step.
+* Durable derived-provenance persistence through rendered workbooks and
+  file→frame reimport (owned by `FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A` and a
+  future durable-provenance FTR).
+* Uniform malformed-`_meta.derived` hardening inside producers and
+  `drop_helpers` (policy step already hardened).
+* Richer reimport findings (expected/actual/join-key summaries) — owned by the
+  reimport-policy FTR follow-ups.
+
+==== Related FTRs and references
+
+* `FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A` and its
+  `_review.adoc` — origin of the lifecycle blockers and the cleanup/hardening
+  fixes.
+* `FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A` — owns durable file→frame mapping;
+  derived-provenance persistence interplay is deferred to it / a future FTR.
+* `docs/internal_guide/architecture/meta_registry.yaml` — the `derived` entry
+  (producers/consumers/lifecycle).
+* `docs/ai_info/concepts_fk_helpers.adoc` — helper provenance shape, the
+  unsupported rename cases, prefix-cleanup notes.
+* `docs/ai_info/architecture_primer.adoc` — meta_canonical vs meta_rendering
+  invariants.
+* `docs/human_info/concepts/metadata_canonical_vs_derived.adoc` — prose
+  concept; candidate home for the formalized lifecycle wording.
