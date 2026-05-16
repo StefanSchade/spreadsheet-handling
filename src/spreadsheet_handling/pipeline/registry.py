@@ -147,6 +147,13 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
             "write_key_value_resources"
         ),
     ),
+    "write_artifact_manifest": StepRegistration(
+        factory=make_frames_target_step,
+        target=(
+            "spreadsheet_handling.domain.artifact_manifest:"
+            "write_artifact_manifest"
+        ),
+    ),
 }
 
 
