@@ -1,0 +1,187 @@
+= Review: FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A
+
+Date: 2026-05-16
+
+Reviewed commit: `c802080`
+
+== Verdict
+
+BLOCK.
+
+The implementation is mostly aligned with the intended minimal slice at the data-transformation boundary: it is frame-level and in-memory, it does not implement workbook reimport mapping, it does not introduce a broad reimport framework, it does not treat spreadsheet protection as authoritative, and it does not patch canonical lookup/source frames from helper edits.
+
+The implementation should not remain as-is for FTR closure because metadata lifecycle handling is not yet correct enough for the locked slice. The step drops helper columns but leaves consumed `_meta.derived` provenance behind, and the existing `drop_helpers` cleanup does not remove the `enrich_lookup` subkey. There is also incomplete hardening around malformed `_meta.derived` shapes.
+
+== Blocking Issues
+
+=== 1. Dropped helper columns leave stale `_meta.derived` provenance
+
+`src/spreadsheet_handling/domain/transformations/derived_column_policy.py:107` to `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:123` writes the cleaned payload frame but does not update `_meta.derived`.
+
+`src/spreadsheet_handling/domain/transformations/derived_column_policy.py:141` to `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:156` resolves helper identity and drops helper columns, but the consumed `helper_columns` and `enrich_lookup` provenance remains in the output frames.
+
+This is visible in the default replacement mode:
+
+* source frame `orders` is replaced by a payload frame without `_customer_name` and `tier`;
+* `_meta.derived.sheets.orders.helper_columns` still advertises `_customer_name`;
+* `_meta.derived.sheets.orders.enrich_lookup.helper_columns` still advertises `tier`.
+
+Running `drop_helpers` afterwards only partially cleans this up. Existing `src/spreadsheet_handling/domain/transformations/fk_helpers.py:428` to `src/spreadsheet_handling/domain/transformations/fk_helpers.py:432` removes only the FK `helper_columns` subkey. It does not remove `enrich_lookup`, so lookup-helper provenance remains stale after the documented pre-`drop_helpers` lifecycle.
+
+This contradicts the lifecycle story in `docs/general_info/backlog/FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A.adoc:52` to `docs/general_info/backlog/FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A.adoc:65` and the meta registry description at `docs/internal_guide/architecture/meta_registry.yaml:652` to `docs/internal_guide/architecture/meta_registry.yaml:684`, which describe `_meta.derived` as transient operational provenance removed by cleanup rather than carried as orphaned helper identity.
+
+This is not the deferred durable workbook provenance problem. It is stale in-memory metadata created by the slice itself after it removes the columns.
+
+Recommended amendment:
+
+* Decide the owner of cleanup for consumed provenance.
+* If `apply_derived_column_policy` owns check + drop, then when `output` is omitted or equals `source`, remove the consumed `helper_columns` and `enrich_lookup` entries for that source and prune empty `derived.sheets` containers.
+* If `drop_helpers` remains the cleanup owner, extend it to clean `enrich_lookup` as well as `helper_columns`.
+* Preserve the original source provenance when `output` is a different frame and the original helper-bearing source frame remains in the frame set.
+* Add tests for `apply_derived_column_policy` followed by `remove_fk_helpers`, including an `enrich_lookup` helper.
+
+=== 2. `meta_registry.yaml` does not list the new derived-metadata consumer
+
+The pipeline step registry correctly declares transient `_meta.derived` reads for `apply_derived_column_policy` at `docs/internal_guide/architecture/pipeline_step_registry.json:1501` to `docs/internal_guide/architecture/pipeline_step_registry.json:1519`.
+
+However, the canonical metadata review artifact does not list the new consumer. `docs/internal_guide/architecture/meta_registry.yaml:671` to `docs/internal_guide/architecture/meta_registry.yaml:676` lists only:
+
+* `domain.transformations.enrich_lookup._write_provenance`
+* `domain.transformations.fk_helpers._write_helper_provenance`
+* `rendering.passes._base._derived_helper_column_names`
+* `domain.transformations.fk_helpers.drop_helpers`
+
+`domain.transformations.derived_column_policy.apply_derived_column_policy` is a new direct consumer of `derived.sheets.*.helper_columns` and `derived.sheets.*.enrich_lookup`, but it is absent from that registry entry.
+
+This weakens the metadata lifecycle contract the FTR relies on. It should be added before considering the FTR closed.
+
+=== 3. Malformed sheet-level provenance can raise raw `AttributeError`
+
+The missing-`_meta.derived` case is handled as a no-op, but malformed sheet-level provenance is not robust.
+
+`src/spreadsheet_handling/domain/transformations/derived_column_policy.py:159` to `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:178` assumes `derived_meta` is a mapping and assumes every `helper_columns` entry has `.get("column")`.
+
+Examples observed in an in-memory probe:
+
+* `_meta.derived.sheets.orders = "bad"` raises `AttributeError: 'str' object has no attribute 'get'`.
+* `_meta.derived.sheets.orders.helper_columns = ["_h"]` raises `AttributeError: 'str' object has no attribute 'get'`.
+
+The review instructions explicitly ask whether missing, partial, malformed, stale, or absent-column provenance behaves safely. Raw `AttributeError` does not meet that bar. The implementation should either treat malformed provenance as a safe no-op or fail with a clear validation-style `ValueError` that identifies the bad `_meta.derived` path.
+
+== Architectural Boundary Review
+
+The implementation stays inside the intended frame-level boundary:
+
+* No workbook/XLSX/ODS parser behavior is added.
+* No sheet-frame mapping or `FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A` behavior is implemented.
+* No broad reimport framework is introduced.
+* Spreadsheet protection is not used as a trust boundary.
+* Canonical lookup/source frames are not patched from edited helper values.
+* Helper identity is resolved from `_meta.derived.sheets[source]`, not from prefixes or helper-column naming conventions.
+
+The step is correctly positioned as a pre-`drop_helpers` policy/check/drop primitive, but the metadata cleanup consequence of performing the drop is not yet handled.
+
+== Policy Semantics Review
+
+Validated behavior:
+
+* `drop` removes registered FK and `enrich_lookup` helper columns and emits no findings.
+* `warn_on_mismatch` reports edited `enrich_lookup` helpers and still writes the cleaned payload frame.
+* `fail_on_mismatch` raises clearly on edited `enrich_lookup` helpers.
+* Unchanged `enrich_lookup` helpers are silent.
+* FK helper values are dropped but not value-checked, matching the locked slice decision.
+* Editable payload columns are preserved.
+* `output` replacement is consistent with existing pipeline conventions: omitted `output` replaces `source`; a distinct `output` preserves the original source frame.
+
+Semantics needing follow-up:
+
+* Missing join-key columns in the payload or lookup frame are silently skipped by the comparison path instead of producing a clear finding.
+* Missing helper columns in the payload are skipped. That is safe for stale metadata but should be documented or tested.
+* Formula-mode `enrich_lookup` helpers are not distinguished from copied values because provenance does not record helper value mode. That can remain deferred, but should be captured if formula helpers become part of reimport policy.
+
+== Findings Review
+
+The findings shape is coherent with `resource_overrides`: `rule_type`, `frame`, `columns`, `row_index`, `value`, `severity`, `message`.
+
+Warning and fail modes are consistent with existing validation behavior: warn writes a findings frame; fail raises and does not write a findings frame.
+
+Non-blocking diagnostic concern: mismatch findings are grouped by helper column and include row indices plus a count, but the `value` field is empty and the finding does not include join key values, expected values, or actual values. This is enough to identify affected rows in simple frames, but it is thin for debugging edited workbooks.
+
+Suggested improvement: include at least join key values or expected/actual summaries in follow-up findings, while preserving the shared findings shape.
+
+== Test Coverage Against Acceptance
+
+Covered by `tests/unit/domain/transformations/test_derived_column_policy.py`:
+
+* drop mode removes FK and lookup helpers;
+* unchanged helpers in warn mode produce no findings;
+* edited lookup helpers warn without raising;
+* edited lookup helpers fail in fail mode;
+* edited FK helpers are drop-only;
+* no helper-column name heuristics;
+* missing `_meta.derived` no-op behavior;
+* mixed editable/helper payload extraction;
+* pure function usage;
+* invalid policy handling;
+* pipeline registration/addressability.
+
+Missing tests that matter before closure:
+
+* metadata cleanup when `output` is omitted or equals `source`;
+* behavior of `apply_derived_column_policy` followed by `remove_fk_helpers`, especially for `enrich_lookup`;
+* malformed `_meta.derived.sheets[source]` shapes;
+* malformed `helper_columns` entries;
+* stale provenance referencing absent helper columns;
+* missing lookup frame in both warn and fail mode;
+* absent join key columns in payload or lookup frame;
+* preservation of original source provenance when `output` is distinct from `source`.
+
+The existing tests are mostly behavior-oriented. The main coupling risk is that they assert the current minimal findings shape but do not validate lifecycle cleanup.
+
+== XLSX / ODS Disposition
+
+The FTR text correctly says slice 1 is in-pipeline and frame-level only. It does not silently claim XLSX/ODS reimport mapping.
+
+Durable file-to-frame classification, persisted derived provenance, and sheet/frame mapping remain correctly deferred to `FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A` or a dedicated derived-provenance persistence/orphan-cleanup FTR.
+
+== Deferred Concerns
+
+These should remain deferred and are not blockers for slice 1:
+
+* FK-helper value comparison until FK provenance records the target key column.
+* `frame_lifecycle` / `workbook_view` editability fusion.
+* Workbook parser readback of derived provenance.
+* Durable rendered-workbook provenance, including orphaned/stale metadata after sheet or column renames.
+* Formula-mode helper value comparison, unless formula-mode helpers are explicitly brought into reimport policy.
+
+Suggested new follow-up FTR:
+
+* `FTR-DERIVED-PROVENANCE-PERSISTENCE-AND-ORPHAN-CLEANUP-P4A` or similar, covering durable derived-column provenance, stale/orphan cleanup after workbook edits, and metadata lifecycle across render/parse boundaries.
+
+== Focused Checks Run
+
+----
+make test-file FILE=tests/unit/domain/transformations/test_derived_column_policy.py
+----
+
+Result: passed, 11 tests.
+
+----
+make test-file FILE=tests/architecture/dependency_guards/test_pipeline_step_registry.py
+----
+
+Result: passed, 11 tests.
+
+----
+make test-file FILE=tests/architecture/semantic_invariants/test_meta_registry.py
+----
+
+Result: passed, 5 tests.
+
+Additional read-only in-memory probes confirmed the malformed-provenance `AttributeError` cases and the stale `enrich_lookup` provenance after `apply_derived_column_policy` followed by `drop_helpers`.
+
+== Recommendation
+
+Do not close the FTR with commit `c802080` as-is.
+
+Amend the implementation minimally to fix the in-memory metadata lifecycle, update `meta_registry.yaml` to list the new consumer, and harden malformed provenance handling. The broader architecture should remain unchanged: no workbook reimport mapping, no lifecycle/build framework, no spreadsheet-protection trust semantics, and no canonical lookup/source patching from helper edits.
