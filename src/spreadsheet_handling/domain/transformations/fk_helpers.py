@@ -426,10 +426,26 @@ def _clean_helper_provenance(
         return
 
     for sheet_name in list(derived_sheets.keys()):
-        if "helper_columns" in (derived_sheets.get(sheet_name) or {}):
-            derived_sheets[sheet_name].pop("helper_columns")
-            if not derived_sheets[sheet_name]:
-                del derived_sheets[sheet_name]
+        sheet_entry = derived_sheets.get(sheet_name) or {}
+        if "helper_columns" in sheet_entry:
+            sheet_entry.pop("helper_columns")
+        # Narrow enrich_lookup cleanup: drop the subkey only when none of its
+        # helper columns remain in the cleaned frame, so still-present lookup
+        # helper columns are never left without provenance.
+        enrich = sheet_entry.get("enrich_lookup")
+        if isinstance(enrich, dict):
+            enrich_cols = {str(c) for c in (enrich.get("helper_columns") or [])}
+            frame = out.get(sheet_name)
+            frame_columns = getattr(frame, "columns", None)
+            present = (
+                {_visible_label(c) for c in frame_columns}
+                if frame_columns is not None
+                else set()
+            )
+            if not (enrich_cols & present):
+                sheet_entry.pop("enrich_lookup")
+        if not sheet_entry:
+            del derived_sheets[sheet_name]
 
     # Write cleaned meta back
     derived = meta.get("derived") or {}

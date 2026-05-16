@@ -95,8 +95,7 @@ def apply_derived_column_policy(
     payload = _require_frame(frames, source)
 
     meta = frames.get(META_KEY) or {}
-    derived_sheets = ((meta.get("derived") or {}).get("sheets") or {})
-    sheet_meta = derived_sheets.get(source)
+    sheet_meta = _safe_sheet_meta(meta, source)
 
     lookup_frames = {
         key: value
@@ -120,6 +119,14 @@ def apply_derived_column_policy(
     out[output or source] = cleaned
     if policy == "warn_on_mismatch":
         out[findings] = findings_to_frame(found)
+
+    # When the cleaned payload replaces the source frame, the consumed
+    # provenance no longer describes any present column. Remove it and prune
+    # empty containers. When `output` is a distinct frame, the original
+    # helper-bearing source frame (and its provenance) is preserved untouched.
+    replacing = output is None or output == source
+    if replacing and sheet_meta:
+        out[META_KEY] = _strip_consumed_provenance(meta, source)
     return out
 
 
@@ -138,7 +145,7 @@ def enforce_derived_column_policy_frame(
     dropped without a value check.
     """
     policy = _valid_policy(policy)
-    helper_names, enrich_spec = _resolve_derived_identity(derived_meta)
+    helper_names, enrich_spec = _resolve_derived_identity(derived_meta, frame_name=frame_name)
 
     findings: list[DerivedColumnFinding] = []
     if policy in ("warn_on_mismatch", "fail_on_mismatch") and enrich_spec is not None:
@@ -157,25 +164,136 @@ def enforce_derived_column_policy_frame(
 
 
 def _resolve_derived_identity(
-    derived_meta: Mapping[str, Any] | None,
+    derived_meta: Any,
+    *,
+    frame_name: str,
 ) -> tuple[set[str], Mapping[str, Any] | None]:
-    if not derived_meta:
-        return set(), None
+    """Resolve helper identity from sheet-level provenance.
 
-    helper_names: set[str] = set()
-    for entry in derived_meta.get("helper_columns") or []:
+    Missing provenance is a safe no-op. Malformed provenance fails with a
+    clear ``ValueError`` naming the bad ``_meta.derived`` path rather than
+    raising a raw ``AttributeError`` or silently treating it as valid.
+    """
+    if derived_meta is None:
+        return set(), None
+    if not isinstance(derived_meta, Mapping):
+        raise ValueError(
+            f"_meta.derived.sheets[{frame_name!r}] must be a mapping, "
+            f"got {type(derived_meta).__name__}"
+        )
+
+    helper_names = _validated_fk_helper_names(
+        derived_meta.get("helper_columns"), frame_name=frame_name
+    )
+    enrich_spec, enrich_names = _validated_enrich_spec(
+        derived_meta.get("enrich_lookup"), frame_name=frame_name
+    )
+    helper_names |= enrich_names
+    return helper_names, enrich_spec
+
+
+def _validated_fk_helper_names(raw_helper_columns: Any, *, frame_name: str) -> set[str]:
+    if raw_helper_columns is None:
+        return set()
+    if not isinstance(raw_helper_columns, (list, tuple)):
+        raise ValueError(
+            f"_meta.derived.sheets[{frame_name!r}].helper_columns must be a list"
+        )
+    names: set[str] = set()
+    for index, entry in enumerate(raw_helper_columns):
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                f"_meta.derived.sheets[{frame_name!r}].helper_columns[{index}] "
+                f"must be a mapping, got {type(entry).__name__}"
+            )
         column = entry.get("column")
         if column:
-            helper_names.add(str(column))
+            names.add(str(column))
+    return names
 
-    enrich_spec = derived_meta.get("enrich_lookup")
-    if isinstance(enrich_spec, Mapping):
-        for column in enrich_spec.get("helper_columns") or []:
-            helper_names.add(str(column))
+
+def _validated_enrich_spec(
+    enrich_spec: Any,
+    *,
+    frame_name: str,
+) -> tuple[Mapping[str, Any] | None, set[str]]:
+    if enrich_spec is None:
+        return None, set()
+    if not isinstance(enrich_spec, Mapping):
+        raise ValueError(
+            f"_meta.derived.sheets[{frame_name!r}].enrich_lookup must be a mapping, "
+            f"got {type(enrich_spec).__name__}"
+        )
+    raw_cols = enrich_spec.get("helper_columns")
+    if raw_cols is not None and not isinstance(raw_cols, (list, tuple)):
+        raise ValueError(
+            f"_meta.derived.sheets[{frame_name!r}].enrich_lookup.helper_columns "
+            f"must be a list"
+        )
+    return enrich_spec, {str(column) for column in raw_cols or []}
+
+
+def _safe_sheet_meta(meta: Mapping[str, Any], source: str) -> Any:
+    """Return ``_meta.derived.sheets[source]`` with clear errors on bad shapes.
+
+    Missing ``derived`` / ``sheets`` is a safe no-op (returns None). A
+    non-mapping ``derived`` or ``sheets`` container is malformed and fails
+    with a clear ``ValueError`` naming the bad path.
+    """
+    derived = meta.get("derived")
+    if derived is None:
+        return None
+    if not isinstance(derived, Mapping):
+        raise ValueError(
+            f"_meta.derived must be a mapping, got {type(derived).__name__}"
+        )
+    sheets = derived.get("sheets")
+    if sheets is None:
+        return None
+    if not isinstance(sheets, Mapping):
+        raise ValueError(
+            f"_meta.derived.sheets must be a mapping, got {type(sheets).__name__}"
+        )
+    return sheets.get(source)
+
+
+def _strip_consumed_provenance(meta: Mapping[str, Any], source: str) -> dict[str, Any]:
+    """Return a copy of ``meta`` with consumed provenance for ``source`` removed.
+
+    Removes both ``helper_columns`` and ``enrich_lookup`` for the replaced
+    source frame and prunes empty ``derived.sheets`` / ``derived`` containers.
+    Copies only the mutated path; sibling sheets and the caller's input are
+    left untouched.
+    """
+    new_meta = dict(meta)
+    derived = new_meta.get("derived")
+    if not isinstance(derived, Mapping):
+        return new_meta
+    derived = dict(derived)
+    sheets = derived.get("sheets")
+    if not isinstance(sheets, Mapping):
+        return new_meta
+    sheets = dict(sheets)
+
+    sheet_entry = sheets.get(source)
+    if isinstance(sheet_entry, Mapping):
+        sheet_entry = dict(sheet_entry)
+        sheet_entry.pop("helper_columns", None)
+        sheet_entry.pop("enrich_lookup", None)
+        if sheet_entry:
+            sheets[source] = sheet_entry
+        else:
+            sheets.pop(source, None)
+
+    if sheets:
+        derived["sheets"] = sheets
     else:
-        enrich_spec = None
-
-    return helper_names, enrich_spec
+        derived.pop("sheets", None)
+    if derived:
+        new_meta["derived"] = derived
+    else:
+        new_meta.pop("derived", None)
+    return new_meta
 
 
 def _check_enrich_lookup_values(
