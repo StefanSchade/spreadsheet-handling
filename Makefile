@@ -226,6 +226,12 @@ snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries)
 	@bash "$(ROOT)tools/repo_snapshot.sh" "$(ROOT)" "$(BUILD_DIR)" "$(BUILD_DIR)/spreadsheet-handling.txt"
 	@echo "Snapshot: $(BUILD_DIR)/spreadsheet-handling.txt"
 
+.PHONY: snapshot-multi
+snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs, src, tests, infra, tree, loc)
+	@mkdir -p "$(BUILD_DIR)"
+	@bash "$(ROOT)tools/repo_snapshot_multi.sh" "$(ROOT)" "$(BUILD_DIR)/snapshots"
+	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/"
+
 # =========================
 # Coverage
 # =========================

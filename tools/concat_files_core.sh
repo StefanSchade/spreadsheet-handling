@@ -6,10 +6,11 @@ set -euo pipefail
 #   --exclude-dir NAME        (prunes by directory name)
 #   --exclude-path GLOB       (prunes by full path glob)
 #   --exclude-ext EXT         (blacklist by file extension, e.g. 'png')
+#   --include-ext EXT         (whitelist; only these extensions pass, applied after all excludes)
 #   --                        (separator; anything after goes to `find`)
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 <ROOT> <OUTFILE> [--exclude-dir NAME ...] [--exclude-path GLOB ...] [--exclude-ext EXT ...] [--] [find-args...]"
+  echo "Usage: $0 <ROOT> <OUTFILE> [--exclude-dir NAME ...] [--exclude-path GLOB ...] [--exclude-ext EXT ...] [--include-ext EXT ...] [--] [find-args...]"
   exit 1
 fi
 
@@ -18,6 +19,7 @@ ROOT=$1; OUTFILE=$2; shift 2
 EX_DIRS=()
 EX_PATHS=()
 EX_EXTS=()
+INC_EXTS=()
 FIND_OPTS=()
 
 # Parse flags (repeatable)
@@ -26,6 +28,7 @@ while (( $# )); do
     --exclude-dir)  shift; EX_DIRS+=( "${1:?--exclude-dir needs a value}" ) ;;
     --exclude-path) shift; EX_PATHS+=( "${1:?--exclude-path needs a value}" ) ;;
     --exclude-ext)  shift; EX_EXTS+=( "${1:?--exclude-ext needs a value}" ) ;;
+    --include-ext)  shift; INC_EXTS+=( "${1:?--include-ext needs a value}" ) ;;
     --) shift; while (( $# )); do FIND_OPTS+=( "$1" ); shift; done; break ;;
     *)  FIND_OPTS+=( "$1" ) ;;
   esac
@@ -78,6 +81,17 @@ if (( ${#EX_EXTS[@]} )); then
   PRUNE_EXTS+=( ')' -prune -o )
 fi
 
+# Build extension whitelist (applied after -type f, before -print0)
+INCLUDE_EXPR=()
+if (( ${#INC_EXTS[@]} )); then
+  INCLUDE_EXPR+=( '(' )
+  for i in "${!INC_EXTS[@]}"; do
+    INCLUDE_EXPR+=( -name "*.${INC_EXTS[$i]}" )
+    (( i < ${#INC_EXTS[@]} - 1 )) && INCLUDE_EXPR+=( -o )
+  done
+  INCLUDE_EXPR+=( ')' )
+fi
+
 # Always avoid re-reading the output file
 PRUNE_OUTFILE=( -path "$OUTFILE" -prune -o )
 
@@ -87,7 +101,9 @@ find "$ROOT" \
   "${PRUNE_PATHS[@]}" \
   "${PRUNE_EXTS[@]}" \
   "${PRUNE_OUTFILE[@]}" \
-  -type f -print0 \
+  -type f \
+  "${INCLUDE_EXPR[@]}" \
+  -print0 \
 | while IFS= read -r -d '' FILE; do
     # Keep blacklist, but still ensure UTF-8 compatible text.
     # `file` reports pure ASCII files as us-ascii; those are valid UTF-8 too.
