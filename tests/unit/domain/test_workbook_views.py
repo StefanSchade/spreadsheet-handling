@@ -6,6 +6,7 @@ import pytest
 from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.workbook_views import (
     WorkbookViewSheetMapping,
+    apply_workbook_view_sheet_mappings,
     configure_workbook_view,
     resolve_workbook_view_sheet_mappings,
 )
@@ -387,3 +388,114 @@ def test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves()
             canonical_frame="variables",
         )
     }
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A")
+def test_apply_workbook_view_sheet_mappings_remaps_renamed_visible_sheet() -> None:
+    df = pd.DataFrame([{"variable_id": "v1", "label": "Rate"}])
+    frames = {
+        "Editable Variables": df,
+        "_meta": {
+            "workbook_view": {
+                "sheet_mappings": [
+                    {
+                        "sheet": "Editable Variables",
+                        "frame": "variables_view",
+                        "canonical_frame": "variables",
+                    }
+                ]
+            }
+        },
+    }
+
+    out = apply_workbook_view_sheet_mappings(frames)
+
+    assert set(out) == {"variables_view", "_meta"}
+    assert "Editable Variables" not in out
+    pd.testing.assert_frame_equal(out["variables_view"], df)
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A")
+def test_apply_workbook_view_sheet_mappings_is_order_independent() -> None:
+    a = pd.DataFrame([{"x": 1}])
+    b = pd.DataFrame([{"y": 2}])
+    meta = {
+        "workbook_view": {
+            "sheet_mappings": [
+                {"sheet": "Sheet A", "frame": "frame_a"},
+                {"sheet": "Sheet B", "frame": "frame_b"},
+            ]
+        }
+    }
+
+    forward = apply_workbook_view_sheet_mappings(
+        {"Sheet A": a, "Sheet B": b, "_meta": meta}
+    )
+    reversed_order = apply_workbook_view_sheet_mappings(
+        {"_meta": meta, "Sheet B": b, "Sheet A": a}
+    )
+
+    assert set(forward) == set(reversed_order) == {"frame_a", "frame_b", "_meta"}
+    pd.testing.assert_frame_equal(forward["frame_a"], reversed_order["frame_a"])
+    pd.testing.assert_frame_equal(forward["frame_b"], reversed_order["frame_b"])
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A")
+def test_apply_workbook_view_sheet_mappings_preserves_meta_unchanged() -> None:
+    meta = {
+        "workbook_view": {
+            "sheet_mappings": [{"sheet": "S", "frame": "f"}],
+            "mode": "editable",
+        },
+        "frame_lifecycle": {"f": {"role": "editable_projection"}},
+    }
+    expected_meta = {
+        "workbook_view": {
+            "sheet_mappings": [{"sheet": "S", "frame": "f"}],
+            "mode": "editable",
+        },
+        "frame_lifecycle": {"f": {"role": "editable_projection"}},
+    }
+    frames = {"S": pd.DataFrame([{"a": 1}]), "_meta": meta}
+
+    out = apply_workbook_view_sheet_mappings(frames)
+
+    assert out["_meta"] is meta
+    assert meta == expected_meta
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A")
+def test_apply_workbook_view_sheet_mappings_fails_loudly_on_undeclared_sheet() -> None:
+    frames = {
+        "S": pd.DataFrame([{"a": 1}]),
+        "Unexpected": pd.DataFrame([{"b": 2}]),
+        "_meta": {
+            "workbook_view": {"sheet_mappings": [{"sheet": "S", "frame": "f"}]}
+        },
+    }
+
+    with pytest.raises(ValueError, match="not declared"):
+        apply_workbook_view_sheet_mappings(frames)
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A")
+def test_apply_workbook_view_sheet_mappings_is_config_addressable_in_pipeline() -> None:
+    df = pd.DataFrame([{"a": 1}])
+    frames = {
+        "Editable": df,
+        "_meta": {
+            "workbook_view": {
+                "sheet_mappings": [{"sheet": "Editable", "frame": "logical"}]
+            }
+        },
+    }
+
+    steps = build_steps_from_config([{"step": "apply_workbook_view_sheet_mappings"}])
+
+    assert steps[0].name == "apply_workbook_view_sheet_mappings"
+    assert steps[0].config["target"].endswith(":apply_workbook_view_sheet_mappings")
+
+    out = run_pipeline(frames, steps)
+
+    assert set(out) == {"logical", "_meta"}
+    pd.testing.assert_frame_equal(out["logical"], df)

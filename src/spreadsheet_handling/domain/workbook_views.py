@@ -339,6 +339,40 @@ def resolve_workbook_view_sheet_mappings(
     return mappings
 
 
+def apply_workbook_view_sheet_mappings(
+    frames: Mapping[str, Any],
+    *,
+    logical_frames: Iterable[str] | None = None,
+    name: str | None = None,
+) -> Frames:
+    """Re-key visible workbook sheets to logical view frames for readback.
+
+    Identity resolution is delegated to
+    :func:`resolve_workbook_view_sheet_mappings`; the persisted
+    ``_meta.workbook_view.sheet_mappings`` is authoritative. No inference from
+    sheet names, sheet order, normalized labels, or columns. Missing,
+    malformed, duplicated, or unknown mappings fail loudly through the
+    resolver.
+
+    Returns a new frames dict keyed by logical frame name containing only the
+    mapped visible sheets plus the reserved ``_meta`` (preserved unchanged).
+    """
+    del name
+    meta = frames.get("_meta") if isinstance(frames, Mapping) else None
+    mappings = resolve_workbook_view_sheet_mappings(
+        meta,
+        visible_sheets=frames,
+        logical_frames=logical_frames,
+    )
+
+    out: dict[str, Any] = {}
+    for visible_sheet, mapping in mappings.items():
+        out[mapping.logical_frame] = frames[visible_sheet]
+    if "_meta" in frames:
+        out["_meta"] = frames["_meta"]
+    return out
+
+
 def _sheet_mappings(
     frames: Mapping[str, Any],
     sheets: list[_SheetSpec],

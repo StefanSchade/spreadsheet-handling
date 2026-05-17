@@ -57,6 +57,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.workbook_views:configure_workbook_view",
     ),
+    "apply_workbook_view_sheet_mappings": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.workbook_views:apply_workbook_view_sheet_mappings",
+    ),
     "configure_lookup_helpers": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.helper_policies:configure_lookup_helpers",
