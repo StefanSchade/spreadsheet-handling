@@ -1,4 +1,4 @@
-"""Declarative workbook view configuration."""
+"""Declarative workbook view configuration and readback mapping helpers."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from spreadsheet_handling.domain.frame_lifecycle import (
 )
 
 Frames = dict[str, Any]
+WORKBOOK_VIEW_SHEET_MAPPINGS_KEY = "sheet_mappings"
 
 _RESERVED_FRAME_KEYS = {"_meta"}
 _ALLOWED_SHEET_KEYS = {
@@ -53,6 +54,13 @@ class _SheetSpec:
     options: Mapping[str, Any] | None
 
 
+@dataclass(frozen=True)
+class WorkbookViewSheetMapping:
+    visible_sheet: str
+    logical_frame: str
+    canonical_frame: str | None = None
+
+
 def configure_workbook_view(
     frames: Mapping[str, Any],
     *,
@@ -87,6 +95,7 @@ def configure_workbook_view(
             }
             for index, sheet in enumerate(normalized)
         ],
+        WORKBOOK_VIEW_SHEET_MAPPINGS_KEY: _sheet_mappings(out, normalized),
     }
     if include_debug_frames:
         view["include_debug_frames"] = True
@@ -115,6 +124,7 @@ def _normalize_sheet_specs(
 
     normalized: list[_SheetSpec] = []
     seen_sheets: set[str] = set()
+    seen_frames: set[str] = set()
     for index, raw in enumerate(raw_specs, start=1):
         if not isinstance(raw, Mapping):
             raise TypeError(f"sheets entry {index} must be a mapping")
@@ -130,6 +140,9 @@ def _normalize_sheet_specs(
             raise KeyError(f"sheets entry {index} references missing frame {frame!r}")
         if not isinstance(frames[frame], pd.DataFrame):
             raise TypeError(f"sheets entry {index} frame {frame!r} must be a pandas DataFrame")
+        if frame in seen_frames:
+            raise ValueError(f"Duplicate workbook view frame {frame!r}")
+        seen_frames.add(frame)
 
         sheet = _non_empty_string(raw.get("sheet") or frame, f"sheets[{index}].sheet")
         if sheet in _RESERVED_FRAME_KEYS:
@@ -235,6 +248,161 @@ def _write_sheet_lifecycle(out: dict[str, Any], sheet: _SheetSpec) -> None:
     )
 
 
+def resolve_workbook_view_sheet_mappings(
+    meta: Mapping[str, Any] | None,
+    *,
+    visible_sheets: Iterable[str] | Mapping[str, Any] | None = None,
+    logical_frames: Iterable[str] | None = None,
+) -> dict[str, WorkbookViewSheetMapping]:
+    """Resolve persisted visible-sheet -> logical-frame mappings from workbook meta."""
+    view = _workbook_view_mapping(meta)
+    raw_mappings = view.get(WORKBOOK_VIEW_SHEET_MAPPINGS_KEY)
+    if raw_mappings is None:
+        raise ValueError(
+            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY} is required for workbook "
+            "view readback"
+        )
+    if not isinstance(raw_mappings, list):
+        raise ValueError(
+            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY} must be a list"
+        )
+
+    mappings: dict[str, WorkbookViewSheetMapping] = {}
+    seen_frames: set[str] = set()
+    for index, raw_entry in enumerate(raw_mappings, start=1):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(
+                f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}] "
+                f"must be a mapping, got {type(raw_entry).__name__}"
+            )
+        visible_sheet = _non_empty_string(
+            raw_entry.get("sheet"),
+            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}].sheet",
+        )
+        logical_frame = _non_empty_string(
+            raw_entry.get("frame"),
+            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}].frame",
+        )
+        canonical_frame = _optional_non_empty_string(
+            raw_entry.get("canonical_frame"),
+            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}].canonical_frame",
+        )
+        if visible_sheet in mappings:
+            raise ValueError(
+                f"Duplicate visible sheet mapping for {visible_sheet!r} in "
+                f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}"
+            )
+        if logical_frame in seen_frames:
+            raise ValueError(
+                f"Duplicate logical frame mapping for {logical_frame!r} in "
+                f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}"
+            )
+        seen_frames.add(logical_frame)
+        mappings[visible_sheet] = WorkbookViewSheetMapping(
+            visible_sheet=visible_sheet,
+            logical_frame=logical_frame,
+            canonical_frame=canonical_frame,
+        )
+
+    visible_sheet_names = _normalize_visible_sheet_names(visible_sheets)
+    if visible_sheet_names is not None:
+        for sheet_name in visible_sheet_names:
+            if sheet_name not in mappings:
+                raise ValueError(
+                    f"Visible sheet {sheet_name!r} is not declared in "
+                    f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}"
+                )
+        missing = [sheet_name for sheet_name in mappings if sheet_name not in visible_sheet_names]
+        if missing:
+            raise ValueError(
+                "Workbook is missing required visible sheet(s) declared in "
+                f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}: {missing!r}"
+            )
+
+    logical_frame_names = set(map(str, logical_frames)) if logical_frames is not None else None
+    if logical_frame_names is not None:
+        for mapping in mappings.values():
+            if mapping.logical_frame not in logical_frame_names:
+                raise ValueError(
+                    f"Workbook view mapping references unknown logical frame "
+                    f"{mapping.logical_frame!r}"
+                )
+            if (
+                mapping.canonical_frame is not None
+                and mapping.canonical_frame not in logical_frame_names
+            ):
+                raise ValueError(
+                    f"Workbook view mapping references unknown canonical frame "
+                    f"{mapping.canonical_frame!r}"
+                )
+
+    return mappings
+
+
+def _sheet_mappings(
+    frames: Mapping[str, Any],
+    sheets: list[_SheetSpec],
+) -> list[dict[str, str]]:
+    lifecycle = frame_lifecycle(frames.get("_meta"))
+    mappings: list[dict[str, str]] = []
+    for sheet in sheets:
+        mapping = {
+            "sheet": sheet.sheet,
+            "frame": sheet.frame,
+        }
+        canonical_frame = _explicit_canonical_frame(sheet.frame, lifecycle)
+        if canonical_frame is not None:
+            mapping["canonical_frame"] = canonical_frame
+        mappings.append(mapping)
+    return mappings
+
+
+def _explicit_canonical_frame(
+    frame: str,
+    lifecycle: Mapping[str, Any],
+) -> str | None:
+    entry = lifecycle.get(frame)
+    if not isinstance(entry, Mapping):
+        return None
+    if entry.get("canonical") is True:
+        return frame
+
+    derived_from = entry.get("derived_from")
+    if not isinstance(derived_from, list) or len(derived_from) != 1:
+        return None
+
+    canonical_frame = derived_from[0]
+    source_entry = lifecycle.get(canonical_frame)
+    if isinstance(source_entry, Mapping) and source_entry.get("canonical") is True:
+        return str(canonical_frame)
+    return None
+
+
+def _workbook_view_mapping(meta: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(meta, Mapping):
+        raise ValueError("_meta.workbook_view is required for workbook view readback")
+    view = meta.get("workbook_view")
+    if not isinstance(view, Mapping):
+        raise ValueError("_meta.workbook_view must be a mapping for workbook view readback")
+    return view
+
+
+def _normalize_visible_sheet_names(
+    visible_sheets: Iterable[str] | Mapping[str, Any] | None,
+) -> set[str] | None:
+    if visible_sheets is None:
+        return None
+    if isinstance(visible_sheets, Mapping):
+        return {
+            str(name)
+            for name, value in visible_sheets.items()
+            if str(name) != "_meta" and isinstance(value, pd.DataFrame)
+        }
+    if isinstance(visible_sheets, (str, bytes)):
+        raise TypeError("visible_sheets must be an iterable of sheet names, not a scalar")
+    return {str(name) for name in visible_sheets}
+
+
 def _merge_sheet_options(meta: dict[str, Any], sheets: list[_SheetSpec]) -> None:
     configured = dict(meta.get("sheets") or {})
     for sheet in sheets:
@@ -272,6 +440,12 @@ def _non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _optional_non_empty_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _non_empty_string(value, field_name)
 
 
 def _string_list(values: Iterable[str], field_name: str) -> list[str]:

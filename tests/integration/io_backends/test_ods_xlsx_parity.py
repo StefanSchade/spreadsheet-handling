@@ -22,7 +22,11 @@ from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.core.formulas import FormulaSpec, formula_list_values
 from spreadsheet_handling.rendering.ir import SheetIR
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
-from spreadsheet_handling.domain.workbook_views import configure_workbook_view
+from spreadsheet_handling.domain.workbook_views import (
+    WorkbookViewSheetMapping,
+    configure_workbook_view,
+    resolve_workbook_view_sheet_mappings,
+)
 from spreadsheet_handling.domain.transformations.join_views import join_frames
 from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
 
@@ -403,6 +407,72 @@ def test_configured_workbook_view_renders_portably_across_xlsx_and_ods(tmp_path:
     assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
 
 
+@pytest.mark.ftr("FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A")
+def test_workbook_view_reverse_mapping_roundtrips_portably_across_xlsx_and_ods(
+    tmp_path: Path,
+) -> None:
+    frames = configure_workbook_view(
+        {
+            "variables": pd.DataFrame(
+                [
+                    {"variable_id": "v1"},
+                ]
+            ),
+            "variables_view": pd.DataFrame(
+                [
+                    {"variable_id": "v1", "label": "Rate"},
+                ]
+            ),
+            "_meta": {
+                "frame_lifecycle": {
+                    "variables": {
+                        "role": "canonical_source",
+                        "canonical": True,
+                        "editable": False,
+                        "render": "visible_by_default",
+                        "derived_from": [],
+                    },
+                    "variables_view": {
+                        "role": "editable_projection",
+                        "canonical": False,
+                        "editable": True,
+                        "render": "visible_by_default",
+                        "derived_from": ["variables"],
+                    },
+                }
+            },
+        },
+        sheets=[{"frame": "variables_view", "sheet": "Editable Variables"}],
+    )
+
+    xlsx_path, ods_path = _write_both(frames, tmp_path, stem="workbook-view-reimport-map")
+
+    xlsx_back = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    ods_back = OdsBackend().read_multi(str(ods_path), header_levels=1)
+
+    xlsx_mapping = resolve_workbook_view_sheet_mappings(
+        xlsx_back["_meta"],
+        visible_sheets=xlsx_back,
+        logical_frames=["variables", "variables_view"],
+    )
+    ods_mapping = resolve_workbook_view_sheet_mappings(
+        ods_back["_meta"],
+        visible_sheets=ods_back,
+        logical_frames=["variables", "variables_view"],
+    )
+
+    expected = {
+        "Editable Variables": WorkbookViewSheetMapping(
+            visible_sheet="Editable Variables",
+            logical_frame="variables_view",
+            canonical_frame="variables",
+        )
+    }
+
+    assert xlsx_mapping == expected
+    assert ods_mapping == expected
+
+
 @pytest.mark.ftr("FTR-HELPER-COLUMN-STYLE-METADATA-P4A")
 def test_explicit_helper_column_style_metadata_is_portable(tmp_path: Path) -> None:
     frames = {
@@ -501,4 +571,3 @@ def test_protection_is_xlsx_only_ods_documented_gap(tmp_path: Path) -> None:
 
     # ODS: file produced without error (protection is a documented gap)
     assert ods_path.exists()
-

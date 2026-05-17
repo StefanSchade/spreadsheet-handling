@@ -4,7 +4,11 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
-from spreadsheet_handling.domain.workbook_views import configure_workbook_view
+from spreadsheet_handling.domain.workbook_views import (
+    WorkbookViewSheetMapping,
+    configure_workbook_view,
+    resolve_workbook_view_sheet_mappings,
+)
 from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
@@ -41,6 +45,10 @@ def test_configure_workbook_view_writes_sheet_order_names_and_lifecycle() -> Non
             {"frame": "variables_view", "sheet": "Variables", "order": 0},
             {"frame": "product_matrix", "sheet": "Variable Matrix", "order": 1},
         ],
+        "sheet_mappings": [
+            {"sheet": "Variables", "frame": "variables_view"},
+            {"sheet": "Variable Matrix", "frame": "product_matrix"},
+        ],
         "name": "consumer_editable_view",
     }
     assert out["_meta"]["sheets"]["Variables"] == {"freeze_header": True}
@@ -76,6 +84,9 @@ def test_configure_workbook_view_preserves_existing_canonical_lifecycle() -> Non
 
     assert frame_lifecycle(out["_meta"])["products"]["role"] == "canonical_source"
     assert frame_lifecycle(out["_meta"])["products"]["canonical"] is True
+    assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
+        {"sheet": "Products", "frame": "products", "canonical_frame": "products"}
+    ]
 
 
 def test_configure_workbook_view_accepts_mapping_shorthand() -> None:
@@ -85,6 +96,9 @@ def test_configure_workbook_view_accepts_mapping_shorthand() -> None:
 
     assert out["_meta"]["workbook_view"]["sheets"] == [
         {"frame": "variables_view", "sheet": "Variables", "order": 0}
+    ]
+    assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
+        {"sheet": "Variables", "frame": "variables_view"}
     ]
 
 
@@ -132,6 +146,15 @@ def test_configure_workbook_view_rejects_missing_duplicate_and_transform_specs()
             ],
         )
 
+    with pytest.raises(ValueError, match="Duplicate workbook view frame"):
+        configure_workbook_view(
+            frames,
+            sheets=[
+                {"frame": "variables_view", "sheet": "Overview"},
+                {"frame": "variables_view", "sheet": "Variables"},
+            ],
+        )
+
     with pytest.raises(ValueError, match="transformation key"):
         configure_workbook_view(
             frames,
@@ -176,3 +199,128 @@ def test_configure_workbook_view_is_config_addressable_in_pipeline() -> None:
         "sheet": "Variables",
         "order": 0,
     }
+
+
+def test_resolve_workbook_view_sheet_mappings_reads_hand_built_payload() -> None:
+    meta = {
+        "workbook_view": {
+            "sheet_mappings": [
+                {
+                    "sheet": "Variables",
+                    "frame": "variables_view",
+                    "canonical_frame": "variables",
+                },
+                {"sheet": "Product Matrix", "frame": "product_matrix"},
+            ]
+        }
+    }
+
+    mapping = resolve_workbook_view_sheet_mappings(
+        meta,
+        visible_sheets=["Product Matrix", "Variables"],
+        logical_frames=["variables", "variables_view", "product_matrix"],
+    )
+
+    assert mapping == {
+        "Variables": WorkbookViewSheetMapping(
+            visible_sheet="Variables",
+            logical_frame="variables_view",
+            canonical_frame="variables",
+        ),
+        "Product Matrix": WorkbookViewSheetMapping(
+            visible_sheet="Product Matrix",
+            logical_frame="product_matrix",
+            canonical_frame=None,
+        ),
+    }
+
+
+def test_resolve_workbook_view_sheet_mappings_fails_loudly_for_missing_and_malformed_meta() -> None:
+    with pytest.raises(ValueError, match="sheet_mappings is required"):
+        resolve_workbook_view_sheet_mappings({"workbook_view": {}})
+
+    with pytest.raises(ValueError, match="sheet_mappings must be a list"):
+        resolve_workbook_view_sheet_mappings({"workbook_view": {"sheet_mappings": {}}})
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        resolve_workbook_view_sheet_mappings({"workbook_view": {"sheet_mappings": ["Variables"]}})
+
+    with pytest.raises(ValueError, match="Duplicate logical frame mapping"):
+        resolve_workbook_view_sheet_mappings(
+            {
+                "workbook_view": {
+                    "sheet_mappings": [
+                        {"sheet": "Variables", "frame": "variables_view"},
+                        {"sheet": "Variables Copy", "frame": "variables_view"},
+                    ]
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="not declared"):
+        resolve_workbook_view_sheet_mappings(
+            {
+                "workbook_view": {
+                    "sheet_mappings": [{"sheet": "Variables", "frame": "variables_view"}]
+                }
+            },
+            visible_sheets=["Products"],
+        )
+
+    with pytest.raises(ValueError, match="missing required visible sheet"):
+        resolve_workbook_view_sheet_mappings(
+            {
+                "workbook_view": {
+                    "sheet_mappings": [{"sheet": "Variables", "frame": "variables_view"}]
+                }
+            },
+            visible_sheets=[],
+        )
+
+    with pytest.raises(ValueError, match="unknown logical frame"):
+        resolve_workbook_view_sheet_mappings(
+            {
+                "workbook_view": {
+                    "sheet_mappings": [{"sheet": "Variables", "frame": "variables_view"}]
+                }
+            },
+            logical_frames=["products_view"],
+        )
+
+
+def test_configure_workbook_view_persists_reverse_mapping_from_explicit_lifecycle() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"variable_id": "v1"}]),
+        "variables_view": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
+        "_meta": {
+            "frame_lifecycle": {
+                "variables": {
+                    "role": "canonical_source",
+                    "canonical": True,
+                    "editable": False,
+                    "render": "visible_by_default",
+                    "derived_from": [],
+                },
+                "variables_view": {
+                    "role": "editable_projection",
+                    "canonical": False,
+                    "editable": True,
+                    "render": "visible_by_default",
+                    "derived_from": ["variables"],
+                },
+            }
+        },
+    }
+
+    out = configure_workbook_view(
+        frames,
+        sheets=[{"frame": "variables_view", "sheet": "Variables"}],
+    )
+
+    assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
+        {
+            "sheet": "Variables",
+            "frame": "variables_view",
+            "canonical_frame": "variables",
+        }
+    ]

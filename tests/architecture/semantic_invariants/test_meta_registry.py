@@ -77,6 +77,7 @@ def test_meta_registry_seeds_current_known_entries():
         "helper_columns",
         "frame_lifecycle",
         "workbook_view",
+        "workbook_view.sheet_mappings",
         "sheets",
         "workbook_meta_blob",
         "options",
