@@ -1,0 +1,136 @@
+= Review: FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A
+
+Date: 2026-05-17
+
+Reviewed commit: `4654049`
+
+== Verdict
+
+ACCEPT — safe as prerequisite for `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`.
+
+The slice does exactly what the FTR scopes and nothing more. No recomposition,
+no matrix expansion/contraction, no conflict resolution, no heuristic mapping
+inference, no `_meta.derived` coupling, no adapter or pipeline-orchestration
+changes.
+
+== Architectural Assessment
+
+`configure_workbook_view` now emits a deterministic, freshly-constructed
+`sheet_mappings` list under `_meta.workbook_view`, and
+`resolve_workbook_view_sheet_mappings` reads it back with loud, precise
+validation. Identity is taken only from explicit persisted metadata:
+visible-sheet -> logical-frame from authored sheet specs, and `canonical_frame`
+only when lifecycle metadata identifies it (`canonical: true`, or a
+single-element `derived_from` whose source is itself canonical). Multi-source /
+matrix / join views (`derived_from` length != 1) correctly yield no
+`canonical_frame` — the conservative boundary that keeps recomposition out of
+this slice and leaves a clean seam for the recomposition FTR.
+
+`resolve_workbook_view_sheet_mappings` is a standalone domain helper, not yet
+wired into any pipeline or adapter; `workbook_projection.workbookir_to_frames`
+remains pure transport. Registry classification
+(`meta_canonical` / `canonical_meta`, persisted-in-blob, replace-whole-list
+merge) matches the FTR's Meta-Carrier disposition. The new duplicate-frame
+rejection in `configure_workbook_view` is a justified consequence of needing a
+bijective inverse and is consistent with the resolver's
+duplicate-logical-frame check.
+
+XLSX and ODS dispositions are explicit: the parity round-trip test writes both
+backends, reads both back, resolves the mapping from both, and asserts an
+identical result including the lifecycle-derived `canonical_frame`.
+
+== Findings
+
+=== 1. SHOULD-FIX — "omitted intermediate frame" acceptance not literally exercised
+
+The FTR acceptance requires tests for "one renamed sheet and one omitted
+intermediate frame". Renamed sheet was covered (`sheet="Editable Variables"`
+vs `frame="variables_view"`). Omitted-frame *behavior* was covered indirectly
+(resolver tolerates a `logical_frames` entry absent from `sheet_mappings`), but
+no test used a frame with role `intermediate` / `render: omit_by_default`.
+
+Resolution: closed in this follow-up.
+`tests/unit/domain/test_workbook_views.py::test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves`
+configures a lifecycle with a `variables_audit` frame
+(`role: intermediate`, `render: omit_by_default`), maps only the visible
+editable sheet, asserts the intermediate frame is absent from
+`_meta.workbook_view.sheet_mappings`, and asserts
+`resolve_workbook_view_sheet_mappings` succeeds when that intermediate frame is
+present in `logical_frames`. No production code change was required; the test
+confirms existing behavior is already correct.
+
+=== 2. NICE-TO-HAVE — `workbook_projection.workbookir_to_frames` listed as consumer
+
+`meta_registry.yaml` lists `rendering.workbook_projection.workbookir_to_frames`
+as a `consumer` of `workbook_view.sheet_mappings`, but that function only
+JSON-deserializes the whole `_meta` blob and never reads the sub-key. The real
+semantic consumer is `resolve_workbook_view_sheet_mappings`.
+
+Disposition: accepted, no code change. The listing mirrors the existing
+(equally loose) parent `workbook_view` entry and is internally consistent with
+the registry's transport-carry-through convention. It resolves under the
+hardening guard (`test_meta_registry_hardening.py`) because the symbol exists;
+the guard validates symbol resolvability, not semantic consumption, so there is
+no concrete registry-test problem. Treated as documentation-level acceptable
+carry-through convention per review constraints.
+
+=== 3. NICE-TO-HAVE — self-canonical mapping records redundant `canonical_frame`
+
+When the visible sheet's frame is itself `canonical: true`,
+`_explicit_canonical_frame` records `canonical_frame == frame`, which is
+redundant with the lifecycle.
+
+Disposition: accepted, no code change. The value is explicitly derivable from
+lifecycle metadata, deterministic, and within FTR bounds ("canonical_frame may
+be recorded only when explicitly derivable from existing lifecycle metadata").
+`canonical_frame` behavior is intentionally left unchanged.
+
+=== Accepted as-is (no action)
+
+* Negative coverage (missing / non-list / non-mapping entry / missing `_meta` /
+  non-mapping `workbook_view` / duplicate visible sheet / duplicate logical
+  frame / extra & missing visible sheet / unknown logical & canonical frame) is
+  comprehensive and precise.
+* Exact-equality assertions pin the metadata contract shape — contract pinning,
+  not overfitting.
+* XLSX and ODS dispositions explicit and round-trip-tested.
+
+== Prerequisite Statement
+
+The commit is safe as a prerequisite for
+`FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`. It supplies a deterministic,
+heuristic-free visible-sheet -> logical-frame (+ optional explicit canonical
+target) map persisted in the canonical channel and validated loudly on
+readback, with no recomposition, no matrix expansion/contraction, no conflict
+resolution, and no overlap with `FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A`
+(no `_meta.derived` coupling). The conservative `derived_from`-length-1 rule
+deliberately leaves multi-source/matrix canonical targeting unresolved, which
+is precisely the seam the recomposition FTR is meant to fill.
+
+== Checks Run
+
+----
+source .venv/bin/activate && python -m pytest tests/unit/domain/test_workbook_views.py
+----
+
+Result: passed, 10 tests (including the new omitted-intermediate-frame test).
+
+----
+source .venv/bin/activate && python -m pytest \
+  tests/architecture/semantic_invariants/test_meta_registry.py \
+  tests/architecture/semantic_invariants/test_meta_registry_hardening.py
+----
+
+Result: passed.
+
+Additionally, the pre-existing
+`tests/integration/io_backends/test_ods_xlsx_parity.py` round-trip equality
+test still passes with the new nested `sheet_mappings` key present.
+
+== Disposition
+
+ACCEPT WITH FOLLOW-UP. Finding #1 closed by an added focused unit test; no
+production behavior changed. Findings #2 and #3 accepted with no code change as
+documented above. No new findings introduced. The architectural boundary is
+unchanged: no recomposition, no `sheet_mappings` semantics change, no
+`canonical_frame` behavior change, no metadata/review framework.

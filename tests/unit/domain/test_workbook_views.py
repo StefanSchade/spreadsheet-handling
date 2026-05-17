@@ -324,3 +324,66 @@ def test_configure_workbook_view_persists_reverse_mapping_from_explicit_lifecycl
             "canonical_frame": "variables",
         }
     ]
+
+
+@pytest.mark.ftr("FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A")
+def test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves() -> None:
+    frames = {
+        "variables": pd.DataFrame([{"variable_id": "v1"}]),
+        "variables_view": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
+        "variables_audit": pd.DataFrame([{"variable_id": "v1", "checked": True}]),
+        "_meta": {
+            "frame_lifecycle": {
+                "variables": {
+                    "role": "canonical_source",
+                    "canonical": True,
+                    "editable": False,
+                    "render": "visible_by_default",
+                    "derived_from": [],
+                },
+                "variables_view": {
+                    "role": "editable_projection",
+                    "canonical": False,
+                    "editable": True,
+                    "render": "visible_by_default",
+                    "derived_from": ["variables"],
+                },
+                "variables_audit": {
+                    "role": "intermediate",
+                    "canonical": False,
+                    "editable": False,
+                    "render": "omit_by_default",
+                    "derived_from": ["variables"],
+                },
+            }
+        },
+    }
+
+    out = configure_workbook_view(
+        frames,
+        sheets=[{"frame": "variables_view", "sheet": "Variables"}],
+    )
+
+    sheet_mappings = out["_meta"]["workbook_view"]["sheet_mappings"]
+    assert "variables_audit" not in {entry["frame"] for entry in sheet_mappings}
+    assert sheet_mappings == [
+        {
+            "sheet": "Variables",
+            "frame": "variables_view",
+            "canonical_frame": "variables",
+        }
+    ]
+
+    mapping = resolve_workbook_view_sheet_mappings(
+        out["_meta"],
+        visible_sheets=["Variables"],
+        logical_frames=["variables", "variables_view", "variables_audit"],
+    )
+
+    assert mapping == {
+        "Variables": WorkbookViewSheetMapping(
+            visible_sheet="Variables",
+            logical_frame="variables_view",
+            canonical_frame="variables",
+        )
+    }
