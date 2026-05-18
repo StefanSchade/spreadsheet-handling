@@ -15,56 +15,27 @@ deferred (see the FTR backlog note).
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
 import pandas as pd
+
+from spreadsheet_handling.domain.finding_frame import (
+    FINDING_COLUMNS,
+    Finding,
+    findings_to_frame,
+    simple_failure_message,
+)
 
 Frames = dict[str, Any]
 
 META_KEY = "_meta"
 
-FINDING_COLUMNS = [
-    "rule_type",
-    "frame",
-    "columns",
-    "row_index",
-    "value",
-    "severity",
-    "message",
-]
+# Public name preserved for surface stability; the canonical model now lives in
+# domain.finding_frame.  Every construction site passes ``severity`` explicitly.
+DerivedColumnFinding = Finding
 
 _VALID_POLICIES = {"drop", "warn_on_mismatch", "fail_on_mismatch"}
-
-
-@dataclass(frozen=True)
-class DerivedColumnFinding:
-    rule_type: str
-    frame: str
-    columns: list[str]
-    row_index: Any
-    value: tuple[Any, ...] | None
-    severity: str = "warn"
-    message: str = ""
-
-    def to_record(self) -> dict[str, Any]:
-        return {
-            "rule_type": self.rule_type,
-            "frame": self.frame,
-            "columns": ", ".join(self.columns),
-            "row_index": "" if self.row_index is None else _row_index_label(self.row_index),
-            "value": "" if self.value is None else " | ".join(map(str, self.value)),
-            "severity": self.severity,
-            "message": self.message,
-        }
-
-
-def findings_to_frame(findings: Iterable[DerivedColumnFinding]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [finding.to_record() for finding in findings],
-        columns=FINDING_COLUMNS,
-    )
 
 
 def apply_derived_column_policy(
@@ -113,12 +84,12 @@ def apply_derived_column_policy(
 
     failures = [finding for finding in found if finding.severity == "fail"]
     if policy == "fail_on_mismatch" and failures:
-        raise ValueError(_failure_message(failures))
+        raise ValueError(simple_failure_message(failures, heading="Derived column policy failed"))
 
     out = dict(frames)
     out[output or source] = cleaned
     if policy == "warn_on_mismatch":
-        out[findings] = findings_to_frame(found)
+        out[findings] = findings_to_frame(found, columns=FINDING_COLUMNS)
 
     # When the cleaned payload replaces the source frame, the consumed
     # provenance no longer describes any present column. Remove it and prune
@@ -421,14 +392,3 @@ def _norm(value: Any) -> str | None:
     except (TypeError, ValueError):
         pass
     return str(value).strip()
-
-
-def _row_index_label(row_index: Any) -> str:
-    if isinstance(row_index, tuple):
-        return ", ".join(map(str, row_index))
-    return str(row_index)
-
-
-def _failure_message(findings: list[DerivedColumnFinding]) -> str:
-    lines = [f"{finding.rule_type}: {finding.message}" for finding in findings]
-    return "Derived column policy failed:\n" + "\n".join(f"  - {line}" for line in lines)

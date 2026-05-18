@@ -1,0 +1,107 @@
+= Finding-Model Consolidation Notes (FTR-FINDING-MODEL-CONSOLIDATION-P5)
+
+Date: 2026-05-18
+
+== Decision: one shared record + one serializer, not one universal model
+
+The inventory shows the duplication is *finding-frame serialization*, not a
+single uniform record. The smallest behavior-preserving consolidation is:
+
+. Extract the genuinely shared mechanic — the column constant, the record
+  shape that two producers share verbatim, the `pd.DataFrame([...],
+  columns=...)` serializer, the empty-frame contract, and the flat failure
+  message — into one small domain module.
+. Leave genuinely different records (`ReferenceFinding`,
+  `findings.py::Finding`) as distinct, but route the *serialization* of
+  `ReferenceFinding` through the one shared serializer so the mechanic is
+  single-sourced.
+
+This deliberately rejects a single "universal Finding" or a diagnostics engine
+(explicit FTR non-goal and REVIEW-002 anti-framework constraint).
+
+== Placement: `domain/finding_frame.py`
+
+Domain-level, beside `frame_lifecycle.py`, `helper_policies.py`,
+`workbook_views.py`. Rationale:
+
+* The shared model belongs in the domain layer (FTR design constraint).
+* Both `domain/transformations/*` and `domain/validations/*` consume it;
+  a neutral domain-level module avoids a `transformations → validations`
+  cross-subpackage import question entirely.
+* `frame_lifecycle.py` already proves this exact placement + import pattern is
+  guard-clean (the domain-transformation boundary/cross-family guards only
+  constrain the `fk_helpers` / `discriminator_split` packages; `findings.py`
+  was rejected as the home because its `Finding` is a different concern and
+  the FTR forbids touching severity behavior).
+
+== Shared API (final)
+
+* `FINDING_COLUMNS` — the 7-col base (`rule_type, frame, columns, row_index,
+  value, severity, message`).
+* `Finding` — frozen dataclass, 7-col shape, `to_record()` = the
+  resource-override/derived-column rendering (`", ".join` columns, labelled
+  `row_index`, `" | ".join` value). `severity` defaults to `"warn"`,
+  behaviourally inert (all call sites pass it explicitly).
+* `row_index_label(row_index)` — scalar→`str`, tuple→`", ".join(map(str,…))`.
+* `findings_to_frame(findings, *, columns=None)` — generic over any
+  `to_record()`-bearing record; `columns=None` → `FINDING_COLUMNS`. Empty
+  input still yields a zero-row frame with exactly `columns` (schema-stable
+  empty-frame contract preserved for *both* the 7-col and 9-col schemas).
+* `simple_failure_message(findings, *, heading)` — the flat, uncapped
+  `"{heading}:\n  - {rule_type}: {message}"` block.
+
+`FindingRecord` is a `Protocol` (just `to_record`) so the serializer accepts
+`ReferenceFinding` without importing it (no domain cycle).
+
+== Per-module conversion
+
+[cols="1,3", options="header"]
+|===
+| Module | Change
+
+| `resource_overrides`
+| Drop local `FINDING_COLUMNS`/dataclass/`findings_to_frame`/
+  `row_index_label`/`_failure_message`. `ResourceOverrideFinding = Finding`
+  (public alias). Serialize via shared `findings_to_frame(...,
+  columns=FINDING_COLUMNS)`; fail via `simple_failure_message(...,
+  heading="Resource override normalization failed")`.
+
+| `derived_column_policy`
+| Identical pattern. `DerivedColumnFinding = Finding`. `FINDING_COLUMNS`
+  kept importable (test dependency) and passed explicitly at the call site so
+  the re-export is genuinely used (no `__all__`, no F401).
+  Heading `"Derived column policy failed"`. (Also removed an accidental
+  duplicate `_norm` introduced and reverted during editing — final file has a
+  single `_norm`.)
+
+| `reference_validations`
+| Keep `ReferenceFinding`, its 9-col `FINDING_COLUMNS`, `to_record`,
+  `_failure_message`, `_finding_line`, `_format_*` *unchanged*.
+  `findings_to_frame` now: `return _serialize_findings(findings,
+  columns=FINDING_COLUMNS)` where `_serialize_findings` is the shared
+  serializer (imported aliased to avoid shadowing the public name).
+
+| `findings.py`
+| Untouched. Documented rationale: different semantic model, no serialization
+  to consolidate, collapsing it = severity-behavior change (forbidden).
+|===
+
+== Duplication removed (net)
+
+* 3 → 1 `findings_to_frame` implementations.
+* 3 → 1 finding-record `to_record` bodies for the two identical producers;
+  the third (`ReferenceFinding`) kept but no longer owns serialization.
+* 2 → 1 flat `_failure_message` bodies (RO + DCP); reference-validations
+  message kept (genuinely different).
+* `row_index_label` / `_row_index_label`: 2 → 1 canonical helper.
+* 3 module-local `FINDING_COLUMNS` constants → 1 canonical (7-col) +
+  reference-validations' documented 9-col extension.
+
+Source line delta in the three modified modules: roughly −108 / +36.
+
+== Explicitly not done (anti-scope-creep)
+
+No predicate/condition-DSL extraction (REVIEW-002 §4.2 watch item, two
+consumers only). No tiny-util package. No `reference_validations.py` split
+(this FTR is its *prerequisite*, not the split). No `graph_validations`
+edits. No pipeline/registry/YAML/severity changes. No `__all__` introduced.

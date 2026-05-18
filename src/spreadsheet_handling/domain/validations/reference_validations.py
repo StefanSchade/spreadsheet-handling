@@ -10,8 +10,15 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain.finding_frame import findings_to_frame as _serialize_findings
+
 Frames = dict[str, Any]
 
+# Module-specific extension of the canonical finding schema: reference
+# validations additionally carry ``target_frame`` / ``target_columns`` and
+# render ``row_index`` / ``value`` differently (raw index, JSON-encoded tuple),
+# so this producer keeps its own column list and ``ReferenceFinding`` record.
+# Only the tabular serialization mechanic is shared (see findings_to_frame).
 FINDING_COLUMNS = [
     "rule_type",
     "frame",
@@ -82,10 +89,7 @@ def validate_references(
 
 def findings_to_frame(findings: Iterable[ReferenceFinding]) -> pd.DataFrame:
     """Convert reference validation findings to the stable report frame shape."""
-    return pd.DataFrame(
-        [finding.to_record() for finding in findings],
-        columns=FINDING_COLUMNS,
-    )
+    return _serialize_findings(findings, columns=FINDING_COLUMNS)
 
 
 def _validate_rules(

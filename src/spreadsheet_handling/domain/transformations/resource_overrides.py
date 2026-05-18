@@ -11,17 +11,19 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain.finding_frame import (
+    FINDING_COLUMNS,
+    Finding,
+    findings_to_frame,
+    simple_failure_message,
+)
+
 Frames = dict[str, Any]
 
-FINDING_COLUMNS = [
-    "rule_type",
-    "frame",
-    "columns",
-    "row_index",
-    "value",
-    "severity",
-    "message",
-]
+# Public name preserved for surface stability; the canonical model now lives in
+# domain.finding_frame.  Every construction site passes ``severity`` explicitly,
+# so the shared default differs harmlessly from the old class-level "fail".
+ResourceOverrideFinding = Finding
 
 _VALID_MODES = {"fail", "warn", "ignore"}
 _VALID_EMPTY_OVERRIDE = {"omit_tuple", "keep_tuple"}
@@ -35,28 +37,6 @@ class ResourceOverridePolicy:
     explicit_empty_marker: Any | None = None
     collapse_override_equal_to_default: bool = True
     allow_empty_default: bool = False
-
-
-@dataclass(frozen=True)
-class ResourceOverrideFinding:
-    rule_type: str
-    frame: str
-    columns: list[str]
-    row_index: Any
-    value: tuple[Any, ...] | None
-    severity: str = "fail"
-    message: str = ""
-
-    def to_record(self) -> dict[str, Any]:
-        return {
-            "rule_type": self.rule_type,
-            "frame": self.frame,
-            "columns": ", ".join(self.columns),
-            "row_index": "" if self.row_index is None else row_index_label(self.row_index),
-            "value": "" if self.value is None else " | ".join(map(str, self.value)),
-            "severity": self.severity,
-            "message": self.message,
-        }
 
 
 @dataclass(frozen=True)
@@ -112,12 +92,14 @@ def normalize_resource_overrides(
     )
     failures = [finding for finding in result.findings if finding.severity == "fail"]
     if mode == "fail" and failures:
-        raise ValueError(_failure_message(failures))
+        raise ValueError(
+            simple_failure_message(failures, heading="Resource override normalization failed")
+        )
 
     out: dict[str, Any] = dict(frames)
     out[output or source] = result.frame
     if mode == "warn":
-        out[findings] = findings_to_frame(result.findings)
+        out[findings] = findings_to_frame(result.findings, columns=FINDING_COLUMNS)
     return out
 
 
@@ -183,19 +165,6 @@ def normalize_resource_override_frame(
         frame=pd.DataFrame(output_rows, columns=list(frame.columns)),
         findings=findings,
     )
-
-
-def findings_to_frame(findings: Iterable[ResourceOverrideFinding]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [finding.to_record() for finding in findings],
-        columns=FINDING_COLUMNS,
-    )
-
-
-def row_index_label(row_index: Any) -> str:
-    if isinstance(row_index, tuple):
-        return ", ".join(map(str, row_index))
-    return str(row_index)
 
 
 def _resource_override_policy(
@@ -482,8 +451,3 @@ def _key_tuple(value: Any) -> tuple[Any, ...]:
     if isinstance(value, tuple):
         return value
     return (value,)
-
-
-def _failure_message(findings: list[ResourceOverrideFinding]) -> str:
-    lines = [f"{finding.rule_type}: {finding.message}" for finding in findings]
-    return "Resource override normalization failed:\n" + "\n".join(f"  - {line}" for line in lines)

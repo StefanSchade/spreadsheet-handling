@@ -1,0 +1,113 @@
+= Finding-Model Inventory (FTR-FINDING-MODEL-CONSOLIDATION-P5)
+
+Date: 2026-05-18
+Scope: pre-consolidation snapshot of every finding dataclass / column list /
+`to_record` / `findings_to_frame` / empty-frame / failure-message helper across
+the four FTR target areas (plus the one cross-module consumer).
+
+== 1. The five sites
+
+[cols="1,2,2,3", options="header"]
+|===
+| Site | Record | Columns | Serialization / failure helpers
+
+| `domain/validations/findings.py`
+| `Finding(category, sheet, column, detail, severity)`
+| *none* (no `FINDING_COLUMNS`)
+| *none*. Drives `apply_severity_policy` / `resolve_severity`. A
+  category→severity-policy model, *not* a finding-frame producer.
+
+| `domain/validations/reference_validations.py`
+| `ReferenceFinding(rule_type, frame, columns, row_index, value,
+  target_frame, target_columns, severity, message)`
+| 9-col: adds `target_frame`, `target_columns` between `value` and `severity`
+| own `FINDING_COLUMNS`, `to_record`, `findings_to_frame`, `_failure_message`
+  (named + capped at 10 + "... N more"), `_finding_line`, `_format_*`
+
+| `domain/transformations/resource_overrides.py`
+| `ResourceOverrideFinding(rule_type, frame, columns, row_index, value,
+  severity="fail", message)`
+| 7-col base
+| own `FINDING_COLUMNS`, `to_record`, `findings_to_frame`,
+  `row_index_label` (public), `_failure_message` (flat, uncapped)
+
+| `domain/transformations/derived_column_policy.py`
+| `DerivedColumnFinding(rule_type, frame, columns, row_index, value,
+  severity="warn", message)`
+| 7-col base (identical list to resource_overrides)
+| own `FINDING_COLUMNS`, `to_record`, `findings_to_frame`,
+  `_row_index_label` (private), `_failure_message` (flat, uncapped)
+
+| `domain/validations/graph_validations.py` (consumer, out of FTR scope)
+| reuses `ReferenceFinding`
+| reuses reference 9-col
+| imports `ReferenceFinding` + `findings_to_frame` from
+  `reference_validations`; defines its *own* `_failure_message` /
+  `_finding_line` (different heading text)
+|===
+
+== 2. `to_record` rendering — field-by-field
+
+[cols="1,2,2,2", options="header"]
+|===
+| Field | reference_validations | resource_overrides | derived_column_policy
+
+| `columns`   | `", ".join(columns)` | `", ".join(columns)` | `", ".join(columns)`
+| `row_index` | `"" if None else row_index` *(raw — int stays int)*
+              | `"" if None else row_index_label(...)` *(tuple→join, else str)*
+              | `"" if None else _row_index_label(...)` *(identical to RO)*
+| `value`     | `"" if None else _format_value(...)` *(len-1 scalar; else
+                JSON array of scalars)*
+              | `"" if None else " | ".join(map(str, value))`
+              | `"" if None else " | ".join(map(str, value))`
+| `severity`/`message` | passthrough | passthrough | passthrough
+| `target_*`  | present (`_format_columns`) | absent | absent
+|===
+
+*Conclusion.* `resource_overrides` and `derived_column_policy` are
+byte-identical record producers (the only nominal difference,
+`row_index_label` vs `_row_index_label`, is the same function body; the
+`severity` default never matters because every construction passes
+`severity=` explicitly). `reference_validations` is a genuinely different
+record: raw `row_index`, JSON/scalar `value`, two extra columns.
+
+== 3. `findings_to_frame` — the actual duplication
+
+All three are literally:
+
+[source,python]
+----
+pd.DataFrame([f.to_record() for f in findings], columns=<that module's FINDING_COLUMNS>)
+----
+
+Identical mechanic, three copies, three column constants. This — plus the
+empty-frame shape that falls out of it — is the single shared primitive worth
+extracting.
+
+== 4. `_failure_message` — partially shared
+
+* `resource_overrides`: `"Resource override normalization failed:\n" +
+  "\n".join("  - {rule_type}: {message}")` — flat, uncapped, no name.
+* `derived_column_policy`: same shape, heading
+  `"Derived column policy failed"`.
+* `reference_validations`: `"{name or 'validate_references'} failed with N
+  reference validation finding(s):\n"` + `_finding_line` per finding, capped
+  at 10 with a "... N more finding(s)" suffix.
+
+→ RO and DCP share everything but the heading string → one helper parameterised
+by `heading`. The reference-validations message is genuinely different
+(name, cap, per-field line) → not shared.
+
+== 5. External coupling (grep-verified)
+
+* `reference_validations`: `FINDING_COLUMNS`, `ReferenceFinding`,
+  `findings_to_frame` imported by `graph_validations.py`,
+  `domain/validations/__init__.py`, and two test modules. Must stay
+  importable from `reference_validations`.
+* `derived_column_policy`: `FINDING_COLUMNS` imported by
+  `test_derived_column_policy.py`. Must stay importable.
+* `resource_overrides`: `FINDING_COLUMNS` / `findings_to_frame` /
+  `row_index_label` / `ResourceOverrideFinding` — *no importers anywhere*
+  (`src/` or `tests/`). Free to relocate.
+* No pipeline/registry static import edges into any finding symbol (REVIEW-002
+  cross-cutting fact #1).
