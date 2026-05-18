@@ -1,0 +1,410 @@
+= REVIEW-002 Findings -- Architecture Follow-up (Pass 1)
+:date: 2026-05-18
+:reviewer: Claude Opus 4.7
+:pass: 1 of 3 (Architecture Follow-up)
+:baseline: REVIEW-001 (2026-05-11)
+:scope: review/documentation only -- no production edits, no commits
+
+== Method and Evidence Base
+
+This pass reassesses the macro architecture against the REVIEW-001 baseline.
+It is calibrated against the *actual current repository state* (source tree,
+module sizes, guard suite, package shapes), not only against the wave/FTR
+narrative. Sources read:
+
+* REVIEW-001 consolidation + raw findings + `completet_wave_notice_3r.adoc`;
+* the REVIEW-001-derived FTR archive and the post-REVIEW-001 maintainability
+  wave FTRs (FK-helper extraction/provenance, discriminator split, the P4
+  guardrail family, workbook-view recomposition, ODS parity, demo
+  reintegration);
+* current architecture docs: `ARCH-LAYERS.adoc`, `generic_ir.adoc`,
+  `architecture_guard_inventory.adoc`, ADR-006, ADR-RENDER-FLOW,
+  ADR-META-BLOB-SERIALIZATION, the 2026-05-18
+  `discriminator_split_package_split_analysis.adoc`;
+* live source under `src/spreadsheet_handling/` and the guard suite under
+  `tests/architecture/`.
+
+Where a finding's status is asserted from the wave narrative but not
+re-verified line-by-line in this pass, it is marked _(reported)_.
+
+== 1. REVIEW-001 Follow-up
+
+REVIEW-001 produced one CRITICAL *architectural* finding (D-001/IR-002), two
+CRITICAL *correctness* findings (IR-008/A-004 serialization; A-003 writer
+crash), a body of SHOULD-FIX structural debt, and hygiene items. Status now:
+
+=== 1.1 Resolved (closed and verified in current code; mostly guard-protected)
+
+[cols="1,3,2", options="header"]
+|===
+| REVIEW-001 ID | What was the problem | Current state
+
+| D-001 + IR-002 (CRITICAL)
+| `domain/transformations/*` imported `rendering.formulas` -- the single real
+hexagonal violation; no guard caught it (gap L1).
+| Formula intent lives in `core/formulas.py`. `core/fk.py` exposes a
+`HelperValueProvider` callback so domain never reaches into rendering. The L1
+boundary (`domain/`+`core/` MUST NOT import `rendering/`+`io_backends/`) is now
+executably enforced in
+`tests/architecture/dependency_guards/test_spreadsheet_boundary_guards.py`.
+*Resolved + guarded.*
+
+| IR-008 + A-004 (CRITICAL)
+| `workbook_meta_blob` persisted via `str(dict)` (Python repr); silent
+roundtrip break on NaN/non-literals.
+| `layout_composer.py:309` now writes `json.dumps(..., sort_keys=True,
+ensure_ascii=False)`. `ADR-META-BLOB-SERIALIZATION` (accepted 2026-05-12)
+records the carrier policy; legacy literal reads kept as compat fallback;
+NaN/nested covered by tests. *Resolved + ADR + test.*
+
+| A-003 (CRITICAL)
+| `sheets-run --out-kind yaml_dir\|xml_dir` crashed on meta-producing
+pipelines.
+| Simple `_meta` writer crash paths fixed in the quick-wins slice. *Resolved
+(reported; consistent with the consolidated `_meta`-skip recommendation).*
+
+| IR-003 + IR-004
+| `rendering/passes/` had stub/dead files while logic sat in one `core.py`;
+two manually-synced pass-order lists.
+| `passes/` is now one module per pass (`_base.py` + 8 pass modules); no
+`core.py`/`formula_pass.py`/`post_pass.py`. `default_passes()` is the single
+order source; ordering drift is tested; ADR-006 documents the full 8-pass
+chain. *Resolved + guarded.*
+
+| IR-005
+| `derived` meta channel crossed domain->rendering with no registry contract.
+| Registered as transient `meta_rendering` / `derived_operational_view` with
+explicit producer/consumer refs; guarded by `test_meta_registry*.py`.
+*Resolved + guarded.*
+
+| A-001 / A-010 / IR-010 / IR-012
+| Triple backend-dispatch table + double orchestrator; `pipeline/registry.py`
+mixed registry/build/exec/re-export; two YAML config dialects.
+| `io_backends/router.py` is the canonical dispatch owner; `make_backend`
+delegates; orchestrator uses `get_loader`/`get_saver`. `pipeline/` is split
+into `registry` / `build` / `execution` / `runner`; `run_app(AppConfig)` vs
+`run_pipeline(frames,steps)` disambiguated. One step-list dialect remains;
+`pipeline/config.py` is now I/O-endpoint + Excel-options only -- exactly the
+REVIEW-001 target end-state. *Resolved* (residual `BACKENDS` vs
+`LOADERS`/`SAVERS` key-vocabulary mismatch deliberately deferred).
+
+| A-002
+| `sheets-pack --input-kind csv_dir` -> `ValueError`.
+| `orchestrate(...)` now has a CSV load path. *Resolved (reported).*
+
+| A-006 / A-007 / IR-007 / D-014 / D-007
+| Dead `_interfaces.py`; `coerce_backend_options(None)` returned a dict; dead
+step factories; `missing_mode` no-op; private cross-module imports.
+| `io_backends/_interfaces.py` is gone from the tree. The rest were taken in
+the quick-wins slice; `missing="fail"` is now explicitly rejected in formula
+mode (a real decision, not a silent no-op). *Resolved (A-006 verified; others
+reported).*
+|===
+
+The wave closed *every* REVIEW-001 release-relevant finding. Both CRITICALs
+that mattered for the library's core promise (hexagonal cleanliness; roundtrip
+fidelity) are closed and now have executable guards or an ADR behind them.
+
+=== 1.2 Mitigated / replaced by a better pattern
+
+[cols="1,3", options="header"]
+|===
+| REVIEW-001 ID | Assessment
+
+| D-002 (FK domain logic in the leaf layer)
+| The FK *enrichment/cleanup lifecycle* was extracted into the
+`domain/transformations/fk_helpers/` package; `core/__init__.py` is slimmed to
+four symbols; `core.fk` is kept leaf-only via the `HelperValueProvider`
+callback and is now load-bearing for a guard. This converts "FK wildwuchs"
+into a *deliberate, guarded* leaf placement. Residue: `FK_PATTERN` (the FK
+naming convention -- arguably a domain rule) still lives in `core/fk.py` (still
+339 lines, byte-stable since REVIEW-001). *Mitigated*: the ownership/coupling
+risk is resolved and guarded; the convention-in-core nuance is now a
+documented trade-off rather than an accident.
+
+| D-003 (triple `fk`/`fk_helpers` name overlap)
+| Responsibilities are now crisp and guard-enforced: `core.fk` = leaf
+detection primitives; `domain/transformations/fk_helpers/` = lifecycle
+package; `domain/validations/fk_helpers.py` = pure checks. The *name* overlap
+persists (three things still named around "fk_helpers"), but the *coupling*
+risk D-003 actually warned about is gone. *Mitigated -- cosmetic residue
+only.*
+
+| D-010 (empty/inconsistent package surfaces)
+| The new split packages have exemplary surfaces: explicit `__all__`,
+re-export guards, public-API boundary guards. `pipeline/__init__.py` is now a
+curated surface. *But the original offenders are unchanged*:
+`domain/__init__.py`, `domain/transformations/__init__.py`,
+`rendering/__init__.py` are still empty; `domain/validations/__init__.py`
+still exports only the Reference/Graph half (not the `Finding`/fk-helper
+half). *Partially mitigated* -- discipline is applied to new code, not
+retrofitted to the originals.
+|===
+
+=== 1.3 Unchanged (still open; confirmed in current code unless marked reported)
+
+[cols="1,3", options="header"]
+|===
+| REVIEW-001 ID | Current state
+
+| IR-006 (render path mutates its inputs) -- *the most important carry-over*
+| Confirmed live: `rendering/frame_selection.py:198`
+(`value[col] = series.apply(...)` on input frames) and
+`rendering/composer/layout_composer.py:230` (`spec["resolved"] = {...}` into
+caller `meta`). The wave notice explicitly lists this as deferred. Still a
+latent correctness hotspot on any second-output path. *Unchanged.*
+
+| D-004 (oversized modules) -- *regressed in absolute terms*
+| REVIEW-001: nine modules > 440 lines, peak 725. Now: ~13 modules > ~430
+lines, *peak 801* (`xref_crosstable.py`); `reference_validations.py` still
+exactly 725. The P4A feature wave added large modules
+(`xref_crosstable` 801, `join_views` 567, `tabular_views` 412,
+`workbook_views` 501, `resource_overrides` 489, `compact_multiaxis` 468,
+`derived_column_policy` 434, `helper_policies` 455) without same-slice
+splitting. `FTR-MODULE-SPLIT-CLEANUP-P3D` remains *Open/undelivered*.
+*Unchanged -> worsened* (but see Section 4: a proven safe-split methodology
+now exists).
+
+| D-005 (two parallel finding models)
+| Both still present: `domain/validations/findings.py::Finding` +
+`apply_severity_policy` (used by fk-helper/validate) vs
+`reference_validations.py`/`graph_validations.py`
+`ReferenceFinding`+`findings_to_frame`+`mode`. *Unchanged.*
+
+| D-009 (backward-compat residue)
+| `core/fk.py::apply_fk_helpers` still carries the "legacy dict inputs" and
+"flat id->label map" backward-compat branches. `core/refs.py::add_helper_columns`
+still has a blank `except Exception:`. (The separate raw-formula leak in
+`core/refs.py` was removed by the raw-formula guard FTR, so refs.py was
+partially cleaned.) *Unchanged.*
+
+| D-006 / D-008 / D-011 / D-012-IR-014 / D-013
+| `transformations/helpers.py` paradigm-mix; `validate_columns.py` mislabel;
+domain file-I/O + direct `yaml` (`structured_yaml.py` 479 lines,
+`yaml_overrides.py`, `pipeline/config.py import yaml`) with no L2
+third-party-dependency guard in the inventory; module-header convention; the
+dual-interface shim. None appear in the wave-closed set. *Unchanged
+(reported / structurally evident).*
+
+| A-005 / A-008 / A-009 / IR-011 / IR-013
+| CLI error-wrapper in the installed path; CSV/JSON multi-header roundtrip
+asymmetry; FK step-name vs registry-key mismatch; unused `exported_at`
+placeholder. The wave notice explicitly lists these as remaining/deferred.
+*Unchanged.*
+|===
+
+=== 1.4 New architectural risks since REVIEW-001
+
+. *Module-size debt grew with feature velocity.* The P4A wave delivered real
+capability (xref crosstables, joins, pivots, workbook views, resource
+overrides, compact multi-axis, ODS) as large single files. This is the one
+axis where the absolute state is worse than at REVIEW-001. It is *accidental*
+complexity (feature-first, split-later), now repayable -- see Section 4.
+. *Guard-inventory drift.* `architecture_guard_inventory.adoc` (dated
+2026-04-24) no longer enumerates the live suite: it omits the
+`tests/architecture/domain_transformations/` family
+(`test_no_cross_family_internal_imports.py`,
+`test_package_public_api_boundaries.py`,
+`test_pipeline_registry_uses_public_transform_apis.py`) and the
+`carrier_boundary/` guard. The anti-sprawl mechanism is sound, but the
+inventory must track the suite or it loses its value.
+. *`odfpy` promoted from optional extra to core runtime dependency* (ODS
+adapter). A deliberate, accepted product/distribution decision, but it sits in
+mild tension with the REVIEW-001 "lazy optional adapters" direction and should
+be reflected wherever that ADR-style guidance lives.
+. *Layer-map doc lag.* `ARCH-LAYERS.adoc` (2026-03-31) still describes
+`pipeline/pipeline.py`, `core/fk.py` as the FK home,
+`domain/transformations/helpers.py` for reorder, and a 5-pass order. ADR-006
+and `generic_ir.adoc` are current and accurate; ARCH-LAYERS is the stale
+steering doc. REVIEW-001 flagged "docs misdescribe the Ist-state" as a top
+agent-facing risk; for the layer-map document specifically that risk is *not
+fully resolved*.
+. *Recurring tiny-helper duplication* (`_non_empty_string` / `_string_list` /
+`_is_empty_cell`) across `frame_extract` / `tabular_views` / `join_views` /
+`workbook_views` -- flagged independently in three FTR reviews. Minor,
+fragmentation-adjacent, non-blocking; a watch item, not a defect.
+
+== 2. Architecture Maturity Assessment
+
+[cols="1,1,3", options="header"]
+|===
+| Dimension | Verdict | Basis
+
+| Layer clarity | Strong | Hexagonal layering is real, documented (ADR-006,
+generic_ir), and *executably enforced* (L1 guard closed -- REVIEW-001's only
+CRITICAL architectural finding).
+
+| Dependency direction | Strong / enforced | The one real inward violation is
+closed; `core` is leaf-only and guard-checked; `domain`/`core` ⊥
+`rendering`/`io_backends` is a test.
+
+| Adapter isolation | Strong | Two real backends (XLSX, ODS) behind
+`spreadsheet_contract.py`; write/parse contract guards + parser-modularization
+guards for both; backend formula syntax confined to adapters
+(raw-formula-boundary guard). ODS is the first real proof the architecture is
+not XLSX-only.
+
+| IR boundaries | Strong (conceptually + guarded) | `generic_ir.adoc` is a
+disciplined write-path model; parse contract stops at `WorkbookIR`;
+semantic-invariant guards defend "meaning lives in IR, not carrier". Reverse
+projection (formatting->canonical) is *deliberately* undefined -- inherent,
+not accidental.
+
+| Transformation-family cohesion | Mixed (improving) | The two split families
+(`fk_helpers`, `discriminator_split`) are cohesive, acyclic, and
+guard-bounded. The remaining large transformation modules are still
+monolithic single files.
+
+| Registry discipline | Strong | `meta_registry.yaml` +
+`pipeline_step_registry.json` + hardening guards. Philosophy is explicit and
+mature: the registry *documents deliberate deep coupling* rather than
+pretending to loosen it; `generic_ir.adoc` explicitly refuses a "universal
+meta engine".
+
+| Metadata handling | Much improved | canonical/rendering split explicit;
+carrier serialization is JSON + ADR; `derived` registered + guarded;
+carrier-boundary guard exists. Conflict/precedence deliberately deferred
+(inherent).
+
+| Test architecture | Strong | ~142 test files, ~20k test LOC, a lean
+117-line conftest, an 8-way architecture-guard taxonomy, FTR markers, GDR
+discipline, durability classification. A scope-confusion incident
+(meta-carrier guard first built the wrong family) was *caught in review* --
+evidence the loop works.
+
+| Maintainability trend | Positive on structure/boundaries/discipline;
+flat-to-negative on module size | See Sections 3-4.
+|===
+
+== 3. Maintainability Trajectory
+
+The project moved *toward* better modularity (for new code), markedly safer
+refactoring, executable boundaries, and clearer ownership; accidental coupling
+is down (single dispatch owner, single config dialect, formula intent
+relocated, derived channel registered).
+
+It did *not* move toward smaller modules -- the opposite, in absolute terms.
+The erosion risk is therefore localized and specific: the large transformation
+modules are where future feature work will concentrate, and they are exactly
+the files an AI agent (or human) cannot hold in one read-window. This is the
+single most important maintainability watch-item, and it is *accidental*
+complexity, not inherent.
+
+Net trajectory: *positive*, because the boundary and discipline gains are
+structural and durable while the module-size regression is a known,
+now-repayable debt rather than a design flaw.
+
+== 4. Refactoring Discipline (the headline maturity gain)
+
+The `fk_helpers` and `discriminator_split` package splits are the strongest
+single piece of evidence in this review:
+
+* *Behavior-preserving*: AST-equivalence checking of moved bodies;
+roundtrip/symmetry witnesses (`merge(split(df)) == df`).
+* *Surface-preserving*: package `__init__` re-exports the public/registry/meta
+symbols; colon-target and dotted meta-registry paths resolve unchanged with
+*zero edits outside the package*.
+* *Guard-protected*: per-family re-export guards
+(`test_fk_helpers_package_reexports.py`,
+`test_discriminator_split_package_reexports.py`), a cross-family
+private-import guard, a package-public-API guard, and a "registry uses public
+transform APIs" guard.
+* *Analysis-driven*: the 2026-05-18
+`discriminator_split_package_split_analysis.adoc` reasons explicitly about
+*whether* to split, derives boundaries from the code's real coupling DAG
+(`split/merge/naming/values/framecheck/metadata`, acyclic), caps the shared
+core at one tiny `values.py`, and *forbids* an anticipatory
+`conflict.py`/`precedence.py` because that design space is owned by a future
+FTR. The live package matches the analysis exactly.
+
+Were the boundaries chosen well? Yes -- they map to real responsibility
+clusters and an acyclic dependency graph, not to cosmetic size targets.
+
+Over-engineering / fragmentation signals: *minimal, and actively policed.* The
+GDR template, the single guard inventory, the explicit refusals ("no
+import-linter", "no second governance document", "not a universal meta
+engine", the rejected over-aggressive CLI rewrite, the localized-resource
+matrix solved through existing primitives instead of a framework) show a
+project that resists generalization. The one genuine fragmentation incident
+(meta-carrier guard built as the wrong family) was caught and split correctly.
+The recurring tiny-helper duplication is the only mild, persistent
+fragmentation-adjacent signal -- and it is the *opposite* of over-abstraction
+(under-consolidation of trivia).
+
+Conclusion: refactoring is now a *repeatable, documented, reviewed, and
+guard-backed process*. This is the most important architectural advance since
+REVIEW-001 and the reason the module-size regression is a manageable debt
+rather than an accelerating one.
+
+== 5. Remaining Structural Hotspots (high level only)
+
+[cols="2,1,3", options="header"]
+|===
+| Hotspot | Risk | Disposition
+
+| Render-input mutation: `frame_selection._resolve_formula_sheet_names`,
+`layout_composer._add_legend_blocks` (IR-006)
+| Medium (latent correctness)
+| *Do a focused purity decision, NOT a refactor.* This is a small, surgical
+fix (copy-on-write or relocate `resolved`), not a modularization target.
+
+| Oversized transformation/validation modules: `xref_crosstable.py` (801),
+`reference_validations.py` (725), `cell_codec.py` (631), `join_views.py`
+(567), `enrich_lookup.py` (567), `workbook_views.py` (501)
+| Medium (maintainability / agent legibility)
+| Good candidates for the *proven* analysis-driven split methodology --
+*selectively*. `xref_crosstable.py` and `reference_validations.py` first.
+Defer deep per-file analysis to REVIEW-002 Pass 2.
+
+| Domain finding-model duality (D-005)
+| Low-medium (semantic inconsistency)
+| Genuine debt; modest, well-scoped consolidation. Not urgent.
+
+| `core/fk.py` + `core/refs.py` compat residue (D-009)
+| Low
+| Low-risk cleanup, but `core/fk.py` is now guard-load-bearing (leaf
+contract + `HelperValueProvider`). Treat conservatively; do not "tidy"
+aggressively.
+
+| Meta conflict/precedence resolution (generic_ir Steps 4-5)
+| Inherent
+| *Explicitly do NOT pre-empt.* The discriminator analysis already forbids an
+anticipatory conflict module; this design space is owned by a future FTR. This
+is the clearest "complexity is inherent; leave it deferred" zone.
+|===
+
+*Inherent vs accidental complexity:*
+
+* *Inherent*: spreadsheet roundtrip fidelity (canonical/rendering/carrier meta
+split, NaN/nested serialization, multi-backend parity); bijective transforms
+(split/merge, xref, compact_multiaxis) and their symmetry invariants; meta
+conflict/precedence. The layered model + registry is a *proportionate*
+response here, not over-design.
+* *Accidental*: module size from feature-first delivery; tiny-helper
+duplication; doc lag (ARCH-LAYERS, guard inventory); finding-model duality;
+compat residue; empty top-level `__init__`. All cheaply addressable; none
+require architecture change.
+
+== 6. Architectural Confidence
+
+The project is *close to a stable beta architecture* on every load-bearing
+axis: layering, the adapter/contract boundary, IR and metadata contracts,
+executable guard enforcement, and -- decisively -- a safe, repeatable
+refactoring process. Changes route through FTR + review + GDR; the seams that
+matter are explicit and tested; a second backend has validated the central
+abstraction.
+
+It is *not* a rapidly shifting prototype: the structural vocabulary
+(WorkbookIR, RenderPlan, meta_canonical/meta_rendering, spreadsheet_contract,
+the pass chain, the backend router) has been stable across the wave and is
+guard-pinned.
+
+It is *not yet fully stable*: a known latent input-mutation bug (IR-006)
+persists untouched; the largest modules are larger than at REVIEW-001; and the
+primary steering doc for layers (ARCH-LAYERS) lags the code. These are
+localized prototype-grade residues on an otherwise beta-grade skeleton -- they
+do not undermine the architecture, but they should be visible and owned rather
+than discovered later.
+
+Confidence: *stable-beta architecture with localized, named, non-architectural
+residue.*
