@@ -1,0 +1,162 @@
+===== [[FTR-IR-006-RENDER-INPUT-MUTATION-FIX]] FTR-IR-006-RENDER-INPUT-MUTATION-FIX — Make render input selection mutation-safe
+
+*Status:* Proposed
+*Priority:* P4
+*Area:* Render IR / workbook composition
+*Kind:* Correctness hardening
+
+==== Purpose
+
+Eliminate the remaining IR-006 render-input mutation defect without changing the render-flow architecture, public APIs, workbook-view semantics, formula semantics, or adapter contracts.
+
+The render path must not mutate caller-owned `frames`, caller-owned DataFrames, or caller-owned meta structures while preparing spreadsheet output.
+
+==== Context
+
+REVIEW-002 confirmed that IR-006 is still live in two localized places:
+
+* `rendering/frame_selection.py::_resolve_formula_sheet_names`
+* `rendering/composer/layout_composer.py::_add_legend_blocks`
+
+The current write-side render flow is:
+
+[source,text]
+----
+Frames + meta_canonical
+  -> compose_workbook()
+  -> apply_render_passes()
+  -> build_render_plan()
+  -> render_workbook()
+----
+
+`compose_workbook()` and frame selection are render-preparation code. They may derive render-local structures, but they must not rewrite caller-owned input payloads.
+
+The known defect is not a broad architecture failure. It is a localized purity/correctness leak.
+
+==== Problem
+
+`frame_selection._resolve_formula_sheet_names(...)` rewrites `LookupFormulaSpec` cells by assigning back into selected DataFrames. In workbook-view paths where a logical frame name is rendered under a different physical sheet name, this can mutate the original DataFrame object owned by the caller.
+
+`layout_composer._add_legend_blocks(...)` currently writes a `resolved` block back into each legend spec in `meta`. This mutates caller-owned metadata during workbook composition.
+
+This is dangerous because `application.orchestrator.orchestrate()` returns the frames after saving, and in-process callers may reuse the same `frames` or `meta` for a second output path. The second output can then observe render-side rewrites that should have remained local to the first render.
+
+==== Goal
+
+Make render preparation mutation-safe while preserving existing visible behavior.
+
+After this FTR:
+
+* selected render frames may be renamed or locally adjusted for workbook rendering;
+* lookup formulas may still target the physical sheet names required by the rendered workbook;
+* legend placement may still be resolved into render-local IR structures;
+* caller-owned `frames`, DataFrames, and `meta` remain unchanged after render preparation.
+
+==== Non-Goals
+
+* No renderer split.
+* No render pass-chain redesign.
+* No adapter redesign.
+* No generic immutability framework.
+* No deep-copy-everything policy unless narrowly required.
+* No change to `LookupFormulaSpec` semantics.
+* No change to workbook-view configuration keys.
+* No change to legend block configuration shape.
+* No change to persisted `_meta` semantics unless an existing test proves the current mutation leaked into persisted meta and must be preserved intentionally.
+* No new diagnostics, validation, or metadata framework.
+
+==== Design Direction
+
+Prefer a surgical copy-on-write fix:
+
+. In `frame_selection.py`, when formula sheet names must be rewritten, copy only the affected DataFrame(s) before assigning rewritten formula cells.
+. Do not copy DataFrames that are merely selected unchanged.
+. Preserve object identity for unaffected selected frames if current behavior and tests allow it.
+. In `layout_composer.py`, avoid writing `spec["resolved"] = ...` into the caller-owned legend spec.
+. If resolved legend placement is still needed later, store it in the generated `TableBlock` or another render-owned IR location, not in caller-owned `meta`.
+
+A full `copy.deepcopy(meta)` at `compose_workbook()` entry is acceptable only if the narrower local fix becomes fragile. The preferred outcome is an explicit local mutation removal, not blanket defensive copying.
+
+==== Expected Implementation Shape
+
+Likely production changes:
+
+* `rendering/frame_selection.py`
+  ** Make `_resolve_formula_sheet_names(...)` return a new/updated `selected` mapping, or copy affected DataFrames in place inside the selected mapping before column assignment.
+  ** Keep `_select_configured_sheets(...)` externally behavior-compatible.
+  ** Ensure the original `frames[frame]` DataFrame is not modified.
+
+* `rendering/composer/layout_composer.py`
+  ** Remove mutation of `spec["resolved"]`.
+  ** Keep legend `TableBlock` creation unchanged in visible workbook terms.
+  ** Preserve existing error behavior for invalid legend placement and duplicate/invalid legend entries.
+
+Likely test changes:
+
+* Add a focused unit test for `select_render_frames(...)` proving that a workbook-view sheet rename with `LookupFormulaSpec` cells rewrites only the selected render copy, not the original source DataFrame.
+* Add a focused unit test for `compose_workbook(...)` proving that `legend_blocks` metadata is not mutated by composition.
+* Add or adjust an integration/regression test only if an existing multi-backend path currently lacks coverage for formula-sheet-name rewriting or legend composition.
+
+==== Acceptance Criteria
+
+* A workbook-view render selection that rewrites `LookupFormulaSpec.lookup_sheet` leaves the original caller-owned DataFrame unchanged.
+* Render-selected formula cells still reference the resolved physical sheet name in the render-local structure.
+* `compose_workbook(frames, meta)` leaves `meta` structurally equal to a pre-call copy when `legend_blocks` are configured.
+* Existing legend rendering behavior is preserved: same sheet, position, headers, rows, title, and table dimensions.
+* Existing formula rendering behavior is preserved for workbook-view sheet renames.
+* No public API, registry entry, step ID, YAML key, or adapter contract changes.
+* No broad refactor or package split is introduced.
+* Targeted tests and the relevant render/spreadsheet suites pass.
+
+==== Suggested Verification
+
+Run at minimum:
+
+[source,bash]
+----
+pytest tests/unit/rendering tests/architecture/current_state tests/architecture/semantic_invariants
+pytest tests/integration/io_backends/test_ods_xlsx_parity.py
+pytest tests/integration/pipeline
+----
+
+If touched code or fixtures make the risk broader, run:
+
+[source,bash]
+----
+make test
+----
+
+==== Review Focus
+
+Review should look specifically for:
+
+* hidden mutation still present through shared DataFrame objects;
+* hidden mutation still present through shared nested `meta` dictionaries;
+* accidental blanket copying that obscures semantics or creates avoidable cost;
+* accidental behavior change in rendered formula targets;
+* accidental behavior change in legend placement or workbook layout;
+* scope creep into render-flow, adapter, or metadata redesign.
+
+==== Model Guidance
+
+This is not a large-design task. It is a small but precision-sensitive correctness fix.
+
+A Sonnet-class coding model is sufficient if it follows the FTR strictly and writes characterization tests first. A larger model is only useful for independent review, not for the implementation itself.
+
+Use a larger model only if the implementer starts widening the scope beyond the two confirmed mutation sites or if tests reveal additional mutation paths.
+
+==== Commit Guidance
+
+Recommended commit shape:
+
+[source,text]
+----
+fix(rendering): make IR-006 render input handling mutation-safe
+----
+
+Commit body should mention:
+
+* `FTR-IR-006-RENDER-INPUT-MUTATION-FIX`
+* affected files;
+* tests run;
+* explicit statement that no render-flow or adapter redesign was introduced.
