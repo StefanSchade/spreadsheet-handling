@@ -1,0 +1,823 @@
+= REVIEW-002 Findings -- Architectural Hotspot Analysis (Pass 2)
+:review-id: REVIEW-002
+:step: 02
+:date: 2026-05-18
+:reviewer: Claude Opus 4.7
+:pass: 2 of 3 (Maintainability Hotspots and Refactorability)
+:baseline: REVIEW-002 Pass 1 (REVIEW-002-FINDINGS.adoc), REVIEW-001 (2026-05-11)
+:scope: review/documentation only -- no production edits, no commits
+:status: complete
+
+== Method and Evidence Base
+
+Every scoped module was read in full (line-by-line, not excerpted), plus the
+registry/meta contracts, the test/guard coupling surface, and the governing
+FTR/analysis docs. Sources:
+
+* Live source: all 11 scoped modules under `src/spreadsheet_handling/`.
+* `pipeline/registry.py`, `pipeline/steps.py`,
+  `docs/internal_guide/architecture/meta_registry.yaml`,
+  `pipeline_step_registry.json` (registry + meta coupling).
+* Test suite under `tests/`, the architecture guard suite under
+  `tests/architecture/`, `architecture_guard_inventory.adoc` (hidden coupling
+  through tests/guards; symmetry-invariant inventory).
+* The discriminator-split package-split analysis and the
+  P4A/P6 workbook-view/derived-column/tabular-view FTRs (protected seams).
+* REVIEW-002 Pass 1 findings (D-004 module-size debt; D-005 finding-model
+  duality; the proven safe-split methodology).
+
+=== Scope path corrections
+
+The prompt lists two modules under `domain/transformations/` that live
+elsewhere. Verified actual paths (reviewed at the real locations):
+
+* `reference_validations.py` -> `domain/validations/reference_validations.py`
+  (~725 LOC).
+* `helper_policies.py` -> `domain/helper_policies.py` (455 LOC) -- it is *not*
+  a transformation; it is a configuration producer. This placement is itself a
+  finding (see §2.11).
+
+=== Cross-cutting facts that drive the dispositions
+
+. *Registry coupling is string-only.* All 11 modules are bound to the pipeline
+exclusively by colon-target strings resolved via `importlib` in `steps.py`.
+There are *no static import edges from `pipeline/` into these modules*. Moving
+a module into a package and re-exporting its registry symbol from the package
+root is therefore behavior-preserving for the registry -- the favorable
+precondition the `fk_helpers`/`discriminator_split` splits already proved.
+. *One intra-family static import cluster.* `compact_multiaxis.py` statically
+imports `expand_xref`/`contract_xref` from `xref_crosstable` and
+`decode_cell_values`/`encode_cell_values` from `cell_codec`. These three are a
+*coupled triad*, not three independent modules (§2.3, §2.8, §3).
+. *The guarded boundary family does not yet cover these 11.* The
+`tests/architecture/domain_transformations/` guards (cross-family imports,
+package public-API, registry-uses-public-API, re-export) enumerate only
+`fk_helpers` and `discriminator_split`. The 11 are constrained today only by
+the directory-level layer guards and the canonical-meta hardening guards. Any
+split of one of these 11 must add an analogous re-export guard *as part of the
+split*, exactly as the discriminator analysis prescribes.
+. *Canonical, roundtrip-relevant meta is pinned.* The hardening guard pins
+`xref_crosstable`, `cell_codecs`, `compact_multiaxis`, `helper_policies`,
+`workbook_view`, `workbook_view.sheet_mappings` as
+`(meta_canonical, canonical_meta)` -- i.e. persisted and roundtrip-bearing.
+The meta payload is the carrier of the symmetry invariants; it cannot be split
+away from the functions that produce/consume it.
+. *Finding-model duality is actually quadruplication.* Pass 1's D-005 named
+two finding models. Pass 2 evidence: `reference_validations.py`,
+`resource_overrides.py`, and `derived_column_policy.py` each independently
+define `FINDING_COLUMNS` + a frozen `*Finding` dataclass + `to_record` +
+`findings_to_frame` + `_failure_message`, in addition to
+`domain/validations/findings.py::Finding`. This is the single most concrete
+new architectural observation in this pass (§4, §6).
+. *A second recurring duplication family: a `where`/condition predicate DSL.*
+`reference_validations._condition_mask` and `join_views._apply_where` share
+the *identical* predicate vocabulary (`equals/in/non_empty/is_null/not_null`)
+implemented twice. This is distinct from the tiny-helper duplication Pass 1
+flagged. It is *adjacent, independent* duplication, not shared infrastructure
+(§4).
+
+'''
+
+== 1. Reading Guide
+
+Each module below has the eight required sub-sections, compressed: surface,
+responsibilities, internal coupling, external/registry coupling, candidate
+seams, risk, disposition (+ exactly one mandatory classification), future-FTR
+outline, and explicit non-goals. §3-§7 consolidate.
+
+Classifications used: PROCEED, PROCEED WITH CONSTRAINTS, ANALYZE FIRST, DEFER,
+DO NOT SPLIT (definitions per the prompt).
+
+'''
+
+== 2. Per-Module Architectural Assessments
+
+=== 2.1 `domain/transformations/xref_crosstable.py` (801 LOC)
+
+*Surface.* `expand_xref`, `contract_xref` (registry steps `expand_xref` /
+`contract_xref`). No `__all__`. Imported intra-family by `compact_multiaxis`.
+Meta key `xref_crosstable` (canonical, pinned).
+
+*Responsibilities.* (1) matrix->relation expansion; (2) relation->matrix
+contraction; (3) a large *dense-axes resolution subsystem*
+(`_dense_axes_from_config_or_meta`, `_resolve_dense_axes`,
+`_axis_source_config`, `_row_identities_from_axis_source`,
+`_column_keys_from_axis_source`, `_ensure_relation_within_dense_axes`,
+`_stored_*`, `_dense_axes_meta_payload` -- ~lines 360-731, ≈46% of the file,
+the FTR-XREF-DENSE-AXES-P4A2 feature); (4) meta read/write
+(`_xref_config`/`_write_xref_meta`); (5) generic equality/normalization and
+schema-guard helpers.
+
+*Internal coupling.* `expand_xref`/`contract_xref` are joined by the shared
+`_meta.xref_crosstable` payload (column order, dense config). The dense-axes
+subsystem is entered *only from the contract path* and is internally cohesive;
+`expand_xref` only carries a previous `dense_axes` block forward. The subsystem
+shares only the tiny equality/normalization helpers and the
+`_require_frame`/`_ensure_*`/`_as_list` validators with the core.
+
+*External / registry coupling.* pandas-only; no `core`/`rendering` imports
+(clean leaf). Registry: string colon-target only. `compact_multiaxis` imports
+both public functions directly -- a split must preserve package-root
+re-exports.
+
+*Candidate seams.* One real seam: `xref_crosstable/{core,dense_axes,_meta}`.
+`core` = expand/contract + payload schema; `dense_axes` = the resolution
+subsystem (only contract calls into it); `_meta`/helpers = the shared tiny
+core. Boundary is the existing `_dense_axes_from_config_or_meta` +
+`_resolve_dense_axes` + `_ensure_relation_within_dense_axes` +
+`_dense_axes_meta_payload` call surface.
+
+*Risk.* `contract_xref(expand_xref(x)) == x` is a tested bijection; the meta
+payload is its carrier. Splitting `expand` from `contract`, or splitting the
+meta writer away from either, would break the symmetry contract. Dense-axes
+*influences row/column ordering that the roundtrip depends on*, so the
+`core<->dense_axes` boundary must be an explicit internal API, not an implicit
+one. Conflict/precedence of dense reconstruction is reserved by P6 -- a
+dense-axes split must not grow a conflict module.
+
+*Disposition.* Largest module; the dense-axes seam is real, FTR-scoped, and
+roughly half the file -- the single highest-value behavior-preserving target.
+But the seam crosses the symmetry contract and the canonical meta carrier, so
+it is feasible *only under constraints* (keep expand+contract+meta together as
+`core`; dense_axes as a sibling with an explicit internal API; package-root
+re-exports for both public functions; a re-export guard and a
+`contract(expand(x))==x` + dense-shape witness added in the same slice).
+*Classification: PROCEED WITH CONSTRAINTS.*
+
+*Future-FTR outline.* `FTR-XREF-CROSSTABLE-DENSE-AXES-PACKAGE-SPLIT`:
+verbatim-move `core`/`dense_axes`/`_meta` per the discriminator template;
+re-export guard; roundtrip + dense-shape witnesses; explicit non-goal:
+no conflict/precedence module (P6).
+
+*Non-goals.* No splitting expand from contract. No extracting the meta writer.
+No anticipatory dense-reconstruction conflict resolver.
+
+=== 2.2 `domain/validations/reference_validations.py` (~725 LOC)
+
+*Surface.* `validate_references`, `findings_to_frame`, `ReferenceFinding`,
+`FINDING_COLUMNS` (registry step `validate_references`). Re-exported by
+`domain/validations/__init__.py`; `FINDING_COLUMNS`/finding model also used by
+`graph_validations.py`. No meta-registry producer/consumer (lowest metadata
+coupling, tied with §2.7).
+
+*Responsibilities.* (1) public orchestration (mode/findings/fail-raise);
+(2) rule dispatch; (3) four independent rule validators (`unique`,
+`primary_key`, `foreign_key`, `unique_reference`); (4) a *condition predicate
+DSL* (`enabled_when`/`when`, `_condition_mask`, ≈175 LOC); (5) its own finding
+model + formatting; (6) generic value helpers.
+
+*Internal coupling.* The four validators are *parallel and independent* (none
+calls another); all share `_frame_and_columns`/`_optional_frame`/`_apply_when`/
+`_duplicate_findings`/`_schema_finding` and the finding model. The condition
+DSL is cross-cutting infrastructure used by all four plus the dispatcher.
+
+*External / registry coupling.* pandas-only leaf. The finding model is the
+real coupling: it is shared *cross-module* with `graph_validations.py` and runs
+parallel to `domain/validations/findings.py::Finding` (D-005).
+
+*Candidate seams.* Internally clean: condition-DSL; the four validators;
+the finding model. *But the finding-model seam is not local* -- it is one of
+four parallel finding models. Extracting the condition DSL as a standalone
+package would weaken locality (single consumer).
+
+*Risk.* No symmetry/bijection; no meta carrier -- low *behavioral* risk. The
+architectural risk is the opposite of a split risk: packaging this module now
+would harden the boundary of *one of four* finding models, entrenching D-005
+quadruplication and pre-empting the consolidation that should come first.
+
+*Disposition.* Mechanically the easiest internal split of all 11 (independent
+validators, clean DSL seam), and the second-largest file -- but the dominant
+architectural question (finding-model quadruplication) is unresolved and
+*upstream* of any packaging decision. Splitting before D-005 is decided is
+churn that makes the eventual consolidation harder.
+*Classification: ANALYZE FIRST* (resolve D-005 ownership/consolidation first;
+the internal seams are clear and can wait).
+
+*Future-FTR outline.* `FTR-FINDING-MODEL-CONSOLIDATION` (cross-module,
+prerequisite) -> then optionally
+`FTR-REFERENCE-VALIDATIONS-PACKAGE-SPLIT` (condition-DSL + per-rule modules
+*within* a package, not as standalone utils).
+
+*Non-goals.* No standalone "predicate-DSL" or "validation-engine" package. No
+packaging this module before D-005 is decided.
+
+=== 2.3 `domain/transformations/cell_codec.py` (631 LOC)
+
+*Surface.* `parse_cell_value`, `serialize_cell_value`, `decode_cell_values`,
+`encode_cell_values`, `ParsedCellValue` (registry steps `decode_cell_values` /
+`encode_cell_values`). Imported intra-family by `compact_multiaxis`. Meta key
+`cell_codecs` (canonical, pinned).
+
+*Responsibilities.* (1) the scalar codec inverse pair
+`parse_cell_value`/`serialize_cell_value` + `ParsedCellValue` + normalization;
+(2) thin frame wrappers `decode_cell_values`/`encode_cell_values`;
+(3) allowed-value resolution incl. `_meta.legend_blocks` lookup
+(`_allowed_values`/`_legend_tokens`); (4) meta write; (5) generic helpers.
+
+*Internal coupling.* The scalar codec is the inseparable core; the frame
+transforms are ~80 LOC wrappers that call it row-wise. The legend resolution
+straddles both layers and depends on a cross-module `_meta.legend_blocks`
+contract (produced elsewhere).
+
+*External / registry coupling.* pandas-only leaf. Participates in a
+*cross-module* lossless chain `expand_xref -> decode -> encode ->
+contract_xref` (tested) -- a bijection co-owned with `xref_crosstable`.
+
+*Candidate seams.* A scalar-vs-frame seam exists but is thin and asymmetric;
+both halves share the inverse-pair invariant, the legend contract, and the
+meta carrier. No clean acyclic cut.
+
+*Risk.* `serialize(parse(x))` is an inverse pair; splitting the pair, or
+splitting the legend resolver from the codec, breaks lossless roundtrip.
+Splitting yields two tiny modules sharing an invariant + contract -- net
+negative for locality.
+
+*Disposition.* Large but *inherently cohesive*: a codec is one concept. The
+seam is thin, the invariants are dense, and it is the binding member of the
+triad (§3). 631 LOC is the smallest of the "large" group and is justified by
+intrinsic complexity (modes, normalization, legend, canonical order).
+*Classification: DO NOT SPLIT.*
+
+*Future-FTR outline.* None recommended. If `xref_crosstable` is packaged,
+`cell_codec` stays a single module; only its package-root re-export needs to
+remain stable for `compact_multiaxis`.
+
+*Non-goals.* No scalar/frame package split. No extracting legend resolution
+into a shared package (it is codec-specific despite the name collision with
+`compact_multiaxis._legend_groups` -- see §4).
+
+=== 2.4 `domain/transformations/join_views.py` (567 LOC)
+
+*Surface.* `join_frames` only (registry step `join_frames`). Imports
+`domain.frame_lifecycle` (domain->domain, allowed). Produces `frame_lifecycle`.
+
+*Responsibilities.* One operation with intrinsically combinatorial
+sub-concerns: key-config resolution (six spellings), column selection +
+rename + collision suffixing, a `where` predicate DSL, semi/left/inner merge,
+temp-key/token machinery, lifecycle write.
+
+*Internal coupling.* Strictly linear: every helper serves the single
+`join_frames` entrypoint. No sub-helper is reused by another concern; no
+inverse.
+
+*External / registry coupling.* pandas + `frame_lifecycle`. String
+colon-target only; no external imports of its internals.
+
+*Candidate seams.* None that preserve locality. Every "seam" (key resolution,
+projection, where) is single-consumer. The only cross-module signal is the
+`where` DSL shared-in-spirit with `reference_validations` (§4) -- a
+consolidation question, explicitly *not* a split question.
+
+*Risk.* Low behavioral risk; no symmetry. The risk is fragmentation: a package
+split would scatter one cohesive operation into single-consumer micro-modules.
+
+*Disposition.* Large because the join feature is intrinsically combinatorial
+(key spellings x column selection x collision policy x where x join kind x
+lifecycle), not because it is overloaded. *Classification: DO NOT SPLIT.*
+
+*Future-FTR outline.* None. The `where`/predicate-DSL duplication with
+`reference_validations` is a *watch item*, not an FTR, until a third consumer
+appears (§4).
+
+*Non-goals.* No join "engine"/"strategy" framework. No premature predicate-DSL
+extraction.
+
+=== 2.5 `domain/transformations/enrich_lookup.py` (567 LOC)
+
+*Surface.* `enrich_lookup` (registry step `add_lookup_helpers` -- the only
+step-name/function-name divergence among the 11). Imports
+`domain.frame_lifecycle` and `core.formulas.lookup_formula` (domain->core leaf,
+allowed). Produces `_meta.derived.sheets.*.enrich_lookup` and
+`frame_lifecycle`; *consumes* `_meta.helper_policies.lookup.*`.
+
+*Responsibilities.* (1) a dense *inline-config-vs-resolved-policy
+reconciliation* cluster (`_resolve_join_keys`/`_resolve_missing`/
+`_resolve_order`/`_resolve_fields`/`_resolve_allowed`/`_resolve_value_mode` --
+each raises on conflict); (2) value-mode join enrichment; (3) formula-mode
+enrichment via `core.formulas`; (4) sort/order/positioning; (5) validation;
+(6) provenance + lifecycle writes.
+
+*Internal coupling.* Tight to two *external string-keyed contracts*: it
+consumes `helper_policies` (produced by §2.11) and produces the `derived`
+provenance read by `derived_column_policy` (§2.9), `fk_helpers/provenance`, and
+`rendering/passes/_base`. The `_resolve_*` cluster is already a
+conflict/precedence implementation.
+
+*External / registry coupling.* The `derived.sheets.*.enrich_lookup` payload
+is an invisible (non-import) contract with three consumers.
+
+*Candidate seams.* A real policy-resolution-vs-enrichment seam exists, but it
+sits *exactly on* the design space owned by
+FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A and the P6 conflict/precedence
+FTR.
+
+*Risk.* Splitting the policy-resolution cluster freezes a conflict-resolution
+boundary that an in-flight FTR is meant to define; it would also harden a
+producer of a 3-consumer contract without coordinating the consumers.
+
+*Disposition.* The seam is genuine but its design space is *owned by upstream
+FTRs that are not yet resolved*. Acting now pre-empts FTR ownership.
+*Classification: DEFER* (useful later; blocked on P4A/P6).
+
+*Future-FTR outline.* Folded into the existing
+FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A line; only after the
+derived/helper-policy contract is finalized should the
+policy-resolution/enrichment split be reconsidered.
+
+*Non-goals.* No anticipatory conflict/precedence module. No splitting the
+producer ahead of the contract owner.
+
+=== 2.6 `domain/workbook_views.py` (501 LOC)
+
+*Surface.* `configure_workbook_view`, `apply_workbook_view_sheet_mappings`,
+`resolve_workbook_view_sheet_mappings`, `WorkbookViewSheetMapping`,
+`WORKBOOK_VIEW_SHEET_MAPPINGS_KEY` (registry steps `configure_workbook_view` /
+`apply_workbook_view_sheet_mappings`). Imports `domain.frame_lifecycle`.
+Strongest meta producer of the 11 (`workbook_view`,
+`workbook_view.sheet_mappings`, `protection`, `sheets`, `frame_lifecycle`;
+canonical, pinned).
+
+*Responsibilities.* Two cleanly separable directions joined only by a
+persisted contract: *(A) configure (render)* --
+`configure_workbook_view`/`_normalize_sheet_specs`/`_write_sheet_lifecycle`/
+`_sheet_mappings`/`_explicit_canonical_frame`/`_merge_sheet_options`; *(B)
+readback (reimport)* -- `resolve_workbook_view_sheet_mappings`/
+`apply_workbook_view_sheet_mappings`/`_workbook_view_mapping`. A writes
+`_meta.workbook_view.sheet_mappings`; B reads it. No shared mutable state; two
+distinct registry steps; tiny shared string validators only.
+
+*Internal coupling.* The A<->B coupling is *entirely mediated by the canonical
+`sheet_mappings` contract* -- the textbook "stable seam" shape. `WorkbookView­
+SheetMapping`/`WORKBOOK_VIEW_SHEET_MAPPINGS_KEY` are the shared vocabulary.
+
+*External / registry coupling.* String colon-target only; two steps.
+`_reject_transform_keys` enforces the FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A
+"views consume, don't transform" boundary versus join/tabular views.
+
+*Candidate seams.* The clearest of all 11: `workbook_views/{configure,readback,
+_contract}`. `_contract` holds `WorkbookViewSheetMapping` +
+`WORKBOOK_VIEW_SHEET_MAPPINGS_KEY` + tiny string helpers.
+
+*Risk.* The mediating contract is canonical, roundtrip-relevant, and *under
+active FTR ownership*: FTR-WORKBOOK-REIMPORT-VIEW-MAPPING-P4A mandates its
+shape, and FTR-WORKBOOK-VIEW-PAYLOAD-CONFLICT-PRECEDENCE-P6 reserves the
+overlapping-editable-view conflict design. A split must not grow a conflict
+module and must keep the contract definition shared.
+
+*Disposition.* The seam is mature (contract-mediated, no shared state, two
+steps) -- a strong split candidate -- *but constrained* by the active P4A/P6
+ownership of the very contract that mediates it.
+*Classification: PROCEED WITH CONSTRAINTS.*
+
+*Future-FTR outline.* `FTR-WORKBOOK-VIEW-CONFIGURE-READBACK-PACKAGE-SPLIT`:
+verbatim move into `configure`/`readback`/`_contract`; both registry targets
++ `WorkbookViewSheetMapping` + `WORKBOOK_VIEW_SHEET_MAPPINGS_KEY` re-exported
+from the package root; re-export guard; explicit non-goal: no conflict module
+(P6 owns it); coordinate timing with the P4A reimport-mapping FTR.
+
+*Non-goals.* No conflict/precedence resolver. No second copy of the
+`sheet_mappings` contract. No inference-based readback.
+
+=== 2.7 `domain/transformations/resource_overrides.py` (489 LOC)
+
+*Surface.* `normalize_resource_overrides` (registry step), plus
+`normalize_resource_override_frame` (pure core), `findings_to_frame`,
+`row_index_label`, and three frozen dataclasses. No meta-registry
+producer/consumer (lowest metadata coupling, tied with §2.2).
+
+*Responsibilities.* One algorithm in stages: policy normalization, duplicate/
+conflict detection, missing-default detection, collapse/normalization, plus its
+*own* finding model (`ResourceOverrideFinding`/`FINDING_COLUMNS`/
+`findings_to_frame`/`_failure_message`).
+
+*Internal coupling.* The stages form one tightly-coupled pipeline over a
+shared identity grouping. A pure-core/orchestration seam *already exists in the
+file* (`normalize_resource_override_frame` is pure; the step function is the
+frames wrapper) -- the right amount of structure.
+
+*External / registry coupling.* pandas-only leaf; string colon-target only.
+The finding model is the third independent copy of the D-005 pattern.
+
+*Candidate seams.* None worth taking: the stages are one algorithm; the only
+real seam (pure vs orchestration) is already realized internally.
+
+*Risk.* No symmetry. Splitting the algorithm fragments cohesion. The genuine
+cross-module issue is finding-model triplication -- a consolidation concern,
+not a split.
+
+*Disposition.* Cohesive single-purpose normalizer with its useful seam already
+internal. *Classification: DO NOT SPLIT.*
+
+*Future-FTR outline.* None of its own; contributes a case to
+`FTR-FINDING-MODEL-CONSOLIDATION` (§4).
+
+*Non-goals.* No package split. No bespoke finding model retained if/when
+consolidation lands.
+
+=== 2.8 `domain/transformations/compact_multiaxis.py` (468 LOC)
+
+*Surface.* `expand_compact_multiaxis`, `contract_compact_multiaxis` (registry
+steps). *Statically imports* `decode_cell_values`/`encode_cell_values` and
+`contract_xref`/`expand_xref` (the only intra-family code coupling among the
+11). Imports `domain.frame_lifecycle`. Meta key `compact_multiaxis`
+(canonical, pinned).
+
+*Responsibilities.* A thin *composition layer*:
+`expand = expand_xref -> decode_cell_values (+ optional group)`,
+`contract = encode_cell_values -> contract_xref`. Own logic limited to
+group-column attachment (`_with_group_column`/`_group_lookup`/`_legend_groups`),
+a `_reject_dense_axes` NotImplementedError seam (deferred feature), temp-frame
+naming, and meta/lifecycle writes.
+
+*Internal coupling.* Its correctness is *defined by* the xref<->codec
+bijection it composes. It is the binding member of the
+xref/cell_codec/compact_multiaxis triad.
+
+*External / registry coupling.* The static intra-family imports mean any
+packaging of `xref_crosstable` or `cell_codec` must preserve their package-root
+re-exports or update `compact_multiaxis`'s two import lines.
+
+*Candidate seams.* None: a 468-LOC, two-function composition has nothing
+cohesive to extract.
+
+*Risk.* Low on its own; the architectural fact is the *triad constraint* it
+imposes on §2.1/§2.3.
+
+*Disposition.* Already minimal and composition-shaped.
+*Classification: DO NOT SPLIT.* (It is the constraint, not the target.)
+
+*Future-FTR outline.* None. It is a passive constraint on the xref split FTR
+(§2.1): keep `expand_xref`/`contract_xref` + `decode_cell_values`/
+`encode_cell_values` resolvable from their package roots.
+
+*Non-goals.* No split. No de-composition into per-primitive wrappers. No
+implementing `dense_axes` here (the `NotImplementedError` is a deliberate,
+correct deferral -- do not pre-empt it).
+
+=== 2.9 `domain/transformations/derived_column_policy.py` (434 LOC)
+
+*Surface.* `apply_derived_column_policy` (registry step),
+`enforce_derived_column_policy_frame` (pure core), `findings_to_frame`,
+`DerivedColumnFinding`, `FINDING_COLUMNS`. pandas-only. *Consumes*
+`_meta.derived.sheets.*` produced by `enrich_lookup` and `fk_helpers`.
+
+*Responsibilities.* FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A *Slice 1*:
+provenance identity resolution + shape validation, provenance stripping,
+value-mismatch checking against the canonical lookup, finding model. Its own
+docstring states durable file->frame reimport, sheet->frame view mapping, and
+derived-provenance persistence are *deferred to the FTR backlog*.
+
+*Internal coupling.* The pure-core/orchestration seam already exists
+(`enforce_derived_column_policy_frame` pure; `apply_*` wrapper). It is the
+*consistency-check half* of the `enrich_lookup` forward transform -- a
+bidirectional-in-spirit pairing via the `derived` contract.
+
+*External / registry coupling.* Fourth independent copy of the D-005 finding
+pattern. Contract co-owned with `enrich_lookup`/`fk_helpers`.
+
+*Candidate seams.* Internal seam realized; no further split that does not
+collide with the unfinished FTR slices.
+
+*Risk.* It is an explicitly mid-FTR module with named deferred design space;
+any structural move now pre-empts the remaining slices and the P6
+conflict/precedence FTR.
+
+*Disposition.* *Classification: DEFER* (blocked by unresolved upstream FTR
+slices; current internal structure is already appropriate).
+
+*Future-FTR outline.* Remaining slices of
+FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A; revisit structure only after
+the `derived` contract and conflict policy are finalized.
+
+*Non-goals.* No package split mid-FTR. No anticipatory persistence/conflict
+layer. No bespoke finding model kept post-consolidation.
+
+=== 2.10 `domain/transformations/tabular_views.py` (412 LOC)
+
+*Surface.* `pivot_frame` only (registry step `pivot_frame`). Imports
+`domain.frame_lifecycle`. Produces `frame_lifecycle`. Smallest scoped module.
+
+*Responsibilities.* One linear pivot pipeline: config validation -> resolve
+pivot keys -> collect cells -> aggregate -> write frame + lifecycle.
+
+*Internal coupling.* Strictly linear single-entrypoint; helpers are
+single-consumer. Shares the recurring tiny-helper family
+(`_is_empty_cell`/`_plain_value`/`_string_list`/`_duplicate_column_names`/
+`_require_frame`) with §2.4/§2.6 (§4).
+
+*External / registry coupling.* pandas + `frame_lifecycle`; string
+colon-target only. Governed by FTR-DECLARATIVE-TABULAR-VIEW-OPS-P4A
+(produces named inspectable frames; layer boundary vs join/workbook views).
+
+*Candidate seams.* None; one operation.
+
+*Risk.* None of note; no symmetry. Large only due to intrinsic pivot-config
+fiddliness (key ordering, duplicate policy, aggregation, collision detection).
+
+*Disposition.* *Classification: DO NOT SPLIT.* Inherent, not accidental,
+complexity.
+
+*Future-FTR outline.* None. Contributes only a data point to the tiny-helper
+watch item (§4) -- which should *not* become a util-package FTR.
+
+*Non-goals.* No pivot framework. No shared tiny-util package extraction.
+
+=== 2.11 `domain/helper_policies.py` (455 LOC) -- optional, included
+
+*Surface.* `configure_lookup_helpers`, `configure_fk_helpers` (registry steps
+of the same names). Imports `core.fk.normalize_sheet_key` and
+`frame_keys.iter_data_frames` (domain->core leaf, allowed). Produces
+`_meta.helper_policies` (`lookup` + `fk`); canonical, pinned. *Not under
+`domain/transformations/`* -- so it is outside the domain-transformations
+boundary-guard family; only the broad L1 guard covers it.
+
+*Responsibilities.* Two parallel policy *producers* (lookup, fk) over a shared
+helper-resolution core (`_resolve_allowed_helpers`/`_resolve_default_helpers`/
+`_auto_allowed_helpers`/`_dtype_matches`/`_dedupe`/`_validate_columns`). The FK
+side adds target/key/fk-column resolution; `_auto_helper_config` is an explicit
+naming-bridge between FK-facing config and the shared lookup resolver.
+
+*Internal coupling.* Acyclic and discriminator-shaped: `fk` and `lookup` each
+use a shared core + their own resolvers. It is the *producer* end of the
+`helper_policies` contract that `enrich_lookup` (§2.5) consumes and that
+`fk_helpers` reads -- a tightly-coupled producer/consumer subsystem also
+touched by derived-column policy (§2.9).
+
+*External / registry coupling.* The `helper_policies` payload is a canonical
+contract with multiple cross-module consumers and is governed by
+FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4 / the P4A reimport line.
+
+*Candidate seams.* Mechanically a clean
+`helper_policies/{lookup,fk,_resolve_core}` package (two registry steps, two
+namespaces, acyclic shared core) -- the same shape that justified the
+discriminator split. *But* (a) the contract is co-owned across
+`enrich_lookup`/`fk_helpers`/`derived_column_policy` under in-flight P4/P4A
+FTRs, and (b) the module's *placement* outside `transformations/` is itself
+unresolved (is it a transformation? a config producer? where do its guards
+live?).
+
+*Risk.* Splitting the producer without coordinating the consumers and the
+governing FTR would freeze a contract boundary the FTR should own; doing it
+while the module's home/guard-family is undecided compounds the ambiguity.
+
+*Disposition.* The lookup/fk seam is real and clean, but two prior questions
+are unanswered: the contract's FTR ownership and the module's architectural
+home/guard-family. *Classification: ANALYZE FIRST* (needs a discriminator-style
+coupling-DAG + placement analysis before any split).
+
+*Future-FTR outline.* `ANALYSIS-HELPER-POLICY-SUBSYSTEM` (placement + contract
+ownership + coupling DAG across helper_policies/enrich_lookup/fk_helpers/
+derived_column_policy) -> only then a potential package split.
+
+*Non-goals.* No split before the placement/ownership analysis. No conflict
+resolver. No tiny shared-util package.
+
+'''
+
+== 3. Hidden Coupling, Symmetry, and Canonical-Contract Map
+
+[cols="2,2,3", options="header"]
+|===
+| Module | Hidden coupling channel | Invariant / contract at risk in a split
+
+| xref_crosstable
+| `_meta.xref_crosstable` payload; intra-family import target of compact_multiaxis
+| `contract(expand(x))==x`; column-order + dense-shape carried in meta
+
+| cell_codec
+| `_meta.cell_codecs`; `_meta.legend_blocks` (consumed); import target of compact_multiaxis
+| `serialize(parse(x))` inverse pair; lossless `expand->decode->encode->contract` chain
+
+| compact_multiaxis
+| static imports of xref + codec; `_meta.compact_multiaxis`
+| composed `expand/contract` roundtrip = product of the xref + codec bijections
+
+| workbook_views
+| canonical `_meta.workbook_view.sheet_mappings` (configure produces, readback consumes)
+| render<->reimport reverse mapping (P4A); P6 owns overlap-conflict
+
+| enrich_lookup
+| produces `_meta.derived.sheets.*.enrich_lookup` (3 consumers); consumes `_meta.helper_policies`
+| forward transform vs derived-column-policy consistency check
+
+| derived_column_policy
+| consumes `_meta.derived.sheets.*` (from enrich_lookup + fk_helpers)
+| value-mismatch check is the inverse-direction guard of enrich_lookup
+
+| helper_policies
+| produces `_meta.helper_policies` (consumed by enrich_lookup + fk_helpers)
+| canonical policy contract; FK/lookup shared resolver vocabulary
+
+| reference_validations
+| finding model shared with graph_validations + parallel to findings.py
+| D-005: no behavioral invariant, but cross-module model identity
+
+| resource_overrides / derived_column_policy
+| third/fourth independent finding-model copy
+| D-005 quadruplication (consolidation, not split)
+
+| join_views / tabular_views
+| recurring tiny-helper + (join_views) `where`-DSL duplication
+| none load-bearing; locality watch items only
+|===
+
+*The binding triad.* `xref_crosstable`, `cell_codec`, `compact_multiaxis` are
+not three independent large modules; they are one bijection expressed in three
+files with static import edges and a tested chained roundtrip. Any split of
+xref or codec is gated by preserving compact_multiaxis's import resolution and
+the chained-roundtrip witness.
+
+'''
+
+== 4. Consolidated Cross-Module Observations (Pass-1 escalations)
+
+. *D-005 is quadruplication, not duality (escalated).* Four independent finding
+models: `domain/validations/findings.py::Finding`,
+`reference_validations.ReferenceFinding`, `resource_overrides.Resource­Override­
+Finding`, `derived_column_policy.DerivedColumnFinding` -- each with its own
+`FINDING_COLUMNS`/`findings_to_frame`/`_failure_message`. This is the single
+highest-value *consolidation* (not split) target and is a *prerequisite* to
+packaging `reference_validations` (§2.2). Accidental complexity.
+. *Second duplication family: a `where`/condition predicate DSL.*
+`reference_validations._condition_mask` and `join_views._apply_where`
+re-implement the same `equals/in/non_empty/is_null/not_null` vocabulary.
+*Adjacent, independent, not shared infrastructure.* Two consumers do not
+justify a DSL package -- doing so would create exactly the speculative
+framework seam the review constraints forbid. Watch item; revisit only at a
+third consumer.
+. *Tiny-helper duplication persists* (`_is_empty_cell`/`_plain_value`/
+`_string_list`/`_require_frame`/`_duplicate_column_names` across join/tabular/
+workbook/xref/codec). Pass 1 already classified this as *under-consolidation of
+trivia*, not over-abstraction. Extracting a util package would weaken locality
+and trip the "no tiny utility packages" constraint. Leave it; it is the
+cheapest possible debt.
+. *Guard-family gap.* The domain-transformations boundary/re-export guard
+family covers only `fk_helpers`/`discriminator_split`. Every PROCEED/PROCEED-
+WITH-CONSTRAINTS split below must ship its own re-export + boundary guard *in
+the same slice*, per the discriminator template; this is a precondition, not a
+follow-up.
+
+'''
+
+== 5. Consolidated Hotspot Ranking
+
+Ranked by *behavior-preserving refactor value*, gated by readiness.
+
+[cols="1,3,2,2", options="header"]
+|===
+| Rank | Module | Classification | Why this rank
+
+| 1
+| `xref_crosstable.py` (801)
+| PROCEED WITH CONSTRAINTS
+| Largest file; ~46% is an FTR-scoped, contract-entered dense-axes subsystem;
+the proven discriminator methodology applies directly. Highest value, ready
+*now* under constraints.
+
+| 2
+| `workbook_views.py` (501)
+| PROCEED WITH CONSTRAINTS
+| Cleanest seam of all 11 (configure/readback, contract-mediated, two registry
+steps, no shared state). Slightly lower rank only because the mediating
+contract is under active P4A/P6 ownership -- split must be timed with the FTR.
+
+| 3
+| `reference_validations.py` (~725)
+| ANALYZE FIRST
+| Second-largest with the easiest *internal* cut, but blocked behind D-005
+consolidation. High value *after* the prerequisite, churn before it.
+
+| 4
+| `helper_policies.py` (455)
+| ANALYZE FIRST
+| Clean discriminator-shaped seam, but two prior unknowns (contract FTR
+ownership; architectural placement/guard-home).
+
+| 5-6
+| `enrich_lookup.py` (567), `derived_column_policy.py` (434)
+| DEFER
+| Real seams owned by in-flight P4A/P6 FTRs; structurally fine as-is.
+
+| 7-11
+| `cell_codec.py` (631), `join_views.py` (567),
+`resource_overrides.py` (489), `compact_multiaxis.py` (468),
+`tabular_views.py` (412)
+| DO NOT SPLIT
+| Deceptively complex but cohesive; size is inherent, not accidental;
+splitting would fragment cohesion or pre-empt the triad/FTRs.
+|===
+
+'''
+
+== 6. Consolidated Future-FTR Candidate List
+
+*Worthwhile (real value, not churn):*
+
+. `FTR-FINDING-MODEL-CONSOLIDATION` -- collapse the four finding models to one
+(or one + thin adapters). *Prerequisite for ranking #3.* Highest conceptual-
+integrity payoff; pure consolidation, no new framework.
+. `FTR-XREF-CROSSTABLE-DENSE-AXES-PACKAGE-SPLIT` -- `core`/`dense_axes`/`_meta`
+per the discriminator template; re-export + boundary guard + roundtrip/dense
+witnesses in-slice; explicit non-goal: no conflict module (P6).
+. `FTR-WORKBOOK-VIEW-CONFIGURE-READBACK-PACKAGE-SPLIT` -- `configure`/
+`readback`/`_contract`; both registry targets + the shared `sheet_mappings`
+contract re-exported; timed with the P4A reimport-mapping FTR.
+. `ANALYSIS-HELPER-POLICY-SUBSYSTEM` -- placement + contract-ownership +
+coupling-DAG analysis spanning helper_policies/enrich_lookup/fk_helpers/
+derived_column_policy (analysis, not a split).
+
+*Likely architectural churn (explicitly do not pursue):*
+
+* Any split of `cell_codec`, `join_views`, `resource_overrides`,
+`compact_multiaxis`, `tabular_views`.
+* Any standalone predicate-DSL / validation-engine / join-engine package.
+* Any shared tiny-util package for `_is_empty_cell`/`_plain_value`/etc.
+* Any anticipatory conflict/precedence module anywhere (owned by P6).
+* Packaging `reference_validations` *before* finding-model consolidation.
+* Splitting `enrich_lookup`/`derived_column_policy` ahead of their P4A/P6 FTRs.
+
+'''
+
+== 7. Avoid Splitting These (cohesion > modularization)
+
+These modules are large because their *domain* is intrinsically dense, not
+because they are overloaded. Their internal "seams" are single-consumer; a
+package split converts cohesion into fragmentation and trips the review's
+anti-tiny-package / anti-framework constraints.
+
+* `cell_codec.py` -- a codec is one concept; inverse-pair + legend + meta
+invariants; triad member.
+* `compact_multiaxis.py` -- a 2-function composition over the triad; nothing
+to extract; it is the *constraint* on the xref split.
+* `join_views.py` -- one combinatorial operation; every helper single-consumer.
+* `tabular_views.py` -- one linear pivot operation; smallest scoped module.
+* `resource_overrides.py` -- one staged algorithm; the only useful seam (pure
+vs orchestration) is *already* internal.
+
+`derived_column_policy.py` also belongs here *for now* (its pure/orchestration
+seam is already internal; further structure waits on its FTR).
+
+'''
+
+== 8. Final Summary
+
+*Which modules are the highest-value refactor targets?*
+`xref_crosstable.py` (rank 1, ready under constraints) and `workbook_views.py`
+(rank 2, ready but FTR-timed). Both have a *real*, contract-or-FTR-scoped seam
+that the already-proven discriminator/fk_helpers methodology fits exactly.
+`reference_validations.py` is high-value but only *after* finding-model
+consolidation -- and that consolidation (`FTR-FINDING-MODEL-CONSOLIDATION`) is
+itself the highest conceptual-integrity win in this pass.
+
+*Which modules are deceptively complex and should remain cohesive?*
+`cell_codec`, `compact_multiaxis`, `join_views`, `tabular_views`,
+`resource_overrides` (§7). Their size is inherent. The triad
+(`xref`/`cell_codec`/`compact_multiaxis`) must be reasoned about as one
+bijection in three files, never as three independent split candidates.
+
+*Which seams are mature enough now?*
+Exactly one is unconstrained-mature in shape: `workbook_views`
+configure<->readback, mediated by a stable canonical contract -- but its
+*timing* is constrained by active P4A/P6 ownership of that contract. The
+`xref_crosstable` core<->dense_axes seam is mature and FTR-bounded but crosses
+the symmetry carrier, so it is "mature under explicit constraints". No other
+seam among the 11 is both mature and local.
+
+*Which areas still lack architectural clarity?*
+(1) Finding-model quadruplication (D-005 escalated) -- ownership and target
+shape undecided. (2) The helper-policy/derived subsystem
+(`helper_policies`/`enrich_lookup`/`derived_column_policy`/`fk_helpers`):
+contract ownership is split across in-flight P4A/P6 FTRs and `helper_policies`'
+architectural *home* (why it sits outside `transformations/`, where its guards
+belong) is unresolved.
+
+*Which future FTRs are worthwhile vs churn?*
+Worthwhile: finding-model consolidation; the xref and workbook-view splits
+(discriminator-template, guarded, witness-backed); the helper-policy subsystem
+*analysis*. Churn: any split of the five cohesive modules; any predicate-DSL /
+util / engine / conflict framework; packaging reference_validations before
+consolidation; touching enrich_lookup/derived_column_policy ahead of their
+FTRs.
+
+*Accidental vs inherent complexity (the headline question).*
+The maintainability risk in these 11 modules is *predominantly accidental and
+cheaply repayable*, sitting on top of genuinely inherent domain complexity:
+
+* *Inherent (do not "fix"):* the xref/codec/compact bijections and their meta
+carriers; the workbook render<->reimport reverse mapping; the
+inline-vs-policy reconciliation in enrich_lookup; pivot/join combinatorics.
+The layered model + canonical-meta registry is a *proportionate* response, not
+over-design. Splitting these would *increase* architectural drift.
+* *Accidental (repayable, no architecture change):* feature-first module size
+in `xref_crosstable`/`workbook_views`; finding-model quadruplication;
+predicate-DSL and tiny-helper duplication; the unresolved `helper_policies`
+placement. None requires a new framework; all are addressable with the
+existing, proven, guard-backed split/consolidation methodology.
+
+Net: the hotspots are real but *bounded and named*. Two are ready for
+behavior-preserving splits under explicit constraints; one consolidation
+(finding models) is the highest-leverage conceptual-integrity fix and gates a
+third; the remaining modules are inherently cohesive and should be explicitly
+protected from decomposition. This is consistent with Pass 1's
+"stable-beta architecture with localized, named, non-architectural residue"
+verdict -- Pass 2 makes that residue specific, ranked, and FTR-actionable.
