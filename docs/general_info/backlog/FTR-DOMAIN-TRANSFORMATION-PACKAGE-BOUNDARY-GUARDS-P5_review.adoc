@@ -1,0 +1,142 @@
+= Review: FTR-DOMAIN-TRANSFORMATION-PACKAGE-BOUNDARY-GUARDS-P5
+
+Date: 2026-05-18
+
+Status: *Independent review completed: ACCEPT.*
+
+== Verdict
+
+Accepted. The guards enforce real structural boundaries, stay narrow, and pass cleanly.
+No governance framework was introduced, no shared utility module was created, and no
+transformation refactoring leaked in. Two minor structural observations noted below;
+neither is an acceptance blocker.
+
+== Architectural assessment
+
+* *Scope discipline is excellent.* Four test files, ~310 lines, one 2-sentence addition
+  to `architecture_primer.adoc`, zero new production modules, zero shared utilities.
+  The FTR Non-Goals list was respected in full.
+
+* *Boundaries enforced are real, not superficial.* `test_package_public_api_boundaries.py`
+  scans the entire `src/spreadsheet_handling/` tree with AST + `resolve_name` resolution,
+  catching both absolute and relative internal-module imports from outside a guarded family.
+  `test_no_cross_family_internal_imports.py` provides a narrower, transformation-subtree-
+  scoped duplicate that gives a more specific violation message for cross-family coupling.
+  `test_pipeline_registry_uses_public_transform_apis.py` guards both the runtime REGISTRY
+  dict and the JSON documentation file, which is the correct dual-target for this project.
+  `test_layer_boundaries.py` guards the domain transformation layer against upward imports
+  into `io_backends`, `rendering`, `cli`, and `application`.
+
+* *Allowlists are explicit, narrow, and locally maintainable.* `GUARDED_FAMILIES` lists
+  every internal module by name. A future package split adds one block to three coordinated
+  places -- each small, obvious, and co-located with the guard logic.
+
+* *Complementarity with existing guards is clean.* `test_fk_helpers_package_reexports.py`
+  and `test_discriminator_split_package_reexports.py` assert that public symbols _exist_
+  at the package root (runtime import tests). The new tests assert that _callers_ use the
+  package root (static AST tests). `test_architecture_guard_fk_helpers.py` asserts that
+  `pipeline.steps` contains no FK-helper domain logic; the new tests assert no module
+  anywhere imports internal submodule paths. No collision, no redundancy that would confuse
+  a failing-test diagnosis.
+
+* *ai_info placement is discoverable.* Two sentences added directly inside the "Architecture
+  guardrails" subsection of `architecture_primer.adoc`, exactly where a future agent would
+  read before starting a new package split. The guidance is prescriptive without being
+  process-heavy: it names the constraint and delegates detail to the test files.
+
+* *All 5 new tests pass against the committed code* (5 passed, 0.31 s).
+
+== Findings
+
+[cols="1,4,3,2",options="header"]
+|===
+| Severity | Evidence | Risk | Recommended fix
+
+| Low
+| `test_layer_boundaries.py::_path_imports` does not call `resolve_name` for
+  `ast.ImportFrom` nodes (line 36: `imports.append(node.module or "")`). A relative import
+  that crosses the layer boundary -- e.g., `from ...rendering import foo` from a deeply
+  nested submodule -- produces `node.module = "rendering"`, which does not match any entry
+  in `FORBIDDEN_PREFIXES`. The other three test files all use `resolve_name` correctly.
+| Very low in practice: outer-layer imports from `domain/transformations/` are universally
+  absolute in this codebase. A relative cross-layer import would also be caught immediately
+  by Python's own import system if the relative path were structurally impossible, and would
+  be obvious to any reviewer. No current violation exists.
+| Replace `imports.append(node.module or "")` in `_path_imports` with the same
+  `resolve_name("." * node.level + (node.module or ""), package_context)` pattern used
+  in the other three test files. This makes all four tests consistent and closes the
+  theoretical bypass without changing the test's intent.
+
+| Trivial / info
+| `from fk_helpers import policy` (importing a submodule via the package root namespace,
+  without going through `__init__.py` re-exports) is not caught by
+  `test_package_public_api_boundaries.py`. For such a statement `ast.ImportFrom.node.module`
+  records only `"spreadsheet_handling.domain.transformations.fk_helpers"` (the package root),
+  so the guard sees a package-root import and passes it. The guard correctly blocks
+  `from fk_helpers.policy import ...` (where `node.module` IS the internal module path).
+| Near-zero: this pattern requires deliberate knowledge of undocumented internal submodule
+  names; it bypasses `__all__`; and `test_fk_helpers_package_reexports.py` would fail
+  immediately if `policy` were accidentally added to `__init__.__all__`. No reasonable
+  future author would reach for this pattern by accident.
+| No action required at this FTR. If a future family's `__init__.py` is found to leak
+  internal module names as attributes, add an `__all__` seal and note the gap there.
+
+| Info
+| `GUARDED_FAMILIES` / `GUARDED_INTERNAL_PREFIXES` data is duplicated between
+  `test_package_public_api_boundaries.py` and `test_no_cross_family_internal_imports.py`.
+  A violation in `domain/transformations/` by a non-family module would surface in both
+  tests simultaneously, with slightly different messages.
+| No correctness impact; two diagnostic messages on the same violation are tolerable.
+  The two tests serve distinct scopes: whole-package guard vs. transformation-subtree-only
+  guard. Both are valuable for the project's existing architecture-test style.
+| No action. When a new guarded family is added, update all three allowlist locations
+  (the two test files plus `GUARDED_FAMILY_ROOTS` in the registry test); the duplication
+  is intentional and the coordination cost is low.
+|===
+
+== Guard correctness notes
+
+* Registry guard correctly uses `module_path != family_root` (not `not module_path.startswith(family_root)`) to allow the package-root target itself while blocking all deeper paths.
+* The registry guard covers both runtime `REGISTRY` dict and the JSON documentation artifact -- important because `test_pipeline_step_registry.py` enforces they mirror each other; a target violation in one is also a violation in the other.
+* `fk_helpers/__init__.py` exports `_write_helper_provenance` (underscore-prefixed) in `__all__`. This is a documented producer symbol path in `meta_registry.yaml`. The guard treats an import of `fk_helpers._write_helper_provenance` through the package root as compliant, which is correct -- the internal module `provenance.py` is still protected.
+* `discriminator_split:split_by_discriminator` and `discriminator_split:merge_by_discriminator` in `registry.py:84-90` correctly target the package root, not `.split:split_by_discriminator` or `.merge:merge_by_discriminator`.
+* `steps.py` uses inline `from ..domain.transformations.fk_helpers import enrich_helpers` at call sites (not a `StepRegistration.target` string), so the registry string guard does not cover it -- but `test_package_public_api_boundaries.py` does, and those imports are correct package-root imports.
+
+== Scope discipline
+
+* No shared utility package introduced.
+* No transformation refactoring.
+* No runtime behavior changes.
+* No registry target churn.
+* No demo repository changes.
+* No generic architecture rule engine introduced.
+* The FTR explicitly prohibits all of the above, and the implementation respected every constraint.
+
+== ai_info guidance assessment
+
+The two-sentence addition to `architecture_primer.adoc` (lines 222-223) is concise and
+placed exactly where a future agent reads before a new package split. It states the
+constraint (use package-root APIs, update guards when modularizing) without describing
+the rule mechanics -- those live in the test files themselves. The guidance will age well
+because it references behaviour rather than file paths.
+
+One minor gap: the guidance does not name the test directory
+(`tests/architecture/domain_transformations/`) directly. A future agent would need to grep
+or scan the architecture test tree to find where to add the new allowlist entry. This is
+acceptable given the existing pattern of architecture-test discoverability in this project.
+
+== Baseline judgement
+
+Yes: this is a good long-term erosion-protection baseline for future transformation package
+splits.
+
+The pattern established -- explicit internal-module allowlists in four focused test files,
+guarding both the production source tree and the registry documentation artifact -- is
+narrow enough that each new package split requires only small, localized additions. It does
+not create a governance layer that future maintainers would need to fight. The one
+structural inconsistency (relative-import handling in `test_layer_boundaries.py`) is a
+simple one-line fix and does not undermine the overall baseline.
+
+Recommended: fix the `resolve_name` inconsistency in `test_layer_boundaries.py` as a
+follow-up cleanup before this FTR is closed, to keep all four test files structurally
+uniform.
