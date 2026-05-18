@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.finding_frame import (

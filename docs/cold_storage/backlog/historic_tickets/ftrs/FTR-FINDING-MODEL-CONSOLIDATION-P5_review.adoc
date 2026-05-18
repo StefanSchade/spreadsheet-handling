@@ -1,0 +1,280 @@
+= Independent Review: FTR-FINDING-MODEL-CONSOLIDATION-P5
+:date: 2026-05-18
+:reviewer: Claude Opus 4.7 (independent pass)
+:commit: a285578 (refactor(FTR-FINDING-MODEL-CONSOLIDATION-P5): consolidate finding records)
+:scope: independent review only — no production edits, no commits, no redesign proposals
+:baseline: REVIEW-002 Pass 1 (D-005), Pass 2 §4.1 (quadruplication), the FTR
+  scope/non-goals, and the three followup migration notes
+
+This document is the independent review called for by the per-FTR workflow. It
+*supersedes* the prior self-documentation note that previously occupied this
+path (that note's own status was "independent review PENDING"). It was written
+against the actual changed code and a live test run, not against the
+implementation pass's narrative.
+
+== 1. Verdict
+
+*ACCEPT.* The change is a genuine behavior-preserving consolidation that does
+exactly what the FTR scopes and nothing it forbids. It removes the real
+duplication (three independent `findings_to_frame` + record + failure-message
+copies collapsed to one shared mechanic), correctly keeps the two genuinely
+different models (`ReferenceFinding`, `findings.py::Finding`) distinct, did not
+grow a diagnostics framework, preserves every externally observable surface
+(verified by grep + a live 357-test run across the FTR targets, the broader
+domain slice, and the architecture guards), and materially improves the
+feasibility of a later `reference_validations.py` package split without
+performing that split.
+
+One *LOW* hygiene finding (an unused import in the new test file) and a small
+number of *INFO* observations are recorded in §4. None is blocking. None
+affects behavior.
+
+This is a safe prerequisite baseline for a later `reference_validations.py`
+package-split FTR (§5).
+
+== 2. Evidence base
+
+* Full diff of `a285578` (4 production/test source files + the new module +
+  docs).
+* Full read of `domain/finding_frame.py`, the converted producers, the
+  reference-validations finding section, the new test, `graph_validations.py`,
+  `domain/validations/__init__.py`, `domain/__init__.py`.
+* Grep across `src/` + `tests/` for every importer of every relocated/aliased
+  symbol.
+* Live runs: the five FTR target suites; `tests/unit/domain/validations` +
+  `tests/unit/domain/transformations` + `tests/architecture` (*357 passed*);
+  `tests/unit/pipeline` (*60 passed*); `ruff` and the source-style guard on the
+  changed files.
+
+== 3. Findings against the mandated focus areas
+
+=== 3.1 Did the consolidation stay behavior-preserving? — YES
+
+Removed `ResourceOverrideFinding.to_record` and `DerivedColumnFinding.to_record`
+are *byte-for-byte* the body now in shared `Finding.to_record`
+(`", ".join(columns)`; `row_index` `None→""` else `row_index_label`; `value`
+`None→""` else `" | ".join(map(str, …))`; `severity`/`message` passthrough).
+The removed `row_index_label` / `_row_index_label` are identical to the shared
+`row_index_label`. The removed flat `_failure_message` bodies are reproduced
+exactly by `simple_failure_message(..., heading=…)` (`"{heading}:\n" +
+"\n".join("  - {rule_type}: {message}")`). Empty-input paths yield the same
+zero-row frame. Confirmed live: `test_resource_overrides`,
+`test_derived_column_policy`, `test_reference_validations`,
+`test_graph_validations`, and the new `test_finding_frame` all pass.
+
+=== 3.2 Was `ReferenceFinding` correctly kept distinct? — YES
+
+`ReferenceFinding` and its 9-column `FINDING_COLUMNS`, `to_record`,
+`_format_value`, `_format_columns`, `_failure_message`, `_finding_line` are
+verbatim-unchanged (the diff touches only the import line, the explanatory
+comment above `FINDING_COLUMNS`, and the one-line `findings_to_frame` body).
+Critically, `ReferenceFinding.to_record` keeps *raw* `row_index`
+(`"" if None else self.row_index` — int stays int) and JSON/scalar `value`
+(`_format_value`), which is materially different from the shared labelled
+renderer. Routing only the *serializer* (`_serialize_findings(findings,
+columns=FINDING_COLUMNS)`) preserves this because the shared serializer calls
+each record's own `to_record()` and never imposes the labelled shape. The
+pre-existing `test_reference_validations` assertions
+`row_index.tolist() == [2, 0, 1]` and `{"row_index": 0, "value":
+'["rate", "de"]'}` pass — concrete proof the distinction survived.
+
+=== 3.3 Was `findings.py::Finding` correctly left untouched? — YES
+
+`findings.py` is not in the commit's changed-file set. It is a
+category→severity-policy input for `apply_severity_policy` with no
+`FINDING_COLUMNS`/`to_record`/`findings_to_frame` — not part of the
+finding-frame duplication. Collapsing it would change severity behavior (an
+explicit non-goal). Correctly excluded, with the rationale documented in the
+new module's docstring.
+
+=== 3.4 Was finding-frame serialization duplication genuinely removed? — YES
+
+`grep "def findings_to_frame" src/` returns exactly two: the shared
+implementation and a one-line delegating wrapper in `reference_validations`
+(kept for import-path stability and the 9-col schema). The three independent
+`pd.DataFrame([f.to_record() …], columns=…)` reimplementations are gone.
+`FINDING_COLUMNS` assignments: 3 module-local copies → 1 canonical + 1
+documented 9-col extension. This is real dedup, not a rename.
+
+=== 3.5 Did a diagnostics framework accidentally emerge? — NO
+
+`finding_frame.py` is 114 lines: one column list, a frozen 7-field record, a
+`to_record`, a `Protocol` with a single method, a one-statement serializer, and
+a flat message formatter. No engine, registry, plugin surface, severity logic,
+config, or conditional dispatch. `simple_failure_message` was deliberately
+*not* grown with cap/name options to absorb the reference-validations message —
+the genuinely different formatter was kept local. This respects the
+anti-framework constraint precisely.
+
+=== 3.6 Is import-path compatibility truly preserved? — YES (one documented relocation, zero importers)
+
+Grep-verified across `src/` + `tests/`:
+
+* `reference_validations` (`validate_references`, `ReferenceFinding`,
+  `findings_to_frame`, 9-col `FINDING_COLUMNS`) and the
+  `domain/validations/__init__.py` surface: unchanged, still resolve.
+  `graph_validations` still imports `ReferenceFinding` + `findings_to_frame`
+  from `reference_validations`; both still defined there.
+* `derived_column_policy.FINDING_COLUMNS` / `DerivedColumnFinding`: still
+  resolve (shared import + alias); the test that imports `FINDING_COLUMNS`
+  passes.
+* `resource_overrides`: `ResourceOverrideFinding` / `findings_to_frame` /
+  `FINDING_COLUMNS` retained as alias/re-export; **had no importers anywhere**.
+* `row_index_label`: relocated to `domain.finding_frame`; grep confirms *zero*
+  external importers of `resource_overrides.row_index_label` (only
+  `finding_frame.py` itself and the new test reference it). The relocation is a
+  genuine zero-importer change, correctly surfaced rather than masked behind a
+  cosmetic shim (consistent with the D-009 anti-compat-residue stance).
+
+=== 3.7 Is empty-frame schema stability really preserved? — YES, for both schemas
+
+`findings_to_frame` returns `pd.DataFrame([], columns=columns)` when empty;
+`columns` defaults to the 7-col base and is passed explicitly as the 9-col list
+by `reference_validations`. `test_empty_findings_to_frame_is_schema_stable` and
+`test_empty_findings_to_frame_with_custom_columns_is_schema_stable` pin both.
+Identical to each removed implementation's empty behavior.
+
+=== 3.8 Is the `domain/finding_frame.py` placement architecturally sound? — YES
+
+It mirrors `domain/frame_lifecycle.py` exactly: a neutral domain-level module
+imported by both `domain/transformations/*` and `domain/validations/*`. This is
+precedented (`frame_lifecycle` is imported the same way by `tabular_views`,
+`compact_multiaxis`, `frame_extract`) and sidesteps the
+`transformations↔validations` cross-subpackage import-direction question
+entirely. `finding_frame` imports only stdlib + pandas — no back-import into
+validations/transformations, so no cycle; the `FindingRecord` `Protocol` lets
+the serializer accept `ReferenceFinding` *without importing it*, which is the
+correct decoupling choice. The architecture guard suite passes unchanged
+(`tests/architecture` green), confirming no new boundary family is needed and
+none is tripped.
+
+=== 3.9 Hidden semantic drift in row_index / value rendering? — NONE
+
+Two rendering regimes exist and are kept strictly separate: (a) shared
+`Finding` — labelled `row_index` (`row_index_label`), `" | ".join` value; used
+only by resource-override / derived-column producers, which previously rendered
+identically. (b) `ReferenceFinding` — raw `row_index`, `_format_value`
+JSON/scalar; unchanged and *not* routed through (a). No path crosses regimes.
+The `_RefLike` test (`row_index` 7 stays integer `[7]`) and the real
+reference-validations integer/JSON assertions are the regression pins.
+
+=== 3.10 Does it improve later `reference_validations` split feasibility? — YES, meaningfully
+
+REVIEW-002 §2.2 classified `reference_validations` as *ANALYZE FIRST*,
+explicitly blocked behind D-005 ("splitting before D-005 is decided is churn").
+The D-005 blocker was the cross-module finding-model identity question. After
+this change that question is answered: there is exactly one serialization
+mechanic; `ReferenceFinding` + its 9-col schema + its named/capped
+`_failure_message` are documented as a genuinely module-specific record, not an
+accidental fourth copy. A future split can move the rule validators / condition
+DSL into a `reference_validations/` package while the shared serializer stays
+put and importable unchanged, and `graph_validations`'s
+`from …reference_validations import ReferenceFinding, findings_to_frame`
+continues to resolve via the package root. The prerequisite is satisfied
+*without* prematurely packaging the module — exactly the ordering REVIEW-002
+prescribed.
+
+=== 3.11 Special-attention items
+
+* *Severity behavior* — the one real preservation risk. The shared `Finding`
+  default is `severity="warn"`; the old `ResourceOverrideFinding` default was
+  `"fail"`. I verified every construction site:
+  `resource_overrides` lines 256/312/326 and `derived_column_policy` lines
+  284/307 all pass `severity=severity` explicitly (severity originates from the
+  unchanged `normalize_resource_override_frame(..., severity="fail")` param /
+  the policy `severity`). The dataclass default is therefore genuinely inert;
+  the `mode == "fail"` raise and the `severity == "fail"` filter behave
+  identically. Confirmed.
+* *Failure-message behavior* — flat/uncapped RO+DCP messages reproduced
+  byte-exactly via `heading=`; reference-validations' named+capped message kept
+  local. No drift.
+* *graph_validations coupling* — untouched; calls `findings_to_frame(list)`
+  with no `columns=` and gets the 9-col schema via the delegating wrapper.
+  `test_graph_validations` passes.
+* *Serializer genericity boundary* — generic over `to_record()` via `Protocol`,
+  parameterised only by `columns`. This is the minimal generalization, not an
+  over-broad one; it does not absorb record semantics.
+* *Protocol vs concrete model* — correct call. A concrete shared base would
+  have forced `ReferenceFinding` into the 7-col shape or created an import
+  cycle; the structural `Protocol` avoids both.
+* *Public API surface* — `domain/__init__.py` is still empty (0 bytes);
+  `finding_frame` is reachable only by explicit deep import. No `__all__`
+  introduced anywhere. The new surface is the minimal one the FTR mandates, not
+  accidental widening.
+* *Remaining intentional local duplication* — `reference_validations` keeps its
+  own `to_record`/`_failure_message`/`_finding_line` and 9-col constant. This
+  is correct and should *stay* local: it is the "do not collapse genuinely
+  different diagnostics" boundary, not residual debt.
+
+== 4. Findings by severity
+
+[cols="1,1,4", options="header"]
+|===
+| ID | Severity | Finding
+
+| R-1
+| LOW (hygiene, non-blocking) — *RESOLVED 2026-05-18*
+| `tests/unit/domain/test_finding_frame.py` had `import pandas as pd` but `pd`
+  was never referenced (ruff `F401`). The commit message / prior self-note
+  asserted "ruff-clean changed/added files"; that was true for the four
+  *source* files but not the new *test* file. *Fixed in the cleanup/archive
+  follow-up*: the unused import was removed; the file is now ruff-clean and the
+  cleanliness claim is literally accurate. No behavioral impact.
+
+| R-2
+| INFO
+| Two domain classes are now named `Finding`
+  (`domain/finding_frame.Finding`, `domain/validations/findings.Finding`).
+  They are never imported into the same namespace and
+  `domain/validations/__init__.py` exports only the reference half, so there is
+  no collision today — but the name reuse is a legibility hazard for future
+  readers. Out of FTR scope to rename; worth a one-line note in the eventual
+  D-005 follow-up / `reference_validations` split FTR.
+
+| R-3
+| INFO
+| `simple_failure_message` is annotated `Iterable[Finding]` though it only
+  needs `.rule_type`/`.message`. Harmless (RO/DCP pass `Finding` aliases;
+  reference-validations does not use it). Not worth changing; noted for
+  completeness.
+
+| R-4
+| INFO
+| `ResourceOverrideFinding`/`DerivedColumnFinding`/`resource_overrides.
+  FINDING_COLUMNS`/`resource_overrides.findings_to_frame` are retained as
+  aliases/re-exports with *zero* importers. This is deliberate
+  surface-preservation, but they are dead-on-arrival compatibility surface; a
+  future FTR may legitimately delete them once the no-importer status is
+  re-confirmed. Not a defect now.
+|===
+
+No MEDIUM/HIGH/CRITICAL findings. No category drift, no severity drift, no
+empty-frame drift, no failure-text drift, no import-path break, no diagnostics
+framework, no premature `reference_validations` split, no `graph_validations` /
+pipeline / YAML / demo edits, no unrelated cleanup.
+
+== 5. Prerequisite-baseline judgment
+
+*This commit is a safe prerequisite baseline for a later
+`reference_validations.py` package-split FTR.* It resolves the exact D-005
+blocker REVIEW-002 §2.2/§6 named as upstream of that split, leaves the
+module's public surface and `graph_validations` coupling intact, keeps the
+genuinely module-specific reference diagnostic local (so the split can package
+it without dragging shared serialization along), and ships an FTR-marked guard
+test that pins the shared mechanic so the future split cannot silently
+regress it. The split itself remains correctly *unstarted* and should follow
+the discriminator-template precedent (in-slice re-export + boundary guard) when
+it is scoped.
+
+== 6. Recommended disposition
+
+Accept the implementation. *Done in the cleanup/archive follow-up
+(2026-05-18):* R-1 cleared (unused import removed; file ruff-clean); FTR +
+this review note moved to
+`docs/cold_storage/backlog/historic_tickets/ftrs/`; a compact archaeology
+comment added to `docs/general_info/backlog/_ftrs_open.adoc` (Phase 5) and the
+cold-storage `_ftrs_done.adoc` index updated. The phase narrative is
+deliberately left untouched — per the per-FTR workflow the narrative is updated
+at phase granularity and Phase 5 remains open. R-2 is carried forward as a note
+into the future D-005-followup / `reference_validations` split FTR. No re-work
+of the consolidation itself was required.
