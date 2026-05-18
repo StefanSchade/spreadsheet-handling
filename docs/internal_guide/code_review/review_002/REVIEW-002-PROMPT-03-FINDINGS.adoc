@@ -1,0 +1,594 @@
+= REVIEW-002 Findings -- Adapter / Spreadsheet Boundary (Pass 3)
+:review-id: REVIEW-002
+:step: 03
+:date: 2026-05-18
+:reviewer: Claude Opus 4.7
+:pass: 3 of 3 (Adapter / Spreadsheet Boundary Focus)
+:baseline: REVIEW-002 Pass 1 (REVIEW-002-FINDINGS.adoc), Pass 2 (REVIEW-002-PROMPT-02-FINDINGS.adoc), REVIEW-001 (2026-05-11)
+:scope: review/documentation only -- no production edits, no commits, no refactoring
+:status: complete
+
+== Method and Evidence Base
+
+Every module in the spreadsheet adapter and contract area was read in full
+(line-by-line, not excerpted), together with the governing ADRs, the parse and
+capability-profile contracts, and the architecture guard suite. Sources:
+
+* *Governing contracts*: ADR-001 (pragmatic hexagonal), ADR-003 (IR ownership),
+  ADR-006 (render chain), ADR-RENDER-FLOW, ADR-META-BLOB-SERIALIZATION,
+  `generic_ir.adoc`, `spreadsheet_parse_contract.adoc`,
+  `spreadsheet_backend_capability_profiles.adoc`, `spreadsheet_meta_semantics.adoc`,
+  `ARCH-LAYERS.adoc`, `architecture_guard_inventory.adoc`.
+* *Live source (full reads)*: `io_backends/spreadsheet_contract.py`, `router.py`,
+  `base.py`, `io_backends/__init__.py`; the XLSX triad
+  (`xlsx_backend.py`, `openpyxl_parser.py`, `parser_interpretation.py`,
+  `openpyxl_renderer.py`); the ODS triad (`ods_backend.py`, `odf_parser.py`,
+  `parser_interpretation.py`, `odf_renderer.py`); the generic write path
+  (`rendering/ir.py`, `plan.py`, `flow.py`, `frame_selection.py`,
+  `workbook_projection.py`, `composer/layout_composer.py`, `passes/_base.py`,
+  `passes/meta_pass.py`, pass-chain index).
+* *Guard suite*: `test_spreadsheet_boundary_guards.py`,
+  `test_adapter_contract_boundary_guards.py`, `test_ir_call_chain.py`,
+  `test_spreadsheet_parse_contract.py`, `test_xlsx_parser_modularization.py`,
+  `test_ods_parser_modularization.py`, `test_raw_formula_boundary_guards.py`,
+  `test_spreadsheet_semantic_invariants.py`, `test_ir_writepath_semantics.py`,
+  `test_meta_carrier_boundary_guards.py`, `test_adapter_alignment.py`,
+  `test_carrier_boundary_guards.py`, plus the cross-adapter integration parity
+  slice `tests/integration/io_backends/test_ods_xlsx_parity.py`.
+
+Findings are grounded in `file:line`. Severity uses the Pass-1/2 scale
+(CRITICAL / MEDIUM / LOW). Every finding is classified as *inherent domain
+complexity*, *deliberate pragmatism*, *acceptable asymmetry*, *temporary
+migration state*, or *accidental architectural debt*, per the prompt's required
+distinction.
+
+'''
+
+== 1. Verdict in Three Sentences
+
+The spreadsheet adapter boundary is *structurally sound and correctly sized*:
+`spreadsheet_contract.py` is a genuinely thin facade, both backends delegate
+through it under executable import guards, backend formula syntax is truly
+confined to adapters, and `RenderPlan`/`WorkbookIR` are backend-neutral and
+guarded -- ODS is a real second backend, not an XLSX-shaped accident. The
+residual risk is *not* in the contract shape but in three small generic
+spreadsheet semantics that leak *sideways as duplicated, unowned, already-drifted
+constants* across the adapter boundary (the workbook-option vocabulary, the
+`" / "` multi-index header convention, and an XLSX-only carrier->canonical
+column-width promotion), none of which is protected by a behavioral parity
+guard at the architecture tier. All adapter-boundary risk in this pass is
+*accidental and narrowly repayable* sitting on top of genuinely inherent
+spreadsheet roundtrip complexity; nothing here justifies a package split, a
+generic backend abstraction, or a generic parser framework.
+
+'''
+
+== 2. What Is Genuinely Solid (stated explicitly, so the residue is calibrated)
+
+[cols="2,4", options="header"]
+|===
+| Area | Evidence
+
+| Contract facade is correctly sized
+| `io_backends/spreadsheet_contract.py` is 55 lines: two `Protocol`s
+(`SpreadsheetParser`, `SpreadsheetRenderer`) plus `build_spreadsheet_render_plan`
+(write entry) and `read_spreadsheet_frames` (read entry). Not too thin (it owns
+the compose->passes->plan orchestration so adapters cannot duplicate it -- see
+`xlsx_backend.py:36-39`, `ods_backend.py:35-37`), not too broad (no format
+knowledge). This is the ADR-006 target end-state realized in code.
+
+| Adapter isolation is executable, not conventional
+| `test_adapter_contract_boundary_guards.py` + `test_ir_call_chain.py` +
+`test_spreadsheet_boundary_guards.py` enforce: backends import only the contract
+facade; renderers import only `rendering.plan`; parsers import only
+`rendering.ir` + their local `parser_interpretation`; the facade stays free of
+`openpyxl`/`odf`. The generic `rendering/` tree is import-guarded against
+`openpyxl`/`odf`/adapter packages (`test_adapter_alignment.py:53`).
+
+| Backend formula syntax is a real abstraction
+| `FormulaSpec`/`ListLiteralFormulaSpec`/`LookupFormulaSpec` (`core.formulas`)
+are backend-neutral IR carriers. XLSX emits `=XLOOKUP(...)`
+(`openpyxl_renderer.py:118-154`); ODS emits `of:=XLOOKUP([...];...)`
+(`odf_renderer.py:181-214`). The raw-formula guard scans all generic layers and
+allows backend syntax only under `io_backends/xlsx`, `io_backends/ods`,
+`tests/architecture/current_state` (`test_raw_formula_boundary_guards.py:25-51`).
+This is the strongest single proof the IR is not XLSX-shaped.
+
+| RenderPlan / WorkbookIR contract integrity
+| Frozen `RenderOp` dataclasses (`plan.py:9-136`); both renderers dispatch on
+the same `Union`; both parsers build the same `ir.py` dataclasses; generic
+projection (`workbook_projection.py`) is 66 lines and backend-neutral, guarded
+by `test_spreadsheet_parse_contract.py:99`.
+
+| ADR-003 bypass holds
+| `csv/json/xml/yaml` backends do not import `rendering` at all (verified);
+they map directly in `router.py` `LOADERS`/`SAVERS`. Spreadsheet-only IR
+coupling is real.
+
+| ODS is a genuine second backend
+| `test_ods_xlsx_parity.py` writes the same frames+meta to both backends and
+asserts identical visible frames, identical canonical `_meta`, and identical
+parser-semantics summaries across 11 representative scenarios (multi-header,
+extracted/pivoted/joined frames, configured workbook views, reverse mapping),
+with the three accepted gaps explicitly encoded as gap tests.
+|===
+
+The adapter boundary therefore moved, as Pass 1 said, "from hexagonal by
+intention to hexagonal by enforcement"; Pass 3 confirms that at the
+*adapter/contract* seam specifically.
+
+'''
+
+== 3. Concrete Findings
+
+=== P3-01 (MEDIUM, accidental debt) -- XLSX parser promotes a carrier observation into the persisted canonical meta blob; ODS does not; the stated "no carrier promotion" invariant does not cover it
+
+*What.* On the XLSX read path, authored column widths are read from the carrier
+(`openpyxl_parser.py:126 _extract_column_widths`, gated on
+`dim.customWidth`), merged into a *canonical-looking* location
+`workbook_meta["sheets"][sheet]["column_widths"]`
+(`openpyxl_parser.py:152 _merge_column_width_meta`), and then the *entire*
+workbook meta is re-serialized as JSON back into the hidden `_meta`
+(`openpyxl_parser.py:176 _store_workbook_meta`). `workbookir_to_frames`
+then returns that blob verbatim as `frames["_meta"]`
+(`workbook_projection.py:42-49`). The ODS parser has *no* equivalent path.
+
+*Why it matters.* The parse contract is explicit: "parser-side hints must not
+silently override canonical meaning"; "carrier-side hints remain explicit and
+quarantined rather than becoming implicit canonical semantics"
+(`spreadsheet_parse_contract.adoc`, Boundary Invariants). Column widths *are*
+already quarantined correctly as the `__column_widths` hint
+(`parser_interpretation.py:90-92`, `openpyxl_parser.py:68`) -- and that part is
+right. The *additional* merge into `sheets.<name>.column_widths` + blob
+re-store is a second, contradictory action: it promotes a carrier observation
+into the persisted canonical payload on read. A read->write XLSX roundtrip
+therefore silently *adds* `column_widths` to canonical meta that never
+originated from the domain/canonical source; an ODS roundtrip of the same file
+does not. This is the single clearest XLSX-centric read-path assumption that
+crosses the carrier->canonical boundary the contract forbids.
+
+*Guard gap.* The strongest stated invariant -- "roundtrip restores canonical
+meta *without promoting carrier hints*" -- exists in three places
+(`test_spreadsheet_parse_contract.py:117`,
+`test_spreadsheet_semantic_invariants.py:149`,
+`test_meta_carrier_boundary_guards.py:69`) but every fixture writes default
+column widths (`customWidth` is False), so `_merge_column_width_meta` returns
+early and `_store_workbook_meta` is never reached. The invariant is real and
+correctly stated; its fixture coverage has a hole *exactly* at the only code
+path that violates it. The cross-adapter parity test has the same hole: it
+asserts `xlsx_back["_meta"] == ods_back["_meta"]` only because no fixture
+authors a custom width (`test_ods_xlsx_parity.py:202,242,...`).
+
+*Classification.* Accidental architectural debt, bounded to XLSX and to
+authored-width inputs. The quarantine principle exists and is followed
+elsewhere; this one path bypasses it. Not inherent: nothing about spreadsheet
+roundtrip requires the parser to mutate the canonical blob.
+
+*Disposition.* This is a *decision*, not a refactor: either (a) column widths
+are not canonical -> stop the blob re-store, keep them only as the
+`__column_widths` hint; or (b) they are canonical for XLSX -> document the
+asymmetry in the capability profile and add an authored-width roundtrip guard.
+Prefer (a); it restores the invariant the project already wrote. Do *not*
+generalize column widths into a cross-backend canonical field (capability
+profile classifies column-width as XLSX-only/partial).
+
+=== P3-02 (MEDIUM, accidental debt) -- The workbook-option vocabulary is triplicated and already divergent across the adapter boundary
+
+*What.* The set of `meta_canonical` keys that project into
+`SheetIR.meta["options"]` is defined three times and is *not* the same set:
+
+* `composer/layout_composer.py:9 _WORKBOOK_OPTION_KEYS` =
+  `{freeze_header, auto_filter, header_fill_rgb, helper_fill_rgb, helper_prefix}`
+  (5 keys, write/compose path).
+* `xlsx/parser_interpretation.py:12 OPTION_HINT_KEYS` and
+  `ods/parser_interpretation.py:10 OPTION_HINT_KEYS` = the same 5 *plus*
+  `helper_columns` and `protection` (7 keys, read path, byte-identical between
+  the two adapters).
+
+*Why it matters.* This is a generic `meta_canonical -> options` projection
+vocabulary -- a spreadsheet-neutral semantic, not adapter-local interpretation.
+The divergence is already observable: top-level (workbook-scoped)
+`protection`/`helper_columns` are surfaced as inheritable options on the *read*
+path but are *not* seeded as workbook-level defaults on the *write/compose*
+path (`layout_composer.py:251-255`). It is currently masked only because every
+fixture places `protection`/`helper_columns` under `meta["sheets"][name]` (the
+sheet overlay at `layout_composer.py:296-302`), never at workbook scope (e.g.
+`test_ods_xlsx_parity.py:476-492` puts `helper_columns` under
+`sheets.Variables`). A workbook-level `helper_columns` would round-trip
+asymmetrically today.
+
+*Guard gap.* No guard pins read-vocabulary == write-vocabulary.
+`test_sheet_option_precedence...` (`test_spreadsheet_semantic_invariants.py:126`)
+exercises only the composer's 5-key subset.
+
+*Classification.* Accidental debt + hidden semantic seam. The *adapter-local
+heuristic bodies* in the two `parser_interpretation` modules are deliberate
+pragmatism (the parse contract explicitly permits adapter-local interpretation
+helpers and forbids a generic parser framework) -- those should stay
+duplicated. But the *vocabulary list itself* is generic and should have one
+owner.
+
+*Disposition.* Narrow seam hardening: a single shared constant owning the
+option vocabulary, referenced by composer and both `parser_interpretation`
+modules, plus a one-line guard asserting the three references resolve to the
+same set. This is *not* a parser-framework and *not* a package split.
+
+=== P3-03 (MEDIUM, accidental debt) -- The `" / "` multi-index header convention is an unowned magic-string contract duplicated across four modules, with a write/read asymmetry and a drift-inviting comment
+
+*What.* The MultiIndex header join/split separator `" / "` appears literally in
+four modules with no shared constant (grep-confirmed: no `HEADER_SEP`-style
+symbol anywhere in `src/` or `tests/`):
+
+* `composer/layout_composer.py:88` -- joins *all* tuple parts:
+  `" / ".join(map(str, tup))`.
+* `xlsx/parser_interpretation.py:126` -- joins *non-empty* parts only.
+* `ods/parser_interpretation.py:117` -- joins *non-empty* parts only.
+* `workbook_projection.py:30-31` -- splits on `" / "` to rebuild a
+  `pd.MultiIndex`.
+
+The composer comment at `layout_composer.py:83` literally says "adjust if you
+prefer another joiner" -- an explicit invitation to the exact drift that would
+silently break parser/projection roundtrip.
+
+*Why it matters.* This is a generic spreadsheet semantic (header flattening
+convention) spanning the adapter boundary and the generic projection, with no
+single owner. The practical roundtrip-bearing path is parser->projection (the
+*write* path renders multi-level headers from `__header_grid`, not from the
+joined string -- `flow.py:127-143`, so live risk is bounded), and the
+join-all-vs-join-non-empty asymmetry already makes trailing-empty header levels
+lossy -- but that loss is explicitly inside the parse contract's "optional /
+incremental layout recovery" zone, so it is *not* a correctness defect today.
+The architectural defect is the *unowned, duplicated, drift-invited* magic
+string itself.
+
+*Classification.* Accidental debt + hidden semantic seam. Bounded (the lossy
+asymmetry is contract-permitted), but the seam is real and unguarded.
+
+*Disposition.* One shared constant referenced by all four sites; delete the
+drift-inviting comment. Do *not* build a header-codec abstraction; do *not*
+attempt to make trailing-empty levels lossless (that is contract-deferred
+layout recovery).
+
+=== P3-04 (LOW, accidental debt) -- ODS renderer silently drops `SetColumnWidth` while it explicitly skips protection ops
+
+*What.* `odf_renderer.py:309-313` skips `SetSheetProtection`/`ApplyCellLock`
+with explicit `continue # ODS ... not implemented in this slice` comments.
+There is *no* branch for `SetColumnWidth` at all -- it falls off the end of the
+`_collect_sheets` dispatch silently (`odf_renderer.py:231-315`). Column-width is
+a documented accepted ODS gap (capability profile; FTR-ODS-CONSUMER-FEATURE-
+PARITY-P4A), but the capability profile requires accepted gaps to be "explicit
+allowed differences instead of ... undocumented skips."
+
+*Why it matters.* The skip is *implicit and uncommented*, unlike the protection
+gap which has an explicit branch and a dedicated documented-gap test
+(`test_ods_xlsx_parity.py:528 test_protection_is_xlsx_only_ods_documented_gap`).
+No equivalent column-width gap test exists; the gap is asserted only in prose.
+
+*Classification.* Accidental, trivially repayable. Acceptable *asymmetry* in
+behavior (the gap itself is fine and profiled); the *code expression* of the
+gap is inconsistent.
+
+*Disposition.* Add an explicit no-op `SetColumnWidth` branch + comment mirroring
+the protection pattern, and a documented-gap test mirroring
+`test_protection_is_xlsx_only_ods_documented_gap`. Trivial; no architecture
+change.
+
+=== P3-05 (MEDIUM, carry-over IR-006 elevated to adapter scope) -- The shared write facade mutates caller inputs and the multi-backend path concretely reaches it
+
+*What.* The two IR-006 mutations Pass 1 flagged are confirmed live at the exact
+lines, and both sit *inside* `build_spreadsheet_render_plan` -- the single
+facade *both* adapters call:
+
+* `frame_selection.py:198` -- `value[col] = series.apply(...)` mutates caller
+  frames in place (only under a `workbook_view` sheet-rename).
+* `layout_composer.py:230` -- `spec["resolved"] = {...}` writes back into the
+  caller's `meta` dict (legend resolution; this write is *read back* by both
+  parsers' `_legend_table_hints`, so it is load-bearing for the legend
+  roundtrip *and* a shared-state mutation).
+
+*Pass 3 contribution.* This is not new, but Pass 3 establishes it is
+*concretely reachable at the adapter boundary*: the parity harness
+`_write_both` (`test_ods_xlsx_parity.py:101-108`) calls
+`ExcelBackend().write_multi(frames)` then `OdsBackend().write_multi(frames)`
+on the *same* `frames`/`meta` objects. The first
+`build_spreadsheet_render_plan` mutates them; the second consumes the mutated
+state. It is currently benign (legend `resolved` re-write is idempotent for
+identical placement; the formula-sheet rewrite only fires under view renames),
+but it is a latent correctness hazard precisely on the multi-output path this
+pass is scoped to.
+
+*Classification.* Accidental debt (input mutation in a pure-by-contract render
+path). Consistent with Pass 1/2 disposition: a *surgical purity fix*
+(copy-on-write of the selected frames; relocate the `resolved` write off the
+caller meta), explicitly *not* a refactor and *not* a modularization target.
+
+=== P3-06 (LOW, deliberate pragmatism -- watch item, not debt) -- ODS hidden-sheet detection hard-codes the carrier name `_meta`
+
+*What.* `odf_parser.py:109-113 _table_is_hidden` treats a table as hidden if it
+is styled `display:false` *or* its name is literally `"_meta"`. XLSX uses the
+real `ws.sheet_state` (`openpyxl_parser.py:46`).
+
+*Assessment.* This is acceptable, deliberate pragmatism: the capability profile
+mandates the hidden `_meta` table as the ODS canonical-meta carrier, so a
+name-based fallback is reasonable for first-cut robustness. The only residual
+risk is that a *non-hidden* user table genuinely named `_meta` would be
+misclassified -- an edge the project already implicitly reserves (`_meta` is a
+reserved frame key everywhere: `frame_selection.py:10`,
+`layout_composer.py:8`). No action; record as a known carrier coupling.
+
+'''
+
+== 4. Evaluation Against the Eleven Required Questions
+
+[cols="1,3,3", options="header"]
+|===
+| # | Question | Grounded answer
+
+| 1 | Generic spreadsheet semantics centralized in IR/contract?
+| *Mostly yes.* Geometry, validations-as-`FormulaSpec`, named ranges, freeze,
+options precedence are resolved in IR/passes/flow and reach a backend-neutral
+`RenderPlan`. *Exceptions*: the option vocabulary (P3-02) and the `" / "`
+convention (P3-03) are generic semantics that live as duplicated constants, not
+centralized.
+
+| 2 | Adapter-specific logic leaking upward?
+| *No upward leak.* L1 guard holds (`test_spreadsheet_boundary_guards.py:287`,
+`:300`); backend formula/carrier syntax stays in adapters. The leakage is
+*sideways/duplicated-downward* (generic constants copied into adapters), not
+adapter logic rising into domain/pipeline.
+
+| 3 | Parser/renderer responsibilities cleanly separated?
+| *Yes.* Parsers stop at `WorkbookIR` and delegate visible-sheet interpretation
+to a local helper (`test_xlsx/ods_parser_modularization.py`); renderers consume
+only `RenderPlan`. The one wrinkle is P3-01 (XLSX parser also *writes*
+canonical meta), which blurs "parser only reads".
+
+| 4 | Abstractions stable or accidental?
+| *Stable.* `WorkbookIR`/`RenderPlan`/`spreadsheet_contract` have been stable
+across the P4A wave and a second backend; frozen RenderOps; guard-pinned. Not a
+shifting prototype at this seam.
+
+| 5 | Is XLSX the de-facto canonical backend?
+| *Partially, intentionally.* Every *architecture-tier* semantic-invariant and
+roundtrip guard uses XLSX as the execution vehicle
+(`test_ir_writepath_semantics.py`, `test_spreadsheet_semantic_invariants.py`,
+`test_spreadsheet_parse_contract.py`, `test_meta_carrier_boundary_guards.py`).
+ODS at the architecture tier has *only* import/call-chain/modularization
+guards. ODS behavioral parity exists but lives in `tests/integration/`, which
+`architecture_guard_inventory.adoc` explicitly classifies as "supporting, not
+primary guardrails." So XLSX is canonical *for invariant enforcement*; ODS is
+*behaviorally tested but not invariant-pinned*. Acceptable as a deliberate
+first-cut posture, but it is the single biggest parity-sustainability risk.
+
+| 6 | ODS parity structurally sustainable?
+| *Yes, structurally.* Symmetric adapter triad; shared contract facade; shared
+`RenderPlan`/`WorkbookIR`; import guards on both; explicit capability profile
+with encoded accepted gaps; a real 11-scenario cross-adapter parity integration
+test with explicit gap tests. The sustainability *risks* are accidental and
+bounded: P3-02/P3-03 can drift the two parsers apart unguarded; parity is
+integration-tier not architecture-tier (Q5); P3-01 makes `_meta` equality
+fixture-dependent. No structural design debt.
+
+| 7 | Contract facades correctly sized?
+| *Yes.* `spreadsheet_contract.py` (55 lines) is correctly minimal -- not too
+thin (owns compose/pass/plan so adapters cannot duplicate it), not too broad
+(no format knowledge). `base.py` `BackendBase` is the ADR-001 minimal port;
+`coerce_backend_options` returning `cast(BackendOptions, dict(...))`
+(`base.py:43`) is a type-lie but explicitly sanctioned by ADR-001's "no type
+safety" stance -- deliberate pragmatism, not debt.
+
+| 8 | Guard coverage matches the risky seams?
+| *Mostly, with three named gaps.* Import-direction / call-chain / facade
+neutrality are well guarded. *Gaps*: (G1) no guard pins read==write option
+vocabulary (P3-02); (G2) no guard owns the `" / "` separator (P3-03); (G3) the
+"no carrier promotion" invariant has a fixture hole at the XLSX column-width
+promotion (P3-01); (G4) ODS semantic parity is not pinned at the architecture
+tier (Q5). See §5.
+
+| 9 | Module/package structure suggests future split pressure?
+| *No.* Largest adapter module is `odf_renderer.py` at 540 lines (a single
+buffered-render concept); the XLSX triad is 113/338/284/359; the contract is
+55. None exceeds the read-window or shows split pressure. *Explicit DO NOT
+SPLIT* -- see §6.
+
+| 10 | Hidden semantic seams not yet protected?
+| *Three*: the option vocabulary (P3-02), the `" / "` header convention
+(P3-03), and the carrier->canonical column-width promotion (P3-01). All three
+are unguarded generic semantics crossing the adapter boundary.
+
+| (11) Inherent vs accidental?
+| All adapter-boundary residue in this pass is *accidental and narrowly
+repayable*. Inherent complexity (roundtrip fidelity, canonical/rendering/carrier
+meta split, multi-backend formula translation, the deferred reverse projection)
+is handled *proportionately* and should not be "fixed". See §7.
+|===
+
+'''
+
+== 5. Guard-Gap Analysis
+
+[cols="1,3,1,3", options="header"]
+|===
+| ID | Seam | Severity | Status
+
+| G1
+| Read-path vs write-path workbook-option vocabulary
+(`OPTION_HINT_KEYS` x2 vs `_WORKBOOK_OPTION_KEYS`)
+| MEDIUM
+| *Unguarded.* Already divergent (7 vs 5 keys). No test asserts equality. Fix:
+single shared constant + one equality guard. (P3-02)
+
+| G2
+| The `" / "` multi-index header join/split convention (4 sites, no constant)
+| MEDIUM
+| *Unguarded.* No symbol owns it; composer comment invites drift. Fix: shared
+constant + reference-site assertion. (P3-03)
+
+| G3
+| "Roundtrip restores canonical meta without promoting carrier hints"
+| MEDIUM
+| *Stated but fixture-blind.* Three guards assert it; none exercises an
+authored column width, the one path that violates it
+(`openpyxl_parser.py:152-181`). Fix: add an authored-width roundtrip case, or
+remove the promotion (P3-01).
+
+| G4
+| ODS *behavioral* semantic parity at the architecture tier
+| MEDIUM
+| *Integration-tier only.* `test_ods_xlsx_parity.py` is strong but is
+explicitly "supporting, not a primary guardrail." A fast/architecture-only
+slice would not catch XLSX/ODS semantic divergence. Fix: either promote one
+minimal ODS roundtrip invariant into `tests/architecture/semantic_invariants/`,
+or record an explicit GDR accepting integration-tier parity with a review
+cadence.
+
+| --
+| Adapter import isolation, facade neutrality, parser stops-at-IR,
+renderer-consumes-plan, raw-formula leakage, meta-registry/carrier shape
+| --
+| *Covered and durable.* No gap; see §2.
+|===
+
+The guard *mechanism* is sound; the gaps are all "a real generic semantic
+crosses the adapter boundary with no owner and no behavioral pin", not
+structural-enforcement failures.
+
+'''
+
+== 6. Package-Split Candidacy (explicit)
+
+*DO NOT SPLIT -- all adapter/contract modules.*
+
+* `spreadsheet_contract.py` (55) -- correctly minimal; splitting would fragment
+  a single facade concept.
+* XLSX triad (`xlsx_backend` 113, `openpyxl_parser` 338,
+  `parser_interpretation` 284, `openpyxl_renderer` 359) and ODS triad
+  (`ods_backend` 86, `odf_parser` 420, `parser_interpretation` 265,
+  `odf_renderer` 540) -- each is one cohesive adapter concern; none exceeds the
+  read-window; the parser/interpretation split *already* realizes the only
+  useful internal seam and is guarded by the modularization tests.
+* The two `parser_interpretation` modules are ~85% structurally parallel, but
+  the parse contract *forbids* a generic parser framework and the duplication
+  is *deliberate adapter-locality*. Do **not** deduplicate the heuristic bodies;
+  only the *shared constants* (P3-02, P3-03) should get a single owner.
+
+There is *no* package-split pressure and *no* justification for a generic
+backend abstraction here. ADR-001's pragmatic-hexagonal stance and the parse
+contract's "no generic parser framework" non-goal are both respected; this
+review does not recommend abstraction for abstraction's sake.
+
+'''
+
+== 7. Inherent vs Accidental Complexity (the headline distinction)
+
+*Inherent -- do NOT "fix"; the current design is proportionate:*
+
+* Roundtrip fidelity and the `meta_canonical`/`meta_rendering`/carrier split
+  (`generic_ir.adoc` invariants 1-4) -- the layered model + JSON blob + ADR is
+  the right-sized response, not over-design.
+* Multi-backend formula translation (XLSX `=XLOOKUP` vs ODS `of:=XLOOKUP[...]`)
+  -- intrinsic format divergence, correctly confined behind `FormulaSpec`.
+* The deferred reverse projection (user formatting -> `meta_canonical`) -- the
+  contract deliberately leaves this open; the named accepted gaps (freeze
+  read-hint, protection, column-width) are inherent format asymmetries, *not*
+  debt, and are mostly encoded as explicit gap tests.
+* The legend `resolved` round-trip channel -- a genuine cross-direction
+  contract; its only flaw is *where* it is written (P3-05), not that it exists.
+
+*Accidental -- repayable with the existing, proven, guard-backed methodology;
+no architecture change:*
+
+* P3-01 carrier->canonical column-width promotion (XLSX-only, bounded).
+* P3-02 triplicated/divergent option vocabulary.
+* P3-03 unowned `" / "` header convention.
+* P3-04 implicit ODS `SetColumnWidth` skip.
+* P3-05 input mutation in the shared write facade (surgical purity fix).
+* G4 parity pinned only at integration tier.
+
+None of the accidental items requires a new framework, a package split, or a
+generic abstraction. Each is a *narrow seam-hardening* or an *explicit
+decision*, exactly the posture the prompt and ADR-001 prescribe.
+
+'''
+
+== 8. Candidate Future FTRs (only where strongly justified)
+
+*Worthwhile (real value, not churn):*
+
+. `FTR-ADAPTER-OPTION-VOCABULARY-SINGLE-OWNER` -- one shared constant for the
+  workbook-option vocabulary, referenced by composer + both
+  `parser_interpretation` modules; ship a read==write equality guard in the
+  same slice (closes G1, P3-02). Small, behavior-preserving.
+. `FTR-MULTIINDEX-HEADER-SEPARATOR-CONSTANT` -- single shared `" / "` constant
+  referenced by composer / projection / both parser_interpretation; delete the
+  drift-inviting comment; one reference-site guard (closes G2, P3-03). Small.
+. `FTR-XLSX-COLUMN-WIDTH-CARRIER-PROMOTION-DECISION` -- decide and document
+  whether parser-time column widths are canonical; preferred outcome: stop the
+  blob re-store, keep only the `__column_widths` hint; add an authored-width
+  roundtrip guard (closes G3, P3-01). Can fold into the existing parse-contract
+  guard family.
+
+*Optional / low:*
+
+* `FTR-ODS-COLUMN-WIDTH-EXPLICIT-GAP` -- explicit ODS `SetColumnWidth` no-op
+  branch + documented-gap test mirroring the protection one (P3-04).
+* A GDR (not an FTR) recording the deliberate integration-tier parity posture
+  with an owner and review cadence, *or* promoting one minimal ODS roundtrip
+  invariant to the architecture tier (G4, Q5).
+
+*Explicitly NOT recommended (would be churn / violate constraints):*
+
+* Any generic backend abstraction or port expansion (ADR-001).
+* Any generic parser framework or deduplication of the two
+  `parser_interpretation` heuristic bodies (parse-contract non-goal).
+* Any package split of the adapter triads or the contract facade (§6).
+* Any reverse-projection / canonical-style-recovery work (contract-deferred;
+  inherent, not debt).
+* Pre-empting `generic_ir` Steps 4-5 conflict/precedence (owned by a future
+  FTR; Pass 1/2 already forbid anticipation).
+
+'''
+
+== 9. Final Summary (as requested)
+
+*Most important adapter-boundary risks.* (1) P3-01: the XLSX parser promotes an
+authored carrier observation (column widths) into the persisted canonical meta
+blob, contradicting the parse contract's quarantine invariant, while the guards
+that assert that invariant never exercise the violating path. (2) P3-02 / P3-03:
+two generic spreadsheet semantics -- the workbook-option vocabulary and the
+`" / "` multi-index header convention -- exist as *duplicated, unowned, and
+already-divergent* constants straddling the adapter boundary, with no behavioral
+guard. (3) G4: ODS semantic parity is pinned only at the integration tier, not
+as a durable architecture invariant.
+
+*Hidden XLSX-centric assumptions.* Exactly one of substance: the
+carrier->canonical column-width promotion in `openpyxl_parser.py` (P3-01),
+which has no ODS counterpart and is not part of the generic parse contract.
+Secondary/benign: ODS's literal-`_meta` hidden-sheet fallback (P3-06,
+acceptable pragmatism). The contract facade, `RenderPlan`, `WorkbookIR`, and
+formula handling are *not* XLSX-shaped.
+
+*Is ODS parity structurally sustainable?* Yes. The structure -- symmetric
+triad, shared facade, shared neutral IR/plan, import guards, a capability
+profile with encoded gaps, and a real 11-scenario cross-adapter parity test --
+is sustainable and is the strongest evidence the abstraction is genuine. The
+sustainability *risks* are all accidental and bounded (P3-01/02/03 unguarded
+seams; parity at integration tier), not structural-design debt.
+
+*Guard gaps.* Four, all named and grounded (§5): G1 option-vocabulary equality,
+G2 header-separator ownership, G3 authored-width carrier-promotion fixture hole,
+G4 architecture-tier ODS parity. The guard *mechanism* is sound; the gaps are
+"a generic semantic crosses the boundary unowned and unpinned", not enforcement
+failures.
+
+*Inherent vs accidental.* The adapter boundary's inherent complexity
+(roundtrip fidelity, canonical/rendering/carrier meta split, multi-backend
+formula translation, the deliberately deferred reverse projection) is handled
+*proportionately* and must not be "refactored". *All* residue surfaced in this
+pass is *accidental and narrowly repayable* with the project's existing proven
+methodology -- shared constants, one decision, one surgical purity fix, and
+optionally one parity-tier guard. This is fully consistent with Pass 1's
+"stable-beta architecture with localized, named, non-architectural residue":
+Pass 3 confirms the adapter/contract seam specifically is stable-beta, and
+makes its residue specific, severity-ranked, and FTR-actionable without any
+architecture change.
