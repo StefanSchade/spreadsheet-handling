@@ -1,0 +1,158 @@
+= Review: FTR-DOMAIN-TRANSFORMATION-MODULE-SPLIT-DISCRIMINATOR-P5
+
+Date: 2026-05-18
+
+Status: *Self-documentation pending independent review.* This note records the
+implementation self-documentation for this behavior-preserving refactoring
+slice. No independent review verdict has been rendered yet; the FTR is
+deliberately left *Open* (not Done, not archived) pending independent review
+and developer merge confirmation per the per-FTR workflow.
+
+== Scope of original implementation pass
+
+Mechanical, behavior-preserving split of the single
+`src/spreadsheet_handling/domain/transformations/discriminator_split.py` module
+(563 lines, 32 functions) into a package. Single repo
+(`spreadsheet-handling`, branch `dev`); demo repo used for verification only
+and left unmodified. Verbatim function moves; no semantic redesign.
+
+== What changed (core repo)
+
+* `discriminator_split.py` -> `discriminator_split/` package: `__init__.py`,
+  `split.py`, `merge.py`, `naming.py`, `values.py`, `framecheck.py`,
+  `metadata.py`. Every function body moved *verbatim*; only the new
+  module-relative imports between submodules were added. Confirmed by an
+  `ast.dump` equivalence check: all 32 functions and all 4 module constants
+  (`Frames`, `_INVALID_SEGMENT_CHARS`, `_META_KEY`, `_PLACEHOLDER`) are
+  byte-identical pre/post move.
+* Function placement (per the approved analysis section C):
+  ** `split.py`: `split_by_discriminator`, `_split_value_entries`. The
+     persisted `split_by_discriminator` metadata payload literal is kept inline
+     here so its canonical shape is unchanged.
+  ** `merge.py`: `merge_by_discriminator`, `_merge_value_entries`,
+     `_meta_value_entries`, `_source_frame_list`, `_uniform_source_columns`,
+     `_output_column_order`, `_sorted_entries_for_merge`, `_merge_sort_key`,
+     `_row_order_positions`. The ordering trio
+     (`_sorted_entries_for_merge`/`_merge_sort_key`/`_row_order_positions`) is
+     kept co-located here; the merge payload literal stays inline.
+  ** `naming.py`: `_ensure_pattern`, `_pattern_parts`,
+     `_try_value_from_frame_name`, `_value_from_frame_name`,
+     `_safe_value_segment`, `_valid_frame_name`, `_value_map_entries`,
+     `_mapped_frame_name`, `_frame_for_value` (+ `_PLACEHOLDER`,
+     `_INVALID_SEGMENT_CHARS`).
+  ** `values.py`: `_valid_discriminator_value`, `_plain_value`,
+     `_is_empty_cell`, `_values_equal`, `_sort_token` -- the single narrow
+     local discriminator-value core shared by split/merge/naming (the
+     FK-FTR's explicitly-permitted "tiny helper must remain local" case),
+     *not* a broad shared utility package.
+  ** `framecheck.py`: `_require_frame`, `_ensure_column`,
+     `_ensure_source_frames_exist`, `_ensure_no_existing_target_frames`,
+     `_ensure_unique_target_frames` -- *structural* checks only. No
+     `conflict.py`/`precedence.py`; that design space remains owned by
+     `FTR-WORKBOOK-VIEW-PAYLOAD-CONFLICT-PRECEDENCE-P6`.
+  ** `metadata.py`: `_META_KEY`, `_split_meta`, `_write_split_meta` --
+     read/write plumbing only; owns no payload shape.
+  ** `Frames = dict[str, Any]` is defined locally in both `split.py` and
+     `merge.py` (it was an internal-only alias never imported elsewhere; not
+     re-exported, per the analysis).
+* `__init__.py` re-exports *only* `split_by_discriminator` and
+  `merge_by_discriminator`; `__all__` is exactly those two names. No private
+  re-export was required (no test pins an internal dotted submodule path --
+  unlike the FK split, which needed `_write_helper_provenance` re-exported).
+* Internal dependency DAG (verified acyclic by successful import + full test
+  run): `split -> {naming, values, framecheck, metadata}`,
+  `merge -> {naming, values, framecheck, metadata}`, `naming -> values`,
+  `naming -> framecheck`. `values`, `framecheck`, `metadata` are leaves.
+* New guard test
+  `tests/architecture/dependency_guards/test_discriminator_split_package_reexports.py`:
+  asserts the two public functions resolve through the package root, that
+  `__all__` is exactly the public surface, and -- because discriminator is
+  registered via `target=` (a colon target) rather than a factory -- that the
+  `importlib`+`getattr` colon-target resolution path imports cleanly through
+  the package root for both step IDs.
+
+== Recorded deviation from the FTR DAG
+
+The FTR DAG lists only `naming -> values`. A verbatim move additionally
+requires `naming -> framecheck` because `_value_map_entries` (assigned to
+`naming` by the analysis) calls `_ensure_unique_target_frames` (assigned to
+`framecheck`). This edge is *acyclic* (`framecheck` is a leaf, imports nothing
+internal) and is forced purely by the no-semantic-edit constraint -- the
+alternatives (duplicating the check, or relocating it against the analysis's
+explicit module assignment) would have been worse. Flagged here for the
+independent reviewer rather than silently broadening scope or doing surgery.
+
+== What deliberately did NOT change
+
+* No edits to `pipeline/registry.py`, `pipeline/steps.py`,
+  `meta_registry.yaml`, or `pipeline_step_registry.json`. The registry
+  colon-targets
+  (`spreadsheet_handling.domain.transformations.discriminator_split:split_by_discriminator`,
+  `:merge_by_discriminator`) and the `meta_registry.yaml`
+  producer/consumer dotted paths
+  (`domain.transformations.discriminator_split.split_by_discriminator`,
+  `.merge_by_discriminator`) resolve unchanged as package attributes. They are
+  NOT "old" paths -- changing them would break the existing meta-registry
+  contract test for no behavioral gain.
+* No pipeline step IDs, YAML config syntax/keys, generated frame names, row
+  order, column order, discriminator value normalization, duplicate/collision
+  error behavior, `_META_KEY`, or metadata payload shape touched. No
+  conflict/precedence behavior added. No generic reimport/recomposition
+  framework. No coupling to `compose_workbook`/`workbookir_to_frames` beyond
+  the pre-existing meta key string.
+* No non-discriminator transform families touched (`fk_helpers`,
+  `tabular_views`, `xref`, `resources`, `workbook_views`,
+  `derived_column_policy`, etc.).
+* One live documentation pointer corrected (mirrors the accepted FK
+  follow-up): `docs/human_info/concepts/partition_by_domain.adoc` pinned the
+  old `domain/transformations/discriminator_split.py` file path; updated to the
+  stable package-level dotted path. The German point-in-time review snapshot
+  `docs/internal_guide/code_review/review-domain-core.adoc` was *not* touched:
+  it is a frozen line-count review artifact (it still lists the pre-split
+  `fk_helpers.py` after the accepted FK split), not a live pointer.
+
+== Verification
+
+* AST-`ast.dump` equivalence: 32/32 functions + 4/4 constants byte-identical
+  pre/post move.
+* FTR "must pass" suites (all green, no test edits):
+  `test_discriminator_split.py` (unit), `test_discriminator_split_pipeline.py`
+  (integration), `test_localized_resource_matrix_roundtrip.py` (integration),
+  `test_step_registration.py` (unit), `test_meta_registry.py` +
+  `test_meta_registry_hardening.py` (architecture), plus the new re-export
+  guard.
+* Broader: `tests/unit/domain` + `tests/unit/pipeline` +
+  `tests/architecture/pipeline_semantics`: pass.
+* Full active dev slice `make test`: *812 passed*.
+* Demo (`spreadsheet-handling-demo`, editable-bound to this local core via its
+  own `make setup-lib-local`): `pytest -q` -> *9 passed*. The demo has no
+  discriminator-specific journey, so this confirms no consumer
+  import/registry regression; discriminator behavior coverage lives in the
+  core suite above. No demo files modified; nothing committed there.
+
+== Reviewer focus (per FTR review guidance)
+
+* Confirm no accidental behavior change hidden in the moved bodies (the
+  `ast.dump` check is the witness; a `git show`-level per-function diff is
+  recommended as independent confirmation).
+* Confirm split/merge symmetry: `merge(split(df)) == df` roundtrip test green;
+  `_plain_value`/`_values_equal`/`_sort_token` are single-sourced in
+  `values.py` and used identically by both directions.
+* Confirm the ordering trio stayed co-located in `merge.py` and only
+  `_sort_token` lives in `values.py`.
+* Confirm `_META_KEY` + both payload literals are unchanged and the
+  `test_meta_registry_hardening.py` profile for `split_by_discriminator`
+  (`meta_canonical`, `canonical_meta`) is untouched.
+* Confirm `values.py` is genuinely tiny/local and not a latent shared-utility
+  seed; confirm no `conflict.py`/`precedence.py` or conflict/precedence
+  behavior was introduced.
+* Confirm the recorded `naming -> framecheck` DAG edge is acceptable as a
+  verbatim-move consequence rather than a scope broadening.
+
+== Open items
+
+None functionally. One transparent DAG deviation recorded above for review
+judgement (not a behavior change). Disposition (move to Done + archive to
+`docs/cold_storage/.../ftrs/` + phase comment in `_ftrs_open.adoc`) is deferred
+to the independent review and developer merge confirmation per the per-FTR
+workflow.
