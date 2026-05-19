@@ -8,6 +8,7 @@ import pytest
 pytestmark = [
     pytest.mark.ftr("FTR-IR-WRITEPATH-P1"),
     pytest.mark.ftr("FTR-LEGEND-BLOCKS"),
+    pytest.mark.ftr("FTR-IR-006-RENDER-INPUT-MUTATION-FIX"),
 ]
 
 
@@ -77,11 +78,6 @@ def test_compose_adds_legend_table_block_next_to_data_table():
     assert legend_table.headers == ["Token", "Meaning", "Group"]
     assert legend_table.data[1] == ["E-R-K", "Capital-path recalculation", "input"]
 
-    resolved = meta["legend_blocks"]["status_codes"]["resolved"]
-    assert resolved["sheet"] == "product_matrix"
-    assert resolved["top"] == 1
-    assert resolved["left"] == 4
-
 
 def test_compose_rejects_duplicate_legend_tokens():
     frames = {"product_matrix": pd.DataFrame({"feature": ["currency"]})}
@@ -136,3 +132,32 @@ def test_render_plan_emits_data_for_data_and_legend_tables():
 
     assert any(op.sheet == "product_matrix" and op.row == 1 and op.col == 4 and op.text == "Token" for op in header_ops)
     assert any(op.sheet == "product_matrix" and op.r1 == 2 and op.c1 == 4 and op.data == (("E", "Editable"),) for op in data_ops)
+
+
+def test_compose_workbook_does_not_mutate_legend_blocks_meta():
+    import copy
+
+    frames = {
+        "product_matrix": pd.DataFrame({"feature": ["currency"], "FZ-AD": ["E-R-K"]})
+    }
+    meta = {
+        "legend_blocks": {
+            "status_codes": {
+                "title": "Status Codes",
+                "placement": {
+                    "sheet": "product_matrix",
+                    "anchor": "right_of_table",
+                    "target": "product_matrix",
+                },
+                "entries": [
+                    {"token": "E", "label": "Editable"},
+                    {"token": "E-R-K", "label": "Capital-path recalculation"},
+                ],
+            }
+        }
+    }
+    meta_before = copy.deepcopy(meta)
+
+    compose_workbook(frames, meta)
+
+    assert meta == meta_before, "compose_workbook must not mutate caller-owned meta"

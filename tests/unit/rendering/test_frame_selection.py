@@ -3,10 +3,14 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.core.formulas import LookupFormulaSpec, lookup_formula
 from spreadsheet_handling.io_backends.spreadsheet_contract import build_spreadsheet_render_plan
 from spreadsheet_handling.rendering.frame_selection import select_render_frames
 
-pytestmark = pytest.mark.ftr("FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4")
+pytestmark = [
+    pytest.mark.ftr("FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4"),
+    pytest.mark.ftr("FTR-IR-006-RENDER-INPUT-MUTATION-FIX"),
+]
 
 
 def _frames_with_meta(meta: dict) -> dict:
@@ -165,3 +169,41 @@ def test_configured_workbook_view_fails_for_missing_or_duplicate_sheets() -> Non
                 }
             },
         )
+
+
+@pytest.mark.ftr("FTR-IR-006-RENDER-INPUT-MUTATION-FIX")
+def test_workbook_view_rename_does_not_mutate_source_dataframe() -> None:
+    formula = lookup_formula(
+        source_key_column="id",
+        lookup_sheet="products_view",
+        lookup_key_column="id",
+        lookup_value_column="name",
+    )
+    original_df = pd.DataFrame({"ref": [formula]})
+    frames = {
+        "products_view": pd.DataFrame({"id": [1], "name": ["Widget"]}),
+        "orders_view": original_df,
+    }
+    meta = {
+        "workbook_view": {
+            "sheets": [
+                {"frame": "products_view", "sheet": "Products"},
+                {"frame": "orders_view", "sheet": "Orders"},
+            ]
+        }
+    }
+
+    selected = select_render_frames(frames, meta)
+
+    # The render-local copy must carry the rewritten sheet name.
+    rewritten_cell = selected["Orders"]["ref"].iloc[0]
+    assert isinstance(rewritten_cell, LookupFormulaSpec)
+    assert rewritten_cell.lookup_sheet == "Products"
+
+    # The original caller-owned DataFrame must be unchanged.
+    original_cell = original_df["ref"].iloc[0]
+    assert isinstance(original_cell, LookupFormulaSpec)
+    assert original_cell.lookup_sheet == "products_view"
+
+    # The selected render copy must be a distinct object, not the original.
+    assert selected["Orders"] is not original_df

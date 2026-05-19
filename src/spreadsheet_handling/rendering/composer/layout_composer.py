@@ -227,16 +227,6 @@ def _add_legend_blocks(wb: WorkbookIR, meta: Dict[str, Any] | None) -> None:
         )
         sheet.tables.append(table)
 
-        spec["resolved"] = {
-            "kind": "legend",
-            "sheet": sheet_name,
-            "frame_name": frame_name,
-            "top": top,
-            "left": left,
-            "n_rows": table.n_rows,
-            "n_cols": table.n_cols,
-        }
-
 def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> WorkbookIR:
     """
     Build a naive 1-table-per-sheet IR:

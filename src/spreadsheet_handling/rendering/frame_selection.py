@@ -182,9 +182,11 @@ def _resolve_formula_sheet_names(
     frame_to_sheet: dict[str, str],
 ) -> None:
     """Rewrite LookupFormulaSpec.lookup_sheet from frame name to physical sheet name."""
-    for sheet_name, value in selected.items():
+    for sheet_name in list(selected.keys()):
+        value = selected[sheet_name]
         if not isinstance(value, pd.DataFrame):
             continue
+        copied = False
         for col in value.columns:
             series = value[col]
             if series.empty:
@@ -194,6 +196,10 @@ def _resolve_formula_sheet_names(
                 continue
             if first.lookup_sheet not in frame_to_sheet:
                 continue
+            if not copied:
+                value = value.copy()
+                selected[sheet_name] = value
+                copied = True
             new_sheet = frame_to_sheet[first.lookup_sheet]
             value[col] = series.apply(
                 lambda cell, ns=new_sheet: lookup_formula(
