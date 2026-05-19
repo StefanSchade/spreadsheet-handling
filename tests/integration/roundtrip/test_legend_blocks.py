@@ -6,6 +6,8 @@ rather than becoming ordinary data frames.
 
 from __future__ import annotations
 
+import copy
+
 import pandas as pd
 import pytest
 
@@ -50,8 +52,10 @@ def _frames_with_legend() -> dict:
 
 
 def test_xlsx_legend_block_roundtrips_as_metadata_not_data_frame(tmp_path):
+    frames = _frames_with_legend()
+    meta_before = copy.deepcopy(frames["_meta"])
     xlsx = tmp_path / "legend.xlsx"
-    ExcelBackend().write_multi(_frames_with_legend(), str(xlsx))
+    ExcelBackend().write_multi(frames, str(xlsx))
 
     ir = parse_workbook(xlsx)
     sheet = ir.sheets["product_matrix"]
@@ -70,6 +74,7 @@ def test_xlsx_legend_block_roundtrips_as_metadata_not_data_frame(tmp_path):
         {"feature": "amount", "FZ-AD": "E-R-K"},
     ]
     assert "legend_blocks" in back["_meta"]
+    assert frames["_meta"] == meta_before
 
 
 def test_ods_legend_block_roundtrips_as_metadata_not_data_frame(tmp_path):

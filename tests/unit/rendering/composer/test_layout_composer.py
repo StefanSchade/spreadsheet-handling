@@ -1,3 +1,6 @@
+import copy
+import json
+
 import pandas as pd
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.flow import build_render_plan
@@ -135,8 +138,6 @@ def test_render_plan_emits_data_for_data_and_legend_tables():
 
 
 def test_compose_workbook_does_not_mutate_legend_blocks_meta():
-    import copy
-
     frames = {
         "product_matrix": pd.DataFrame({"feature": ["currency"], "FZ-AD": ["E-R-K"]})
     }
@@ -158,6 +159,11 @@ def test_compose_workbook_does_not_mutate_legend_blocks_meta():
     }
     meta_before = copy.deepcopy(meta)
 
-    compose_workbook(frames, meta)
+    ir = compose_workbook(frames, meta)
 
     assert meta == meta_before, "compose_workbook must not mutate caller-owned meta"
+    meta_blob = json.loads(ir.hidden_sheets["_meta"].meta["workbook_meta_blob"])
+    resolved = meta_blob["legend_blocks"]["status_codes"]["resolved"]
+    assert resolved["sheet"] == "product_matrix"
+    assert resolved["top"] == 1
+    assert resolved["left"] == 4

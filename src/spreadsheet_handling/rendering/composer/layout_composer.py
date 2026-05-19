@@ -112,6 +112,20 @@ def _legend_items(meta: Dict[str, Any] | None) -> list[tuple[str, dict[str, Any]
     raise ValueError("legend_blocks must be a mapping or a list of mappings")
 
 
+def _clone_legend_blocks(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        return {
+            name: dict(spec) if isinstance(spec, dict) else spec
+            for name, spec in raw.items()
+        }
+    if isinstance(raw, list):
+        return [
+            dict(spec) if isinstance(spec, dict) else spec
+            for spec in raw
+        ]
+    return raw
+
+
 def _legend_columns(entries: list[dict[str, Any]]) -> list[str]:
     columns = list(_LEGEND_BASE_COLUMNS)
     for column in _LEGEND_OPTIONAL_COLUMNS:
@@ -227,6 +241,17 @@ def _add_legend_blocks(wb: WorkbookIR, meta: Dict[str, Any] | None) -> None:
         )
         sheet.tables.append(table)
 
+        # Persist render-local reconstruction data only on the cloned meta copy.
+        spec["resolved"] = {
+            "kind": "legend",
+            "sheet": sheet_name,
+            "frame_name": frame_name,
+            "top": top,
+            "left": left,
+            "n_rows": table.n_rows,
+            "n_cols": table.n_cols,
+        }
+
 def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> WorkbookIR:
     """
     Build a naive 1-table-per-sheet IR:
@@ -238,10 +263,16 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
       - Preserves domain meta in a hidden _meta sheet.
     """
     wb = WorkbookIR()
+    workbook_meta = None
+    if meta:
+        workbook_meta = dict(meta)
+        if "legend_blocks" in meta:
+            workbook_meta["legend_blocks"] = _clone_legend_blocks(meta.get("legend_blocks"))
+
     workbook_options = {
-        key: meta[key]
+        key: workbook_meta[key]
         for key in _WORKBOOK_OPTION_KEYS
-        if meta and key in meta
+        if workbook_meta and key in workbook_meta
     }
 
     for name, df in frames.items():
@@ -284,20 +315,20 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
 
         # inject workbook and per-sheet options from meta
         options = dict(workbook_options)
-        if meta:
-            sheet_opts = (meta.get("sheets") or {}).get(str(name))
+        if workbook_meta:
+            sheet_opts = (workbook_meta.get("sheets") or {}).get(str(name))
             if isinstance(sheet_opts, dict) and sheet_opts:
                 options.update(sheet_opts)
         if options:
             sh.meta.setdefault("options", {}).update(options)
 
-    _add_legend_blocks(wb, meta)
+    _add_legend_blocks(wb, workbook_meta)
 
     # stash the domain meta so meta_pass can persist it (unchanged from your version)
-    if meta:
+    if workbook_meta:
         meta_sheet = wb.hidden_sheets.setdefault("_meta", SheetIR(name="_meta"))
         meta_sheet.meta["workbook_meta_blob"] = json.dumps(
-            meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            workbook_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
 
     return wb
