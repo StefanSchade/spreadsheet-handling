@@ -45,7 +45,7 @@ EXCL=(
     --exclude-dir node_modules --exclude-dir dist      --exclude-dir build
     --exclude-dir tmp        --exclude-dir lib         --exclude-dir lib64
     --exclude-dir bin        --exclude-dir target      --exclude-dir output
-    --exclude-dir cold_storage
+    --exclude-dir cold_storage --exclude-dir warm_storage_phase3
     --exclude-ext pyc  --exclude-ext pyo  --exclude-ext pdf
     --exclude-ext png  --exclude-ext jpg  --exclude-ext jpeg
     --exclude-ext gif  --exclude-ext svg
@@ -78,7 +78,7 @@ skip_dir() {
     case "$1" in
         .git|.venv|.venv_win|__pycache__|.mypy_cache|.pytest_cache|.ruff_cache) return 0 ;;
         .idea|.vscode|node_modules|dist|build|tmp|lib|lib64|bin|target|output)   return 0 ;;
-        cold_storage) return 0 ;;
+        cold_storage|warm_storage_phase3) return 0 ;;
     esac
     return 1
 }
