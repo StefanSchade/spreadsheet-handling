@@ -23,10 +23,20 @@ pytestmark = [
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STEP_REGISTRY_PATH = (
-    REPO_ROOT / "docs" / "internal_guide" / "architecture" / "pipeline_step_registry.json"
+    REPO_ROOT
+    / "docs"
+    / "technical_model"
+    / "ch05_registries"
+    / "pipeline_step_registry"
+    / "pipeline_step_registry.json"
 )
 META_REGISTRY_PATH = (
-    REPO_ROOT / "docs" / "internal_guide" / "architecture" / "meta_registry.yaml"
+    REPO_ROOT
+    / "docs"
+    / "technical_model"
+    / "ch05_registries"
+    / "meta_registry"
+    / "meta_registry.yaml"
 )
 
 
