@@ -37,3 +37,149 @@ jobs:
       - run: python -m build      # creates dist/*
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-docs:
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Serialize Pages publishing across overlapping tag pushes so two release
+    # jobs cannot race the same `main` branch of `spreadsheet-handling-pages`.
+    # Do not cancel a running publish: every release tag must get a chance to
+    # write its own `versions/<tag>/core/` snapshot.
+    concurrency:
+      group: pages-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # CRITICAL for dynamic version from tag
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install documentation build stack
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y asciidoctor plantuml graphviz ruby-asciidoctor-plantuml rsync
+          python -m pip install --upgrade pip
+          python -m pip install packaging
+      - name: Build static documentation
+        run: make docs-pages
+      - name: Configure Pages deploy SSH key
+        env:
+          DOCS_DEPLOY_KEY: ${{ secrets.DOCS_DEPLOY_KEY }}
+        # Why this shape:
+        #  * Deploy key writes only to `spreadsheet-handling-pages` (no core write access).
+        #  * Runner is ephemeral, so the key file is discarded with the runner.
+        #  * Private key is consumed via env in this step only; not printed and not exported.
+        #  * GitHub SSH host keys are pinned inline instead of trust-on-first-use via
+        #    `ssh-keyscan github.com`, so an unexpected host key cannot be silently
+        #    accepted at runtime. Update if GitHub publishes a key rotation.
+        run: |
+          set -euo pipefail
+          test -n "$DOCS_DEPLOY_KEY"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DOCS_DEPLOY_KEY" > ~/.ssh/docs_deploy_key
+          chmod 600 ~/.ssh/docs_deploy_key
+          cat >> ~/.ssh/known_hosts <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAAhAo1xsasjMU+ahPTSPnAGfvIQz1G1ujz8aPaELLJzMM6N
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+          chmod 600 ~/.ssh/known_hosts
+      - name: Publish documentation artifacts to Pages repository
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/docs_deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          set -euo pipefail
+
+          docs_out="$PWD/build/pages"
+          docs_root="$PWD/build/pages-root"
+          pages_repo="$PWD/build/pages-repo"
+          version_path="versions/${GITHUB_REF_NAME}"
+
+          # PEP 440 comparison instead of `git tag --sort=v:refname`: Git's
+          # version sort does not understand pre-release suffixes, so once a
+          # GA tag like `v0.1.0` joins beta tags like `v0.1.0b6`, the GA tag
+          # would be incorrectly sorted older than the beta. PEP 440 via
+          # `packaging.version.Version` orders pre-releases below the matching
+          # release, which is the rule we actually want for `latest/core/`.
+          latest_tag="$(python3 - <<'PY'
+          import subprocess
+          from packaging.version import Version, InvalidVersion
+
+          out = subprocess.check_output(["git", "tag", "-l", "v*"], text=True)
+          parsed = []
+          for tag in out.split():
+              try:
+                  parsed.append((Version(tag[1:]), tag))
+              except InvalidVersion:
+                  continue
+          if parsed:
+              parsed.sort(key=lambda item: item[0])
+              print(parsed[-1][1])
+          PY
+          )"
+          echo "Newest PEP 440 tag: ${latest_tag:-<none>}"
+
+          git clone git@github.com:StefanSchade/spreadsheet-handling-pages.git "$pages_repo"
+
+          # Replace only this publisher's owned subtree. Never delete or
+          # rsync-delete shared roots (`versions/`, `latest/`, `.nojekyll`,
+          # `index.html`, or other publishers' `demo/`, `presentations/`).
+          rm -rf "$pages_repo/$version_path/core"
+          mkdir -p "$pages_repo/$version_path/core"
+          rsync -a "$docs_out/" "$pages_repo/$version_path/core/"
+
+          touch "$pages_repo/.nojekyll"
+
+          # Always refresh the stable root index. PyPI keeps old README
+          # versions online, so the root URL must remain a valid stable entry
+          # point even years after a release. The root links to /latest/core/
+          # and to this release's /versions/<tag>/core/; users can navigate
+          # from there. It is a stable navigation page, not a redirect.
+          cp "$docs_root/index.html" "$pages_repo/index.html"
+
+          if [ -n "$latest_tag" ] && [ "$GITHUB_REF_NAME" = "$latest_tag" ]; then
+            rm -rf "$pages_repo/latest/core"
+            mkdir -p "$pages_repo/latest/core"
+            rsync -a "$docs_out/" "$pages_repo/latest/core/"
+            git -C "$pages_repo" add latest/core
+          else
+            echo "Skipping latest/core update: ${GITHUB_REF_NAME} is not newest tag (${latest_tag:-<none>})."
+          fi
+
+          git -C "$pages_repo" config user.name "github-actions[bot]"
+          git -C "$pages_repo" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$pages_repo" add .nojekyll index.html "$version_path/core"
+
+          if git -C "$pages_repo" diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+
+          git -C "$pages_repo" commit -m "docs: publish ${GITHUB_REF_NAME} core documentation"
+
+          # Push retry with rebase: a concurrent publish-docs run could have
+          # advanced `main` between our clone and our push. Job-level
+          # concurrency normally prevents this, but a manual push to the Pages
+          # repo would also produce non-fast-forward. Rebase our single docs
+          # commit onto the new tip and retry. Limited retries so a real
+          # permission or network failure surfaces instead of looping forever.
+          for attempt in 1 2 3 4 5; do
+            if git -C "$pages_repo" push origin main; then
+              echo "Pushed Pages update on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}/5). Rebasing on origin/main and retrying."
+            git -C "$pages_repo" pull --rebase origin main
+          done
+          echo "Push to Pages repository failed after 5 attempts."
+          exit 1

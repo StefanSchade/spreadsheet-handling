@@ -153,12 +153,17 @@ ci: syntax lint test ## Run syntax + lint + tests
 # Docs (AsciiDoc → HTML/PDF)
 # =========================
 DOC_BUILD_DIR ?= target/docs
+DOC_PAGES_DIR      := $(BUILD_DIR)/pages
+DOC_PAGES_ROOT_DIR := $(BUILD_DIR)/pages-root
 BUILD_DATE    := $(shell date -Iseconds)
 DOCS_SRC      := $(wildcard docs/*/*.adoc)
 
-.PHONY: docs-all docs-html docs-pdf check-asciidoctor check-asciidoctor-pdf clean-docs
+.PHONY: docs-all docs-html docs-pages docs-pdf check-asciidoctor check-asciidoctor-plantuml check-plantuml check-graphviz check-asciidoctor-pdf clean-docs
 
 docs-all: docs-html docs-pdf ## Build HTML and PDF for all docs/*/*.adoc
+
+docs-pages: check-asciidoctor check-asciidoctor-plantuml check-plantuml check-graphviz ## Build public Pages HTML into build/pages/ and root nav into build/pages-root/
+	@scripts/build_docs_pages.sh "$(DOC_PAGES_DIR)" "$(DOC_PAGES_ROOT_DIR)"
 
 docs-html: check-asciidoctor ## Build HTML for all docs/*/*.adoc
 	@set -e; \
@@ -208,6 +213,24 @@ check-asciidoctor: ## Check asciidoctor is available
 		exit 127; \
 	}
 
+check-asciidoctor-plantuml: ## Check asciidoctor-plantuml Ruby extension is available
+	@ruby -e 'require "asciidoctor-plantuml"' >/dev/null 2>&1 || { \
+		echo "asciidoctor-plantuml not found. Install: sudo apt install ruby-asciidoctor-plantuml"; \
+		exit 127; \
+	}
+
+check-plantuml: ## Check PlantUML is available for AsciiDoc diagrams
+	@command -v plantuml >/dev/null 2>&1 || { \
+		echo "plantuml not found. Install: sudo apt install plantuml"; \
+		exit 127; \
+	}
+
+check-graphviz: ## Check Graphviz dot is available for diagram rendering
+	@command -v dot >/dev/null 2>&1 || { \
+		echo "graphviz dot not found. Install: sudo apt install graphviz"; \
+		exit 127; \
+	}
+
 check-asciidoctor-pdf: check-asciidoctor ## Check asciidoctor-pdf is available
 	@command -v asciidoctor-pdf >/dev/null 2>&1 || { \
 		echo "asciidoctor-pdf not found. Install: gem install asciidoctor-pdf"; \
@@ -215,7 +238,7 @@ check-asciidoctor-pdf: check-asciidoctor ## Check asciidoctor-pdf is available
 	}
 
 clean-docs: ## Remove doc build output
-	@rm -rf "$(DOC_BUILD_DIR)"
+	@rm -rf "$(DOC_BUILD_DIR)" "$(DOC_PAGES_DIR)" "$(DOC_PAGES_ROOT_DIR)"
 
 # =========================
 # Snapshot

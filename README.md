@@ -4,6 +4,13 @@
 It converts between JSON, CSV, and Excel (XLSX/ODS) while preserving relationships such as foreign keys, indexes, and hierarchies.  
 The goal is to make complex spreadsheet models easier to validate, transform, and round-trip into structured formats.
 
+This project is still beta. The main user entry point is the
+[spreadsheet-handling-demo](https://github.com/StefanSchade/spreadsheet-handling-demo)
+repository, which contains the runnable prototype integration. Published
+documentation is available at
+[stefanschade.github.io/spreadsheet-handling-pages](https://stefanschade.github.io/spreadsheet-handling-pages/);
+it is being expanded gradually.
+
 ---
 
 ## Features
@@ -62,4 +69,3 @@ according to the [JetBrains Developer Ecosystem 2025 survey published by *Golem.
 
 This project is licensed under the terms of the MIT License.
 See [LICENCE](LICENSE) for details.
-

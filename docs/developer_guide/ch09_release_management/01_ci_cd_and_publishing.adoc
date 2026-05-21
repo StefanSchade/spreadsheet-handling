@@ -25,7 +25,291 @@ on:
 | `publish`
 | `v*` tag only, after `test` succeeds
 | Builds sdist + wheel with `python -m build`, publishes to PyPI
+
+| `publish-docs`
+| `v*` tag only, after `publish` succeeds
+| Builds core AsciiDoc HTML with `make docs-pages`, then publishes generated
+  artifacts to `spreadsheet-handling-pages` via the `DOCS_DEPLOY_KEY` SSH key
 |===
+
+==== Why `publish-docs` is sequenced after `publish`
+
+`publish-docs` declares `needs: publish`, so it only runs after PyPI publishing
+has succeeded. This is deliberate:
+
+* The documentation site advertises a release version; publishing docs for a
+  version that never reached PyPI would mislead users.
+* A failed PyPI publish (token problem, sdist build failure, Trusted Publisher
+  misconfiguration) must not leak into the public docs trail.
+* PyPI publishing is the irreversible side-effect; docs publishing is a
+  downstream artifact refresh. Failing fast on PyPI keeps the recovery story
+  simple -- re-run the workflow after fixing the underlying problem and the
+  docs catch up.
+
+==== Why Pages writes are serialized
+
+The `publish-docs` job sets a job-level concurrency group:
+
+[source,yaml]
+----
+concurrency:
+  group: pages-publish
+  cancel-in-progress: false
+----
+
+Two release tags pushed in quick succession would otherwise both clone the same
+`HEAD` of `spreadsheet-handling-pages`, race the final `git push`, and one of
+the two `versions/<tag>/core/` snapshots would be lost on a non-fast-forward
+rejection. `cancel-in-progress: false` ensures every tagged release still gets
+to write its own immutable `versions/<tag>/core/` snapshot rather than being
+preempted by a newer tag.
+
+==== Why the push retries with rebase
+
+The publish step pushes the generated commit with a bounded retry loop. On
+each non-fast-forward rejection it runs `git pull --rebase origin main` and
+tries again, up to five attempts.
+
+* Job-level concurrency normally prevents conflicting writes, but a manual
+  edit to `spreadsheet-handling-pages` (for example a hand-edited root page or
+  a typo fix on `latest/core/`) can still advance `main` between clone and
+  push.
+* Rebasing the single docs commit onto the new tip is safe because each
+  publisher only touches its own subtree (`versions/<tag>/core/`, `index.html`,
+  optionally `latest/core/`).
+* The retry is bounded so a real authentication or network failure surfaces
+  instead of looping forever.
+
+=== Documentation Build Stack
+
+The first Pages publishing slice builds normal AsciiDoc HTML from the core
+repository only. It does not build Reveal.js presentations, and it does not
+publish demo walkthroughs. Reveal.js / `asciidoctor-revealjs` and presentation
+publishing from `spreadsheet-handling-demo` are intentionally deferred to a
+later demo/presentation publishing slice.
+
+The CI runner and a local VM both need this documentation toolchain:
+
+* `asciidoctor`
+* `plantuml`
+* `graphviz`
+* Java runtime (`default-jre-headless` or OpenJDK 21)
+* `ruby-asciidoctor-plantuml`
+
+On the current Debian/Ubuntu-style environment, prepare the stack with:
+
+[source,console]
+----
+sudo apt-get update
+sudo apt-get install -y \
+    asciidoctor \
+    plantuml \
+    graphviz \
+    default-jre-headless \
+    ruby-asciidoctor-plantuml
+----
+
+CI additionally pins Java with `actions/setup-java` instead of relying on the
+system JRE:
+
+[source,yaml]
+----
+- uses: actions/setup-java@v4
+  with:
+    distribution: temurin
+    java-version: '21'
+----
+
+The PEP 440 latest-tag guard (see "Pages Artifact Layout" below) runs through
+`python3` with the `packaging` library. CI installs it explicitly. Locally,
+`packaging` is already pulled in transitively by the project's dev dependencies
+through `setuptools-scm`, so no extra step is required for `make docs-pages`.
+
+The public core documentation build is:
+
+[source,console]
+----
+make docs-pages
+----
+
+This renders, into `build/pages/`:
+
+* `docs/pages/index.adoc` -- core landing page
+* `docs/user_guide/user_guide.adoc` -- user guide
+* `docs/release_notes/release_notes.adoc` -- release notes entry point
+
+And into `build/pages-root/`:
+
+* `docs/pages/root_index.adoc` -- root navigation page for the Pages repo
+
+Both output directories are under `build/`, which is gitignored. *Generated
+HTML must never be committed to `spreadsheet-handling`.* Release publishing
+copies the output into the separate `spreadsheet-handling-pages` artifact
+repository.
+
+=== Local Toolchain Reference
+
+The headless Debian developer VM keeps the local toolchain grouped by purpose.
+The release/docs workflow only depends on the "documentation build" group, but
+the others are recorded here so a fresh VM (or a future CI image) can be set
+up with one apt invocation.
+
+[cols="1,3"]
+|===
+| Group | Packages
+
+| Base development tools
+| `git`, `curl`, `wget`, `build-essential`, `make`, `ripgrep`, `fd-find`,
+  `tmux`, `jq`, `unzip`
+
+| Python / build tools
+| `python3`, `python3-pip`, `python3-venv`
+
+| Spreadsheet / office tools (for round-trip checks)
+| `libreoffice`, `libreoffice-calc`
+
+| Documentation build tools (required by `make docs-pages`)
+| `asciidoctor`, `plantuml`, `graphviz`, `default-jre-headless`,
+  `ruby-asciidoctor-plantuml`
+
+| AI-agent convenience tools
+| `nodejs`, `npm`, plus locally installed Codex / Claude CLIs
+
+| VM / operator convenience tools
+| `qemu-guest-agent`, `tree`, `cloc`, `mosh`, `locales`, `yq`
+|===
+
+Reveal.js / `asciidoctor-revealjs` is intentionally absent: presentation
+publishing is the responsibility of a later demo/presentation slice in
+`spreadsheet-handling-demo`, not the core publishing path.
+
+=== Pages Artifact Layout
+
+The Pages repository uses shared release roots for a validated combined release
+state. Individual source repositories own subdirectories inside those roots:
+
+* `versions/<tag>/core/` -- core documentation built by
+  `spreadsheet-handling`
+* `versions/<tag>/demo/` -- future demo integration documentation
+* `versions/<tag>/presentations/` -- future presentation output
+* `latest/core/`, `latest/demo/`, `latest/presentations/` -- moving pointers
+  for the latest validated release state
+
+The core workflow only ever replaces the core-owned subtree. It removes and
+re-copies `versions/<tag>/core/` for every release tag run. It updates
+`latest/core/` only when the triggering tag is the highest visible `v*` tag by
+PEP 440 ordering. Older tag reruns therefore refresh their stable versioned
+snapshot without rolling back `latest/core/`.
+
+==== Why `/versions/<tag>/core/` is treated as immutable
+
+Each tagged release produces a stable snapshot at `versions/<tag>/core/`. Old
+PyPI release pages remain online forever, and their READMEs link into the
+Pages site. If those snapshots could shift retroactively, an old PyPI release
+page would silently start linking to documentation describing a newer library
+version. Treating `versions/<tag>/core/` as effectively immutable per tag
+preserves the link contract for users browsing historical releases.
+
+A re-run for the same tag does overwrite `versions/<tag>/core/` -- that is the
+intended escape hatch for fixing a broken doc build, not for editing the
+release narrative.
+
+==== Why `/latest/core/` is guarded
+
+`latest/core/` is a moving pointer and must only advance, never roll back. The
+guard is "only update when the triggering tag is the newest PEP 440 version
+among the visible `v*` tags". Re-running an older tag therefore refreshes that
+tag's stable `versions/<tag>/core/` snapshot but leaves `latest/core/` pointing
+to the actual latest release.
+
+==== Why PEP 440 comparison instead of Git version sort
+
+The earlier implementation used:
+
+[source,console]
+----
+git tag -l 'v*' --sort=-v:refname | head -n 1
+----
+
+Git's version sort does *not* understand pre-release suffixes. For tags
+`v0.1.0`, `v0.1.0b6`, `v0.1.0b10` it would sort `v0.1.0b10 > v0.1.0b6 > v0.1.0`
+because the trailing `b6`/`b10` is appended after the version number, not
+interpreted as a pre-release marker. Once a GA tag like `v0.1.0` ships, the
+guard would incorrectly believe a beta is still newer.
+
+The workflow now runs a short Python comparator that parses each tag with
+`packaging.version.Version` (stripping the leading `v`) and selects the max.
+PEP 440 sorts pre-releases below the matching release, so:
+
+* `v0.1.0b1 < v0.1.0b6 < v0.1.0b10 < v0.1.0` -- expected order
+* invalid tags are silently skipped instead of breaking the sort
+
+==== Why the root `index.html` is a navigation page, not a redirect
+
+The Pages root URL is referenced from `README.md` (and therefore from the
+README that PyPI freezes onto every release page). PyPI keeps that
+long-description rendering online indefinitely. Pointing the root URL straight
+at `/latest/core/` via redirect would mean that a user who clicks the link
+from an old PyPI release lands on documentation for a later library version,
+without any indication of the mismatch.
+
+Instead, the root `index.html` is a stable landing page that names this
+release explicitly, links to `/latest/core/`, and links to
+`/versions/<tag>/core/` for the release that generated the index. The source
+lives at `docs/pages/root_index.adoc`; the workflow rebuilds it on every
+release and copies it to the Pages repo root.
+
+==== Scope boundary: per-version umbrella index
+
+A future `versions/<tag>/index.html` (or `latest/index.html`) linking matching
+core / demo / presentations versions together is out of scope for this
+publishing slice. That umbrella page coordinates output from multiple
+publishers and belongs to a later cross-publisher slice. Until then the only
+shared page owned at the repo root is the navigation `index.html` described
+above; `versions/<tag>/` and `latest/` directories themselves stay flat,
+without an umbrella index.
+
+=== Pages Repository Configuration
+
+[cols="1,3"]
+|===
+| Setting | Value
+
+| Repository
+| `StefanSchade/spreadsheet-handling-pages`
+
+| Publishing branch
+| `main`
+
+| Publishing folder
+| `/ (root)`
+
+| Deploy credential
+| SSH deploy key (write access). The private key is stored as the repository
+  secret `DOCS_DEPLOY_KEY` on `spreadsheet-handling`; the matching public key
+  is registered on `spreadsheet-handling-pages` with write access.
+
+| Public URL
+| https://stefanschade.github.io/spreadsheet-handling-pages/
+|===
+
+==== Why SSH deploy-key handling is structured the way it is
+
+* *Deploy key, not a personal token*: the credential only grants write access
+  to `spreadsheet-handling-pages`. A leak cannot push to core or to any other
+  repository.
+* *Step-scoped secret*: `DOCS_DEPLOY_KEY` is only exposed to the
+  "Configure Pages deploy SSH key" step, written to a private file with mode
+  `600`, and never echoed. Subsequent steps reach it only via
+  `GIT_SSH_COMMAND` pointing at the file path.
+* *Pinned host keys*: instead of trust-on-first-use through
+  `ssh-keyscan github.com`, the workflow writes GitHub's published SSH host
+  keys (ed25519, ecdsa-sha2-nistp256, ssh-rsa) into `known_hosts` and runs
+  `ssh` with `StrictHostKeyChecking=yes`. A man-in-the-middle on the runner's
+  network path cannot silently substitute an unexpected host key. Pinning
+  costs a one-time update if GitHub ever rotates its SSH host keys.
+* *Ephemeral runner*: GitHub Actions runners are discarded after the job, so
+  no further cleanup of the key file is required.
 
 === Dynamic Version from Tag
 
@@ -71,7 +355,13 @@ git push origin v1.2.3      # developer executes
 ----
 . GitHub Actions picks up the tag, runs tests, builds the distribution, and
   publishes to PyPI automatically.
+. After PyPI publishing succeeds, GitHub Actions builds core documentation and
+  publishes generated HTML to `spreadsheet-handling-pages` under
+  `/versions/<tag>/core/`, and under `/latest/core/` only for the newest
+  release tag.
 . Verify the release at https://pypi.org/project/spreadsheet-handling/.
+. Verify the published documentation at
+  https://stefanschade.github.io/spreadsheet-handling-pages/.
 
 === Consumer Repo Integration
 
