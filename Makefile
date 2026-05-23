@@ -262,6 +262,14 @@ snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs,
 release-check: ## Pre-tag branch and topology check (read-only). Pass a tag as TAG=vX.Y.Z to also validate the tag.
 	@bash "$(ROOT)tools/release_check.sh" "$(TAG)"
 
+.PHONY: pages-check
+pages-check: ## Post-deploy Pages structure check. CORE_TAG=vX required; DEMO_TAG, PAGES_DIR optional; LATEST=1 also checks latest/ aliases.
+	@bash "$(ROOT)tools/pages_publish_check.sh" \
+	  $(if $(PAGES_DIR),--pages "$(PAGES_DIR)") \
+	  $(if $(CORE_TAG),--core-tag "$(CORE_TAG)") \
+	  $(if $(DEMO_TAG),--demo-tag "$(DEMO_TAG)") \
+	  $(if $(LATEST),--check-latest)
+
 # =========================
 # Coverage
 # =========================
