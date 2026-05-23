@@ -49,6 +49,97 @@ the generated artifacts after release. Write access from CI uses the SSH
 deploy key whose private half is stored as the `DOCS_DEPLOY_KEY` secret on the
 core repository.
 
+=== Cross-Repo Release Sequence
+
+A release touches three repositories in a strict order. The intent of
+this section is to give an operator a one-screen mental model so the
+later checklists can be followed without rereading the whole runbook.
+
+[cols="1,1,2,2,1", options="header"]
+|===
+| Stage | Repository | What happens | Owner | Verification
+
+| 1
+| `spreadsheet-handling` (core)
+| Pre-tag branch and topology check; tag created on `main`; tag pushed;
+  PyPI Trusted Publisher uploads the release; core `publish-docs` writes
+  `versions/<core-tag>/core/` (and `latest/core/` for the newest tag)
+  into the Pages repo.
+| Release operator (you)
+| `make release-check`, then `make release-check TAG=vX.Y.Z`;
+  PyPI project page; CI status on the tag commit; `make pages-check
+  CORE_TAG=vX.Y.Z LATEST=1` after the Pages push completes.
+
+| 2
+| `spreadsheet-handling-demo` (demo)
+| Demo `pyproject.toml` core pin updated to the published version; demo
+  test suite runs against the installed PyPI release; demo state
+  committed on `main`; optional demo tag `vX.Y.Z-demo` created and
+  pushed; demo `publish-docs` writes
+  `versions/<demo-tag>/demo/slides/` (and `latest/demo/slides/` for the
+  newest demo tag).
+| Release operator (you)
+| Demo CI green on the tag commit; `make pages-check CORE_TAG=vX.Y.Z
+  DEMO_TAG=vX.Y.Z-demo LATEST=1` reports all sections plausible.
+
+| 3
+| `spreadsheet-handling-pages` (pages)
+| Receives the generated artifacts from stages 1 and 2 under the shared
+  release roots. Pull the working tree locally before running
+  `pages-check`. The pages repo has no CI surface of its own; both
+  publishers push directly under their owned subtrees with the
+  `DOCS_DEPLOY_KEY` SSH deploy key.
+| Both publishers (write-only via deploy key); operator (verifies)
+| `git -C ../pages pull --ff-only`, then `make pages-check ...`.
+|===
+
+Dependencies between stages are real, not stylistic:
+
+* Stage 2 *waits* for stage 1's PyPI artifact to exist. Demo CI installs
+  the pinned core version from PyPI; bumping the pin before the
+  publish succeeds breaks demo CI.
+* Stage 3 (pages) is the *consequence* of stages 1 and 2, not a stage
+  to drive independently. Manual edits to the pages repo are
+  legitimate for the root `index.html` only; the
+  `versions/<tag>/` and `latest/` subtrees are publisher-owned.
+
+For a one-shot "where am I across all three repos right now" view, see
+the `release-status` helper:
+
+[source,console]
+----
+make release-status
+----
+
+It prints per-repo branch/tag/clean state, the demo's pinned core
+version, the versioned core/demo snapshots present in the local pages
+checkout, and a one-line next-action hint based on internal
+consistency. The helper is read-only; it never fetches, never tags,
+never publishes, and never touches the pages working tree. Sibling
+checkouts are auto-detected as `../demo` / `../pages` (or the
+upstream-named `../spreadsheet-handling-demo` / `-pages`); override
+with `CORE_DIR` / `DEMO_DIR` / `PAGES_DIR` if your workspace uses
+different paths.
+
+The three helpers compose into the same flow:
+
+[cols="1,3", options="header"]
+|===
+| When | Helper
+
+| Before tagging
+| `make release-check` (current state) / `make release-check
+  TAG=vX.Y.Z` (validates the named tag's topology)
+
+| After stage 1 or stage 2 push
+| `make pages-check CORE_TAG=vX.Y.Z [DEMO_TAG=...] [LATEST=1]`
+  (verifies the published file tree)
+
+| Any time, to orient
+| `make release-status` (one-shot cross-repo state + likely next
+  action)
+|===
+
 === Branch and Topology Awareness
 
 Release tags must be reachable from `main`. The `v0.1.0b6` release succeeded
@@ -382,6 +473,130 @@ Tags that sit outside `main` cause three follow-on problems:
 
 The check is one small step in the runbook; the recovery cost of
 skipping it is larger than the cost of running it.
+
+=== Cross-Repo Recovery Scenarios
+
+Five additional recovery cases turned up during the beta release.
+None of them require retagging; all of them have a small operator
+action that closes the loop without further damage. Run
+`make release-status` first to confirm which scenario you are in
+before acting.
+
+==== Demo tag pushed before main alignment
+
+Symptom: a `vX.Y.Z-demo` tag exists on `origin` of the demo repo, but
+`main` of the demo repo does not yet contain the pin bump or the
+matching test-run commit. `make release-status` typically shows the
+demo pinned-core version diverging from the just-released core tag.
+
+If the demo `publish-docs` workflow already ran from the tag:
+
+. Confirm the rendered slide decks under `versions/<demo-tag>/demo/slides/`
+  match the intended demo state (they were rendered from the tag
+  commit, not from `main`). `make pages-check CORE_TAG=vX.Y.Z
+  DEMO_TAG=vX.Y.Z-demo LATEST=1` confirms structural presence; eyeball
+  one deck for content.
+. Fast-forward `main` of the demo repo to the tag commit so
+  `git log main` includes the release commit. If `main` has diverged
+  (someone committed elsewhere in the meantime), reconcile by merging
+  or rebasing -- do not retag.
+. Document the topology gap in the next release notes.
+
+If the demo `publish-docs` workflow has not yet run (CI queued or
+held), prefer cancelling and following `Tag created from \`dev\``
+above instead -- treating the demo tag as a normal `non-main-branch`
+tag is cleaner than living with the divergence.
+
+==== Stale workflow rerun
+
+Symptom: a `publish-docs` (or `build-test-publish`) re-run was
+triggered manually from the GitHub UI on an older tag, and the run
+used the workflow definition that existed *at that tag*, not the
+current one on `main`. Rerunning a tag from `v0.1.0b6` for a docs
+fix, for example, would re-execute the `actions/checkout@v4` /
+`actions/setup-python@v5` pin combination -- not the current `@v6` /
+`@v6` pins documented in
+`01_ci_cd_and_publishing.adoc § GitHub Actions Version Policy and
+Dependabot Scope`.
+
+This is intentional GitHub behavior: a tag-triggered run always uses
+the workflow file as it was at the tagged commit. The recovery is to
+recognize it and decide whether you actually want a docs-only
+republish:
+
+. If the artifact still needs republishing (Pages was wiped, etc.),
+  re-running the historical workflow is correct -- accept the older
+  action pins and the Node-runtime deprecation warning that may
+  reappear in the log. The published artifact is the same.
+. If the goal is to republish *with current workflow shape*, cut a
+  new patch-level tag from current `main` instead. PyPI rejects
+  same-version re-uploads, so this path only applies to docs
+  republishes or to a new patch release.
+
+The maintenance-signal classification in §"Blocking vs Non-Blocking
+CI Signals" still applies: action-version deprecation warnings on a
+historical-tag rerun are non-blocking and expected.
+
+==== PyPI succeeded but docs failed
+
+Symptom: `build-test-publish / publish` is green for the tag; the
+PyPI project page shows the new version; `build-test-publish /
+publish-docs` is red. `make pages-check CORE_TAG=vX.Y.Z` reports
+missing or partial sections.
+
+PyPI publication is the irreversible side-effect; documentation is
+recoverable. Do not retag.
+
+. Inspect the failed `publish-docs` run log. The most common
+  failure modes are: the AsciiDoctor build stack apt-get install
+  flaking; the `make docs-pages` build erroring on a source file
+  the release commit changed; the `DOCS_DEPLOY_KEY` push being
+  rejected because the pages repo `main` advanced between clone and
+  push (the workflow already retries with rebase up to 5 times, so a
+  hard failure here is unusual).
+. Re-run the failed `publish-docs` job from the GitHub UI. Tag
+  re-runs use the workflow definition at the tag (see §"Stale
+  workflow rerun" above); accept that.
+. After the re-run goes green: `git -C ../pages pull --ff-only`, then
+  `make pages-check CORE_TAG=vX.Y.Z LATEST=1` to confirm the
+  structural state.
+
+==== Demo publish succeeded but CI hygiene failed
+
+Symptom: `publish-docs / publish-docs` is green for the demo tag; the
+Pages repo contains the new slides; another demo workflow
+(Dependabot, scheduled job, ad-hoc CI hygiene run) is red around the
+same time and the repository status page is therefore yellow/red.
+
+The publish *was* the release-blocking signal. Non-publish CI noise
+on the demo repo is classified per
+§"Blocking vs Non-Blocking CI Signals". A red Dependabot run on the
+demo repo does not invalidate the demo tag. Capture the failing run
+ID, open a separate maintenance ticket if the cause is new, and do
+not re-run the publish workflow.
+
+==== Pages publish green but public site not yet visibly updated
+
+Symptom: both `publish-docs` jobs are green; `make pages-check ...`
+reports all sections plausible against the pulled pages working tree;
+`https://stefanschade.github.io/spreadsheet-handling-pages/` still
+shows the previous release.
+
+GitHub Pages serves content from the pages repo `main` branch through
+a separate edge cache and a periodic build. Propagation can take
+several minutes after the publisher's `git push` completes. This is
+not a publish failure.
+
+. Confirm the pushed commit is on `pages/main`:
+  `git -C ../pages log --oneline -1`.
+. Wait a few minutes; refresh with cache-busting
+  (`Ctrl+Shift+R` in most browsers).
+. If the public site still shows stale content after ~10 minutes,
+  inspect the *Pages* tab of the pages repository's GitHub Settings
+  for a build/deployment error. This is repository-UI territory,
+  not a workflow issue.
+. Do not retag, do not re-run the publish job, and do not edit the
+  pages repo manually to "force" a refresh.
 
 === Notes
 

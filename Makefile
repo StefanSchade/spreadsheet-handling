@@ -270,6 +270,13 @@ pages-check: ## Post-deploy Pages structure check. CORE_TAG=vX required; DEMO_TA
 	  $(if $(DEMO_TAG),--demo-tag "$(DEMO_TAG)") \
 	  $(if $(LATEST),--check-latest)
 
+.PHONY: release-status
+release-status: ## One-shot cross-repo release state (core/demo/pages). CORE_DIR/DEMO_DIR/PAGES_DIR optional (siblings auto-detected).
+	@bash "$(ROOT)tools/release_status.sh" \
+	  $(if $(CORE_DIR),--core "$(CORE_DIR)") \
+	  $(if $(DEMO_DIR),--demo "$(DEMO_DIR)") \
+	  $(if $(PAGES_DIR),--pages "$(PAGES_DIR)")
+
 # =========================
 # Coverage
 # =========================

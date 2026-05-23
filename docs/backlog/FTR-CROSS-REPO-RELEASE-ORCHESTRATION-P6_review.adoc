@@ -1,0 +1,265 @@
+= FTR-CROSS-REPO-RELEASE-ORCHESTRATION-P6 — Implementation Review
+
+== Metadata
+
+|===
+| Field            | Value
+
+| Review date      | 2026-05-23
+| Reviewed change  | Core working tree on top of `4e6213c` (uncommitted at review time; lands as a single Conventional Commit naming this FTR)
+| Repo             | `spreadsheet-handling` (`core`) — sole implementation surface (one small read-only helper + Make target + runbook + boundary doc + this review + archival). Demo and pages unchanged.
+| Reviewer         | Claude Opus 4.7 (xhigh effort), via Claude Code
+| Scope            | Cross-repo orchestration clarity: read-only `release_status.sh` helper, runbook §"Cross-Repo Release Sequence" + §"Cross-Repo Recovery Scenarios", `repository_boundaries.adoc` §"Release-time data flow", archival of this FTR.
+|===
+
+== Verdict
+
+Ship. The slice closes the "where am I across all three repos right
+now?" question with one short read-only command, ties it into the
+existing helpers (`release_check.sh`, `pages_publish_check.sh`), and
+fills out the runbook with the missing recovery cases the v0.1.0b6
+release surfaced. It explicitly does not introduce automation, does
+not change publish behavior, and does not touch demo or pages.
+
+== Scope reviewed
+
+* Does the new helper actually answer "what stage am I in?" from a
+  fresh terminal without operator memory?
+* Does it correctly remain read-only (no git writes, no fetch, no
+  network calls)?
+* Do the runbook additions complete the FTR's acceptance criteria
+  without overlapping or contradicting the existing sections?
+* Do the cross-repo dependencies in the new sequence table match the
+  actual workflow files (`core/.github/workflows/release.yml`,
+  `demo/.github/workflows/publish-docs.yml`,
+  `demo/.github/workflows/ci.yml`)?
+* Did the slice keep repository roles clean (core owns release
+  governance; pages remains an artifact repo; demo unchanged)?
+
+== Files changed
+
+* `tools/release_status.sh` — new read-only helper. ~280 lines. Pattern
+  matches the existing `release_check.sh` / `pages_publish_check.sh`
+  (set -euo pipefail, color output when stdout is a terminal, doc
+  header with explicit read-only contract and exit-code table, sibling
+  auto-detection with `--core` / `--demo` / `--pages` overrides and
+  `CORE_DIR` / `DEMO_DIR` / `PAGES_DIR` env fallbacks). Exit 0 on a
+  rendered summary regardless of internal consistency; exit 3 only on
+  setup error (missing core checkout). Inconsistencies are surfaced as
+  WARN markers in the cross-correlation block, not via the exit code,
+  because the helper's job is visibility, not gating.
+* `Makefile` — new `release-status` target wrapping the helper, using
+  the same `$(if VAR,--flag "$(VAR)")` shape as the existing
+  `release-check` and `pages-check` wrappers.
+* `docs/developer_guide/ch09_release_management/02_release_runbook.adoc`
+  — two additions:
+** New §"Cross-Repo Release Sequence" (inserted immediately before
+   §"Branch and Topology Awareness"): three-stage table with what
+   happens / owner / verification per repo, an explicit dependency
+   list (stage 2 waits for stage 1; stage 3 is the consequence not a
+   driver), a reference to `make release-status`, and a "when to use
+   which helper" table tying `release-check`, `pages-check`, and
+   `release-status` together.
+** New §"Cross-Repo Recovery Scenarios" (appended after §"Why this
+   matters", before §"Notes"): five subsections covering the FTR's
+   five listed cases — demo tag pushed before main alignment; stale
+   workflow rerun; PyPI succeeded but docs failed; demo publish green
+   but CI hygiene red; pages publish green but public site not yet
+   visibly updated. Each scenario lists symptom, classification,
+   operator action, and what *not* to do.
+* `docs/ai_info/repository_boundaries.adoc` — new §"Release-time data
+  flow between the three repositories" (inserted immediately before
+  §"Path-reference convention for cross-repo entry docs"): directional
+  table making `core --> PyPI`, `demo --> released core`, `pages <--
+  core publish-docs`, `pages <-- demo publish-docs` explicit, plus the
+  two rules that fall out of it (pages is never a driver; demo
+  pin-bump is always downstream of the core PyPI publish).
+* `docs/cold_storage/backlog/ftrs_done/FTR-CROSS-REPO-RELEASE-ORCHESTRATION-P6.adoc`
+  — moved via `git mv`; stamped `*Status:* Done` with a Delivery
+  scope subsection listing the helper, Make target, runbook
+  additions, boundary-doc addition, and the explicit non-goals
+  (no automation, no semantic-release, no version propagation).
+* `docs/backlog/_ftrs_open.adoc` — removed the include for this FTR;
+  Phase 1 narrative paragraph rewritten to reflect that all four
+  Phase-1 items are now in cold storage.
+* `docs/backlog/FTR-CROSS-REPO-RELEASE-ORCHESTRATION-P6_review.adoc`
+  — this document.
+
+No changes to core workflows, the demo repo, or the pages repo.
+
+== Orchestration model added
+
+The runbook now exposes a deliberate two-axis model of the release flow.
+
+**Axis 1: per-repo stages, in order.**
+Stage 1 (core: pre-tag check → tag → PyPI publish → core docs publish)
+hands off to Stage 2 (demo: pin bump → demo CI → demo tag → demo slides
+publish) hands off to Stage 3 (pages: artifact reception). Each stage
+has an explicit owner and a single verification command; the table is
+the canonical place to look when an operator is mid-release and unsure
+which step is next.
+
+**Axis 2: per-question helper.**
+Three read-only helpers compose:
+
+* "is this tag topologically safe to push?" → `make release-check`
+  (already existed; carries through the cross-repo flow).
+* "did the publish leave the expected files on Pages?" → `make
+  pages-check` (added by the previous FTR; carries through).
+* "what is the current state across all three repos, and what should I
+  do next?" → `make release-status` (added by this slice; the
+  orientation helper).
+
+Operators can pick the helper that matches the question they have,
+without rederiving the flow each time. None of the three helpers makes
+network calls, none fetches, none publishes.
+
+== Recovery scenarios covered
+
+All five cases from the FTR's `Common recovery cases` checklist are
+documented under §"Cross-Repo Recovery Scenarios":
+
+. Demo tag pushed before main alignment — confirm slide artifact,
+  fast-forward `main` to the tag commit, do *not* retag.
+. Stale workflow rerun — recognize that tag-triggered runs use the
+  workflow file at the tag, accept historical action pins if
+  re-publishing is the goal, cut a new patch tag if current workflow
+  shape is the goal.
+. PyPI succeeded but docs failed — re-run the failed `publish-docs`
+  job from the UI; do not retag (PyPI rejects same-version
+  re-upload); validate with `pages-check` after the re-run.
+. Demo publish green but CI hygiene red — recognize that the publish
+  was the release-blocking signal; non-publish CI noise is classified
+  per §"Blocking vs Non-Blocking CI Signals"; do *not* re-run the
+  publish workflow.
+. Pages publish green but public site not yet visibly updated — wait
+  for the GitHub Pages edge cache to refresh (typically a few minutes);
+  cache-bust in the browser; inspect Pages Settings only if the stale
+  state persists past ~10 minutes; do *not* retag or hand-edit pages.
+
+The sixth FTR-listed case, "tag created from non-`main` branch",
+already had a full section §"Troubleshooting: Accidental Release
+Topology" prior to this slice; the new recovery section
+cross-references it rather than duplicating it.
+
+== Validation commands run
+
+[cols="1,2", options="header"]
+|===
+| Command | Result
+
+| `bash -n tools/release_status.sh`
+| Syntax check passes.
+
+| `make release-status` from `core/` with all three sibling checkouts
+  present
+| Renders all three repos correctly. Reports
+  `core dev (dirty)` (expected — this session has uncommitted edits),
+  `demo dev (clean) pinned core=0.1.0b6`, `pages versioned core/
+  snapshots: v0.1.0b6`, `pages versioned demo/ snapshots:
+  v0.1.0b6-demo`. Cross-correlation all-green; next-action says
+  "cross-repo state appears coherent for v0.1.0b6; next release: cut a
+  new core tag from main". Exit 0.
+
+| `bash tools/release_status.sh --help`
+| Prints the doc header (usage, env vars, read-only contract, exit
+  codes) and exits 0.
+
+| `bash tools/release_status.sh --bogus`
+| Setup error, exit 3.
+
+| `CORE_DIR=... DEMO_DIR=... PAGES_DIR=... bash
+  tools/release_status.sh`
+| Honors env overrides identically to the auto-detected path.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/out.html <file>` on the
+  modified runbook, the modified boundary doc, the archived FTR, the
+  new review note, and the full `backlog.adoc`
+| All five render without errors.
+
+| `grep -rn "FTR-CROSS-REPO-RELEASE-ORCHESTRATION-P6"
+  docs/backlog/`
+| Returns only the review note path; no remaining `include::`
+  reference in the active backlog.
+|===
+
+Cross-repo validation: no demo or pages changes, no sibling-repo
+validation needed.
+
+== Acceptance criteria check (FTR §Acceptance)
+
+* ✅ Release process clearly distinguishes authoritative / consumer /
+  publish repositories — `repository_boundaries.adoc` already had the
+  three-repo responsibility table; this slice adds the explicit
+  release-time data-flow direction table and the two falling-out
+  rules.
+* ✅ Release sequencing is explicitly documented — runbook
+  §"Cross-Repo Release Sequence" three-stage table.
+* ✅ Operators can determine current release stage, next expected
+  step, and safe recovery actions — `make release-status` answers the
+  state question; the new sequence table answers the next-step
+  question; the new recovery section answers the safe-recovery
+  question for the five identified cases.
+* ✅ Common recovery scenarios documented (failed demo publish, stale
+  workflow rerun, release from non-`main`, partial publish success) —
+  covered in §"Cross-Repo Recovery Scenarios" plus the pre-existing
+  §"Troubleshooting: Accidental Release Topology" (cross-referenced
+  to avoid duplication).
+* ✅ Cross-repository dependencies explicit (core → PyPI; demo →
+  released core; pages ← publish outputs) — directional table in
+  `repository_boundaries.adoc` and stage-dependency bullets in the
+  runbook sequence section.
+* ✅ Release operators can perform a release without undocumented
+  knowledge — every helper invocation is in the runbook, every
+  recovery case lists the operator action, and `release-status`
+  reports the state without requiring memory of which command to run.
+
+== Residual risks
+
+* *Helper's "next action" hint is heuristic.* It compares the demo
+  pin to the core latest tag and the pages versioned snapshots
+  against the core/demo latest tags. It does not understand release
+  intent (e.g. a deliberate decision to defer the demo bump for two
+  releases). When the heuristic conflicts with the operator's plan,
+  the operator overrides; the hint is *advisory*, not authoritative.
+  The closing line of the helper output makes this explicit.
+* *Latest-tag detection uses `git describe --match 'v*'`.* This finds
+  the most recent annotated-or-lightweight tag whose name starts with
+  `v` and is reachable from HEAD. If a tag exists on a branch other
+  than HEAD's history, it will not be picked up — for the release
+  flow this is the right default (a release tag must be reachable
+  from `main`), but a one-off feature branch could surprise the
+  operator. The cross-correlation surfaces this as a "no" in the
+  "at HEAD" field.
+* *Pages versioned-snapshot detection is structural only.* The helper
+  reports that `versions/<tag>/core/` exists; it does not verify
+  contents. `make pages-check CORE_TAG=<tag>` is the deeper structural
+  check operators should run after `release-status` flags a missing
+  snapshot. The runbook's per-question helper table makes this
+  composition obvious.
+* *Recovery scenarios are written for the current workflow shape.* If
+  the publish workflows are reshaped meaningfully (different jobs,
+  different secrets, etc.), the recovery prose will need a refresh.
+  Cross-references to the workflow source files are kept loose so a
+  rename does not silently invalidate the runbook.
+* *No CI invocation of `release-status`.* The helper is operator-only
+  on purpose; running it from CI would add a sibling-checkout
+  requirement to the release pipeline that does not exist today.
+  This is intentional and aligns with the FTR's "favor clarity and
+  observability over aggressive automation" note.
+
+== Disposition
+
+All FTR acceptance criteria met. No open findings.
+
+* Helper + Make target + runbook + boundary doc + sibling review note
+  + archival of this FTR land in *core* as a single Conventional
+  Commit naming this FTR (per the user's instruction that
+  backlog/review/documentation changes belong with the FTR commit
+  unless there is a strong reason to split, and per the
+  cross-repo commit-separation rule).
+* No demo or pages commit.
+* `_ftrs_open.adoc` Phase-1 paragraph updated to reflect that all
+  four Phase-1 FTRs are now in cold storage.
+* Commit is not pushed by the agent; the developer performs remote
+  sync per `docs/ai_info/agent_rules.adoc § Remote sync`.
