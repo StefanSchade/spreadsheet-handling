@@ -49,25 +49,88 @@ the generated artifacts after release. Write access from CI uses the SSH
 deploy key whose private half is stored as the `DOCS_DEPLOY_KEY` secret on the
 core repository.
 
+=== Branch and Topology Awareness
+
+Release tags must be reachable from `main`. The `v0.1.0b6` release succeeded
+technically but was first tagged from `dev`, which produced operator
+uncertainty, CI noise, and a manual fast-forward repair of `main` after the
+fact. The artifacts themselves were correct; the topology around them was
+not. This section makes the expected branch state explicit so the next
+release does not repeat that pattern.
+
+Before tagging a core release, confirm by hand or via `make release-check`:
+
+* you are on `main` (not on `dev` or a feature branch);
+* the working tree is clean (no uncommitted changes);
+* local `main` is in sync with `origin/main` (not ahead, not behind);
+* the commit you intend to tag is the current `HEAD` of `main` and is
+  reachable from `origin/main`;
+* after creating the tag locally, the tag commit is reachable from
+  `origin/main` (verified by `make release-check TAG=vX.Y.Z` before
+  pushing the tag).
+
+`make release-check` runs `tools/release_check.sh`, a strictly read-only
+script that prints the current branch, working-tree state, and topology
+against `origin/main`. It exits non-zero on any condition that should
+block a tag:
+
+* current branch is not `main` (including detached HEAD);
+* working tree has uncommitted changes;
+* `origin/main` is not known locally (the script does not fetch; run
+  `git fetch origin` first);
+* local `main` is ahead of, behind, or diverged from `origin/main`;
+* HEAD is not reachable from `origin/main`;
+* an explicit `TAG=...` argument was given and that tag does not exist
+  locally;
+* the named tag is not reachable from `origin/main`.
+
+Advisory `WARN` output is reserved for non-blocking information (for
+example, a named tag that points at an earlier commit on `main` rather
+than current `HEAD` -- legitimate when intentionally tagging a prior
+release commit). Warnings do not cause a non-zero exit.
+
+The script performs *no* git operations that write -- no fetch, no ref
+updates, no working-tree changes. Run `git fetch origin` yourself before
+the check if you want it to validate against the latest remote state.
+
+[source,console]
+----
+# refresh remote-tracking refs, then inspect branch + topology
+git fetch origin
+make release-check
+
+# after creating the tag locally, before pushing, validate the tag itself
+make release-check TAG=v0.1.0b7
+----
+
+The check is intentionally lightweight: it does not validate the release
+notes, the version number, or the package build. It only verifies that the
+tag will sit on the canonical history.
+
 === Core Release Checklist
 
 Before tagging a core release:
 
-* ensure the intended release branch is merged to `main`,
-* run the core test suite from the repo-local environment,
-* confirm that the internal release notes draft reflects the important changes,
-* confirm that core documentation source for the release is in this repo and
-  can be built as a Pages-bound artifact,
-* confirm that the public `README.md` still describes the current product and
-  CLI shape shown on PyPI,
-* verify the tag format is `v<version>` without extra punctuation, for example
+* `make release-check` reports no failures (current branch is `main`,
+  working tree clean, local `main` in sync with `origin/main`);
+* the intended release branch is merged to `main`;
+* the core test suite passes from the repo-local environment;
+* the internal release notes draft reflects the important changes;
+* core documentation source for the release is in this repo and can be
+  built as a Pages-bound artifact;
+* the public `README.md` still describes the current product and CLI shape
+  shown on PyPI;
+* the tag format is `v<version>` without extra punctuation, for example
   `v0.1.0b6`.
 
 For the current GitHub Actions based release flow:
 
-. push `main`,
-. create and push the release tag,
-. let GitHub Actions build and publish the package,
+. push `main`;
+. create the release tag locally (do not push yet);
+. run `make release-check TAG=v<version>` and confirm the tag is reachable
+   from `origin/main` and points where intended;
+. push the release tag;
+. let GitHub Actions build and publish the package;
 . verify that the PyPI version and the workflow outcome match the intended
    release.
 
@@ -121,6 +184,90 @@ Keep tagging intentionally small and predictable:
   releases when a matching frozen demo state is useful,
 * do not tag ordinary development commits or internal milestones without a real
   release.
+
+=== Troubleshooting: Accidental Release Topology
+
+These scenarios are not unusual during a beta line. The intent of this
+section is to make the safe recovery path explicit before it is needed.
+
+==== Tag created from `dev` (or another non-`main` branch)
+
+Symptom: `make release-check TAG=v<version>` reports
+*tag is NOT reachable from origin/main*, or `git branch --contains
+v<version>` does not list `main`.
+
+If the tag has *not* been pushed yet:
+
+. delete the tag locally: `git tag -d v<version>`;
+. resolve the topology (merge `dev` into `main`, or fast-forward `main`
+   to the intended commit);
+. re-create the tag from the correct commit on `main`;
+. re-run `make release-check TAG=v<version>` before pushing.
+
+If the tag *has* been pushed but the PyPI release has not yet run (CI
+queued or still running, no artifacts on PyPI):
+
+. stop or cancel the in-flight CI job if possible;
+. delete the remote tag: `git push origin :v<version>`;
+. delete the local tag and resolve the topology as above;
+. re-create the tag from the correct commit on `main` and re-push.
+
+If the tag has been pushed *and* the PyPI release succeeded:
+
+* do not retag. Retagging an already-published version is unsafe: PyPI
+  refuses to re-upload the same version number, the existing PyPI release
+  page is frozen against the original tag commit, and any downstream
+  consumer that already installed the version sees no change. Fast-forward
+  `main` to include the release commit (so future `release-check` runs
+  agree) and document the situation in the next release notes.
+
+==== When retagging is safe vs unsafe
+
+[cols="1,3,3"]
+|===
+| Situation | Safe to retag? | Notes
+
+| Tag created locally, never pushed
+| Yes
+| Local-only operation; no published artifact exists.
+
+| Tag pushed, PyPI publish failed before any artifact was uploaded
+| Yes, with care
+| Delete remote tag, fix the problem, re-push. CI re-runs from the
+  re-pushed tag.
+
+| Tag pushed, PyPI publish succeeded
+| No
+| PyPI rejects re-upload of the same version number. The PyPI page is
+  frozen against the original commit. Fix going forward (next version)
+  rather than retroactively.
+
+| Tag pushed, Pages publish failed (PyPI succeeded)
+| No retag needed
+| Re-running the failed `publish-docs` job re-publishes documentation
+  against the same tag. The retry logic in the workflow handles concurrent
+  edits to the Pages repo.
+
+| Wrong commit tagged but artifact contents happen to match intent
+| Avoid retagging
+| Fast-forward `main` so the tag is reachable, document the topology gap
+  in the next release notes, and move on.
+|===
+
+==== Why this matters
+
+Tags that sit outside `main` cause three follow-on problems:
+
+* `git log main` does not include the release commit, so future
+  archaeology misses the release;
+* `make release-check` for a subsequent release reports the prior tag as
+  unreachable, masking the signal it is designed to give;
+* automated tooling (the PEP 440 latest-tag guard in the publish
+  workflow, version helpers in sibling repos) operates on tags it
+  assumes are on canonical history.
+
+The check is one small step in the runbook; the recovery cost of
+skipping it is larger than the cost of running it.
 
 === Notes
 

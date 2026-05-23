@@ -256,6 +256,13 @@ snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs,
 	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/"
 
 # =========================
+# Release helpers
+# =========================
+.PHONY: release-check
+release-check: ## Pre-tag branch and topology check (read-only). Pass a tag as TAG=vX.Y.Z to also validate the tag.
+	@bash "$(ROOT)tools/release_check.sh" "$(TAG)"
+
+# =========================
 # Coverage
 # =========================
 .PHONY: coverage coverage-html
