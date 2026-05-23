@@ -446,3 +446,131 @@ make setup-lib-local    # in the demo repo
 
 This wires `pip install -e ../spreadsheet-handling` so the demo always
 reflects the current working state of the library without a PyPI release.
+
+=== GitHub Actions Version Policy and Dependabot Scope
+
+==== Pinned action versions
+
+All workflows in this project (core `release.yml`, demo `ci.yml`, demo
+`publish-docs.yml`) pin first-party GitHub Actions to their current
+published majors:
+
+[cols="1,1,2"]
+|===
+| Action | Pin | Notes
+
+| `actions/checkout`
+| `v4`
+| Current major. `fetch-depth: 0` is set on tag-triggered jobs that need
+  the full tag history (PEP 440 latest-tag guard, `setuptools-scm`
+  dynamic version).
+
+| `actions/setup-python`
+| `v5`
+| Current major. Python `3.11` for the demo CI, `3.12` for core
+  release/publish.
+
+| `actions/setup-java`
+| `v4`
+| Used only by core `publish-docs` for the AsciiDoctor build stack.
+  Temurin distribution, Java 21.
+
+| `pypa/gh-action-pypi-publish`
+| `release/v1`
+| PyPA's documented rolling tag for the v1 line. PyPA explicitly
+  recommends pinning to `release/v1` rather than a SHA or fixed minor;
+  this tracks security patches automatically without manual bumps. Used
+  only for the Trusted Publisher OIDC exchange against PyPI.
+|===
+
+The pinning policy is "current major from the publisher; let patches
+roll in". The Trusted Publisher action is the one intentional exception
+that uses a rolling tag because PyPA owns the upgrade story.
+
+==== Node.js runtime deprecation warnings
+
+GitHub Actions emits Node.js runtime deprecation warnings during release
+runs. As of this writing every first-party action above is pinned to
+its latest published major and those majors still run on Node 20. The
+warnings come from GitHub's runner-side notice that Node 20 will be
+deprecated in favor of the next LTS once action maintainers publish new
+majors.
+
+These warnings are *upstream-driven* and cannot be silenced from a
+workflow file today. When `actions/checkout@v5`, `actions/setup-python@v6`,
+or equivalents ship targeting the next Node LTS, bump the pins and the
+warnings disappear. Until then the warnings are expected noise and do
+not invalidate any release.
+
+==== Job-level permissions
+
+Every workflow sets a top-level `permissions: contents: read` default
+for `GITHUB_TOKEN` and elevates per job only where needed:
+
+* Core `release.yml`:
+** `test` and `publish-docs`: read-only contents (inherited).
+** `publish`: explicitly adds `id-token: write` for the PyPI Trusted
+   Publisher OIDC exchange. No write access to repo contents.
+* Demo `ci.yml`: read-only contents. Pytest and CLI smoke do not write
+  to the repository.
+* Demo `publish-docs.yml`:
+** `test`: read-only contents (inherited).
+** `publish-docs`: read-only contents. The push to
+   `spreadsheet-handling-pages` runs under the `DOCS_DEPLOY_KEY` SSH
+   deploy key, not `GITHUB_TOKEN`.
+
+A leaked `GITHUB_TOKEN` from any of these jobs therefore cannot mutate
+the source repository, publish to PyPI, or push to the Pages repository.
+This is operational defense-in-depth rather than a response to a known
+incident.
+
+==== Dependabot scope (no checked-in configuration)
+
+None of `spreadsheet-handling`, `spreadsheet-handling-demo`, or
+`spreadsheet-handling-pages` carries a `.github/dependabot.yml` file. Any
+Dependabot activity visible in the repository status page therefore comes
+from GitHub repository-level settings, not from version-controlled
+configuration in this codebase.
+
+The two GitHub-side knobs that can surface Dependabot signals without a
+checked-in config are:
+
+. *Settings → Code security and analysis → Dependabot alerts* --
+  vulnerability scanning of installed dependencies. Does not run as a
+  workflow; surfaces as security alerts.
+. *Settings → Code security and analysis → Dependabot security updates*
+  -- automatic PRs to bump vulnerable dependencies. Runs under the
+  Dependabot identity. This is the most likely source of the
+  `403 Token invalid` failures observed during the `v0.1.0b6` release
+  cycle: the bot attempts to author a PR but the per-repo token boundary
+  rejects the action (commonly because a private package registry, a
+  required token secret, or the per-repo Dependabot permission block
+  needs adjustment in the UI).
+
+The release pipeline does *not* depend on Dependabot in any form:
+
+* No release-critical workflow consumes Dependabot output.
+* No publish gate is conditioned on a Dependabot job's success.
+* No package version pin is rewritten by Dependabot during release.
+
+Dependabot failures are therefore reclassified as
+*infrastructure-maintenance noise*, not release-blocking. See
+`02_release_runbook.adoc` § Blocking vs Non-Blocking CI Signals for the
+operator-side triage shape.
+
+Manual GitHub UI follow-up (cannot be done from a code commit):
+
+. Open `https://github.com/StefanSchade/spreadsheet-handling/settings/security_analysis`
+   and inspect the Dependabot status for each of the three repositories
+   in turn.
+. For each repository, decide explicitly: keep Dependabot alerts /
+   security updates enabled, or disable them. Either choice is valid;
+   the current ambiguity (signals appearing without a tracked policy) is
+   what needs to end.
+. If updates remain enabled and continue to 403, capture the failing run
+   ID and open a new FTR -- diagnosing the token boundary requires UI
+   access this codebase cannot provide.
+. If a future `dependabot.yml` is wanted (for example to scope updates
+   to a single ecosystem on a monthly cadence), introduce it as its own
+   small FTR. Adding one is out of scope for the maintenance-noise
+   stabilization slice that motivated this section.
