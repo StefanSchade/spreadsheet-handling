@@ -107,6 +107,21 @@ auto_locate() {
   return 1
 }
 
+validate_checkout() {
+  local kind="$1" dir="$2"
+  local check_fn="is_$kind"
+  if ! "$check_fn" "$dir"; then
+    printf 'release_status: %s checkout is not valid: %s\n' "$kind" "$dir" >&2
+    printf '  Pass --%s PATH or set %s_DIR to a matching local checkout.\n' \
+      "$kind" "${kind^^}" >&2
+    exit 3
+  fi
+}
+
+normalize_dir() {
+  ( cd "$1" && pwd )
+}
+
 if [[ -z "$core_dir" ]]; then
   core_dir="$(auto_locate core "$PWD" "../core" "../spreadsheet-handling" 2>/dev/null || true)"
 fi
@@ -124,8 +139,19 @@ if [[ -z "$core_dir" ]]; then
   exit 3
 fi
 
+validate_checkout core "$core_dir"
+core_dir="$(normalize_dir "$core_dir")"
+
 # Demo and pages are optional. If absent, the helper still reports core
 # state and notes the missing sibling.
+if [[ -n "$demo_dir" ]]; then
+  validate_checkout demo "$demo_dir"
+  demo_dir="$(normalize_dir "$demo_dir")"
+fi
+if [[ -n "$pages_dir" ]]; then
+  validate_checkout pages "$pages_dir"
+  pages_dir="$(normalize_dir "$pages_dir")"
+fi
 
 # ------------------------------------------------------------
 # Per-repo state extraction (read-only git plumbing)
@@ -200,7 +226,10 @@ pages_versioned_core_tags() {
   local dir="$1"
   [[ -d "$dir/versions" ]] || return 0
   find "$dir/versions" -maxdepth 2 -mindepth 2 -type d -name core 2>/dev/null \
-    | sed -E "s|$dir/versions/||; s|/core$||" \
+    | while IFS= read -r path; do
+        path="${path#"$dir/versions/"}"
+        printf '%s\n' "${path%/core}"
+      done \
     | sort -u
 }
 
@@ -209,7 +238,10 @@ pages_versioned_demo_tags() {
   local dir="$1"
   [[ -d "$dir/versions" ]] || return 0
   find "$dir/versions" -maxdepth 2 -mindepth 2 -type d -name demo 2>/dev/null \
-    | sed -E "s|$dir/versions/||; s|/demo$||" \
+    | while IFS= read -r path; do
+        path="${path#"$dir/versions/"}"
+        printf '%s\n' "${path%/demo}"
+      done \
     | sort -u
 }
 
@@ -283,6 +315,7 @@ fi
 printf '\n%scross-correlation%s\n' "$C_BOLD" "$C_RESET"
 
 issues=0
+visibility_gaps=0
 
 # Strip leading 'v' from core_latest_tag (if any) for pyproject comparison.
 core_latest_stripped=""
@@ -290,7 +323,11 @@ if [[ "$core_latest_tag" =~ ^v.+ ]]; then
   core_latest_stripped="${core_latest_tag#v}"
 fi
 
-if [[ -n "$demo_dir" && "$core_latest_tag" != "(none)" && -n "$core_latest_stripped" ]]; then
+if [[ -z "$demo_dir" ]]; then
+  printf '  %s!%s demo checkout not located; demo pin/tag not checked\n' \
+    "$C_WARN" "$C_RESET"
+  visibility_gaps=$((visibility_gaps + 1))
+elif [[ "$core_latest_tag" != "(none)" && -n "$core_latest_stripped" ]]; then
   if [[ "$demo_pinned_core" == "$core_latest_stripped" ]]; then
     printf '  %s=%s demo pyproject pin matches core latest tag (%s)\n' \
       "$C_OK" "$C_RESET" "$core_latest_tag"
@@ -305,7 +342,11 @@ if [[ -n "$demo_dir" && "$core_latest_tag" != "(none)" && -n "$core_latest_strip
   fi
 fi
 
-if [[ -n "$pages_dir" && "$core_latest_tag" != "(none)" ]]; then
+if [[ -z "$pages_dir" ]]; then
+  printf '  %s!%s pages checkout not located; pages snapshots not checked\n' \
+    "$C_WARN" "$C_RESET"
+  visibility_gaps=$((visibility_gaps + 1))
+elif [[ "$core_latest_tag" != "(none)" ]]; then
   if printf '%s' "$pages_core_tags" | grep -Fxq "$core_latest_tag"; then
     printf '  %s=%s pages has versions/%s/core/ snapshot\n' \
       "$C_OK" "$C_RESET" "$core_latest_tag"
@@ -334,6 +375,17 @@ printf '\n%snext likely action%s\n' "$C_BOLD" "$C_RESET"
 if [[ "$core_latest_tag" == "(none)" ]]; then
   printf '  no core release tags yet -- ship the first tag from core main\n'
   printf '  per runbook §"Core Release Checklist".\n'
+elif [[ "$visibility_gaps" -gt 0 ]]; then
+  printf '  local view is incomplete (%d sibling checkout(s) not located).\n' \
+    "$visibility_gaps"
+  if [[ "$issues" -gt 0 ]]; then
+    printf '  available state also has %d cross-correlation issue(s); resolve\n' \
+      "$issues"
+    printf '  those after locating the missing sibling checkout(s).\n'
+  else
+    printf '  locate the missing sibling checkout(s) before deciding the next\n'
+    printf '  release action.\n'
+  fi
 elif [[ "$issues" -eq 0 ]]; then
   printf '  cross-repo state appears coherent for %s.\n' "$core_latest_tag"
   printf '  next release: cut a new core tag from main per runbook §"Core Release Checklist".\n'
@@ -348,7 +400,7 @@ else
     printf '       run demo test suite, commit, tag %s-demo, push.\n' \
       "$core_latest_tag"
   fi
-  if [[ -n "${pages_core_tags:-}" ]] \
+  if [[ -n "$pages_dir" ]] \
      && [[ "$core_latest_tag" != "(none)" ]] \
      && ! printf '%s' "$pages_core_tags" | grep -Fxq "$core_latest_tag"; then
     printf '    -> pages missing core snapshot for %s: check publish-docs job;\n' \
