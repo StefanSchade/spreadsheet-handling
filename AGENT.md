@@ -8,3 +8,8 @@ Entry point only. Canonical repo-committing guidance lives in
 
 Start there, then consult the active FTR, review note, ADR, and nearby
 architecture docs for the task at hand.
+
+Review discipline: if a task is a review or produces findings / validation
+work, create or update the matching `*_review.adoc` artifact, commit that
+review artifact separately from any follow-up fix, summarize the validation
+commands you ran, and record the disposition plus any residual risks.
