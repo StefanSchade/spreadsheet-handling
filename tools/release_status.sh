@@ -122,6 +122,10 @@ normalize_dir() {
   ( cd "$1" && pwd )
 }
 
+git_read() {
+  GIT_OPTIONAL_LOCKS=0 git "$@"
+}
+
 if [[ -z "$core_dir" ]]; then
   core_dir="$(auto_locate core "$PWD" "../core" "../spreadsheet-handling" 2>/dev/null || true)"
 fi
@@ -162,13 +166,13 @@ git_field() {
   local dir="$1" field="$2"
   case "$field" in
     branch)
-      git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "DETACHED"
+      git_read -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "DETACHED"
       ;;
     head_short)
-      git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?"
+      git_read -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?"
       ;;
     clean)
-      if [[ -z "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+      if [[ -z "$(git_read -C "$dir" status --porcelain 2>/dev/null)" ]]; then
         echo "clean"
       else
         echo "dirty"
@@ -177,19 +181,19 @@ git_field() {
     latest_tag)
       # Newest annotated or lightweight tag matching v* by topology
       # (not lexical). Falls back silently if no tag exists.
-      git -C "$dir" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "(none)"
+      git_read -C "$dir" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "(none)"
       ;;
     ahead_behind)
       local branch
       branch="$(git_field "$dir" branch)"
       local remote_ref="refs/remotes/origin/$branch"
-      if ! git -C "$dir" rev-parse --verify --quiet "$remote_ref" >/dev/null 2>&1; then
+      if ! git_read -C "$dir" rev-parse --verify --quiet "$remote_ref" >/dev/null 2>&1; then
         echo "no-remote"
         return
       fi
       local ahead behind
-      ahead="$(git -C "$dir" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo '?')"
-      behind="$(git -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo '?')"
+      ahead="$(git_read -C "$dir" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo '?')"
+      behind="$(git_read -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo '?')"
       printf '%s ahead, %s behind' "$ahead" "$behind"
       ;;
   esac
@@ -200,8 +204,8 @@ tag_at_head() {
   local dir="$1" tag="$2"
   [[ -z "$tag" || "$tag" == "(none)" ]] && { echo "n/a"; return; }
   local tag_sha head_sha
-  tag_sha="$(git -C "$dir" rev-parse --verify --quiet "$tag^{commit}" 2>/dev/null || echo "")"
-  head_sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_sha="$(git_read -C "$dir" rev-parse --verify --quiet "$tag^{commit}" 2>/dev/null || echo "")"
+  head_sha="$(git_read -C "$dir" rev-parse HEAD 2>/dev/null || echo "")"
   [[ -n "$tag_sha" && "$tag_sha" == "$head_sha" ]] && echo "yes" || echo "no"
 }
 
