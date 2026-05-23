@@ -277,13 +277,19 @@ if [[ -n "$demo_tag" && "$check_latest" -eq 1 ]]; then
     slide_files=("$demo_latest"/*.html)
     shopt -u nullglob
     nonzero=0
+    empty=0
     for f in "${slide_files[@]}"; do
-      [[ -s "$f" ]] && nonzero=$((nonzero + 1))
+      if [[ -s "$f" ]]; then nonzero=$((nonzero + 1)); else empty=$((empty + 1)); fi
     done
-    if [[ "$nonzero" -gt 0 ]]; then
+    if [[ "$nonzero" -gt 0 && "$empty" -eq 0 ]]; then
       pass "$nonzero slide deck(s) present"
       printf '  -> %splausible%s\n' "$C_PASS" "$C_RESET"
       plausible_count=$((plausible_count + 1))
+    elif [[ "$nonzero" -gt 0 ]]; then
+      pass "$nonzero slide deck(s) present"
+      fail "$empty slide deck(s) empty"
+      printf '  -> %spartial%s\n' "$C_WARN" "$C_RESET"
+      partial_count=$((partial_count + 1))
     else
       fail "no slide deck(s) present"
       printf '  -> %spartial%s\n' "$C_WARN" "$C_RESET"
