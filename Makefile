@@ -270,6 +270,12 @@ pages-check: ## Post-deploy Pages structure check. CORE_TAG=vX required; DEMO_TA
 	  $(if $(DEMO_TAG),--demo-tag "$(DEMO_TAG)") \
 	  $(if $(LATEST),--check-latest)
 
+.PHONY: readme-check
+readme-check: ## Pre-publish README link-versioning check. TAG=vX.Y.Z enforces /versions/<tag>/ (fails on remaining /latest/ Pages URLs); without TAG runs lint mode. FILE=PATH overrides ./README.md.
+	@bash "$(ROOT)tools/readme_links_check.sh" \
+	  $(if $(TAG),--release-tag "$(TAG)") \
+	  $(if $(FILE),--file "$(FILE)")
+
 .PHONY: release-status
 release-status: ## One-shot cross-repo release state (core/demo/pages). CORE_DIR/DEMO_DIR/PAGES_DIR optional (siblings auto-detected).
 	@bash "$(ROOT)tools/release_status.sh" \
