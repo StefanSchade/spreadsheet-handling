@@ -24,6 +24,41 @@ The project already distinguishes configuration steps from primitive steps in
 the pipeline registry model. This FTR defines the FK relation policy shape that
 future FK configuration and primitive steps will use.
 
+*Relationship to existing `helper_policies.fk`:*::
++
+`_meta.helper_policies.fk` is already a real, populated metadata root today.
+The existing `configure_fk_helpers` step
+(`domain.helper_policies.configure_fk_helpers`) writes a per-target shape under
+that root, roughly:
++
+[source,yaml]
+----
+helper_policies:
+  fk:
+    <target_key>:
+      target: <target_key>
+      target_sheet: <sheet_name>
+      key: <id_field>
+      allowed_helpers: [...]
+      default_helpers: [...]
+      helper_prefix: "_"
+      fk_column: "id_(<target_key>)"
+      label: <optional>
+----
++
+This FTR replaces that per-target shape with a v2, relation-oriented shape
+under the same root (`_meta.helper_policies.fk`). The project keeps a single
+FK-helper policy root; no adjacent root is introduced. The v2 shape is keyed
+by `(source_frame, source_column)` because *relation identity is per FK
+column on a specific source frame*, not per target alone -- two sheets may
+reference the same target with different helper choices.
++
+The v2 shape carries an explicit `schema_version: 2` (or equivalent planning
+marker) at the `helper_policies.fk` level so consumers can detect the shape
+unambiguously and so the lifecycle FTR
+(`FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`) and the meta-schema-validation FTR
+(`FTR-META-SCHEMA-VALIDATION-P5`) can validate it directly.
+
 *Dependencies:*::
 
 * Existing FK-helper behavior and tests.
@@ -33,24 +68,34 @@ future FK configuration and primitive steps will use.
 
 *Scope:*::
 
-* Define the canonical FK relation policy shape stored in `_meta`.
+* Define the v2 relation-oriented FK policy shape stored under the existing
+  root `_meta.helper_policies.fk`.
 * Represent at least:
   ** source frame,
   ** source FK column,
   ** target frame,
-  ** target key column,
-  ** target display/helper fields,
+  ** target key column (the PK column on the target sheet),
+  ** target display / helper fields,
   ** materialized helper column names or naming policy,
-  ** provenance fields needed for reimport cleanup and later consistency checks.
-* Clarify whether the policy lives under `_meta.helper_policies.fk` or under a
-  new adjacent root, and document the decision.
-* Update the meta registry and pipeline step registry documentation so the
-  policy has one clear authority.
-* Mark convention-based FK detection as legacy current-state behavior to be
-  removed by the follow-up primitive refactor.
+  ** provenance fields needed for reimport cleanup and later helper-value
+     consistency checks.
+* Carry a `schema_version: 2` marker at the `helper_policies.fk` level so
+  consumers can detect the shape unambiguously.
+* Replace the existing per-target shape rather than adding an adjacent root.
+* Update the meta registry
+  (`docs/technical_model/ch05_registries/meta_registry/meta_registry.yaml`) so
+  that `helper_policies` reflects the v2 shape, its producers
+  (`configure_fk_helpers` for explicit policy, `infer_fk_relations` for
+  heuristic policy), and its consumers (FK-helper primitives).
+* Update the pipeline step registry documentation
+  (`docs/technical_model/ch05_registries/pipeline_step_registry/pipeline_step_registry.json`)
+  description fields for `configure_fk_helpers` so that the v2 shape is the
+  documented contract once the primitives FTR lands.
+* Mark convention-based FK detection inside primitives as legacy current-state
+  behavior to be removed by the follow-up primitive refactor.
 * Define the failure principle for future primitive FK-helper execution:
-  missing FK relation policy is an error unless a configuration/inference step
-  wrote one earlier in the pipeline.
+  missing FK relation policy is an error unless a configuration / inference
+  step wrote one earlier in the pipeline.
 
 *Non-Goals:*::
 
@@ -58,22 +103,43 @@ future FK configuration and primitive steps will use.
 * No rewrite of `add_fk_helpers`, `remove_fk_helpers`, `validate_fk_helpers`, or
   `reorder_fk_helpers`.
 * No demo pipeline migration.
-* No backward-compatibility layer for public users.
+* No backward-compatibility layer for public users (the project is pre-beta
+  for this surface; see the public-surface gate below).
 * No runtime schema validation framework.
 * No generic relation model for all possible joins; this FTR only covers FK
   helper semantics.
+* No removal of the FK column convention `id_(<target>)`
+  (`core/fk.py:FK_PATTERN`). The convention remains the cell-level wire
+  format; this FTR only changes the metadata shape consumed by
+  configuration / primitive steps.
 
-*Policy sketch:*::
+*Public-surface gate:*::
+
+The v2 shape replaces a documented YAML / `_meta` surface (the per-target
+`helper_policies.fk` shape currently produced by `configure_fk_helpers` and
+referenced in the user-guide transformation catalog). Per
+`docs/ai_info/interfaces_and_gates.adoc`, structural changes to the
+`helper_policies.fk` shape and to the documented `configure_fk_helpers`
+parameter contract are gated surface changes. The developer must approve the
+v2 shape (and the related primitive-refactor approval) before
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` is implemented.
+
+*Policy sketch (v2, illustrative):*::
+
+The example uses the project's actual FK column convention
+`id_(<target>)` (see `core/fk.py:FK_PATTERN` and the
+`product_business_slice` demo data).
 
 [source,yaml]
 ----
 _meta:
   helper_policies:
     fk:
+      schema_version: 2
       relations:
-        - source_frame: products
-          source_column: product_manager_id
-          target_frame: product_managers
+        - source_frame: product
+          source_column: id_(product_manager)
+          target_frame: product_manager
           target_key: id
           helper_fields:
             - name
@@ -85,27 +151,43 @@ _meta:
             mode: naming_convention
 ----
 
-The exact shape may change during implementation, but the final policy must be
-explicit enough that helper materialization does not need to derive relation
-identity from visible column names.
+`target_key` is mandatory. It is the PK column on the target sheet that the
+source FK column resolves against. Primitives (and later validation checks)
+must read it from policy rather than reconstructing it from
+`build_registry(...)["id_field"]` defaults.
+
+The exact field names may change during implementation, but the final policy
+must be explicit enough that helper materialization does not need to derive
+relation identity from visible column names, and consistent enough that
+validation can look up target values from `(target_frame, target_key)` alone.
 
 *Acceptance:*::
 
-* The FK relation policy shape is documented in the technical model.
+* The v2 FK relation policy shape is documented in the technical model,
+  including the `schema_version: 2` marker and the mandatory `target_key`
+  field.
 * The metadata authority is clear: the policy is a canonical configuration
-  claim, not derived helper provenance.
+  claim under `_meta.helper_policies.fk`, not derived helper provenance.
+* The v2 shape replaces the existing per-target shape under the same root;
+  no adjacent FK-helper policy root is introduced.
 * The relation policy contains enough information for:
   ** helper materialization,
-  ** helper validation,
+  ** helper validation (including target-key consistency checks),
   ** helper reordering,
   ** provenance writing,
   ** later reimport cleanup.
-* The policy distinguishes relation identity from materialized helper columns.
+* The policy distinguishes relation identity (`source_frame`, `source_column`,
+  `target_frame`, `target_key`) from materialized helper columns
+  (`helper_columns`).
 * The policy does not rely on visible workbook labels as identity.
-* Existing convention-based FK detection is documented as current-state behavior
-  to be removed by follow-up FTRs.
+* Existing convention-based FK detection inside primitives is documented as
+  current-state behavior to be removed by follow-up FTRs; the convention
+  itself (`id_(<target>)`) stays as the cell-level wire format.
 * No primitive FK-helper step is changed in this FTR except for documentation
   comments or registry descriptions required to explain the transition.
+* The meta registry entry for `helper_policies` and the pipeline-step registry
+  description for `configure_fk_helpers` are updated to reference the v2
+  shape.
 
 *Validation:*::
 
