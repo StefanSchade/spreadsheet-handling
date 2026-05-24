@@ -84,6 +84,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --release-tag=*)
       RELEASE_TAG="${1#--release-tag=}"
+      [[ -n "$RELEASE_TAG" ]] || { printf 'readme_links_check: --release-tag requires an argument\n' >&2; exit 2; }
       shift
       ;;
     --file)
