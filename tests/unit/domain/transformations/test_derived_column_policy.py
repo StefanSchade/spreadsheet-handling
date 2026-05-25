@@ -212,19 +212,29 @@ def test_default_replacement_removes_consumed_fk_and_enrich_provenance() -> None
 
 
 def test_followed_by_remove_fk_helpers_leaves_no_stale_enrich_provenance() -> None:
+    """``apply_derived_column_policy`` followed by ``remove_fk_helpers`` is a
+    no-op when the policy step already consumed the provenance. After
+    FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 the second step requires
+    policy or provenance; if both are absent it raises clearly, so the
+    pipeline does not silently bypass the cleanup contract.
+    """
     frames = _frames_with_fk_and_lookup_helpers()
 
-    steps = build_steps_from_config([
-        {"step": "apply_derived_column_policy", "source": "orders", "policy": "drop"},
-        {"step": "remove_fk_helpers"},
-    ])
-    out = run_pipeline(frames, steps)
+    out = run_pipeline(
+        frames,
+        build_steps_from_config([
+            {"step": "apply_derived_column_policy", "source": "orders", "policy": "drop"},
+        ]),
+    )
 
     derived = out["_meta"].get("derived", {})
     sheets = derived.get("sheets", {})
     assert "orders" not in sheets
     assert "_customer_name" not in out["orders"].columns
     assert "tier" not in out["orders"].columns
+
+    with pytest.raises(ValueError, match="infer_fk_relations"):
+        run_pipeline(out, build_steps_from_config([{"step": "remove_fk_helpers"}]))
 
 
 def test_distinct_output_preserves_original_source_provenance() -> None:

@@ -207,47 +207,44 @@ def test_retired_bridge_does_not_still_read_source_shape() -> None:
 
 
 def test_pilot_helper_policies_fk_current_consumers_match_runtime_truth() -> None:
-    """Catch the dangerous case the FTR named: a target-only consumer
-    silently appearing under ``current_state.consumers`` and being treated as
-    a current runtime reader.
+    """The pilot ``helper_policies.fk`` lifecycle pins runtime truth.
 
-    Until ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`` refactors the
-    FK-helper primitives to consume the v2 relation policy, the only current
-    runtime reader of ``_meta.helper_policies.fk`` is
-    ``domain.transformations.fk_helpers.enrich_helpers``. v2-aware
-    primitives (notably ``drop_helpers``) must stay listed under
-    ``target_state.target_consumers`` only.
-
-    Pinning the expected current reader and the target-only consumer here
-    avoids the false negative of a set-difference check that is true by
-    construction.
+    ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`` refactored the
+    FK-helper primitives to consume the v2 relation policy. The
+    pilot lifecycle now records the v2-aware primitive consumers
+    under ``current_state.consumers`` and ``runtime_reads`` is
+    v2 only. ``configure_fk_helpers`` still writes the v1
+    per-target shape as a producer-side back-compat residual, so
+    ``runtime_writes`` continues to list both shapes and the bridge
+    remains active (dual_write) on the producer side.
     """
     registry = _load_registry()
     pilot_entry = next(
         entry for entry in registry["entries"] if entry["name"] == _PILOT_ENTRY_NAME
     )
     lifecycle = pilot_entry["contract_lifecycle"]
-    current_consumers = set(lifecycle["current_state"]["consumers"])
-    target_consumers = set(lifecycle["target_state"].get("target_consumers") or [])
+    current_state = lifecycle["current_state"]
+    current_consumers = set(current_state["consumers"])
+    runtime_reads = set(current_state["runtime_reads"])
+    runtime_writes = set(current_state["runtime_writes"])
 
-    expected_current_consumers = {"domain.transformations.fk_helpers.enrich_helpers"}
-    target_only_until_primitives_ftr = {
+    expected_v2_consumers = {
+        "domain.transformations.fk_helpers.enrich_helpers",
         "domain.transformations.fk_helpers.drop_helpers",
+        "domain.transformations.helpers.reorder_helpers_next_to_fk",
+        "domain.validations.fk_helpers.validate_fk_helpers",
     }
-
-    assert current_consumers == expected_current_consumers, (
-        "helper_policies.fk current_state.consumers must reflect runtime truth; "
-        "only enrich_helpers consumes v1 today. "
-        "FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 owns adding v2-aware "
-        "primitives to the current reader set."
+    assert expected_v2_consumers <= current_consumers, (
+        "helper_policies.fk current_state.consumers must include every "
+        "v2-aware FK-helper primitive after "
+        "FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5; missing: "
+        f"{expected_v2_consumers - current_consumers}"
     )
-
-    for target_only_consumer in target_only_until_primitives_ftr:
-        assert target_only_consumer not in current_consumers, (
-            f"{target_only_consumer} must stay target-only until "
-            "FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 changes runtime behavior"
-        )
-        assert target_only_consumer in target_consumers, (
-            f"{target_only_consumer} should be listed under "
-            "target_state.target_consumers while the bridge is active"
-        )
+    assert runtime_reads == {"v2_relation_policy"}, (
+        "runtime_reads must reflect v2-only consumption after "
+        "FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5"
+    )
+    assert {"v1_per_target_policy", "v2_relation_policy"} <= runtime_writes, (
+        "runtime_writes must still list v1 and v2 while configure_fk_helpers "
+        "writes the residual v1 per-target shape"
+    )

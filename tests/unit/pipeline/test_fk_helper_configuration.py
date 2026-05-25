@@ -73,7 +73,12 @@ def test_add_fk_helpers_uses_resolved_default_policy() -> None:
     assert level0_series(out["Orders"], "_Products_category").tolist() == ["B", "A"]
 
 
-def test_add_fk_helpers_rejects_inline_target_policy_conflict() -> None:
+@pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
+def test_add_fk_helpers_ignores_inline_helper_field_overrides() -> None:
+    """Inline ``helper_fields_by_target`` is no longer consumed by
+    ``add_fk_helpers``: the only relation contract is the v2 policy written
+    by ``configure_fk_helpers`` / ``infer_fk_relations``.
+    """
     steps = build_steps_from_config(
         [
             {
@@ -89,17 +94,33 @@ def test_add_fk_helpers_rejects_inline_target_policy_conflict() -> None:
             {
                 "step": "add_fk_helpers",
                 "defaults": {
+                    # This v1 hint is intentionally ignored; configured policy
+                    # remains authoritative and produces ``_Products_category``.
                     "helper_fields_by_target": {"Products": ["name"]},
                 },
             },
         ]
     )
 
-    with pytest.raises(ValueError, match="conflict"):
+    out = run_pipeline(_frames(), steps)
+    lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["Orders"].columns]
+    assert "_Products_category" in lvl0
+    assert "_Products_name" not in lvl0
+
+
+@pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
+def test_add_fk_helpers_without_policy_raises_actionable_error() -> None:
+    steps = build_steps_from_config([{"step": "add_fk_helpers"}])
+    with pytest.raises(ValueError, match="infer_fk_relations"):
         run_pipeline(_frames(), steps)
 
 
-def test_add_fk_helpers_rejects_stale_policy_defaults_outside_allowlist() -> None:
+@pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
+def test_add_fk_helpers_ignores_stale_v1_only_policy() -> None:
+    """A v1-only policy without the schema_version 2 marker is no longer
+    read by primitives; missing v2 must be reported clearly even when v1 is
+    present.
+    """
     frames = _frames()
     frames["_meta"] = {
         "helper_policies": {
@@ -116,14 +137,16 @@ def test_add_fk_helpers_rejects_stale_policy_defaults_outside_allowlist() -> Non
             }
         }
     }
-
     steps = build_steps_from_config([{"step": "add_fk_helpers"}])
-
-    with pytest.raises(ValueError, match="must be included in allowed_helpers"):
+    with pytest.raises(ValueError, match="schema_version: 2"):
         run_pipeline(frames, steps)
 
 
-def test_add_fk_helpers_rejects_multiple_policy_prefixes() -> None:
+@pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
+def test_add_fk_helpers_supports_distinct_helper_prefixes_per_relation() -> None:
+    """v2 relations carry per-relation ``helper_prefix``; distinct prefixes
+    for different targets coexist in one execution.
+    """
     steps = build_steps_from_config(
         [
             {
@@ -147,29 +170,30 @@ def test_add_fk_helpers_rejects_multiple_policy_prefixes() -> None:
         ]
     )
 
-    with pytest.raises(ValueError, match="multiple helper_prefix"):
-        run_pipeline(_frames(), steps)
+    frames = _frames()
+    frames["Orders"]["code_(Suppliers)"] = ["s1", "s2"]
+    out = run_pipeline(frames, steps)
+
+    lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["Orders"].columns]
+    assert "_Products_name" in lvl0
+    assert "__Suppliers_name" in lvl0
 
 
-def test_add_fk_helpers_legacy_inline_behavior_remains_supported() -> None:
+@pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
+def test_add_fk_helpers_consumes_inferred_relations_path() -> None:
+    """``infer_fk_relations`` -> ``add_fk_helpers`` composes through v2 policy."""
+    frames = _frames()
     steps = build_steps_from_config(
         [
             {
-                "step": "add_fk_helpers",
-                "defaults": {
-                    "id_field": "code",
-                    "helper_fields_by_fk": {"code_(Products)": ["category", "name"]},
-                },
-            }
+                "step": "infer_fk_relations",
+                "id_columns": ["code"],
+                "fk_patterns": ["code_({target})"],
+            },
+            {"step": "add_fk_helpers"},
         ]
     )
 
-    out = run_pipeline(_frames(), steps)
+    out = run_pipeline(frames, steps)
     lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["Orders"].columns]
-
-    assert lvl0 == [
-        "order_id",
-        "code_(Products)",
-        "_Products_category",
-        "_Products_name",
-    ]
+    assert "_Products_name" in lvl0

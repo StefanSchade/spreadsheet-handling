@@ -34,6 +34,7 @@ def _write_helper_provenance(
                     "column": fk.helper_column,
                     "fk_column": fk.fk_column,
                     "target": fk.target_sheet_key,
+                    "target_key": fk.id_field,
                     "value_field": fk.value_field,
                 }
                 for fk in fk_defs

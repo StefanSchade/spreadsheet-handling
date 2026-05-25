@@ -30,11 +30,14 @@ def test_pipeline_validate_apply_drop_roundtrip():
         "levels": 3,
     }
 
-    steps = [
-        make_validate_step(defaults=defaults, mode_duplicate_ids="warn", mode_missing_fk="warn"),
-        make_apply_fks_step(defaults=defaults),               # should add helper column to B
-        make_drop_helpers_step(prefix=defaults["helper_prefix"]),  # should drop helper columns again
-    ]
+    steps = build_steps_from_config(
+        [
+            {"step": "validate", "mode_duplicate_ids": "warn", "mode_missing_fk": "warn", "defaults": defaults},
+            {"step": "infer_fk_relations"},
+            {"step": "add_fk_helpers", "defaults": defaults},
+            {"step": "remove_fk_helpers", "prefix": defaults["helper_prefix"]},
+        ]
+    )
 
     out = run_pipeline(frames, steps)
 
@@ -60,6 +63,7 @@ def test_pipeline_build_from_config_registry():
             "mode_missing_fk": "warn",
             "defaults": {"id_field": "id", "label_field": "name", "detect_fk": True, "helper_prefix": "_"},
         },
+        {"step": "infer_fk_relations"},
         {"step": "add_fk_helpers", "defaults": {"id_field": "id", "label_field": "name", "detect_fk": True}},
         {"step": "remove_fk_helpers", "prefix": "_"},
     ]
@@ -85,15 +89,26 @@ def test_pipeline_reorder_multi_helpers_next_to_fk_in_configured_order():
         "detect_fk": True,
         "helper_prefix": "_",
         "levels": 3,
-        "helper_fields_by_fk": {"id_(A)": ["category", "name"]},
     }
 
     out = run_pipeline(
         frames,
-        [
-            make_apply_fks_step(defaults=defaults),
-            build_steps_from_config([{"step": "reorder_fk_helpers", "helper_prefix": "_"}])[0],
-        ],
+        build_steps_from_config(
+            [
+                {
+                    "step": "configure_fk_helpers",
+                    "targets": {
+                        "A": {
+                            "key": "id",
+                            "allowed_helpers": ["category", "name"],
+                            "default_helpers": ["category", "name"],
+                        }
+                    },
+                },
+                {"step": "add_fk_helpers", "defaults": defaults},
+                {"step": "reorder_fk_helpers", "helper_prefix": "_"},
+            ]
+        ),
     )
 
     lvl0 = [c[0] if isinstance(c, tuple) else c for c in out["B"].columns]

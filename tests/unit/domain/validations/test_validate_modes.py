@@ -16,10 +16,14 @@ def _frames_with_duplicate_ids():
 
 
 def _frames_with_missing_fk():
-    return {
-        "A": pd.DataFrame([{"id": 1, "name": "Alpha"}]),
-        "B": pd.DataFrame([{"id_(A)": 1}, {"id_(A)": 99}]),  # 99 does not exist in A
-    }
+    from spreadsheet_handling.domain.fk_relations import infer_fk_relations
+
+    return infer_fk_relations(
+        {
+            "A": pd.DataFrame([{"id": 1, "name": "Alpha"}]),
+            "B": pd.DataFrame([{"id_(A)": 1}, {"id_(A)": 99}]),  # 99 does not exist in A
+        }
+    )
 
 
 DEFAULTS = {

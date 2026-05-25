@@ -297,18 +297,17 @@ entries:
     classification: canonical_meta
     meaning: >-
       Resolved helper policy metadata for lookup-helper and FK-helper steps.
-      The `lookup` namespace is keyed by lookup frame. The `fk` namespace is
-      currently in a *transitional state* between two shapes under the same
-      root: v1 per-target dicts keyed by FK target (consumed by current
-      FK-helper primitives) and v2 relation entries under
-      `fk.schema_version` plus `fk.relations` keyed by
-      `(source_frame, source_column)` (the target producer shape). v2 is the
-      forward-looking contract; v1 is retained only for the current primitive
-      consumers. The v1+v2 coexistence is not a permanent dual authority. It
-      is owned by `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5` while
-      configuration steps emit both shapes, and is narrowed or removed by
-      `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` once primitives consume
-      v2 directly.
+      The `lookup` namespace is keyed by lookup frame. The `fk` namespace
+      uses v2 relation entries under `fk.schema_version` plus
+      `fk.relations` keyed by `(source_frame, source_column)`. v2 is the
+      authoritative runtime contract for FK-helper primitives. v1
+      per-target dicts keyed by FK target are still written by
+      `configure_fk_helpers` for now (a residual producer-side
+      compatibility shim under the same root) but are *not* read by any
+      runtime consumer after
+      `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. Trimming the residual
+      v1 producer write is a follow-up clean-up that does not block the
+      runtime consumer contract documented here.
     scope: workbook mapping with `lookup` and `fk` policy namespaces keyed by lookup frame or FK target
     origin: configuration steps, persisted input meta, plugins, or caller-supplied canonical workbook meta
     render_relevance: indirect
@@ -323,28 +322,30 @@ entries:
     consumer:
       - domain.transformations.enrich_lookup.enrich_lookup
       - domain.transformations.fk_helpers.enrich_helpers
+      - domain.transformations.fk_helpers.drop_helpers
+      - domain.transformations.helpers.reorder_helpers_next_to_fk
+      - domain.validations.fk_helpers.validate_fk_helpers
       - rendering.composer.layout_composer.compose_workbook
       - rendering.workbook_projection.workbookir_to_frames
     merge_behavior: >-
-      Lookup and v1 FK policy entries are keyed by namespace and target; a
-      later policy replaces the prior entry of the same key. v2 FK relation
-      entries under `fk.relations` are keyed by
-      `(source_frame, source_column)`; cross-producer collisions on the same
-      key fail clearly; same-producer rewrites are accepted only when the
-      relation body is semantically identical and otherwise fail clearly
-      (no silent overwrites). `configure_fk_helpers` derives its v2 entries
-      from each resolved v1 policy by deterministic frame scan for the
-      configured literal `fk_column`; this transitional bridge is owned by
-      `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5` and is narrowed or
-      removed by `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+      Lookup policy entries are keyed by lookup frame and replace the prior
+      entry of the same key. v2 FK relation entries under `fk.relations`
+      are keyed by `(source_frame, source_column)`; cross-producer
+      collisions on the same key fail clearly; same-producer rewrites are
+      accepted only when the relation body is semantically identical and
+      otherwise fail clearly (no silent overwrites). `configure_fk_helpers`
+      additionally writes residual v1 per-target dicts derived from each
+      resolved policy entry; those entries are no longer read by any
+      runtime consumer and remain only as a producer-side compatibility
+      shim that will be trimmed by a follow-up clean-up.
     precedence_notes: >-
       Configuration steps must persist concrete resolved policy; primitive
       helper steps must not treat unresolved `auto` as execution semantics.
-      Current FK-helper primitives consume the v1 per-target shape;
-      v2-aware primitive consumption is owned by
-      `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. The v1 entries and the
-      `configure_fk_helpers` v1 -> v2 bridge are transitional compatibility
-      mechanisms, not a permanent dual authority.
+      FK-helper primitives consume only the v2 relation policy under
+      `helper_policies.fk` (plus derived helper provenance under
+      `_meta.derived.sheets.*.helper_columns`). Convention-driven primitive
+      inference is no longer supported and is asserted by the FK-helper
+      primitives architecture guard.
     contract_lifecycle:
       scope: fk
       notes: >-
@@ -353,54 +354,65 @@ entries:
         Vocabulary definition lives in
         `docs/technical_model/ch05_registries/registry_semantics/05_contract_lifecycle.adoc`.
         Pilot established by
-        `FTR-REGISTRY-CONTRACT-LIFECYCLE-MODEL-P5`.
+        `FTR-REGISTRY-CONTRACT-LIFECYCLE-MODEL-P5`. After
+        `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` the runtime
+        consumers read v2 only; the bridge remains active on the
+        producer side because `configure_fk_helpers` still emits the
+        residual v1 per-target shape as a no-op back-compat write.
       current_state:
         shapes:
           v1_per_target_policy: >-
             Per-target dicts under
-            `_meta.helper_policies.fk.<target_key>`. Written by
-            `configure_fk_helpers` from explicit user configuration and
-            consumed today by the FK-helper primitives.
+            `_meta.helper_policies.fk.<target_key>`. Still written by
+            `configure_fk_helpers` from explicit user configuration but
+            no longer read by any runtime consumer after
+            `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
           v2_relation_policy: >-
             Relation list under `_meta.helper_policies.fk.relations`
             keyed by `(source_frame, source_column)`, plus the
             `_meta.helper_policies.fk.schema_version` marker.
             Written by `configure_fk_helpers` (via a deterministic
             v1 -> v2 frame-scan bridge) and by `infer_fk_relations`.
-            Not yet consumed by FK-helper primitives at runtime.
+            Authoritatively consumed by the FK-helper primitives.
         runtime_writes:
           - v1_per_target_policy
           - v2_relation_policy
         runtime_reads:
-          - v1_per_target_policy
+          - v2_relation_policy
         producers:
           - domain.helper_policies.configure_fk_helpers
           - domain.fk_relations.infer_fk_relations
         consumers:
           - domain.transformations.fk_helpers.enrich_helpers
+          - domain.transformations.fk_helpers.drop_helpers
+          - domain.transformations.helpers.reorder_helpers_next_to_fk
+          - domain.validations.fk_helpers.validate_fk_helpers
       target_state:
         preferred_shape: v2_relation_policy
         owning_ftr: FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5
         target_consumers:
           - domain.transformations.fk_helpers.enrich_helpers
           - domain.transformations.fk_helpers.drop_helpers
+          - domain.transformations.helpers.reorder_helpers_next_to_fk
+          - domain.validations.fk_helpers.validate_fk_helpers
       transition_bridge:
         status: active
         bridge_type: dual_write
         source_shape: v1_per_target_policy
         target_shape: v2_relation_policy
         reason: >-
-          Current FK-helper primitives still consume the v1 per-target
-          shape while configuration steps additionally emit v2 relation
-          entries for future v2-aware primitives. The bridge is
-          temporary; v1 and v2 are not a permanent dual authority.
+          FK-helper primitives now consume v2 only;
+          `configure_fk_helpers` still writes the v1 per-target shape
+          for producer-side back-compat with persisted workbooks that
+          may carry the older shape. The bridge is no longer load-bearing
+          on the consumer side and remains a producer-only residual.
         bridge_rule: >-
-          `configure_fk_helpers` writes the v1 per-target shape for
-          current primitive consumers and additionally writes v2
-          relation entries derived from each resolved v1 policy by a
-          deterministic frame-scan over current data frames for the
-          configured literal `fk_column` header. `infer_fk_relations`
-          writes the v2 shape only.
+          `configure_fk_helpers` writes both the residual v1 per-target
+          shape and the v2 relation list derived from each resolved
+          policy by a deterministic frame-scan over current data frames
+          for the configured literal `fk_column` header.
+          `infer_fk_relations` writes the v2 shape only. Runtime
+          consumers read v2 exclusively.
         identity_derivation: temporary_bridge
         identity_derivation_notes: >-
           `configure_fk_helpers` derives v2 relation identity
@@ -414,10 +426,11 @@ entries:
           inference belongs to `infer_fk_relations`.
         removal_ftr: FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5
         removal_condition: >-
-          Closure of `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` with
-          tests demonstrating that FK-helper primitives consume the v2
-          relation policy and that no runtime reader still depends on
-          the v1 per-target shape.
+          `configure_fk_helpers` no longer writes the residual v1
+          per-target shape, at which point the entry becomes
+          single-shape v2 and the bridge is retired. Runtime consumer
+          migration is already complete; only the producer-side residual
+          write remains.
 
   - name: frame_lifecycle
     layer: meta_canonical

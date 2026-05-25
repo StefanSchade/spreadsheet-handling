@@ -1,4 +1,9 @@
-"""Tests for FK-helper enrichment as pure domain transformation."""
+"""Tests for FK-helper enrichment as pure domain transformation.
+
+FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 refactored the primitives to
+consume v2 relation policy at ``_meta.helper_policies.fk``; tests in this
+module seed that policy explicitly before invoking ``make_apply_fks_step``.
+"""
 from __future__ import annotations
 
 import pytest
@@ -12,6 +17,8 @@ from spreadsheet_handling.core.fk import (
     apply_fk_helpers,
 )
 from spreadsheet_handling.core.indexing import level0_series
+from spreadsheet_handling.domain.fk_relations import infer_fk_relations
+from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
 from spreadsheet_handling.pipeline.steps import make_apply_fks_step
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-REFACTOR-P3B")
@@ -25,7 +32,26 @@ def _frames():
     return {"A": a, "B": b}
 
 
+def _frames_with_v2_policy(*, helper_fields: list[str] | None = None):
+    frames = _frames()
+    if helper_fields is not None:
+        return configure_fk_helpers(
+            frames,
+            target="B",
+            key="id",
+            allowed_helpers=helper_fields,
+            default_helpers=helper_fields,
+        )
+    return infer_fk_relations(frames)
+
+
 class TestApplyFkHelpers:
+    """Materialization unit tests stay on the legacy core/fk helpers.
+
+    These tests cover the lower-level ``apply_fk_helpers`` building block; they
+    remain unchanged because that helper is still used by the v2-aware
+    primitive to write declared helper columns.
+    """
 
     def test_adds_helper_column(self):
         frames = _frames()
@@ -43,7 +69,6 @@ class TestApplyFkHelpers:
         fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
 
         result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
-        # Helper column is stored as tuple even at levels=1
         helper_col = [c for c in result.columns if (c[0] if isinstance(c, tuple) else c) == "_B_name"][0]
         helpers = result[helper_col].tolist()
         assert helpers == ["alpha", "beta"]
@@ -60,7 +85,6 @@ class TestApplyFkHelpers:
     def test_detect_fk_disabled_skips(self):
         frames = _frames()
         reg = build_registry(frames, DEFAULTS)
-        # Empty registry simulates detect_fk=False (no target sheets matched)
         fk_defs = detect_fk_columns(frames["A"], {}, helper_prefix="_")
         assert fk_defs == []
 
@@ -95,7 +119,7 @@ class TestApplyFksStepProvenance:
     """FTR-FK-HELPER-PROVENANCE-CLEANUP: apply_fks writes derived provenance."""
 
     def test_provenance_written_for_single_helper(self):
-        frames = _frames()
+        frames = _frames_with_v2_policy()
         step = make_apply_fks_step(defaults=DEFAULTS)
         out = step.fn(frames)
 
@@ -106,6 +130,7 @@ class TestApplyFksStepProvenance:
             "column": "_B_name",
             "fk_column": "id_(B)",
             "target": "B",
+            "target_key": "id",
             "value_field": "name",
         }
 
@@ -116,12 +141,15 @@ class TestApplyFksStepProvenance:
                 {"id": [1, 2], "name": ["alpha", "beta"], "category": ["x", "y"]}
             ),
         }
-        defaults = {
-            **DEFAULTS,
-            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
-        }
-        step = make_apply_fks_step(defaults=defaults)
-        out = step.fn(frames)
+        configured = configure_fk_helpers(
+            frames,
+            target="B",
+            key="id",
+            allowed_helpers=["category", "name"],
+            default_helpers=["category", "name"],
+        )
+        step = make_apply_fks_step(defaults=DEFAULTS)
+        out = step.fn(configured)
 
         prov = out["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
         assert len(prov) == 2
@@ -131,7 +159,7 @@ class TestApplyFksStepProvenance:
         assert prov[1]["value_field"] == "name"
 
     def test_no_provenance_for_sheet_without_fks(self):
-        frames = _frames()
+        frames = _frames_with_v2_policy()
         step = make_apply_fks_step(defaults=DEFAULTS)
         out = step.fn(frames)
 
@@ -139,8 +167,8 @@ class TestApplyFksStepProvenance:
         assert "B" not in derived_sheets
 
     def test_provenance_preserves_existing_meta(self):
-        frames = _frames()
-        frames["_meta"] = {"version": "3.0", "author": "test"}
+        frames = _frames_with_v2_policy()
+        frames["_meta"].update({"version": "3.0", "author": "test"})
         step = make_apply_fks_step(defaults=DEFAULTS)
         out = step.fn(frames)
 
@@ -151,17 +179,14 @@ class TestApplyFksStepProvenance:
     def test_stale_provenance_removed_for_sheet_without_current_fks(self):
         """apply_fks removes stale helper_columns provenance for sheets that
         no longer have FK defs in the current run."""
-        frames = _frames()
-        # Inject stale provenance for a sheet that has no FKs
-        frames["_meta"] = {
-            "derived": {
-                "sheets": {
-                    "B": {
-                        "helper_columns": [
-                            {"column": "_X_old", "fk_column": "id_(X)",
-                             "target": "X", "value_field": "old"},
-                        ]
-                    }
+        frames = _frames_with_v2_policy()
+        frames["_meta"]["derived"] = {
+            "sheets": {
+                "B": {
+                    "helper_columns": [
+                        {"column": "_X_old", "fk_column": "id_(X)",
+                         "target": "X", "target_key": "id", "value_field": "old"},
+                    ]
                 }
             }
         }
@@ -174,16 +199,14 @@ class TestApplyFksStepProvenance:
 
     def test_stale_provenance_removed_for_sheet_no_longer_in_frames(self):
         """apply_fks cleans provenance for sheets that are not in frames at all."""
-        frames = _frames()
-        frames["_meta"] = {
-            "derived": {
-                "sheets": {
-                    "Gone": {
-                        "helper_columns": [
-                            {"column": "_Z_val", "fk_column": "id_(Z)",
-                             "target": "Z", "value_field": "val"},
-                        ]
-                    }
+        frames = _frames_with_v2_policy()
+        frames["_meta"]["derived"] = {
+            "sheets": {
+                "Gone": {
+                    "helper_columns": [
+                        {"column": "_Z_val", "fk_column": "id_(Z)",
+                         "target": "Z", "target_key": "id", "value_field": "val"},
+                    ]
                 }
             }
         }
@@ -195,12 +218,10 @@ class TestApplyFksStepProvenance:
 
     def test_key_selective_merge_preserves_other_derived_keys(self):
         """apply_fks only replaces helper_columns, not the whole sheet dict."""
-        frames = _frames()
-        frames["_meta"] = {
-            "derived": {
-                "sheets": {
-                    "A": {"other_derived_key": "keep_me"}
-                }
+        frames = _frames_with_v2_policy()
+        frames["_meta"]["derived"] = {
+            "sheets": {
+                "A": {"other_derived_key": "keep_me"}
             }
         }
         step = make_apply_fks_step(defaults=DEFAULTS)

@@ -21,6 +21,7 @@ def test_pipeline_from_yaml_fragment():
           label_field: name
           detect_fk: true
           helper_prefix: "_"
+      - step: infer_fk_relations
       - step: add_fk_helpers
         defaults:
           id_field: id
@@ -47,6 +48,12 @@ def test_pipeline_from_yaml_fragment():
 def test_pipeline_from_yaml_supports_multi_helper_config():
     yaml_txt = textwrap.dedent("""
     pipeline:
+      - step: configure_fk_helpers
+        targets:
+          A:
+            key: id
+            allowed_helpers: [category, name]
+            default_helpers: [category, name]
       - step: add_fk_helpers
         defaults:
           id_field: id
@@ -54,8 +61,6 @@ def test_pipeline_from_yaml_supports_multi_helper_config():
           detect_fk: true
           helper_prefix: "_"
           levels: 3
-          helper_fields_by_fk:
-            id_(A): [category, name]
       - step: reorder_fk_helpers
         helper_prefix: "_"
     """).strip()
