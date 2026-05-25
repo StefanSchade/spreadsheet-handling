@@ -1,16 +1,24 @@
 """Pure domain validation functions for FK-helper consistency.
 
-The validation primitives consume v2 FK relation policy under
-``_meta.helper_policies.fk.relations`` and derived helper provenance under
-``_meta.derived.sheets.*.helper_columns``. They never re-derive FK identity
-from column names. Without policy or provenance, the FK-specific checks have
-no declared relations to validate against and emit no findings; the
-duplicate-id check still runs because it is independent of FK structure.
+The validation primitive ``validate_fk_helpers`` consumes v2 FK relation
+policy under ``_meta.helper_policies.fk.relations`` and derived helper
+provenance under ``_meta.derived.sheets.*.helper_columns``. The primitive
+never re-derives FK identity from column names. Missing both policy and
+provenance raises a clear actionable error naming ``configure_fk_helpers``
+and ``infer_fk_relations`` -- the same contract as ``add_fk_helpers``,
+``remove_fk_helpers``, and ``reorder_fk_helpers``.
+
+The generic ``check_duplicate_ids`` helper is intentionally
+policy-independent: it can be called from the broader ``validate`` step or
+from callers that only care about per-sheet uniqueness, without requiring
+FK-helper policy.
 
 Refactored by ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`` from the
 previous convention-driven detection path.
 
-All functions are stateless and return structured findings.
+All functions are stateless and return structured findings (except for the
+combined ``validate_fk_helpers`` primitive entry point, which raises when
+the FK-helper policy contract is not satisfied).
 No logging, no exceptions for validation issues -- callers decide policy.
 """
 from __future__ import annotations
@@ -24,6 +32,7 @@ from ...core.fk import normalize_sheet_key
 from ...core.indexing import has_level0, level0_series
 from ..transformations.fk_helpers import (
     derived_helper_columns_by_sheet,
+    missing_fk_policy_error,
     resolve_v2_fk_relations,
 )
 from .findings import Finding
@@ -276,7 +285,23 @@ def validate_fk_helpers(
     frames: Frames,
     defaults: Dict[str, Any] | None = None,
 ) -> Findings:
-    """Run all FK-helper validation checks and return combined findings."""
+    """Run all FK-helper validation checks and return combined findings.
+
+    Primitive entry point for the ``validate_fk_helpers`` pipeline step.
+    Requires v2 FK relation policy at ``_meta.helper_policies.fk``
+    (schema_version 2) or derived helper provenance under
+    ``_meta.derived.sheets.*.helper_columns``. If neither is present the
+    primitive raises ``MissingFkRelationPolicyError`` -- the same actionable
+    error used by ``add_fk_helpers``, ``remove_fk_helpers``, and
+    ``reorder_fk_helpers`` -- so the pipeline author runs
+    ``configure_fk_helpers`` or ``infer_fk_relations`` first.
+
+    For policy-independent uniqueness checks the standalone
+    ``check_duplicate_ids`` helper remains available.
+    """
+    if resolve_v2_fk_relations(frames) is None and not derived_helper_columns_by_sheet(frames):
+        raise missing_fk_policy_error("validate_fk_helpers")
+
     return (
         check_duplicate_ids(frames, defaults)
         + check_unresolvable_fks(frames, defaults)

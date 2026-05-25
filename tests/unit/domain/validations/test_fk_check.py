@@ -225,14 +225,25 @@ class TestValidateUsesTargetKeyFromPolicy:
             for f in findings
         ), findings
 
-    def test_no_policy_no_provenance_returns_no_fk_findings(self):
-        """Without policy / provenance there is no declared relation to
-        validate; the FK-specific checks have nothing to report."""
+    def test_validate_fk_helpers_without_policy_or_provenance_raises(self):
+        """The primitive entry point requires v2 policy or derived helper
+        provenance and raises a clear actionable error when neither is
+        present -- matching the contract of ``add_fk_helpers``,
+        ``remove_fk_helpers``, and ``reorder_fk_helpers``.
+        """
         frames = {
             "A": pd.DataFrame({"id": [10], "id_(B)": [1], "_B_name": ["WRONG"]}),
             "B": pd.DataFrame({"id": [1], "name": ["alpha"]}),
         }
-        assert check_helper_values(frames, DEFAULTS) == []
-        assert check_missing_helpers(frames, DEFAULTS) == []
-        assert check_unresolvable_fks(frames, DEFAULTS) == []
-        assert check_unexpected_helpers(frames, DEFAULTS) == []
+        with pytest.raises(ValueError, match="infer_fk_relations"):
+            validate_fk_helpers(frames, DEFAULTS)
+
+    def test_check_duplicate_ids_remains_policy_independent(self):
+        """``check_duplicate_ids`` is the generic uniqueness check; it
+        is intentionally usable without FK-helper policy so the broader
+        ``validate`` step (and direct callers) keep working on workbooks
+        that have no FK relations at all."""
+        frames = {"X": pd.DataFrame({"id": [1, 1, 2], "name": ["a", "b", "c"]})}
+        findings = check_duplicate_ids(frames, DEFAULTS)
+        assert len(findings) == 1
+        assert findings[0].category == "duplicate_id"

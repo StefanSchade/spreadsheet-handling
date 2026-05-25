@@ -22,6 +22,7 @@ from spreadsheet_handling.domain.validations.fk_helpers import (
     check_helper_values,
     check_missing_helpers,
     check_unresolvable_fks,
+    validate_fk_helpers,
 )
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5")
@@ -131,6 +132,10 @@ class TestMissingPolicyErrors:
         step = reorder_helpers_next_to_fk()
         with pytest.raises(ValueError, match="infer_fk_relations"):
             step(_orders_and_products())
+
+    def test_validate_fk_helpers_without_policy_or_provenance_raises(self):
+        with pytest.raises(ValueError, match="infer_fk_relations"):
+            validate_fk_helpers(_orders_and_products())
 
     def test_v1_only_policy_is_not_consumed_by_primitives(self):
         """A persisted v1-shape policy without ``schema_version: 2`` must
