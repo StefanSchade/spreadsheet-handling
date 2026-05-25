@@ -1,0 +1,607 @@
+===== FTR-REGISTRY-CONTRACT-LIFECYCLE-MODEL-P5 -- Model current, target, and transition states in registry contracts
+
+*Status:* New
+
+*Suggested sequence:* After `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`
+closes, before `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. If the review
+of the immediately preceding FK-helper FTR concludes that the v1/v2 bridge
+in `configure_fk_helpers` is not acceptable, that implementation must be
+fixed first. This FTR should pilot a *real, already-accepted* transition;
+it must not paper over a rejected one.
+
+*Purpose:*::
+Give registry entries a small, explicit way to distinguish:
++
+* what runtime producers and consumers actually do *now*,
+* what the *target contract* is meant to be,
+* which temporary *bridge* exists during the migration,
+* when and how that bridge must be removed.
++
+A registry should be able to describe contract evolution without lying
+about current runtime behavior, and without making a temporary
+compatibility mechanism look like a second permanent authority.
+
+*Design constraints (read first):*::
+This FTR exists *because* the recent FK-helper FTRs
+(`FTR-FK-RELATION-POLICY-MODEL-P5`,
+`FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`) exposed the same
+current-state / target-state / transition-bridge ambiguity twice in a row
+in living registry contracts. It is a *narrow lesson-capture FTR*, not the
+opening move of a registry-governance subproject. The implementing agent
+must respect the following constraints:
++
+* No general governance framework. Pilot one small shape on one entry,
+  with one narrow guard.
+* No requirement that every registry entry adopts lifecycle fields. The
+  model is opt-in for entries that actually have current / target /
+  transition ambiguity. The initial pilot is `_meta.helper_policies.fk`.
+* Prefer a small, truthful, guardable model over a broad formal one. If a
+  field cannot be guarded or read by a fresh agent without ambiguity, it
+  should not be required.
+* Preserve flexibility for explicitly approved breaking changes.
+  Transition semantics must *not* become a compatibility straightjacket
+  that prevents the developer from later choosing "rename and migrate"
+  over "keep a temporary bridge".
+* The pilot is a real transition that has already been authorized
+  (`_meta.helper_policies.fk` v1 -> v2). This FTR is not a vehicle to
+  retrofit lifecycle fields onto stable registry entries.
+
+*Problem statement:*::
+The project increasingly uses registries as living contracts, especially:
++
+* `docs/technical_model/ch05_registries/meta_registry/meta_registry.yaml`
+* `docs/technical_model/ch05_registries/pipeline_step_registry/pipeline_step_registry.json`
++
+These registries are not just static documentation. Agents, reviewers,
+architecture guards, and future implementation FTRs rely on them to decide
+what metadata roots, step contracts, producers, and consumers mean.
++
+The recent FK-helper work surfaced a recurring ambiguity:
++
+. *Current state* -- what does the runtime actually write or read today?
+. *Target contract* -- what shape should exist after the planned change?
+. *Transition bridge* -- what temporary dual-write, dual-read, mapping, or
+  adapter rule exists until all producers and consumers have moved?
++
+The `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5` review surfaced this
+directly ("registry hybrid-contract wording is too close to a permanent
+dual authority"), and commit `1efae37` already added a
+"do not let current-state registries lie" rule to the Developer Guide.
+When a registry cannot express the three states separately, three failure
+modes recur:
++
+* A target contract is written into a current-state registry before the
+  runtime supports it.
+* A temporary bridge becomes indistinguishable from the intended
+  permanent contract.
+* A producer / consumer migration has no explicit removal condition, so
+  compatibility code becomes permanent architecture by accident.
++
+The concrete motivating case is `_meta.helper_policies.fk` during the
+Phase 3a FK-helper semantic work:
++
+* The target contract is v2 relation-oriented policy
+  (`schema_version: 2`, `relations: [...]` keyed by
+  `(source_frame, source_column)`).
+* Current FK-helper primitives still consume the v1 per-target shape
+  during the transition.
+* Producers (`configure_fk_helpers`, `infer_fk_relations`) dual-write or
+  bridge during the transition.
+* Registries must say this truthfully without making v1 and v2 look like
+  two equal permanent authorities.
++
+This FTR generalizes that lesson into a *small* registry-contract
+lifecycle model that captures the same pattern if (and only if) it
+appears again.
+
+*Important terminology boundary:*::
+This FTR introduces a registry-*contract* lifecycle axis. It is not about
+workbook metadata lifecycle. Do not blur:
++
+* registry-contract current-state / target-state / transition-bridge --
+  the subject of this FTR;
+* workbook `_meta` payload shape and lifecycle -- owned elsewhere (e.g.
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` for the derived channel);
+* `canonical` / `derived` / `operational-carrier` meta-layer roles --
+  defined in
+  `docs/technical_model/ch05_registries/registry_semantics/02_meta_layer.adoc`;
+* `model` / `presentation` / `workbook_identity` meta classifications --
+  `registry_semantics/03_meta_classification.adoc`;
+* backend capability profiles and their `accepted initial gap`
+  vocabulary --
+  `docs/technical_model/ch08_architecture_details/spreadsheet_backend_capability_profiles.adoc`.
++
+This lifecycle axis is *orthogonal* to those vocabularies. A registry
+entry remains canonical / derived / operational-carrier whatever its
+lifecycle state is. In particular:
++
+* Do not use `canonical` as a synonym for `target_state`. A meta claim
+  can be canonical *and* in transition between two shapes; the meta-layer
+  role does not change because a shape migration is underway.
+* Do not use `accepted_gap` (or any capability-profile term) as a bridge
+  status. That vocabulary describes backend capability gaps -- a
+  different classification axis. See *Bridge status vs capability-gap
+  vocabulary* below.
+
+*Background and analogous industry patterns (background only):*::
+This problem is structurally similar to API and schema evolution:
++
+* Schema registries treat schemas as contracts between producers and
+  consumers; evolution is safe only when compatibility rules say which
+  old / new producers and consumers can interoperate.
+* API deprecation / sunset / removal practices distinguish current
+  support, planned replacement, migration windows, and removal.
+* Consumer-driven contracts emphasize evaluating a provider contract
+  against *real consumers*, not only against an ideal future shape.
++
+The portable lessons are narrow:
++
+* Contract evolution must explicitly name current producers and consumers.
+* Target state is not current truth.
+* Bridges need removal conditions.
++
+This is the only API-evolution baggage this FTR should carry. It must
+*not* import schema-registry tooling, API gateways, or external
+service-governance models into the repository.
+
+*Metadata / registry checklist:*::
+
+* Existing metadata root / registry entry:
+  `meta_registry.yaml`, `pipeline_step_registry.json`; pilot on
+  `_meta.helper_policies.fk`.
+* Decision (extend / replace / introduce):
+  Extend registry-entry semantics with optional lifecycle fields. Do not
+  introduce a new workbook `_meta` root and do not extend the workbook
+  payload shape.
+* Authority / source of truth:
+  Registry files remain the source of reviewed registry-contract claims.
+* Producers (steps, plugins, callers):
+  As listed today on `_meta.helper_policies.fk`
+  (`domain.helper_policies.configure_fk_helpers`,
+  `domain.fk_relations.infer_fk_relations`).
+* Consumers (steps, passes, adapters, readback):
+  Current FK-helper primitives (still on v1) and later v2-consuming
+  primitives.
+* Persistence / carrier behavior:
+  Lifecycle fields are documentation / guard metadata in the registry
+  files. They are not part of the workbook payload.
+* Lifecycle owner:
+  This FTR owns the registry-lifecycle vocabulary and the pilot. Each
+  feature FTR owns its own bridge removal.
+* Missing-metadata behavior:
+  Unchanged by this FTR.
+* Heuristic / configuration split:
+  Unchanged; heuristics remain in configuration steps.
+* Primitive execution contract:
+  Unchanged.
+* Wire-format vs inference distinction:
+  Unchanged.
+* Public-surface approval gate:
+  Registry structure and documented `_meta` contract semantics are gated
+  surfaces per `docs/ai_info/interfaces_and_gates.adoc`. This FTR
+  requires developer approval before implementation.
+* Guard / test to enforce the rule:
+  Add one lightweight architecture guard pinned to the pilot. No broad
+  schema engine.
+* Docs / demo realignment slice:
+  No demo update. Developer Guide / AI-info / technical-model registry
+  docs may be lightly updated in this FTR; AI-info stays a pointer to
+  canonical documentation.
+
+*Design intent (illustrative, not mandatory):*::
+A registry entry that opts into lifecycle annotation may carry something
+like:
++
+[source,yaml]
+----
+contract_lifecycle:
+  current_state:
+    runtime_writes:
+      - v1_per_target_policy
+      - v2_relation_policy
+    runtime_reads:
+      - v1_per_target_policy
+    producers:
+      - spreadsheet_handling.domain.helper_policies.configure_fk_helpers
+      - spreadsheet_handling.domain.fk_relations.infer_fk_relations
+    consumers:
+      - current_fk_helper_primitives
+
+  target_state:
+    preferred_shape: v2_relation_policy
+    owning_ftr: FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5
+    target_consumers:
+      - policy_driven_fk_helper_primitives
+
+  transition_bridge:
+    status: active           # none | planned | active | retired
+    bridge_type: dual_write  # see Questions for implementation analysis
+    source_shape: v1_per_target_policy
+    target_shape: v2_relation_policy
+    reason: current primitives still consume v1 while v2 is being introduced
+    bridge_rule: configure_fk_helpers writes v1 for current primitives and v2 for future primitives
+    removal_ftr: FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5
+    removal_condition: primitives consume v2 and no runtime reader depends on v1
+----
++
+The sketch is illustrative. The implementing agent should choose the
+smallest field shape that lets the pilot be guarded and read
+unambiguously. Do not adopt every field above just because it is listed.
+
+*Bridge status vs capability-gap vocabulary (do not mix):*::
+The bridge lifecycle status must stay focused on producer / consumer
+contract migration. Use a small closed set such as:
++
+* `none` -- no bridge declared; the entry is single-shape today.
+* `planned` -- a target contract is documented; no bridge has shipped yet.
+* `active` -- the runtime currently carries the bridge.
+* `retired` -- the bridge has been removed; the entry is single-shape
+  again.
++
+Do *not* include `accepted_gap` in this set. `accepted_gap` (more
+precisely `accepted initial gap`) belongs to the *backend capability
+profile* vocabulary in
+`spreadsheet_backend_capability_profiles.adoc`. It classifies a backend's
+capability gap relative to an IR operation, not a producer / consumer
+contract migration. The two concepts are loosely *analogous* -- both
+record "we accept a known divergence for now" -- but they are different
+axes and must not share a status field. If a future analogy is needed, it
+must be a *separate* classification, never folded into
+`transition_bridge.status`.
+
+*Guardability constraint:*::
+If lifecycle semantics are meant to be guarded, prefer structured fields
+over prose-only notes:
++
+* Prose may explain *why* a transition exists, what the bridge does, and
+  what the removal condition means. Prose is for reviewers and future
+  agents.
+* Guards must not parse free text. Any value a guard checks (status,
+  source shape, target shape, bridge type, removal FTR id) must be a
+  structured field with a small enumerated or pattern-matched vocabulary.
+* The first guard must be narrow and pilot-focused. It validates the
+  pilot entry's lifecycle structure; it must not become a general schema
+  engine that walks every registry entry.
+
+*Public surface vs runtime behavior:*::
+A registry-lifecycle entry may need to distinguish three things, not two:
++
+* *Current runtime behavior* -- what the producers / consumers actually
+  do today in code.
+* *Documented public surface* -- what the registry / user guide /
+  pipeline-step description currently claims to support.
+* *Target design intent* -- what the next implementation FTR will make
+  true.
++
+These can drift independently. A migration may already ship in code while
+the user-facing docs still describe the old contract; conversely, a
+target state can be documented before any runtime change.
++
+The implementing agent must make an *explicit* decision for this FTR:
++
+* either model documented-public-surface state minimally (for example a
+  small `documented_surface_shape` / `documented_surface_status` pair on
+  entries that need it);
+* or explicitly *exclude* documented-public-surface state from this
+  lifecycle model and record where it is handled instead (likely the
+  pipeline-step registry `purpose` / `notes` fields and the user-guide
+  transformation catalog, with the public-surface approval gate in
+  `interfaces_and_gates.adoc` acting as the discipline).
++
+Do not silently treat current-state-in-code as a stand-in for documented
+public surface, and do not force three full state objects when two are
+enough.
+
+*Shape migration bridge (deriving new identity from an old shape):*::
+The recent FK-helper work exposed a subtle issue worth its own design
+attention.
++
+When an old metadata shape is being replaced by a new identity model, the
+two shapes often do not align field-for-field. The v1 FK policy is
+*target-oriented* (`helper_policies.fk.<target_key>`). The v2 shape is
+*relation-oriented*, keyed by `(source_frame, source_column)`. A producer
+that still accepts v1 input but must also emit v2 has to *derive new
+identity* (the source frame, here) from data that v1 does not carry
+explicitly.
++
+In the v1 -> v2 migration this was solved by a frame-scan bridge inside
+`configure_fk_helpers` (one v2 relation per source frame carrying the
+configured literal `fk_column`). That is an *approved* transitional
+compatibility mechanism, not a general pattern. Future shape migrations
+may need different answers.
++
+For any contract whose *identity model* changes, the implementing FTR
+must state how old producers map to the new identity:
++
+* *explicit new fields* on the producer's input surface;
+* *deterministic normalization* from old fields to new identity;
+* *temporary bridge* (such as the FK-helper frame-scan), explicitly
+  authorized and scoped;
+* *rejection with a migration error*; or
+* *no migration* (the old shape is dropped outright).
++
+Agents must *not* silently scan frames or invent identity-bearing fields
+when emitting the new shape unless the FTR that introduces the migration
+explicitly authorizes that bridge -- as
+`FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5` did for
+`configure_fk_helpers`.
++
+This lifecycle model should make the requirement visible. The
+implementing agent must pick at least one of the following slots and use
+it:
++
+* a design question in this FTR's *Questions for implementation analysis*
+  that the later implementation FTR must answer;
+* a Developer Guide update that extends the existing metadata FTR
+  checklist (already added in commit `1efae37`) with an
+  identity-derivation question;
+* an acceptance criterion on the implementing FTR.
+
+*Questions for implementation analysis:*::
+The implementing agent should explicitly evaluate the following design
+questions before editing registry files:
++
+. Should lifecycle be modeled as one `contract_lifecycle` object, or as
+  smaller top-level fields such as `current_state`, `target_state`, and
+  `transition_bridge`?
+. Should shapes be named symbolic tokens, structured inline objects, or
+  both?
+. Should producer / consumer lists reference Python modules, registry
+  step names, or both?
+. Is one `removal_condition` enough, or should the model distinguish
+  *deprecation*, *sunset*, and *removal* conditions for this repository?
+. Should `transition_bridge.bridge_type` include any subset of
+  `dual_write`, `dual_read`, `adapter`, `mapping`,
+  `rejection_with_migration_error`, `manual_review_only`? Keep the set
+  small enough to enumerate.
+. How should the lifecycle model relate to existing `schema_version`
+  markers without duplicating them?
+. How does the lifecycle model address the *shape migration bridge*
+  identity-derivation question described above? Pick which of the three
+  slots above is used.
+. Should the lifecycle model carry a *documented public surface* state,
+  or should that be handled outside this model (see *Public surface vs
+  runtime behavior*)?
+. How should guards avoid becoming a broad schema-validation framework
+  while still catching the dangerous cases?
+. How should the model stay useful for both `meta_registry.yaml` and
+  `pipeline_step_registry.json` without forcing both registries into the
+  same schema prematurely?
+
+*Scope:*::
+
+* Define a small registry-contract lifecycle vocabulary for current
+  state, target state, and transition bridge.
+* Keep the lifecycle axis strictly orthogonal to canonical / derived /
+  operational-carrier meta-layer roles and to model / presentation /
+  workbook_identity classifications.
+* Add or update technical-model documentation explaining the lifecycle
+  axis. Keep it short.
+* Extend the existing Developer Guide metadata / registry FTR checklist
+  (commit `1efae37`) so future agents know when (and when not) to use
+  lifecycle fields and how to answer the identity-derivation question.
+  Do not introduce a second checklist.
+* Update AI-info guidance only as a concise pointer to the canonical
+  Developer Guide / technical-model section.
+* Pilot the model on `_meta.helper_policies.fk`.
+* Update the `helper_policies` entry in `meta_registry.yaml` to express
+  current writes, current reads, target shape, active bridge, and bridge
+  removal condition in structured form.
+  `pipeline_step_registry.json` may be updated only where lifecycle
+  ambiguity exists and the chosen model supports it cleanly; do not
+  noisify the pipeline registry.
+* Add one lightweight architecture guard for the pilot lifecycle fields.
+  Keep it narrow:
+  ** target state without distinguishable current state;
+  ** active bridge without removal FTR / removal condition;
+  ** current reads and writes reference different shapes without a
+     non-retired bridge;
+  ** lifecycle fields that confuse target state with current runtime
+     behavior (for example listing target-only consumers under
+     `current_state.consumers`).
+
+*Non-goals:*::
+
+* No workbook `_meta` payload change.
+* No runtime behavior change.
+* No FK-helper primitive refactor.
+* No implementation of new FK-helper semantics.
+* No demo repo change.
+* No public user-guide transformation catalog update.
+* No broad metadata schema-validation framework.
+* No migration of every registry entry to lifecycle fields.
+* No forced lifecycle fields on stable entries that have no real
+  transition ambiguity.
+* No attempt to version every project API.
+* No external API-gateway / service-governance model.
+* No renaming or redefining `canonical`, `derived`, `operational-carrier`,
+  `model`, `presentation`, `workbook_identity`, or any other existing
+  meta-role / classification terminology.
+* No date-based sunset requirement. Prefer FTR-id, consumer-state, or
+  test-based removal conditions for this repository.
+* No backend capability-profile redesign. `accepted_gap` /
+  `accepted initial gap` stays where it lives today.
+* No mechanism that prevents an explicitly approved breaking change.
+  Lifecycle semantics describe migrations the developer has chosen; they
+  do not lock the developer out of future "rename and migrate"
+  decisions.
+
+*Suggested implementation approach:*::
+
+. Read the current registry-semantics docs and glossary first.
+. Identify the smallest natural place for lifecycle semantics in:
+   ** `docs/technical_model/ch05_registries/registry_semantics/` (likely
+      a short new section on contract lifecycle),
+   ** `docs/technical_model/ch09_glossary/01_terms.adoc` (add minimal
+      terms),
+   ** `docs/developer_guide/ch08_git_and_workflow/01_git_and_workflow.adoc`
+      (extend the existing metadata FTR checklist; do not introduce a
+      second checklist).
+. Propose the smallest model that expresses the FK-helper v1 / v2 bridge
+   truthfully.
+. Pilot the model on `_meta.helper_policies.fk`.
+. Add one narrow architecture test under `tests/architecture/` that
+   validates the lifecycle fields on the pilot entry only.
+. Update the metadata / registry FTR checklist so future FTRs explicitly
+   state, for any contract change:
+   ** current-state claim,
+   ** target-state claim,
+   ** transition bridge (if any),
+   ** removal / sunset condition,
+   ** how new identity is derived from the old shape, when the shape
+      changes.
+. Prefer boring, explicit field names over clever abstractions.
+. Keep field ordering deterministic so the guard test stays simple.
+. Make the documentation say what a reviewer should do when lifecycle
+   fields are missing -- in particular, that absence is the default and
+   does not imply non-compliance.
+
+*Possible guard rules (final set up to implementation review):*::
+
+* If a registry entry has `target_state`, it must also have a
+  distinguishable `current_state`.
+* If a registry entry has `transition_bridge.status: active`, it must
+  name bridge type, source shape, target shape, reason, removal FTR, and
+  removal / sunset condition.
+* If `current_state.runtime_reads` and `current_state.runtime_writes`
+  reference different shapes, a non-retired bridge must be documented.
+* If a bridge names a removal FTR, that FTR id must match the project
+  FTR-id pattern (`FTR-...`).
+* If an entry marks a bridge as `retired`, it must not still describe
+  current consumers as reading the retired source shape.
+* Guards fail on missing structural lifecycle fields *only* where
+  lifecycle is explicitly in use. Entries without `contract_lifecycle`
+  are not required to opt in.
+
+*Pilot expectation for `_meta.helper_policies.fk`:*::
+The pilot must make the v1 -> v2 transition explicit and readable by a
+fresh agent without any conversation context. Depending on the runtime
+state at implementation time, the entry should say some variant of:
++
+* Current producers write the v1 per-target policy for current FK-helper
+  primitives.
+* Current producers also write the v2 relation policy.
+* Current FK-helper primitives still consume v1 until
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+* Target state is the v2 relation policy.
+* The v1 / v2 bridge is `active` and *temporary*; it is not a second
+  long-term canonical contract.
+* The removal condition is closure of
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` with tests demonstrating
+  that primitives consume v2 and no runtime reader depends on v1.
+* `configure_fk_helpers`'s v1 -> v2 frame-scan bridge is the approved
+  *identity-derivation mechanism* for this transition; future shape
+  migrations must restate the mechanism explicitly.
++
+Exact wording must match the runtime state at implementation time. If
+the primitive FK-helper FTR has already landed by then, the pilot should
+describe a *retired* bridge rather than an active one.
+
+*Acceptance:*::
+
+* A registry-contract lifecycle vocabulary is documented in the technical
+  model.
+* The vocabulary distinguishes at least *current state*, *target state*,
+  and *transition bridge*.
+* The vocabulary explicitly states that it is orthogonal to existing
+  canonical / derived / operational-carrier meta-layer roles and to
+  model / presentation / workbook_identity classifications.
+* The Developer Guide metadata / registry FTR checklist is extended to
+  require current / target / transition / removal analysis when a
+  registry contract changes, and to require the identity-derivation
+  question to be answered when the contract shape changes.
+* AI-info guidance points to the canonical lifecycle documentation
+  without duplicating it heavily.
+* `_meta.helper_policies.fk` is updated as the pilot registry entry,
+  unless implementation analysis shows the immediately preceding
+  FK-helper FTR state makes that impossible or premature. If not
+  updated, the FTR must record why.
+* The pilot entry is *complete enough* that a fresh agent can
+  distinguish current runtime, target intent, and bridge purely from the
+  entry plus linked FTR / docs -- no chat-context dependency.
+* The pilot entry truthfully describes current runtime behavior at the
+  time of implementation.
+* The pilot entry identifies any active bridge as temporary, not as a
+  permanent dual-authority contract.
+* Every active bridge in the pilot names either the FTR that removes /
+  sunsets it or a consumer-state / test-based removal condition.
+* The pilot entry's bridge status value does *not* use
+  capability-profile vocabulary (`accepted_gap`, `accepted initial gap`);
+  those terms remain in
+  `spreadsheet_backend_capability_profiles.adoc`.
+* The lifecycle model remains opt-in. Registry entries without real
+  transition ambiguity are not required to adopt lifecycle fields, and
+  the guard does not flag their absence.
+* Guardable lifecycle fields are structured enough that the pilot guard
+  reads only field values, not free prose. Prose stays in `reason` and
+  notes-shaped fields, which are *not* parsed by guards.
+* A lightweight architecture guard validates the lifecycle structure
+  used by the pilot.
+* The guard does not become a broad metadata schema validator and does
+  not require lifecycle fields on entries that have not opted in.
+* No workbook payload `_meta` shape changes in this FTR.
+* No runtime behavior changes in this FTR.
+* Existing registry and architecture tests continue to pass.
+
+*Validation:*::
+
+* Run targeted registry lifecycle guard tests.
+* Run existing registry architecture tests.
+* Run architecture tests related to `meta_registry.yaml` and
+  `pipeline_step_registry.json`.
+* Render affected technical-model and developer-guide docs.
+* Render backlog docs.
+* Run `git diff --check`.
+* Run `make source-style-guards` if tooling or Python guard code
+  changes.
+
+Suggested commands, to adapt to the actual file paths changed:
+
+[source,console]
+----
+pytest -q tests/architecture -k "registry or lifecycle or meta"
+pytest -q tests/architecture/dependency_guards/test_pipeline_step_registry.py
+asciidoctor -o /dev/null docs/developer_guide/developer_guide.adoc
+asciidoctor -o /dev/null docs/technical_model/technical_model.adoc
+asciidoctor -o /dev/null docs/backlog/_ftrs_open.adoc
+asciidoctor --safe-mode=unsafe -o /tmp/backlog.html docs/backlog/backlog.adoc
+git diff --check
+----
+
+*Residual risks:*::
+
+* The lifecycle model may be overfit to the FK-helper transition. Keep
+  the pilot concrete, but use names that can later support other
+  registry transitions. If a name only makes sense for FK helpers,
+  rename it before acceptance.
+* Too much structure risks turning into a governance framework. Keep the
+  first guard narrow and the field set small.
+* Too little structure preserves the current ambiguity. The model must
+  be explicit enough that an agent can tell current runtime truth from
+  target intent without reading the surrounding FTR prose.
+* Bridges can become permanent if removal conditions are vague. Prefer
+  FTR-id, consumer-state, or test-based conditions over date-only
+  language.
+* If the primitive FK-helper FTR lands before this FTR, the pilot may
+  describe a *retired* bridge rather than an active one; the model must
+  handle both gracefully.
+* The model could be misread as a compatibility straightjacket. The
+  Design constraints and Non-goals must keep the door open to an
+  explicitly approved "rename and migrate" decision.
+
+*Implementation note for Opus:*::
+Use high / maximum reasoning. Do not treat this FTR text as a rigid
+schema. The purpose is to solve the recurring
+current-state / target-state / transition-bridge ambiguity in a
+maintainable way. Read established API and schema-evolution practices,
+but adapt them to this repository's lightweight registry and FTR
+workflow.
+
+Prefer a smaller, truthful model that agents can reliably apply over a
+larger formal model that nobody will maintain.
+
+*Suggested next FTR after this one:*::
+Resume `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`, unless this FTR's
+implementation analysis discovers that the FK-helper bridge semantics
+need one additional narrowing FTR first. In that case, document the
+additional narrowing FTR before resuming primitives.
