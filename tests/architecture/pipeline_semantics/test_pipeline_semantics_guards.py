@@ -19,22 +19,8 @@ pytestmark = pytest.mark.ftr("FTR-PIPELINE-SEMANTICS-GUARDS-P4")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-STEP_REGISTRY_PATH = (
-    REPO_ROOT
-    / "docs"
-    / "technical_model"
-    / "ch05_registries"
-    / "pipeline_step_registry"
-    / "pipeline_step_registry.json"
-)
-META_REGISTRY_PATH = (
-    REPO_ROOT
-    / "docs"
-    / "technical_model"
-    / "ch05_registries"
-    / "meta_registry"
-    / "meta_registry.yaml"
-)
+STEP_REGISTRY_PATH = REPO_ROOT / "registries" / "pipeline_step_registry.json"
+META_REGISTRY_PATH = REPO_ROOT / "registries" / "meta_registry.yaml"
 
 PIPELINE_ORCHESTRATION_PATHS = [
     REPO_ROOT / "src" / "spreadsheet_handling" / "pipeline" / "__init__.py",

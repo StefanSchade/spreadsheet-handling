@@ -2,7 +2,8 @@
 
 Validates the structure of ``contract_lifecycle`` blocks on meta registry
 entries that opt into the lifecycle vocabulary defined in
-``docs/technical_model/ch05_registries/registry_semantics/05_contract_lifecycle.adoc``.
+``docs/technical_model/ch05_registries/registry_semantics/05_contract_lifecycle.adoc``
+(registry artifact: ``registries/meta_registry.yaml``).
 
 The guard intentionally does **not**:
 
@@ -61,14 +62,7 @@ _PILOT_ENTRY_NAME = "helper_policies"
 
 def _load_registry() -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[3]
-    registry_path = (
-        repo_root
-        / "docs"
-        / "technical_model"
-        / "ch05_registries"
-        / "meta_registry"
-        / "meta_registry.yaml"
-    )
+    registry_path = repo_root / "registries" / "meta_registry.yaml"
     with registry_path.open("r", encoding="utf-8") as handle:
         loaded = yaml.safe_load(handle)
     assert isinstance(loaded, dict)
