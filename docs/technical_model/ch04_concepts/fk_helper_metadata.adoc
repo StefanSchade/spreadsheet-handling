@@ -137,6 +137,147 @@ Cleanup direction: `remove_fk_helpers` removing by prefix is good enough for
 now but is the main conceptual weakness; longer term, cleanup should trust
 explicit helper-column metadata first and keep prefixes as fallback aids.
 
+=== Target model (v2): relation-oriented FK helper policy
+
+Status: *target model*, not current runtime behavior. The shape below is
+the contract that the Phase 3a FK-helper FTRs converge on. It is defined
+here so that the implementing FTRs share a single concrete reference;
+it is *not* produced or consumed by `add_fk_helpers`,
+`remove_fk_helpers`, `validate_fk_helpers`, or `reorder_fk_helpers`
+today. The owning planning artifact is
+`docs/backlog/FTR-FK-RELATION-POLICY-MODEL-P5.adoc`.
+
+The v2 shape sits under the existing root `_meta.helper_policies.fk`
+(no new adjacent root) and carries a top-level `schema_version` marker so
+consumers can detect the shape unambiguously. Relation identity is per
+FK column on a specific source frame -- the `(source_frame,
+source_column)` pair -- because two sheets may reference the same target
+frame with different helper choices.
+
+[source,yaml]
+----
+_meta:
+  helper_policies:
+    fk:
+      schema_version: 2
+      relations:
+        - source_frame: Products
+          source_column: id_(product_manager)
+          target_frame: ProductManagers
+          target_key: id
+          helper_fields:
+            - name
+          helper_columns:
+            - column: _product_manager_name
+              target_field: name
+          helper_prefix: "_"
+          produced_by:
+            step: infer_fk_relations
+            mode: naming_convention
+----
+
+An explicit / manual relation written by `configure_fk_helpers` (target
+state) uses the same shape and records `produced_by.step:
+configure_fk_helpers`, `produced_by.mode: explicit`.
+
+==== Field schema
+
+`target_key` is mandatory: it is the PK column on `target_frame` against
+which `source_column` joins. Storing it in policy means primitives,
+validators, and reimport cleanup never need to re-derive it from
+`build_registry(...)["id_field"]` defaults.
+
+`helper_columns[].column` records the literal helper-column header that
+materialization writes. `helper_columns[].target_field` records the
+target column it reads. Pairing them in policy lets validation check
+helper values against the target without consulting either the FK column
+convention or the helper-prefix convention.
+
+`produced_by.step` plus `produced_by.mode` make the entry's origin
+explicit so consumers can distinguish manual configuration from inferred
+configuration; lifecycle FTRs use the same fields to decide ownership
+when a later run wants to rewrite an entry.
+
+For the full per-field table (required / optional, type, semantics, and
+which step produces each field) see the *Relation entry: field schema
+(v2)* subsection of
+`docs/backlog/FTR-FK-RELATION-POLICY-MODEL-P5.adoc`.
+
+==== Four distinctions that must stay separate
+
+The v2 model only earns its keep if these four concerns are not
+collapsed. They are listed in the order metadata flows through the
+pipeline:
+
+. *Configuration / inference produces resolved relation policy.* Two
+  configuration steps write `_meta.helper_policies.fk.relations`:
+  `configure_fk_helpers` (manual / explicit policy) and the planned
+  `infer_fk_relations` (heuristic policy, owned by
+  `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`). Both write the same
+  shape under the same root; both behave as `configuration` steps in
+  the pipeline registry sense; a pipeline that runs both must fail
+  clearly when they collide on the same relation key.
+. *Primitive FK-helper execution consumes resolved relation policy.*
+  The primitive steps (`add_fk_helpers`, `validate_fk_helpers`,
+  `remove_fk_helpers`, `reorder_fk_helpers`) read policy and derived
+  helper provenance; they do not run inference. Missing policy is a
+  clear error whose message names the configuration / inference step
+  that should have run earlier. Encoding this is owned by
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+. *Derived helper provenance records materialized helper-column
+  state.* The per-run record under
+  `_meta.derived.sheets.*.helper_columns` (registered as the `derived`
+  entry in `meta_registry.yaml`) is *not* the policy. It is what the
+  primitive wrote when it last enriched the source frame. The
+  producer-side enrichment of that record with `target_key` is owned
+  by `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`; its lifecycle
+  (pruning, stale / orphan handling, schema validation) is owned by
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+. *Wire-format FK column naming is independent of inference and
+  execution.* The cell-level convention `id_(<target>)`
+  (`core/fk.py:FK_PATTERN`) is how cross-sheet references survive XLSX /
+  ODS roundtrips. It is consumed by the parser / writer and by
+  `infer_fk_relations` as one heuristic mode among future modes. It is
+  *not* consumed by primitive FK-helper execution for relation
+  inference. Removing primitive inference is not the same as removing
+  the wire format.
+
+==== What stays current-state until later FTRs land
+
+Until `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5` and
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` ship, the runtime continues
+to write and read the v1 per-target shape under the same root:
+
+[source,yaml]
+----
+_meta:
+  helper_policies:
+    fk:
+      <target_key>:
+        target: <target_key>
+        target_sheet: <sheet_name>
+        key: <id_field>
+        allowed_helpers: [...]
+        default_helpers: [...]
+        helper_prefix: "_"
+        fk_column: id_(<target>)
+        label: <optional>
+----
+
+`configure_fk_helpers` writes this shape today (manual mode and the
+`targets: "auto"` heuristic mode);
+`domain.transformations.fk_helpers.enrich_helpers` reads it; primitive
+detection of FK columns still uses `FK_PATTERN`; `remove_fk_helpers`
+prefers derived provenance and falls back to the helper prefix. The
+registry artifacts
+(`docs/technical_model/ch05_registries/meta_registry/meta_registry.yaml`,
+`docs/technical_model/ch05_registries/pipeline_step_registry/pipeline_step_registry.json`)
+describe that v1 behavior today and are deliberately not updated by
+`FTR-FK-RELATION-POLICY-MODEL-P5` (the model FTR) so that they remain
+truthful with respect to current runtime. They are updated by the later
+implementation FTRs together with the runtime change that earns the
+update.
+
 === How it connects
 
 * Vocabulary: <<concept-metadata-canonical-vs-derived,Canonical vs. Derived
