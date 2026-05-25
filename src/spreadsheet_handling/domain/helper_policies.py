@@ -8,6 +8,7 @@ from pandas.api import types as pd_types
 
 from ..core.fk import normalize_sheet_key
 from ..frame_keys import iter_data_frames
+from .fk_relations import apply_v2_relations, build_v2_relation
 
 Frames = dict[str, Any]
 
@@ -91,7 +92,7 @@ def configure_fk_helpers(
     frames: Frames,
     *,
     target: str | None = None,
-    targets: dict[str, Any] | str | None = None,
+    targets: dict[str, Any] | None = None,
     key: str | None = None,
     label: str | None = None,
     allowed_helpers: list[str] | str | None = None,
@@ -101,14 +102,21 @@ def configure_fk_helpers(
     fk_columns: dict[str, Any] | None = None,
     auto: dict[str, Any] | None = None,
 ) -> Frames:
-    """Write resolved FK-helper policies to ``_meta.helper_policies.fk``.
+    """Write explicit FK-helper policies to ``_meta.helper_policies.fk``.
 
-    ``target`` configures one FK target. ``targets`` accepts either a mapping
-    of target names to per-target configuration or ``"auto"`` for constrained
-    inference from current data frames.
+    ``target`` configures one FK target. ``targets`` accepts a mapping of
+    target names to per-target configuration. Heuristic inference moved to
+    the ``infer_fk_relations`` configuration step and is no longer accepted
+    here.
     """
     if target is not None and targets is not None:
         raise ValueError("Use either target or targets for configure_fk_helpers, not both")
+    if targets == "auto":
+        raise ValueError(
+            "configure_fk_helpers no longer accepts targets=\"auto\". "
+            "Use the infer_fk_relations configuration step to write "
+            "heuristically-resolved FK relation policy."
+        )
 
     policy_specs = _fk_policy_specs(
         frames,
@@ -135,7 +143,52 @@ def configure_fk_helpers(
     helper_policies["fk"] = fk_policies
     meta["helper_policies"] = helper_policies
     out["_meta"] = meta
+
+    v2_relations = _v2_relations_from_explicit_policies(out, policy_specs)
+    if v2_relations:
+        out = apply_v2_relations(out, v2_relations)
     return out
+
+
+def _v2_relations_from_explicit_policies(
+    frames: Frames,
+    policy_specs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    relations: list[dict[str, Any]] = []
+    for policy in policy_specs:
+        fk_column = str(policy.get("fk_column", ""))
+        if not fk_column:
+            continue
+        target_frame = str(policy.get("target_sheet") or policy.get("target"))
+        target_key = str(policy.get("key", ""))
+        helper_prefix = str(policy.get("helper_prefix", "_"))
+        helper_fields = [str(field) for field in policy.get("default_helpers") or []]
+        helper_columns = [
+            {
+                "column": f"{helper_prefix}{target_frame}_{field}",
+                "target_field": field,
+            }
+            for field in helper_fields
+        ]
+        for source_frame, source_df in iter_data_frames(frames):
+            if fk_column in [
+                column[0] if isinstance(column, tuple) else column
+                for column in source_df.columns
+            ]:
+                relations.append(
+                    build_v2_relation(
+                        source_frame=source_frame,
+                        source_column=fk_column,
+                        target_frame=target_frame,
+                        target_key=target_key,
+                        helper_fields=helper_fields,
+                        helper_columns=helper_columns,
+                        helper_prefix=helper_prefix,
+                        produced_by_step="configure_fk_helpers",
+                        produced_by_mode="explicit",
+                    )
+                )
+    return relations
 
 
 def _require_frame(frames: Frames, name: str) -> pd.DataFrame:
@@ -236,7 +289,7 @@ def _fk_policy_specs(
     frames: Frames,
     *,
     target: str | None,
-    targets: dict[str, Any] | str | None,
+    targets: dict[str, Any] | None,
     key: str | None,
     label: str | None,
     allowed_helpers: list[str] | str | None,
@@ -246,9 +299,6 @@ def _fk_policy_specs(
     fk_columns: dict[str, Any] | None,
     auto: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    if targets == "auto":
-        return _auto_fk_policy_specs(frames, auto=auto, helper_prefix=helper_prefix)
-
     if isinstance(targets, dict):
         policies: list[dict[str, Any]] = []
         for target_name, raw_cfg in targets.items():
@@ -271,7 +321,7 @@ def _fk_policy_specs(
         return policies
 
     if targets is not None:
-        raise TypeError("targets must be a mapping or 'auto'")
+        raise TypeError("targets must be a mapping of target names to policy config")
     if target is None:
         raise ValueError("configure_fk_helpers needs target or targets")
 
@@ -355,35 +405,6 @@ def _build_fk_policy(
     if label is not None:
         policy["label"] = label
     return policy
-
-
-def _auto_fk_policy_specs(
-    frames: Frames,
-    *,
-    auto: dict[str, Any],
-    helper_prefix: str,
-) -> list[dict[str, Any]]:
-    candidates = _as_list(auto.get("id_column_candidates") or ["id"])
-    policies: list[dict[str, Any]] = []
-    for sheet_name, df in iter_data_frames(frames):
-        key = next((candidate for candidate in candidates if candidate in df.columns), None)
-        if key is None:
-            continue
-        policies.append(
-            _build_fk_policy(
-                frames,
-                target=sheet_name,
-                key=key,
-                label=None,
-                allowed_helpers="auto",
-                default_helpers="auto",
-                helper_prefix=helper_prefix,
-                fk_column=None,
-                fk_columns=None,
-                auto=auto,
-            )
-        )
-    return policies
 
 
 def _resolve_target_frame(frames: Frames, target: str) -> tuple[str, str]:

@@ -24,25 +24,92 @@ per-target path and a heuristic `targets: "auto"` path
 (`domain.helper_policies._auto_fk_policy_specs`). Phase 3a removes the
 heuristic from `configure_fk_helpers`:
 +
-* `configure_fk_helpers` remains the *explicit / manual* policy step. It
-  writes the v2 relation-oriented `_meta.helper_policies.fk` shape from
-  user-supplied configuration only. The `targets: "auto"` mode is removed
-  from `configure_fk_helpers` together with the related `auto:` parameter
-  shapes.
+* `configure_fk_helpers` remains the *explicit / manual* policy step. Its
+  *input surface* stays v1 / target-oriented: callers supply per-target
+  `key`, `allowed_helpers`, `default_helpers`, `fk_column` (or the
+  `fk_column_pattern` convention), etc. The `targets: "auto"` mode is
+  removed from `configure_fk_helpers` together with the related heuristic
+  semantics; the `auto:` parameter is kept for explicit-path defaults
+  (`helper_candidates`, `default_helpers.prefer`, `fk_column_pattern`).
 * `infer_fk_relations` is the *heuristic* policy step. It owns the inference
   modes (initially `naming_convention`) that previously lived inside
   `configure_fk_helpers(targets: "auto")` and `add_fk_helpers`'s implicit
-  detection. It writes the same v2 shape.
+  detection. It writes the v2 shape.
 +
-Both steps write to the same root and the same shape; pipelines pick one
-according to whether the relation set is explicit or inferred. A pipeline
-that uses both must fail clearly on conflicting writes (a relation key may
-be produced by at most one step in a given pipeline run).
+Both steps write to the same root (`_meta.helper_policies.fk`) and to the
+v2 relation list. A pipeline that uses both must fail clearly on
+conflicting writes (a relation key may be produced by at most one step in
+a given pipeline run).
 +
 This is a documented YAML / step-surface change to `configure_fk_helpers`
 and therefore goes through the public-surface gate in
 `docs/ai_info/interfaces_and_gates.adoc` (already named in the Phase 3a
 preamble and in `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`).
+
+*Transitional v1 -> v2 bridge inside `configure_fk_helpers`:*::
++
+Current FK-helper *primitives* (`add_fk_helpers`, `remove_fk_helpers`,
+`validate_fk_helpers`, `reorder_fk_helpers`) still consume the v1
+per-target shape under `_meta.helper_policies.fk.<target_key>`. Until the
+primitives refactor lands (owned by
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`), `configure_fk_helpers`
+therefore retains its v1 write and *additionally* writes v2 relation
+entries derived from each resolved v1 policy. The bridge is deterministic
+and bounded:
++
+* For each resolved v1 policy entry, the configured literal `fk_column`
+  (e.g. `id_(Products)`) is taken as-is. The bridge scans current data
+  frames and emits one v2 relation per `(source_frame, source_column)`
+  pair whose source frame carries that literal column header.
+* No source frame is inferred from naming heuristics. The bridge does
+  not invent new relations beyond those implied by the user-supplied
+  `fk_column` (or the `fk_column_pattern` resolution that already
+  happens inside the v1 path).
+* If no current data frame carries the configured `fk_column`, the
+  bridge emits no v2 entry for that policy; v1 is still written.
+* If multiple data frames carry the same configured `fk_column`, the
+  bridge emits one v2 relation per source frame. This is consistent
+  with v2 relation identity `(source_frame, source_column)`.
++
+This bridge is approved as a *temporary transitional compatibility*
+mechanism for this FTR only, not as the final architecture. Agents must
+not:
++
+* generalize the bridge into heuristic inference inside primitives or
+  elsewhere -- heuristic inference belongs to `infer_fk_relations`;
+* widen the bridge to scan for FK-pattern columns the user did not
+  configure;
+* treat the bridge's "frame scan for a literal fk_column" as a
+  user-facing v2 input surface -- explicit v2 source identity remains a
+  future enhancement.
++
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` owns *narrowing or removing*
+the bridge once primitives consume the v2 shape directly. Likely
+endpoints once v2 is the consumed shape:
++
+. drop the bridge entirely and require explicit v2 source identity on
+  `configure_fk_helpers` for callers who need v2 entries;
+. keep the bridge but only as a backwards-compat shim, gated behind an
+  opt-in flag.
++
+Either resolution is acceptable; the choice is deferred to the
+primitives FTR.
+
+*Same-producer relation merge semantics:*::
++
+`apply_v2_relations` merges v2 relation entries into
+`_meta.helper_policies.fk.relations` keyed by
+`(source_frame, source_column)`. Conflict rules:
++
+* *cross-producer* (different `produced_by.step`) -> raise;
+* *same producer, semantically identical relation* -> accept
+  idempotently (no-op overwrite);
+* *same producer, any meaningful field differs* -> raise with a clear
+  error naming the relation key and producer. Meaningful fields cover
+  the whole v2 relation entry: `target_frame`, `target_key`,
+  `helper_fields`, `helper_columns`, `helper_prefix`, and
+  `produced_by.mode`. This prevents silent overwrites when the same
+  producing step is invoked twice with diverging input.
 
 *Dependencies:*::
 
@@ -72,6 +139,16 @@ preamble and in `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`).
   into `infer_fk_relations`; `configure_fk_helpers` keeps only its explicit /
   manual policy path. Update the pipeline step registry descriptions
   accordingly.
+* Keep `configure_fk_helpers` writing the v1 per-target shape (current FK-helper
+  primitives still consume it) and additionally emit v2 relation entries via
+  the transitional bridge described above. The bridge's existence and
+  scope must be documented in the active FTR, the concept doc, the agent
+  notes, and both registries; it must not be presented as the final
+  contract.
+* Make `apply_v2_relations` enforce the merge rules under
+  *Same-producer relation merge semantics*: cross-producer collisions
+  fail; same-producer rewrites are accepted only when semantically
+  identical; any meaningful difference fails clearly.
 
 *Configuration sketch (illustrative):*::
 
@@ -135,7 +212,19 @@ v2 relation policy defined in `FTR-FK-RELATION-POLICY-MODEL-P5`.
   ** no relation found,
   ** deterministic ordering of written policy entries,
   ** failure when both `configure_fk_helpers` and `infer_fk_relations` write
-     the same relation key in one pipeline run (conflicting writers).
+     the same relation key in one pipeline run (conflicting writers),
+  ** same-producer idempotent re-run returns the exact same relation body,
+  ** same-producer rewrite with a changed `helper_prefix`, `helper_fields`,
+     `target_key`, `target_frame`, or `produced_by.mode` fails clearly.
+* The transitional v1 -> v2 bridge inside `configure_fk_helpers` has unit
+  tests for:
+  ** no current source frame carries the configured literal `fk_column`
+     (v1 written, no v2 entry emitted),
+  ** multiple current source frames carry the same `fk_column` (one v2
+     entry per source frame, all attributed to `configure_fk_helpers`),
+  ** the v1 primitive consumer (`add_fk_helpers` /
+     `enrich_helpers`) keeps working unchanged on the v1 per-target shape
+     written alongside v2.
 * The heuristic / `targets: "auto"` path is removed from `configure_fk_helpers`;
   a single integration test exercises `infer_fk_relations` followed by an
   explicit-config `configure_fk_helpers` call writing disjoint relations
