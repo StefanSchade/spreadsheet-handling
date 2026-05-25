@@ -11,6 +11,7 @@ DATE := $(shell date -Iseconds)
 
 ROOT          := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR     := $(ROOT)build
+SNAPSHOT_MAX_FILES ?= 20
 DOC_BUILD_DIR := $(BUILD_DIR)/doc
 VENV          := $(ROOT).venv
 COV_HTML_DIR  := $(BUILD_DIR)/htmlcov
@@ -250,10 +251,11 @@ snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries)
 	@echo "Snapshot: $(BUILD_DIR)/spreadsheet-handling.txt"
 
 .PHONY: snapshot-multi
-snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs, src, tests, infra, tree, loc)
+snapshot-multi: ## Create split snapshots; merge smallest files down to SNAPSHOT_MAX_FILES (default 20)
 	@mkdir -p "$(BUILD_DIR)"
 	@bash "$(ROOT)tools/repo_snapshot_multi.sh" "$(ROOT)" "$(BUILD_DIR)/snapshots"
-	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/"
+	@bash "$(ROOT)scripts/merge_snapshots.sh" "$(BUILD_DIR)/snapshots" "$(SNAPSHOT_MAX_FILES)"
+	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/ (max $(SNAPSHOT_MAX_FILES) files)"
 
 # =========================
 # Release helpers
