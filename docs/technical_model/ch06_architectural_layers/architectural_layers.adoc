@@ -130,7 +130,7 @@ Leaf-level library of stateless, side-effect-free functions used by both Domain 
 
 *Modules:*
 
-`fk.py`:: FK detection, registry building, id-label maps, helper-column application (`FKDef`, `build_registry`, `detect_fk_columns`, `build_id_label_maps`, `apply_fk_helpers`).
+`fk.py`:: Wire-format and helper-column utilities (`FK_PATTERN`, `FKDef`, `build_id_value_maps`, `apply_fk_helpers`); legacy convention helpers (`build_registry`, `detect_fk_columns`) remain available but are no longer used by FK-helper primitives for relation inference.
 `indexing.py`:: DataFrame column access aware of MultiIndex levels (`has_level0`, `level0_series`).
 `df_build.py`:: Build MultiIndex DataFrames from flat records.
 `flatten.py`:: Flatten nested JSON dicts with configurable separator.
@@ -276,37 +276,75 @@ Example: `{"duplicate_id": "fail", "missing_helper": "ignore", "__default__": "w
 ==== Feature Slice: FK-Helper Behavior Across Layers
 
 This section traces the FK-helper feature through all architectural layers to illustrate
-how responsibilities are distributed.
+how responsibilities are distributed. Since
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` the runtime split is:
+*configuration steps produce policy*; *primitive steps consume policy and
+write / read derived provenance*. Primitives no longer infer relation
+identity from column names.
 
 *1. Core (`core/fk.py`):*::
-Pure functions that operate on `Frames` (Dict of DataFrames).
-`build_registry()` scans sheet names for FK-naming conventions and returns a registry dict.
-`detect_fk_columns()` inspects a DataFrame's columns against the registry and returns `FKDef` tuples.
-`build_id_label_maps()` extracts id-to-label lookup dicts per sheet.
-`apply_fk_helpers()` adds helper columns (label lookups) to a DataFrame.
-These functions have no side effects and no configuration awareness.
+Pure utility functions that operate on `Frames` (Dict of DataFrames).
+`FK_PATTERN` is the cell-level wire format (`id_(<target>)`) used by the
+parser / writer and by `infer_fk_relations`. `apply_fk_helpers()` adds
+helper columns (label lookups) to a DataFrame given explicit `FKDef`
+inputs. `build_id_value_maps()` extracts id-to-value lookup dicts per
+sheet from an explicit target registry.
+`build_registry()` / `detect_fk_columns()` remain available as utilities
+but are no longer called from the FK-helper primitives. These functions
+have no side effects and no configuration awareness.
 
-*2. Domain -- Validation (`domain/validations/fk_helpers.py`):*::
-Five pure check functions consume `Frames` + defaults and return `List[Finding]`.
-They call Core functions to build registry and id-maps, then inspect for inconsistencies.
-`validate_fk_helpers()` is a convenience aggregator that runs all five checks.
-The functions produce findings but never log or raise -- severity is determined by the caller.
+*2. Domain -- Configuration / producers
+(`domain/fk_relations.py`, `domain/helper_policies.py`):*::
+Two configuration steps write the v2 relation policy under
+`_meta.helper_policies.fk` (`schema_version: 2`, list of relations keyed
+by `(source_frame, source_column)`).
+`infer_fk_relations` scans data frames with bounded heuristics (initial
+mode `naming_convention`) and emits inferred relations with
+`produced_by.mode: naming_convention`. `configure_fk_helpers` takes
+per-target policy from YAML, runs the transitional v1 → v2 bridge, and
+emits explicit relations with `produced_by.mode: explicit`.
+`apply_v2_relations` is the shared, collision-aware writer used by both
+producers.
 
-*3. Domain -- Transformation (`domain/transformations/helpers.py`):*::
-`reorder_helpers_next_to_fk()` rearranges columns so that helper columns appear adjacent to their FK column.  Pure `DataFrame -> DataFrame` transformation.
+*3. Domain -- Transformation (FK-helper consumers):*::
+`domain/transformations/fk_helpers/enrich.py` (`enrich_helpers`,
+registered as `add_fk_helpers`) reads the v2 relation list, materializes
+only the helper columns the relations declare, and writes derived helper
+provenance under `_meta.derived.sheets.*.helper_columns` (entries:
+`{column, fk_column, target, target_key, value_field}`). Missing policy
+raises a clear error naming the producer step.
+`domain/transformations/fk_helpers/drop.py` (`drop_helpers`, registered as
+`remove_fk_helpers`) removes columns identified by derived provenance,
+falling back to the v2 policy when provenance is absent; frames with
+neither raise clearly -- there is no normal-operation classification by
+column name.
+`domain/transformations/helpers.py:reorder_helpers_next_to_fk`
+(registered as `reorder_fk_helpers`) reads policy / provenance to find
+helper columns to move next to their FK column; it does not consult
+`FK_PATTERN`.
 
-*4. Pipeline (`pipeline/pipeline.py`):*::
-Step factories wire Core and Domain functions into pipeline-compatible `BoundStep` closures:
-- `make_validate_step` calls `check_duplicate_ids` + `check_unresolvable_fks`, applies severity policy.
-- `make_apply_fks_step` calls `build_registry` + `detect_fk_columns` + `apply_fk_helpers`.
-- `make_check_fk_helpers_step` calls `validate_fk_helpers`, applies severity policy.
-All three are registered in `REGISTRY` and can be invoked from YAML pipeline definitions.
+*4. Domain -- Validation (`domain/validations/fk_helpers.py`):*::
+Pure check functions consume `Frames` + defaults and return `List[Finding]`.
+They join helper columns against the target using `target_key` from the
+v2 policy or from derived helper provenance. `validate_fk_helpers()` is
+the convenience aggregator that backs the `validate_fk_helpers` step.
+The functions produce findings but never log or raise -- severity is
+determined by the caller.
 
-*5. Render IR + IO Backend:*::
-The rendering layer is FK-agnostic.  Helper columns are regular DataFrame columns by the time
-`compose_workbook()` builds the IR.  Styling passes may highlight helper columns via `SheetIR.meta["options"]`,
-but no FK-specific logic exists in the rendering or backend layers.
+*5. Pipeline (`pipeline/registry.py`, `pipeline/steps.py`):*::
+The step registry exposes both producers and consumers as YAML-driven
+steps. The architecture guard
+`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`
+pins the no-convention-inference contract for the primitive package.
 
-*6. CLI:*::
-The CLI passes configuration (profile defaults, YAML pipeline) to the Orchestrator.
-It never references FK concepts directly.
+*6. Render IR + IO Backend:*::
+The rendering layer is FK-agnostic. Helper columns are regular DataFrame
+columns by the time `compose_workbook()` builds the IR. Styling and
+protection passes locate helper columns via the derived helper
+provenance (`_derived_helper_column_names` in `rendering/passes/_base.py`),
+not by column-name prefix. No FK-specific logic exists in the backend
+layer.
+
+*7. CLI:*::
+The CLI passes configuration (profile defaults, YAML pipeline) to the
+Orchestrator. It never references FK concepts directly.
