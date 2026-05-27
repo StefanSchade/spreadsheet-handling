@@ -1,0 +1,199 @@
+[[semantic-model-lifecycle-and-update-semantics]]
+== Lifecycle And Update Semantics
+
+=== Why lifecycle matters
+
+Metadata is not static. The same field may, over the lifetime of a project,
+be loaded from persistence, supplied by configuration, inferred from
+conventions, overwritten by a transformation, consumed by the render layer,
+persisted again, and eventually pruned. The semantic model must describe
+what happens at each transition -- not only what each individual step does.
+
+Two failure modes motivate this chapter:
+
+* *Historical residue* -- metadata that survives roundtrips after the
+  semantics it described have changed. The runtime accepts it, no consumer
+  errors, and yet the value no longer reflects current truth.
+* *Semantic drift* -- the gradual divergence between what the runtime
+  actually does and what registries, docs, and tests claim it does. The
+  FK-helper phase produced concrete instances of both (see the Problem
+  Statement chapter).
+
+Lifecycle rules are how the project keeps residue from becoming drift.
+
+=== Lifecycle events
+
+Candidate lifecycle events, grouped by the phase they occur in:
+
+[cols="1,3"]
+|===
+| Phase | Events
+
+| Load
+| load persisted metadata; load configuration; load registry entries.
+
+| Establish
+| bootstrap metadata from existing data; infer metadata from conventions
+  (for example, `infer_fk_relations`); apply explicit configuration.
+
+| Transform
+| transformation reads metadata; transformation writes metadata;
+  transformation overwrites or supersedes metadata; primitive emits derived
+  provenance.
+
+| Render
+| render layer consumes metadata; render layer emits transient render plan;
+  render-only metadata is intentionally discarded.
+
+| Persist
+| adapter persists metadata; sidecar is written; workbook is emitted.
+
+| Reimport
+| workbook is edited; workbook is reimported; metadata is reconstructed;
+  helper columns are removed via provenance or v2 policy.
+
+| End-of-life
+| metadata is pruned; metadata is deprecated; metadata is removed; transition
+  bridge is closed.
+|===
+
+Each event is a candidate observation point for a future guard or registry
+rule. The semantic model does not require that all events be observed; it
+requires that they have *names* so different parts of the project can
+discuss the same transition without each inventing its own term.
+
+=== Write-time conflict resolution
+
+Conflicts should preferably be resolved when metadata is written or updated,
+not deferred indefinitely to later consumers. Late resolution multiplies
+ambiguity: every consumer must reinvent the resolution rule, and the rules
+drift apart.
+
+Bad pattern:
+
+[source,text]
+----
+old persisted value remains
+new config value exists
+consumer decides ad hoc which value to use
+----
+
+Better pattern:
+
+[source,text]
+----
+on write/update:
+  decide allow / reject / supersede / merge / explicit override required
+  leave metadata in a coherent post-event state
+----
+
+The post-event state must be valid on its own, so that downstream consumers
+do not need to know the history to interpret it correctly. If the history
+matters, it should be recorded explicitly (provenance, supersession), not
+implied by leaving multiple competing values in place.
+
+=== Precedence as update semantics
+
+Precedence is not merely a read rule -- "which value wins when I look it up".
+It is part of update semantics -- "what state may exist after a write".
+
+Questions a precedence rule must answer:
+
+* May a new producer overwrite an existing value, or must it call out the
+  supersession explicitly?
+* Does explicit config override persisted metadata? Always, or only for
+  attributes in *Configurable*?
+* Does bootstrap inference override explicit config? (For
+  `infer_fk_relations` the answer must be "no": explicit policy wins.)
+* Does a workbook edit override generated render metadata? Render metadata
+  is *RenderConsumed* + *Transient*; workbook edits sit in
+  *UserEditable* + *Canonical* and have priority.
+* Is an older explicit value stronger than a newer heuristic value?
+* Is "newer wins" valid only within the same authority class?
+* Should the old value be discarded, retained as audit history, or marked
+  as superseded?
+
+These are the questions that adoption slices must answer per
+transformation family. The semantic model only requires that each slice
+answer them, not that they all give the same answer.
+
+=== Age, generation, and run identity
+
+Age or generation may be useful as a tie-breaker or staleness signal, but
+must not silently replace semantic precedence. The project distinguishes
+two layers:
+
+* *Semantic precedence* -- which source class is authoritative for an
+  attribute (explicit config, persisted metadata, inferred value,
+  transformation output, render layer, ...). This is a property of the
+  attribute and its membership in the candidate sets above.
+* *Age / generation* -- when a value was produced and by which run. This
+  is a property of a particular instance of the value, not of the
+  attribute.
+
+Newer is not automatically better. A newer heuristic value should *not*
+override an older explicit value; a newer render-layer write should *not*
+override an older user edit. Age is consulted only within a single
+authority class.
+
+Potential fields that could carry generation/run information (none are
+required today; this list is rule-ready material, not a schema):
+
+* `produced_by.step`
+* `produced_by.run_id`
+* `produced_from`
+* `generation`
+* `source_authority`
+* `valid_for_frame_schema_hash`
+* `lifecycle_stage`
+* `supersedes`
+* `stale_when`
+* `prune_on`
+
+Possible rule shape:
+
+[source,text]
+----
+If two values come from the same authority class:
+    newer generation may win.
+
+If explicit config conflicts with heuristic inference:
+    explicit config wins or conflict is raised, regardless of age.
+
+If generated render metadata conflicts with user-edited canonical data:
+    generated render metadata must not silently win.
+----
+
+Whether any of these fields should actually be written to `_meta` is an
+open question, deferred to per-family adoption slices. The semantic model
+records the *distinction* between age and precedence so that the answer
+to that question is reviewable.
+
+=== Repeated roundtrip risk
+
+A single roundtrip may appear correct while repeated roundtrips accumulate
+stale or contradictory metadata. This is where historical residue most often
+becomes semantic drift.
+
+Concrete project example: when `_meta.helper_policies.fk` migrated from a
+v1 per-target shape to the v2 `relations` shape, runs during the bridge
+window could legitimately write both shapes. Without a removal owner and a
+named bridge state, repeated runs would either keep accreting both shapes
+indefinitely or silently drop one of them based on writer order.
+
+Questions:
+
+* Can metadata entries become stale (still valid by shape, no longer valid
+  by meaning)?
+* Do repeated runs accumulate obsolete entries?
+* Does each run overwrite, supersede, or prune prior metadata?
+* Is there a concept of generation, or does the project rely on
+  end-of-pipeline pruning?
+* When is pruning safe? Specifically, when can a writer assume that the
+  attribute it is about to discard has no other current consumer?
+* Which metadata must survive roundtrip (RoundtripRelevant + Persistent)?
+* Which metadata must be regenerated every run (RenderConsumed + Transient)?
+* Which metadata must never be persisted at all (Transient + InternalOnly)?
+
+The Ambiguity Policy treats any of these questions as "must become explicit"
+once the attribute is RuntimeConsumed or RoundtripRelevant.
