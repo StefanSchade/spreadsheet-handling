@@ -504,19 +504,42 @@ Project interpretation:
 
 === Core entities
 
-The semantic model starts with the following entities:
+The semantic model treats the following as first-class entities. Each one
+carries semantic obligations beyond its data shape.
 
-* transformations;
-* pipeline steps;
-* metadata attributes;
-* canonical frame data;
-* derived data;
-* configuration;
-* persisted sidecar metadata;
-* render directives;
-* workbook-visible cells/columns;
-* registry entries;
-* lifecycle events.
+* *transformations* -- the primitive and step-level operations that read or
+  write frames, metadata, or render state;
+* *pipeline steps* -- composed operations the registry and YAML configuration
+  describe and orchestrate;
+* *metadata attributes* -- fields under `_meta.*` that carry meaning between
+  steps and across roundtrips;
+* *canonical frame data* -- the project's authoritative dataset
+  representation, decoupled from any spreadsheet projection;
+* *derived data* -- materialized fields and columns whose authority comes from
+  a producer step, not from user edit (for example, FK-helper columns recorded
+  under `_meta.derived.sheets.*.helper_columns`);
+* *configuration* -- YAML and CLI inputs that select transformations,
+  primitives, and named semantic modes;
+* *persisted sidecar metadata* -- `_meta`-shaped state that survives between
+  runs;
+* *render directives* -- metadata that controls workbook presentation and is
+  not part of canonical data;
+* *workbook-visible cells/columns* -- the public projection a user edits;
+* *registry entries* -- `registries/meta_registry.yaml` and
+  `registries/pipeline_step_registry.json` records that describe producers,
+  consumers, and (in the rule-ready direction) contracts;
+* *lifecycle events* -- writes, reads, supersessions, prunings, and
+  reimports that change metadata state over time.
+
+[NOTE]
+====
+Metadata *meaning* is distinct from metadata *shape*. Two fields with the same
+JSON shape may carry different semantics if they live in different sets (for
+example, a column index in `_meta.derived.sheets.*.helper_columns` is derived
+provenance, while the same shape in a configuration block would be input
+policy). The semantic model classifies fields by meaning; the schema describes
+shape.
+====
 
 === Transformations
 
@@ -532,132 +555,214 @@ A transformation may:
 * render data;
 * prepare data for adapter output.
 
-Questions per transformation:
+Questions per transformation (to be answered by the transformation's owning
+FTR, registry entry, and -- where stable -- architecture guard):
 
 * What does it read?
 * What does it write?
 * Does it mutate canonical data, metadata, or only render state?
 * Does it consume policy, provenance, config, or inferred structure?
-* May it infer semantics, or must it consume explicit metadata?
-* What happens when required metadata is absent?
+* May it infer semantics, or must it consume explicit metadata? The FK-helper
+  primitives, for example, no longer infer relation identity from column
+  names and must consume `_meta.helper_policies.fk` (policy) or
+  `_meta.derived.sheets.*.helper_columns` (provenance).
+* What happens when required metadata is absent? (See the Ambiguity Policy
+  for the "must become explicit" criteria.)
 * Which registry entry describes it?
 * Which tests or guards enforce its contract?
 
 === Metadata attributes
 
-A metadata attribute is a meaning-bearing field in project metadata.
+A metadata attribute is a meaning-bearing field in project metadata. It is
+characterized by the semantic sets it belongs to, not by where it lives in
+the JSON tree.
 
 Questions per metadata attribute:
 
-* What does it mean?
-* Who may produce it?
-* Who may consume it?
-* Is it persistent or transient?
+* What does it mean (in project terms, not in JSON-schema terms)?
+* Who may produce it? Who currently does?
+* Who may consume it? Who currently does?
+* Is it persistent or transient (in the sense defined under Overlapping
+  Semantic Sets)?
 * Is it canonical, derived, render-related, operational, or diagnostic?
-* Is it user-editable?
-* Is it roundtrip-relevant?
-* Does it require provenance?
-* Does it have lifecycle/versioning rules?
+* Is it user-editable through the workbook surface?
+* Is it roundtrip-relevant? Does it survive a canonical-to-workbook-to-
+  canonical cycle?
+* Does it require provenance, or is the producer obvious from its location?
+* Does it have lifecycle/versioning rules (transition bridge, deprecation,
+  removal owner)?
 * What happens when it conflicts with configuration or newly generated data?
+  Which precedence rule applies?
 
 [[semantic-model-overlapping-semantic-sets]]
 == Overlapping Semantic Sets
 
 === Basic idea
 
-Semantic classes should be modeled as overlapping sets, not as disjoint
-categories.
+Semantic classes are modeled as overlapping sets, not as disjoint categories.
 
-Example analogy:
+A metadata attribute or a transformation may belong to several sets at the
+same time, and the *intersections* are where the load-bearing rules live.
+A taxonomy that forced each attribute into exactly one bucket would either
+lose information (collapsing distinctions) or invent artificial buckets
+(splitting attributes that genuinely overlap).
 
-[source,text]
-----
-A plastic tile may be:
-- red;
-- triangular;
-- large;
-- wooden or plastic.
+Concrete project example:
 
-The set of red tiles is not disjoint from the set of triangular tiles.
-----
+* `_meta.derived.sheets.*.helper_columns` is *Derived* (produced by
+  `add_fk_helpers`), *Persistent* (survives roundtrip via the sidecar),
+  *RuntimeConsumed* (read by `remove_fk_helpers` cleanup), and
+  *RoundtripRelevant* (its absence changes reimport behavior). It is *not*
+  *UserEditable*: workbook edits should not invent or rewrite provenance.
 
-Likewise, a metadata attribute may belong to multiple semantic sets.
+The same field carries four membership statements simultaneously, and each
+statement contributes a different lifecycle obligation.
 
 === Candidate sets
 
-Potential sets include:
+The following sets are candidates for classifying metadata attributes and,
+where the framing fits, transformations. Each definition is one sentence;
+detailed semantics are deferred to per-family adoption FTRs.
 
-* Canonical
-* Derived
-* Persistent
-* Transient
-* RoundtripRelevant
-* RenderConsumed
-* RuntimeConsumed
-* UserEditable
-* ProducerOwned
-* Configurable
-* HeuristicallyInferred
-* Policy
-* Provenance
-* PublicSurface
-* InternalOnly
-* Deprecated
-* TransitionBridge
+* *Canonical* -- treated as authoritative for the reconstructed domain
+  output; conflicts against canonical are not silently merged.
+* *Derived* -- produced from other data or metadata by a known producer
+  step; its authority depends on that producer remaining the source of truth.
+* *Persistent* -- survives process boundaries or roundtrip via the sidecar,
+  workbook, or another store.
+* *Transient* -- exists only during a single run or rendering phase and
+  must not be persisted as canonical metadata.
+* *RoundtripRelevant* -- its presence, absence, or value can change the
+  outcome of a canonical-to-workbook-to-canonical cycle.
+* *RenderConsumed* -- read by the render layer to shape workbook
+  presentation, not to alter canonical content.
+* *RuntimeConsumed* -- read by transformations or validations at runtime
+  and therefore affects behavior, not only documentation.
+* *UserEditable* -- legitimately modifiable through the workbook projection
+  or other public surface; edits are part of the contract.
+* *ProducerOwned* -- has a single, identifiable producer step or component
+  responsible for its current value; other writers are exceptions, not the
+  rule.
+* *Configurable* -- supplied or overridden by YAML pipeline config or CLI
+  arguments.
+* *HeuristicallyInferred* -- computed by an inference step from
+  conventions or data shape rather than from explicit declaration (for
+  example, `infer_fk_relations`).
+* *Policy* -- a declarative input that tells a transformation what relation,
+  rule, or behavior to apply (for example, `_meta.helper_policies.fk`).
+* *Provenance* -- records how a derived value was produced (for example,
+  `_meta.derived.sheets.*.helper_columns`).
+* *PublicSurface* -- part of the project's external contract (YAML schema,
+  CLI, demo, user-guide), bundled through the public Pages gate.
+* *InternalOnly* -- not part of the public surface; may still have
+  lifecycle obligations if it is RoundtripRelevant or RuntimeConsumed.
+* *Deprecated* -- announced as on its way out; new producers should not
+  emit it and consumers must have a migration path.
+* *TransitionBridge* -- temporarily coexists with an old or new shape during
+  a migration, with explicit current and target behavior.
+
+These sets are descriptive and rule-ready, not yet enforced by code.
+Membership is recorded in registry entries and reviewed in FTRs; runtime
+enforcement is owned by `FTR-SEMANTIC-CONTRACT-MATRIX-PILOT-FK-HELPERS-P5`
+and the per-family adoption slices.
 
 === Example membership statements
 
-[source,text]
-----
-target_key in Derived
-target_key in Persistent
-target_key in RoundtripRelevant
-target_key in RuntimeConsumed
-target_key not in UserEditable
-----
+FK-helper provenance:
 
 [source,text]
 ----
-helper_policies.fk.relations in Policy
-helper_policies.fk.relations in Persistent
-helper_policies.fk.relations in RuntimeConsumed
-helper_policies.fk.relations in RoundtripRelevant
+_meta.derived.sheets.*.helper_columns
+  in {Derived, Persistent, RoundtripRelevant, RuntimeConsumed, Provenance,
+      ProducerOwned, InternalOnly}
+  not in {UserEditable, Canonical, Configurable}
 ----
+
+FK-helper v2 relation policy:
+
+[source,text]
+----
+_meta.helper_policies.fk.relations
+  in {Policy, Persistent, RuntimeConsumed, RoundtripRelevant, Configurable,
+      InternalOnly}
+  not in {UserEditable, Canonical, HeuristicallyInferred}
+----
+
+v1 per-target helper-policy shape (during transition):
+
+[source,text]
+----
+_meta.helper_policies.fk.<target>
+  in {Policy, Persistent, RuntimeConsumed, TransitionBridge}
+  -- coexists with the v2 .relations shape; owning FTR controls removal.
+----
+
+Render-layer column-group metadata (illustrative):
+
+[source,text]
+----
+column-group render metadata
+  in {Derived, RenderConsumed, Transient}
+  not in {Canonical, Persistent}
+  -- regenerated per run; absence in canonical output is intentional.
+----
+
+Membership statements are *descriptive* of current understanding. They are
+recorded so that future producers, consumers, and reviewers can disagree
+explicitly rather than implicitly.
 
 === Derived rules from intersections
 
 The useful part is not only classification, but rules over intersections.
-
-Examples:
+The rules below are rule-ready guidance, not executable checks.
 
 [source,text]
 ----
 x in Derived and Persistent
-=> x needs producer/provenance information.
+=> x needs explicit provenance: who produced it, from what, when.
+   FK-helper provenance under _meta.derived.sheets.* is the working example.
 ----
 
 [source,text]
 ----
 x in Policy and RequiredByPrimitive
-=> missing x is a configuration error.
+=> missing x is a configuration error, not a no-op.
+   This is the resolved FK-helper missing-policy contract.
 ----
 
 [source,text]
 ----
 x in RenderConsumed and Transient
-=> x must not be persisted as canonical metadata.
+=> x must not be persisted as canonical metadata, even if persisting it would
+   be technically convenient. Persistence is a semantic decision.
 ----
 
 [source,text]
 ----
 x in UserEditable and Derived
-=> conflict behavior must be explicitly defined.
+=> conflict behavior must be explicitly defined: prefer-user-edit,
+   prefer-derived, or raise. Silent merge is a defect.
 ----
 
 [source,text]
 ----
 x in Deprecated and RuntimeConsumed
-=> a lifecycle bridge and removal owner are required.
+=> a TransitionBridge is required: named current writers, current readers,
+   target readers, removal conditions, and owning FTR.
+----
+
+[source,text]
+----
+x in TransitionBridge
+=> at most one owning FTR controls the bridge state at a time; ambiguous
+   bridge ownership is itself a semantic drift signal.
+----
+
+[source,text]
+----
+x in PublicSurface and (Deprecated or TransitionBridge)
+=> deprecation policy from External Inspirations applies: migration path,
+   timeline, and removal conditions must be named, not implied.
 ----
 
 [[semantic-model-lifecycle-and-update-semantics]]
@@ -665,48 +770,71 @@ x in Deprecated and RuntimeConsumed
 
 === Why lifecycle matters
 
-Metadata is not static.
+Metadata is not static. The same field may, over the lifetime of a project,
+be loaded from persistence, supplied by configuration, inferred from
+conventions, overwritten by a transformation, consumed by the render layer,
+persisted again, and eventually pruned. The semantic model must describe
+what happens at each transition -- not only what each individual step does.
 
-It may be:
+Two failure modes motivate this chapter:
 
-* read from persistence;
-* written by bootstrap logic;
-* supplied by configuration;
-* inferred by configuration steps;
-* written by transformations;
-* consumed by render logic;
-* embedded into or reconstructed from workbooks;
-* persisted across multiple roundtrips;
-* deprecated or superseded.
+* *Historical residue* -- metadata that survives roundtrips after the
+  semantics it described have changed. The runtime accepts it, no consumer
+  errors, and yet the value no longer reflects current truth.
+* *Semantic drift* -- the gradual divergence between what the runtime
+  actually does and what registries, docs, and tests claim it does. The
+  FK-helper phase produced concrete instances of both (see the Problem
+  Statement chapter).
 
-The semantic model must describe what happens when metadata changes over time.
+Lifecycle rules are how the project keeps residue from becoming drift.
 
 === Lifecycle events
 
-Candidate lifecycle events:
+Candidate lifecycle events, grouped by the phase they occur in:
 
-* load persisted metadata;
-* load configuration;
-* bootstrap metadata from existing data;
-* infer metadata from conventions;
-* apply explicit configuration;
-* transformation reads metadata;
-* transformation writes metadata;
-* transformation overwrites metadata;
-* adapter persists metadata;
-* render layer consumes metadata;
-* render layer emits transient render plan;
-* workbook is edited;
-* workbook is reimported;
-* metadata is reconstructed;
-* metadata is pruned;
-* metadata is deprecated;
-* metadata is removed.
+[cols="1,3"]
+|===
+| Phase | Events
+
+| Load
+| load persisted metadata; load configuration; load registry entries.
+
+| Establish
+| bootstrap metadata from existing data; infer metadata from conventions
+  (for example, `infer_fk_relations`); apply explicit configuration.
+
+| Transform
+| transformation reads metadata; transformation writes metadata;
+  transformation overwrites or supersedes metadata; primitive emits derived
+  provenance.
+
+| Render
+| render layer consumes metadata; render layer emits transient render plan;
+  render-only metadata is intentionally discarded.
+
+| Persist
+| adapter persists metadata; sidecar is written; workbook is emitted.
+
+| Reimport
+| workbook is edited; workbook is reimported; metadata is reconstructed;
+  helper columns are removed via provenance or v2 policy.
+
+| End-of-life
+| metadata is pruned; metadata is deprecated; metadata is removed; transition
+  bridge is closed.
+|===
+
+Each event is a candidate observation point for a future guard or registry
+rule. The semantic model does not require that all events be observed; it
+requires that they have *names* so different parts of the project can
+discuss the same transition without each inventing its own term.
 
 === Write-time conflict resolution
 
 Conflicts should preferably be resolved when metadata is written or updated,
-not deferred indefinitely to later consumers.
+not deferred indefinitely to later consumers. Late resolution multiplies
+ambiguity: every consumer must reinvent the resolution rule, and the rules
+drift apart.
 
 Bad pattern:
 
@@ -726,39 +854,68 @@ on write/update:
   leave metadata in a coherent post-event state
 ----
 
+The post-event state must be valid on its own, so that downstream consumers
+do not need to know the history to interpret it correctly. If the history
+matters, it should be recorded explicitly (provenance, supersession), not
+implied by leaving multiple competing values in place.
+
 === Precedence as update semantics
 
-Precedence is not merely a read rule. It should be understood as part of update
-semantics.
+Precedence is not merely a read rule -- "which value wins when I look it up".
+It is part of update semantics -- "what state may exist after a write".
 
-Questions:
+Questions a precedence rule must answer:
 
-* May a new producer overwrite an existing value?
-* Does explicit config override persisted metadata?
-* Does bootstrap inference override explicit config?
-* Does a workbook edit override generated render metadata?
+* May a new producer overwrite an existing value, or must it call out the
+  supersession explicitly?
+* Does explicit config override persisted metadata? Always, or only for
+  attributes in *Configurable*?
+* Does bootstrap inference override explicit config? (For
+  `infer_fk_relations` the answer must be "no": explicit policy wins.)
+* Does a workbook edit override generated render metadata? Render metadata
+  is *RenderConsumed* + *Transient*; workbook edits sit in
+  *UserEditable* + *Canonical* and have priority.
 * Is an older explicit value stronger than a newer heuristic value?
 * Is "newer wins" valid only within the same authority class?
-* Should the old value be discarded, retained as audit history, or marked as
-  superseded?
+* Should the old value be discarded, retained as audit history, or marked
+  as superseded?
+
+These are the questions that adoption slices must answer per
+transformation family. The semantic model only requires that each slice
+answer them, not that they all give the same answer.
 
 === Age, generation, and run identity
 
-Age or generation may be useful, but should not silently replace semantic
-precedence.
+Age or generation may be useful as a tie-breaker or staleness signal, but
+must not silently replace semantic precedence. The project distinguishes
+two layers:
 
-Potential fields:
+* *Semantic precedence* -- which source class is authoritative for an
+  attribute (explicit config, persisted metadata, inferred value,
+  transformation output, render layer, ...). This is a property of the
+  attribute and its membership in the candidate sets above.
+* *Age / generation* -- when a value was produced and by which run. This
+  is a property of a particular instance of the value, not of the
+  attribute.
 
-* produced_by.step
-* produced_by.run_id
-* produced_from
-* generation
-* source_authority
-* valid_for_frame_schema_hash
-* lifecycle_stage
-* supersedes
-* stale_when
-* prune_on
+Newer is not automatically better. A newer heuristic value should *not*
+override an older explicit value; a newer render-layer write should *not*
+override an older user edit. Age is consulted only within a single
+authority class.
+
+Potential fields that could carry generation/run information (none are
+required today; this list is rule-ready material, not a schema):
+
+* `produced_by.step`
+* `produced_by.run_id`
+* `produced_from`
+* `generation`
+* `source_authority`
+* `valid_for_frame_schema_hash`
+* `lifecycle_stage`
+* `supersedes`
+* `stale_when`
+* `prune_on`
 
 Possible rule shape:
 
@@ -774,21 +931,39 @@ If generated render metadata conflicts with user-edited canonical data:
     generated render metadata must not silently win.
 ----
 
+Whether any of these fields should actually be written to `_meta` is an
+open question, deferred to per-family adoption slices. The semantic model
+records the *distinction* between age and precedence so that the answer
+to that question is reviewable.
+
 === Repeated roundtrip risk
 
-A single roundtrip may appear correct while repeated roundtrips accumulate stale
-or contradictory metadata.
+A single roundtrip may appear correct while repeated roundtrips accumulate
+stale or contradictory metadata. This is where historical residue most often
+becomes semantic drift.
+
+Concrete project example: when `_meta.helper_policies.fk` migrated from a
+v1 per-target shape to the v2 `relations` shape, runs during the bridge
+window could legitimately write both shapes. Without a removal owner and a
+named bridge state, repeated runs would either keep accreting both shapes
+indefinitely or silently drop one of them based on writer order.
 
 Questions:
 
-* Can metadata entries become stale?
+* Can metadata entries become stale (still valid by shape, no longer valid
+  by meaning)?
 * Do repeated runs accumulate obsolete entries?
 * Does each run overwrite, supersede, or prune prior metadata?
-* Is there a concept of generation?
-* When is pruning safe?
-* Which metadata must survive roundtrip?
-* Which metadata must be regenerated every run?
-* Which metadata must never be persisted?
+* Is there a concept of generation, or does the project rely on
+  end-of-pipeline pruning?
+* When is pruning safe? Specifically, when can a writer assume that the
+  attribute it is about to discard has no other current consumer?
+* Which metadata must survive roundtrip (RoundtripRelevant + Persistent)?
+* Which metadata must be regenerated every run (RenderConsumed + Transient)?
+* Which metadata must never be persisted at all (Transient + InternalOnly)?
+
+The Ambiguity Policy treats any of these questions as "must become explicit"
+once the attribute is RuntimeConsumed or RoundtripRelevant.
 
 [[semantic-model-registry-role]]
 == Registry Role
@@ -950,38 +1125,108 @@ Questions:
 
 === Source classes
 
-Potential metadata sources:
+Metadata can enter `_meta` from several source classes, each with a different
+default authority and a different set of consumers it must be safe for.
 
-* explicit YAML config;
-* CLI override;
-* persisted metadata sidecar;
-* workbook-embedded metadata;
-* workbook-visible user edits;
-* bootstrap logic;
-* heuristic inference step;
-* transformation output;
-* render layer output;
-* adapter readback.
+[cols="1,3"]
+|===
+| Source class | Project examples and authority posture
+
+| explicit YAML config
+| pipeline configuration, FK relation declarations,
+  `_meta.helper_policies.fk.relations` written by `configure_fk_helpers`.
+  High authority for Configurable attributes; conflicts against this should
+  raise unless the contract explicitly allows override.
+
+| CLI override
+| ad-hoc per-invocation overrides. Same authority as YAML config for the
+  duration of one run; should not be silently persisted as if it were
+  equivalent to a declared policy.
+
+| persisted metadata sidecar
+| `_meta` carried across runs. Authoritative for Persistent attributes
+  whose producer is the previous run; bridges between runs but does not
+  outrank fresh explicit config.
+
+| workbook-embedded metadata
+| metadata serialized into the workbook surface. Trusted only insofar as
+  the workbook is itself part of the public contract; subject to user edit.
+
+| workbook-visible user edits
+| edits to UserEditable cells/columns. Authoritative for Canonical content;
+  must not be silently overwritten by Derived or RenderConsumed output.
+
+| bootstrap logic
+| reconstruction from existing data when persisted metadata is missing.
+  Authoritative only as a fallback and must be visible as such.
+
+| heuristic inference step
+| for example, `infer_fk_relations`. HeuristicallyInferred; loses to
+  explicit Policy or Configurable values.
+
+| transformation output
+| `_meta.helper_policies.fk`, `_meta.derived.sheets.*.helper_columns`, and
+  similar. Authoritative within its producer step's scope; ProducerOwned.
+
+| render layer output
+| RenderConsumed + Transient. Must not survive as Canonical or Persistent
+  unless an explicit promotion rule applies.
+
+| adapter readback
+| values reread from the persisted artifact after a write. Used to verify
+  roundtrip determinism, not to amend canonical truth.
+|===
 
 === Precedence questions
 
-For each relevant metadata attribute:
+For each relevant metadata attribute, the owning adoption slice should be
+able to answer the following questions. These are *questions* the slice must
+resolve, not pre-decided rules.
 
-* Which source is authoritative?
+* Which source class is authoritative?
 * Which source may overwrite which other source?
-* Is conflict an error?
-* Is merge allowed?
-* Is fallback allowed?
-* Is explicit override required?
-* Is historical value retained?
-* Does "newer wins" ever apply?
-* Does user-visible workbook content override hidden metadata?
-* Does persisted metadata override regenerated metadata?
+* Is conflict an error, or is one of the sources designated as the winner?
+* Is merge allowed? If so, on what key, and how is order resolved?
+* Is fallback allowed (use source B if source A is absent), or must A be
+  present?
+* Is explicit override required (refuse to overwrite without an explicit
+  marker)?
+* Is the historical value retained as audit, or discarded?
+* Does "newer wins" ever apply? Within which authority class?
+* Does user-visible workbook content override hidden metadata? (Default for
+  Canonical: yes; for RenderConsumed-only: no.)
+* Does persisted metadata override regenerated metadata? Or is each run a
+  fresh write for that attribute?
+
+The Overlapping Semantic Sets chapter informs default answers (for example,
+*Configurable* + *Policy* attributes default to "explicit config wins over
+inference"), but per-attribute decisions remain the slice's responsibility.
+
+=== Resolve conflicts early when possible
+
+A conflict that can be detected at write time should be resolved at write
+time. Deferring resolution to consumers multiplies the resolution rule
+across every consumer and is the most common path to drift.
+
+This does not mean the writer must always be the resolver. It means the
+writer is responsible for leaving metadata in a state whose meaning is
+unambiguous, even if that requires raising an error rather than silently
+writing competing values.
+
+Where genuine late resolution is required (for example, when only the
+render layer knows whether a value is needed), the late-resolution rule
+itself must be documented and reviewable.
 
 === No customer identity as semantics
 
-Customer- or context-specific behavior must not enter runtime code as identity
-checks.
+Customer- or context-specific behavior must not enter runtime code as
+identity checks. The Problem Statement chapter covers the underlying
+anti-pattern; in the precedence context the rule is narrower:
+
+*Source classes are defined by role, not by identity.* "explicit YAML
+config" is a source class because it has a defined contract and lifecycle.
+"config for customer X" is not a source class; it is an identity-keyed
+branch wearing a config-shaped costume.
 
 Bad:
 
@@ -995,6 +1240,7 @@ Preferred:
 
 [source,yaml]
 ----
+# A named semantic mode is reviewable as a contract.
 semantic_mode: explicit_named_mode
 ----
 
@@ -1004,7 +1250,8 @@ Each semantic mode needs:
 * contract;
 * tests;
 * documentation;
-* migration/removal ownership if temporary.
+* migration/removal ownership if temporary (in which case it is also a
+  TransitionBridge).
 
 [[semantic-model-contract-matrices]]
 == Contract Matrices
@@ -1263,16 +1510,50 @@ Goal:
 [[semantic-model-open-questions]]
 == Open Questions
 
-* Should metadata attributes carry generation/run identity?
+These questions are recorded, not resolved. Per-family adoption slices will
+answer them for their own attributes; the semantic model only requires that
+each slice answer them deliberately.
+
+General lifecycle and precedence:
+
+* Should metadata attributes carry generation/run identity, or is end-of-pipeline
+  pruning enough?
 * Which metadata classes require explicit producer provenance?
-* Which metadata classes may be pruned automatically?
-* Are render directives persistent metadata or transient render plan?
-* How should config interact with persisted metadata?
-* Should conflicts be represented, rejected, or resolved at write time?
-* Can semantic contracts be versioned separately from metadata schema?
-* When does a registry entry become runtime-affecting?
-* Which parts of the matrix should become executable guards?
+* Which metadata classes may be pruned automatically, and under what
+  preconditions?
+* Are render directives persistent metadata or transient render plan? (Current
+  working assumption: RenderConsumed + Transient unless an explicit promotion
+  rule applies.)
+* How should config interact with persisted metadata when the two disagree on
+  a Configurable attribute?
+* Should conflicts be represented (kept side-by-side), rejected (raise), or
+  resolved at write time (supersede)? The default favors write-time
+  resolution, but some attributes may legitimately need representation.
+* Can semantic contracts be versioned separately from metadata schema? The
+  v1->v2 `helper_policies.fk` example suggests yes; the registry surface
+  to express this is not yet decided.
+* When does a registry entry become runtime-affecting? Today registries are
+  description + test oracle; promotion to runtime input is owned by
+  `FTR-SEMANTIC-REGISTRY-ROLE-P5` and adoption slices.
+* Which parts of the contract matrix should become executable guards?
 * Which ambiguity should remain intentionally informal?
+
+Set membership and intersections:
+
+* Are the candidate sets above exhaustive, or will adoption slices need to
+  introduce additional sets (for example, *AuditOnly*, *DiagnosticOnly*)?
+* Is *RuntimeConsumed* always paired with at least one of *Policy*,
+  *Provenance*, or *Configurable*? If so, that pairing is itself a rule.
+* How is set membership recorded today (free-text in FTRs and registry
+  prose) versus structurally? The semantic model defers this to
+  `FTR-SEMANTIC-REGISTRY-ROLE-P5`.
+
+Transition bridges:
+
+* When a TransitionBridge is closed, how is the historical residue (if any)
+  pruned from existing sidecars?
+* May an attribute be in multiple TransitionBridges concurrently? (Working
+  assumption: no -- ambiguous bridge ownership is a drift signal.)
 
 [[semantic-model-glossary]]
 == Glossary
@@ -1289,6 +1570,32 @@ persistent::
 
 transient::
   Exists only during a run or rendering phase.
+
+render::
+  Pertaining to the workbook presentation layer; render metadata controls
+  how canonical data is projected, not what it means.
+
+authoritative::
+  Designated as the source of truth for a given attribute or class of
+  attributes; conflicts against an authoritative source are not silently
+  resolved in favor of another source.
+
+runtime-consumed::
+  Read by transformations or validations at runtime, so changes to its value
+  or absence change behavior, not only documentation.
+
+historical residue::
+  Metadata that survives roundtrips after the semantics it described have
+  changed; still accepted by the runtime, no longer reflects current truth.
+
+semantic drift::
+  Gradual divergence between what the runtime actually does and what
+  registries, docs, or tests claim it does.
+
+bridge::
+  Short form of *transition bridge*: a temporary coexistence of old and new
+  semantic forms with named current writers, current readers, target readers,
+  removal conditions, and an owning FTR.
 
 policy::
   Declarative metadata that tells a transformation what relation, rule, or
