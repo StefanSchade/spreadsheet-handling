@@ -29,15 +29,314 @@ For a transformation or primitive:
 * lifecycle stage;
 * tests/guards.
 
-=== Example: FK-helper primitive contract
+=== FK Helper Pilot Matrix
 
-[source,text]
-----
-primitive              reads policy   reads provenance   may infer   missing metadata
-add_fk_helpers         required       no                 no          error
-remove_fk_helpers      optional       yes                no          error
-reorder_fk_helpers     optional       yes                no          error
-validate_fk_helpers    optional       yes                no          error
-----
+==== Context
 
-This example should be refined by the FK-helper contract-matrix pilot FTR.
+The FK-helper family is the first transformation-family pilot for the
+contract-matrix machinery because it hit all five pilot-selection
+criteria before any other family: recent review pain, bounded primitive
+surface, live v2 runtime contract, roundtrip exposure, and existing
+registry and guard scaffolding (see the Adoption Strategy chapter for
+the full rationale).
+
+The family divides into three participant classes:
+
+* *Policy producers* (`infer_fk_relations`, `configure_fk_helpers`) —
+  write the v2 relation policy under `_meta.helper_policies.fk`;
+  a pipeline that uses any primitive must run one of these earlier in
+  the same pipeline, or rely on persisted policy from a prior run.
+* *Primitive consumers* (`add_fk_helpers`, `remove_fk_helpers`,
+  `reorder_fk_helpers`, `validate_fk_helpers`) — read the v2 policy
+  and the transient derived helper provenance
+  (`_meta.derived.sheets.*.helper_columns`); must not perform any
+  convention-based FK inference.
+* *Transient working metadata* (`_meta.derived.sheets.*.helper_columns`)
+  — written by `add_fk_helpers`, consumed within the same pipeline run
+  by the other primitives and by the render layer; not persisted as
+  canonical roundtrip metadata.
+
+The `FK_PATTERN` / `id_(<target>)` cell-level convention is
+wire-format truth used by the IO layer and by `infer_fk_relations` as
+its default heuristic mode. Primitive steps do not consult it for
+relation identity.
+
+==== Matrix — part 1: role and metadata contract
+
+[cols="2,1,2,3,3", options="header"]
+|===
+| Step | Category | Role
+| Reads `_meta` (persistent)
+| Writes `_meta`
+
+| `infer_fk_relations`
+| configuration
+| policy producer (heuristic)
+| `helper_policies.fk` — reads existing entries for collision detection via `apply_v2_relations`
+| `helper_policies.fk.relations` (v2); `helper_policies.fk.schema_version`; +
+  *not* the v1 per-target shape
+
+| `configure_fk_helpers`
+| configuration
+| policy producer (explicit)
+| `helper_policies.fk` — reads existing entries for collision detection via `apply_v2_relations`
+| `helper_policies.fk.relations` (v2, runtime-consumed); +
+  `helper_policies.fk.schema_version`; +
+  `helper_policies.fk.<target_key>` (v1 — *residual producer-side write only;
+  no current runtime consumer reads this after
+  FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5*)
+
+| `add_fk_helpers`
+| primitive
+| consumer / data writer
+| `helper_policies.fk.relations` (required); +
+  `helper_policies.fk.schema_version`
+| `derived.sheets.*.helper_columns` — writes transient provenance entries
+  `{column, fk_column, target, target_key, value_field}` per materialized
+  helper column
+
+| `remove_fk_helpers`
+| primitive
+| consumer / cleanup
+| `helper_policies.fk.relations` (v2) — fallback only, when per-sheet
+  provenance is absent
+| `derived.sheets.*.helper_columns` — cleans transient provenance after
+  helper columns are removed
+
+| `reorder_fk_helpers`
+| primitive
+| consumer / layout
+| `helper_policies.fk.relations` (v2) — fallback for helper-to-FK pairing
+  when provenance is absent
+| nothing
+
+| `validate_fk_helpers`
+| primitive
+| validator
+| `helper_policies.fk.relations` (v2) — declares helper columns and
+  `target_key` used for join
+| nothing
+
+|===
+
+Column `derived.sheets.*.helper_columns` is `meta_rendering` /
+`derived_operational_view` in the registry; the table above lists it
+separately because it is transient working metadata, not persistent
+canonical metadata.
+
+==== Matrix — part 2: inference, missing-metadata behavior, and lifecycle
+
+[cols="2,1,2,2,2", options="header"]
+|===
+| Step
+| May infer
+| Must not infer
+| Missing-metadata behavior
+| Lifecycle stage
+
+| `infer_fk_relations`
+| yes — scans data-frame column headers against `FK_PATTERN` (default
+  `naming_convention` mode) to derive `(source_frame, source_column)`
+  relation identity and `target_key`
+| must not write v1 per-target shape; must not guess targets from name
+  prefixes when `on_missing_target: ignore` is not set
+| fresh write when no prior `helper_policies.fk` exists; collision on
+  same `(source_frame, source_column)` key via `apply_v2_relations` fails
+  clearly (same-producer semantic-identity rewrites accepted idempotently;
+  cross-producer collisions on the same key fail)
+| Establish
+
+| `configure_fk_helpers`
+| no — the v1→v2 bridge is a deterministic identity derivation
+  (frame-scan for literal `fk_column` header), not heuristic inference;
+  heuristic inference belongs to `infer_fk_relations`
+| must not derive relation targets from naming heuristics; the frame-scan
+  bridge must not be generalized into primitive heuristic inference
+| missing `targets` config parameter is a configuration error
+| Establish
+
+| `add_fk_helpers`
+| no
+| must not call `detect_fk_columns`; must not consult `FK_PATTERN` for
+  relation identity; pinned by `test_fk_helper_primitives_consume_policy.py`
+| missing v2 policy raises a clear error naming `configure_fk_helpers`
+  or `infer_fk_relations`
+| Transform
+
+| `remove_fk_helpers`
+| no
+| must not use prefix-based fallback in the normal-operation path (removed
+  after FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5)
+| missing both provenance and policy raises a clear error naming
+  `configure_fk_helpers` or `infer_fk_relations`
+| Reimport / cleanup
+
+| `reorder_fk_helpers`
+| no
+| must not consult `FK_PATTERN` for helper placement; pinned by
+  `test_fk_helper_primitives_consume_policy.py`
+| missing both provenance and policy raises a clear error
+| Transform (render-adjacent)
+
+| `validate_fk_helpers`
+| no
+| must not call `detect_fk_columns`; joins on `target_key` from policy
+  or provenance, not re-derived PK; pinned by
+  `test_fk_helper_primitives_consume_policy.py`
+| non-declared FK sheets: tolerated; declared FK relations without v2
+  policy raise an error
+| Transform (validation)
+
+|===
+
+==== Matrix — part 3: persistence, provenance, public surface, and registry
+
+[cols="2,2,1,2,2", options="header"]
+|===
+| Step
+| Provenance written
+| Public-surface impact
+| Registry sources
+| Tests / guards
+
+| `infer_fk_relations`
+| `produced_by.step=infer_fk_relations`, +
+  `produced_by.mode=naming_convention` on each relation entry
+| YAML step config (step configuration surface only)
+| `pipeline_step_registry.json` subtype `fk_relation_inference`, category `configuration`; +
+  `meta_registry.yaml` `helper_policies` entry
+| `test_fk_relations_inference.py`; +
+  `test_infer_fk_relations_step.py`
+
+| `configure_fk_helpers`
+| `produced_by.step=configure_fk_helpers`, +
+  `produced_by.mode=explicit` on each v2 relation entry
+| YAML schema — `targets` mapping is the public YAML config surface
+| `pipeline_step_registry.json` subtype `fk_helper_policy`, category `configuration`; +
+  `meta_registry.yaml` `helper_policies` entry plus `contract_lifecycle` block
+| `test_fk_helper_policies.py`; +
+  `test_fk_helper_configuration.py`
+
+| `add_fk_helpers`
+| writes `{column, fk_column, target, target_key, value_field}` per
+  helper column to `derived.sheets.*.helper_columns`
+| adds visible helper columns to workbook frames
+| `pipeline_step_registry.json` subtype `fk_helper_projection`; +
+  `meta_registry.yaml` `derived` and `helper_policies` entries
+| `test_fk_helpers_enrich.py`; +
+  `test_fk_helper_primitives_policy_driven.py`; +
+  architecture guard `test_fk_helper_primitives_consume_policy.py`
+
+| `remove_fk_helpers`
+| reads and cleans provenance from `derived.sheets.*.helper_columns`
+  after removal; does not write new entries
+| removes visible helper columns from workbook frames
+| `pipeline_step_registry.json` subtype `fk_helper_cleanup`; +
+  `meta_registry.yaml` `derived` and `helper_policies` entries
+| `test_fk_helpers_domain.py`; +
+  `test_fk_edge_cases.py`; +
+  architecture guard `test_fk_helper_primitives_consume_policy.py`
+
+| `reorder_fk_helpers`
+| none
+| affects visible column ordering in workbook frames
+| `pipeline_step_registry.json` subtype `fk_helper_layout`; +
+  `meta_registry.yaml` `derived`, `helper_policies`, `helper_prefix` entries
+| `test_fk_helpers_domain.py`; +
+  architecture guard `test_fk_helper_primitives_consume_policy.py`
+
+| `validate_fk_helpers`
+| none
+| validation errors only; no frame modification
+| `pipeline_step_registry.json` subtype `fk_helper_validation`; +
+  `meta_registry.yaml` `derived` and `helper_policies` entries
+| `test_fk_check.py`; +
+  `test_fk_helper_primitives_policy_driven.py`; +
+  architecture guard `test_fk_helper_primitives_consume_policy.py`
+
+|===
+
+==== Drift found and resolved
+
+Cross-checking the matrix against
+`registries/pipeline_step_registry.json` surfaced three stale notes in
+the `configure_fk_helpers` entry and one in `infer_fk_relations`.
+All were residue from before `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`
+completed:
+
+. `configure_fk_helpers` meta_contract write notes for the v1 path
+  said "consumed by current FK-helper primitives" — stale; updated to
+  record it as a residual producer-side write with no current runtime
+  consumer.
+. `configure_fk_helpers` meta_contract write notes for the v2 relations
+  path said "compatibility for the period in which ... primitives still
+  consume v1" — stale; updated to record that the runtime consumer
+  transition is complete and the bridge is active on the producer side
+  only.
+. `configure_fk_helpers` purpose said "persist them as canonical v1
+  helper policy metadata for current FK-helper primitives" — stale;
+  updated to describe v2 as the runtime contract and v1 as a residual
+  producer-side write.
+. `infer_fk_relations` purpose said "current FK-helper primitives do
+  not pick up inferred relations until
+  FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 makes them v2-aware" —
+  stale; the FTR has completed and primitives are v2-aware now.
+
+These are documentation-only drift corrections.  The registry
+`contract_lifecycle` block in `meta_registry.yaml` for `helper_policies`
+was already accurate (`transition_bridge.status: active`,
+`transition_bridge.bridge_type: dual_write`) and required no change.
+No runtime source files changed.
+
+==== Guard coverage assessment
+
+The primitive no-convention-inference contract is already guarded and
+stable:
+
+* `tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`
+  pins that the `fk_helpers` primitive package, `reorder_fk_helpers`,
+  and `validate_fk_helpers` do not import `FK_PATTERN`,
+  `detect_fk_columns`, or `build_registry` from `core.fk`, and that
+  each primitive references at least one policy or provenance token.
+* `tests/architecture/dependency_guards/test_architecture_guard_fk_helpers.py`
+  guards that `pipeline.steps` does not import FK-helper domain symbols
+  or manipulate `_meta` / `derived` / `helper_columns` directly.
+* `tests/architecture/dependency_guards/test_fk_helpers_package_reexports.py`
+  pins the public dotted-path symbols on the `fk_helpers` package root.
+
+These guards cover the most silent drift risk: a future caller
+re-introducing convention-based inference into primitives. No new guard
+was added by this matrix pilot because:
+
+* The producer-side residual v1 write in `configure_fk_helpers` is
+  already recorded in `meta_registry.yaml` under `contract_lifecycle`;
+  a guard against its consumer absence would duplicate the registry
+  record without adding test oracle value.
+* The `derived.sheets.*.helper_columns` transient lifecycle
+  (pruning, orphan handling, schema validation) is deferred to
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`; a guard here is premature
+  while that contract is unsettled.
+* The duplicate-id check in `validate_fk_helpers` using
+  `defaults['id_field']` for non-declared FK sheets is a stable
+  behavior but a narrow, schema-adjacent concern that is adequately
+  covered by `test_fk_check.py`.
+
+Rows in this matrix that are stable enough for guard consideration are
+marked by already having an existing guard (all four primitive rows).
+The two producer rows (`infer_fk_relations`, `configure_fk_helpers`)
+are stable on their v2 write contract and could support a guard
+verifying that each writes `schema_version: 2`; that is deferred as
+a future narrow guard if silent drift surfaces.
+
+==== Deferred concerns
+
+* Provenance lifecycle for `derived.sheets.*.helper_columns` (pruning,
+  stale / orphan handling, schema validation) — owned by
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`; no lifecycle policy beyond
+  "transient, recomputed per run" is recorded here.
+* Producer-side residual v1 write in `configure_fk_helpers` — bridge
+  state is active; removal condition and owning FTR are recorded in
+  `meta_registry.yaml` under `contract_lifecycle`.
+* Duplicate-id check behavior in `validate_fk_helpers` for non-declared
+  FK sheets (`defaults['id_field']`) — stable but outside the core
+  FK relation policy contract; deferred to per-validation adoption work.
