@@ -101,13 +101,14 @@ class TestPrimitivesDoNotImportConventionDetection:
                 f"resolve the FK identity through helper_policies/provenance."
             )
 
-    def test_reorder_fk_helpers_step_does_not_import_fk_pattern(self):
+    def test_reorder_fk_helpers_step_does_not_import_convention_inference(self):
         source = _module_source(_REORDER_MODULE)
         imported = _imported_names_from_core_fk(source)
-        assert "FK_PATTERN" not in imported, (
+        violations = imported & _FORBIDDEN_NAMES
+        assert not violations, (
             "reorder_fk_helpers (domain.transformations.helpers) must not "
-            "import FK_PATTERN: helper placement is driven by v2 policy or "
-            "derived helper provenance."
+            f"import convention-detection helpers from core.fk: {violations}. "
+            "Helper placement is driven by v2 policy or derived helper provenance."
         )
 
     def test_validate_fk_helpers_does_not_import_convention_inference(self):
