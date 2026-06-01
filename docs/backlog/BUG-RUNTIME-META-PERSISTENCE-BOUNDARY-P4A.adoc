@@ -1,0 +1,159 @@
+===== BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A -- Runtime-only metadata must be pruned before persistence
+
+*Status:* Open
+*Priority:* P4A
+*Area:* Pipeline / metadata lifecycle / persistence boundary
+
+==== Context
+
+During the Dino worldbuilding adoption, a reviewed reimport snapshot was
+promoted back into the canonical consumer data directory, including
+`_meta.yaml`.
+
+After that promotion, a later spreadsheet export failed with:
+
+[source,text]
+----
+Error: Frame 'groups' must have flat columns
+----
+
+The failure was not caused by the canonical business data itself. The
+immediate carrier was persisted runtime metadata that was replayed on a later
+pipeline run.
+
+Concretely, `_meta.yaml` contained runtime-produced sections such as helper
+policies and workbook/runtime reconstruction metadata. On the next export run,
+that persisted runtime metadata was consumed again before the pipeline had
+re-established its fresh runtime state. In the Dino case this caused FK helper
+materialization to be applied to `groups` based on replayed helper policy for
+`places`, yielding tuple-shaped helper columns and an eventual failure in
+`join_frames`.
+
+The consumer was able to work around the problem by stripping runtime sections
+from `_meta` near the start of the export pipeline. That is useful as a local
+containment measure, but it is the wrong architectural ownership point.
+
+==== Problem statement
+
+The core pipeline currently lacks a clearly defined persistence boundary for
+metadata that is:
+
+* produced during a run,
+* consumed during the same run,
+* useful for rendering or cleanup,
+* but not part of the canonical roundtrip contract.
+
+As a result, runtime-only metadata can leak into persisted `_meta.yaml` and be
+mistaken for canonical input on a later run.
+
+This is not merely a missing cleanup edge case. It is a lifecycle bug:
+
+* the project does not yet make it explicit enough which metadata belongs to
+  canonical persistence and which does not;
+* there is no unmistakable pipeline step or persistence-boundary rule that
+  enforces this distinction before sidecar persistence;
+* the behavior is therefore vulnerable to repeated-run contamination and
+  consumer-specific workaround logic.
+
+==== Why this is architectural
+
+This bug sits at the boundary between semantic lifecycle and persistence
+mechanics.
+
+The fix must therefore be visible as part of the pipeline lifecycle, not as an
+incidental detail hidden inside a consumer plugin or left to ad hoc producer
+cleanup.
+
+The implementer still has to choose the exact carrier:
+
+* a dedicated pre-persist cleanup step,
+* a persistence-time metadata filter,
+* or another explicit pipeline-stage mechanism,
+
+but the contract must be clear in code and in documentation:
+
+* runtime-only metadata is not part of the canonical persisted roundtrip
+  surface unless explicitly classified otherwise;
+* the pipeline must remove or exclude it before persistence;
+* consumers must not be responsible for rediscovering and stripping it.
+
+==== Working hypothesis
+
+The project already distinguishes semantic classes such as canonical,
+derived/transient, render-consumed, and roundtrip-relevant metadata, but the
+persisted JSON-directory `_meta.yaml` sidecar currently does not enforce that
+boundary strongly enough.
+
+A correct fix likely needs both:
+
+* an operational enforcement point in the pipeline before persistence, and
+* explicit documentation of the metadata lifecycle so producers, consumers,
+  and maintainers know what is expected to survive a roundtrip.
+
+==== Scope
+
+* Define which runtime-produced metadata sections must not survive into the
+  persisted `_meta.yaml` sidecar by default unless explicitly classified as
+  roundtrip-relevant.
+* Add a clear pipeline-level enforcement point before persistence so this is a
+  core lifecycle rule rather than a consumer workaround.
+* Ensure repeated export/reimport/promote cycles do not replay stale runtime
+  metadata as canonical input.
+* Update the semantic model lifecycle documentation to describe this
+  persistence boundary explicitly.
+* Update the Developer Guide so implementers understand where this boundary
+  sits in the pipeline and why it matters.
+
+==== Non-goals
+
+* Do not solve this by requiring every consumer to add its own `_meta`
+  sanitizing plugin.
+* Do not treat this as a one-off FK-helper bug only; the issue is broader than
+  helper policies.
+* Do not silently blur the distinction between canonical persisted metadata and
+  runtime operational metadata.
+* Do not redesign the entire metadata model in this bug.
+
+==== Acceptance
+
+* A core pipeline run that persists `_meta.yaml` no longer leaks runtime-only
+  metadata into persisted canonical data by default.
+* Repeated roundtrips do not replay stale runtime helper/view/reconstruction
+  metadata as fresh canonical input.
+* The enforcing behavior is represented as a clear lifecycle/pipeline concern
+  in code, not merely as scattered ad hoc cleanup.
+* The intended persistence boundary is documented in:
+** `docs/semantic_model/`
+** the Developer Guide
+* The Dino worldbuilding adoption no longer requires a consumer-side workaround
+  to strip promoted runtime metadata before spreadsheet export.
+
+==== Validation
+
+* Reproduce the Dino export failure from promoted `_meta.yaml` on the
+  pre-fix path.
+* Verify that the fixed core path allows:
+** promote reviewed reimport snapshot including `_meta.yaml`
+** later spreadsheet export
+** later spreadsheet reimport
+  without consumer-side `_meta` stripping.
+* Add regression coverage for repeated-run persistence contamination.
+* Verify that documentation and code agree on which metadata classes may be
+  persisted.
+
+==== Documentation follow-up expectation
+
+This bug should feed directly into the lifecycle and persistence chapters of
+the semantic model, and likely into the Developer Guide workflow material as
+well.
+
+The key point to document is:
+
+[source,text]
+----
+runtime metadata may exist during a run,
+but metadata that does not belong to the roundtrip contract
+must be pruned or excluded before persistence
+at a clear pipeline boundary
+----
+
