@@ -234,11 +234,17 @@ def _parse_table_grid(
                         )
                     if validation_name:
                         validation_cells[validation_name].append((absolute_row, absolute_col))
-                    if absolute_col > max_col:
-                        max_col = absolute_col
+                    # Bounds must include the full span of an explicit merge:
+                    # downstream extent scans and header-merge extraction rely
+                    # on max_col / max_row reaching the right/bottom edge of
+                    # the merge, not just its anchor.
+                    span_right = absolute_col + col_span - 1
+                    if span_right > max_col:
+                        max_col = span_right
+                    span_bottom = absolute_row + row_span - 1
+                    if span_bottom > max_row:
+                        max_row = span_bottom
                 col_index += col_repeat
-            if absolute_row > max_row:
-                max_row = absolute_row
         row_index += row_repeat
 
     return ParsedTable(

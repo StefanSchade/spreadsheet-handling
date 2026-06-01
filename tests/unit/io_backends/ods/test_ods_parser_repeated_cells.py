@@ -182,6 +182,51 @@ def test_parser_limits_reject_implausible_row_block(tmp_path: Path) -> None:
         parse_workbook(out, limits=limits)
 
 
+def test_explicit_merge_span_extends_parsed_bounds() -> None:
+    # Review follow-up: covered-table-cell siblings of a merged anchor must
+    # not silently bound the parsed table. Before the bounds fix, an anchor
+    # at col=1 with col_span=2 left max_col at 1, which dropped header merges
+    # in _extract_header_merges and shrunk _find_col_extent's scan window.
+    from odf.table import CoveredTableCell, Table, TableCell, TableRow
+    from odf.text import P
+
+    from spreadsheet_handling.io_backends.ods.parser_interpretation import (
+        build_visible_sheet_ir,
+    )
+
+    table = Table(name="Sheet1")
+    header = TableRow()
+    anchor = TableCell(numbercolumnsspanned=2)
+    anchor.addElement(P(text="Group"))
+    header.addElement(anchor)
+    header.addElement(CoveredTableCell())
+    table.addElement(header)
+    leaf = TableRow()
+    left = TableCell()
+    left.addElement(P(text="L"))
+    right = TableCell()
+    right.addElement(P(text="R"))
+    leaf.addElement(left)
+    leaf.addElement(right)
+    table.addElement(leaf)
+
+    parsed = _parse_table_grid(table)
+
+    assert parsed.merges == [(1, 1, 1, 2)]
+    assert parsed.max_col == 2
+    assert parsed.max_row == 2
+
+    sheet = build_visible_sheet_ir(
+        parsed,
+        sheet_name="Sheet1",
+        meta_hints={},
+        validations=[],
+        autofilter_ref=None,
+    )
+    assert sheet.tables[0].n_cols == 2
+    assert sheet.meta.get("__header_merges") == [(1, 1, 1, 2)]
+
+
 def test_max_row_max_col_track_only_real_content() -> None:
     # Direct check on the parser's bounds: pathological filler cells around a
     # small island of real content must not inflate ParsedTable dimensions.

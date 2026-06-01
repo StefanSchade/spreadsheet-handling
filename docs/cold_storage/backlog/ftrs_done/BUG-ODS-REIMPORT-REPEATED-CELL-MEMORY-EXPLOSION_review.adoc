@@ -1,0 +1,201 @@
+== Review-Notiz: BUG-ODS-REIMPORT-REPEATED-CELL-MEMORY-EXPLOSION
+
+=== Review-Gegenstand
+
+Reviewed wurde Commit `06375d0c21700c1c5cc51bd7fc020fcd752e7f28`
+(`fix(BUG-ODS-REIMPORT-REPEATED-CELL-MEMORY-EXPLOSION): skip empty filler`).
+
+Der Fix reagiert auf den waehrend der Worldbuilding-Adoption aufgetretenen
+ODS-Reimport-Fehler, bei dem LibreOffice leere, aber formatierte Zellen und
+Zeilen ueber `number-columns-repeated` / `number-rows-repeated` bis zur
+theoretischen Sheet-Grenze deklarierte. Der alte Parser expandierte diese
+Positionen in Python-Datenstrukturen und lief auf dem Dino-Workbook in einen
+`MemoryError`.
+
+=== Bewertung
+
+Der zentrale Bugfix ist in der Richtung richtig und fuer den beobachteten
+Dino-Carrier wirksam.
+
+Positiv:
+
+* `_parse_table_grid` expandiert leere repeated-cell-Filler nicht mehr eager,
+  sondern behaelt `number-columns-repeated` als Descriptor und schreibt nur
+  Zellen mit Inhalt, Merge-Span oder Validation-Bezug in das Parsed Grid.
+* Repeated empty rows werden vollstaendig uebersprungen und erhoehen weder
+  `values` noch `max_row`. Damit ist auch der nachgelagerte Extent-Scan in
+  `parser_interpretation.py` gegen den konkreten 1M-Leerzeilen-Carrier
+  geschuetzt.
+* `ParserLimits` und `SpreadsheetTooLargeError` sind eine sinnvolle zweite
+  Verteidigungslinie fuer nicht-leere Repeat-Bloecke, bevor der Parser grosse
+  Row-/Column-Bereiche materialisiert.
+* Die Regressionstests nutzen synthetische ODS-Pakete und committen keine
+  Worldbuilding-/Dino-Domaenendaten. Das passt zur dokumentierten
+  Fixture-Policy.
+* Der lokale Original-Carrier `tmp/dino_stories.ods` laesst sich mit dem
+  neuen Parser wieder lesen; die sichtbaren Sheets und Tabellenbreiten wirken
+  plausibel fuer die Worldbuilding-Projektion.
+
+=== Befund 1: Merge-Spans erweitern `max_col` / `max_row` nicht konsistent
+
+*Severity:* Medium
+
+In `src/spreadsheet_handling/io_backends/ods/odf_parser.py` aktualisiert die
+neue Materialisierung `max_col` nur mit der konkreten Ankerposition
+`absolute_col`:
+
+* `odf_parser.py`, Zeilen 223-239: bei einem Inhalt mit `col_span > 1` wird
+  zwar ein Merge `(absolute_row, absolute_col, ..., absolute_col + col_span -
+  1)` erzeugt, `max_col` wird aber nur bis `absolute_col` fortgeschrieben.
+* `odf_parser.py`, Zeilen 240-241: analog wird `max_row` nur bis
+  `absolute_row` fortgeschrieben, nicht bis zum unteren Ende eines
+  `row_span`.
+
+Das ist eine echte Verhaltensdifferenz zum alten Parser fuer Covered Cells.
+Vor dem Fix wurden `covered-table-cell`-Positionen zwar nicht in `values`
+geschrieben, aber sie liefen durch den Spaltenzaehler und konnten dadurch
+`max_col` vergroessern. Jetzt werden Covered Cells als nicht-inhaltlich
+uebersprungen; das ist fuer Filler richtig, verliert aber die
+Bounds-Information echter Merge-Spans.
+
+Minimal bestaetigter Repro:
+
+[source,python]
+----
+from odf.table import Table, TableCell, TableRow, CoveredTableCell
+from odf.text import P
+from spreadsheet_handling.io_backends.ods.odf_parser import _parse_table_grid
+from spreadsheet_handling.io_backends.ods.parser_interpretation import build_visible_sheet_ir
+
+table = Table(name="Sheet1")
+row = TableRow()
+cell = TableCell(numbercolumnsspanned=2)
+cell.addElement(P(text="Group"))
+row.addElement(cell)
+row.addElement(CoveredTableCell())
+table.addElement(row)
+
+parsed = _parse_table_grid(table)
+sheet = build_visible_sheet_ir(
+    parsed,
+    sheet_name="Sheet1",
+    meta_hints={},
+    validations=[],
+    autofilter_ref=None,
+)
+
+assert parsed.merges == [(1, 1, 1, 2)]
+assert parsed.max_col == 1
+assert sheet.tables[0].n_cols == 1
+assert sheet.meta.get("__header_merges") is None
+----
+
+Erwartbar waere mindestens, dass explizite Merge-Spans die ParsedTable-Bounds
+bis zum rechten bzw. unteren Span-Ende erweitern. Sonst kann ein gueltiger
+ODS-Header-Merge zwar in `parsed.merges` vorhanden sein, wird aber spaeter durch
+`_find_col_extent` / `_extract_header_merges` nicht mehr sichtbar, weil die
+Tabellenbreite zu klein bestimmt wird.
+
+Fuer den konkret beobachteten Dino-Carrier ist das kein Blocker: dort setzen
+die realen Leaf-Header und Datenzellen die benoetigten Breiten separat. Als
+Parser-Invariante ist es aber unsauber, weil der Commit selbst Merge-Spans als
+weiterhin inhaltlich relevante Zellen behandelt.
+
+Empfohlene Korrektur:
+
+* Beim Schreiben eines inhaltlichen Zellenankers `max_col` mit
+  `absolute_col + col_span - 1` aktualisieren.
+* `max_row` mit `absolute_row + row_span - 1` aktualisieren.
+* Einen gezielten Test ergaenzen, der einen ODS-Header-Merge mit
+  `covered-table-cell` readseitig wieder als Tabellenbreite und
+  `__header_merges` sichtbar macht.
+
+*Disposition:* Behoben in einem Follow-up-Commit auf demselben FTR-/Bug-Scope.
+
+* `odf_parser.py:_parse_table_grid` aktualisiert `max_col` jetzt mit
+  `absolute_col + col_span - 1` und `max_row` mit
+  `absolute_row + row_span - 1` direkt nach jedem Inhaltsschreiben.
+* Neuer Regressionstest
+  `test_explicit_merge_span_extends_parsed_bounds` in
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` prueft den
+  vom Review angegebenen Repro: ein `TableCell` mit `col_span=2` gefolgt von
+  einem `CoveredTableCell` erzeugt `parsed.max_col == 2` und ergibt nach
+  `build_visible_sheet_ir` eine Tabellenbreite von 2 sowie einen Eintrag in
+  `sheet.meta["__header_merges"]`.
+
+=== Kein weiterer Blocker gefunden
+
+Die uebrigen geprueften Bereiche tragen den Bugfix:
+
+* Empty repeated columns bleiben aus `values` und aus der Tabellenbreite
+  heraus.
+* Empty repeated rows bleiben aus `values` und aus `max_row` heraus.
+* Non-empty repeated cells werden weiterhin materialisiert; das schuetzt den
+  legitimen Dino-Fall, in dem ein wiederholter nicht-leerer Header-Wert eine
+  echte Projektion repraesentiert.
+* Nicht-leere Repeat-Bloecke werden vor der Iteration gegen `ParserLimits`
+  geprueft.
+
+Eine bewusste Einschraenkung bleibt: `limits=` ist aktuell direkt am
+ODS-Parser oeffentlich, aber nicht als konfigurierbare Option durch den
+Backend-/Pipeline-Pfad gefuehrt. Fuer die akute Memory-Explosion ist das
+unproblematisch, weil die Defaults greifen. Falls Consumer spaeter eigene
+Grenzwerte pro Pipeline setzen sollen, braucht es eine separate kleine
+Erweiterung im ODS-Backend bzw. in der Pipeline-Konfiguration.
+
+=== Verifikation
+
+Ausgefuehrt:
+
+[source,bash]
+----
+.venv/bin/python -m pytest \
+  tests/unit/io_backends/ods \
+  tests/integration/io_backends/test_ods_xlsx_parity.py \
+  -q
+----
+
+Ergebnis: `33 passed`.
+
+[source,bash]
+----
+.venv/bin/python - <<'PY'
+from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook
+
+ir = parse_workbook("tmp/dino_stories.ods")
+print(list(ir.sheets))
+for name, sheet in ir.sheets.items():
+    table = sheet.tables[0]
+    print(name, table.n_rows, table.n_cols)
+PY
+----
+
+Ergebnis: der lokale Dino-Carrier wird ohne Memory-Explosion gelesen; sichtbar
+sind u.a. `stories`, `characters`, `story_cast_roles`,
+`story_cast_development` und `story_locations`.
+
+[source,bash]
+----
+git diff --check
+----
+
+Ergebnis: clean.
+
+Hinweis zur Testumgebung: `make test-file
+FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` scheiterte
+nicht an Tests, sondern an einem stale Shebang in `.venv/bin/pytest`
+(`#!/home/stefan/repos/spreadsheet-handling/.venv/bin/python`). Der direkte
+Aufruf ueber `.venv/bin/python -m pytest` funktioniert.
+
+=== Arbeitsurteil
+
+Der Fix loest den konkreten Worldbuilding-Blocker und ist als akute
+Stabilisierung richtig gelandet. Die neue Sparse-Behandlung leerer ODS-Filler
+und die Parser-Limits sind die passende Gegenmassnahme gegen den beobachteten
+LibreOffice-Carrier.
+
+Vor einer abschliessenden Einordnung als vollstaendige Haertung des ODS-Parsers
+sollte aber der Merge-Bounds-Befund nachgezogen werden. Er ist nicht
+derselbe Memory-Bug, wurde aber durch denselben Umbau sichtbar: Covered Cells
+duerfen als leere Filler ignoriert werden, explizite Merge-Spans muessen
+trotzdem die logischen Tabellen-Bounds erhalten.
