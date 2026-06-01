@@ -1,0 +1,136 @@
+===== BUG-ODS-REIMPORT-REPEATED-CELL-MEMORY-EXPLOSION -- ODS reimport must not expand unused repeated cells into memory
+
+*Status:* New
+
+*Type:* Bug
+
+*Context:*::
+During Dino worldbuilding adoption testing, an ODS reimport was started via:
+
+[source,bash]
+----
+make import-stories-ods
+----
+
+The command invokes:
+
+[source,bash]
+----
+PYTHONPATH=. .venv/bin/sheets-run 
+--config ./pipelines/dino_insel/spreadsheet_to_json.yaml 
+--in-kind ods 
+--in-path ./tmp/dino_stories.ods
+----
+
+The process exhausted memory quickly. With a 4 GB virtual-memory limit:
+
+[source,bash]
+----
+ulimit -v $((4*1024*1024))
+make import-stories-ods
+----
+
+the process failed with `MemoryError` in the ODS parser:
+
+[source,text]
+----
+spreadsheet_handling/io_backends/ods/odf_parser.py
+parse_workbook()
+_parse_table_grid(table)
+----
+
+*Operational note:*::
+The local reproduction used `ulimit -v` as a blunt safety limit so the host
+would not become unstable during debugging.
+
+This should not be interpreted as the recommended production containment
+mechanism.
+
+If a persistent memory ceiling is desired for operational protection, that
+belongs more naturally to `systemd` / cgroup-based limits than to a shell-level
+`ulimit`, because `ulimit -v` also affects unrelated child processes and can
+interfere with tools such as Electron / VS Code.
+
+Resource limiting therefore belongs to the caller environment, for example:
+
+* shell wrapper,
+* Makefile target,
+* CI job,
+* service manager or container runtime.
+
+It should not become a hard runtime requirement inside the library itself.
+
+The runtime path should remain OS-agnostic. Linux may be the development
+environment, but spreadsheet data produced on other systems such as Windows
+must remain processable without Linux-specific assumptions in the runtime
+behavior.
+
+A prior manual interrupt showed the parser spending time in `_parse_table_grid`,
+around column-index/max-column handling.
+
+*Working hypothesis:*::
+The ODS parser treats empty cells or rows with `table:number-columns-repeated`
+or `table:number-rows-repeated` as real payload and expands them into large
+Python structures. This may happen especially when empty cells carry global or
+sheet-level formatting. The parser should distinguish used table content from
+formatting-expanded empty spreadsheet space.
+
+*Fixture policy:*::
+The original Dino workbook and pipeline are available locally for debugging but
+must not be committed to the core repository because they contain consumer
+domain data. The regression test should generate a minimal synthetic ODS fixture
+inside the test, or write a tiny generated ODS archive with targeted
+`content.xml`, reproducing the repeated-empty-cell/row condition without
+private domain content.
+
+*Scope:*::
+
+* Reproduce the memory explosion with the local Dino ODS and pipeline.
+* Identify the exact ODS carrier pattern causing expansion.
+* Fix the ODS parser so repeated empty cells/rows outside the used data range
+  are bounded, ignored, or represented sparsely.
+* Add parser bounds for implausible spreadsheet dimensions before materializing
+  data structures.
+* Add clear errors for excessive dimensions, for example:
+  ** too many parsed rows,
+  ** too many parsed columns,
+  ** too many materialized cells.
+* Convert expected oversized-sheet failures into domain-specific or parser-specific
+  exceptions with actionable messages instead of raw `MemoryError` where feasible.
+* Add regression tests using synthetic ODS input, not Dino data.
+* Preserve existing valid ODS/XLSX parity behavior.
+
+*Non-Goals:*::
+
+* Do not commit the Dino ODS workbook or Dino pipeline into the core repository.
+* Do not add consumer-domain test data to core.
+* Do not redesign the ODS parser into a streaming parser unless the bounded fix
+  proves insufficient.
+* Do not change XLSX behavior unless a shared spreadsheet-contract invariant
+  requires it.
+* Do not solve CLI interrupt behavior here.
+* Do not define the long-term production resource-governance strategy here; use
+  this bug only to record the debugging/reproduction context.
+
+*Acceptance:*::
+
+* The synthetic repeated-empty-cell/row ODS fixture no longer causes uncontrolled
+  memory growth.
+* The local Dino ODS reimport no longer exhausts memory.
+* Oversized ODS tables fail early with a clear diagnostic before large allocation.
+* Valid ODS roundtrip and ODS/XLSX parity tests still pass.
+* Tests cover:
+  ** repeated empty columns,
+  ** repeated empty rows,
+  ** formatted-but-empty repeated cells if applicable,
+  ** dimension-bound failure behavior.
+* `MemoryError` is not the normal user-facing result for the reproduced case.
+
+*Validation:*::
+[source,bash]
+----
+pytest tests/unit/io_backends/ods -q
+pytest tests/integration/io_backends/test_ods_xlsx_parity.py -q
+make test-ods
+git diff --check
+----
