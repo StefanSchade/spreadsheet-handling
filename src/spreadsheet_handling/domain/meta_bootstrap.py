@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from .ingress import run_domain_ingress
+
 
 def deep_merge(base: dict, overlay: dict) -> dict:
     """Return a new dict with *overlay* merged on top of *base*.
@@ -69,5 +71,13 @@ def bootstrap_meta(
     if cli_overrides:
         merged = deep_merge(merged, cli_overrides)
 
-    set_meta(frames, merged)
+    # Profile and CLI overrides can introduce externally authored workbook
+    # metadata (e.g. Legend Blocks list form) after the initial load, so run
+    # the domain ingress coordinator on the post-merge candidate before writing
+    # it back. This is automatic internal post-merge enforcement, not a
+    # separately selectable pipeline step. Canonicalizing before set_meta keeps
+    # the merge atomic: an ingress failure leaves *frames* unchanged.
+    canonical = run_domain_ingress({"_meta": merged}).get("_meta", merged)
+
+    set_meta(frames, canonical)
     return frames

@@ -91,39 +91,30 @@ def _flatten_header_to_strings(df: pd.DataFrame) -> list[str]:
 
 
 def _legend_items(meta: Dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]]:
+    # Canonical legend_blocks is mapping form only; external list-form authoring
+    # is normalized at the domain.ingress boundary before the render flow runs.
     if not meta:
         return []
     raw = meta.get("legend_blocks")
     if not raw:
         return []
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         return [
             (str(name), spec)
             for name, spec in raw.items()
             if isinstance(spec, dict)
         ]
-    if isinstance(raw, list):
-        items: list[tuple[str, dict[str, Any]]] = []
-        for index, spec in enumerate(raw, start=1):
-            if not isinstance(spec, dict):
-                continue
-            name = str(spec.get("name") or spec.get("id") or f"legend_{index}")
-            items.append((name, spec))
-        return items
-    raise ValueError("legend_blocks must be a mapping or a list of mappings")
+    raise ValueError(
+        "legend_blocks must be a mapping (list form is normalized at domain ingress)"
+    )
 
 
 def _clone_legend_blocks(raw: Any) -> Any:
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         return {
             name: dict(spec) if isinstance(spec, dict) else spec
             for name, spec in raw.items()
         }
-    if isinstance(raw, list):
-        return [
-            dict(spec) if isinstance(spec, dict) else spec
-            for spec in raw
-        ]
     return raw
 
 

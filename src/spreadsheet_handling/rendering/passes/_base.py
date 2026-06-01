@@ -134,17 +134,12 @@ def _workbook_meta(doc: WorkbookIR) -> dict[str, Any]:
 
 
 def _legend_spec(wb_meta: dict[str, Any], legend_name: str) -> dict[str, Any] | None:
+    # Canonical legend_blocks is mapping form only; external list-form authoring
+    # is normalized at the domain.ingress boundary before the render flow runs.
     raw = wb_meta.get("legend_blocks")
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         spec = raw.get(legend_name)
         return spec if isinstance(spec, dict) else None
-    if isinstance(raw, list):
-        for index, spec in enumerate(raw, start=1):
-            if not isinstance(spec, dict):
-                continue
-            name = str(spec.get("name") or spec.get("id") or f"legend_{index}")
-            if name == legend_name:
-                return spec
     return None
 
 

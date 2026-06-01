@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
+from spreadsheet_handling.domain.ingress import run_domain_ingress
 from spreadsheet_handling.domain.validations.validate_columns import add_validations
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.passes import ValidationPass
@@ -126,24 +127,35 @@ class TestValidationPassFromConstraints:
         assert formula_list_values(dv.formula) == ("E", "R", "K")
 
     @pytest.mark.ftr("FTR-LEGEND-VALIDATION-LISTS-P4A")
-    def test_from_legend_supports_list_style_legend_blocks(self):
+    @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+    def test_from_legend_supports_list_authoring_normalized_at_ingress(self):
+        # List-form legend_blocks is external authoring sugar, canonicalized to
+        # mapping form at the domain.ingress boundary. The render/validation
+        # layer only ever sees mapping form; list authoring must still yield the
+        # same dropdown values end to end.
+        normalized = run_domain_ingress(
+            {
+                "_meta": {
+                    "legend_blocks": [
+                        {
+                            "name": "status_codes",
+                            "entries": [
+                                {"token": "E", "label": "Editable"},
+                                {"token": "R", "label": "Read-only"},
+                            ],
+                        }
+                    ]
+                }
+            }
+        )["_meta"]
+
         ir = self._make_ir_with_constraints(
             [{
                 "sheet": "Products",
                 "column": "category",
                 "rule": {"type": "from_legend", "legend": "status_codes"},
             }],
-            extra_meta={
-                "legend_blocks": [
-                    {
-                        "name": "status_codes",
-                        "entries": [
-                            {"token": "E", "label": "Editable"},
-                            {"token": "R", "label": "Read-only"},
-                        ],
-                    }
-                ]
-            },
+            extra_meta={"legend_blocks": normalized["legend_blocks"]},
         )
 
         ir = ValidationPass().apply(ir)

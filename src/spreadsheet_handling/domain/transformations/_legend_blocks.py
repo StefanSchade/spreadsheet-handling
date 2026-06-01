@@ -1,10 +1,16 @@
 """Shared reader for the ``_meta.legend_blocks`` schema.
 
-Owns the schema walk (mapping vs list form, name-resolution fallback chain,
-non-empty entries list, per-entry mapping + non-empty token validation)
-used by both ``cell_codec.scalar._legend_tokens`` and
-``compact_multiaxis._legend_groups``. Yields validated
-``(token, group_value)`` records; each caller picks what it needs.
+Owns the schema walk (name-resolution by mapping key, non-empty entries list,
+per-entry mapping + non-empty token validation) used by both
+``cell_codec.scalar._legend_tokens`` and ``compact_multiaxis._legend_groups``.
+Yields validated ``(token, group_value)`` records; each caller picks what it
+needs.
+
+Canonical ``_meta.legend_blocks`` is mapping form only. External list-form
+authoring is normalized once at the ``domain.ingress`` boundary
+(``FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5``); this reader therefore
+resolves a block only by mapping key and does not carry a second list-shape
+compatibility surface.
 
 This module is private to the transformations layer. It exists only to
 remove the duplicated schema walk; it does not define a public legend-block
@@ -35,19 +41,7 @@ def _read_legend_block(
             "but _meta.legend_blocks is missing"
         )
     raw = meta.get("legend_blocks")
-    if isinstance(raw, Mapping):
-        spec = raw.get(legend_name)
-    elif isinstance(raw, list):
-        spec = next(
-            (
-                item for index, item in enumerate(raw, start=1)
-                if isinstance(item, Mapping)
-                and str(item.get("name") or item.get("id") or f"legend_{index}") == legend_name
-            ),
-            None,
-        )
-    else:
-        spec = None
+    spec = raw.get(legend_name) if isinstance(raw, Mapping) else None
 
     if not isinstance(spec, Mapping):
         raise KeyError(

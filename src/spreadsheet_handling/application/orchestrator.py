@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, Mapping, TypeAlias
 
 import logging
 
+from ..domain.ingress import run_domain_ingress
 from ..domain.pipeline_cleanup import execute_final_domain_cleanup
 from ..io_backends.router import get_loader, get_saver
 from ..pipeline.execution import run_pipeline
@@ -100,6 +101,15 @@ def orchestrate(
 
     log.info("orchestrate: loading input kind=%s path=%s", inp.kind, inp.path)
     frames = _load_frames(inp, header_levels=header_levels)
+
+    # Domain ingress: canonicalize externally authored _meta (e.g. Legend
+    # Blocks list-form authoring sugar) into its single downstream shape the
+    # moment frames enter the domain, before the first configured step. Every
+    # router-backed input kind converges here. Like the persistence boundary
+    # below, this is part of the orchestrator's macro flow, not a configurable
+    # pipeline step; it is not registered and cannot be built from YAML. See
+    # src/spreadsheet_handling/domain/ingress/coordinator.py.
+    frames = run_domain_ingress(frames)
 
     if steps:
         step_list = list(steps)

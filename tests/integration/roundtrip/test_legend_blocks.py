@@ -11,6 +11,7 @@ import copy
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.domain.ingress import run_domain_ingress
 from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook as parse_ods_workbook
 from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
 from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
@@ -120,18 +121,26 @@ def _find_key(node, key) -> bool:
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 def test_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
-    """The workbook-embedded carrier keeps ``resolved``; the structured sidecar
-    projection drops it and never carries ``__legend_blocks``."""
+    """Canonical workbook readback no longer exposes ``resolved``; the
+    structured sidecar projection also drops it and never carries
+    ``__legend_blocks``.
+
+    FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5 removed the carrier-derived
+    ``resolved`` leak (LB-2): parsers still consume it to classify legend
+    surfaces, but ``workbookir_to_frames`` strips it before returning canonical
+    Frames, so it never re-enters canonical ``_meta``.
+    """
     xlsx = tmp_path / "legend.xlsx"
     ExcelBackend().write_multi(_frames_with_legend(), str(xlsx))
 
     back = ExcelBackend().read_multi(str(xlsx), header_levels=1)
     back_meta = back["_meta"]
 
-    # Carrier readback characterization: resolved is present (workbook carrier),
-    # and the read-path-only __legend_blocks hint does not propagate to meta.
-    assert _find_key(back_meta["legend_blocks"], "resolved")
+    # Canonical readback: resolved is stripped after classification, and the
+    # read-path-only __legend_blocks hint does not propagate to meta.
+    assert not _find_key(back_meta["legend_blocks"], "resolved")
     assert not _find_key(back_meta, "__legend_blocks")
 
     # Structured sidecar projection: resolved stripped, no dunder hint, intent kept.
@@ -172,6 +181,7 @@ def test_legend_classification_is_load_bearing_not_dunder_hint(tmp_path):
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 def test_second_roundtrip_rebuilds_legend_from_config_source(tmp_path):
     """Forward -> reverse -> forward again rebuilds the legend (entries and a
     freshly computed ``resolved``) from the config-backed source, with no
@@ -197,17 +207,22 @@ def test_second_roundtrip_rebuilds_legend_from_config_source(tmp_path):
 
     ir2 = parse_workbook(xlsx2)
     sheet2 = ir2.sheets["product_matrix"]
+    # Classification is load-bearing: the parser could only classify the legend
+    # table because the composer produced a fresh ``resolved`` on the second
+    # pass, even though the input sidecar had none.
     assert [t.kind for t in sheet2.tables] == ["data", "legend"]
     # Legend table rebuilt from entries.
     assert sheet2.tables[1].headers == ["Token", "Meaning", "Group"]
     assert sheet2.tables[1].data[1] == ["E-R-K", "Capital-path recalculation", "input"]
 
-    # resolved is re-derived on the second pass, even though the input had none.
+    # Canonical readback still does not expose resolved (stripped after
+    # classification), even though it was freshly produced for the carrier.
     back2 = ExcelBackend().read_multi(str(xlsx2), header_levels=1)
-    assert _find_key(back2["_meta"]["legend_blocks"], "resolved")
+    assert not _find_key(back2["_meta"]["legend_blocks"], "resolved")
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 def test_ods_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
     """ODS parity for the Slice B/C characterization: the legend is classified
     (not payload), the workbook carrier keeps ``resolved``, the structured
@@ -225,9 +240,10 @@ def test_ods_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
     back = OdsBackend().read_multi(str(ods), header_levels=1)
     back_meta = back["_meta"]
 
-    # Legend does not become a payload frame; dunder hint does not reach meta.
+    # Legend does not become a payload frame; dunder hint does not reach meta;
+    # resolved is stripped from canonical readback (ODS parity with XLSX).
     assert set(back) == {"_meta", "product_matrix"}
-    assert _find_key(back_meta["legend_blocks"], "resolved")
+    assert not _find_key(back_meta["legend_blocks"], "resolved")
     assert not _find_key(back_meta, "__legend_blocks")
 
     # Structured sidecar projection: resolved stripped, no dunder hint, intent kept.
@@ -238,3 +254,97 @@ def test_ods_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
     assert block["title"] == "Status Codes"
     assert block["placement"]["target"] == "product_matrix"
     assert [e["token"] for e in block["entries"]] == ["E", "E-R-K", "x"]
+
+
+# ---------------------------------------------------------------------------
+# FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5 -- own-sheet exclusion (LB-4)
+# and list-form authoring parity through domain ingress
+# ---------------------------------------------------------------------------
+
+
+def _frames_with_own_sheet_legend() -> dict:
+    """Default-placement legend (no target/sheet) -> lands on its own sheet."""
+    return {
+        "data": pd.DataFrame({"id": [1], "code": ["A"]}),
+        "_meta": {
+            "legend_blocks": {
+                "L": {
+                    "title": "Codes",
+                    "entries": [{"token": "A", "label": "Active"}],
+                }
+            }
+        },
+    }
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_xlsx_own_sheet_legend_is_not_a_payload_frame(tmp_path):
+    xlsx = tmp_path / "own.xlsx"
+    ExcelBackend().write_multi(_frames_with_own_sheet_legend(), str(xlsx))
+    back = ExcelBackend().read_multi(str(xlsx), header_levels=1)
+    # The default-placement legend sheet does not return as a payload frame.
+    assert set(back) == {"_meta", "data"}
+    assert list(back["data"].columns) == ["id", "code"]
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_ods_own_sheet_legend_is_not_a_payload_frame(tmp_path):
+    ods = tmp_path / "own.ods"
+    OdsBackend().write_multi(_frames_with_own_sheet_legend(), str(ods))
+    back = OdsBackend().read_multi(str(ods), header_levels=1)
+    assert set(back) == {"_meta", "data"}
+    assert list(back["data"].columns) == ["id", "code"]
+
+
+def _list_authored_frames() -> dict:
+    """List-form authoring sugar, normalized once via domain ingress."""
+    frames = {
+        "product_matrix": pd.DataFrame({"feature": ["currency"], "FZ-AD": ["E"]}),
+        "_meta": {
+            "legend_blocks": [
+                {
+                    "name": "status_codes",
+                    "title": "Status Codes",
+                    "placement": {
+                        "sheet": "product_matrix",
+                        "anchor": "right_of_table",
+                        "target": "product_matrix",
+                    },
+                    "entries": [{"token": "E", "label": "Editable", "group": "input"}],
+                }
+            ]
+        },
+    }
+    return run_domain_ingress(frames)
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+@pytest.mark.parametrize(
+    "backend, parser",
+    [
+        (ExcelBackend, parse_workbook),
+        (OdsBackend, parse_ods_workbook),
+    ],
+    ids=["xlsx", "ods"],
+)
+def test_list_authored_legend_roundtrips_as_mapping_form(tmp_path, backend, parser):
+    # End-to-end parity: list-form authoring -> ingress -> render classifies
+    # the legend identically on both carriers, and canonical readback returns
+    # mapping form without resolved and without a legend payload frame.
+    frames = _list_authored_frames()
+    assert isinstance(frames["_meta"]["legend_blocks"], dict)  # normalized at ingress
+
+    ext = "xlsx" if backend is ExcelBackend else "ods"
+    path = tmp_path / f"legend.{ext}"
+    backend().write_multi(frames, str(path))
+
+    ir = parser(path)
+    sheet = ir.sheets["product_matrix"]
+    assert [t.kind for t in sheet.tables] == ["data", "legend"]
+
+    back = backend().read_multi(str(path), header_levels=1)
+    assert set(back) == {"_meta", "product_matrix"}
+    blocks = back["_meta"]["legend_blocks"]
+    assert isinstance(blocks, dict)
+    assert set(blocks) == {"status_codes"}
+    assert not _find_key(blocks, "resolved")

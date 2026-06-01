@@ -118,12 +118,39 @@ def _hidden_meta_to_frames_meta(meta_sh: Any) -> dict[str, Any] | None:
     return canonicalize_workbook_meta(kv)
 
 
+def _strip_legend_resolved(meta: dict[str, Any]) -> dict[str, Any]:
+    """Drop the render-derived ``legend_blocks[*].resolved`` Resolution facet.
+
+    Parsers consume ``resolved`` from the framework-owned workbook carrier to
+    classify legend tables (``TableBlock.kind == "legend"``). That
+    classification is already applied to the ``WorkbookIR`` by the time this
+    projection runs, so canonical readback metadata must not re-expose the
+    carrier-derived coordinates as if they were durable domain Intent. A later
+    render recomputes ``resolved`` fresh. See
+    ``FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5``.
+    """
+    legend_blocks = meta.get("legend_blocks")
+    if not isinstance(legend_blocks, Mapping):
+        return meta
+    stripped = {
+        name: ({k: v for k, v in block.items() if k != "resolved"}
+               if isinstance(block, Mapping) else block)
+        for name, block in legend_blocks.items()
+    }
+    result = dict(meta)
+    result["legend_blocks"] = stripped
+    return result
+
+
 def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
     """
     Convert a :class:`WorkbookIR` into a frames dict suitable for the pipeline.
 
-    Each visible sheet's first table becomes a DataFrame.
-    Hidden ``_meta`` sheet is returned as ``frames["_meta"]`` (plain dict).
+    Each visible sheet's first table becomes a DataFrame, unless that selected
+    table is a classified legend surface (``kind == "legend"``) — a
+    default-placement legend on its own sheet must not round-trip as a payload
+    frame. Hidden ``_meta`` sheet is returned as ``frames["_meta"]`` (plain
+    dict) with the render-local ``legend_blocks[*].resolved`` facet stripped.
     """
     import pandas as pd
 
@@ -134,6 +161,12 @@ def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
             frames[name] = pd.DataFrame()
             continue
         tbl = sh.tables[0]
+        if tbl.kind == "legend":
+            # Feature-owned projection: a legend is support material, never a
+            # payload frame. Default own-sheet placement therefore yields no
+            # extra payload frame (LB-4). Data-sheet placement is unaffected:
+            # the data table is tables[0] and the colocated legend is tables[1].
+            continue
         data = tbl.data if tbl.data is not None else []
 
         if tbl.header_rows > 1 and tbl.headers and " / " in tbl.headers[0]:
@@ -150,7 +183,7 @@ def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
     if meta_sh:
         meta = _hidden_meta_to_frames_meta(meta_sh)
         if meta is not None:
-            frames["_meta"] = meta
+            frames["_meta"] = _strip_legend_resolved(meta)
 
     return frames
 
