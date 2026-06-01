@@ -79,6 +79,29 @@ def test_run_cli_exception_verbose(monkeypatch, capsys):
     assert "Traceback" in err
 
 
+def test_run_cli_exception_verbose_long_form(monkeypatch, capsys):
+    """`--verbose --verbose` matches the argparse count semantics -> Traceback"""
+    argv = ["prog", "--verbose", "--verbose"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as e:
+        run_cli(main_exception)
+    assert e.value.code == 1
+    out, err = capsys.readouterr()
+    assert "Traceback" in err
+
+
+def test_run_cli_exception_single_verbose_stays_short(monkeypatch, capsys):
+    """One `--verbose` is below the traceback threshold (>= 2)."""
+    argv = ["prog", "--verbose"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as e:
+        run_cli(main_exception)
+    assert e.value.code == 1
+    out, err = capsys.readouterr()
+    assert "Error: kaputt" in err
+    assert "Traceback" not in err
+
+
 def test_run_cli_interrupt_short(monkeypatch, capsys):
     """KeyboardInterrupt without --debug -> short interrupt message, exit 130"""
     argv = ["prog"]
