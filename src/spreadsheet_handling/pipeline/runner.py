@@ -3,50 +3,57 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..io_backends.router import get_loader, get_saver
 from .build import build_steps_from_config
 from .config import AppConfig
-from .execution import run_pipeline as _run_pipeline
 
 
-def run_app(app: AppConfig, run_id: str | None = None, **_: object) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+def run_app(
+    app: AppConfig,
+    run_id: str | None = None,
+    **_: object,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
-    Run I/O and optional pipeline steps.
-    Returns: (frames, meta, issues)
+    Run I/O and optional pipeline steps via the orchestrator.
+
+    Thin compatibility adapter over :func:`spreadsheet_handling.application.
+    orchestrator.orchestrate`. ``AppConfig`` is unpacked into the
+    orchestrator's input/output/steps surface so that ``run_app`` keeps a
+    single source of truth for load/step/save semantics -- including the
+    persistence boundary that projects runtime ``_meta`` onto its
+    persistable contract immediately before save.
+
+    Returns: ``(frames, meta, issues)``.
     """
+    # Local import: ``application.orchestrator`` pulls in modules that
+    # transitively import ``pipeline`` at package load, which would close a
+    # cycle if this import happened at module top.
+    from ..application.orchestrator import orchestrate
+
     io = app.io
 
-    # --- Select input (use the first named input) ---
     if not io.inputs:
         raise SystemExit("No inputs configured.")
-    inp_name, inp = next(iter(io.inputs.items()))
-    try:
-        loader = get_loader(inp.kind)
-    except ValueError as exc:
-        raise ValueError(f"Unsupported input kind: {inp.kind!r}") from exc
+    _inp_name, inp = next(iter(io.inputs.items()))
 
-    # Loaders may accept 'options'; backends handle None themselves.
-    frames = loader(
-        inp.path,
-        options=getattr(inp, "options", None),
-        header_levels=getattr(inp, "header_levels", 1),
-    )
-
-    # --- Bind steps (may be empty) ---
     step_specs = app.pipeline or []
     bound_steps = build_steps_from_config(step_specs) if step_specs else []
 
-    # --- Execute only when steps are present ---
-    if bound_steps:
-        frames = _run_pipeline(frames, bound_steps)
-
-    # --- Write output ---
     out = io.output
-    try:
-        saver = get_saver(out.kind)
-    except ValueError as exc:
-        raise ValueError(f"Unsupported output kind: {out.kind!r}") from exc
-    saver(frames, out.path, options=getattr(out, "options", None))
+
+    frames = orchestrate(
+        input={
+            "kind": inp.kind,
+            "path": inp.path,
+            "options": getattr(inp, "options", None),
+        },
+        output={
+            "kind": out.kind,
+            "path": out.path,
+            "options": getattr(out, "options", None),
+        },
+        steps=bound_steps or None,
+        header_levels=getattr(inp, "header_levels", 1),
+    )
 
     # Meta/issues are still empty; keep the API stable.
     return frames, {}, []

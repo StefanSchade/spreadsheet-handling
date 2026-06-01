@@ -149,6 +149,48 @@ def test_persistence_boundary_runs_for_spreadsheet_output(tmp_path: Path) -> Non
     assert "relations" not in fk, "spreadsheet path must not carry the runtime relation either"
 
 
+def test_run_app_routes_through_persistence_boundary(tmp_path: Path) -> None:
+    """``run_app`` is a thin adapter over ``orchestrate`` and therefore
+    inherits the persistence boundary. A runtime-produced FK-helper v2
+    relation in the input ``_meta.yaml`` must not survive into the
+    persisted sidecar even when the entry point is ``run_app`` rather than
+    ``orchestrate`` directly. Guards against accidental reintroduction of
+    a second load/step/save path.
+    """
+    from spreadsheet_handling.pipeline.config import AppConfig, IOConfig, IOEndpoint
+    from spreadsheet_handling.pipeline.runner import run_app
+
+    in_dir = _write_input_dir(
+        tmp_path,
+        {
+            "version": "1.0",
+            "helper_policies": {
+                "fk": {
+                    "schema_version": 2,
+                    "relations": [_runtime_relation("groups")],
+                },
+            },
+            "derived": {"sheets": {"groups": {"helper_columns": []}}},
+        },
+    )
+    out_dir = tmp_path / "out"
+    app = AppConfig(
+        io=IOConfig(
+            inputs={"primary": IOEndpoint(kind="json_dir", path=str(in_dir))},
+            output=IOEndpoint(kind="json_dir", path=str(out_dir)),
+        ),
+    )
+
+    frames, _meta, _issues = run_app(app)
+
+    persisted = yaml.safe_load((out_dir / "_meta.yaml").read_text(encoding="utf-8"))
+    assert "derived" not in persisted
+    assert "relations" not in persisted["helper_policies"]["fk"]
+    # Returned frames also reflect the projected view, matching the
+    # behaviour of orchestrate().
+    assert "derived" not in frames["_meta"]
+
+
 def test_repeated_run_does_not_replay_stale_relation(tmp_path: Path) -> None:
     """Synthetic regression for the Dino-shaped repeated-run contamination.
 
