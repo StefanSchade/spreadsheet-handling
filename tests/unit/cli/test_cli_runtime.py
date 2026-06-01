@@ -18,6 +18,10 @@ def main_exception(argv=None) -> int:
     """simulates uncaught exception in main"""
     raise ValueError("kaputt")
 
+def main_interrupt(argv=None) -> int:
+    """simulates KeyboardInterrupt during main (Ctrl+C path)"""
+    raise KeyboardInterrupt()
+
 # ---------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------
@@ -73,3 +77,28 @@ def test_run_cli_exception_verbose(monkeypatch, capsys):
     assert e.value.code == 1
     out, err = capsys.readouterr()
     assert "Traceback" in err
+
+
+def test_run_cli_interrupt_short(monkeypatch, capsys):
+    """KeyboardInterrupt without --debug -> short interrupt message, exit 130"""
+    argv = ["prog"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as e:
+        run_cli(main_interrupt)
+    assert e.value.code == 130
+    out, err = capsys.readouterr()
+    assert "Interrupted by user." in err
+    assert "Traceback" not in err
+    assert "Error:" not in err
+
+
+def test_run_cli_interrupt_debug(monkeypatch, capsys):
+    """KeyboardInterrupt with --debug -> full Traceback, exit 130"""
+    argv = ["prog", "--debug"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as e:
+        run_cli(main_interrupt)
+    assert e.value.code == 130
+    out, err = capsys.readouterr()
+    assert "Traceback" in err
+    assert "KeyboardInterrupt" in err
