@@ -1,0 +1,617 @@
+= Adoption 003 – Home-Lab Activity Journal
+:toc:
+:toclevels: 3
+
+== Purpose
+
+This document captures requirements considerations for a home-lab activity
+journal use case.
+
+The objective is to explore whether the spreadsheet-handling framework can
+support an append-dominant, temporal data model where the central artifact
+is a chronological record of actions, and entities (devices, networks,
+zones, storage tiers) act as filter dimensions over that record.
+
+The use case is intentionally distinct from prior adoption cases:
+
+* Adoption 001 (Worldbuilding) validated multi-view projection over a
+  canonical tuple relation, on a hobby domain.
+* Adoption 002 (Generic Loan Configuration) explores classification matrices
+  driving conditional follow-up projections, on a business domain.
+* Adoption 003 (this document) explores temporal append-dominant records
+  with lazy entity emergence and multi-entity-typed filtering, on a
+  technical inventory domain.
+
+== Status
+
+* Early adoption exploration.
+* Not an implementation plan.
+* Not a committed roadmap.
+* Input for the next consumer-validation slice after Adoption 002.
+
+== Relationship to Prior Adoptions
+
+The core architectural insight from Adoption 001 was:
+
+[source,text]
+----
+One canonical tuple relation
+↓
+Multiple specialized maintenance views
+----
+
+This adoption case is a direct instance of that pattern with three new
+dimensions the framework has not yet validated:
+
+[cols="1,3"]
+|===
+| Dimension | Why it is new
+
+| Temporal data
+| Records carry a date axis, and primary views are chronological or temporal-window slices. Prior adoptions worked on essentially time-invariant canonical models.
+
+| Lazy entity emergence
+| Event records reference entities (device IDs, network IDs, zone IDs) before those entities exist in a canonical entity registry. Soft references must be tolerated and surfaced for opportunistic canonicalization, not rejected.
+
+| Append-dominant workflow
+| New events are added far more often than existing events are edited. Roundtrip semantics must remain correct, but the primary user motion is append, not edit. Prior adoptions validated edit-heavy roundtrips.
+|===
+
+== Central Observation
+
+The primary artifact is not a static inventory.
+
+The primary artifact is a chronological record of actions.
+
+The inventory exists, but secondarily — as a set of dimensions over which
+the chronological record is filtered, sliced, and aggregated.
+
+The central pattern can be summarized as:
+
+[source,text]
+----
+
+Chronological Record (events over time)
+↓
+Filter Projections by Entity / Type / Kind / Time Window
+↓
+Specialized Maintenance Views
+↓
+Controlled Append + Occasional Correction
+↓
+Chronological Record
+---------------------
+----
+
+== Existing Surface
+
+The home-lab repository already maintains the journal as an AsciiDoc table
+at `doc/runbooks/aktivitaetslog.adoc`. The current shape is a four-column
+table:
+
+[source,text]
+----
+
+| Datum | Modul | Aktion | Runbook / Referenz |
+--------------------------------------------------
+----
+
+Filtering is performed via `grep "<entity>" aktivitaetslog.adoc`.
+
+This works for the most common case (filter by a single named entity that
+appears verbatim in the `Modul` column) but breaks several real-world
+needs (see next section).
+
+The discipline of recording entries is already established. The expensive
+half of adoption — building the habit — does not need to be created.
+
+The journal is referenced by the project Claude.md as:
+
+[source,text]
+----
+
+Jede abgeschlossene Aktion wird im Aktivitaetslog eingetragen.
+Zustandsbild wird bei jeder Aktion mitaktualisiert.
+----
+
+== What Breaks Filtering Today
+
+Three categories of friction:
+
+=== Mixed levels in the Modul column
+
+The `Modul` column mixes three semantic levels:
+
+[cols="1,2"]
+|===
+| Level | Example entries
+
+| Entity instances
+| `nas-02`, `cli-02`, `srv-12`
+| Entity classes
+| `Switches`, `Firewall`, `WLAN`, `Shelly Plugs`
+| Activity categories
+| `Dokumentation`
+|===
+
+Filtering for `srv-12` reliably finds entries labeled with that instance
+but misses entries labeled with the class — e.g. an entry "Alle Switches
+auf feste IPs konfiguriert" implicitly touched `sw-core-01`, `sw-agg-01`,
+`sw-agg-02`, `sw-agg-03`, and `sw-agg-04`, none of which are named in the
+row.
+
+=== Single-touch only
+
+Each row carries exactly one `Modul`. Multi-touch events — VLAN migration
+across multiple switches plus affected servers, or shutdown procedure
+exercises touching the USV plus protected devices — either lose
+granularity (rolled up under a vague class) or must be split into several
+rows that lose the fact that they belong to one action.
+
+=== Inconsistent granularity
+
+The same kind of event may be logged at different levels in different
+weeks. There is no schema enforcing consistency, and no derivation that
+could project a class-level entry into its constituent instance-level
+references.
+
+== Canonical Modeling Pattern
+
+The proposed canonical form is a tuple relation:
+
+[source,text]
+----
+
+event_id × entity_id × role × context
+--------------------------------------
+----
+
+Equivalent to the worldbuilding pattern:
+
+[source,text]
+----
+
+story_id × character_id × facet × value
+----
+
+but with `event_id` carrying a temporal axis and `entity_id` ranging over
+heterogeneous entity types.
+
+This is the same projection-centric architecture validated in Adoption 001,
+applied to a temporal append-dominant case.
+
+== Core Entities
+
+=== Events
+
+Events represent recorded actions or observations.
+
+Typical attributes:
+
+* `event_id` (stable identifier; date-based or sequential)
+* `date` (the date the action occurred or was recorded)
+* `summary` (one-line description)
+* `body` (optional extended description)
+* `kind` (setup / config / maintenance / observation / decision / ...)
+* `runbook_ref` (optional pointer into runbook tree)
+* `author` (optional)
+
+Events should be immutable once recorded. Corrections happen as new events
+that explicitly reference and amend prior events, not as in-place edits.
+Practical roundtrip semantics may relax this for trivial fixes (typo in
+summary).
+
+=== Entity Touches
+
+Each event touches zero or more entities. The touch is the bridge record
+that makes the model n-to-m.
+
+Typical attributes per touch:
+
+* `event_id` (FK)
+* `entity_id` (string; may reference a canonical entity or be a soft
+  reference that has not been canonicalized yet)
+* `entity_type` (device / switch / network / vlan / zone / tier / power /
+  ...; closed or open vocabulary, see open questions)
+* `role` (primary / secondary / affected / observed / ...; closed or open
+  vocabulary, see open questions)
+
+An event with zero touches is allowed (pure observation, documentation work
+with no specific target).
+
+=== Entity Registry (optional, lightweight)
+
+A separate flat registry of canonical entities, kept deliberately minimal:
+
+* `entity_id`
+* `entity_type`
+* `label` (human-readable name)
+* `aliases` (optional, for label drift)
+* `superseded_by` (optional, for renames)
+
+The registry is *not* the full home-lab inventory. It is a thin lookup
+that tells projections what to suggest when a user filters by entity. The
+full inventory (CPU, RAM, NIC list, power circuit membership, zone
+assignment) remains a separate concern that may be canonicalized later,
+opportunistically driven by view enrichment needs.
+
+== Event Identity and Immutability
+
+Event identifiers must be stable across:
+
+* Renames of touched entities.
+* Restructuring of runbook references.
+* Edits to the journal that are not the event itself.
+
+Practical implications:
+
+* Event IDs should not embed entity references.
+* A date-based identifier scheme (`EV-YYYY-MM-DD-NNN`) is human-meaningful
+  but must accommodate corrections that surface long after the original
+  date.
+* A pure sequential identifier scheme (`EV-000123`) avoids date-collision
+  edge cases but loses scanability.
+* Open question: which scheme, or whether both are acceptable.
+
+Corrections to historical events should preferably be modeled as new events
+that explicitly reference the prior event, mirroring the
+review-area + semantic-diff + promotion pattern already established for
+roundtrips in Adoption 001.
+
+== Lazy Entity Emergence
+
+A key requirement for this adoption case: an event may reference an entity
+that does not yet exist in the canonical entity registry.
+
+Example:
+
+[source,text]
+----
+
+EV-2026-03-04-002
+date:    2026-03-04
+summary: "BA-lastige Modellierung reduziert, Branch fruehe_planung erstellt"
+touches:
+  - { entity: "branch:fruehe_planung", type: "git_branch", role: "primary" }
+----
+
+`branch:fruehe_planung` is not in the entity registry. That is acceptable.
+The framework should:
+
+* Accept the touch without rejecting the event.
+* Surface dangling references as a validation report, not as a hard error.
+* Allow opportunistic canonicalization: when the same dangling reference
+  recurs and an entity registry entry is created for it, historical events
+  are retroactively linked simply by virtue of carrying the same
+  `entity_id`.
+
+This is a new framework stress-test. Adoption 001 and 002 worked with
+closed canonical models. Lazy emergence is a property of real adoption
+workflows that has not yet been validated.
+
+== Maintenance Views
+
+The classification of an event by entity touches and kind determines its
+membership in multiple maintenance views.
+
+=== Chronological Full Log
+
+Default presentation, sorted by date. Optionally filtered by date range.
+
+=== Per-Entity View
+
+For a given `entity_id`, the chronological sequence of events that touched
+it. The primary use case: "What has happened to nas-02?"
+
+A class-level filter (`entity_type == "device"`) yields all device-touching
+events. Combined with the entity registry, the user can also filter on
+*derived* attributes if the entity registry carries them ("all devices in
+zone Blast Area") — but only if the registry has been canonicalized to
+that depth.
+
+=== Per-Kind View
+
+Filter by `kind`. Examples:
+
+* `setup` — all installation and initial-configuration events.
+* `maintenance` — all recurring upkeep events.
+* `observation` — observations not tied to a configuration change.
+
+=== Per-Zone View
+
+Requires entity registry enrichment with zone assignments. Once present,
+"every event in Blast Area" becomes a derivable view.
+
+=== Recent Activity Slice
+
+Last N days, last N events, or events since a watermark — useful as a
+review-ready slice for periodic reflection.
+
+=== Decision Trail
+
+Filter by `kind == "decision"` plus optionally entity-type, to reconstruct
+why a configuration is the way it is. Complementary to ADRs (which are
+formal decisions); journal decisions are smaller, context-bound choices.
+
+== Visibility Versus Applicability
+
+Analogous to Adoption 002, the framework should distinguish:
+
+* Events with canonical entity references — fully filterable.
+* Events with soft / dangling entity references — visible in chronological
+  views, surfaced in validation reports as canonicalization candidates,
+  not hidden.
+* Events with no entity touches — visible in chronological and kind views,
+  excluded from per-entity views by construction.
+
+Hiding dangling references would defeat the purpose of lazy entity
+emergence.
+
+== Reimport Safety
+
+Reimport safety is *critical* for this case in a way it is not for the
+prior adoption cases.
+
+The journal is the single record of historical action. Accidental
+overwrite during a roundtrip would destroy memory that cannot be
+reconstructed from the codebase. The reimport-safety pattern established
+in Adoption 001 should apply with one strengthening:
+
+[source,text]
+----
+
+Canonical Journal (JSON)
+↓
+Workbook Export (editable view)
+↓
+User Edit / Append
+↓
+Reimport Into Review Area
+↓
+Semantic Diff against Canonical
+↓
+Explicit Promotion (append-only diffs auto-promotable, edits require ack)
+↓
+Canonical Journal
+--------------------------
+----
+
+The strengthening: distinguish *append-only* semantic diffs from
+*edit-in-place* diffs. Append-only diffs (new events added) can be
+auto-promoted under a clear policy; edit-in-place diffs (existing event
+modified) require explicit acknowledgement. This protects the
+append-dominant workflow from accidental rewrite.
+
+== State Reconstruction (Optional Advanced View)
+
+State at time `t` could in principle be derived from `fold(events ≤ t,
+initial_state)`. The home-lab project already has a parallel
+representation of state in `doc/runbooks/zustandsbild.adoc` and
+`doc/runbooks/model/states.json`.
+
+For the first slice of this adoption, state reconstruction is *not* a
+requirement. The journal and the state snapshots coexist; cross-reference
+is by entity_id.
+
+A future capability could derive state checkpoints from the journal —
+useful for audit and for replay reasoning ("what did the lab look like on
+2026-02-15?"). This is out of scope for the initial considerations but
+should not be foreclosed by the data model.
+
+== Append-Dominant Workflow
+
+Prior adoptions validated workflows in which the user opens the workbook,
+makes substantial edits across many cells, and reimports. This adoption
+case stresses a different motion:
+
+* The user adds *one or two new rows* at the end of the events sheet,
+  reflecting actions taken that day.
+* Existing rows are touched only rarely, and usually as corrections.
+* The roundtrip cost should be proportional to the size of the change,
+  not to the size of the journal.
+
+Implications for framework adoption:
+
+* Performance considerations differ from edit-heavy cases. A 10k-event
+  journal should roundtrip cheaply when only one row is added.
+* Workbook UX should make the *next-row append* obvious and frictionless.
+* Validation should give immediate feedback on the new row without
+  re-validating the entire history.
+
+== Inventory Canonicalization as Opportunistic Follow-On
+
+The home-lab repository contains substantial inventory data (devices,
+NICs, switch ports, IPs, power circuits, storage tiers, zones) currently
+maintained as AsciiDoc tables and prose. Full canonicalization of that
+inventory is *not* a prerequisite for this adoption case.
+
+The natural sequence:
+
+1. The journal becomes canonical with soft entity references.
+2. Some entities accumulate enough touches that a per-entity view becomes
+   valuable.
+3. To enrich the view (e.g. show the device's zone and tier alongside its
+   event history), the entity registry grows to include that attribute.
+4. Eventually a recurring view need pulls the full inventory into the
+   canonical model — but driven by demand, not by upfront design.
+
+This staging is the right order for a single-developer adoption. It also
+exposes the framework to a realistic emergent-canonicalization workflow.
+
+== Workbook UX
+
+The workbook should support:
+
+* A primary `events` sheet, append-friendly, with one row per event.
+* A `touches` sheet (or an embedded list per row, depending on
+  presentation choice) that captures the n-to-m bridge to entities.
+* A read-only `entities` sheet showing the current registry, for lookup
+  during entry.
+* Per-entity filter sheets generated by the pipeline (one per recurring
+  filter, or one parametric sheet).
+
+Visual cues:
+
+* Soft-reference entity IDs (not in registry) should be visually marked
+  in the workbook — possibly an inline warning style.
+* The most-recent events should be visually distinguished from older
+  ones to support append-focused workflow.
+* Multi-touch events should render their touches compactly to avoid
+  scrolling.
+
+Open question: whether the touches list is presented as compact-cell
+encoding (one cell, encoded list) or as a separate sheet linked by
+`event_id`. Both fit existing framework primitives. Compact-cell is
+faster for append; separate-sheet is clearer for multi-attribute touches.
+
+== Validation
+
+Two validation passes are valuable:
+
+=== Hard constraints
+
+* `event_id` is unique.
+* `event_id` matches the declared scheme (date-based or sequential).
+* Required fields are present.
+* `date` parses as ISO-8601.
+
+Failures here are correctness errors and should block promotion.
+
+=== Soft consistency report
+
+* Dangling entity references (touches that name an `entity_id` not in
+  the registry).
+* Entity types in touches that are not in the registered type vocabulary
+  (if a closed vocabulary is chosen).
+* Possible duplicates (same date, same summary, no distinguishing
+  touches).
+
+These should produce a report, not block promotion, to preserve lazy
+emergence.
+
+== Candidate Framework Capabilities Exercised
+
+This adoption case exercises:
+
+* Tuple-relation canonical modeling with temporal axis.
+* Multi-view projection over a single canonical relation.
+* Compact-cell encoding (for touches list, if chosen).
+* Soft reference tolerance and dangling-reference reporting (new).
+* Append-dominant roundtrip semantics (new).
+* Distinction between append-only and edit-in-place semantic diffs (new).
+* Lookup helpers (entity registry).
+* Workbook styling for soft references and recency cues.
+* Plugin-driven custom views (per-entity filter sheets).
+* Validation as report rather than blocking gate (new emphasis).
+
+== New Capability Stress-Tests
+
+Three areas this case stresses that prior adoptions did not:
+
+[cols="1,3"]
+|===
+| Area | Stress test
+
+| Temporal projection
+| Per-entity views must order events chronologically. Time-window filters must compose with entity filters. Recent-activity slices need a stable "now" semantics.
+
+| Lazy emergence
+| The framework must tolerate references that are not yet canonical, surface them for opportunistic canonicalization, and not reject roundtrips that contain them.
+
+| Append economics
+| One-row appends should not require full-journal revalidation. Append-only semantic diffs should be auto-promotable; edit-in-place requires explicit ack.
+|===
+
+== Open Questions
+
+=== Event Identity
+
+* Date-based ID (`EV-YYYY-MM-DD-NNN`) versus pure sequential
+  (`EV-000123`) versus both side by side?
+* How to handle backdated events (an action recorded weeks later)?
+
+=== Entity Type Vocabulary
+
+* Closed vocabulary (`device`, `switch`, `network`, `vlan`, `zone`,
+  `tier`, `power`, `git_branch`, `decision`, ...) or open / extensible
+  vocabulary?
+* If closed, where is the vocabulary maintained — alongside the entity
+  registry or as a separate type registry?
+
+=== Touch Role Vocabulary
+
+* Closed (`primary`, `secondary`, `affected`, `observed`) or open?
+* Is `role` even necessary for the first slice, or is the bare existence
+  of a touch sufficient?
+
+=== Corrections and Amendments
+
+* In-place edit of a logged event versus an explicit amendment-event
+  pointing to the prior event?
+* Trivial-typo policy: are typo fixes promotable as edit-in-place under a
+  lighter rule than substantive edits?
+
+=== Multi-Day Events
+
+* A burn-in test ran for several days. Is that one event with a
+  `start_date` and `end_date`, or a sequence of daily events, or a
+  bracket event with intermediate observation events?
+
+=== Granularity
+
+* When is an action one event versus several? A pull request that
+  configured five switches: one event or five?
+* Guidance for the user, not framework enforcement — but the model must
+  not force one shape over the other.
+
+=== Workbook Encoding of Touches
+
+* Compact-cell encoding (one cell per event, list of touches inside) or
+  separate sheet keyed by `event_id`?
+* Both are framework-supported. Which serves append-dominant motion
+  better in practice?
+
+=== Validation Reporting
+
+* How prominent are dangling-reference reports — separate sheet,
+  highlight band on the events sheet, both?
+* Should the framework offer a one-click "canonicalize this dangling
+  reference" path, or is that a consumer-side plugin?
+
+=== Inventory Pull-Through
+
+* At what point does it make sense to canonicalize the device inventory
+  alongside the journal? Demand-driven, but what counts as demand?
+* Should the entity registry carry minimal attributes (id, type, label)
+  forever and rely on a separate canonical inventory model for the rest,
+  or should attributes accumulate in the registry over time?
+
+== Initial Assessment
+
+The use case appears structurally compatible with the framework and offers
+methodologically valuable stress-tests not covered by prior adoption
+cases.
+
+The primary challenges are not in canonical modeling of events themselves
+— that is a direct application of the worldbuilding tuple-relation
+pattern. The primary challenges are:
+
+* Soft-reference tolerance and lazy entity emergence.
+* Append-dominant economics.
+* Distinguishing append-only from edit-in-place semantic diffs.
+
+These are framework concerns that benefit from validation against a real,
+ongoing journal — and the home-lab repository already supplies one.
+
+The path forward is to confirm the minimal data model (events plus
+touches plus a lightweight entity registry), define the first three or
+four maintenance views (chronological, per-entity, per-kind), and run a
+small migration of the existing AsciiDoc journal as a single-developer
+adoption exercise. The detailed framework decisions can wait until that
+exercise surfaces concrete findings — mirroring the pattern of Adoption
+001.
+
+The full home-lab inventory canonicalization is explicitly *out of scope*
+for this adoption case. It may follow opportunistically, driven by the
+view enrichment needs that emerge during journal use, but it is not a
+prerequisite.
