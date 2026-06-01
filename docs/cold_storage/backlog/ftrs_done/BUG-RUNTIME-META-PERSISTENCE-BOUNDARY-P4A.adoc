@@ -1,6 +1,6 @@
 ===== BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A -- Runtime-only metadata must be pruned before persistence
 
-*Status:* Open
+*Status:* Done
 *Priority:* P4A
 *Area:* Pipeline / metadata lifecycle / persistence boundary
 
@@ -156,4 +156,90 @@ but metadata that does not belong to the roundtrip contract
 must be pruned or excluded before persistence
 at a clear pipeline boundary
 ----
+
+==== Delivery scope
+
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py` -- new
+  module providing the pure function
+  ``project_meta_to_persistable_contract(meta)``. Pruning rules:
+** top-level ``derived`` (transient runtime helper-column provenance),
+** top-level ``__*``-prefixed keys (carrier / derived-view markers),
+** ``helper_policies.fk.relations`` entries where
+   ``produced_by.step == "configure_fk_helpers"``; when no relations
+   remain the empty ``relations`` list and its paired ``schema_version``
+   are removed too. v1 per-target dicts under ``fk`` and the
+   ``lookup`` namespace are preserved.
+* `src/spreadsheet_handling/application/orchestrator.py` -- calls the
+  pure function exactly once, between the pipeline steps and the saver,
+  for every output kind. The projection is part of the macro flow, not a
+  configurable pipeline step.
+* `tests/unit/pipeline/test_persistence_boundary.py` -- 11 pure-function
+  cases: ``derived`` removed, ``__*`` removed, helper_policies
+  preservation, runtime relation pruning, empty-envelope cleanup,
+  idempotency, non-mutation, robustness to ``None`` / empty / malformed
+  input.
+* `tests/integration/pipeline/test_orchestrator_persistence_boundary.py`
+  -- 4 cases: ``json_dir`` output strips runtime relations,
+  ``orchestrate()`` returns the projected view in-process,
+  carrier-neutral behavior for spreadsheet output, and the synthetic
+  repeated-run regression that mirrors the Dino contamination shape.
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc` -- new
+  *Persistence boundary* section. Describes the orchestrator-owned
+  projection, carrier neutrality, the deliberately narrow current rule
+  set, and the deferred follow-ups.
+* `docs/developer_guide/ch06_code_conventions/01_code_conventions.adoc`
+  -- implementer rules: producers may write runtime meta, the
+  orchestrator owns persistence.
+* `docs/ai_info/agent_rules.adoc` -- agent rule prohibiting reconstruction
+  of the boundary as a consumer plugin, a YAML pipeline step, or a
+  backend special case; warns against treating ``produced_by.mode:
+  explicit`` as user-authored canonical metadata.
+* `docs/release_notes/release_notes.adoc` -- Highlight plus
+  "Spreadsheet backends and roundtrip behavior" entry.
+* `docs/backlog/FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.adoc` -- new follow-up
+  FTR for the broader FK-helper lifecycle classification.
+* `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc` -- new follow-up
+  FTR for the complete ``_meta`` inventory.
+* `docs/backlog/technical_debt.adoc` -- new debt register, opens with
+  ``TD-META-LIFECYCLE-INVENTORY`` pointing at both follow-up FTRs.
+  Linked from ``docs/arc42_guide/ch13_risks_and_technical_debt/01_intro.adoc``.
+
+==== Forensic analysis result
+
+The forensic analysis ahead of the fix isolated the carrier precisely:
+
+* The promoted ``daten/dino_insel/_meta.yaml`` contained no top-level
+  ``derived`` and no ``__*`` keys. The pre-bug-fix hypothesis that
+  ``derived`` was the primary carrier did not survive observation.
+* Single-key strip experiments against the failing export pipeline
+  showed that ``helper_policies`` was the *only* top-level key whose
+  removal restored success; the seven other keys removed by the codex
+  workaround plugin were defensive over-bereiterung.
+* Within ``helper_policies``, the v2 ``relations`` list was the sole
+  carrier: keeping ``relations + schema_version`` (with v1 entries
+  removed) reproduced the failure; keeping the v1 per-target dicts
+  (with ``relations + schema_version`` removed) restored success.
+* Per-relation isolation showed each ``relations`` entry triggers the
+  failure for its ``source_frame``. The Dino-reported ``Frame 'groups'
+  must have flat columns`` is carried by the runtime-produced relation
+  ``source_frame=groups, target_frame=places``.
+
+The narrow ``produced_by.step == configure_fk_helpers`` discriminator
+covers exactly the observed runtime-produced relations without touching
+user-authored or otherwise classified helper policy. The broader
+classification is explicitly deferred to
+``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``.
+
+==== Validation results
+
+* Pure-function suite ``tests/unit/pipeline/test_persistence_boundary.py``:
+  11 passed.
+* Integration / regression suite
+  ``tests/integration/pipeline/test_orchestrator_persistence_boundary.py``:
+  4 passed (including the synthetic repeated-run regression).
+* Full suite ``pytest tests/unit tests/integration tests/architecture``:
+  928 / 928 pass.
+* ``ruff check src/spreadsheet_handling/pipeline/persistence_boundary.py``
+  and the orchestrator: clean.
+* ``git diff --check``: clean.
 

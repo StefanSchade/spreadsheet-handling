@@ -197,3 +197,107 @@ Questions:
 
 The Ambiguity Policy treats any of these questions as "must become explicit"
 once the attribute is RuntimeConsumed or RoundtripRelevant.
+
+=== Persistence boundary
+
+The pipeline distinguishes two views of ``_meta``:
+
+* the *runtime view* -- what producers and consumers see and mutate during
+  a single pipeline execution, and
+* the *persistable contract* -- the carrier-neutral subset that may survive
+  into the next run via a workbook, a JSON / YAML / XML / CSV sidecar, or
+  any other backend.
+
+The orchestrator owns the boundary between them. Immediately before the
+saver runs, the runtime ``_meta`` is projected onto the persistable
+contract by ``pipeline/persistence_boundary.py``. The projection is part
+of the orchestrator's macro flow:
+
+[source,text]
+----
+load frames + _meta
+merge / bootstrap runtime state
+run configured pipeline steps
+project runtime meta to persistable meta contract   <-- boundary
+save output
+----
+
+==== Why this is not a normal pipeline step
+
+The persistence boundary is *not* a domain transformation. Producers and
+consumers inside the configured pipeline must continue to see the runtime
+view; the projection only happens once, at the orchestrator-owned exit. The
+projection is deliberately *not* exposed as a public YAML step, and must
+not be auto-appended as one. Consumers cannot opt out of it and do not
+need to opt into it.
+
+==== Carrier neutrality
+
+The persistable ``_meta`` contract is identical regardless of output kind.
+Spreadsheet persistence adds a rendering / layout branch on top of the
+persistable contract, but the persistable meta itself contains no
+carrier-specific assumptions:
+
+[source,text]
+----
+runtime _meta
+  -> project to persistable contract     # one rule set
+  -> save to chosen carrier
+
+spreadsheet backends additionally:
+  persistable _meta
+  -> compose render plan + layout artifacts
+  -> write hidden meta sheet + visible sheets
+----
+
+The relevant axis is *whether layout/rendering is needed*, not "structured
+carrier" vs. "spreadsheet carrier". JSON, YAML, XML, and CSV directories
+need only the persistable meta. Spreadsheets need that plus a render flow.
+The runtime ``_meta`` must reach both pathways through the same projection
+so neither pathway can drift away from the other.
+
+==== Current rules (minimal, release-near)
+
+The projection currently removes:
+
+* top-level ``derived`` -- transient runtime helper-column provenance, never
+  part of the persistable contract,
+* top-level ``__*``-prefixed keys -- carrier / derived-view markers owned by
+  IR rendering passes,
+* runtime-produced FK-helper v2 relation entries under
+  ``helper_policies.fk.relations`` whose ``produced_by.step`` field is
+  ``configure_fk_helpers``. The remainder of ``helper_policies`` (the
+  ``lookup`` namespace, v1 per-target dicts under ``fk``, and any manually
+  authored or otherwise non-runtime-produced relations) is preserved.
+
+This is a deliberately narrow set. The intent is to break the concrete
+``BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`` repeated-run contamination
+that the worldbuilding adoption surfaced, without committing the project to
+a complete lifecycle inventory before the next release.
+
+A note on ``produced_by.mode``: ``produced_by.mode: explicit`` does *not*
+mean user-authored canonical metadata. It records only that the pipeline
+step that wrote the entry was invoked explicitly. The content of
+runtime-produced FK-helper v2 relations is compiled pipeline state, and
+must not be replayed as canonical input on a later run.
+
+The complete ``_meta`` lifecycle inventory and a sharper FK-helper policy
+classification are tracked separately as
+``FTR-META-LIFECYCLE-INVENTORY-P5`` and
+``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``, and as
+``TD-META-LIFECYCLE-INVENTORY`` in ``docs/backlog/technical_debt.adoc``.
+
+==== Producer guidance
+
+Producers may freely write into the runtime ``_meta`` view -- including
+under ``derived`` and under ``__*``-prefixed keys -- when the value is only
+needed for the duration of the current run. Producers must not, however,
+assume that the runtime shape is what later runs will see. If a producer
+needs its output to survive a roundtrip, it must either:
+
+* write into a key that is already classified as persistable (e.g. a
+  canonical workbook option), or
+* extend the projection rules in ``pipeline/persistence_boundary.py`` with
+  an explicit, documented decision.
+
+The projection should never be bypassed at the consumer level.
