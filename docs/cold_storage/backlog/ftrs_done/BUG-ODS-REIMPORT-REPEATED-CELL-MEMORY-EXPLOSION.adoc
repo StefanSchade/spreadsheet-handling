@@ -1,6 +1,6 @@
 ===== BUG-ODS-REIMPORT-REPEATED-CELL-MEMORY-EXPLOSION -- ODS reimport must not expand unused repeated cells into memory
 
-*Status:* New
+*Status:* Done
 
 *Type:* Bug
 
@@ -134,3 +134,51 @@ pytest tests/integration/io_backends/test_ods_xlsx_parity.py -q
 make test-ods
 git diff --check
 ----
+
+*Delivery scope:*::
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` — `_parse_table_grid`
+  reworked to keep `number-columns-repeated` as a per-cell descriptor instead
+  of expanding it eagerly. Empty cells are no longer written to the parsed
+  grid; empty row-repeat blocks short-circuit before iteration. `max_row` /
+  `max_col` track real content positions only, which also protects downstream
+  extent scans (`_find_col_extent`, `_find_row_extent` in
+  `parser_interpretation.py`) from iterating the theoretical sheet.
+  `parse_workbook(path, limits=...)` and `_parse_hidden_sheet(..., limits=...)`
+  accept a `ParserLimits` instance.
+* `src/spreadsheet_handling/io_backends/parser_limits.py` — new shared module
+  providing `ParserLimits`, `SpreadsheetTooLargeError`, and `DEFAULT_LIMITS`.
+  Limits enforce row, column, and materialized-cell ceilings before the next
+  row block is materialized; defaults follow Excel/Calc maxima
+  (1,048,576 × 16,384) with a 10,000,000 cell ceiling per sheet.
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` — synthetic
+  ODS fixtures cover repeated empty columns, repeated empty rows, non-empty
+  repeated cells (the legitimate header pseudo-merge case from the Dino
+  workbook), and `SpreadsheetTooLargeError` for declared dimensions beyond
+  configured limits. No consumer-domain data is committed.
+* `docs/ai_info/architecture_primer.adoc` — new "I/O backend defense-in-depth
+  bounds" subsection documents the parser-limits module for future backends.
+* `docs/release_notes/release_notes.adoc` — bug fix highlight plus
+  description of the new public `limits=` keyword argument and the typed
+  exception.
+
+*Validation results:*::
+
+* `parse_workbook('tmp/dino_stories.ods')` under `ulimit -v 4G`: 0.11 s,
+  ~81 MB RSS (previously crashed with `MemoryError` at ~3.3 GB).
+* Full ODS reimport via the public `sheets-run` CLI completes under
+  `ulimit -v 4G` with exit code 0 and 13 reconstructed JSON / meta files.
+* `pytest tests/unit/io_backends/ods tests/integration/io_backends/test_ods_xlsx_parity.py`
+  — 33 tests pass, including 5 new regression tests for the carrier patterns
+  observed in the Dino workbook.
+* Full suite `pytest tests/unit tests/integration tests/architecture` —
+  907 / 907 pass.
+* `git diff --check` — clean.
+
+*Carrier pattern observed in the Dino workbook (informational):*::
+
+`unzip -p tmp/dino_stories.ods content.xml` revealed 44 cells with
+`number-columns-repeated="16375"` (sheet width minus the 9 real columns) and
+a single row with `number-rows-repeated="1048534"`. Multiplied out, a naive
+parser is asked to materialize on the order of 10^10 dict entries. The fix
+treats these as formatting-only fillers and skips materialization.

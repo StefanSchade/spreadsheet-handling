@@ -28,6 +28,10 @@ from spreadsheet_handling.io_backends.ods.parser_interpretation import (
     build_sheet_meta_hints,
     build_visible_sheet_ir,
 )
+from spreadsheet_handling.io_backends.parser_limits import (
+    DEFAULT_LIMITS,
+    ParserLimits,
+)
 from spreadsheet_handling.rendering.ir import (
     DataValidationSpec,
     NamedRange,
@@ -113,7 +117,10 @@ def _table_is_hidden(table: Element, hidden_style_names: set[str]) -> bool:
     return str(table.attributes.get((TABLENS, "name"), "")) == "_meta"
 
 
-def _parse_table_grid(table: Element) -> ParsedTable:
+def _parse_table_grid(
+    table: Element,
+    limits: ParserLimits = DEFAULT_LIMITS,
+) -> ParsedTable:
     values: dict[tuple[int, int], str] = {}
     merges: list[tuple[int, int, int, int]] = []
     validation_cells: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -125,49 +132,113 @@ def _parse_table_grid(table: Element) -> ParsedTable:
     row_index = 1
     max_row = 0
     max_col = 0
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}'"
 
-    for row in [child for child in table.childNodes if isinstance(child, Element) and child.qname == table_row_name]:
+    for row in [
+        child
+        for child in table.childNodes
+        if isinstance(child, Element) and child.qname == table_row_name
+    ]:
         row_repeat = int(row.attributes.get((TABLENS, "number-rows-repeated"), 1))
-        cell_entries: list[tuple[bool, str, int, int, str | None]] = []
+        # Keep col_repeat as a descriptor — never expand here, so a row of
+        # empty-but-styled filler cells stays O(cell_count_in_row), not
+        # O(sum_of_col_repeats).
+        row_cells: list[tuple[bool, str, int, int, str | None, int]] = []
 
         for cell in row.childNodes:
-            if not isinstance(cell, Element) or cell.qname not in (table_cell_name, covered_cell_name):
+            if not isinstance(cell, Element) or cell.qname not in (
+                table_cell_name,
+                covered_cell_name,
+            ):
                 continue
             col_repeat = int(cell.attributes.get((TABLENS, "number-columns-repeated"), 1))
-            row_span = int(cell.attributes.get((TABLENS, "number-rows-spanned"), 1))
-            col_span = int(cell.attributes.get((TABLENS, "number-columns-spanned"), 1))
-            validation_name = cell.attributes.get((TABLENS, "content-validation-name"))
             if cell.qname == covered_cell_name:
-                cell_entries.extend([(True, "", 1, 1, None)] * col_repeat)
+                row_cells.append((True, "", 1, 1, None, col_repeat))
             else:
-                entry = (
-                    False,
-                    _cell_value(cell),
-                    row_span,
-                    col_span,
-                    str(validation_name) if validation_name else None,
+                row_span = int(cell.attributes.get((TABLENS, "number-rows-spanned"), 1))
+                col_span = int(cell.attributes.get((TABLENS, "number-columns-spanned"), 1))
+                validation_name = cell.attributes.get((TABLENS, "content-validation-name"))
+                row_cells.append(
+                    (
+                        False,
+                        _cell_value(cell),
+                        row_span,
+                        col_span,
+                        str(validation_name) if validation_name else None,
+                        col_repeat,
+                    )
                 )
-                cell_entries.extend([entry] * col_repeat)
+
+        row_has_content = any(
+            (not covered)
+            and (value != "" or row_span > 1 or col_span > 1 or validation_name is not None)
+            for covered, value, row_span, col_span, validation_name, _ in row_cells
+        )
+
+        if not row_has_content:
+            # Repeated empty filler block — skip materialization entirely.
+            # No values, no merges, no validations, and no extension of
+            # max_row / max_col so downstream extent scans do not iterate the
+            # full theoretical sheet either.
+            row_index += row_repeat
+            continue
+
+        # Defense-in-depth: confirm the declared block dimensions are within
+        # configured limits before iterating. The local skip above already
+        # neutralizes the common LibreOffice "select-all + format" pattern;
+        # this check protects against inputs that declare implausibly large
+        # repeats on rows that do carry content.
+        projected_row = row_index + row_repeat - 1
+        projected_col = 0
+        projected_content_cols_per_row = 0
+        running_col = 1
+        for covered, value, row_span, col_span, validation_name, col_repeat in row_cells:
+            has_cell_content = (not covered) and (
+                value != "" or row_span > 1 or col_span > 1 or validation_name is not None
+            )
+            if has_cell_content:
+                cell_right = running_col + col_repeat - 1 + (col_span - 1 if col_span > 1 else 0)
+                if cell_right > projected_col:
+                    projected_col = cell_right
+                projected_content_cols_per_row += col_repeat
+            running_col += col_repeat
+        limits.enforce(
+            context=context,
+            rows=projected_row,
+            cols=projected_col,
+            cells=len(values) + row_repeat * projected_content_cols_per_row,
+        )
 
         for repeated_row in range(row_repeat):
+            absolute_row = row_index + repeated_row
             col_index = 1
-            for covered, value, row_span, col_span, validation_name in cell_entries:
-                if not covered:
-                    values[(row_index + repeated_row, col_index)] = value
+            for covered, value, row_span, col_span, validation_name, col_repeat in row_cells:
+                has_cell_content = (not covered) and (
+                    value != "" or row_span > 1 or col_span > 1 or validation_name is not None
+                )
+                if not has_cell_content:
+                    col_index += col_repeat
+                    continue
+                for offset in range(col_repeat):
+                    absolute_col = col_index + offset
+                    values[(absolute_row, absolute_col)] = value
                     if row_span > 1 or col_span > 1:
                         merges.append(
                             (
-                                row_index + repeated_row,
-                                col_index,
-                                row_index + repeated_row + row_span - 1,
-                                col_index + col_span - 1,
+                                absolute_row,
+                                absolute_col,
+                                absolute_row + row_span - 1,
+                                absolute_col + col_span - 1,
                             )
                         )
                     if validation_name:
-                        validation_cells[validation_name].append((row_index + repeated_row, col_index))
-                max_col = max(max_col, col_index)
-                col_index += 1
-            max_row = max(max_row, row_index + repeated_row)
+                        validation_cells[validation_name].append((absolute_row, absolute_col))
+                    if absolute_col > max_col:
+                        max_col = absolute_col
+                col_index += col_repeat
+            if absolute_row > max_row:
+                max_row = absolute_row
         row_index += row_repeat
 
     return ParsedTable(
@@ -179,8 +250,8 @@ def _parse_table_grid(table: Element) -> ParsedTable:
     )
 
 
-def _parse_hidden_sheet(table: Element) -> SheetIR:
-    parsed = _parse_table_grid(table)
+def _parse_hidden_sheet(table: Element, limits: ParserLimits = DEFAULT_LIMITS) -> SheetIR:
+    parsed = _parse_table_grid(table, limits=limits)
     sheet = SheetIR(name=str(table.attributes.get((TABLENS, "name"), "_meta")))
     sheet.meta["_hidden"] = True
     for row in range(1, parsed.max_row + 1):
@@ -229,12 +300,14 @@ def _legend_table_hints(
         if str(resolved.get("sheet")) != sheet_name:
             continue
         try:
-            hints.append({
-                "name": str(legend_name),
-                "frame_name": str(resolved.get("frame_name") or f"legend_{legend_name}"),
-                "top": int(resolved["top"]),
-                "left": int(resolved["left"]),
-            })
+            hints.append(
+                {
+                    "name": str(legend_name),
+                    "frame_name": str(resolved.get("frame_name") or f"legend_{legend_name}"),
+                    "top": int(resolved["top"]),
+                    "left": int(resolved["left"]),
+                }
+            )
         except (KeyError, TypeError, ValueError):
             continue
     return hints
@@ -243,10 +316,7 @@ def _legend_table_hints(
 def _apply_legend_table_hints(sheet: SheetIR, hints: list[dict[str, Any]]) -> None:
     if not hints:
         return
-    by_position = {
-        (int(hint["top"]), int(hint["left"])): hint
-        for hint in hints
-    }
+    by_position = {(int(hint["top"]), int(hint["left"])): hint for hint in hints}
     sheet.meta["__legend_blocks"] = list(hints)
     for table in sheet.tables:
         hint = by_position.get((table.top, table.left))
@@ -360,27 +430,35 @@ def _extract_autofilter_ref(database_ranges: list[Element], *, sheet_name: str) 
     return None
 
 
-def parse_workbook(path: str | Path) -> WorkbookIR:
+def parse_workbook(
+    path: str | Path,
+    *,
+    limits: ParserLimits = DEFAULT_LIMITS,
+) -> WorkbookIR:
     """Parse an ODS workbook into WorkbookIR."""
     doc = load(str(path))
     ir = WorkbookIR()
 
     hidden_style_names = _parse_hidden_style_names(doc)
-    tables = [table for table in doc.getElementsByType(Table) if table.parentNode == doc.spreadsheet]
+    tables = [
+        table for table in doc.getElementsByType(Table) if table.parentNode == doc.spreadsheet
+    ]
     validation_defs: dict[str, str] = {}
     for validation in doc.spreadsheet.getElementsByType(OdfContentValidation):
         name = validation.attributes.get((TABLENS, "name"))
         condition = validation.attributes.get((TABLENS, "condition"))
         if name and condition:
             validation_defs[str(name)] = str(condition)
-    database_ranges = [database_range for database_range in doc.spreadsheet.getElementsByType(DatabaseRange)]
+    database_ranges = [
+        database_range for database_range in doc.spreadsheet.getElementsByType(DatabaseRange)
+    ]
 
     meta_payload: dict[str, Any] = {}
 
     for table in tables:
         name = str(table.attributes.get((TABLENS, "name"), "Sheet1"))
         if _table_is_hidden(table, hidden_style_names):
-            hidden_sheet = _parse_hidden_sheet(table)
+            hidden_sheet = _parse_hidden_sheet(table, limits=limits)
             ir.hidden_sheets[name] = hidden_sheet
             if name == "_meta":
                 meta_payload = _read_meta_payload(hidden_sheet)
@@ -391,7 +469,7 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
         if name in ir.hidden_sheets:
             continue
 
-        parsed = _parse_table_grid(table)
+        parsed = _parse_table_grid(table, limits=limits)
         meta_hints = build_sheet_meta_hints(meta_payload, sheet_name=name)
         validations = _extract_validations(parsed, validation_defs)
         autofilter_ref = _extract_autofilter_ref(database_ranges, sheet_name=name)
