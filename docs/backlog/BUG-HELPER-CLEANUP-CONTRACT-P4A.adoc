@@ -1,0 +1,559 @@
+===== BUG-HELPER-CLEANUP-CONTRACT-P4A -- Canonical reimport leaks helper columns after persistence-boundary fix removed the cleanup carrier
+
+*Status:* New
+*Priority:* P4A
+*Area:* Reimport / helper lifecycle / canonical persistence
+*Release relevance:* `0.2.0` blocker
+
+==== Summary
+
+A canonical reimport pipeline that explicitly invokes
+`apply_derived_column_policy ... policy: drop` now silently no-ops, so helper
+columns like `_places_name`, `_regions_name`, `_regions_kind` survive into
+canonical JSON. The regression was introduced by the closure of
+`BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`: that fix stripped the
+`_meta.derived` channel from persisted artifacts, but the reimport cleanup
+step reads only that channel for helper identity. The cleanup contract was
+not migrated onto a stable carrier in the same change set.
+
+Verified reproducible against the worldbuilding consumer (Adoption-001) at
+core HEAD `8f8b519` (2026-06-03). The historical adoption-era ODS at
+`core/tmp/dino_stories.ods` does *not* exhibit the bug because it was
+exported before the persistence-boundary fix landed and still embeds the
+rich `_meta.derived` channel inside the workbook blob.
+
+==== Context
+
+During continued worldbuilding adoption work, two related issues were observed
+in the canonical consumer data after roundtrip/reimport:
+
+* helper columns such as `_places_name` and `_regions_name`/`_regions_kind`
+  appeared in canonical JSON files where they do not belong;
+* unresolved helper values appeared as the literal string `nan` in canonical
+  JSON for rows whose source FK was empty.
+
+The unresolved-value behavior (`"nan"`) is tracked separately in
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`. It can co-occur with the
+helper-cleanup leak but is independently triggered: it would still matter
+even if helper cleanup worked, because it is a contract gap about how
+unresolved helper values are represented, not about whether helpers should
+reach canonical data.
+
+Reproduced example (from the worldbuilding canonical `characters.json` after
+the export -> reimport cycle described below):
+
+[source,json]
+----
+{
+  "id": "CHAR-0022",
+  "name": "...",
+  "home_place_id": "",
+  "_places_name": "nan"
+}
+----
+
+The helper-cleanup half: `_places_name` should never have been in
+`characters.json`. The `"nan"` half: even if it were there legitimately, the
+literal string `nan` is not a defined contract for "no resolved helper
+value".
+
+==== Reproduction recipe (worldbuilding consumer)
+
+This is the recipe that confirms the bug at HEAD `8f8b519` (2026-06-03).
+It uses only the public CLI and the consumer Makefile.
+
+Setup (one-time, against a sibling worldbuilding checkout):
+
+[source,bash]
+----
+cd worldbuilding
+make setup    # creates .venv and installs ../core editable
+mkdir -p tmp
+----
+
+Reproduce the bug (fresh round-trip, no historical data dependency):
+
+[source,bash]
+----
+make export-stories-ods    # writes tmp/dino_stories.ods from canonical daten/dino_insel
+make import-stories-ods    # reimports into tmp/dino_stories_reimported
+----
+
+Verify the leak:
+
+[source,bash]
+----
+python3 -c "
+import json
+d = json.load(open('tmp/dino_stories_reimported/characters.json'))
+empties = [r for r in d if r.get('home_place_id') in ('', None)]
+print(f'rows with empty home_place_id: {len(empties)}')
+for r in empties[:3]:
+    print(r['id'], r.get('_places_name'))"
+----
+
+Expected (current buggy) output at HEAD `8f8b519`:
+
+[source,text]
+----
+rows with empty home_place_id: 6
+CHAR-0012 nan
+CHAR-0022 nan
+CHAR-0023 nan
+----
+
+Frames that leak helpers in the same run:
+
+[cols="2,1,3", options="header"]
+|===
+| Frame | Rows | Leaked helper columns
+
+| `characters.json` | 30 | `_places_name` (6 cells = `"nan"`)
+| `groups.json`     |  8 | `_places_name`
+| `places.json`     | 24 | `_regions_name`, `_regions_kind`
+|===
+
+Negative control (historical ODS predating the persistence-boundary fix):
+
+[source,bash]
+----
+cp ../core/tmp/dino_stories.ods tmp/dino_stories.ods
+make import-stories-ods
+----
+
+Produces clean canonical JSON. No helper columns, no `nan` strings. This
+distinguishes a *current code* bug from a *historical data* bug: the
+historical ODS embeds the cleanup carrier the current code still needs; the
+fresh export does not.
+
+==== Pipeline anatomy (consumer-side context)
+
+The following YAML / Makefile excerpts live in the worldbuilding consumer
+repository, not in core. They are reproduced here so a future reader can
+understand the bug without cross-repo navigation.
+
+The consumer Makefile target `make import-stories-ods` delegates to the
+same generic import target with an ODS override; there is no special
+reimport-only path:
+
+[source,make]
+----
+# consumer-side (worldbuilding/Makefile)
+import-stories:
+	rm -rf $(REIMPORT_DIR)
+	$(RUN) --config ./pipelines/dino_insel/spreadsheet_to_json.yaml \
+	      --in-kind $(SHEET_FORMAT) --in-path $(SPREADSHEET_FILE)
+
+import-stories-ods:
+	$(MAKE) import-stories SHEET_FORMAT=ods
+----
+
+The reimport behavior is therefore defined entirely by
+`worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml`. Helper cleanup
+intent is explicit (consumer-side):
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: characters
+  policy: drop
+
+- step: apply_derived_column_policy
+  source: groups
+  policy: drop
+
+- step: apply_derived_column_policy
+  source: places
+  policy: drop
+----
+
+The forward export pipeline (`json_to_spreadsheet.yaml`, consumer-side)
+materializes helper columns for editing usability via the canonical core
+sequence `configure_fk_helpers` -> `add_fk_helpers`:
+
+[source,yaml]
+----
+- step: configure_fk_helpers
+  targets:
+    places:
+      key: id
+      allowed_helpers: [name]
+      default_helpers: [name]
+      helper_prefix: "_"
+      fk_column: home_place_id
+
+- step: add_fk_helpers
+  defaults:
+    levels: 2
+    helper_value_mode: values
+----
+
+A reader of either YAML file would reasonably expect helper columns to
+disappear during reimport. They do not.
+
+==== Why it leaks: the two-carrier mismatch
+
+The core step `apply_derived_column_policy` lives at
+`src/spreadsheet_handling/domain/transformations/derived_column_policy.py:41`.
+Its docstring is unambiguous (line 60):
+
+[source,python]
+----
+"""Helper identity comes only from ``_meta.derived.sheets[source]``.  Runs
+before ``drop_helpers``; if the channel is already cleaned it is a no-op
+for identity/value purposes."""
+----
+
+The runtime call resolves the carrier through `_safe_sheet_meta` (line 207):
+
+[source,python]
+----
+def _safe_sheet_meta(meta, source):
+    derived = meta.get("derived")
+    if derived is None:
+        return None
+    sheets = derived.get("sheets")
+    if sheets is None:
+        return None
+    return sheets.get(source)
+----
+
+So if `_meta.derived.sheets[source]` is missing, identity resolution returns
+the empty set, no columns are marked for drop, and the step is a no-op --
+*by design*, because a "no provenance, no cleanup" stance is a safe default.
+
+The framework has at least two distinct helper-related metadata carriers
+that overlap in vocabulary but not in role:
+
+[cols="1,1,1,1", options="header"]
+|===
+| Carrier | Shape | Producer | Consumer
+
+| `_meta.derived.sheets.<frame>.helper_columns`
+| List of mappings with `column`, `fk_column`, `target`, `target_key`,
+  `value_field`
+| Runtime FK helper materialization (`add_fk_helpers`,
+  `configure_fk_helpers`)
+| `apply_derived_column_policy` (cleanup), policy/value checks
+
+| `_meta.sheets.<frame>.helper_columns`
+| Flat list of column names
+| `configure_workbook_view`
+| Workbook rendering (editing-surface visibility / styling)
+|===
+
+Both carriers are present in normal forward operation. The second is
+declarative editing-surface intent and *should* persist across the round
+trip. The first is runtime provenance: it carries enough information to act
+on identity (`column` plus the FK target it was derived from) and is
+intentionally rebuilt on each run.
+
+==== Why it didn't leak before: the historical ODS embedded the rich carrier
+
+Inspection of the two ODS files (both opened as zip archives, then
+`content.xml` scanned for `"derived":` blobs) shows the regression vector
+directly:
+
+[cols="2,2,2", options="header"]
+|===
+| Blob carrier | Historical ODS (`core/tmp/dino_stories.ods`, 2026-06-01) | Fresh ODS (just exported, 2026-06-03)
+
+| `"derived"` key in embedded `pipeline_meta_blob`
+| present
+| absent (only `"derived_from"` -- a different concept from
+  `flatten_headers` column genealogy)
+
+| `derived.sheets.<frame>.helper_columns`
+| rich shape, example:
+  `[{"column": "_places_name", "fk_column": "home_place_id",
+  "target": "places", "target_key": "id", "value_field": "name"}]`
+| missing
+
+| `sheets.<frame>.helper_columns`
+| flat list (workbook-view)
+| flat list (workbook-view)
+|===
+
+The historical ODS predates the persistence-boundary tightening from
+`BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`. It still embeds the rich
+`derived` channel inside the workbook blob, so on reimport the cleanup step
+finds its expected carrier and drops the helpers. The fresh ODS exports the
+canonical state through the post-fix persistence boundary, which strips the
+`derived` channel; on reimport the cleanup step finds nothing to act on.
+
+This is concept drift across the BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A
+fix, not just a stale data row.
+
+==== The regression vector in one line
+
+`BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` correctly stripped
+`_meta.derived` from the persistence boundary because it is runtime-only
+metadata. But `apply_derived_column_policy` consumes only
+`_meta.derived.sheets[source]` for identity. The fix removed the carrier
+without migrating the consumer onto a durable carrier, so a cleanup step
+that was working through an unintended persistence path now silently
+no-ops.
+
+This is the durable lesson: the persistence boundary alone is not enough.
+Each consumer of a stripped runtime channel must either be rebuilt within
+the same run (so the channel exists at consumption time) or migrated onto a
+durable carrier.
+
+==== Architectural direction (chosen)
+
+The project explicitly chooses to *not* add helper-cleanup logic in the
+writer or at the persistence boundary. The decision is recorded here so
+the implementer does not re-litigate it.
+
+Rationale:
+
+* *Writers stay dumb on purpose.* A writer's contract is "serialize the
+  frames you receive". Adding semantic filtering would open a slippery
+  slope: should the writer also reject dangling FKs, duplicate PKs,
+  cardinality violations, missing-required cells? Each answer is
+  debatable and *debugging routinely wants the opposite* -- writing out
+  pathological state to inspect it is a legitimate use of the writer.
+* *Symmetry with the reader.* Parsers do not validate either. They
+  produce frames; the pipeline validates. If that is the line on the
+  read path, it must be the same on the write path.
+* *No DRY violation across layers.* The framework already has a
+  validation primitive (`validate_references`) with a small rule
+  catalogue (`primary_key`, `unique`, `foreign_key`) and a findings
+  frame mechanism. Adding helper-related checks at the writer would
+  duplicate this machinery in a second place with its own vocabulary
+  and its own test surface. The architectural error to avoid is
+  duplication, not "magic".
+
+The fix therefore has two components, both inside the domain /
+pipeline layer:
+
+1. *Repair the existing cleanup step.* Teach
+   `apply_derived_column_policy` to resolve helper identity from a
+   durable carrier when `_meta.derived` is absent: workbook-view
+   `_meta.sheets.<frame>.helper_columns` together with FK relations in
+   `_meta.helper_policies.fk.relations` carry enough information to
+   reconstruct identity. The step's call site stays the same; only its
+   internal carrier resolution becomes broader. No new pipeline step.
+
+2. *Add a validation rule type that catches silent regressions.*
+   Extend the existing `validate_references` rule catalogue with a
+   rule (working name: `no_helper_columns`, or equivalent) that asserts
+   "the named frames must not contain helper columns at this pipeline
+   point". A pipeline that declares cleanup intent should follow it
+   with this rule; if the cleanup step silently becomes a no-op again
+   (for any future reason), the validation fails loudly with a
+   findings frame, exactly like every other validation rule today.
+
+Pipeline discipline that follows from this:
+
+[source,text]
+----
+apply_derived_column_policy (cleanup)
+        -> validate_references rules: [no_helper_columns] (assert)
+                -> write
+----
+
+The cleanup step is fixed (component 1). The assertion is opt-in but
+recommended (component 2). Authors who legitimately want helpers in an
+output (debug dump, intermediate inspection) simply omit the assertion
+rule; the writer continues to serialize whatever it gets.
+
+Rejected alternatives, recorded so they are not re-proposed:
+
+* *Persistence-boundary guard in the writer.* Would silently filter
+  helpers, or fail at the writer level. Rejected: puts policy at the
+  serialization boundary, breaks reader/writer symmetry, hides the
+  pipeline mistake instead of exposing it.
+* *Reconstruction step at the start of the reimport pipeline.* Was
+  considered as a way to keep `apply_derived_column_policy` unchanged.
+  Rejected: adds a step whose only purpose is to re-establish a
+  runtime carrier that the cleanup step could resolve directly from a
+  durable carrier instead. Reduces to component 1 with extra
+  ceremony.
+* *Reverse the persistence-boundary decision for FK helpers.*
+  Rejected: would re-introduce the original
+  `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` failure mode.
+
+This direction aligns with the long-term plans in
+`FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` and
+`FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`. Those FTRs may later refine *which
+durable carrier* is canonical (workbook-view metadata, helper-policy
+relations, or a future merged shape). This BUG does not pre-empt that
+decision; it commits to "a durable carrier resolved inside the cleanup
+step", not to a specific carrier.
+
+==== Scope
+
+* Restore the helper-cleanup contract on the canonical reimport path so
+  that pipelines declaring `apply_derived_column_policy ... policy: drop`
+  actually drop helper columns from canonical JSON (component 1 above).
+* Extend the `validate_references` rule catalogue with an assertion rule
+  that fails loudly when helper columns are present at a pipeline point
+  where the author expects them gone (component 2 above).
+* Document the relationship between
+  `_meta.derived.sheets.<frame>.helper_columns` (runtime provenance,
+  intentionally stripped at persistence) and
+  `_meta.sheets.<frame>.helper_columns` (workbook-view metadata,
+  durable across the round trip) so future implementers do not
+  rediscover the carrier mismatch.
+* Document the recommended reimport pipeline shape (cleanup -> assert
+  -> write) in the FK helper concept docs and in the user-guide
+  workflow chapter.
+* Record the architectural principle ("writers carry no semantic
+  logic; validation lives in the domain, triggered by the pipeline")
+  as an ADR in
+  `docs/technical_model/ch03_architecture_decisions/`. Reuse the
+  existing ADR shape (Context / Decision / Alternatives Considered /
+  Rationale / Consequences). The rejected alternatives in this BUG
+  translate directly to the ADR's *Alternatives Considered* section.
+* Add regression coverage using the worldbuilding reproduction pattern
+  (fresh export -> reimport, verify no helpers in canonical JSON, and
+  verify the new validation rule fails when cleanup is bypassed).
+* Coordinate with `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`: the
+  cleanup fix may or may not eliminate the `"nan"` symptom in practice.
+  Even if it does, the contract for unresolved helper values should be
+  decided independently in that BUG.
+
+==== Non-goals
+
+* *No semantic logic in the writer.* Writers serialize the frames they
+  receive. Helper-related filtering, FK-consistency checks, PK checks,
+  cardinality checks, and missing-required checks all live in the
+  domain layer and are triggered by pipeline steps, never by writers.
+  This is a deliberate architectural position (see *Architectural
+  direction* above) and is recorded as a non-goal so future agents do
+  not propose writer-side guards as a "defence in depth" addition.
+* No persistence-boundary guard. The persistence boundary established
+  by `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` strips runtime
+  metadata; that boundary stays read-only. Validation and cleanup are
+  domain concerns, not boundary concerns.
+* Do not treat the local worldbuilding consumer workaround (stripping
+  runtime sections from `_meta` in a plugin) as the product solution.
+* Do not revert the persistence-boundary fix from
+  `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`.
+* Do not bundle the `"nan"` semantics work (tracked separately in
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`).
+* Do not address the LibreOffice Calc `#NAME?` formula-evaluation symptom
+  the user observed in the UI -- it is orthogonal (a Calc runtime issue,
+  not a framework state on disk).
+* Do not redesign the existing `validate_references` step. The new
+  rule type plugs into the same primitive; the step itself stays as
+  the single domain-validation entry point.
+
+==== Acceptance
+
+* `apply_derived_column_policy` resolves helper identity from a
+  durable carrier when `_meta.derived.sheets[source]` is absent. The
+  step is no longer silently a no-op on the canonical reimport path.
+* A new `validate_references` rule type asserts "no helper columns in
+  these frames" and is documented in the user-guide validation
+  catalogue. Findings-frame integration follows the same pattern as
+  existing rule types.
+* The recommended reimport pipeline tail (cleanup -> assert -> write)
+  is documented in the FK helper concept doc and demonstrated in at
+  least one example pipeline (worldbuilding consumer pipeline, demo
+  pipeline, or both).
+* Regression tests added:
+** an `export -> reimport` round trip on a representative pipeline
+   (FK helper present, FK source allowed empty, workbook-view helper
+   metadata present, no historical derived blob) produces canonical
+   JSON with no helper columns;
+** the new assertion rule, run after a deliberately bypassed cleanup
+   step, fails with a findings-frame entry naming the offending frame
+   and column(s).
+* The architectural principle established here is recorded as an ADR
+  in `docs/technical_model/ch03_architecture_decisions/` (working
+  name: `ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB.adoc`,
+  implementer may rename). The ADR captures: the principle (writers
+  serialize what they receive; validation and cleanup live in the
+  domain, triggered by pipeline steps), the rationale (writer/reader
+  symmetry; DRY against the existing `validate_references`
+  primitive; debugging requires the ability to write pathological
+  state), the rejected alternatives from this BUG (persistence-
+  boundary guard in writer, semantic filtering in writer,
+  reconstruction step, persistence-reversal). The ADR is added to
+  the index in
+  `docs/technical_model/ch03_architecture_decisions/_adrs.adoc`.
+  The FTR review note may cite the ADR rather than restate the
+  decision.
+* Release-notes checkpoint: either the 0.2.0 release notes record a
+  short entry under *Bug fixes* naming the cleanup-contract
+  restoration *and* under *User-facing changes* (or
+  *Transformation and pipeline changes*) naming the new validation
+  rule type, or the FTR review note records why no release-note
+  entry is needed (per the project's release-notes checkpoint rule).
+
+==== Validation
+
+Pre-fix evidence (already collected at HEAD `8f8b519`):
+
+* `make export-stories-ods` + `make import-stories-ods` from worldbuilding
+  HEAD produces `_places_name` in `characters.json` and `groups.json`,
+  `_regions_name` / `_regions_kind` in `places.json`.
+* The same script confirms 6 `_places_name` cells equal the literal
+  string `"nan"` for rows with empty `home_place_id`.
+* The historical ODS `core/tmp/dino_stories.ods` reimports cleanly --
+  control case proving the bug is in the *exported state*, not the
+  *import code path*.
+* Embedded blob inspection (zipfile + content.xml grep) confirms the
+  fresh ODS lacks `_meta.derived.sheets.*.helper_columns` while the
+  historical ODS contains it.
+
+Post-fix verification:
+
+* Repeat `make export-stories-ods` + `make import-stories-ods`. Verify
+  the leaked-columns table from the reproduction recipe is empty.
+* Verify XLSX path behaves identically (`SHEET_FORMAT=xlsx`).
+* Verify `make check-reimport` and `make check-reimport-ods` produce
+  diffs that contain only legitimate content edits.
+* Verify the new `validate_references` rule type by adding it to the
+  worldbuilding reimport pipeline tail (after the three
+  `apply_derived_column_policy` steps) and confirming a clean run.
+  Then temporarily comment out the cleanup steps and confirm the
+  validation rule produces a findings-frame entry naming the leaked
+  helper columns. Restore the cleanup steps.
+
+==== Related backlog items
+
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` -- introduced the
+  persistence boundary that removed the cleanup carrier. The fix here
+  must respect that boundary, not reverse it.
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- the `"nan"` symptom
+  on empty FK source values. Co-observed with this BUG but independently
+  triggered.
+* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` -- the long-term home for the
+  durable-carrier decision.
+* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- the FK-helper-specific
+  classification that the fix should align with.
+* `FTR-META-LIFECYCLE-INVENTORY-P5` -- the broader classification work
+  that this fix should not pre-empt.
+* `TD-META-LIFECYCLE-INVENTORY` (in `technical_debt.adoc`) -- the
+  containment record for the unfinished lifecycle classification.
+
+==== Reference: exact source locations consulted
+
+For future debugging without re-walking the codebase:
+
+* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py`
+  - `apply_derived_column_policy` at line 41
+  - docstring "Helper identity comes only from ``_meta.derived.sheets[source]``"
+    at line 60
+  - `_safe_sheet_meta` at line 207
+  - `_strip_consumed_provenance` at line 231
+* `src/spreadsheet_handling/pipeline/registry.py` -- step registration at
+  line 165
+* `src/spreadsheet_handling/core/fk.py` -- `_norm_id` at line 26 (FK key
+  normalization; orthogonal to helper *value* normalization)
+* `src/spreadsheet_handling/domain/fk_relations.py` -- helper provenance
+  shape produced by `configure_fk_helpers` at line 160-285
+* `src/spreadsheet_handling/domain/workbook_views.py` -- workbook-view
+  `helper_columns` shape at lines 24, 51, 155
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py`
+  and `.../ods/parser_interpretation.py` -- both list `helper_columns`
+  as a recognized sheet-level metadata key (workbook-view carrier)
+* `validate_references` step -- the extension point for component 2.
+  Locate the step's source via the registry
+  (`src/spreadsheet_handling/pipeline/registry.py`); the existing rule
+  catalogue (`primary_key`, `unique`, `foreign_key`) is the structural
+  template for the new `no_helper_columns` rule type. Findings-frame
+  integration follows the same shape used by the existing rules.

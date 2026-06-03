@@ -1,0 +1,203 @@
+===== BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A -- Unresolved helper values become the literal string `nan` in canonical JSON
+
+*Status:* New
+*Priority:* P4A
+*Area:* FK helper materialization / unresolved-value contract / canonical persistence
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker. Honest documentation is required for `0.2.0`; the contract decision itself can land after.
+
+==== Summary
+
+When the source FK column of a configured FK helper is empty
+(`home_place_id: ""`), the materialized helper value reaches canonical JSON
+as the literal string `"nan"`. The framework currently has no documented
+contract for *unresolved helper values*: it normalizes FK *keys* but does
+not define the persisted representation of "no resolved helper value".
+
+This BUG asks the project to define and enforce that contract. It is
+distinct from `BUG-HELPER-CLEANUP-CONTRACT-P4A`, which addresses *whether*
+helper columns reach canonical JSON. Even when cleanup works, helpers can
+legitimately appear in upstream views, and the contract for unresolved
+values still needs to be defined.
+
+==== Reproduced symptom
+
+From `worldbuilding/tmp/dino_stories_reimported/characters.json` after
+`make export-stories-ods` + `make import-stories-ods` at core HEAD
+`8f8b519` (see `BUG-HELPER-CLEANUP-CONTRACT-P4A` for the full recipe):
+
+[source,json]
+----
+{
+  "id": "CHAR-0022",
+  "name": "...",
+  "home_place_id": "",
+  "_places_name": "nan"
+}
+----
+
+Six rows in `characters.json` carry `"_places_name": "nan"` -- one per row
+whose `home_place_id` is empty. The literal string `"nan"` originates from
+the pandas/NumPy stringification of a NaN cell, and reaches canonical
+storage unchanged because no normalization layer treats "unresolved helper
+value" as a separate case.
+
+==== Why this is wrong
+
+A canonical JSON consumer cannot distinguish between:
+
+* a helper that resolved to the actual string `"nan"` (an in-domain value);
+* a helper that failed to resolve because the FK source was empty;
+* a helper that failed to resolve because the FK target was missing;
+* a helper that failed to resolve for some other reason (e.g. type coercion).
+
+Collapsing all of these into the ordinary string `nan` changes a
+missing/error state into domain data. This is a silent contract failure.
+
+==== Three options for the contract
+
+Recorded so the decision is explicit, not implicit:
+
+1. *Empty / null.* Unresolved helper values become the empty string `""`
+   (parallel to how empty FK source values are represented) or JSON
+   `null`. Cheapest to implement, simplest contract, but loses the
+   "unresolved" distinction.
+
+2. *Structured finding.* Unresolved helper values do not appear inline;
+   they are surfaced through a findings frame (compatible with the
+   existing `derived_column_findings` mechanism used by the
+   `warn_on_mismatch` / `fail_on_mismatch` policies). The cell either
+   stays empty or carries a stable marker. Preserves the distinction at
+   the cost of a separate carrier.
+
+3. *Spreadsheet error preservation.* If LibreOffice Calc or Excel
+   produced a real error value (`#NAME?`, `#N/A`), preserve it as a
+   typed error token rather than stringifying it as `"nan"`. This is
+   only a partial answer -- it does not cover the empty-FK case, where
+   no spreadsheet error exists in the first place. Likely a useful
+   complement to option 1 or 2, not a standalone answer.
+
+The maintainer's intuition (from project notes) leans toward option 1 for
+`0.2.0` simplicity, with option 2 as a later refinement once the FK
+helper policy lifecycle clarifies what counts as a "finding".
+
+==== Root cause sketch (still to be pinned)
+
+The path that produces `"nan"` is not yet fully traced. Three plausible
+carriers exist; the BUG asks the implementer to confirm which one is in
+play before choosing a fix:
+
+1. *FK helper materialization.* `configure_fk_helpers` + `add_fk_helpers`
+   join helper values from the target frame. When the source FK is empty,
+   `_norm_id` returns `None` (see `src/spreadsheet_handling/core/fk.py:26`),
+   which produces a pandas NaN in the joined column. NaN serializes as
+   `"nan"` via `str()` if not caught by a normalization layer.
+2. *Pandas / object stringification artifact.* If a downstream step
+   coerces a NaN-bearing object column to string before writing JSON, the
+   stringification yields `"nan"` even when the upstream cell was a true
+   missing value.
+3. *Replay of already-contaminated canonical data.* If a prior reimport
+   wrote `"nan"` into canonical JSON, a subsequent export + reimport
+   round trip would echo that value back without any new NaN ever being
+   produced. This is unlikely here (canonical
+   `worldbuilding/daten/dino_insel/characters.json` does not currently
+   contain `"nan"`) but worth ruling out explicitly.
+
+The reproduction recipe in `BUG-HELPER-CLEANUP-CONTRACT-P4A` produces a
+deterministic fresh case from canonical data with no `"nan"` strings, so
+the cause is in the export-or-import code path, not in stale canonical
+data. That eliminates option 3 for this reproduction.
+
+==== Scope
+
+* Define an explicit contract for unresolved helper values on the
+  canonical persistence path.
+* Implement the contract in the FK helper materialization /
+  serialization path so the literal string `"nan"` no longer appears in
+  canonical JSON by accident.
+* Document the contract in the FK helper concept docs and the user
+  guide where helper materialization is described.
+* Add regression coverage using a representative empty-FK source.
+* Coordinate with `BUG-HELPER-CLEANUP-CONTRACT-P4A`: when both fixes
+  land, the worldbuilding reproduction must produce zero leaked helper
+  columns *and* zero `"nan"` strings.
+
+==== Non-goals
+
+* Do not block on this BUG before `0.2.0` ships. The
+  helper-cleanup contract fix (separate BUG) alone is enough to make
+  the worldbuilding canonical JSON clean for the documented round trip
+  pattern. A 0.2.0 release notes entry under *Known limitations* naming
+  the unresolved-helper-value contract as undefined is acceptable as
+  the pre-decision posture.
+* Do not extend this BUG to cover all NaN / null normalization across
+  the framework. The scope is *helper values produced by the FK helper
+  family* on the canonical persistence path.
+* Do not address the LibreOffice Calc `#NAME?` formula-evaluation
+  symptom (UI error that resolves on re-confirm). That is a Calc runtime
+  issue; the on-disk ODS does not carry `#NAME?` for the reproduction
+  used here. If a separate BUG for formula-error mapping is needed,
+  open it independently.
+
+==== Acceptance
+
+* The project records an explicit contract for unresolved helper values
+  (which of the three options above, or another) and that contract is
+  documented in the FK helper concept doc.
+* The chosen representation is enforced in the helper materialization
+  / serialization path. The literal string `"nan"` no longer appears in
+  canonical JSON for the worldbuilding reproduction or for any
+  representative empty-FK source.
+* Tests cover the empty-FK source case: a `home_place_id: ""` row
+  produces the contracted representation, not `"nan"`.
+* Release-notes checkpoint: the relevant 0.x release notes record either
+  the chosen contract (under *User-facing changes* or *Bug fixes*) or
+  -- for the interim period before the decision lands -- a *Known
+  limitation* naming this case.
+
+==== Validation
+
+Pre-fix evidence (already collected at HEAD `8f8b519`):
+
+* `make export-stories-ods` + `make import-stories-ods` from worldbuilding
+  HEAD produces 6 rows with `"_places_name": "nan"` in
+  `characters.json` whose `home_place_id` is the empty string.
+* No `"nan"` strings appear in the historical
+  `core/tmp/dino_stories.ods` reimport (control case), so the cause is
+  in the fresh export-or-import path, not in stale data.
+* The canonical input data
+  `worldbuilding/daten/dino_insel/characters.json` does not contain
+  `"nan"` strings, ruling out replay of contaminated input.
+
+Post-fix verification:
+
+* `make export-stories-ods` + `make import-stories-ods` produces zero
+  `"nan"` strings in any canonical JSON file.
+* Empty-FK source values produce the chosen contracted representation
+  (empty string, JSON null, structured finding, or other).
+* XLSX path behaves identically.
+
+==== Related backlog items
+
+* `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- the helper-leak twin. Co-observed
+  with this BUG but independently triggered. Fix order: cleanup first
+  (it is the `0.2.0` blocker); unresolved-value contract follows.
+* `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` (Cutline 0.2) -- the
+  visible-cell typing decision. Adjacent: both touch the question of
+  how missing / unresolved / typed values are represented across the
+  spreadsheet round trip. The cutline FTR governs the *general*
+  visible-cell contract; this BUG narrows to the helper-value subset.
+* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- the FK-helper lifecycle work
+  that will likely host the durable contract documentation.
+
+==== Reference: where unresolved values are produced
+
+* `src/spreadsheet_handling/core/fk.py:26` -- `_norm_id`, FK key
+  normalization. Returns `None` for `None`, NaN, or unrecognized.
+  Operates on *keys*, not values.
+* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:386`
+  -- `_norm`, a separate helper-value normalization used by the
+  policy-check path. Returns `None` for None/NaN. Not currently applied
+  to written-out values.
+* `src/spreadsheet_handling/domain/fk_relations.py:160-285` -- the FK
+  helper provenance and materialization shape produced by
+  `configure_fk_helpers`. The value-producing path lives downstream.
