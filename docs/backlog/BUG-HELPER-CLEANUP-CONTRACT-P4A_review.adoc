@@ -1,0 +1,458 @@
+= REVIEW: BUG-HELPER-CLEANUP-CONTRACT-P4A
+:date: 2026-06-03
+:reviewer: Claude Opus 4.7 (read-only)
+:commit: `1bbe0fb fix(BUG-HELPER-CLEANUP-CONTRACT-P4A): restore helper cleanup after reimport`
+:status: review artifact
+
+== Metadata
+
+* *Review date:* 2026-06-03.
+* *Commit reviewed:* `1bbe0fb89c26950bb4043b51cce2714ae276ec66`
+  (`fix(BUG-HELPER-CLEANUP-CONTRACT-P4A): restore helper cleanup after
+  reimport`).
+* *Reviewer / model:* Claude Opus 4.7, read-only, no source modifications.
+* *Scope:* the chosen architectural direction (durable workbook-view
+  helper metadata as drop-identity fallback; new `no_helper_columns`
+  validation rule), the implementation of both halves, regression
+  coverage, documentation, and the BUG-archival path. Architecture is
+  not re-litigated; the ADR documents the decision.
+* *Files modified by this review:* exactly one --
+  `docs/backlog/BUG-HELPER-CLEANUP-CONTRACT-P4A_review.adoc` (this
+  artifact). No production or test code changed during review.
+* *Commands run:* listed in *Validation Performed* below.
+
+== Executive Verdict
+
+*Green.*
+
+The fix restores the cleanup contract on the canonical reimport path
+without touching the persistence boundary, writers, or the runtime
+`_meta.derived` channel. The chosen direction (durable
+`_meta.sheets.<frame>.helper_columns` as the drop-identity fallback)
+aligns with the project position recorded in
+`ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB`. The new
+`no_helper_columns` rule plugs into the existing `validate_references`
+catalogue and the findings-frame mechanism without duplicating
+validation infrastructure. Tests cover the regression at the
+roundtrip layer, the new unit-level identity-resolution paths, and
+the validation rule's three execution modes (default, warn-only
+findings, fail-mode raise). The worldbuilding consumer reproduction
+from the BUG no longer leaks helper columns.
+
+The `tests/roundtrip` suite reports `3 passed, 1 xpassed`; the XPASS
+is on
+`test_empty_fk_source_helper_representation`
+(`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`) and is *masking* by
+construction -- once helper cleanup works, the unresolved-helper-value
+contract becomes vacuously satisfied for this fixture because the
+helper column is gone. This is correctly recorded in the BUG closure
+notes; the unresolved-value BUG remains open.
+
+No blocking findings. Three non-blocking observations are listed
+below; all are documentation / consistency notes, not behavior
+defects.
+
+== Validation Performed
+
+All commands were run from `/home/stefan/repos/spreadsheet-handling/core`
+in a read-only posture.
+
+[cols="3,1,4", options="header"]
+|===
+| Command | Result | Purpose
+
+| `git show --stat 1bbe0fb`
+| 12 files changed, 416 insertions(+), 32 deletions(-)
+| Confirm commit scope.
+
+| `git show 1bbe0fb -- src/...`
+| (see *Implementation review* below)
+| Inspect each modified production file.
+
+| `.venv/bin/python -m pytest -q tests/roundtrip`
+| `3 passed, 1 xpassed in 0.32s`
+| Roundtrip layer including the formerly-xfail cleanup-invariant
+  test (now green) and the unresolved-helper test (now XPASS by
+  masking).
+
+| `.venv/bin/python -m pytest -q tests/unit tests/integration`
+| `829 passed in ~4s`
+| Unit and integration layers green.
+
+| `.venv/bin/python -m pytest -q
+  tests/architecture/carrier_boundary/test_carrier_boundary_guards.py`
+| `4 passed`
+| Carrier-boundary guard still green (no new test root introduced).
+
+| `.venv/bin/python -m pytest --tb=no`
+| `938 passed, 1 xpassed in ~6s`
+| Full suite green; the single XPASS is the documented masking case.
+
+| Worldbuilding reproduction:
+  `make export-stories-ods` + `make import-stories-ods` + inspect
+  `tmp/dino_stories_reimported/characters.json`
+| `helper columns in characters.json: []` (was
+  `["_places_name"]`); 6 rows with empty `home_place_id`;
+  `_places_name` absent for those rows (was the literal `"nan"`).
+| Confirm the BUG's external reproduction is closed.
+
+| Manual probe: roundtrip with synthetic fixture; inspect
+  reimported `_meta.yaml`.
+| `_meta.derived` is `None`;
+  `_meta.sheets.items.helper_columns == ["_entities_name"]`.
+| Confirm `_meta.derived` stays transient (not re-introduced);
+  durable carrier is preserved and is what the cleanup step now reads.
+
+| Manual probe: `apply_derived_column_policy(...,
+  policy="warn_on_mismatch")` with only the durable carrier.
+| Helper column dropped; findings frame present and empty; no
+  exception.
+| Confirm value-/mismatch-checks remain limited to rich
+  `_meta.derived`; durable-only carrier triggers drop only, no
+  spurious mismatch findings.
+|===
+
+== Durable-carrier assessment
+
+The fix routes drop-identity through two carriers in order of
+precedence:
+
+. *Transient runtime channel* --
+  `_meta.derived.sheets.<frame>.helper_columns`, rich shape with
+  `{column, fk_column, target, target_key, value_field}`. Continues
+  to be the authoritative source for value/mismatch checks via
+  `_check_enrich_lookup_values`. Stripped by the persistence
+  boundary; only present inside a single pipeline run.
+. *Durable workbook-view channel* --
+  `_meta.sheets.<frame>.helper_columns`, flat list of column names
+  produced by `configure_workbook_view`. Persists across the round
+  trip because it is editing-surface intent, not runtime
+  provenance. Used by the fix only to identify columns to drop
+  when the rich channel is absent.
+
+This carrier choice is semantically sound. The durable list is
+already declared by the consumer pipeline (`configure_workbook_view`)
+as part of the workbook-view intent; reusing it for cleanup makes the
+two roles coherent without inventing a new persisted carrier. The
+fix does not promote durable metadata into value-check territory
+where its flat-list shape would be insufficient. The FK helper
+concept doc was updated to record this dual role explicitly.
+
+Implementation details verified:
+
+* `_safe_durable_helper_names` in
+  `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:240-265`
+  reads the durable list with malformed-shape diagnostics
+  (`ValueError` for non-Mapping `sheets`, non-Mapping sheet entry,
+  non-list `helper_columns`). Missing carriers are a safe no-op.
+* `enforce_derived_column_policy_frame` at line 109-143 unions the
+  durable names into `helper_names` *before* the value-check
+  branch. The value-check branch (lines 130-139) consumes
+  `enrich_spec` only, which is populated from `_meta.derived`
+  alone. The `drop_cols` computation at line 141 consumes
+  `helper_names` (union of both carriers). This is the correct
+  separation: durable identity affects what gets dropped, never
+  what gets value-checked.
+
+== `no_helper_columns` rule assessment
+
+The new rule is added to
+`src/spreadsheet_handling/domain/validations/reference_validations.py`:
+
+* Rule type registered alongside existing types in
+  `_VALID_RULE_TYPES` at line 35-41.
+* Dispatch in `_validate_rules` at line 133-134 uses the established
+  branch-per-type pattern; no parallel infrastructure.
+* `_validate_no_helper_columns` (line 336-362) reads the durable
+  list, finds columns still present on the frame, emits one
+  `ReferenceFinding` naming the offending columns. The finding
+  shape matches `FINDING_COLUMNS` so the existing serializer and
+  the `mode=fail` path work without further changes.
+* `_durable_helper_columns` (line 614-627) is the local reader
+  duplicate of `_safe_durable_helper_names`. See *Non-blocking
+  finding 3* about the strictness asymmetry between the two.
+
+Findings shape verified against the existing schema:
+
+[source,json]
+----
+{
+  "rule_type": "no_helper_columns",
+  "frame": "orders",
+  "columns": "_customer_name",
+  "row_index": "",
+  "value": "",
+  "target_frame": "",
+  "target_columns": "",
+  "severity": "warn",
+  "message": "Helper columns must be absent after cleanup."
+}
+----
+
+`row_index`, `value`, `target_frame`, `target_columns` are correctly
+empty for a schema-level (column-presence) check. `columns` carries
+the offending helper name; multiple helpers would serialize as the
+existing list-collapsing convention. Findings frame columns are the
+canonical `FINDING_COLUMNS`. `mode=fail` raises with the
+`no_helper_columns <frame>(<columns>)` shape consistent with the
+other rule types.
+
+The recommended pipeline tail in the FK helper concept doc
+(`apply_derived_column_policy -> validate_references /
+no_helper_columns -> write`) is the right discipline. It pairs the
+cleanup step with the assertion rule that catches silent regressions
+(the exact failure mode the original BUG had), without putting
+either in the writer.
+
+== XPASS / unresolved-helper-value assessment
+
+`tests/roundtrip/test_pathological_cell_contracts.py
+::test_empty_fk_source_helper_representation` is annotated
+`xfail strict=False` against
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`. The assertion is:
+
+[source,python]
+----
+helper_absent = helper_column not in unresolved
+helper_value = unresolved.get(helper_column)
+helper_is_null = helper_value is None
+assert helper_value != "nan"   # always-on guard
+assert helper_absent or helper_is_null
+----
+
+Before the fix, `helper_absent` was `False` and `helper_value` was the
+empty string (or `"nan"` on the worldbuilding ODS path) -- the
+assertion failed, the test xfailed. After the fix, `helper_absent`
+becomes `True` (cleanup removed the column) and the assertion passes
+trivially -- xpassed.
+
+This is the *masking* case the BUG closure note explicitly calls
+out. The unresolved-helper-value contract is *not* decided by this
+fix; the test simply has no leaked helper to inspect anymore.
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` remains open in
+`docs/backlog/` and its acceptance criteria are unchanged.
+
+The use of `strict=False` is correct here: an XPASS under a different
+condition (cleanup masks the symptom) is exactly the situation
+`strict=False` is designed to tolerate. A future agent looking at
+the test report sees one XPASS with a clearly named BUG reason; the
+test file's docstring and the BUG closure both document why the
+test will pass even before the contract is decided. See
+*Non-blocking finding 2* for a small refinement opportunity.
+
+== Implementation review: per-question
+
+. *Is `_meta.sheets.<frame>.helper_columns` semantically sufficient
+  as durable drop-identity carrier?*
++
+Yes. The durable carrier carries enough information to identify
+which columns to drop (their names). Value/mismatch checks require
+the richer rich `_meta.derived` shape and the fix correctly keeps
+those checks gated to that carrier.
+
+. *Is `_meta.derived` still treated as transient and not persisted?*
++
+Yes. The fix does not touch `_strip_consumed_provenance`, the
+persistence boundary, or any writer. `_meta.derived` is still
+stripped at persistence; the durable carrier the fix consumes is
+the one that was already persisted as workbook-view metadata
+before this commit.
+
+. *Is the fallback really limited to drop identity / helper identity?*
++
+Yes. Durable names enter `helper_names`, which is consumed only by
+the `drop_cols` computation. The value-check branch consumes
+`enrich_spec`, which comes from `_meta.derived` alone. Verified by
+unit probe (warn_on_mismatch with durable-only carrier: drops
+helpers, writes an empty findings frame, raises nothing).
+
+. *Are value-/mismatch-/provenance-policies not fed from incomplete
+  durable meta?*
++
+Yes -- correctly not fed. `_validated_enrich_spec` is called only
+on `derived_meta.get("enrich_lookup")`, where `derived_meta` is
+`_meta.derived.sheets.<frame>`. Durable metadata never reaches the
+enrich_spec path.
+
+. *Do writers and persistence boundary stay free of semantic cleanup
+  logic?*
++
+Yes. The commit modifies only domain code
+(`derived_column_policy.py`, `reference_validations.py`) and docs.
+No writer, no `persistence_boundary.py`, no orchestrator change.
+
+. *Is the new `no_helper_columns` rule well-housed in
+  `validate_references`?*
++
+Yes. It plugs into the existing dispatch, uses the existing
+`ReferenceFinding` shape, integrates with `mode=warn`/`mode=fail`,
+serializes through the existing findings frame. No new validation
+primitive, no new column schema.
+
+. *Are findings informative enough (frame + offending helper
+  columns)?*
++
+Yes. `frame` and `columns` carry the actionable information.
+`message` names the contract being asserted. The empty
+`row_index`/`value`/`target_frame`/`target_columns` are correct for
+a schema-level check.
+
+. *Is the roundtrip cleanup test now green for the right reason?*
++
+Yes. Verified by manual probe: with the fix, the durable carrier
+contains `_entities_name`; `_meta.derived` is absent at reimport
+time; the cleanup step reads the durable carrier and drops the
+column; canonical items.json has no helper columns. Pre-fix this
+exact configuration produced a leak (recorded in the BUG's
+reproduction recipe).
+
+. *Is the XPASS correctly understood as masking, not as closure of
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`?*
++
+Yes. The unresolved-helper-value BUG remains open in
+`docs/backlog/BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A.adoc`.
+The fix removes the helper column entirely from canonical output
+for the fixture's empty-FK row, so the test's "absent OR null"
+disjunction passes via the absence branch. The contract for the
+value-when-present case is still undecided.
+
+. *Is documentation appropriately scoped (not over-extended)?*
++
+Yes. Three doc touches: release notes (two short bullets), FK
+helper metadata concept (one new paragraph and one new recommended
+pipeline tail), supporting-step catalog (two one-line updates).
+The ADR is short and on-topic. No semantic-model chapter pulled in,
+no `_ftrs_open.adoc` index churn beyond the BUG removal that the
+archival lifecycle requires.
+
+. *Are ADR and Release Notes proportionate?*
++
+Yes. The ADR captures one decision (writers serialize; domain owns
+cleanup and validation) with rejected alternatives. Format matches
+`ADR-RENDER-FLOW-VS-DOMAIN-PIPELINE` and
+`ADR-META-BLOB-SERIALIZATION`. Release notes entries name the new
+behavior and the new rule type without overcommitting to a public
+import surface.
+
+. *Are there backward-compat risks for historical ODS/XLSX still
+  embedding `_meta.derived`?*
++
+Low. With both carriers present, helper names are unioned (set
+absorbs duplicates); drop_cols is unchanged because deduped names
+target the same physical columns. Value checks still come from the
+rich `_meta.derived` channel. No new failure mode for historical
+files.
+
+== Findings
+
+=== Blocking findings
+
+*None.*
+
+=== Non-blocking findings
+
+==== F-NB-1 -- `warn_on_mismatch` with durable-only carrier silently degrades to drop
+
+*Observation.* When `apply_derived_column_policy ... policy:
+warn_on_mismatch` runs on a frame where `_meta.derived` is absent
+but the durable list names helper columns, the step drops the
+columns but performs no value comparison. The findings frame is
+written but empty. The docstring says `warn_on_mismatch` "drops,
+value-checks enrich_lookup helpers". With durable-only metadata,
+there are no enrich_lookup helpers to check, so no value check
+runs.
+
+*Why non-blocking.* This is the correct conservative behavior --
+the alternative (don't drop) would be worse for the cleanup
+contract. The FK helper concept doc records the degradation
+("mismatch value checks remain limited to the richer `_meta.derived`
+provenance"). A consumer that needs strict value-checking should
+ensure `_meta.derived` is present in the same pipeline run (it is,
+by default, because the runtime materializes it).
+
+*Recommended action.* No code change. Optionally name the degradation
+in the catalog row for `apply_derived_column_policy` (currently the
+catalog mentions the durable fallback but does not mention that
+warn/fail modes become drop-only when the durable fallback is the
+only carrier).
+
+==== F-NB-2 -- XPASS reporting could be tightened with a referencing comment in the BUG-UNRESOLVED test
+
+*Observation.* `test_empty_fk_source_helper_representation` now
+xpasses by construction (the cleanup fix masks the symptom). With
+`strict=False` the suite tolerates this. A future agent reading the
+test in isolation will see "the test passes" and might assume
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` is now satisfied.
+
+*Why non-blocking.* The XFAIL reason already names the open BUG and
+the test docstring documents the candidate contract. The BUG file
+itself stays open in `docs/backlog/` so anyone navigating from the
+test reason to the source of truth lands on the open ticket.
+
+*Recommended action.* Optionally append one sentence in the test
+docstring: "After `BUG-HELPER-CLEANUP-CONTRACT-P4A` landed the
+cleanup fix masks this symptom by removing the column entirely; the
+test passes (XPASS) without the contract for unresolved helper
+values being decided." This is purely a clarity improvement for
+future maintainers; no behavior change.
+
+==== F-NB-3 -- Asymmetric strictness between the two durable-carrier readers
+
+*Observation.* `_safe_durable_helper_names` in
+`derived_column_policy.py` raises `ValueError` on malformed shapes
+(non-Mapping `sheets`, non-Mapping sheet entry, non-list
+`helper_columns`). `_durable_helper_columns` in
+`reference_validations.py` silently returns `[]` for the same
+malformed shapes. Both functions read the same on-disk carrier.
+
+*Why non-blocking.* The asymmetry is defensible per role: the
+cleanup step must read the carrier to act on it, so silent
+malformed-no-op would be a stealth failure; the validation rule's
+job is to report, and absent valid data it has nothing to assert,
+so returning `[]` is reasonable. But two readers of the same
+carrier diverging on what "malformed" means is a small smell that
+could surprise a future maintainer.
+
+*Recommended action.* Optionally extract a single shared reader
+with a `strict: bool` parameter and let each caller choose the
+posture explicitly. Or document the intentional asymmetry next to
+the two readers. Not in scope for this fix.
+
+== Risks and residual concerns
+
+* *None blocking the 0.2.0 release for this BUG.*
+* *Released as 0.2.0 fix:* the release-notes entry under
+  *User-facing changes* names the cleanup-contract restoration; the
+  entry under *Transformation and pipeline changes* names the new
+  `no_helper_columns` rule. Both are appropriately scoped.
+* *Open follow-ups outside this BUG:*
+** `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- masking does
+   not close it. Contract decision still pending.
+** `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` and
+   `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- the long-term
+   durable-carrier work. The fix aligns with their direction by
+   choosing the existing workbook-view carrier rather than
+   inventing a new one.
+** `TD-META-LIFECYCLE-INVENTORY` -- the unfinished lifecycle
+   classification still applies; this fix narrows one item from
+   that list (FK helper drop identity) by giving it a documented
+   carrier.
+
+== Final recommendation
+
+*Accept.*
+
+The fix closes the regression introduced by
+`BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` without re-opening it,
+honors the chosen architectural direction
+(`ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB`), reuses existing
+domain validation infrastructure, and is regression-covered at three
+levels (unit, validation-rule unit, roundtrip). Documentation is
+proportionate. No release blocker.
+
+The three non-blocking findings are clarity / consistency
+improvements only; the maintainer may pick them up opportunistically
+or leave them for a later FTR.
+
+The BUG is correctly archived in
+`docs/cold_storage/backlog/ftrs_done/`.
