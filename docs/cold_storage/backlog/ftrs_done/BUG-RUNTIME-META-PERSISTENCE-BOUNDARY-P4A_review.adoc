@@ -1,0 +1,302 @@
+= BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A Review
+:review-date: 2026-06-01
+
+== Commit Reviewed
+
+* Commit: `d9d21f752d9c5ee053c0fac556df983c1d890520`
+* Branch observed: `dev`
+* Review type: completed bugfix review, semantic / architectural focus
+
+== Scope
+
+Reviewed the persistence-boundary implementation and related tests/docs for the Dino
+runtime metadata contamination bug:
+
+* `src/spreadsheet_handling/application/orchestrator.py`
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py`
+* `tests/unit/pipeline/test_persistence_boundary.py`
+* `tests/integration/pipeline/test_orchestrator_persistence_boundary.py`
+* semantic model, Developer Guide, agent rules, release notes
+* new backlog / technical debt artifacts
+* moved cold-storage bug ticket
+
+== Verdict
+
+*Yellow -- keep the fix, but require follow-up before release.*
+
+The core idea is correct: the boundary is a lifecycle concern owned by the
+orchestrator, it runs after configured pipeline steps and before saving, and the
+projection rules are narrow enough for the release-near bugfix.
+
+Two release-facing gaps remain:
+
+* a public `pipeline.runner.run_app()` write path bypasses the projection entirely;
+* the documented closure does not clearly warn that already-contaminated input
+  sidecars may still need one-time cleanup because this boundary is post-pipeline
+  and cannot repair input that crashes during configured steps.
+
+== Blocking Findings
+
+No Red/blocking finding that requires reverting the commit.
+
+== Required Follow-Ups Before Release
+
+=== High-1: `run_app()` bypasses the persistence boundary
+
+`orchestrate()` applies the projection at the right point:
+`src/spreadsheet_handling/application/orchestrator.py:101` runs configured steps,
+`src/spreadsheet_handling/application/orchestrator.py:112` projects `_meta`, and
+`src/spreadsheet_handling/application/orchestrator.py:118` saves.
+
+However, `src/spreadsheet_handling/pipeline/runner.py:39` runs configured steps and
+`src/spreadsheet_handling/pipeline/runner.py:49` calls the saver directly, with no
+call to `project_meta_to_persistable_contract`.
+
+This is not obviously dead code. The technical model still names
+`pipeline/runner.py::run_app()` as the application-level `AppConfig` entry point
+(`docs/technical_model/ch06_architectural_layers/architectural_layers.adoc:69`),
+and `docs/ai_info/architecture_primer.adoc:75` to `:80` describes the all-format
+flow as `run_app() -> get_saver(kind)`. The consumer smoke test also states that
+`run_app` is part of the public surface used by `spreadsheet-handling-demo`
+(`tests/integration/pipeline/test_consumer_smoke.py:4` to `:16`).
+
+Required action: either route `run_app()` through `orchestrate()`, add the same
+projection boundary there, or explicitly retire/deprecate that path and update the
+docs/tests that still define it as public. Add a regression proving `run_app()`
+does not persist `helper_policies.fk.relations` entries produced by
+`configure_fk_helpers`.
+
+=== High-2: Existing-contaminated-sidecar limitation is under-documented
+
+The implementation is intentionally post-pipeline. That is architecturally right
+for preventing new contamination, but it means a pre-existing contaminated
+`_meta.yaml` can still be consumed by `add_fk_helpers` or other steps before the
+boundary gets a chance to save a cleaned sidecar.
+
+The current docs mention that historical `_meta.yaml` migration is out of scope
+(`src/spreadsheet_handling/pipeline/persistence_boundary.py` module docstring) and
+defer legacy handling in `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`, but the active
+semantic docs and closed bug ticket do not plainly state the operational
+limitation. The closed ticket instead says the fixed path allows promotion of a
+reviewed reimport snapshot including `_meta.yaml` without consumer-side stripping
+(`docs/cold_storage/backlog/ftrs_done/BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A.adoc:135`
+to `:139`), which is too broad for a post-pipeline-only hook.
+
+Required action: document that already-contaminated sidecars may need a one-time
+cleanup/quarantine if they fail before save. The bug closure should distinguish
+"prevents future persisted contamination" from "repairs all existing contaminated
+inputs".
+
+== Non-Blocking Findings / Follow-Ups
+
+=== Medium-1: Synthetic Dino regression is weaker than the observed mechanism
+
+`tests/integration/pipeline/test_orchestrator_persistence_boundary.py:152` to
+`:188` verifies that a stale runtime relation is stripped across two identity
+runs. That proves the write-side boundary, but it does not execute the actual
+failure chain described in the ticket: stale relation replay, FK-helper
+materialization on `groups`, tuple-shaped columns, then `join_frames` rejecting
+the frame.
+
+This is acceptable for the narrow boundary test, but the test name/comment should
+not overclaim. A stronger follow-up regression should run a synthetic
+`configure_fk_helpers` / `add_fk_helpers` / `join_frames` path or preserve a
+minimal fixture that demonstrates the original failure pre-fix.
+
+=== Medium-2: `infer_fk_relations` is deferred, but should be named in active docs
+
+The narrow pruning rule only removes relations with
+`produced_by.step == "configure_fk_helpers"`. That matches the observed Dino
+carrier and is conservative. `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` explicitly
+tracks inferred / heuristic relations from `infer_fk_relations` and says the
+single discriminator does not capture the broader lifecycle.
+
+The active semantic section should still name this as a known deferral. Otherwise
+future readers may infer that all runtime-produced FK-helper v2 relations are
+covered by the current boundary.
+
+== Test Evidence
+
+Commands run locally from `/home/stefan/repos/spreadsheet-handling/core`:
+
+[source,bash]
+----
+.venv/bin/python -m pytest -q tests/unit/pipeline tests/integration
+.venv/bin/python -m pytest -q
+----
+
+Both passed.
+
+Initial `pytest -q ...` and `python -m pytest ...` attempts failed because
+`pytest` and `python` were not on PATH in this shell; the repository `.venv`
+interpreter was available and worked.
+
+== Documentation Evidence
+
+Positive coverage:
+
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc:201` to `:223`
+  documents the lifecycle placement.
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc:225` to `:232`
+  correctly states this is not a normal pipeline step.
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc:234` to `:257`
+  captures carrier neutrality.
+* `docs/developer_guide/ch06_code_conventions/01_code_conventions.adoc`
+  documents the producer/orchestrator split.
+* `docs/ai_info/agent_rules.adoc` prevents future agents from rebuilding the
+  boundary as a plugin, YAML step, or backend-specific rule.
+* `docs/backlog/FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.adoc` and
+  `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc` are the right backlog
+  artifacts for the larger lifecycle inventory.
+* `docs/backlog/technical_debt.adoc` makes the incomplete inventory explicit.
+
+Documentation gap:
+
+* The closed bug ticket and release-facing docs should explicitly state the
+  already-contaminated-sidecar limitation described above.
+
+== FK-Helper Policy Pruning Assessment
+
+The pruning rule is intentionally conservative and mostly correct for this bug:
+
+* It removes only `helper_policies.fk.relations` entries whose
+  `produced_by.step` is `configure_fk_helpers`.
+* It preserves the `helper_policies` root.
+* It preserves lookup helper policy.
+* It preserves v1 per-target FK helper entries.
+* It preserves relations without the runtime producer marker.
+* It removes the orphan `schema_version` only when all relations are pruned,
+  which avoids leaving a misleading empty v2 envelope.
+
+`produced_by.step == "configure_fk_helpers"` is sufficient for the observed
+Dino carrier, but not a complete lifecycle discriminator. `infer_fk_relations`
+is another runtime policy producer and is appropriately deferred only if the
+deferral is explicit in active docs and release notes.
+
+== Existing-Contaminated-Sidecar Limitation
+
+The limitation is real and should be stated plainly:
+
+* The boundary is after configured pipeline execution.
+* Therefore it prevents contaminated runtime meta from being written at the end
+  of a successful run.
+* It cannot remove stale input meta before steps consume it.
+* If stale input meta causes a step to fail before save, no cleaned output is
+  written.
+
+That does not invalidate the architectural placement. It means the release notes
+and closed bug ticket need to avoid implying automatic repair of every promoted
+pre-fix `_meta.yaml`.
+
+== Answers To Review Questions
+
+1. Hook placement in `orchestrate()` is correct: after configured steps, before save.
+2. The boundary is implemented as lifecycle/persistence behavior, not a domain transformation.
+3. The projection function is pure/idempotent/non-mutating for the covered rules. It does not deep-copy every preserved nested value, but it does not mutate input.
+4. Pruning rules are conservative enough for the narrow bugfix.
+5. FK pruning preserves legitimate helper policy shapes covered by the tests.
+6. `configure_fk_helpers` is sufficient for the observed carrier; `infer_fk_relations` should remain an explicit follow-up/deferral.
+7. In `orchestrate()`, the hook is carrier-neutral and precedes all savers. Across the repository, `run_app()` currently breaks that consistency.
+8. Spreadsheet meta persistence risk is low because user-authored workbook/presentation metadata is not pruned; only root `derived`, root `__*`, and selected FK relations are removed.
+9. The synthetic regression covers the stale-carrier persistence mechanism but not the full materialization plus `join_frames` failure path.
+10. The existing-contaminated-sidecar limitation is not clear enough and should be fixed before release.
+11. The new FTRs/debt entries are sufficient to signal that this is not the completed global `_meta` lifecycle model.
+12. Bug closure is directionally honest about the narrow fix, but overstates the promoted-`_meta.yaml` recovery story unless the limitation is added.
+
+== Final Recommendation
+
+Keep commit `d9d21f7`, but do not release it as-is. Before release, close the
+`run_app()` bypass and add the explicit existing-contamination limitation to the
+semantic docs, release notes, and cold-storage bug closure. The implementation
+itself is narrow, aligned with the architecture decision, and backed by passing
+targeted and full test runs.
+
+== Disposition
+
+Both release-facing follow-ups were closed in a single targeted commit on
+the same FTR-/Bug-scope:
+
+=== High-1 disposition: `run_app()` routed through `orchestrate()`
+
+`src/spreadsheet_handling/pipeline/runner.py` is now a thin adapter over
+`spreadsheet_handling.application.orchestrator.orchestrate`. It translates
+the first configured input plus the output endpoint into the
+orchestrator's `input` / `output` / `steps` / `header_levels` surface and
+delegates. The local loader/saver dispatch and the pre-existing pipeline
+execution macro flow were removed; `run_app` no longer constructs its
+own load/step/save sequence.
+
+The `orchestrate` symbol is imported inside the function body to avoid a
+cycle with `pipeline.__init__` re-exporting `run_app` while the
+orchestrator transitively imports from `pipeline`. Behavior and the
+public return shape `(frames, meta, issues)` are unchanged.
+
+A new test
+`tests/integration/pipeline/test_orchestrator_persistence_boundary.py::test_run_app_routes_through_persistence_boundary`
+constructs an `AppConfig` whose input `_meta.yaml` carries a
+runtime-produced FK-helper v2 relation
+(`source_frame=groups, target_frame=places, produced_by.step=
+configure_fk_helpers`) plus a `derived` top-level. It runs `run_app`,
+re-reads the persisted output sidecar, and asserts:
+
+* the persisted `_meta` has no `derived` key,
+* `helper_policies.fk.relations` is absent (paired `schema_version`
+  removed too),
+* the returned `frames["_meta"]` reflects the projected view.
+
+This guards against an accidental reintroduction of a second
+load/step/save path that would bypass the persistence boundary.
+
+=== High-2 disposition: operational scope and limitation documented
+
+Three documents now state plainly that the boundary is post-pipeline and
+write-side only, and that pre-existing contaminated `_meta.yaml` inputs
+may need a one-time cleanup or quarantine:
+
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc` adds an
+  *Operational scope: post-pipeline, write-side only* subsection and a
+  *Known deferrals* subsection that names `infer_fk_relations` as the
+  explicit out-of-scope runtime producer (Medium-2 follow-up).
+* `docs/release_notes/release_notes.adoc` rephrases the highlight and
+  the backends entry to make clear that the boundary prevents *new*
+  contamination but does not retroactively repair pre-fix sidecars.
+  The same entry now states that `run_app` is a thin adapter over
+  `orchestrate` (High-1).
+* The closed bug ticket at
+  `docs/cold_storage/backlog/ftrs_done/BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A.adoc`
+  gains an *Operational scope and limitation* section and a *Review
+  follow-up (codex 2026-06-01)* section that cite this review note's
+  findings and their disposition.
+
+=== Validation of disposition
+
+[source,bash]
+----
+.venv/bin/python -m pytest \
+  tests/integration/pipeline/test_orchestrator_persistence_boundary.py \
+  tests/unit/pipeline/test_run_app.py \
+  tests/integration/pipeline/test_consumer_smoke.py \
+  tests/integration/pipeline/test_run_minimal_roundtrip_pipeline.py \
+  tests/integration/pipeline/test_ir_roundtrip_smoke.py \
+  tests/unit/pipeline/test_public_import_surface.py \
+  -v
+----
+
+Result: 18 passed, including the new
+`test_run_app_routes_through_persistence_boundary`.
+
+Full suite:
+
+[source,bash]
+----
+.venv/bin/python -m pytest tests/unit tests/integration tests/architecture
+----
+
+Result: 929 / 929 pass (previous 928 plus the new `run_app` regression).
+
+Medium-1 (stronger synthetic regression that exercises the full
+`configure_fk_helpers` / `add_fk_helpers` / `join_frames` chain) and
+Medium-2 (broader runtime-producer coverage for `infer_fk_relations`)
+remain documented follow-ups under
+`FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`; they were deliberately not
+collapsed into this release-near disposition.

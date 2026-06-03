@@ -75,6 +75,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             _add_marker(item, "unit")
         elif parts and parts[0] == "integration":
             _add_marker(item, "integ")
+        elif parts and parts[0] == "roundtrip":
+            _add_marker(item, "roundtrip")
         elif parts and parts[0] == "architecture":
             _add_marker(item, "arch")
             if "current_state" in parts:

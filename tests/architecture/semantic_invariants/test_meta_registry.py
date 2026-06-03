@@ -20,14 +20,7 @@ pytestmark = [
 
 def _load_registry() -> dict:
     repo_root = Path(__file__).resolve().parents[3]
-    registry_path = (
-        repo_root
-        / "docs"
-        / "technical_model"
-        / "ch05_registries"
-        / "meta_registry"
-        / "meta_registry.yaml"
-    )
+    registry_path = repo_root / "registries" / "meta_registry.yaml"
     with registry_path.open("r", encoding="utf-8") as handle:
         loaded = yaml.safe_load(handle)
     assert isinstance(loaded, dict)

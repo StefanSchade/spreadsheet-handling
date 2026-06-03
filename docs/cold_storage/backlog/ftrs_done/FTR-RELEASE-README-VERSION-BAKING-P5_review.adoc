@@ -1,0 +1,441 @@
+= FTR-RELEASE-README-VERSION-BAKING-P5 -- Implementation Review
+
+== Metadata
+
+|===
+| Field           | Value
+
+| Review date     | 2026-05-24
+| Reviewed FTR    | `FTR-RELEASE-README-VERSION-BAKING-P5`
+                    (promoted from Draft directly to Done in this
+                    slice).
+| Repos           | `spreadsheet-handling` core only. Per FTR
+                    *Non-goals*: no scope expansion to demo or pages
+                    repos in this slice.
+| Reviewer        | Claude Opus 4.7 (implementation + self-review)
+| Scope of slice  | One core commit. Read-only helper +
+                    Make wrapper + workflow guard + runbook section +
+                    backlog lifecycle.
+|===
+
+== Verdict
+
+Ship. The slice solves the silent-miss drift problem the FTR
+identifies (PyPI keeps old release pages online indefinitely; a
+`/latest/...` link inside a frozen README silently sends an old
+release's reader to documentation that no longer matches the
+installed version), without committing to the more invasive
+"two commits per release" automated workflow the FTR's
+*Risks / open questions* explicitly defers.
+
+The chosen path is *manual substitution on a release branch +
+read-only CI guard*. Substitution stays a maintainer decision; the
+helper only verifies. The CI guard is wired into the publish job
+before `python -m build`, so a missed bake fails the workflow
+before the wheel is generated and PyPI never sees a release whose
+README points at `/latest/...`.
+
+== Scope reviewed
+
+* Does the helper follow the existing tooling pattern
+  (`tools/release_check.sh`, `tools/pages_publish_check.sh`)?
+* Does the Make wrapper match the existing wrapper shape
+  (`release-check`, `pages-check`, `release-status`) -- single Make
+  variable threaded through with `$(if ...)`?
+* Does the CI guard fail the publish job before
+  `python -m build` runs (so a missed bake never reaches PyPI)?
+* Does the runbook section explain *why* (drift on PyPI, GitHub
+  release pages), *what* (substitution surface and policy), and
+  *how* (manual procedure, helper invocation, CI guard, idempotency,
+  demo-repo adoption)?
+* Does the slice avoid the FTR Non-goals (no template engine, no
+  general-purpose documentation pipeline, no rewriting of URLs
+  outside `README.md`, no in-code URL rewriting, no scope expansion
+  to other repositories beyond core README)?
+* Does the slice preserve the FTR's narrow allowlist (only
+  `https://stefanschade.github.io/spreadsheet-handling-pages/latest/`
+  URLs are flagged; other `latest`-shaped strings are left alone)?
+
+== Files changed
+
+Core repo only (`spreadsheet-handling`):
+
+* `tools/readme_links_check.sh` -- new, executable. Bash with
+  `set -euo pipefail`, color output when stdout is a terminal, two
+  modes (lint default; release-tag enforcement via
+  `--release-tag vX.Y.Z`), three exit codes (0 safe / 1 enforcement
+  failure / 2 setup error), `--file PATH` override for the scanned
+  README, and a `--help` that re-prints the leading comment block as
+  the operator-facing reference. Strictly read-only: no `sed -i`, no
+  filesystem writes, no `git` invocations. ~150 lines, doc header
+  is the contract.
+* `Makefile` -- new `readme-check` target with descriptive `##`
+  help text. Threads optional `TAG=` and `FILE=` Make variables to
+  helper flags using `$(if ...)`, matching the
+  `release-check` / `pages-check` / `release-status` pattern.
+* `.github/workflows/release.yml` -- new step *README link-versioning
+  guard* in the `publish` job, positioned immediately before
+  `python -m build`. The step runs `make readme-check
+  TAG=${GITHUB_REF_NAME}`. Inline comment explains why the guard
+  exists and references the runbook section. No other workflow
+  change; the test job, the publish-docs job, the concurrency block,
+  and the Trusted Publisher action are untouched.
+* `docs/developer_guide/ch09_release_management/02_release_runbook.adoc`
+  -- new top-level section *Release-bound README links* with five
+  subsections (*Why*, *Substitution surface*, *Manual procedure*,
+  *CI guard*, *Demo repository*, *Idempotency*). The *Core Release
+  Checklist* bullet list gains a line referencing the new section;
+  the *For the current GitHub Actions based release flow* numbered
+  list gains an explicit branch-and-bake step plus a sentence on
+  what the CI guard does. Cross-references the runbook's existing
+  branch-awareness language and the
+  `developer_guide/ch09_release_management/01_ci_cd_and_publishing.adoc`
+  publish-job description.
+* `docs/cold_storage/backlog/ftrs_done/FTR-RELEASE-README-VERSION-BAKING-P5.adoc`
+  -- moved from `docs/backlog/`. Status flipped from
+  *Draft -- design only; not implementation-ready* to *Done*. New
+  *Delivery scope* subsection enumerates the landed files,
+  cross-references the chosen path against the FTR's two candidate
+  paths, and lists the deferred items. The
+  `[IMPORTANT]` design-draft callout from the top of the FTR is
+  replaced with a `[NOTE]` block that preserves the historical
+  design rationale as context that informed the implementation.
+* `docs/cold_storage/backlog/ftrs_done/FTR-RELEASE-README-VERSION-BAKING-P5_review.adoc`
+  -- this document.
+* `docs/backlog/_ftrs_open.adoc` -- include directive for the FTR
+  dropped; Phase 2 *Recommended order* note updated so the
+  archived-here breadcrumb is explicit, in the same shape used by
+  the other two Phase 2 entries that landed earlier.
+
+No source-code change. No publish-docs job change. No demo repo
+change. No pages repo change. No `pyproject.toml` change (the
+`readme = "README.md"` line stays untouched).
+
+== Chosen strategy
+
+*Manual substitution on a release branch + read-only CI guard.*
+
+The release runbook *Release-bound README links* section is the
+maintainer-facing contract:
+
+. Branch off `main` to a short-lived release branch.
+. Run a sed substitution (a copy-and-paste one-liner is documented
+  in the runbook and is also printed by
+  `readme_links_check.sh --release-tag` on a non-clean README) that
+  rewrites every `…/spreadsheet-handling-pages/latest/` URL to
+  `…/spreadsheet-handling-pages/versions/v<version>/`.
+. Run `make readme-check TAG=v<version>` to verify.
+. Commit the substitution; merge or fast-forward into `main`; tag
+  from the release-bound commit; push the tag.
+. The publish workflow's *README link-versioning guard* step runs
+  the same check before `python -m build`; a missed bake fails the
+  publish before anything is built.
+. On `main`, restore `/latest/...` so the living README is
+  unaffected.
+
+The helper does only the *check* half. It does not call `sed -i`,
+does not write to the file system, does not git-add or git-commit,
+and does not require any release-time secret access.
+
+== Why not the alternatives
+
+* *Automated `prepare-release` / `finalize-release` two-commit
+  workflow* (the second candidate the FTR's *Scope (design phase)*
+  describes). The FTR's *Risks / open questions* explicitly calls
+  out the two-commits-per-release vs single-drift-commit trade-off
+  as the most contentious unresolved design point. Implementing it
+  here would require either committing to that workflow shape
+  without a separate design review, or building both shapes and
+  letting the maintainer pick at release time -- both larger than
+  the FTR scope. The chosen path produces the same release-time
+  correctness guarantee (no `/latest/` URL leaves PyPI for a frozen
+  release) without committing to either shape; the maintainer can
+  always layer automation on top later by wrapping the documented
+  sed substitution in a script.
+
+* *Build-time README substitution* (rewriting the README inside
+  `python -m build` or a pre-build step that does the substitution
+  and re-points `[project].readme`). Rejected on three grounds:
++
+- FTR *Non-goals* prohibits "template engine, Jinja-style
+  preprocessing, general-purpose documentation pipeline". A
+  build-time substitution that produces a generated readme path
+  blurs that line and starts conversations about substitution
+  scope, generated-file location, and reproducibility.
+- The tagged commit on the release branch would no longer match
+  what `python -m build` packages as the long description: a
+  reader who clones the tag would see one README; PyPI would
+  display another. Surprising and hard to debug.
+- It requires `[tool.setuptools]` plumbing (a `dynamic` declaration
+  for `readme`, or a `setup.py`-level shim) that changes how
+  routine dev workflows interact with packaging.
+
+* *`pyproject.toml [project].readme` redirected to a `build/`
+  artifact.* Same drawbacks as build-time substitution, plus it
+  splits the maintainer's mental model between "README on `main`"
+  and "README packaged from `build/`". The manual-substitution path
+  keeps one README per branch and lets git history record which
+  shape each commit carries.
+
+* *No tooling; just a manual checklist*. This is the FTR's
+  *Interim manual checklist*. It is the right shape for the policy
+  documentation but leaves the "operator forgot to bake" failure
+  mode silent: a maintainer who skips the sed step still passes
+  every existing `release-check` invariant and ships to PyPI. The
+  read-only CI guard added in this slice closes that gap with one
+  step in the publish job and no risk to the rest of the workflow.
+
+== Validation commands run
+
+Helper exec contract:
+
+[cols="1,2", options="header"]
+|===
+| Command | Result
+
+| `bash tools/readme_links_check.sh --help`
+| Prints the leading comment block as the operator reference and
+  exits 0.
+
+| `bash tools/readme_links_check.sh` (lint mode against the current
+  living `README.md`)
+| Reports one `/spreadsheet-handling-pages/latest/` URL with
+  source line numbers and exits 0 (lint mode is informational; the
+  living README is allowed to use `/latest/` per the policy).
+
+| `bash tools/readme_links_check.sh --release-tag v0.1.0b7`
+  (release-tag enforcement against the current living `README.md`)
+| Fails with one FAIL line (one per `/latest/` URL) and prints
+  the suggested sed substitution. Exits 1. This is the failure mode
+  the CI guard catches when a maintainer skips the manual bake.
+
+| `bash tools/readme_links_check.sh --release-tag v0.1.0b7 --file
+  /tmp/baked.md` where `/tmp/baked.md` is a copy of `README.md`
+  with the sed substitution applied
+| Prints `PASS`; exits 0. Verifies the helper recognises the baked
+  state.
+
+| `bash tools/readme_links_check.sh --release-tag v0.1.0b7 --file
+  /tmp/baked.md` re-run on the same file
+| Same `PASS`; exits 0. Confirms idempotency of the check
+  (rerunning on a baked file is a no-op).
+
+| `bash tools/readme_links_check.sh --release-tag 0.1.0b7`
+  (missing `v` prefix)
+| Fails with a setup error explaining the tag format and exits 2.
+
+| `bash tools/readme_links_check.sh --file /tmp/does-not-exist`
+| Fails with `file does not exist`; exits 2.
+
+| `bash tools/readme_links_check.sh --bogus`
+| Fails with `unknown argument`; exits 2.
+|===
+
+Make + workflow + docs:
+
+[cols="1,2", options="header"]
+|===
+| Command | Result
+
+| `make readme-check`
+| Delegates to the helper in lint mode; same output as the bare
+  helper invocation.
+
+| `make readme-check TAG=v0.1.0b7`
+| Delegates to the helper in release-tag enforcement mode; same
+  fail-with-suggestion output as the bare helper invocation.
+
+| `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"`
+| Exit 0. The added step parses as valid YAML and the surrounding
+  job structure is unchanged.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/runbook.html
+  docs/developer_guide/ch09_release_management/02_release_runbook.adoc`
+| Exit 0. The new *Release-bound README links* section renders.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/backlog.html
+  docs/backlog/backlog.adoc`
+| Exit 0. The full backlog still renders after the FTR include is
+  removed from `_ftrs_open.adoc`.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/coldftr.html
+  docs/cold_storage/backlog/ftrs_done/FTR-RELEASE-README-VERSION-BAKING-P5.adoc`
+| Exit 0.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/coldreview.html
+  docs/cold_storage/backlog/ftrs_done/FTR-RELEASE-README-VERSION-BAKING-P5_review.adoc`
+| Exit 0.
+
+| `git diff --check`
+| No whitespace or conflict-marker issues.
+
+| `git log --oneline -1`
+| Single new commit on the slice with the prescribed
+  `chore(FTR-RELEASE-README-VERSION-BAKING-P5)` subject.
+|===
+
+Out of scope and intentionally not run:
+
+* `python -m build` and a PyPI dry-publish: the slice does not
+  change the build configuration. The publish job's existing
+  `python -m build` step is untouched aside from the new guard
+  immediately before it.
+* `make release-check`: the slice does not change
+  `tools/release_check.sh`. `make release-check` continues to be
+  the branch/topology check; the new `make readme-check` is a
+  separate concern that the runbook calls out in its own
+  checklist bullet.
+* Demo-repo helper adoption: explicitly deferred (FTR scope; the
+  runbook documents the adoption path).
+
+== Acceptance criteria check
+
+FTR *Acceptance (design-phase, current)*:
+
+* ✅ Policy documented in
+  `developer_guide/ch09_release_management/` -- the
+  *Release-bound README links* section opens with
+  *Why* (drift), *Substitution surface* (URL prefix), and the
+  link-versioning rule.
+* ✅ Both candidate paths described with explicit trade-offs --
+  the FTR's `==== Scope (design phase)` already enumerated them;
+  this review's *Why not the alternatives* records the reasoning
+  for picking the manual + guard path.
+* ✅ Interim choice for the next beta release recorded -- the
+  runbook section *Manual procedure (current, default path)* is
+  unambiguous about what the next release does.
+* ✅ Substitution surface documented and intentionally narrow --
+  *Substitution surface* in the runbook plus the
+  `LATEST_PREFIX` constant in `tools/readme_links_check.sh` are
+  the two single sources of truth.
+
+FTR *Acceptance (to be expanded when promoted from Draft to New)*:
+
+* ✅ Chosen enforcement path implemented -- read-only helper +
+  Make wrapper + CI guard + runbook procedure.
+* ✅ Idempotency verified -- re-running
+  `make readme-check TAG=vX.Y.Z` against a baked README is a no-op
+  (the helper does not modify files); re-running the documented sed
+  against a baked README produces zero changes.
+* ✅ CI/Make target asserts that the tagged README contains no
+  remaining `…/latest/...` Pages URLs --
+  `make readme-check TAG=vX.Y.Z` (local) and the publish-job CI
+  guard (remote).
+* ✅ `02_release_runbook.adoc` *Core Release Checklist* references
+  the chosen path explicitly -- bullet
+  *release-bound `README.md` links are baked … and
+  `make readme-check TAG=v<version>` reports no remaining …*.
+
+FTR *Non-goals* honoured:
+
+* ✅ No CI automation of *tagging*; the maintainer still pushes
+  tags by hand.
+* ✅ No template engine, no Jinja-style preprocessing, no
+  general-purpose documentation pipeline.
+* ✅ No rewriting of URLs outside `README.md`.
+* ✅ No in-code / docstring / asciidoc cross-reference rewriting.
+* ✅ No scope expansion to sibling repositories in this slice
+  (helper lives under `tools/` so demo *can* adopt later; runbook
+  documents the path; demo repo itself is untouched).
+* ✅ Implementation only proceeded after an explicit user-prompt
+  approval for the chosen path.
+
+== Residual risks
+
+* **Maintainer skips the bake AND CI somehow does not fire.** The
+  CI guard depends on the publish job being part of every release.
+  If a maintainer publishes to PyPI from a local `python -m build`
+  + `twine upload` (rather than via the tag-triggered workflow),
+  the guard does not run. Mitigation: the runbook prescribes the
+  tag-push flow and does not describe a manual upload path. If a
+  future emergency requires a hand-publish, the maintainer is
+  expected to run `make readme-check TAG=vX.Y.Z` first; the runbook
+  *Core Release Checklist* bullet makes that explicit.
+
+* **`main` carries an unbaked README between releases by design.**
+  That is the policy: the README on `main` is a *living* document
+  with `/latest/` links. A reader cloning the repo and reading
+  `README.md` on `main` between releases will see `/latest/` URLs
+  and follow them to the moving documentation. This is correct for
+  that audience -- they are on the moving tip of the project. The
+  policy specifically allows `/latest/` for living contexts; only
+  frozen contexts (PyPI long descriptions, GitHub release pages)
+  must use `/versions/<tag>/`.
+
+* **Maintainer forgets the restore-on-`main` step after tagging.**
+  If the release branch is merged back to `main` carrying the
+  baked URLs, `main` itself becomes a "frozen" surface pointing at
+  `versions/<vX.Y.Z>/...`. Mitigation: the runbook
+  *Manual procedure* lists the restore as step 7. The check
+  helper's lint mode (no `--release-tag`) provides a non-blocking
+  audit: a routine `make readme-check` from `main` after a release
+  prints zero `/latest/` URLs if the restore was skipped, which is
+  a visible signal during normal development. A stricter lint
+  guard (CI on `main` push that requires `/latest/` URLs present)
+  is intentionally not added in this slice; that is a different
+  policy and belongs in a follow-up if drift in this direction ever
+  shows up in practice.
+
+* **Demo-repo drift not solved by this slice.** Per FTR scope and
+  per the user prompt's "Do not touch demo or pages repos"
+  instruction, the demo `README.md` is not baked here. Demo tags
+  (`v<core-tag>-demo`) currently surface a `/latest/` README on
+  their GitHub release pages. The runbook *Demo repository*
+  subsection describes the one-line adoption path (copy the helper,
+  wire a Make target, add the checklist bullet) so the demo
+  maintainer can land a parallel slice when convenient.
+
+* **Substitution allowlist is a single literal prefix.** If the
+  Pages hostname or path layout changes (e.g. a custom domain),
+  the helper's `LATEST_PREFIX` constant and the runbook example
+  sed both need a coordinated update. Same constraint that
+  `pages_publish_check.sh` already has; documented inline in both
+  files.
+
+* **PyPI long-description rendering trust.** PyPI renders Markdown
+  with a constrained subset of features. The slice does not change
+  the Markdown shape of `README.md`, only the URL inside existing
+  links, so the rendered output is identical except for the href
+  target. No risk to the existing rendering.
+
+== Disposition
+
+Ship. All FTR Acceptance criteria (both design-phase and
+"to be expanded") are met; no open blocking findings.
+
+The slice ships as a single core commit and archives the FTR plus
+this review note to `docs/cold_storage/backlog/ftrs_done/` per the
+existing cold-storage convention. `docs/backlog/_ftrs_open.adoc` is
+updated to drop the include directive.
+
+The commit is not pushed by the agent; remote sync is the
+developer's action per `docs/ai_info/agent_rules.adoc § Remote sync`.
+
+== Skeptical follow-up review
+
+Review date: 2026-05-24.
+
+Reviewer: Codex.
+
+Findings from the independent follow-up review:
+
+* *Low -- empty `--release-tag=` was accepted as lint mode.*
+  The long-option form with an empty value should be a setup/usage
+  error, consistent with the documented exit-code contract for a
+  malformed release tag. Fixed by making `--release-tag=` exit 2 with
+  the same "requires an argument" message as `--release-tag` without
+  a following value.
+* *Low -- release-flow sequencing was inferable but too implicit.*
+  The runbook already required the release branch to reach `main`
+  before tagging, but the short GitHub Actions flow did not spell out
+  the `main` push after the README-bake commit. Clarified the flow so
+  `origin/main` contains the release-bound README commit before
+  `release-check` and tag push.
+* *Low -- this review note's validation count was stale.*
+  The current `README.md` contains one matching `/latest/` Pages URL,
+  and the helper reports one. Corrected the validation text above.
+
+No blocking findings remain after the follow-up changes. The CI guard
+is correctly placed in the `publish` job before `python -m build`, and
+it scans `./README.md` from the tag-triggered checkout rather than a
+generated artifact.

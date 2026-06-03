@@ -1,0 +1,293 @@
+===== BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A -- Runtime-only metadata must be pruned before persistence
+
+*Status:* Done
+*Priority:* P4A
+*Area:* Pipeline / metadata lifecycle / persistence boundary
+
+==== Context
+
+During the Dino worldbuilding adoption, a reviewed reimport snapshot was
+promoted back into the canonical consumer data directory, including
+`_meta.yaml`.
+
+After that promotion, a later spreadsheet export failed with:
+
+[source,text]
+----
+Error: Frame 'groups' must have flat columns
+----
+
+The failure was not caused by the canonical business data itself. The
+immediate carrier was persisted runtime metadata that was replayed on a later
+pipeline run.
+
+Concretely, `_meta.yaml` contained runtime-produced sections such as helper
+policies and workbook/runtime reconstruction metadata. On the next export run,
+that persisted runtime metadata was consumed again before the pipeline had
+re-established its fresh runtime state. In the Dino case this caused FK helper
+materialization to be applied to `groups` based on replayed helper policy for
+`places`, yielding tuple-shaped helper columns and an eventual failure in
+`join_frames`.
+
+The consumer was able to work around the problem by stripping runtime sections
+from `_meta` near the start of the export pipeline. That is useful as a local
+containment measure, but it is the wrong architectural ownership point.
+
+==== Problem statement
+
+The core pipeline currently lacks a clearly defined persistence boundary for
+metadata that is:
+
+* produced during a run,
+* consumed during the same run,
+* useful for rendering or cleanup,
+* but not part of the canonical roundtrip contract.
+
+As a result, runtime-only metadata can leak into persisted `_meta.yaml` and be
+mistaken for canonical input on a later run.
+
+This is not merely a missing cleanup edge case. It is a lifecycle bug:
+
+* the project does not yet make it explicit enough which metadata belongs to
+  canonical persistence and which does not;
+* there is no unmistakable pipeline step or persistence-boundary rule that
+  enforces this distinction before sidecar persistence;
+* the behavior is therefore vulnerable to repeated-run contamination and
+  consumer-specific workaround logic.
+
+==== Why this is architectural
+
+This bug sits at the boundary between semantic lifecycle and persistence
+mechanics.
+
+The fix must therefore be visible as part of the pipeline lifecycle, not as an
+incidental detail hidden inside a consumer plugin or left to ad hoc producer
+cleanup.
+
+The implementer still has to choose the exact carrier:
+
+* a dedicated pre-persist cleanup step,
+* a persistence-time metadata filter,
+* or another explicit pipeline-stage mechanism,
+
+but the contract must be clear in code and in documentation:
+
+* runtime-only metadata is not part of the canonical persisted roundtrip
+  surface unless explicitly classified otherwise;
+* the pipeline must remove or exclude it before persistence;
+* consumers must not be responsible for rediscovering and stripping it.
+
+==== Working hypothesis
+
+The project already distinguishes semantic classes such as canonical,
+derived/transient, render-consumed, and roundtrip-relevant metadata, but the
+persisted JSON-directory `_meta.yaml` sidecar currently does not enforce that
+boundary strongly enough.
+
+A correct fix likely needs both:
+
+* an operational enforcement point in the pipeline before persistence, and
+* explicit documentation of the metadata lifecycle so producers, consumers,
+  and maintainers know what is expected to survive a roundtrip.
+
+==== Scope
+
+* Define which runtime-produced metadata sections must not survive into the
+  persisted `_meta.yaml` sidecar by default unless explicitly classified as
+  roundtrip-relevant.
+* Add a clear pipeline-level enforcement point before persistence so this is a
+  core lifecycle rule rather than a consumer workaround.
+* Ensure repeated export/reimport/promote cycles do not replay stale runtime
+  metadata as canonical input.
+* Update the semantic model lifecycle documentation to describe this
+  persistence boundary explicitly.
+* Update the Developer Guide so implementers understand where this boundary
+  sits in the pipeline and why it matters.
+
+==== Non-goals
+
+* Do not solve this by requiring every consumer to add its own `_meta`
+  sanitizing plugin.
+* Do not treat this as a one-off FK-helper bug only; the issue is broader than
+  helper policies.
+* Do not silently blur the distinction between canonical persisted metadata and
+  runtime operational metadata.
+* Do not redesign the entire metadata model in this bug.
+
+==== Acceptance
+
+* A core pipeline run that persists `_meta.yaml` no longer leaks runtime-only
+  metadata into persisted canonical data by default.
+* Repeated roundtrips do not replay stale runtime helper/view/reconstruction
+  metadata as fresh canonical input.
+* The enforcing behavior is represented as a clear lifecycle/pipeline concern
+  in code, not merely as scattered ad hoc cleanup.
+* The intended persistence boundary is documented in:
+** `docs/semantic_model/`
+** the Developer Guide
+* The Dino worldbuilding adoption no longer requires a consumer-side workaround
+  to strip promoted runtime metadata before spreadsheet export.
+
+==== Validation
+
+* Reproduce the Dino export failure from promoted `_meta.yaml` on the
+  pre-fix path.
+* Verify that the fixed core path allows:
+** promote reviewed reimport snapshot including `_meta.yaml`
+** later spreadsheet export
+** later spreadsheet reimport
+  without consumer-side `_meta` stripping.
+* Add regression coverage for repeated-run persistence contamination.
+* Verify that documentation and code agree on which metadata classes may be
+  persisted.
+
+==== Documentation follow-up expectation
+
+This bug should feed directly into the lifecycle and persistence chapters of
+the semantic model, and likely into the Developer Guide workflow material as
+well.
+
+The key point to document is:
+
+[source,text]
+----
+runtime metadata may exist during a run,
+but metadata that does not belong to the roundtrip contract
+must be pruned or excluded before persistence
+at a clear pipeline boundary
+----
+
+==== Delivery scope
+
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py` -- new
+  module providing the pure function
+  ``project_meta_to_persistable_contract(meta)``. Pruning rules:
+** top-level ``derived`` (transient runtime helper-column provenance),
+** top-level ``__*``-prefixed keys (carrier / derived-view markers),
+** ``helper_policies.fk.relations`` entries where
+   ``produced_by.step == "configure_fk_helpers"``; when no relations
+   remain the empty ``relations`` list and its paired ``schema_version``
+   are removed too. v1 per-target dicts under ``fk`` and the
+   ``lookup`` namespace are preserved.
+* `src/spreadsheet_handling/application/orchestrator.py` -- calls the
+  pure function exactly once, between the pipeline steps and the saver,
+  for every output kind. The projection is part of the macro flow, not a
+  configurable pipeline step.
+* `tests/unit/pipeline/test_persistence_boundary.py` -- 11 pure-function
+  cases: ``derived`` removed, ``__*`` removed, helper_policies
+  preservation, runtime relation pruning, empty-envelope cleanup,
+  idempotency, non-mutation, robustness to ``None`` / empty / malformed
+  input.
+* `tests/integration/pipeline/test_orchestrator_persistence_boundary.py`
+  -- 4 cases: ``json_dir`` output strips runtime relations,
+  ``orchestrate()`` returns the projected view in-process,
+  carrier-neutral behavior for spreadsheet output, and the synthetic
+  repeated-run regression that mirrors the Dino contamination shape.
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc` -- new
+  *Persistence boundary* section. Describes the orchestrator-owned
+  projection, carrier neutrality, the deliberately narrow current rule
+  set, and the deferred follow-ups.
+* `docs/developer_guide/ch06_code_conventions/01_code_conventions.adoc`
+  -- implementer rules: producers may write runtime meta, the
+  orchestrator owns persistence.
+* `docs/ai_info/agent_rules.adoc` -- agent rule prohibiting reconstruction
+  of the boundary as a consumer plugin, a YAML pipeline step, or a
+  backend special case; warns against treating ``produced_by.mode:
+  explicit`` as user-authored canonical metadata.
+* `docs/release_notes/release_notes.adoc` -- Highlight plus
+  "Spreadsheet backends and roundtrip behavior" entry.
+* `docs/backlog/FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.adoc` -- new follow-up
+  FTR for the broader FK-helper lifecycle classification.
+* `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc` -- new follow-up
+  FTR for the complete ``_meta`` inventory.
+* `docs/backlog/technical_debt.adoc` -- new debt register, opens with
+  ``TD-META-LIFECYCLE-INVENTORY`` pointing at both follow-up FTRs.
+  Linked from ``docs/arc42_guide/ch13_risks_and_technical_debt/01_intro.adoc``.
+
+==== Forensic analysis result
+
+The forensic analysis ahead of the fix isolated the carrier precisely:
+
+* The promoted ``daten/dino_insel/_meta.yaml`` contained no top-level
+  ``derived`` and no ``__*`` keys. The pre-bug-fix hypothesis that
+  ``derived`` was the primary carrier did not survive observation.
+* Single-key strip experiments against the failing export pipeline
+  showed that ``helper_policies`` was the *only* top-level key whose
+  removal restored success; the seven other keys removed by the codex
+  workaround plugin were defensive over-bereiterung.
+* Within ``helper_policies``, the v2 ``relations`` list was the sole
+  carrier: keeping ``relations + schema_version`` (with v1 entries
+  removed) reproduced the failure; keeping the v1 per-target dicts
+  (with ``relations + schema_version`` removed) restored success.
+* Per-relation isolation showed each ``relations`` entry triggers the
+  failure for its ``source_frame``. The Dino-reported ``Frame 'groups'
+  must have flat columns`` is carried by the runtime-produced relation
+  ``source_frame=groups, target_frame=places``.
+
+The narrow ``produced_by.step == configure_fk_helpers`` discriminator
+covers exactly the observed runtime-produced relations without touching
+user-authored or otherwise classified helper policy. The broader
+classification is explicitly deferred to
+``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``.
+
+==== Validation results
+
+* Pure-function suite ``tests/unit/pipeline/test_persistence_boundary.py``:
+  11 passed.
+* Integration / regression suite
+  ``tests/integration/pipeline/test_orchestrator_persistence_boundary.py``:
+  5 passed (including the synthetic repeated-run regression and, after
+  the codex review follow-up, ``test_run_app_routes_through_persistence_boundary``
+  which guards the ``run_app`` adapter).
+* Full suite ``pytest tests/unit tests/integration tests/architecture``:
+  929 / 929 pass.
+* ``ruff check src/spreadsheet_handling/pipeline/persistence_boundary.py``
+  and the orchestrator: clean.
+* ``git diff --check``: clean.
+
+==== Operational scope and limitation
+
+The boundary is *post-pipeline* and *write-side only*:
+
+* It prevents runtime-only metadata from being written into a persisted
+  sidecar at the end of any successful run.
+* It is *not* a load-time sanitizer. A previously-promoted
+  ``_meta.yaml`` that already carries runtime-produced
+  ``helper_policies.fk.relations`` entries is still loaded into the
+  runtime view as-is. A configured pipeline step (typically
+  ``add_fk_helpers``) may then crash on that stale carrier before the
+  boundary gets a chance to save a cleaned output.
+
+Operational consequence: after this fix is deployed, every *successful*
+export writes a clean sidecar. The contamination cycle breaks at the
+next successful run. A repository that holds a pre-existing
+contaminated ``_meta.yaml`` may still need a one-time cleanup or
+quarantine for that specific carrier (manual removal of the offending
+relations, or a transitional consumer-side stripping plugin) until a
+fresh, projected sidecar has been produced.
+
+The earlier wording in this ticket about promotion "without
+consumer-side stripping" applies to the steady state once the boundary
+has produced its first clean sidecar. It does not promise retroactive
+repair of every pre-fix ``_meta.yaml``. A load-time sanitizer is
+explicitly deferred to ``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``; the
+broader inventory work is tracked under
+``FTR-META-LIFECYCLE-INVENTORY-P5``.
+
+==== Review follow-up (codex 2026-06-01)
+
+Two release-facing findings raised after commit ``d9d21f7`` and closed
+in the follow-up:
+
+* High-1 (``run_app`` bypass): ``pipeline.runner.run_app`` had its own
+  load/step/save macro flow and bypassed the orchestrator-owned
+  boundary. ``run_app`` is now a thin compatibility adapter that
+  translates ``AppConfig`` into ``orchestrate``'s input/output/steps
+  surface and delegates. The public return shape
+  ``(frames, meta, issues)`` is preserved. A new regression test
+  ``test_run_app_routes_through_persistence_boundary`` guards against
+  reintroduction of a second load/step/save path.
+* High-2 (existing-contamination limitation): the operational scope
+  section above states plainly that the boundary is post-pipeline and
+  write-side only, and the release notes carry the same caveat.
+

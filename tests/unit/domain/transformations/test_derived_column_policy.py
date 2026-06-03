@@ -77,6 +77,63 @@ def test_drop_removes_fk_and_lookup_helper_columns() -> None:
     assert "derived_column_findings" not in out
 
 
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_drop_uses_durable_workbook_helper_columns_when_derived_is_absent() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [
+                {
+                    "order_id": "o1",
+                    "customer_id": "c1",
+                    "_customer_name": "Alice",
+                    "amount": 100,
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "amount"]
+    assert "_customer_name" in frames["orders"].columns
+    assert out["_meta"]["sheets"]["orders"]["helper_columns"] == ["_customer_name"]
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_no_derived_or_durable_helper_carrier_is_conservative_noop() -> None:
+    frames = {
+        "orders": pd.DataFrame(
+            [{"order_id": "o1", "customer_id": "c1", "_customer_name": "Alice"}]
+        )
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "_customer_name"]
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_durable_helper_cleanup_preserves_non_helper_columns() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [
+                {
+                    "order_id": "o1",
+                    "customer_id": "c1",
+                    "_customer_name": "Alice",
+                    "_manual_note": "keep",
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "_manual_note"]
+
+
 def test_unchanged_lookup_helper_warn_mode_emits_no_findings() -> None:
     frames = _frames_with_fk_and_lookup_helpers()
 
@@ -212,19 +269,29 @@ def test_default_replacement_removes_consumed_fk_and_enrich_provenance() -> None
 
 
 def test_followed_by_remove_fk_helpers_leaves_no_stale_enrich_provenance() -> None:
+    """``apply_derived_column_policy`` followed by ``remove_fk_helpers`` is a
+    no-op when the policy step already consumed the provenance. After
+    FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 the second step requires
+    policy or provenance; if both are absent it raises clearly, so the
+    pipeline does not silently bypass the cleanup contract.
+    """
     frames = _frames_with_fk_and_lookup_helpers()
 
-    steps = build_steps_from_config([
-        {"step": "apply_derived_column_policy", "source": "orders", "policy": "drop"},
-        {"step": "remove_fk_helpers"},
-    ])
-    out = run_pipeline(frames, steps)
+    out = run_pipeline(
+        frames,
+        build_steps_from_config([
+            {"step": "apply_derived_column_policy", "source": "orders", "policy": "drop"},
+        ]),
+    )
 
     derived = out["_meta"].get("derived", {})
     sheets = derived.get("sheets", {})
     assert "orders" not in sheets
     assert "_customer_name" not in out["orders"].columns
     assert "tier" not in out["orders"].columns
+
+    with pytest.raises(ValueError, match="infer_fk_relations"):
+        run_pipeline(out, build_steps_from_config([{"step": "remove_fk_helpers"}]))
 
 
 def test_distinct_output_preserves_original_source_provenance() -> None:

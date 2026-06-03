@@ -1,0 +1,101 @@
+===== FTR-CLI-INTERRUPT-ERROR-UX-P5 -- Improve CLI behavior for user interrupts
+
+*Status:* Done
+
+*Type:* Improvement
+
+*Context:*::
+When a user cancels `sheets-run` with `Ctrl+C`, Python raises
+`KeyboardInterrupt`. The current behavior may print a full traceback, which is
+technically correct but noisy for normal CLI usage.
+
+Example observed during ODS reimport debugging:
+
+[source,text]
+----
+^CTraceback (most recent call last):
+...
+KeyboardInterrupt
+make[1]: *** [Makefile:34: import-stories] Interrupt
+----
+
+This is normal Python behavior, but not ideal CLI UX.
+
+*Scope:*::
+
+* Catch `KeyboardInterrupt` at the CLI wrapper boundary.
+* Print a concise message such as:
+  +
+  [source,text]
+  ----
+  Interrupted by user.
+  ----
+
+* Return a non-zero exit code appropriate for interruption.
+* Preserve full traceback behavior for debug mode if explicitly requested.
+* Ensure existing exception handling for normal errors remains unchanged.
+
+*Non-Goals:*::
+
+* Do not hide real exceptions.
+* Do not change pipeline execution semantics.
+* Do not implement cancellation checkpoints inside long-running parser code.
+* Do not solve ODS memory explosion here.
+
+*Acceptance:*::
+
+* `Ctrl+C` during `sheets-run` exits cleanly without a full traceback in normal mode.
+* `--debug` or equivalent verbose/debug mode may still show traceback if desired.
+* Exit code is non-zero.
+* Existing CLI error tests continue to pass.
+
+*Validation:*::
+[source,bash]
+----
+pytest tests/unit/cli -q
+git diff --check
+----
+
+*Delivery scope:*::
+
+* `src/spreadsheet_handling/cli/runtime.py` -- `run_cli` now catches
+  `KeyboardInterrupt` separately (it is a `BaseException`, not `Exception`,
+  so the existing `except Exception` did not cover it). In normal mode the
+  wrapper writes `Interrupted by user.` to stderr and exits with code 130
+  (POSIX SIGINT convention). With `--debug` or `-vv` it shows the full
+  traceback as before. No `signal` module is used, so the behavior remains
+  OS-agnostic.
+* `src/spreadsheet_handling/cli/apps/run.py` -- new `cli_entry()` wrapper
+  that routes the installed `sheets-run` console script through
+  `run_cli(main)`. `main()` itself is unchanged and remains the direct
+  testable function. A pre-existing wiring gap meant the installed entry
+  point bypassed `run_cli` entirely, so the existing `Error: ...` short
+  message and the new `Interrupted by user.` message would otherwise not
+  have reached real users.
+* `pyproject.toml` -- `[project.scripts] sheets-run` now points to
+  `spreadsheet_handling.cli.apps.run:cli_entry`. A reinstall
+  (`make setup` or `pip install -e .`) regenerates `.venv/bin/sheets-run`.
+* `tests/unit/cli/test_cli_runtime.py` -- two new tests
+  (`test_run_cli_interrupt_short`, `test_run_cli_interrupt_debug`) mirror
+  the existing exception tests and assert the new exit code, stderr
+  content, and traceback gating.
+
+*Validation results:*::
+
+* `.venv/bin/python -m pytest tests/unit/cli -q` -- 27 passed (5 -> 7 in
+  `test_cli_runtime.py`).
+* Full suite `pytest tests/unit tests/integration tests/architecture` --
+  910 / 910 pass.
+* End-to-end smoke: after `pip install -e .`, the regenerated
+  `.venv/bin/sheets-run` script imports `cli_entry`; injecting a
+  `KeyboardInterrupt` into `main` via the public module surface produces
+  `Interrupted by user.` on stderr and `SystemExit(130)`.
+* `git diff --check` -- clean.
+
+*Non-Goals confirmed unchanged:*::
+
+* Real exceptions still surface (Error: ... + traceback in debug).
+* Pipeline execution semantics untouched.
+* No cancellation checkpoints inside parser code.
+* No OS-specific code, no signal module, no platform branching.
+* Make-level interrupt messaging in consumer Makefiles is out of scope.

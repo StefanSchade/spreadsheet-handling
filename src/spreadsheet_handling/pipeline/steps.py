@@ -156,8 +156,12 @@ def make_apply_fks_step(
     defaults: Dict[str, Any] | None = None,
     name: str = "add_fk_helpers",
 ) -> BoundStep:
-    """Detect FK columns and add helper columns.
+    """Add FK helper columns from the v2 relation policy.
 
+    Reads ``_meta.helper_policies.fk.relations`` (v2, required); relation
+    identity comes from policy — no convention-based FK inference is performed.
+    Missing policy raises a clear error naming the producer step
+    (``configure_fk_helpers`` or ``infer_fk_relations``).
     Delegates to ``domain.transformations.fk_helpers.enrich_helpers``.
     """
     from ..domain.transformations.fk_helpers import enrich_helpers
@@ -175,8 +179,13 @@ def make_drop_helpers_step(
     prefix: str = "_",
     name: str = "remove_fk_helpers",
 ) -> BoundStep:
-    """Remove all helper columns (starting with prefix) from all sheets.
+    """Remove FK helper columns identified by provenance or v2 policy.
 
+    Primary source: derived helper provenance at
+    ``_meta.derived.sheets.*.helper_columns``. Fallback: v2 relation policy.
+    Missing both raises a clear error naming the producer step. The ``prefix``
+    parameter is retained for step-binding compatibility only and no longer
+    drives cleanup behavior.
     Delegates to ``domain.transformations.fk_helpers.drop_helpers``.
     """
     from ..domain.transformations.fk_helpers import drop_helpers

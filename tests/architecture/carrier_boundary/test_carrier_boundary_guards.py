@@ -22,10 +22,18 @@ pytestmark = [
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TESTS_ROOT = REPO_ROOT / "tests"
 
-ACTIVE_CARRIER_ROOTS = ("unit", "integration", "architecture", "legacy_pre_hex")
+ACTIVE_CARRIER_ROOTS = ("unit", "integration", "roundtrip", "architecture", "legacy_pre_hex")
 SUPPORT_CARRIER_ROOTS = ("utils", "data", "experimental")
 QUARANTINE_CARRIER_ROOTS = ("legacy_pre_hex",)
-PATH_OWNED_TOPOLOGY_MARKERS = ("unit", "integ", "arch", "current_state", "legacy", "prehex")
+PATH_OWNED_TOPOLOGY_MARKERS = (
+    "unit",
+    "integ",
+    "roundtrip",
+    "arch",
+    "current_state",
+    "legacy",
+    "prehex",
+)
 
 
 def _iter_python_files(root: Path) -> list[Path]:
@@ -82,6 +90,11 @@ def _explicit_pytest_marker_names(module_path: Path) -> list[str]:
     return names
 
 
+def _explicit_topology_marker_allowed(rel_path: str, marker_name: str) -> bool:
+    """Return whether an explicit topology marker is allowed by carrier root."""
+    return marker_name == "roundtrip" and rel_path.startswith("roundtrip/")
+
+
 def test_pytest_style_tests_live_only_under_known_carrier_roots():
     violations: list[str] = []
 
@@ -124,6 +137,7 @@ def test_topology_markers_are_path_owned_not_written_manually():
                 marker_name
                 for marker_name in _explicit_pytest_marker_names(module_path)
                 if marker_name in PATH_OWNED_TOPOLOGY_MARKERS
+                and not _explicit_topology_marker_allowed(rel_path, marker_name)
             }
         )
         if explicit_markers:

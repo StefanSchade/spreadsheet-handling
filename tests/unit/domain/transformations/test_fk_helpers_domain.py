@@ -3,12 +3,19 @@
 FTR-FK-HELPER-DOMAIN-EXTRACTION: primary coverage for FK-helper semantics
 lives here, testing the domain functions directly rather than via pipeline
 step factories.
+
+FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 refactored the primitives to
+consume v2 relation policy at ``_meta.helper_policies.fk``; the tests in
+this module therefore seed the policy explicitly (via ``infer_fk_relations``
+or ``configure_fk_helpers``) before calling the primitives.
 """
 from __future__ import annotations
 
 import pytest
 import pandas as pd
 
+from spreadsheet_handling.domain.fk_relations import infer_fk_relations
+from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
 from spreadsheet_handling.domain.transformations.fk_helpers import (
     enrich_helpers,
     drop_helpers,
@@ -23,7 +30,7 @@ DEFAULTS = {"id_field": "id", "label_field": "name", "helper_prefix": "_"}
 def _frames():
     b = pd.DataFrame({"id": [1, 2], "name": ["alpha", "beta"]})
     a = pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]})
-    return {"A": a, "B": b}
+    return infer_fk_relations({"A": a, "B": b})
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +55,7 @@ class TestEnrichHelpers:
         assert out is frames
 
     def test_no_fk_columns_returns_without_helpers(self):
-        frames = {"X": pd.DataFrame({"id": [1], "value": ["x"]})}
+        frames = infer_fk_relations({"X": pd.DataFrame({"id": [1], "value": ["x"]})})
         out = enrich_helpers(frames, DEFAULTS)
         assert list(out["X"].columns) == ["id", "value"]
 
@@ -60,6 +67,7 @@ class TestEnrichHelpers:
             "column": "_B_name",
             "fk_column": "id_(B)",
             "target": "B",
+            "target_key": "id",
             "value_field": "name",
         }
 
@@ -70,7 +78,7 @@ class TestEnrichHelpers:
 
     def test_preserves_existing_meta(self):
         frames = _frames()
-        frames["_meta"] = {"version": "3.0", "author": "test"}
+        frames["_meta"].update({"version": "3.0", "author": "test"})
         out = enrich_helpers(frames, DEFAULTS)
         assert out["_meta"]["version"] == "3.0"
         assert out["_meta"]["author"] == "test"
@@ -78,15 +86,13 @@ class TestEnrichHelpers:
 
     def test_stale_provenance_removed(self):
         frames = _frames()
-        frames["_meta"] = {
-            "derived": {
-                "sheets": {
-                    "B": {
-                        "helper_columns": [
-                            {"column": "_X_old", "fk_column": "id_(X)",
-                             "target": "X", "value_field": "old"},
-                        ]
-                    }
+        frames["_meta"]["derived"] = {
+            "sheets": {
+                "B": {
+                    "helper_columns": [
+                        {"column": "_X_old", "fk_column": "id_(X)",
+                         "target": "X", "target_key": "id", "value_field": "old"},
+                    ]
                 }
             }
         }
@@ -97,9 +103,7 @@ class TestEnrichHelpers:
 
     def test_key_selective_merge_preserves_other_derived_keys(self):
         frames = _frames()
-        frames["_meta"] = {
-            "derived": {"sheets": {"A": {"other_derived_key": "keep_me"}}}
-        }
+        frames["_meta"]["derived"] = {"sheets": {"A": {"other_derived_key": "keep_me"}}}
         out = enrich_helpers(frames, DEFAULTS)
         sheet_derived = out["_meta"]["derived"]["sheets"]["A"]
         assert sheet_derived["other_derived_key"] == "keep_me"
@@ -112,12 +116,26 @@ class TestEnrichHelpers:
                 {"id": [1, 2], "name": ["alpha", "beta"], "category": ["x", "y"]}
             ),
         }
-        defaults = {**DEFAULTS, "helper_fields_by_fk": {"id_(B)": ["category", "name"]}}
-        out = enrich_helpers(frames, defaults)
+        configured = configure_fk_helpers(
+            frames,
+            target="B",
+            key="id",
+            allowed_helpers=["category", "name"],
+            default_helpers=["category", "name"],
+        )
+        out = enrich_helpers(configured, DEFAULTS)
         prov = out["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
         assert len(prov) == 2
         assert prov[0]["column"] == "_B_category"
         assert prov[1]["column"] == "_B_name"
+
+    def test_missing_policy_raises_with_actionable_message(self):
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]}),
+            "B": pd.DataFrame({"id": [1, 2], "name": ["alpha", "beta"]}),
+        }
+        with pytest.raises(ValueError, match="infer_fk_relations"):
+            enrich_helpers(frames, DEFAULTS)
 
     @pytest.mark.ftr("FTR-FORMULA-FK-HELPER-PROVIDERS-P4A")
     def test_formula_mode_writes_structured_lookup_formula_specs(self):
@@ -175,18 +193,15 @@ class TestDropHelpers:
         for sheet_info in sheets.values():
             assert "helper_columns" not in sheet_info
 
-    def test_prefix_fallback_without_provenance(self):
+    def test_missing_policy_and_provenance_raises(self):
         frames = {
             "A": pd.DataFrame(
                 {"id": [10], "id_(B)": [1], "_B_name": ["alpha"], "_custom": ["z"]}
             ),
             "B": pd.DataFrame({"id": [1], "name": ["alpha"]}),
         }
-        out = drop_helpers(frames, prefix="_")
-        cols_a = list(out["A"].columns)
-        assert "_B_name" not in cols_a
-        assert "_custom" not in cols_a
-        assert "id" in cols_a
+        with pytest.raises(ValueError, match="infer_fk_relations"):
+            drop_helpers(frames, prefix="_")
 
     def test_non_helper_underscored_column_kept_with_provenance(self):
         enriched = enrich_helpers(_frames(), DEFAULTS)

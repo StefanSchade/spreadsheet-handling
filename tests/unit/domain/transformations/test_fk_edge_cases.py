@@ -2,6 +2,11 @@
 
 Migrated from legacy_pre_hex (test_fk_custom_id_field, test_fk_mixed_types,
 test_fk_multi_targets, test_fk_missing_label_field, test_fk_duplicate_ids).
+
+FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 made the FK-helper primitives
+consume v2 relation policy at ``_meta.helper_policies.fk``. Frames built with
+the cell-level FK convention are run through ``infer_fk_relations`` (or
+``configure_fk_helpers``) to seed that policy before the primitive runs.
 """
 from __future__ import annotations
 
@@ -12,6 +17,8 @@ from spreadsheet_handling.core.fk import (
     assert_no_parentheses_in_columns,
 )
 from spreadsheet_handling.core.indexing import level0_series
+from spreadsheet_handling.domain.fk_relations import infer_fk_relations
+from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
 from spreadsheet_handling.pipeline import run_pipeline
 from spreadsheet_handling.pipeline.steps import (
     make_apply_fks_step,
@@ -31,6 +38,12 @@ class TestCustomIdField:
                  {"bestellnr": "B-2", "Schluessel_(Guten_Morgen)": "B-2"}]
             ),
         }
+        frames = infer_fk_relations(
+            frames,
+            id_columns=["Schluessel"],
+            fk_patterns=["Schluessel_({target})"],
+            target_label_fields=["name"],
+        )
         defaults = {"id_field": "Schluessel", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
         step = make_apply_fks_step(defaults=defaults)
@@ -51,6 +64,7 @@ class TestMixedIdTypes:
             "Ziel": pd.DataFrame([{"id": "1", "name": "Alpha"}]),
             "Q": pd.DataFrame([{"id_(Ziel)": 1}]),  # int FK referencing string id
         }
+        frames = infer_fk_relations(frames)
         defaults = {"id_field": "id", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
         step = make_apply_fks_step(defaults=defaults)
@@ -75,6 +89,7 @@ class TestMultiFkTargets:
                 {"nr": 2, "id_(Orte)": 2, "id_(Kunden)": "B"},
             ]),
         }
+        frames = infer_fk_relations(frames)
         defaults = {"id_field": "id", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
         step = make_apply_fks_step(defaults=defaults)
@@ -105,17 +120,23 @@ class TestMultiFkTargets:
                 ]
             ),
         }
+        configured = configure_fk_helpers(
+            frames,
+            target="B",
+            key="id",
+            allowed_helpers=["category", "name"],
+            default_helpers=["category", "name"],
+        )
         defaults = {
             "id_field": "id",
             "label_field": "name",
             "helper_prefix": "_",
             "detect_fk": True,
             "levels": 3,
-            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
         }
 
         out = run_pipeline(
-            frames,
+            configured,
             [
                 make_apply_fks_step(defaults=defaults),
                 make_reorder_helpers_step(helper_prefix="_"),
@@ -126,12 +147,22 @@ class TestMultiFkTargets:
         assert lvl0 == ["id", "other", "id_(B)", "_B_category", "_B_name"]
 
     def test_reorder_helpers_moves_left_side_helpers_directly_behind_fk(self):
-        frames = {
-            "A": pd.DataFrame(
-                [[10, "Alpha", "A", 1, "tail"]],
-                columns=["id", "_B_name", "_B_category", "id_(B)", "tail"],
-            )
-        }
+        # The frame already carries helper columns; we synthesize the v2
+        # policy that would have produced them so reorder can place them
+        # correctly without using FK_PATTERN inference.
+        frames = configure_fk_helpers(
+            {
+                "B": pd.DataFrame([{"id": 1, "name": "Alpha", "category": "A"}]),
+                "A": pd.DataFrame(
+                    [[10, "Alpha", "A", 1, "tail"]],
+                    columns=["id", "_B_name", "_B_category", "id_(B)", "tail"],
+                ),
+            },
+            target="B",
+            key="id",
+            allowed_helpers=["name", "category"],
+            default_helpers=["name", "category"],
+        )
 
         out = run_pipeline(frames, [make_reorder_helpers_step(helper_prefix="_")])
 
@@ -143,9 +174,10 @@ class TestMultiFkTargets:
 class TestMissingLabelField:
     def test_missing_label_field_results_in_none_helper(self):
         frames = {
-            "Ziel": pd.DataFrame([{"id": 1}, {"id": 2}]),  # no "name" column
+            "Ziel": pd.DataFrame([{"id": 1, "name": None}, {"id": 2, "name": None}]),
             "Quelle": pd.DataFrame([{"fk": "x", "id_(Ziel)": 1}]),
         }
+        frames = infer_fk_relations(frames)
         defaults = {"id_field": "id", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
         step = make_apply_fks_step(defaults=defaults)
@@ -167,6 +199,7 @@ class TestDuplicateIdsLastWins:
             "Ziel": pd.DataFrame([{"id": 1, "name": "Alt"}, {"id": 1, "name": "Neu"}]),
             "Q": pd.DataFrame([{"id_(Ziel)": 1}]),
         }
+        frames = infer_fk_relations(frames)
         defaults = {"id_field": "id", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
         step = make_apply_fks_step(defaults=defaults)

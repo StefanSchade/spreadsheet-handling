@@ -11,6 +11,7 @@ DATE := $(shell date -Iseconds)
 
 ROOT          := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR     := $(ROOT)build
+SNAPSHOT_MAX_FILES ?= 20
 DOC_BUILD_DIR := $(BUILD_DIR)/doc
 VENV          := $(ROOT).venv
 COV_HTML_DIR  := $(BUILD_DIR)/htmlcov
@@ -250,10 +251,11 @@ snapshot: ## Create a repository text snapshot (excludes build/, venv, binaries)
 	@echo "Snapshot: $(BUILD_DIR)/spreadsheet-handling.txt"
 
 .PHONY: snapshot-multi
-snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs, src, tests, infra, tree, loc)
+snapshot-multi: ## Create split snapshots; merge smallest files down to SNAPSHOT_MAX_FILES (default 20)
 	@mkdir -p "$(BUILD_DIR)"
 	@bash "$(ROOT)tools/repo_snapshot_multi.sh" "$(ROOT)" "$(BUILD_DIR)/snapshots"
-	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/"
+	@bash "$(ROOT)scripts/merge_snapshots.sh" "$(BUILD_DIR)/snapshots" "$(SNAPSHOT_MAX_FILES)"
+	@echo "Multi-snapshots written to $(BUILD_DIR)/snapshots/ (max $(SNAPSHOT_MAX_FILES) files)"
 
 # =========================
 # Release helpers
@@ -261,6 +263,27 @@ snapshot-multi: ## Create split snapshots per section in build/snapshots/ (docs,
 .PHONY: release-check
 release-check: ## Pre-tag branch and topology check (read-only). Pass a tag as TAG=vX.Y.Z to also validate the tag.
 	@bash "$(ROOT)tools/release_check.sh" "$(TAG)"
+
+.PHONY: pages-check
+pages-check: ## Post-deploy Pages structure check. CORE_TAG=vX required; DEMO_TAG, PAGES_DIR optional; LATEST=1 also checks latest/ aliases.
+	@bash "$(ROOT)tools/pages_publish_check.sh" \
+	  $(if $(PAGES_DIR),--pages "$(PAGES_DIR)") \
+	  $(if $(CORE_TAG),--core-tag "$(CORE_TAG)") \
+	  $(if $(DEMO_TAG),--demo-tag "$(DEMO_TAG)") \
+	  $(if $(LATEST),--check-latest)
+
+.PHONY: readme-check
+readme-check: ## Pre-publish README link-versioning check. TAG=vX.Y.Z enforces /versions/<tag>/ (fails on remaining /latest/ Pages URLs); without TAG runs lint mode. FILE=PATH overrides ./README.md.
+	@bash "$(ROOT)tools/readme_links_check.sh" \
+	  $(if $(TAG),--release-tag "$(TAG)") \
+	  $(if $(FILE),--file "$(FILE)")
+
+.PHONY: release-status
+release-status: ## One-shot cross-repo release state (core/demo/pages). CORE_DIR/DEMO_DIR/PAGES_DIR optional (siblings auto-detected).
+	@bash "$(ROOT)tools/release_status.sh" \
+	  $(if $(CORE_DIR),--core "$(CORE_DIR)") \
+	  $(if $(DEMO_DIR),--demo "$(DEMO_DIR)") \
+	  $(if $(PAGES_DIR),--pages "$(PAGES_DIR)")
 
 # =========================
 # Coverage
@@ -288,7 +311,7 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 # Tests
 # =========================
 # Quick reference:
-#   make test                              # unit + integ + arch, no slow/prehex
+#   make test                              # unit + integ + roundtrip + arch, no slow/prehex
 #   make test-fast                         # unit only (fastest feedback)
 #   make test-arch                         # architecture / guardrail layer
 #   make test-full                         # everything including slow tests
@@ -296,12 +319,12 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 #   make test-file FILE=tests/unit/...     # single file
 #   make test-node NODE=tests/unit/..::fn  # single test
 
-.PHONY: test test-fast test-unit test-integ test-arch test-full \
+.PHONY: test test-fast test-unit test-integ test-roundtrip test-arch test-full \
         test-verbose test-lastfailed test-one test-file test-node
 
 MARK              ?= not legacy and not prehex and not slow
 PYTEST_OPTS       ?=
-ACTIVE_TEST_PATHS ?= tests/unit tests/integration tests/architecture
+ACTIVE_TEST_PATHS ?= tests/unit tests/integration tests/roundtrip tests/architecture
 
 MARK_OPT := $(if $(strip $(MARK)),-m '$(MARK)',)
 
@@ -309,7 +332,7 @@ define run_pytest
 	$(PYTEST) $(MARK_OPT) $(PYTEST_OPTS) $(1)
 endef
 
-test: deps-dev ## Active suite: unit + integ + arch (no slow/prehex)
+test: deps-dev ## Active suite: unit + integ + roundtrip + arch (no slow/prehex)
 	$(call run_pytest,$(ACTIVE_TEST_PATHS))
 
 test-fast: deps-dev ## Unit tests only — fastest feedback loop
@@ -323,6 +346,9 @@ test-integ: deps-dev ## Integration tests only
 
 test-arch: deps-dev ## Architecture and guardrail tests only
 	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/architecture
+
+test-roundtrip: deps-dev ## Roundtrip invariant tests only (FTR-ROUNDTRIP-TEST-LAYER-P4A)
+	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/roundtrip
 
 test-full: deps-dev ## All tests including slow (no marker filter)
 	$(PYTEST) -q $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)

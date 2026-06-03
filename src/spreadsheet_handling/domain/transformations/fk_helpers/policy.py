@@ -1,216 +1,183 @@
-"""Resolution and validation of FK helper policies from ``_meta`` and inline config.
+"""Resolution of FK helper policies from ``_meta`` for primitive consumers.
 
-Behavior-preserving split out of the former single ``fk_helpers`` module
-(FTR-DOMAIN-TRANSFORMATION-MODULE-SPLIT-FK-HELPERS-P5).
+Primitives consume the v2 relation policy under
+``_meta.helper_policies.fk.relations`` (schema_version 2). Convention-driven
+relation inference is owned by the ``infer_fk_relations`` configuration step;
+primitives never re-derive FK identity from column names.
+
+Refactored from the previous v1 consumption path by
+``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5``.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from ....core.fk import normalize_sheet_key
+from ....core.fk import FKDef, normalize_sheet_key
 from ....frame_keys import iter_data_frames
 
 Frames = dict[str, Any]
 
+_FK_POLICY_SCHEMA_VERSION = 2
 
-def _defaults_with_fk_policies(
-    frames: Frames,
-    defaults: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    policies = _fk_policies(frames)
-    if not policies:
-        return defaults, {}
 
-    execution_defaults = dict(defaults)
-    by_target = dict(execution_defaults.get("helper_fields_by_target") or {})
-    by_fk = dict(execution_defaults.get("helper_fields_by_fk") or {})
-    id_by_target = dict(execution_defaults.get("id_field_by_target") or {})
-    label_by_target = dict(execution_defaults.get("label_field_by_target") or {})
-    inline_helper_prefix = (
-        str(defaults["helper_prefix"])
-        if "helper_prefix" in defaults
-        else None
+class MissingFkRelationPolicyError(ValueError):
+    """Raised when a primitive FK-helper step runs without v2 relation policy.
+
+    Primitive steps are deterministic executors of resolved metadata. Missing
+    policy is reported clearly and names the configuration / inference step
+    that should have run first.
+    """
+
+
+def resolve_v2_fk_relations(frames: Frames) -> list[dict[str, Any]] | None:
+    """Return the v2 FK relations list from ``_meta``.
+
+    Returns ``None`` when the v2 shape is absent (no ``helper_policies.fk``
+    block, missing ``schema_version``, or ``schema_version != 2``). Returns an
+    empty list when the v2 block is present but declares no relations.
+    """
+    meta = frames.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    helper_policies = meta.get("helper_policies")
+    if not isinstance(helper_policies, dict):
+        return None
+    fk_root = helper_policies.get("fk")
+    if not isinstance(fk_root, dict):
+        return None
+    if fk_root.get("schema_version") != _FK_POLICY_SCHEMA_VERSION:
+        return None
+    relations = fk_root.get("relations")
+    if relations is None:
+        return []
+    if not isinstance(relations, list):
+        raise ValueError(
+            "Malformed `_meta.helper_policies.fk.relations`: expected a list, "
+            f"got {type(relations).__name__}"
+        )
+    return relations
+
+
+def missing_fk_policy_error(step_name: str) -> MissingFkRelationPolicyError:
+    """Build a clear error pointing the caller at the producer steps."""
+    return MissingFkRelationPolicyError(
+        f"{step_name} requires v2 FK relation policy at "
+        "`_meta.helper_policies.fk` (schema_version: 2). Run "
+        "`configure_fk_helpers` (explicit configuration) or "
+        "`infer_fk_relations` (heuristic inference) before "
+        f"`{step_name}` to produce that policy. Convention-driven "
+        "primitive inference is no longer supported."
     )
-    resolved_helper_prefix: str | None = None
 
-    for target_key, policy in policies.items():
-        target_sheet = str(policy.get("target_sheet") or target_key)
-        policy_key = str(policy.get("key") or execution_defaults.get("id_field", "id"))
-        default_helpers = _list_value(policy.get("default_helpers"))
-        policy_allowed = (
-            _list_value(policy.get("allowed_helpers"))
-            if "allowed_helpers" in policy
-            else None
-        )
-        policy_prefix = str(policy.get("helper_prefix", inline_helper_prefix or "_"))
 
-        if inline_helper_prefix is not None and inline_helper_prefix != policy_prefix:
+def build_v2_target_registry(
+    relations: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
+    """Derive a target-side registry and required fields from v2 relations.
+
+    Returns a ``(registry, fields_by_target_sheet_key)`` pair. The registry
+    mirrors the structure produced by ``core.fk.build_registry`` so the
+    legacy ``apply_fk_helpers`` / ``build_id_value_maps`` plumbing can drive
+    materialization without ever inspecting frame column names.
+    """
+    registry: dict[str, dict[str, Any]] = {}
+    fields_by_target_sheet: dict[str, list[str]] = {}
+
+    for relation in relations:
+        target_frame = str(relation.get("target_frame", ""))
+        target_key = str(relation.get("target_key", ""))
+        if not target_frame or not target_key:
             raise ValueError(
-                f"Inline helper_prefix {inline_helper_prefix!r} conflicts with "
-                f"resolved FK helper policy for target {target_key!r}: {policy_prefix!r}"
+                "v2 FK relation entry is missing required fields "
+                "`target_frame`/`target_key`: " + repr(relation)
             )
-        if resolved_helper_prefix is None:
-            resolved_helper_prefix = policy_prefix
-        elif resolved_helper_prefix != policy_prefix:
+        sheet_key = normalize_sheet_key(target_frame)
+        existing = registry.get(sheet_key)
+        if existing is None:
+            registry[sheet_key] = {
+                "sheet_name": target_frame,
+                "id_field": target_key,
+                # ``label_field`` is intentionally a no-op default. v2
+                # relations carry per-field selection in ``helper_columns``;
+                # no implicit label_field is honored.
+                "label_field": target_key,
+            }
+        elif existing["id_field"] != target_key:
             raise ValueError(
-                "Resolved FK helper policies define multiple helper_prefix values "
-                f"({resolved_helper_prefix!r}, {policy_prefix!r}); one add_fk_helpers "
-                "execution supports a single helper_prefix"
+                f"Conflicting target_key for target frame {target_frame!r}: "
+                f"{existing['id_field']!r} vs {target_key!r}"
             )
 
-        if policy_allowed is not None:
-            disallowed_defaults = [
-                field for field in default_helpers
-                if field not in policy_allowed
-            ]
-            if disallowed_defaults:
-                raise ValueError(
-                    f"default_helpers {disallowed_defaults!r} must be included in "
-                    f"allowed_helpers for FK target {target_key!r}: {policy_allowed!r}"
-                )
+        fields = fields_by_target_sheet.setdefault(sheet_key, [])
+        for entry in relation.get("helper_columns") or []:
+            target_field = str(entry.get("target_field", ""))
+            if target_field and target_field not in fields:
+                fields.append(target_field)
+    return registry, fields_by_target_sheet
 
-        _merge_scalar_target_default(
-            id_by_target,
-            target_key=target_key,
-            target_sheet=target_sheet,
-            value=policy_key,
-            label="id field",
-        )
-        if policy.get("label") is not None:
-            _merge_scalar_target_default(
-                label_by_target,
-                target_key=target_key,
-                target_sheet=target_sheet,
-                value=str(policy["label"]),
-                label="label field",
+
+def iter_relation_fk_defs(
+    relation: dict[str, Any],
+) -> list[FKDef]:
+    """Build ``FKDef`` rows describing one relation's helper columns.
+
+    Each helper column entry yields one ``FKDef`` so existing materialization
+    plumbing (``core.fk.apply_fk_helpers``) can be reused unchanged.
+    """
+    source_column = str(relation["source_column"])
+    target_frame = str(relation["target_frame"])
+    target_key = str(relation["target_key"])
+    target_sheet_key = normalize_sheet_key(target_frame)
+    defs: list[FKDef] = []
+    for entry in relation.get("helper_columns") or []:
+        helper_column = str(entry["column"])
+        value_field = str(entry["target_field"])
+        defs.append(
+            FKDef(
+                fk_column=source_column,
+                id_field=target_key,
+                target_sheet_key=target_sheet_key,
+                helper_column=helper_column,
+                value_field=value_field,
             )
-
-        global_helpers = (
-            _list_value(defaults.get("helper_fields"))
-            if "helper_fields" in defaults
-            else None
         )
-        if global_helpers is not None and global_helpers != default_helpers:
-            raise ValueError(
-                f"Inline helper_fields {global_helpers!r} conflict with resolved "
-                f"FK helper policy for target {target_key!r}: {default_helpers!r}"
-            )
-
-        _merge_helper_target_default(
-            by_target,
-            target_key=target_key,
-            target_sheet=target_sheet,
-            helpers=default_helpers,
-        )
-
-        fk_column = str(policy.get("fk_column") or f"{policy_key}_({target_key})")
-        if fk_column in by_fk:
-            inline = _list_value(by_fk[fk_column])
-            if inline != default_helpers:
-                raise ValueError(
-                    f"Inline helper_fields_by_fk for {fk_column!r} conflict with resolved "
-                    f"FK helper policy for target {target_key!r}: {default_helpers!r}"
-                )
-
-    execution_defaults["id_field_by_target"] = id_by_target
-    execution_defaults["helper_fields_by_target"] = by_target
-    if resolved_helper_prefix is not None:
-        execution_defaults["helper_prefix"] = resolved_helper_prefix
-    if label_by_target:
-        execution_defaults["label_field_by_target"] = label_by_target
-    return execution_defaults, policies
+    return defs
 
 
-def _fk_policies(frames: Frames) -> dict[str, dict[str, Any]]:
+def source_frame_has_column(df: Any, column: str) -> bool:
+    """Return True when ``column`` appears as a first-level header on ``df``."""
+    columns = getattr(df, "columns", None)
+    if columns is None:
+        return False
+    for header in columns:
+        first = header[0] if isinstance(header, tuple) else header
+        if str(first) == column:
+            return True
+    return False
+
+
+def derived_helper_columns_by_sheet(
+    frames: Frames,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return ``_meta.derived.sheets.<sheet>.helper_columns`` per sheet."""
     meta = frames.get("_meta")
     if not isinstance(meta, dict):
         return {}
-    helper_policies = meta.get("helper_policies")
-    if not isinstance(helper_policies, dict):
+    derived = meta.get("derived")
+    if not isinstance(derived, dict):
         return {}
-    raw_policies = helper_policies.get("fk")
-    if not isinstance(raw_policies, dict):
+    sheets = derived.get("sheets")
+    if not isinstance(sheets, dict):
         return {}
-
-    sheet_keys = {
-        normalize_sheet_key(sheet_name): sheet_name
-        for sheet_name, _df in iter_data_frames(frames)
-    }
-    policies: dict[str, dict[str, Any]] = {}
-    for raw_target, raw_policy in raw_policies.items():
-        if not isinstance(raw_policy, dict):
+    out: dict[str, list[dict[str, Any]]] = {}
+    for sheet_name, sheet_entry in sheets.items():
+        if not isinstance(sheet_entry, dict):
             continue
-        target_key = str(raw_policy.get("target") or normalize_sheet_key(str(raw_target)))
-        if target_key not in sheet_keys:
-            raise KeyError(f"FK helper policy target {target_key!r} not found in frames")
-        policy = dict(raw_policy)
-        policy["target"] = target_key
-        policy.setdefault("target_sheet", sheet_keys[target_key])
-        policies[target_key] = policy
-    return policies
+        entries = sheet_entry.get("helper_columns")
+        if isinstance(entries, list) and entries:
+            out[str(sheet_name)] = [dict(entry) for entry in entries if isinstance(entry, dict)]
+    return out
 
 
-def _merge_scalar_target_default(
-    mapping: dict[str, Any],
-    *,
-    target_key: str,
-    target_sheet: str,
-    value: str,
-    label: str,
-) -> None:
-    for key in (target_key, target_sheet):
-        if key in mapping and str(mapping[key]) != value:
-            raise ValueError(
-                f"Inline {label} for FK target {target_key!r} conflicts with "
-                f"resolved FK helper policy: {value!r}"
-            )
-    mapping[target_key] = value
-
-
-def _merge_helper_target_default(
-    mapping: dict[str, Any],
-    *,
-    target_key: str,
-    target_sheet: str,
-    helpers: list[str],
-) -> None:
-    for key in (target_key, target_sheet):
-        if key in mapping:
-            inline = _list_value(mapping[key])
-            if inline != helpers:
-                raise ValueError(
-                    f"Inline helper_fields_by_target for FK target {target_key!r} "
-                    f"conflict with resolved FK helper policy: {helpers!r}"
-                )
-    mapping[target_key] = helpers
-
-
-def _validate_fk_policy_usage(
-    fk_defs_by_sheet: dict[str, Any],
-    fk_policies: dict[str, dict[str, Any]],
-) -> None:
-    if not fk_policies:
-        return
-    for fk_defs in fk_defs_by_sheet.values():
-        for fk in fk_defs:
-            policy = fk_policies.get(fk.target_sheet_key)
-            if policy is None:
-                continue
-            if "allowed_helpers" not in policy:
-                continue
-            allowed = _list_value(policy.get("allowed_helpers"))
-            if fk.value_field not in allowed:
-                raise ValueError(
-                    f"FK helper field {fk.value_field!r} for target {fk.target_sheet_key!r} "
-                    f"is not in allowed list {allowed!r}"
-                )
-
-
-def _list_value(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        values = [value]
-    else:
-        values = [str(item) for item in value]
-    return list(dict.fromkeys(item for item in values if item))
+def known_data_frame_names(frames: Frames) -> set[str]:
+    return {sheet_name for sheet_name, _df in iter_data_frames(frames)}

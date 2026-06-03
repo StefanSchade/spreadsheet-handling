@@ -1,0 +1,170 @@
+===== FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5 -- Make FK helper primitives consume explicit relation policy
+
+*Status:* New
+
+*Purpose:*::
+Refactor FK helper primitive steps so they consume explicit FK relation policy
+from `_meta` instead of inferring relation semantics from frame, table, or
+column naming conventions.
+
+*Context:*::
+After FK relation policy and `infer_fk_relations` exist, the primitive FK-helper
+steps should become deterministic executors of resolved metadata.
++
+The current primitive path still uses convention-based detection to decide
+which columns are FKs and which target frames they reference. That makes the
+primitive step both an inference engine and a transformation, which conflicts
+with the architecture rule that heuristics belong in configuration steps.
++
+Backward compatibility is intentionally not a goal for this project stage.
+There are no relevant external users whose pipelines must keep running with the
+old implicit behavior.
++
+This FTR removes convention-driven *primitive behavior* only. It does *not*
+remove the FK column convention itself (`id_(<target>)`,
+`core/fk.py:FK_PATTERN`). That convention remains the cell-level wire format
+for cross-sheet references on XLSX / ODS roundtrips and is used by
+`infer_fk_relations` (a configuration step) to write resolved policy. The
+distinction matters: removing the convention would break parse / roundtrip;
+removing primitive inference is the actual goal here.
+
+*Public-surface gate:*::
+
+This FTR removes the implicit relation-detection path from `add_fk_helpers`
+and removes the prefix fallback from `remove_fk_helpers`. Both are documented
+behaviors in the user-guide transformation catalog and in the pipeline-step
+registry, so per `docs/ai_info/interfaces_and_gates.adoc` they are gated
+YAML / step-surface changes. The developer must approve the block before
+implementation begins. The Phase 3a preamble in `_ftrs_open.adoc` names this
+gate at planning time.
+
+*Dependencies:*::
+
+* `FTR-FK-RELATION-POLICY-MODEL-P5`
+* `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`
+* Existing FK helper implementation.
+* Existing derived-helper provenance implementation.
+* Existing FK-helper validation tests.
+
+*Scope:*::
+
+* Refactor `add_fk_helpers` so it reads the v2 FK relation policy from
+  `_meta.helper_policies.fk` (see `FTR-FK-RELATION-POLICY-MODEL-P5`).
+* Remove normal-path dependency on convention-based FK detection from
+  `add_fk_helpers` (no `detect_fk_columns` call, no `FK_PATTERN` match for
+  relation inference inside the primitive).
+* Refactor `validate_fk_helpers` so validation checks relation policy and
+  materialized helper values, not naming conventions. Use `target_key` from
+  policy to resolve target values.
+* Refactor `remove_fk_helpers` so helper removal uses derived provenance and /
+  or explicit policy. The prefix fallback is removed from normal operation;
+  missing provenance / policy is a clear error. Recovery from
+  externally-edited workbooks that arrive without provenance is intentionally
+  out of scope here -- if it is wanted later, it becomes a separate opt-in
+  recovery / inference step or follow-up FTR, not a hidden fallback inside
+  the primitive.
+* Refactor `reorder_fk_helpers` so helper placement uses explicit policy or
+  helper provenance, not `FK_PATTERN` or helper-prefix matching.
+* Extend `_meta.derived.sheets.*.helper_columns` entries written by
+  `add_fk_helpers` with `target_key` (the PK column on the target sheet)
+  alongside the existing `column`, `fk_column`, `target`, `value_field`.
+  This is the producer-side change; lifecycle policy for the channel is
+  owned by `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+* Remove or quarantine old convention helpers that are no longer used by
+  primitive FK-helper runtime paths.
+* Update tests to use either:
+  ** explicit relation policy, or
+  ** `infer_fk_relations` before FK-helper primitives.
+
+*Behavior:*::
+
+* `add_fk_helpers` fails clearly if no FK relation policy is available, with
+  an error that names the expected configuration or inference step
+  (`configure_fk_helpers` or `infer_fk_relations`).
+* `add_fk_helpers` materializes only helpers declared by policy.
+* `validate_fk_helpers` checks declared FK relations and helper values using
+  `target_key` from policy.
+* `remove_fk_helpers` removes only columns identified by provenance or
+  policy. Missing provenance / policy is a clear error; no prefix fallback
+  hides the failure.
+* `reorder_fk_helpers` moves only declared helper columns.
+* No primitive FK-helper step may interpret `auto`, infer target frames, or
+  guess target key columns.
+
+*Non-Goals:*::
+
+* No public backward compatibility (subject to the approval gate above).
+* No legacy mode hidden behind defaults.
+* No automatic migration of old user YAML.
+* No generic relation engine beyond FK helper use cases.
+* No redesign of workbook-view readback.
+* No screenshot or tutorial update; that belongs to the docs realignment FTR.
+* No removal of `FK_PATTERN` or the `id_(<target>)` cell-level convention;
+  this FTR only changes primitive *behavior*, not the serialized FK shape.
+  The convention is used by `infer_fk_relations` (a configuration step) and
+  by the parser / writer.
+* No hidden prefix-based recovery in `remove_fk_helpers`. If recovery from
+  externally-edited workbooks without provenance is needed later, it is a
+  separate opt-in step / FTR, not a silent fallback.
+* No lifecycle policy for `_meta.derived.sheets.*.helper_columns` (pruning,
+  stale / orphan handling, schema validation). That is owned by
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` in Phase 4.
+
+*Acceptance:*::
+
+* FK-helper primitives no longer infer FK relation identity from column
+  names.
+* Missing policy produces a clear actionable error that names the expected
+  configuration or inference step (`configure_fk_helpers` or
+  `infer_fk_relations`).
+* `add_fk_helpers` writes derived helper provenance entries that include
+  `target_key` alongside `column`, `fk_column`, `target`, `value_field`.
+* Tests cover a fully explicit policy path
+  (`configure_fk_helpers` -> `add_fk_helpers`).
+* Tests cover an inferred-policy path
+  (`infer_fk_relations` -> `add_fk_helpers`).
+* Tests cover failure when `add_fk_helpers` is run without policy (clear
+  error names the expected configuration / inference step).
+* Tests cover helper cleanup after reimport via provenance (no prefix
+  fallback).
+* Tests cover failure of `remove_fk_helpers` when neither provenance nor
+  policy is available (no silent fallback).
+* Tests cover validation mismatch using `target_key` and helper field
+  information from policy / provenance.
+* `remove_fk_helpers` no longer applies a helper prefix fallback in normal
+  operation; if absent metadata is detected, the step fails clearly.
+* Registry docs classify FK-helper primitives as primitive execution steps
+  with no heuristic responsibility.
+* A new architecture guard
+  (`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`,
+  or an equivalent additional assertion in the existing FK-helper guard) asserts:
+  ** `domain.transformations.fk_helpers.enrich.enrich_helpers` does not call
+     `detect_fk_columns`;
+  ** the FK-helper primitives package does not import `FK_PATTERN` for
+     relation inference (use inside cell-level parsing utilities is
+     unaffected);
+  ** any FK structure used by FK-helper primitives is read from
+     `_meta.helper_policies` (v2 shape) or
+     `_meta.derived.sheets.*.helper_columns`.
+* The existing FK-helper architecture guard
+  (`test_architecture_guard_fk_helpers.py`) continues to pass unchanged.
+
+*Validation:*::
+
+* Run FK helper unit tests.
+* Run relevant pipeline integration tests.
+* Run demo product-business-slice tests after the docs realignment FTR updates
+  the demo pipeline, or temporarily update a fixture pipeline inside this FTR.
+* Run architecture guards.
+* Run source-style guards if production code is changed substantially.
+* Render affected technical and user documentation.
+
+*Residual risks:*::
+
+* Removing convention fallback may break local scratch pipelines not represented
+  in tests. This is acceptable before external users depend on the package.
+* Some old core utilities may become dead code but not be removed immediately.
+  Dead-code cleanup may be handled in a later maintainability FTR if removing
+  them would expand this slice too far.
+* The relation policy shape may need later extension for composite keys or
+  grouped workbook views.

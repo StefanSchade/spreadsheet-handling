@@ -1,0 +1,225 @@
+===== FTR-ROUNDTRIP-TEST-LAYER-P4A -- Introduce a roundtrip-invariant test layer
+
+*Status:* New
+*Priority:* P4A
+*Area:* Test architecture / regression coverage / pipeline contract validation
+*Release relevance:* The first roundtrip test (helper-cleanup invariant) is
+the acceptance regression for `BUG-HELPER-CLEANUP-CONTRACT-P4A`, which is a
+`0.2.0` blocker. The full FTR (all three invariant sub-groups, marker, make
+target, docs) is intended to land within the same `0.2.0` window. Slipping
+the marker/docs work to immediately after `0.2.0` is acceptable; the
+cleanup-invariant test itself is not.
+
+==== Context
+
+The Adoption-001 wave (May-June 2026) surfaced a class of defects that
+existing test layers do not catch:
+
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` -- runtime metadata
+  accumulated into persisted `_meta` across pipeline runs. Unit tests for
+  each step passed; the defect only appeared when canonical state was
+  promoted from a reviewed reimport and replayed on a later run.
+* `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- the persistence-boundary fix from
+  the previous BUG removed the carrier that `apply_derived_column_policy`
+  reads, so the cleanup step silently became a no-op. Unit tests for the
+  step still passed (with a mocked `_meta.derived` they do their job);
+  architecture guards still passed (no boundary violation); the defect
+  only appeared on a fresh `canonical -> workbook -> canonical` round trip.
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- the literal string
+  `"nan"` reaches canonical JSON for empty FK source values. Only
+  observable end-to-end; the per-step value normalization is technically
+  correct in isolation.
+
+The common shape: cross-step contract failures, only visible when the full
+export-import loop is exercised. Unit tests cover step internals.
+Architecture tests cover layer boundaries. Integration tests cover per-step
+or per-feature slices. None of these reliably catches "intent declared in
+YAML, silently not enforced across a pipeline cycle."
+
+==== Problem statement
+
+The framework needs a test category whose invariants are scoped to **full
+pipeline cycles**, not individual steps. Without it, each future bug of
+this class is discovered by an external adopter, not by the test suite.
+
+==== Scope
+
+* Establish a roundtrip-invariant test layer with its own pytest marker,
+  directory, and make target, alongside the existing unit / architecture /
+  integration / end-to-end layers documented in
+  `FTR-TEST-SUITE-TOPOLOGY-P3C` and `FTR-ARCHITECTURE-TEST-LAYER-P3C`.
+* Build a small, reusable fixture for roundtrip tests: 2-3 frames, at
+  least one FK relation, at least one FK helper, at least one row with an
+  empty FK source value (deliberately exercising the unresolved-helper
+  case). Fixture is the single source of truth for all roundtrip tests;
+  individual tests parametrize from it rather than each defining their
+  own.
+* Implement three initial invariant sub-groups, each starting with one
+  concrete test:
+** *Cleanup invariants* -- assert that intent declared in a pipeline
+   (helper cleanup, view sheet mapping cleanup, derived-column policy)
+   actually holds after the round trip. First test:
+   `test_helper_columns_absent_after_canonical_reimport` (covers
+   `BUG-HELPER-CLEANUP-CONTRACT-P4A`).
+** *Metadata convergence* -- assert that running the same round trip N
+   times produces a stable persisted `_meta` for `N >= 2`, modulo
+   explicitly accepted drift (counters, commit stamps, timestamps, etc.,
+   which the test must enumerate or whitelist). First test:
+   `test_meta_stable_from_second_roundtrip` (prevents recurrence of the
+   `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` failure class).
+** *Pathological-cell contracts* -- assert defined behavior when a cell
+   carries non-domain content: empty FK source, spreadsheet error tokens
+   (`#NAME?`, `#N/A`, `#REF!`), NaN-valued numeric cells, etc. First
+   test: `test_empty_fk_source_helper_representation` (becomes
+   enforceable once `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+   defines the contract; until then runs as `xfail` with a documented
+   reason naming the open BUG).
+* Update AI-info and contributor docs to record:
+** Where roundtrip tests live (`tests/roundtrip/`).
+** When to write one ("a bug only reproducible across a canonical ->
+   workbook -> canonical loop, or any invariant that holds only over a
+   full pipeline cycle").
+** The naming discipline (test names describe *invariants*, not
+   *implementations*; see *Non-goals* below).
+* Wire the make target into the default test invocation matrix
+  documented in the repository runbook, so a contributor running the
+  standard test target sees the roundtrip layer's status as a clearly
+  named line in the output.
+* Backfill the test-layer inventory in the user-guide or developer-guide
+  chapter that hosts the test topology, naming `roundtrip` as the fourth
+  layer with a one-paragraph description and the cross-reference to this
+  FTR.
+
+==== Non-goals
+
+* *No naming by implementation.* Test names must describe invariants
+  (`test_helper_columns_absent_after_canonical_reimport`), never the
+  step that currently provides the invariant
+  (`test_apply_derived_column_policy_drops_columns`). The latter is a
+  unit test, not a roundtrip test. Recorded as a non-goal because the
+  whole point of roundtrip tests is to remain green across refactors of
+  the implementation that provides the invariant.
+* No end-to-end consumer scenarios. Worldbuilding and demo repositories
+  exercise full consumer flows informally; promoting them into the test
+  suite is a separate decision tracked under existing adoption work.
+* No new pipeline steps. Roundtrip tests use the existing public CLI
+  surface (`sheets-run`) plus assertions on the produced artifacts. They
+  do not introduce framework-internal test hooks that bypass the public
+  surface.
+* No replacement of unit or integration tests for individual steps.
+  Roundtrip tests are additive; unit tests for `apply_derived_column_policy`
+  (or its successors) remain the right place to test per-step internals.
+* No coverage of features that do not yet exist (e.g., the
+  pathological-cell contract for `#NAME?` formula errors). Tests that
+  cannot be made green today are marked `xfail` with a documented
+  reason naming the open backlog item, never `skip` and never silently
+  omitted.
+
+==== Acceptance
+
+* New pytest marker (working name: `roundtrip`) registered in the test
+  configuration alongside existing markers. Selection works in both
+  directions: `-m roundtrip` runs only roundtrip tests; `-m "not
+  roundtrip"` runs the default suite without them.
+* New directory `tests/roundtrip/` with the three sub-files:
+** `test_cleanup_invariants.py`
+** `test_metadata_convergence.py`
+** `test_pathological_cell_contracts.py`
+* Shared fixture (working name: `tests/roundtrip/fixtures/minimal_fk_dataset/`
+  or equivalent) -- small, reusable, deliberately covering FK relation,
+  FK helper, empty FK source row.
+* New make target (working name: `test-roundtrip`) plus inclusion in the
+  CI matrix at the same release-blocking severity as the architecture
+  test layer.
+* At least one green test per invariant sub-group:
+** `test_helper_columns_absent_after_canonical_reimport` -- before the
+   `BUG-HELPER-CLEANUP-CONTRACT-P4A` fix the test runs as `xfail`
+   capturing the pre-fix symptom; after the fix it runs green. The
+   transition is a deliberate part of the BUG fix slice.
+** `test_meta_stable_from_second_roundtrip` -- green at HEAD with an
+   explicit whitelist of accepted drift fields. If new drift is
+   introduced by a later feature (e.g., a commit-stamp field), the
+   whitelist is updated as part of that feature's slice, not as
+   roundtrip-test maintenance.
+** `test_empty_fk_source_helper_representation` -- runs as `xfail`
+   until `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` defines the
+   contract; transitions to green as part of that BUG's fix.
+* AI-info entry under `docs/ai_info/` (or the existing test-topology
+  reference) names the roundtrip layer, points contributors at this FTR,
+  and records the invariant-naming discipline as a project convention.
+* Test-layer inventory (developer guide or user-guide chapter that hosts
+  test topology) updated to list four layers: unit, architecture,
+  integration, roundtrip. The pre-existing taxonomy from
+  `FTR-TEST-SUITE-TOPOLOGY-P3C` is extended, not replaced.
+* Acceptance criteria of `BUG-HELPER-CLEANUP-CONTRACT-P4A` and
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` now point at
+  `tests/roundtrip/` as the home of their respective regression tests.
+
+==== Tradeoffs explicitly accepted
+
+Recorded so future agents do not re-litigate them.
+
+* *Roundtrip tests are coupling by construction.* They exercise many
+  components together, so a refactor in one component can break several
+  roundtrip tests at once. This is acceptable because the test names are
+  bound to invariants, not implementations -- a refactor that preserves
+  the invariant does not break the test, only changes which production
+  code provides the invariant. The invariant-naming discipline (see
+  *Non-goals*) is what makes this tradeoff sustainable.
+* *Roundtrip tests are slower than unit tests.* They perform real I/O
+  through the CLI, parse spreadsheets, and run full pipelines. The
+  dedicated marker is what makes this manageable: contributors running
+  the default suite during local iteration can skip roundtrip tests; CI
+  runs them at release-blocking severity, analogous to how the existing
+  `architecture` test layer is handled today.
+
+==== Validation
+
+* Marker registration: `pytest --markers | grep roundtrip` lists the new
+  marker with its documented description.
+* Marker selection works: `pytest -m roundtrip tests/` collects only the
+  three new files; `pytest -m "not roundtrip" tests/` collects the
+  default suite unchanged in count.
+* The three invariant tests run and produce the documented outcomes
+  (one green, one green-with-whitelist, one `xfail`-with-reason).
+* The pre-fix `xfail` for the helper-cleanup invariant captures the
+  exact symptom documented in `BUG-HELPER-CLEANUP-CONTRACT-P4A`'s
+  reproduction recipe.
+
+==== Future extensions (recorded, not in scope here)
+
+* Worldbuilding consumer roundtrip as a CI smoke (would require pinning
+  the worldbuilding repo or vendoring a minimal subset; coordinate with
+  the adoption plan).
+* Additional pathological-cell cases beyond empty FK source: formula
+  errors, typed null, unicode normalization, multi-line strings.
+* Property-based or fuzz testing on the round-trip path. Possibly
+  valuable, but premature before the three named invariant categories
+  have settled their fixture and assertion shape.
+
+==== Related backlog items
+
+* `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- first concrete consumer of the
+  new layer. Its acceptance regression test lives here.
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- second consumer;
+  its regression test lives here once the contract is decided.
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` (archived in
+  `docs/cold_storage/backlog/ftrs_done/`) -- the metadata-convergence
+  test in this FTR exists to prevent recurrence of that failure class.
+* `FTR-TEST-SUITE-TOPOLOGY-P3C` (archived) -- the test taxonomy this
+  FTR extends.
+* `FTR-ARCHITECTURE-TEST-LAYER-P3C` (archived) -- the precedent for
+  introducing a new test layer with its own marker, directory, and
+  CI integration.
+
+==== Reference: locations a future implementer will need
+
+* `pyproject.toml` or `pytest.ini` (whichever holds marker registration
+  in the current tree) -- where the new marker is declared.
+* `tests/architecture/` -- the structural precedent for what a
+  dedicated test-layer directory looks like in this repo.
+* `Makefile` -- where the new `test-roundtrip` target lands; reuse the
+  existing test-target shape.
+* `docs/ai_info/` -- where the contributor-facing convention note lives.
+* The user-guide or developer-guide chapter currently documenting test
+  layers (locate via `grep -rn "architecture test layer" docs/`).

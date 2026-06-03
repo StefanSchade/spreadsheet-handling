@@ -45,6 +45,7 @@ def test_pipeline_steps_preserve_meta_sidecar_and_skip_reserved_keys() -> None:
                 "helper_prefix": "_",
             },
         },
+        {"step": "infer_fk_relations"},
         {
             "step": "add_fk_helpers",
             "defaults": {

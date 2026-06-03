@@ -1,0 +1,257 @@
+== Review-Notiz: FTR-CLI-INTERRUPT-ERROR-UX-P5
+
+=== Review-Gegenstand
+
+Reviewed wurde Commit `e776c7796f61e56ab3e9585d1294da9f672ab054`
+(`feat(FTR-CLI-INTERRUPT-ERROR-UX-P5): friendly Ctrl+C handling at
+sheets-run`).
+
+Der Commit liefert zwei zusammenhaengende Korrekturen:
+
+* `run_cli()` behandelt `KeyboardInterrupt` explizit und beendet den Prozess
+  mit `SystemExit(130)`.
+* Der echte `sheets-run` Console-Script-Entry-Point ist von `run:main` auf
+  `run:cli_entry` umverdrahtet, so dass der Runtime-Wrapper auch im
+  installierten Benutzerpfad greift.
+
+=== Gesamtbewertung
+
+Der FTR ist im Kern korrekt umgesetzt. Insbesondere war die zweite Aenderung
+kein optionaler Komfort, sondern notwendig fuer die Acceptance: Vorher wurde
+`run_cli(main)` nur beim direkten Datei-Aufruf ueber
+`if __name__ == "__main__"` genutzt. Der installierte `sheets-run`-Pfad ging
+direkt in `main()` und umging damit nicht nur die neue Interrupt-Behandlung,
+sondern auch die bereits vorhandene kurze `Error: ...`-Fehlerausgabe.
+
+Die jetzige Struktur ist sauber:
+
+* `main(argv)` bleibt testbar und enthaelt die fachliche CLI-Logik.
+* `cli_entry()` ist die Prozess-/Console-Script-Grenze und ruft
+  `run_cli(main)`.
+* `run_cli()` bleibt der zentrale Ort fuer Exit-Code- und Fehler-UX.
+* Es gibt kein `signal`-Modul, keine Plattformabfrage und keine
+  Parser-Cancellation-Checkpoints. Die dokumentierten Non-Goals bleiben
+  eingehalten.
+
+=== Findings
+
+==== Finding 1: `--verbose --verbose` aktiviert den Debug-Traceback nicht
+
+*Severity:* Low
+
+`src/spreadsheet_handling/cli/runtime.py`, Zeile 23, berechnet die
+Vorab-Verbosity nur aus exakten `-v`-Argumenten und einem exakten `-vv`:
+
+[source,python]
+----
+verbosity = sum(1 for a in argv if a == "-v") + (2 if "-vv" in argv else 0)
+----
+
+Damit zeigen `-v -v`, `-vv` und `--debug` wie vorgesehen den Traceback, aber
+`--verbose --verbose` nicht, obwohl `main()` diese Langform ueber argparse als
+denselben Verbosity-Zaehler akzeptiert.
+
+Gezielter Check:
+
+[source,text]
+----
+['prog', '--verbose', '--verbose'] exit 130 traceback False short True
+['prog', '-v', '-v'] exit 130 traceback True short False
+['prog', '-vv'] exit 130 traceback True short False
+['prog', '--debug'] exit 130 traceback True short False
+----
+
+Das blockiert den FTR nicht, weil die dokumentierte Delivery ausdruecklich
+`--debug` und `-vv` nennt und der normale Ctrl+C-Pfad korrekt kurz bleibt. Als
+CLI-Konsistenz waere es spaeter trotzdem sinnvoll, die Cheap-Peek-Logik in
+`run_cli()` an die argparse-Optionen anzugleichen oder bewusst nur `--debug`
+als Traceback-Freigabe zu dokumentieren.
+
+==== Finding 2: Entry-Point-Wiring ist funktional gefixt, aber nur indirekt getestet
+
+*Severity:* Low / Test gap
+
+`pyproject.toml`, Zeile 32, zeigt jetzt korrekt auf:
+
+[source,toml]
+----
+sheets-run = "spreadsheet_handling.cli.apps.run:cli_entry"
+----
+
+Der installierte lokale Wrapper `.venv/bin/sheets-run` importiert ebenfalls
+`cli_entry`. Damit ist der reale Benutzerpfad in dieser Arbeitskopie
+verifiziert.
+
+Die Unit-Tests decken aber vor allem `run_cli()` selbst ab. Es gibt keinen
+gezielten Regressionstest, der die konkrete `sheets-run`-Target-Zeichenkette
+im `pyproject.toml` gegen `spreadsheet_handling.cli.apps.run:cli_entry`
+absichert. Das ist kein Produktfehler im aktuellen Stand, aber genau diese
+Verdrahtung war der Teil, der vorher kaputt war. Ein kleiner Test im
+CLI-Import-Surface-Bereich wuerde den Fix gegen Rueckfall schuetzen.
+
+=== Erfuellte Akzeptanz
+
+* `KeyboardInterrupt` wird an der CLI-Wrapper-Grenze gefangen.
+* Normalmodus: `Interrupted by user.` auf stderr, kein Python-Traceback.
+* Exit-Code: `130`.
+* `--debug`, `-v -v` und `-vv` zeigen weiterhin den Traceback.
+* Normale Exceptions bleiben im bestehenden Fehlerpfad:
+  `Error: ...` im Normalmodus, Traceback im Debug-/Verbose-Pfad.
+* `sheets-run` nutzt nach Reinstall den Wrapper-Pfad
+  `cli_entry -> run_cli -> main`.
+
+=== Verifikation
+
+Ausgefuehrt:
+
+[source,bash]
+----
+.venv/bin/python -m pytest tests/unit/cli -q
+----
+
+Ergebnis: `27 passed`.
+
+[source,bash]
+----
+.venv/bin/python -m ruff check src/spreadsheet_handling/cli
+----
+
+Ergebnis: `All checks passed!`
+
+[source,bash]
+----
+git diff --check
+----
+
+Ergebnis: clean.
+
+Zusaetzlich geprueft:
+
+[source,bash]
+----
+sed -n '1,120p' .venv/bin/sheets-run
+----
+
+Der installierte Wrapper importiert
+`from spreadsheet_handling.cli.apps.run import cli_entry`.
+
+=== Arbeitsurteil
+
+Der FTR ist angenommen. Die Umsetzung behebt nicht nur die sichtbare
+Ctrl+C-UX, sondern auch den dahinterliegenden Entry-Point-Bug, durch den der
+installierte `sheets-run`-Pfad den Runtime-Wrapper bisher umgangen hat.
+
+Die beiden Findings sind Restpunkte niedriger Schwere: eine kleine
+Konsistenzluecke bei der Langform `--verbose --verbose` und ein fehlender
+Regressionstest fuer die konkrete pyproject-Verdrahtung. Keiner davon stellt
+die Acceptance oder die gelieferte Bugfix-Richtung in Frage.
+
+=== Disposition der Findings
+
+Beide Findings wurden im Follow-up-Commit auf demselben FTR-Scope behoben.
+
+==== Finding 1 -- Disposition
+
+`run_cli()` benutzt jetzt einen kleinen Helper `_count_verbose(argv)`, der
+die argparse-`action="count"`-Semantik fuer den Cheap-Peek nachbildet:
+
+* `--verbose` wird als 1 gezaehlt.
+* Jedes Short-Token `-v`, `-vv`, `-vvv`, ... traegt `len(token) - 1` bei.
+* Beliebige Kombinationen sind additiv.
+
+Damit triggern jetzt `-vv`, `-v -v`, `--verbose --verbose`, `-vvv`,
+`-v --verbose` usw. alle den Traceback-Pfad. Ein einzelnes `-v` /
+`--verbose` bleibt wie zuvor unter der Schwelle `>= 2`.
+
+Neue Tests in `tests/unit/cli/test_cli_runtime.py`:
+
+* `test_run_cli_exception_verbose_long_form` -- `--verbose --verbose`
+  liefert Traceback.
+* `test_run_cli_exception_single_verbose_stays_short` -- ein einzelnes
+  `--verbose` bleibt bei der kurzen `Error: ...`-Ausgabe.
+
+Bestehende Tests fuer `-v -v`, `-vv` und `--debug` bleiben unveraendert.
+
+==== Finding 2 -- Disposition
+
+Neuer Test
+`test_sheets_run_entry_point_routes_through_cli_entry` in
+`tests/unit/cli/test_cli_import_surface.py` parst `pyproject.toml` mit
+`tomllib` und pruefte:
+
+* `[project.scripts] sheets-run` zeigt exakt auf
+  `spreadsheet_handling.cli.apps.run:cli_entry`.
+* `cli_entry` ist importierbar und aufrufbar.
+
+Damit faellt ein versehentlicher Rueckfall auf `run:main` (also der alte
+Bypass-Pfad) als Testfehler auf, nicht erst beim naechsten Ctrl+C eines
+echten Users.
+
+==== Validation der Disposition
+
+[source,bash]
+----
+.venv/bin/python -m pytest tests/unit/cli -q
+----
+
+Ergebnis: `30 passed` (vorher 27; +2 Verbose-Tests, +1 Entry-Point-Pin).
+
+[source,bash]
+----
+.venv/bin/python -m ruff check src/spreadsheet_handling/cli
+----
+
+Ergebnis: `All checks passed!`.
+
+[source,bash]
+----
+.venv/bin/python -m pytest tests/unit tests/integration tests/architecture
+----
+
+Ergebnis: `913 passed`.
+
+==== Nachpruefung Codex
+
+Gezielt nachgeprueft nach Commit
+`ebbb2aa50e2999109e23a6b107b2fc80600ad080`
+(`fix(FTR-CLI-INTERRUPT-ERROR-UX-P5): close codex review findings`):
+
+* Finding 1 ist geschlossen. `--verbose --verbose` aktiviert jetzt denselben
+  Traceback-Pfad wie `-v -v` / `-vv`; ein einzelnes `--verbose` bleibt
+  bewusst unterhalb der Schwelle und liefert weiterhin die kurze Meldung.
+* Finding 2 ist geschlossen. Der neue Test pinnt
+  `[project.scripts] sheets-run` exakt auf
+  `spreadsheet_handling.cli.apps.run:cli_entry` und prueft, dass `cli_entry`
+  importierbar und callable ist.
+
+Ausgefuehrt:
+
+[source,bash]
+----
+.venv/bin/python -m pytest \
+  tests/unit/cli/test_cli_runtime.py \
+  tests/unit/cli/test_cli_import_surface.py \
+  -q
+----
+
+Ergebnis: `12 passed`.
+
+Manueller Runtime-Check:
+
+[source,text]
+----
+['prog', '--verbose', '--verbose'] exit 130 traceback True short False
+['prog', '--verbose'] exit 130 traceback False short True
+['prog', '-v', '--verbose'] exit 130 traceback True short False
+['prog', '-vvv'] exit 130 traceback True short False
+----
+
+Entry-Point-Check:
+
+[source,text]
+----
+spreadsheet_handling.cli.apps.run:cli_entry
+True
+----
+
+Damit sind beide im Review dokumentierten Low-Restpunkte erledigt.

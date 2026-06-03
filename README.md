@@ -1,59 +1,48 @@
 # Spreadsheet Handling
 
-**Spreadsheet Handling** is a Python toolkit for converting and orchestrating tabular data.  
-It converts between JSON, CSV, and Excel (XLSX/ODS) while preserving relationships such as foreign keys, indexes, and hierarchies.  
-The goal is to make complex spreadsheet models easier to validate, transform, and round-trip into structured formats.
+**Spreadsheet Handling** is a Python toolkit for round-tripping tabular data
+between JSON, CSV, and Excel/ODS workbooks while preserving relationships such
+as foreign keys, indexes, and hierarchies. It is built around small composable
+pipeline steps configured in YAML so that complex spreadsheet models stay
+easier to validate, transform, and reimport.
 
-This project is still beta. The main user entry point is the
-[spreadsheet-handling-demo](https://github.com/StefanSchade/spreadsheet-handling-demo)
-repository, which contains the runnable prototype integration. Published
-documentation is available at
-[stefanschade.github.io/spreadsheet-handling-pages](https://stefanschade.github.io/spreadsheet-handling-pages/);
-it is being expanded gradually.
+The project is in beta.
+
+---
+
+## Install
+
+```bash
+pip install spreadsheet-handling
+```
+
+Requires Python 3.10 or newer.
+
+## Where to go next
+
+- **Try it locally in a few minutes** &mdash;
+  the [spreadsheet-handling-demo](https://github.com/StefanSchade/spreadsheet-handling-demo)
+  repository walks you through a first-hour tutorial: generate a workbook
+  from a normalized JSON model, edit it, reimport it, and verify the
+  canonical JSON stays clean.
+- **Read the user guide (latest release)** &mdash;
+  <https://stefanschade.github.io/spreadsheet-handling-pages/versions/v0.2.0/core/user-guide/>.
+- **Browse documentation by version** &mdash;
+  <https://stefanschade.github.io/spreadsheet-handling-pages/>
+  is the per-release archive portal; it carries the latest-release banner
+  and a list of every published version.
 
 ---
 
 ## Features
 
-- Convert JSON ↔ CSV/Excel with round-tripping support
+- Convert JSON ↔ CSV/Excel (XLSX) with round-tripping support
 - Detect and enforce foreign key relationships
 - Validate spreadsheet structures (naming rules, uniqueness, etc.)
 - Orchestrate multi-sheet pipelines via YAML configs
 - Extensible: plug in new backends and transformation steps
 
 ---
-
-## Installation
-
-```bash
-# clone repo
-git clone https://github.com/StefanSchade/spreadsheet-handling.git
-cd spreadsheet-handling
-
-# set up environment
-make setup
-```
-
-## Usage
-
-### Run a configurable pipeline:
-
-```bash
-sheets-run --config sheets.yaml --profile demo
-```
-
-### Try the reference shortcut commands:
-
-```bash
-sheets-example-json-to-xlsx examples/json -o demo.xlsx
-sheets-example-xlsx-to-json demo.xlsx -o demo_out
-```
-
-### Run full test suite:
-
-```bash
-make test
-```
 
 ### AI Usage & Position Statement
 
@@ -64,8 +53,7 @@ make test
 *Industry trends support this approach:*
 according to the [JetBrains Developer Ecosystem 2025 survey published by *Golem.de*](https://www.golem.de/news/umfrage-unter-24-000-entwicklern-gesamtes-berufsfeld-befindet-sich-im-wandel-2510-188855.html), AI adoption is already pervasive and considered a core competency.
 
-
 ### License
 
 This project is licensed under the terms of the MIT License.
-See [LICENCE](LICENSE) for details.
+See [LICENSE](LICENSE) for details.

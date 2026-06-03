@@ -14,14 +14,7 @@ pytestmark = pytest.mark.ftr("FTR-DOMAIN-TRANSFORMATION-PACKAGE-BOUNDARY-GUARDS-
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-STEP_REGISTRY_PATH = (
-    REPO_ROOT
-    / "docs"
-    / "technical_model"
-    / "ch05_registries"
-    / "pipeline_step_registry"
-    / "pipeline_step_registry.json"
-)
+STEP_REGISTRY_PATH = REPO_ROOT / "registries" / "pipeline_step_registry.json"
 
 GUARDED_FAMILY_ROOTS = (
     "spreadsheet_handling.domain.transformations.fk_helpers",

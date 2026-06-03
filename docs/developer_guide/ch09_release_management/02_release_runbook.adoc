@@ -49,6 +49,97 @@ the generated artifacts after release. Write access from CI uses the SSH
 deploy key whose private half is stored as the `DOCS_DEPLOY_KEY` secret on the
 core repository.
 
+=== Cross-Repo Release Sequence
+
+A release touches three repositories in a strict order. The intent of
+this section is to give an operator a one-screen mental model so the
+later checklists can be followed without rereading the whole runbook.
+
+[cols="1,1,2,2,1", options="header"]
+|===
+| Stage | Repository | What happens | Owner | Verification
+
+| 1
+| `spreadsheet-handling` (core)
+| Pre-tag branch and topology check; tag created on `main`; tag pushed;
+  PyPI Trusted Publisher uploads the release; core `publish-docs` writes
+  `versions/<core-tag>/core/` (and `latest/core/` for the newest tag)
+  into the Pages repo.
+| Release operator (you)
+| `make release-check`, then `make release-check TAG=vX.Y.Z`;
+  PyPI project page; CI status on the tag commit; `make pages-check
+  CORE_TAG=vX.Y.Z LATEST=1` after the Pages push completes.
+
+| 2
+| `spreadsheet-handling-demo` (demo)
+| Demo `pyproject.toml` core pin updated to the published version; demo
+  test suite runs against the installed PyPI release; demo state
+  committed on `main`; optional demo tag `vX.Y.Z-demo` created and
+  pushed; demo `publish-docs` writes
+  `versions/<demo-tag>/demo/slides/` (and `latest/demo/slides/` for the
+  newest demo tag).
+| Release operator (you)
+| Demo CI green on the tag commit; `make pages-check CORE_TAG=vX.Y.Z
+  DEMO_TAG=vX.Y.Z-demo LATEST=1` reports all sections plausible.
+
+| 3
+| `spreadsheet-handling-pages` (pages)
+| Receives the generated artifacts from stages 1 and 2 under the shared
+  release roots. Pull the working tree locally before running
+  `pages-check`. The pages repo has no CI surface of its own; both
+  publishers push directly under their owned subtrees with the
+  `DOCS_DEPLOY_KEY` SSH deploy key.
+| Both publishers (write-only via deploy key); operator (verifies)
+| `git -C ../pages pull --ff-only`, then `make pages-check ...`.
+|===
+
+Dependencies between stages are real, not stylistic:
+
+* Stage 2 *waits* for stage 1's PyPI artifact to exist. Demo CI installs
+  the pinned core version from PyPI; bumping the pin before the
+  publish succeeds breaks demo CI.
+* Stage 3 (pages) is the *consequence* of stages 1 and 2, not a stage
+  to drive independently. Manual edits to the pages repo are
+  legitimate for the root `index.html` only; the
+  `versions/<tag>/` and `latest/` subtrees are publisher-owned.
+
+For a one-shot "where am I across all three repos right now" view, see
+the `release-status` helper:
+
+[source,console]
+----
+make release-status
+----
+
+It prints per-repo branch/tag/clean state, the demo's pinned core
+version, the versioned core/demo snapshots present in the local pages
+checkout, and a one-line next-action hint based on internal
+consistency. The helper is read-only; it never fetches, never tags,
+never publishes, and never touches the pages working tree. Sibling
+checkouts are auto-detected as `../demo` / `../pages` (or the
+upstream-named `../spreadsheet-handling-demo` / `-pages`); override
+with `CORE_DIR` / `DEMO_DIR` / `PAGES_DIR` if your workspace uses
+different paths.
+
+The three helpers compose into the same flow:
+
+[cols="1,3", options="header"]
+|===
+| When | Helper
+
+| Before tagging
+| `make release-check` (current state) / `make release-check
+  TAG=vX.Y.Z` (validates the named tag's topology)
+
+| After stage 1 or stage 2 push
+| `make pages-check CORE_TAG=vX.Y.Z [DEMO_TAG=...] [LATEST=1]`
+  (verifies the published file tree)
+
+| Any time, to orient
+| `make release-status` (one-shot cross-repo state + likely next
+  action)
+|===
+
 === Branch and Topology Awareness
 
 Release tags must be reachable from `main`. The `v0.1.0b6` release succeeded
@@ -120,19 +211,157 @@ Before tagging a core release:
   built as a Pages-bound artifact;
 * the public `README.md` still describes the current product and CLI shape
   shown on PyPI;
+* `docs/pages/root_index.adoc` -- update the *Latest release* banner tag
+  and add a new row to the *Browse by version* table for the new release
+  (mark the new tag as `(current)` and remove `(current)` from the
+  previous row). Demo tags `v<core-tag>-demo` share the same row;
+* release-bound `README.md` links are baked from `/latest/...` to
+  `/versions/<tag>/...` on the release branch, and
+  `make readme-check TAG=v<version>` reports no remaining
+  `/spreadsheet-handling-pages/latest/` URLs (see
+  *Release-bound README links* below for the full procedure and the
+  rationale);
 * the tag format is `v<version>` without extra punctuation, for example
   `v0.1.0b6`.
 
 For the current GitHub Actions based release flow:
 
 . push `main`;
-. create the release tag locally (do not push yet);
+. branch off `main` to a short-lived release branch and bake the
+  README link versions per *Release-bound README links* below;
+. merge or fast-forward the release branch into `main`, then push
+  `main` so `origin/main` contains the release-bound README commit;
+. create the release tag locally on the release-bound `main` commit
+  (do not push yet);
 . run `make release-check TAG=v<version>` and confirm the tag is reachable
    from `origin/main` and points where intended;
 . push the release tag;
-. let GitHub Actions build and publish the package;
+. let GitHub Actions build and publish the package; the `publish` job
+  runs `make readme-check TAG=$GITHUB_REF_NAME` before `python -m build`
+  so a missed bake fails the publish before anything reaches PyPI;
 . verify that the PyPI version and the workflow outcome match the intended
    release.
+
+=== Release-bound README links
+
+==== Why
+
+The public `README.md` lives on `main` as a *living* document and
+points at the moving `/latest/...` Pages documentation. That is the
+right shape for a reader on GitHub `main` or in a freshly-cloned
+checkout, but it is the wrong shape for any *frozen* public artifact
+that is generated at tag time:
+
+* PyPI keeps old release pages online indefinitely. A `/latest/...`
+  link on `pypi.org/project/spreadsheet-handling/0.1.0b6/` silently
+  starts sending the reader to documentation for a newer release as
+  soon as the next tag publishes.
+* GitHub release pages render the `README.md` as of the tagged
+  commit; a `/latest/...` link there has the same drift problem.
+
+The policy (`FTR-RELEASE-README-VERSION-BAKING-P5 § Link-versioning
+policy`) is therefore: *frozen contexts use
+`/versions/<tag>/...`*; *living contexts may use `/latest/...`* with
+an explicit "latest release" / "current release" label.
+
+==== Substitution surface
+
+The only URLs rewritten are those that begin with the literal prefix
+
+[source]
+----
+https://stefanschade.github.io/spreadsheet-handling-pages/latest/
+----
+
+The prefix is rewritten to
+
+[source]
+----
+https://stefanschade.github.io/spreadsheet-handling-pages/versions/v<version>/
+----
+
+Other strings containing `latest` (prose, shell snippets, asciidoctor
+output paths) are intentionally left alone: the policy is about the
+*Pages URL shape* a frozen reader follows, not about the word `latest`
+appearing in text. The link *labels* on `main` may continue to say
+"latest release" / "current release"; only the underlying URL needs
+to move.
+
+==== Manual procedure (current, default path)
+
+Before tagging a release on the core repository:
+
+. Branch off `main` to a short-lived release branch
+  (`release/v<version>` is a convenient name).
+. Rewrite the README URLs in place. The check helper prints the
+  exact sed one-liner when run in release-tag mode, but for
+  convenience:
++
+[source,bash]
+----
+sed -i \
+  "s#https://stefanschade.github.io/spreadsheet-handling-pages/latest/\
+#https://stefanschade.github.io/spreadsheet-handling-pages/versions/v<version>/#g" \
+  README.md
+----
+. Run the verifier:
++
+[source,bash]
+----
+make readme-check TAG=v<version>
+----
++
+A successful run prints `PASS` and exits 0. If any
+`/spreadsheet-handling-pages/latest/` URL remains, the helper exits
+non-zero and prints each remaining line with its line number, plus
+the suggested sed substitution.
+. Commit the substitution as a single Conventional Commit, suggested
+  subject `docs(release): bake versioned README links for v<version>`.
+. Merge or fast-forward the release branch into `main`, then push
+  `main` so the tag reaches `origin/main` (`release-check`
+  requires this).
+. Create and push the release tag from the release-bound commit.
+. After the tag publishes, on `main`: restore `/latest/...` so the
+  living README is unaffected. The simplest path is a single
+  Conventional Commit on `main` that re-applies the inverse sed.
+
+==== CI guard
+
+The publish job in `.github/workflows/release.yml` runs
+`make readme-check TAG=$GITHUB_REF_NAME` before `python -m build`,
+so a missed manual bake fails the workflow before the wheel is
+built. The guard is the *non-silent backstop* required by
+`FTR-RELEASE-README-VERSION-BAKING-P5 § Acceptance` (extended);
+it does not replace the manual procedure, only catches it being
+skipped.
+
+==== Demo repository
+
+The demo `README.md` is surfaced on GitHub release pages for the
+matching demo tag (`v<core-tag>-demo`). The same policy applies if
+the demo repository adopts the helper:
+
+* copy `tools/readme_links_check.sh` from core into the demo
+  repository (the `tools/` directory is the cross-repo copy point
+  documented in `ai_info/conventions.adoc` § *Helper script
+  placement*);
+* wire a `readme-check` Make target through the same shape;
+* add a *Release-bound README links* bullet to the demo's release
+  / alignment procedure.
+
+The demo adoption is outside this slice's scope; it is documented
+here so a future maintainer can apply the same rule without
+re-discovering it. The check helper substitution allowlist (only
+`…/spreadsheet-handling-pages/latest/` URLs) is identical between
+core and demo, so no per-repo configuration is needed.
+
+==== Idempotency
+
+`readme_links_check.sh` does not modify any file, so running
+`make readme-check TAG=v<version>` twice in a row is a no-op. The
+manual sed substitution is also idempotent against a baked README:
+re-running the sed against a README that already uses
+`/versions/v<version>/...` produces zero changes.
 
 === Demo Alignment Checklist
 
@@ -144,6 +373,11 @@ After the core release is successfully published:
 * render slide decks locally with `scripts/render_slides.sh` (optional
   smoke check that asciidoctor-revealjs still parses the walkthroughs
   against the new core),
+* review `demo/docs/screenshots/product_business_slice/` against the
+  freshly-generated workbook: if any image no longer matches what the
+  reader will see, refresh it per the procedure in
+  `demo/docs/screenshots/README.md` or delete the stale image rather
+  than ship a misleading one,
 * commit the aligned demo state on `main`,
 * create a matching demo tag such as `v0.1.0b6-demo`,
 * push the demo tag -- the demo `publish-docs` workflow then renders
@@ -157,6 +391,332 @@ group, so a simultaneous core + demo tag push serializes against the
 Pages repo automatically. See
 `01_ci_cd_and_publishing.adoc` ("Demo Slide Publishing") for the full
 workflow shape and the reveal.js vendoring rationale.
+
+=== Post-Deploy Pages Validation
+
+The core `publish-docs` and demo `publish-docs` workflows both push into
+`spreadsheet-handling-pages`. A green publish job confirms that the job
+finished without an error, but it does not confirm that the expected
+files exist in the published topology or that an inadvertently-empty
+artifact was not pushed. Validate the observable post-deploy state
+explicitly:
+
+. Pull the latest Pages working tree into the local checkout (the
+  publisher's push is to `origin/main` of the Pages repo):
++
+[source,console]
+----
+git -C ../pages pull --ff-only
+----
++
+The agent does not perform the pull. The developer runs it; the helper
+in the next step is read-only and does not fetch.
+
+. Run the structural check from the core repository:
++
+[source,console]
+----
+make pages-check CORE_TAG=v<version> DEMO_TAG=v<version>-demo LATEST=1
+----
++
+`CORE_TAG` is required. `DEMO_TAG` is optional and only meaningful when
+a matching demo tag was pushed. `LATEST=1` additionally validates the
+`latest/core/` and (when a demo tag is given) `latest/demo/slides/`
+moving aliases. `PAGES_DIR=...` overrides the auto-detected pages
+checkout (default: `../pages` or `../spreadsheet-handling-pages`).
+
+. Interpret the result:
++
+[cols="1,4"]
+|===
+| Exit 0 | Structurally plausible publish. Every checked section's
+  expected files exist and are nonzero in size. This does not
+  validate page content or external HTTP accessibility.
+| Exit 1 | At least one section is *partial*: the parent directory
+  exists but one or more expected files are missing or empty. Likely
+  cause: the publish job hit a partial failure between cloning the
+  Pages repo and pushing -- inspect the relevant publish workflow run.
+| Exit 2 | At least one section is *missing entirely*: the parent
+  directory does not exist. Likely cause: the publish job never ran
+  for this tag, or the pages checkout has not been pulled since the
+  publish completed.
+| Exit 3 | Setup error: pages checkout could not be located, or
+  `--core-tag` was not provided.
+|===
+
+The check looks for these targets, classified per section:
+
+* Pages root invariants -- `index.html`, `.nojekyll`.
+* Core versioned publish -- `versions/<core-tag>/core/{index,user-guide/index,release-notes/index}.html`.
+* Core latest alias (with `LATEST=1`) -- `latest/core/{index,user-guide/index,release-notes/index}.html`.
+* Demo versioned slides (with `DEMO_TAG`) -- at least one nonzero
+  `.html` under `versions/<demo-tag>/demo/slides/`; any empty `.html`
+  in that directory makes the section partial.
+* Demo latest alias (with `DEMO_TAG` and `LATEST=1`) -- at least one
+  nonzero `.html` under `latest/demo/slides/`; any empty `.html` in
+  that directory makes the section partial.
+
+The script is read-only and deterministic. It does not invoke `git`,
+does not reach over the network, and does not modify the Pages working
+tree. Heavier validation (HTTP fetch, link integrity, visual
+comparison) is intentionally out of scope and is *not* a substitute
+for the structural check -- those tools would gate on issues that this
+slice does not.
+
+If `pages-check` reports exit 1 or 2, the corresponding `publish-docs`
+job is the place to look first. Use `Blocking vs Non-Blocking CI
+Signals` (below) to confirm whether the publish job ran for this tag.
+
+=== Blocking vs Non-Blocking CI Signals
+
+The repository status page mixes release-critical signals with
+infrastructure-maintenance noise. When triaging a tag run, separate the
+two before deciding whether to retag or roll back.
+
+*Release-blocking* (must be green to consider the release valid):
+
+* `build-test-publish / test` on the tag commit (core repo);
+* `build-test-publish / publish` on the tag commit (core repo);
+* `build-test-publish / publish-docs` on the tag commit (core repo);
+* `publish-docs / test` and `publish-docs / publish-docs` on the matching
+  demo tag (demo repo), if a demo tag was pushed for this release.
+
+*Non-blocking maintenance signals* (red status here does not invalidate a
+release; treat as a separate maintenance ticket):
+
+* Dependabot job failures, including `403 Token invalid`. These come from
+  GitHub-side Security / Code-security configuration, not from any
+  workflow checked into these repos. See
+  `01_ci_cd_and_publishing.adoc` § GitHub Actions version policy and
+  Dependabot scope for the classification and the manual UI follow-up.
+* GitHub Actions Node.js runtime deprecation warnings, *if any reappear*.
+  The current pins (`actions/checkout@v6`, `actions/setup-python@v6`,
+  `actions/setup-java@v5`) declare the `node24` runtime and the
+  release-time Node-20 warning that motivated this entry is resolved.
+  If a future runner deprecation cycle reintroduces a similar warning,
+  treat it as upstream-driven: wait for the action maintainers to ship
+  a new major targeting the next Node LTS, bump the pins, update the
+  version table in `01_ci_cd_and_publishing.adoc`. Do not invent a
+  workflow-side suppression.
+* `pip install` deprecation notices unrelated to the build artifact.
+* Demo `CI` runs on non-tag pushes -- these are integration smoke against
+  the pinned core release, not release validation.
+
+If only non-blocking signals are red, the release is good. Record the
+maintenance signal in the FTR backlog so it does not silently reappear
+on the next release.
+
+=== Local Public-Surface Preview
+
+==== When to use this
+
+Use this workflow during editorial work on the user-facing public surface
+-- the core `README.md`, the Pages root navigation
+(`docs/pages/root_index.adoc`), the user guide entry point
+(`docs/user_guide/`), and the walkthrough assets surfaced from the demo
+repository -- *before* deciding whether the editorial delta is worth a new
+beta release.
+
+The intent is to answer one editorial question: does the assembled public
+surface (READMEs -> Pages root -> `latest/core/` -> `versions/<tag>/core/`
+-> demo slides) still read coherently from the perspective of a first-time
+user arriving from PyPI or from GitHub? If the on-disk surface already
+reads correctly and no user-visible behavior has changed, skip the
+release.
+
+==== What this is not
+
+This procedure is *not*:
+
+* a release -- nothing is tagged, built into a wheel, or published;
+* a substitute for the *Core Release Checklist* -- `release-check` and
+  `readme-check` are not invoked;
+* a substitute for *Post-Deploy Pages Validation* -- the scratch tree
+  never reaches `../pages`, and `DOCS_DEPLOY_KEY` is never exercised;
+* a substitute for *Pre-Tag Local Dry-Run* (below) -- that section
+  validates that `make docs-pages` succeeds against the current source;
+  the preview adds an assembled, browsable tree on top of that.
+
+The scratch tree lives in a disposable location (a `mktemp` dir or
+`/tmp/<name>`). It must never be copied into `../pages`, pushed anywhere,
+or treated as a release artifact.
+
+==== Why not just cut a preview tag
+
+A "just to look at it" tag is more expensive than it appears:
+
+* The publish workflow uploads to PyPI on every `v*` tag, and PyPI
+  refuses to re-upload the same version number. A preview tag therefore
+  burns a version even when the editorial change does not warrant one.
+* The core `publish-docs` job moves the public `latest/core/` alias on
+  every successful publish, silently changing the URL every previously
+  published PyPI release page resolves to.
+* The Pages root `index.html` is regenerated against the new tag; the
+  *Latest release* banner in the public archive view advances.
+
+These are public-facing side effects. Use the local preview to gate the
+"is this worth a beta?" decision so the public site only moves when
+something user-relevant changed.
+
+==== Procedure
+
+The preview reuses the existing `make docs-pages` output and assembles a
+Pages-like topology under a scratch directory. No new Make target is
+introduced; the steps stay explicit so the scratch nature of the
+workflow is visible at the command line.
+
+. Build the public Pages HTML locally:
++
+[source,console]
+----
+make docs-pages
+ls build/pages build/pages-root
+----
++
+`build/pages/` is the core subtree (the same content the release
+workflow publishes under `versions/<tag>/core/` and `latest/core/`).
+`build/pages-root/index.html` is the root navigation page that the
+release workflow copies to the Pages repo root.
+
+. Pick a disposable scratch directory and create the Pages-like
+  skeleton:
++
+[source,console]
+----
+SCRATCH="$(mktemp -d -t sh-pages-preview.XXXXXX)"
+SCRATCH_TAG="vPREVIEW"
+mkdir -p "$SCRATCH/latest/core" \
+         "$SCRATCH/versions/$SCRATCH_TAG/core"
+----
++
+`SCRATCH_TAG` is a deliberately fake label so a slip of the eye cannot
+confuse the scratch tree with a real release tag.
+
+. Copy the freshly built core artifacts into both the `latest/core/`
+  and the versioned path, and the root navigation page into the
+  scratch root:
++
+[source,console]
+----
+cp -a build/pages/.               "$SCRATCH/latest/core/"
+cp -a build/pages/.               "$SCRATCH/versions/$SCRATCH_TAG/core/"
+cp -a build/pages-root/index.html "$SCRATCH/index.html"
+----
+
+. Optional: if a sibling Pages checkout already carries published demo
+  slides, copy them in so the demo walkthrough link on the root page
+  resolves locally. This step only *reads* from `../pages`; it does
+  not modify it.
++
+[source,console]
+----
+if [ -d ../pages/latest/demo/slides ]; then
+  mkdir -p "$SCRATCH/latest/demo"
+  cp -a ../pages/latest/demo/. "$SCRATCH/latest/demo/"
+fi
+if [ -d ../pages/assets ]; then
+  mkdir -p "$SCRATCH/spreadsheet-handling-pages"
+  cp -a ../pages/assets "$SCRATCH/spreadsheet-handling-pages/assets"
+fi
+for d in ../pages/versions/*-demo; do
+  [ -d "$d" ] || continue
+  tag="$(basename "$d")"
+  mkdir -p "$SCRATCH/versions/$tag"
+  cp -a "$d"/. "$SCRATCH/versions/$tag/"
+done
+----
++
+If the sibling checkout is missing, skip this step. The preview still
+exercises the core surface; demo-slide links will 404 in the browser,
+which is itself a useful signal about what a brand-new reader sees
+when there is no demo artifact yet.
+
+If the sibling Pages checkout contains `assets/`, copy it as shown above.
+The published demo slides reference self-hosted RevealJS assets under the
+deployed `/spreadsheet-handling-pages/assets/...` path, so adding that tree
+to the scratch preview keeps the local demo rendering aligned with the
+published topology.
+
+. Serve the scratch tree:
++
+[source,console]
+----
+python3 -m http.server --directory "$SCRATCH" 8000
+----
++
+Then open `http://localhost:8000/` in a browser.
+
+. When the walkthrough is done, remove the scratch directory:
++
+[source,console]
+----
+rm -rf "$SCRATCH"
+----
+
+==== Manual inspection checklist
+
+Walk the public user journey end-to-end. Each item is a "would a
+first-time reader still understand this?" question, not a structural
+assertion.
+
+* Core `README.md` (open on GitHub or in a local Markdown viewer): do
+  the "user guide (latest release)" and "browse documentation by
+  version" links still describe what a user actually finds when they
+  follow them into the scratch tree?
+* Demo `README.md` (sibling `../demo/README.md`, if checked out): does
+  the demo entry point still match what a brand-new user would land
+  on?
+* Pages root (`http://localhost:8000/`): does it read as a stable
+  portal/archive entry point (latest-release banner + browse-by-version
+  table), not as a redirect or a duplicate of the user guide?
+* `latest/core/` user guide
+  (`http://localhost:8000/latest/core/user-guide/`): does the page open
+  into a usable document, and do internal navigation links resolve?
+* `latest/core/release-notes/`: does it open and list the current
+  release trail in a way a user can scan?
+* Versioned path
+  (`http://localhost:8000/versions/<SCRATCH_TAG>/core/...`): the same
+  pages a frozen PyPI README link will resolve to once baked. Content
+  should be identical to `latest/core/` for the current build because
+  both were copied from `build/pages/`.
+* Demo walkthrough deck
+  (`http://localhost:8000/latest/demo/slides/...`), if copied in: does
+  the link surface from the root page, does the deck render, and does
+  navigation inside the deck work?
+* Link *intent* vs link mechanics: do the user-facing labels read as
+  intent ("Latest release user guide", "Browse by version", "Demo
+  visual walkthrough") rather than exposing `versions/<tag>/core/`
+  path mechanics too early in the user journey?
+* Old PyPI / GitHub-rendered README contexts: a frozen reader on
+  `pypi.org/project/spreadsheet-handling/<old-version>/` sees the
+  *baked* README for that version (see *Release-bound README links*
+  above), whose URLs target `versions/<old-tag>/core/...`. Mentally
+  cross-check that the corresponding versioned paths in the scratch
+  tree would still make sense to that reader -- not just the
+  `latest/...` view.
+* Is a real beta release now justified? Concretely: is there a
+  user-visible change beyond editorial polish (new CLI surface, a
+  behavior change, a release-note-worthy fix)? If not, defer the beta
+  and reopen this question once one accumulates.
+
+==== Boundaries
+
+This procedure intentionally:
+
+* does not invoke `release-check`, `readme-check`, or `pages-check` --
+  those gate real releases and post-deploy validation; the scratch
+  tree is neither;
+* does not fetch, pull, or push the `../pages` working tree -- step 4
+  only reads from it if present;
+* does not create or move any tag, version, or PyPI artifact;
+* does not modify `latest/` anywhere outside the scratch directory;
+* does not introduce a new Make target -- the steps stay explicit so
+  the scratch nature of the workflow is visible at the command line.
+
+If automating this into a Make target starts to feel useful, the right
+next step is usually the opposite: ask whether the editorial delta has
+grown large enough to justify a real beta release and the normal
+*Core Release Checklist*.
 
 === Pre-Tag Local Dry-Run
 
@@ -268,6 +828,130 @@ Tags that sit outside `main` cause three follow-on problems:
 
 The check is one small step in the runbook; the recovery cost of
 skipping it is larger than the cost of running it.
+
+=== Cross-Repo Recovery Scenarios
+
+Five additional recovery cases turned up during the beta release.
+None of them require retagging; all of them have a small operator
+action that closes the loop without further damage. Run
+`make release-status` first to confirm which scenario you are in
+before acting.
+
+==== Demo tag pushed before main alignment
+
+Symptom: a `vX.Y.Z-demo` tag exists on `origin` of the demo repo, but
+`main` of the demo repo does not yet contain the pin bump or the
+matching test-run commit. `make release-status` typically shows the
+demo pinned-core version diverging from the just-released core tag.
+
+If the demo `publish-docs` workflow already ran from the tag:
+
+. Confirm the rendered slide decks under `versions/<demo-tag>/demo/slides/`
+  match the intended demo state (they were rendered from the tag
+  commit, not from `main`). `make pages-check CORE_TAG=vX.Y.Z
+  DEMO_TAG=vX.Y.Z-demo LATEST=1` confirms structural presence; eyeball
+  one deck for content.
+. Fast-forward `main` of the demo repo to the tag commit so
+  `git log main` includes the release commit. If `main` has diverged
+  (someone committed elsewhere in the meantime), reconcile by merging
+  or rebasing -- do not retag.
+. Document the topology gap in the next release notes.
+
+If the demo `publish-docs` workflow has not yet run (CI queued or
+held), prefer cancelling and following `Tag created from \`dev\``
+above instead -- treating the demo tag as a normal `non-main-branch`
+tag is cleaner than living with the divergence.
+
+==== Stale workflow rerun
+
+Symptom: a `publish-docs` (or `build-test-publish`) re-run was
+triggered manually from the GitHub UI on an older tag, and the run
+used the workflow definition that existed *at that tag*, not the
+current one on `main`. Rerunning a tag from `v0.1.0b6` for a docs
+fix, for example, would re-execute the `actions/checkout@v4` /
+`actions/setup-python@v5` pin combination -- not the current `@v6` /
+`@v6` pins documented in
+`01_ci_cd_and_publishing.adoc § GitHub Actions Version Policy and
+Dependabot Scope`.
+
+This is intentional GitHub behavior: a tag-triggered run always uses
+the workflow file as it was at the tagged commit. The recovery is to
+recognize it and decide whether you actually want a docs-only
+republish:
+
+. If the artifact still needs republishing (Pages was wiped, etc.),
+  re-running the historical workflow is correct -- accept the older
+  action pins and the Node-runtime deprecation warning that may
+  reappear in the log. The published artifact is the same.
+. If the goal is to republish *with current workflow shape*, cut a
+  new patch-level tag from current `main` instead. PyPI rejects
+  same-version re-uploads, so this path only applies to docs
+  republishes or to a new patch release.
+
+The maintenance-signal classification in §"Blocking vs Non-Blocking
+CI Signals" still applies: action-version deprecation warnings on a
+historical-tag rerun are non-blocking and expected.
+
+==== PyPI succeeded but docs failed
+
+Symptom: `build-test-publish / publish` is green for the tag; the
+PyPI project page shows the new version; `build-test-publish /
+publish-docs` is red. `make pages-check CORE_TAG=vX.Y.Z` reports
+missing or partial sections.
+
+PyPI publication is the irreversible side-effect; documentation is
+recoverable. Do not retag.
+
+. Inspect the failed `publish-docs` run log. The most common
+  failure modes are: the AsciiDoctor build stack apt-get install
+  flaking; the `make docs-pages` build erroring on a source file
+  the release commit changed; the `DOCS_DEPLOY_KEY` push being
+  rejected because the pages repo `main` advanced between clone and
+  push (the workflow already retries with rebase up to 5 times, so a
+  hard failure here is unusual).
+. Re-run the failed `publish-docs` job from the GitHub UI. Tag
+  re-runs use the workflow definition at the tag (see §"Stale
+  workflow rerun" above); accept that.
+. After the re-run goes green: `git -C ../pages pull --ff-only`, then
+  `make pages-check CORE_TAG=vX.Y.Z LATEST=1` to confirm the
+  structural state.
+
+==== Demo publish succeeded but CI hygiene failed
+
+Symptom: `publish-docs / publish-docs` is green for the demo tag; the
+Pages repo contains the new slides; another demo workflow
+(Dependabot, scheduled job, ad-hoc CI hygiene run) is red around the
+same time and the repository status page is therefore yellow/red.
+
+The publish *was* the release-blocking signal. Non-publish CI noise
+on the demo repo is classified per
+§"Blocking vs Non-Blocking CI Signals". A red Dependabot run on the
+demo repo does not invalidate the demo tag. Capture the failing run
+ID, open a separate maintenance ticket if the cause is new, and do
+not re-run the publish workflow.
+
+==== Pages publish green but public site not yet visibly updated
+
+Symptom: both `publish-docs` jobs are green; `make pages-check ...`
+reports all sections plausible against the pulled pages working tree;
+`https://stefanschade.github.io/spreadsheet-handling-pages/` still
+shows the previous release.
+
+GitHub Pages serves content from the pages repo `main` branch through
+a separate edge cache and a periodic build. Propagation can take
+several minutes after the publisher's `git push` completes. This is
+not a publish failure.
+
+. Confirm the pushed commit is on `pages/main`:
+  `git -C ../pages log --oneline -1`.
+. Wait a few minutes; refresh with cache-busting
+  (`Ctrl+Shift+R` in most browsers).
+. If the public site still shows stale content after ~10 minutes,
+  inspect the *Pages* tab of the pages repository's GitHub Settings
+  for a build/deployment error. This is repository-UI territory,
+  not a workflow issue.
+. Do not retag, do not re-run the publish job, and do not edit the
+  pages repo manually to "force" a refresh.
 
 === Notes
 

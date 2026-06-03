@@ -71,40 +71,84 @@ _meta:
           - column: _employees_first_name
             fk_column: id_(employees)
             target: employees
+            target_key: id
             value_field: first_name
           - column: _employees_last_name
             fk_column: id_(employees)
             target: employees
+            target_key: id
             value_field: last_name
 ----
 
-The important point: the derived shape lives under the `_meta` carrier in a
-*derived* namespace, not under canonical sheet intent such as `_meta["sheets"]`.
-The canonical `fk_helpers` shape under `_meta["sheets"][...]` is the *direction*
-and is not fully implemented today.
+Each entry carries `{column, fk_column, target, target_key, value_field}`.
+`target_key` (the PK column on the target frame) was added by
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` so v2-aware consumers
+(`remove_fk_helpers`, `reorder_fk_helpers`, `validate_fk_helpers`,
+`apply_derived_column_policy`) can resolve target values without
+re-deriving the target's primary-key column.
+
+The important point: the rich shape above lives under the `_meta` carrier in a
+*derived* namespace. It is transient operational provenance, not durable
+canonical sheet intent. The durable workbook-view shape
+`_meta.sheets.<frame>.helper_columns` may list the visible helper column names
+for rendering/reimport cleanup, but it does not carry FK provenance such as
+`fk_column`, `target`, or `target_key`. The canonical `fk_helpers` shape under
+`_meta["sheets"][...]` is the *direction* and is not fully implemented today.
 
 === What is true today, and what is not
 
-Already true: helper enrichment and cleanup exist as real pipeline steps;
-multiple helper columns per FK are supported; helper-field order is configurable
-and stable; there is step-specific precedence in helper-field resolution; and
-`bootstrap_meta` has its own precedence model.
+Already true: FK-helper primitives are policy consumers, not heuristic
+discoverers. `add_fk_helpers`, `remove_fk_helpers`, `validate_fk_helpers`,
+and `reorder_fk_helpers` read the v2 relation policy under
+`_meta.helper_policies.fk` (`schema_version: 2`) and the derived helper
+provenance under `_meta.derived.sheets.*.helper_columns`; they never call
+`detect_fk_columns` and never consult `FK_PATTERN` to infer relation
+identity. Producing the v2 policy is the job of two configuration steps:
+`infer_fk_relations` (heuristic; default mode `naming_convention`) and
+`configure_fk_helpers` (explicit / manual). Helper provenance entries
+carry `{column, fk_column, target, target_key, value_field}` so consumers
+resolve target values without re-deriving the target's primary-key column.
+Multiple helper columns per FK are supported; helper-field order is
+configurable and stable; `bootstrap_meta` has its own precedence model.
 
-Not yet true: helper cleanup is not yet driven by first-class persisted
-helper-column metadata; helper identification still depends mainly on prefixes
-and naming conventions; helper provenance is registered only as transient
-working metadata, not as durable canonical intent; sheet rename and
-helper-column rename are not supported operations.
+Not yet true: helper provenance is still registered as transient working
+metadata, not as durable canonical intent; sheet rename and helper-column
+rename are not supported operations; lifecycle policy for the derived
+helper-column channel (pruning, stale / orphan handling, schema validation)
+remains owned by `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+Workbook-view helper column lists under `_meta.sheets.<frame>.helper_columns`
+are durable editing-surface metadata. They identify which visible columns are
+helpers, but they are not rich provenance and are not enough for helper value
+checks.
 
-Current behaviour (operational path): `add_fk_helpers` detects FK columns and
-adds helper columns; helper-field selection is driven by step defaults
-(`helper_fields_by_fk`, `helper_fields_by_target` by normalized sheet key, then
-by original sheet name, `helper_fields`, `label_field` as legacy fallback);
-`remove_fk_helpers` removes helper columns by prefix; validation and styling
-rely on helper prefixes and materialized column names. `bootstrap_meta` is part
-of the broader workbook-metadata direction (precedence: `profile_defaults` →
-persisted metadata → `cli_overrides`) but is *not yet* the active source of
+Current behaviour (operational path): a configuration step
+(`infer_fk_relations` or `configure_fk_helpers`) writes the v2 relation
+list at `_meta.helper_policies.fk.relations` first. `add_fk_helpers` then
+reads that policy, materializes only the helper columns the relations
+declare, and writes derived provenance entries
+`{column, fk_column, target, target_key, value_field}`. Missing policy
+raises a clear error naming the producer step. `remove_fk_helpers`
+removes columns identified by the per-sheet derived helper provenance and
+uses the v2 relation list as a fallback when provenance is absent;
+frames with neither provenance nor explicit policy raise clearly --
+recovery from externally-edited workbooks without provenance is a
+separate opt-in concern owned by `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+`validate_fk_helpers` checks declared helper-to-FK pairs and joins on
+`target_key` from the policy or provenance. `reorder_fk_helpers` moves
+helper columns next to their declared FK column using policy / provenance,
+not `FK_PATTERN`. `bootstrap_meta` is part of the broader
+workbook-metadata direction (precedence: `profile_defaults` → persisted
+metadata → `cli_overrides`) but is *not yet* the active source of
 helper-field resolution inside `add_fk_helpers`.
+
+Reimport cleanup: `apply_derived_column_policy` reads the rich
+`_meta.derived.sheets.*.helper_columns` provenance when it is present. After a
+fresh persisted workbook reimport, that transient channel is intentionally
+absent; in that case `policy: drop` resolves helper identity from durable
+`_meta.sheets.<frame>.helper_columns` and drops those visible columns. Because
+the durable list contains names only, `warn_on_mismatch` and
+`fail_on_mismatch` still perform value/provenance checks only for helpers
+described by `_meta.derived`.
 
 === Precedence is per step
 
@@ -116,14 +160,18 @@ heuristics must not silently contradict existing metadata.
 
 === Naming conventions: two different jobs
 
-* *FK naming* (`id_(employees)`) helps the system detect that a column is
-  intended as a foreign key.
-* *Helper naming* (`_employees_first_name`) helps distinguish derived helper
-  columns from ordinary payload and helps cleanup avoid collisions.
+* *FK naming* (`id_(employees)`) remains the cell-level wire format for
+  cross-sheet references on XLSX/ODS roundtrips. It is parsed by the
+  IO layer and consumed by `infer_fk_relations` (a configuration step)
+  as the default heuristic. FK-helper *primitive* steps do not interpret
+  this convention.
+* *Helper naming* (`_employees_first_name`) is the human-readable column
+  shape produced when policy is materialized. Primitives identify
+  helper columns by *declaration* (v2 relation or derived provenance);
+  the prefix is no longer a runtime classification rule.
 
-Both are conventions, but they solve different problems and should not be merged
-into one vague rule. Neither is the final model; both are practical detection
-aids for the current phase.
+Both are conventions, but they solve different problems and must not be merged
+into one vague rule.
 
 === First conservative policy
 
@@ -133,9 +181,237 @@ not treated as source truth; helper values may be ignored or overwritten on
 re-enrichment; renaming helper columns is unsupported; renaming relevant sheets
 is unsupported. Not great UX, but a feasible first contract.
 
-Cleanup direction: `remove_fk_helpers` removing by prefix is good enough for
-now but is the main conceptual weakness; longer term, cleanup should trust
-explicit helper-column metadata first and keep prefixes as fallback aids.
+Cleanup direction: `remove_fk_helpers` follows the derived helper
+provenance per sheet and uses the v2 relation policy as a fallback when
+provenance is missing. Frames with neither provenance nor explicit policy
+raise a clear error that names the producer steps -- there is no
+normal-operation fallback that classifies helper columns by name.
+Recovery from externally-edited workbooks without provenance is a
+separate opt-in concern owned by `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+For canonical reimport pipelines, the recommended tail is:
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: <frame>
+  policy: drop
+- step: validate_references
+  rules:
+    - type: no_helper_columns
+      frame: <frame>
+----
+
+The cleanup step removes helper columns in the domain pipeline; the validation
+rule asserts that the declared helper columns are gone. Writers still serialize
+the frames they receive.
+
+=== Target model (v2): relation-oriented FK helper policy
+
+Status: *live*. The v2 relation policy shape is produced by configuration
+steps and consumed by the FK-helper primitives:
+
+* `infer_fk_relations` writes v2 only (heuristic policy);
+* `configure_fk_helpers` writes the v2 relation list (the runtime
+  contract) and, as a producer-side residual, the legacy v1 per-target
+  shape (see "Transitional v1 -> v2 bridge" below).
+
+Primitives consume v2 exclusively. `add_fk_helpers`,
+`remove_fk_helpers`, `validate_fk_helpers`, and `reorder_fk_helpers`
+read the v2 relation list and the derived helper provenance under
+`_meta.derived.sheets.*.helper_columns`; missing policy raises a clear
+error naming the configuration / inference step. Producing v2 from
+configuration steps is owned by
+`FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`; consuming v2 in
+primitives is owned by `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+The shape itself was defined by
+`FTR-FK-RELATION-POLICY-MODEL-P5`.
+
+The v2 shape sits under the existing root `_meta.helper_policies.fk`
+(no new adjacent root) and carries a top-level `schema_version` marker so
+consumers can detect the shape unambiguously. Relation identity is per
+FK column on a specific source frame -- the `(source_frame,
+source_column)` pair -- because two sheets may reference the same target
+frame with different helper choices.
+
+[source,yaml]
+----
+_meta:
+  helper_policies:
+    fk:
+      schema_version: 2
+      relations:
+        - source_frame: Products
+          source_column: id_(product_manager)
+          target_frame: ProductManagers
+          target_key: id
+          helper_fields:
+            - name
+          helper_columns:
+            - column: _product_manager_name
+              target_field: name
+          helper_prefix: "_"
+          produced_by:
+            step: infer_fk_relations
+            mode: naming_convention
+----
+
+An explicit / manual relation written by `configure_fk_helpers` (target
+state) uses the same shape and records `produced_by.step:
+configure_fk_helpers`, `produced_by.mode: explicit`.
+
+==== Field schema
+
+`target_key` is mandatory: it is the PK column on `target_frame` against
+which `source_column` joins. Storing it in policy means primitives,
+validators, and reimport cleanup never need to re-derive it from
+`build_registry(...)["id_field"]` defaults.
+
+`helper_columns[].column` records the literal helper-column header that
+materialization writes. `helper_columns[].target_field` records the
+target column it reads. Pairing them in policy lets validation check
+helper values against the target without consulting either the FK column
+convention or the helper-prefix convention.
+
+`produced_by.step` plus `produced_by.mode` make the entry's origin
+explicit so consumers can distinguish manual configuration from inferred
+configuration; lifecycle FTRs use the same fields to decide ownership
+when a later run wants to rewrite an entry.
+
+For the full per-field table (required / optional, type, semantics, and
+which step produces each field) see the *Relation entry: field schema
+(v2)* subsection of
+`docs/backlog/FTR-FK-RELATION-POLICY-MODEL-P5.adoc`.
+
+==== Four distinctions that must stay separate
+
+The v2 model only earns its keep if these four concerns are not
+collapsed. They are listed in the order metadata flows through the
+pipeline:
+
+. *Configuration / inference produces resolved relation policy.* Two
+  configuration steps write `_meta.helper_policies.fk.relations`:
+  `configure_fk_helpers` (manual / explicit policy) and
+  `infer_fk_relations` (heuristic policy). Both are now implemented;
+  both write the same shape under the same root; both behave as
+  `configuration` steps in the pipeline registry sense; a pipeline that
+  runs both must fail clearly when they collide on the same relation
+  key (`(source_frame, source_column)`). `apply_v2_relations` also
+  refuses *same-producer* rewrites that diverge in any meaningful field;
+  same-producer rewrites that are semantically identical are accepted
+  idempotently.
+. *Primitive FK-helper execution consumes resolved relation policy.*
+  The primitive steps (`add_fk_helpers`, `validate_fk_helpers`,
+  `remove_fk_helpers`, `reorder_fk_helpers`) read policy and derived
+  helper provenance; they do not run inference. Missing policy is a
+  clear error whose message names the configuration / inference step
+  that should have run earlier. This contract is encoded by
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` and pinned by the
+  primitive architecture guard at
+  `tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`.
+. *Derived helper provenance records materialized helper-column
+  state.* The per-run record under
+  `_meta.derived.sheets.*.helper_columns` (registered as the `derived`
+  entry in `meta_registry.yaml`) is *not* the policy. It is what the
+  primitive wrote when it last enriched the source frame. Entries
+  carry `{column, fk_column, target, target_key, value_field}`;
+  `target_key` was added by
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. Its lifecycle
+  (pruning, stale / orphan handling, schema validation) is owned by
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`.
+. *Wire-format FK column naming is independent of inference and
+  execution.* The cell-level convention `id_(<target>)`
+  (`core/fk.py:FK_PATTERN`) is how cross-sheet references survive XLSX /
+  ODS roundtrips. It is consumed by the parser / writer and by
+  `infer_fk_relations` as one heuristic mode among future modes. It is
+  *not* consumed by primitive FK-helper execution for relation
+  inference. Removing primitive inference is not the same as removing
+  the wire format.
+
+==== Current state: v2 is the runtime contract
+
+As of `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` the FK-helper
+primitives consume v2 exclusively. Concrete state:
+
+* `infer_fk_relations` writes v2 only (`schema_version: 2` plus a
+  `relations` list under `_meta.helper_policies.fk`); the
+  `targets: "auto"` heuristic mode on `configure_fk_helpers` is removed
+  and raises with a migration message.
+* `configure_fk_helpers` writes the v2 relation list (one entry per
+  `(source_frame, source_column)` pair carrying the resolved
+  `fk_column`) — this is the *runtime contract* the primitives consume.
+  It also writes the legacy v1 per-target shape as a residual
+  producer-side compatibility write that no runtime reader depends on
+  (kept for persisted-workbook back-compat; a follow-up clean-up may
+  remove it).
++
+[source,yaml]
+----
+# legacy producer-side residual (not read at runtime)
+_meta:
+  helper_policies:
+    fk:
+      <target_key>:
+        target: <target_key>
+        target_sheet: <sheet_name>
+        key: <id_field>
+        allowed_helpers: [...]
+        default_helpers: [...]
+        helper_prefix: "_"
+        fk_column: id_(<target>)
+        label: <optional>
+----
+* `domain.transformations.fk_helpers.enrich_helpers` reads only the v2
+  relation list; it does not call `detect_fk_columns` and does not
+  consult `FK_PATTERN` for relation inference.
+  `domain.transformations.fk_helpers.drop_helpers` removes columns
+  identified by derived helper provenance, falling back to the v2
+  policy for sheets without provenance; missing both raises clearly.
+  `domain.transformations.helpers.reorder_helpers_next_to_fk` and
+  `domain.validations.fk_helpers.validate_fk_helpers` likewise read
+  v2 / provenance only.
+* Derived helper provenance entries written by `add_fk_helpers` now
+  include `target_key` (the PK column on the target frame) alongside
+  `column`, `fk_column`, `target`, and `value_field`.
+
+==== Transitional v1 -> v2 bridge inside `configure_fk_helpers`
+
+`configure_fk_helpers` keeps its v1 / target-oriented *input surface*
+(per-target `key`, `allowed_helpers`, `default_helpers`, `fk_column` /
+`fk_column_pattern`, etc.). To populate v2 it runs a bounded,
+deterministic *bridge*: for each resolved v1 policy entry, it scans
+current data frames and emits one v2 relation per source frame that
+carries the resolved literal `fk_column` header.
+
+Bridge invariants:
+
+* No source frame is inferred from naming heuristics. The bridge only
+  matches data frames whose column header equals the configured
+  `fk_column` exactly.
+* If no current data frame carries the configured `fk_column`, the
+  bridge emits no v2 entry for that policy (the residual v1 dict is
+  still written).
+* If multiple current data frames carry the configured `fk_column`, the
+  bridge emits one v2 relation per source frame; relation identity is
+  `(source_frame, source_column)`.
+
+After `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5` the bridge is
+no longer load-bearing on the consumer side: primitives read only the
+v2 entries it produces. The bridge remains active on the producer side
+because `configure_fk_helpers` still emits the legacy v1 per-target
+shape as a residual back-compat write. Removing that residual v1 write
+turns the entry single-shape v2 and retires the bridge; it is a
+follow-up clean-up that is *not* part of this FTR.
+
+The bridge is *not* a sanctioned mechanism for heuristic inference
+inside primitives or elsewhere; that responsibility belongs to
+`infer_fk_relations`.
+
+The registry artifacts
+(`registries/meta_registry.yaml`,
+`registries/pipeline_step_registry.json`)
+reflect this: v2 is the runtime consumer contract for FK-helper
+primitives; the residual v1 dual_write is a producer-side compatibility
+mechanism only.
 
 === How it connects
 

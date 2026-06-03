@@ -1,0 +1,350 @@
+[[semantic-model-lifecycle-and-update-semantics]]
+== Lifecycle And Update Semantics
+
+=== Why lifecycle matters
+
+Metadata is not static. The same field may, over the lifetime of a project,
+be loaded from persistence, supplied by configuration, inferred from
+conventions, overwritten by a transformation, consumed by the render layer,
+persisted again, and eventually pruned. The semantic model must describe
+what happens at each transition -- not only what each individual step does.
+
+Two failure modes motivate this chapter:
+
+* *Historical residue* -- metadata that survives roundtrips after the
+  semantics it described have changed. The runtime accepts it, no consumer
+  errors, and yet the value no longer reflects current truth.
+* *Semantic drift* -- the gradual divergence between what the runtime
+  actually does and what registries, docs, and tests claim it does. The
+  FK-helper phase produced concrete instances of both (see the Problem
+  Statement chapter).
+
+Lifecycle rules are how the project keeps residue from becoming drift.
+
+=== Lifecycle events
+
+Candidate lifecycle events, grouped by the phase they occur in:
+
+[cols="1,3"]
+|===
+| Phase | Events
+
+| Load
+| load persisted metadata; load configuration; load registry entries.
+
+| Establish
+| bootstrap metadata from existing data; infer metadata from conventions
+  (for example, `infer_fk_relations`); apply explicit configuration.
+
+| Transform
+| transformation reads metadata; transformation writes metadata;
+  transformation overwrites or supersedes metadata; primitive emits derived
+  provenance.
+
+| Render
+| render layer consumes metadata; render layer emits transient render plan;
+  render-only metadata is intentionally discarded.
+
+| Persist
+| adapter persists metadata; sidecar is written; workbook is emitted.
+
+| Reimport
+| workbook is edited; workbook is reimported; metadata is reconstructed;
+  helper columns are removed via provenance or v2 policy.
+
+| End-of-life
+| metadata is pruned; metadata is deprecated; metadata is removed; transition
+  bridge is closed.
+|===
+
+Each event is a candidate observation point for a future guard or registry
+rule. The semantic model does not require that all events be observed; it
+requires that they have *names* so different parts of the project can
+discuss the same transition without each inventing its own term.
+
+=== Write-time conflict resolution
+
+Conflicts should preferably be resolved when metadata is written or updated,
+not deferred indefinitely to later consumers. Late resolution multiplies
+ambiguity: every consumer must reinvent the resolution rule, and the rules
+drift apart.
+
+Bad pattern:
+
+[source,text]
+----
+old persisted value remains
+new config value exists
+consumer decides ad hoc which value to use
+----
+
+Better pattern:
+
+[source,text]
+----
+on write/update:
+  decide allow / reject / supersede / merge / explicit override required
+  leave metadata in a coherent post-event state
+----
+
+The post-event state must be valid on its own, so that downstream consumers
+do not need to know the history to interpret it correctly. If the history
+matters, it should be recorded explicitly (provenance, supersession), not
+implied by leaving multiple competing values in place.
+
+=== Precedence as update semantics
+
+Precedence is not merely a read rule -- "which value wins when I look it up".
+It is part of update semantics -- "what state may exist after a write".
+
+Questions a precedence rule must answer:
+
+* May a new producer overwrite an existing value, or must it call out the
+  supersession explicitly?
+* Does explicit config override persisted metadata? Always, or only for
+  attributes in *Configurable*?
+* Does bootstrap inference override explicit config? (For
+  `infer_fk_relations` the answer must be "no": explicit policy wins.)
+* Does a workbook edit override generated render metadata? Render metadata
+  is *RenderConsumed* + *Transient*; workbook edits sit in
+  *UserEditable* + *Canonical* and have priority.
+* Is an older explicit value stronger than a newer heuristic value?
+* Is "newer wins" valid only within the same authority class?
+* Should the old value be discarded, retained as audit history, or marked
+  as superseded?
+
+These are the questions that adoption slices must answer per
+transformation family. The semantic model only requires that each slice
+answer them, not that they all give the same answer.
+
+=== Age, generation, and run identity
+
+Age or generation may be useful as a tie-breaker or staleness signal, but
+must not silently replace semantic precedence. The project distinguishes
+two layers:
+
+* *Semantic precedence* -- which source class is authoritative for an
+  attribute (explicit config, persisted metadata, inferred value,
+  transformation output, render layer, ...). This is a property of the
+  attribute and its membership in the candidate sets above.
+* *Age / generation* -- when a value was produced and by which run. This
+  is a property of a particular instance of the value, not of the
+  attribute.
+
+Newer is not automatically better. A newer heuristic value should *not*
+override an older explicit value; a newer render-layer write should *not*
+override an older user edit. Age is consulted only within a single
+authority class.
+
+Potential fields that could carry generation/run information (none are
+required today; this list is rule-ready material, not a schema):
+
+* `produced_by.step`
+* `produced_by.run_id`
+* `produced_from`
+* `generation`
+* `source_authority`
+* `valid_for_frame_schema_hash`
+* `lifecycle_stage`
+* `supersedes`
+* `stale_when`
+* `prune_on`
+
+Possible rule shape:
+
+[source,text]
+----
+If two values come from the same authority class:
+    newer generation may win.
+
+If explicit config conflicts with heuristic inference:
+    explicit config wins or conflict is raised, regardless of age.
+
+If generated render metadata conflicts with user-edited canonical data:
+    generated render metadata must not silently win.
+----
+
+Whether any of these fields should actually be written to `_meta` is an
+open question, deferred to per-family adoption slices. The semantic model
+records the *distinction* between age and precedence so that the answer
+to that question is reviewable.
+
+=== Repeated roundtrip risk
+
+A single roundtrip may appear correct while repeated roundtrips accumulate
+stale or contradictory metadata. This is where historical residue most often
+becomes semantic drift.
+
+Concrete project example: when `_meta.helper_policies.fk` migrated from a
+v1 per-target shape to the v2 `relations` shape, runs during the bridge
+window could legitimately write both shapes. Without a removal owner and a
+named bridge state, repeated runs would either keep accreting both shapes
+indefinitely or silently drop one of them based on writer order.
+
+Questions:
+
+* Can metadata entries become stale (still valid by shape, no longer valid
+  by meaning)?
+* Do repeated runs accumulate obsolete entries?
+* Does each run overwrite, supersede, or prune prior metadata?
+* Is there a concept of generation, or does the project rely on
+  end-of-pipeline pruning?
+* When is pruning safe? Specifically, when can a writer assume that the
+  attribute it is about to discard has no other current consumer?
+* Which metadata must survive roundtrip (RoundtripRelevant + Persistent)?
+* Which metadata must be regenerated every run (RenderConsumed + Transient)?
+* Which metadata must never be persisted at all (Transient + InternalOnly)?
+
+The Ambiguity Policy treats any of these questions as "must become explicit"
+once the attribute is RuntimeConsumed or RoundtripRelevant.
+
+=== Persistence boundary
+
+The pipeline distinguishes two views of ``_meta``:
+
+* the *runtime view* -- what producers and consumers see and mutate during
+  a single pipeline execution, and
+* the *persistable contract* -- the carrier-neutral subset that may survive
+  into the next run via a workbook, a JSON / YAML / XML / CSV sidecar, or
+  any other backend.
+
+The orchestrator owns the boundary between them. Immediately before the
+saver runs, the runtime ``_meta`` is projected onto the persistable
+contract by ``pipeline/persistence_boundary.py``. The projection is part
+of the orchestrator's macro flow:
+
+[source,text]
+----
+load frames + _meta
+merge / bootstrap runtime state
+run configured pipeline steps
+project runtime meta to persistable meta contract   <-- boundary
+save output
+----
+
+==== Why this is not a normal pipeline step
+
+The persistence boundary is *not* a domain transformation. Producers and
+consumers inside the configured pipeline must continue to see the runtime
+view; the projection only happens once, at the orchestrator-owned exit. The
+projection is deliberately *not* exposed as a public YAML step, and must
+not be auto-appended as one. Consumers cannot opt out of it and do not
+need to opt into it.
+
+==== Carrier neutrality
+
+The persistable ``_meta`` contract is identical regardless of output kind.
+Spreadsheet persistence adds a rendering / layout branch on top of the
+persistable contract, but the persistable meta itself contains no
+carrier-specific assumptions:
+
+[source,text]
+----
+runtime _meta
+  -> project to persistable contract     # one rule set
+  -> save to chosen carrier
+
+spreadsheet backends additionally:
+  persistable _meta
+  -> compose render plan + layout artifacts
+  -> write hidden meta sheet + visible sheets
+----
+
+The relevant axis is *whether layout/rendering is needed*, not "structured
+carrier" vs. "spreadsheet carrier". JSON, YAML, XML, and CSV directories
+need only the persistable meta. Spreadsheets need that plus a render flow.
+The runtime ``_meta`` must reach both pathways through the same projection
+so neither pathway can drift away from the other.
+
+==== Current rules (minimal, release-near)
+
+The projection currently removes:
+
+* top-level ``derived`` -- transient runtime helper-column provenance, never
+  part of the persistable contract,
+* top-level ``__*``-prefixed keys -- carrier / derived-view markers owned by
+  IR rendering passes,
+* runtime-produced FK-helper v2 relation entries under
+  ``helper_policies.fk.relations`` whose ``produced_by.step`` field is
+  ``configure_fk_helpers``. The remainder of ``helper_policies`` (the
+  ``lookup`` namespace, v1 per-target dicts under ``fk``, and any manually
+  authored or otherwise non-runtime-produced relations) is preserved.
+
+This is a deliberately narrow set. The intent is to break the concrete
+``BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`` repeated-run contamination
+that the worldbuilding adoption surfaced, without committing the project to
+a complete lifecycle inventory before the next release.
+
+A note on ``produced_by.mode``: ``produced_by.mode: explicit`` does *not*
+mean user-authored canonical metadata. It records only that the pipeline
+step that wrote the entry was invoked explicitly. The content of
+runtime-produced FK-helper v2 relations is compiled pipeline state, and
+must not be replayed as canonical input on a later run.
+
+The complete ``_meta`` lifecycle inventory and a sharper FK-helper policy
+classification are tracked separately as
+``FTR-META-LIFECYCLE-INVENTORY-P5`` and
+``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``, and as
+``TD-META-LIFECYCLE-INVENTORY`` in ``docs/backlog/technical_debt.adoc``.
+
+==== Operational scope: post-pipeline, write-side only
+
+The boundary runs *after* configured pipeline steps and *before* the
+saver. That placement is correct for preventing runtime-only metadata
+from being written into a persisted sidecar by any future successful
+run. It is *not* a load-time sanitizer:
+
+* A ``_meta.yaml`` that already contains runtime-produced FK-helper v2
+  relations (because it was written by an older fix-less run and
+  promoted into a canonical data directory) will still be loaded into
+  the runtime view as-is.
+* If a configured pipeline step then crashes on that stale carrier
+  before reaching the saver, the boundary never runs and no cleaned
+  sidecar is written.
+* The worldbuilding ``Frame 'groups' must have flat columns`` failure
+  has this shape: stale relation is consumed by ``add_fk_helpers``
+  during configured pipeline execution, before the orchestrator hook
+  could project the meta.
+
+Operational consequence: once the boundary is deployed, every
+*successful* run writes a clean sidecar, and the contamination cycle
+breaks at the next successful export. A repository that holds a
+pre-existing contaminated ``_meta.yaml`` may need a one-time cleanup
+or quarantine for that specific carrier (manual removal of the offending
+``helper_policies.fk.relations`` entries, or a consumer-side stripping
+plugin retained as a transitional aid) until a successful run produces
+a fresh, projected sidecar.
+
+A load-time sanitizer that retroactively cleans pre-existing
+contamination is deliberately out of scope here. It is part of the
+broader lifecycle/quarantine work tracked under
+``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`` and the inventory under
+``FTR-META-LIFECYCLE-INVENTORY-P5``.
+
+==== Known deferrals
+
+Within the FK-helper space, the current boundary only matches relations
+whose ``produced_by.step`` is ``configure_fk_helpers``. Other runtime
+producers of v2 relations -- in particular ``infer_fk_relations``, which
+emits heuristically inferred relations -- are *not* covered by the
+current rule. That is a deliberate narrowing: the observed Dino carrier
+was the ``configure_fk_helpers`` shape, and a broader discriminator
+would prejudge the larger lifecycle question. The deferral is tracked
+under ``FTR-FK-HELPER-POLICY-LIFECYCLE-P4A``; readers must not assume
+that all runtime-produced FK-helper v2 relations are covered by the
+current boundary.
+
+==== Producer guidance
+
+Producers may freely write into the runtime ``_meta`` view -- including
+under ``derived`` and under ``__*``-prefixed keys -- when the value is only
+needed for the duration of the current run. Producers must not, however,
+assume that the runtime shape is what later runs will see. If a producer
+needs its output to survive a roundtrip, it must either:
+
+* write into a key that is already classified as persistable (e.g. a
+  canonical workbook option), or
+* extend the projection rules in ``pipeline/persistence_boundary.py`` with
+  an explicit, documented decision.
+
+The projection should never be bypassed at the consumer level.

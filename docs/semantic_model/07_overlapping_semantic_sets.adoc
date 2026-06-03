@@ -1,0 +1,196 @@
+[[semantic-model-overlapping-semantic-sets]]
+== Overlapping Semantic Sets
+
+=== Basic idea
+
+Semantic classes are modeled as overlapping sets, not as disjoint categories.
+
+A metadata attribute or a transformation may belong to several sets at the
+same time, and the *intersections* are where the load-bearing rules live.
+A taxonomy that forced each attribute into exactly one bucket would either
+lose information (collapsing distinctions) or invent artificial buckets
+(splitting attributes that genuinely overlap).
+
+Concrete project example:
+
+* `_meta.derived.sheets.*.helper_columns` is *Derived* (produced by
+  `add_fk_helpers` and other helper-enrichment steps), *Transient*
+  (current-run working metadata; never persisted to workbook output as
+  canonical metadata), *RuntimeConsumed* within the *current run* (read by
+  `remove_fk_helpers`, helper layout, and FK-helper validation),
+  *Provenance*, *ProducerOwned*, and *InternalOnly*. It is *not*
+  *UserEditable* (workbook edits should not invent or rewrite provenance)
+  and *not* authoritative for roundtrip reconstruction: when helper
+  provenance is needed in a later run, it is recomputed by helper-
+  enrichment steps rather than restored from the sidecar.
+
+The same field carries multiple membership statements simultaneously, and
+each statement contributes a different lifecycle obligation. Note that
+"runtime relevance within the current run" is not the same obligation as
+"authoritative across roundtrip"; an attribute can be the first without
+being the second.
+
+=== Candidate sets
+
+The following sets are candidates for classifying metadata attributes and,
+where the framing fits, transformations. Each definition is one sentence;
+detailed semantics are deferred to per-family adoption FTRs.
+
+* *Canonical* -- treated as authoritative for the reconstructed domain
+  output; conflicts against canonical are not silently merged.
+* *Derived* -- produced from other data or metadata by a known producer
+  step; its authority depends on that producer remaining the source of truth.
+* *Persistent* -- survives process boundaries or roundtrip via the sidecar,
+  workbook, or another store.
+* *Transient* -- exists only during a single run or rendering phase and
+  must not be persisted as canonical metadata.
+* *RoundtripRelevant* -- its presence, absence, or value can change the
+  outcome of a canonical-to-workbook-to-canonical cycle.
+* *RenderConsumed* -- read by the render layer to shape workbook
+  presentation, not to alter canonical content.
+* *RuntimeConsumed* -- read by transformations or validations at runtime
+  and therefore affects behavior, not only documentation.
+* *UserEditable* -- legitimately modifiable through the workbook projection
+  or other public surface; edits are part of the contract.
+* *ProducerOwned* -- has a single, identifiable producer step or component
+  responsible for its current value; other writers are exceptions, not the
+  rule.
+* *Configurable* -- supplied or overridden by YAML pipeline config or CLI
+  arguments.
+* *HeuristicallyInferred* -- computed by an inference step from
+  conventions or data shape rather than from explicit declaration (for
+  example, `infer_fk_relations`).
+* *Policy* -- a declarative input that tells a transformation what relation,
+  rule, or behavior to apply (for example, `_meta.helper_policies.fk`).
+* *Provenance* -- records how a derived value was produced (for example,
+  `_meta.derived.sheets.*.helper_columns`).
+* *PublicSurface* -- part of the project's external contract (YAML schema,
+  CLI, demo, user-guide), bundled through the public Pages gate.
+* *InternalOnly* -- not part of the public surface; may still have
+  lifecycle obligations if it is RoundtripRelevant or RuntimeConsumed.
+* *Deprecated* -- announced as on its way out; new producers should not
+  emit it and consumers must have a migration path.
+* *TransitionBridge* -- temporarily coexists with an old or new shape during
+  a migration, with explicit current and target behavior.
+
+These sets are descriptive and rule-ready, not yet enforced by code.
+Membership is recorded in registry entries and reviewed in FTRs; runtime
+enforcement is owned by `FTR-SEMANTIC-CONTRACT-MATRIX-PILOT-FK-HELPERS-P5`
+and the per-family adoption slices.
+
+=== Example membership statements
+
+FK-helper provenance (current-run working metadata, not authoritative for
+roundtrip):
+
+[source,text]
+----
+_meta.derived.sheets.*.helper_columns
+  in {Derived, Transient, RuntimeConsumed, Provenance, ProducerOwned,
+      InternalOnly}
+  not in {UserEditable, Canonical, Configurable, Persistent,
+          RoundtripRelevant}
+  -- RuntimeConsumed here means current-run consumers
+     (`remove_fk_helpers` cleanup, helper layout, FK-helper validation).
+     The namespace is transient working metadata: it is not persisted as
+     canonical workbook metadata, and helper provenance is recomputed by
+     helper-enrichment steps in later runs rather than restored from the
+     sidecar.
+----
+
+FK-helper v2 relation policy:
+
+[source,text]
+----
+_meta.helper_policies.fk.relations
+  in {Policy, Persistent, RuntimeConsumed, RoundtripRelevant, Configurable,
+      InternalOnly}
+  not in {UserEditable, Canonical, HeuristicallyInferred}
+----
+
+v1 per-target helper-policy shape (post-consumer-migration,
+producer-side residual):
+
+[source,text]
+----
+_meta.helper_policies.fk.<target>
+  in {Policy, Persistent, TransitionBridge}
+  not in {RuntimeConsumed}
+  -- Still written by `configure_fk_helpers` as a residual producer-side
+     compatibility shim under the same root as the v2 .relations shape.
+     After `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`, current runtime
+     consumers read the v2 relation policy only; historical consumption
+     of the v1 per-target shape is historical truth, not current runtime
+     truth. Trimming the residual v1 producer write is a follow-up
+     clean-up that does not block the runtime consumer contract.
+----
+
+Render-layer column-group metadata (illustrative):
+
+[source,text]
+----
+column-group render metadata
+  in {Derived, RenderConsumed, Transient}
+  not in {Canonical, Persistent}
+  -- regenerated per run; absence in canonical output is intentional.
+----
+
+Membership statements are *descriptive* of current understanding. They are
+recorded so that future producers, consumers, and reviewers can disagree
+explicitly rather than implicitly.
+
+=== Derived rules from intersections
+
+The useful part is not only classification, but rules over intersections.
+The rules below are rule-ready guidance, not executable checks.
+
+[source,text]
+----
+x in Derived and Persistent
+=> x needs explicit provenance: who produced it, from what, when.
+   (Note: FK-helper provenance under _meta.derived.sheets.* is Derived
+   but Transient, not Persistent; it is a working example for
+   Derived + RuntimeConsumed within a run, not for this intersection.)
+----
+
+[source,text]
+----
+x in Policy and RequiredByPrimitive
+=> missing x is a configuration error, not a no-op.
+   This is the resolved FK-helper missing-policy contract.
+----
+
+[source,text]
+----
+x in RenderConsumed and Transient
+=> x must not be persisted as canonical metadata, even if persisting it would
+   be technically convenient. Persistence is a semantic decision.
+----
+
+[source,text]
+----
+x in UserEditable and Derived
+=> conflict behavior must be explicitly defined: prefer-user-edit,
+   prefer-derived, or raise. Silent merge is a defect.
+----
+
+[source,text]
+----
+x in Deprecated and RuntimeConsumed
+=> a TransitionBridge is required: named current writers, current readers,
+   target readers, removal conditions, and owning FTR.
+----
+
+[source,text]
+----
+x in TransitionBridge
+=> at most one owning FTR controls the bridge state at a time; ambiguous
+   bridge ownership is itself a semantic drift signal.
+----
+
+[source,text]
+----
+x in PublicSurface and (Deprecated or TransitionBridge)
+=> deprecation policy from External Inspirations applies: migration path,
+   timeline, and removal conditions must be named, not implied.
+----

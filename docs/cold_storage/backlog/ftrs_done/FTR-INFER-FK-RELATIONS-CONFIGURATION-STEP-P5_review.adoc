@@ -1,0 +1,306 @@
+= FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5 -- Implementation Review
+
+== Metadata
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+
+| Reviewed FTR
+| `FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5`
+
+| Review verdict
+| NOT READY
+
+| Reviewer
+| Codex
+
+| Scope reviewed
+| Runtime `infer_fk_relations` implementation, `configure_fk_helpers`
+  migration / v1-v2 bridge, runtime and documentation registries, unit tests,
+  and related FK-helper model documentation.
+|===
+
+== Verdict
+
+NOT READY.
+
+The implementation lands the basic `infer_fk_relations` step shape and the
+happy-path tests pass, but the merge semantics and transition documentation do
+not yet match the FTR/model contract. The largest runtime issue is that
+same-producer writes to an existing `(source_frame, source_column)` relation
+key silently overwrite divergent relation content even though the registry and
+review criteria require idempotent same-producer writes only.
+
+== Blocking Findings
+
+. Same-producer divergent relation writes are silently accepted.
++
+`src/spreadsheet_handling/domain/fk_relations.py` merges by relation key and
+only rejects cross-producer conflicts. When the prior and new relations have
+the same `produced_by.step`, line-level logic overwrites the existing relation
+without comparing `target_frame`, `target_key`, helper fields, helper columns,
+`helper_prefix`, or `produced_by.mode`. The docstring says same-producer
+rewrites are idempotent, and `meta_registry.yaml` says the same producing step
+may overwrite its own prior entry idempotently, but the implementation accepts
+non-identical overwrites.
++
+Required fix: if a prior relation exists for the same
+`(source_frame, source_column)`, accept only semantic equality. If anything
+meaningful differs, raise a clear conflict error naming the relation key and
+producer. Add a test that re-runs the same producer with changed
+`helper_prefix`, `target_label_fields`, `target_key`, or equivalent and
+expects failure.
+
+. The v1-v2 bridge in `configure_fk_helpers` is not authorized or documented
+  clearly enough.
++
+`configure_fk_helpers` builds v2 entries by taking the resolved v1
+`fk_column` and scanning all current data frames for that literal column. This
+can write v2 relation entries without explicit `source_frame` /
+`source_column` configuration. That may be acceptable as a deterministic
+transitional normalization of current v1 policy, but the active FTR currently
+says `configure_fk_helpers` writes v2 from user-supplied configuration only
+and removes `targets: "auto"` together with related `auto:` parameter shapes.
+It does not describe this source-frame discovery bridge or its risks.
++
+Required fix: either make explicit v2 source identity part of
+`configure_fk_helpers` configuration, or document this as a transitional
+compatibility bridge owned by this FTR, with clear handoff to
+`FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. Add tests for no matching source
+frame, multiple source frames with the same configured FK column, and the
+bridge coexisting with existing v1 primitive behavior.
+
+. Concept and agent-facing docs remain stale after v2 becomes runtime-produced.
++
+`docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` still says the v2
+shape is "not current runtime behavior" and is "not produced", and its
+current-state section still says `configure_fk_helpers` writes v1 including
+`targets: "auto"` until both later FTRs ship. `docs/ai_info/concepts_fk_helpers.adoc`
+also says v2 is not current runtime behavior and names `infer_fk_relations` as
+planned. That was true for the closed model-only FTR, but this implementation
+now produces v2 from `infer_fk_relations` and from `configure_fk_helpers`,
+while primitives still consume v1.
++
+Required fix: update the technical concept doc, AI notes, and active FTR to
+state the actual transition: v2 is now produced by configuration steps,
+current FK-helper primitives still consume v1, and v1+v2 coexistence is
+temporary until `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+
+. Registry hybrid-contract wording is too close to a permanent dual authority.
++
+`meta_registry.yaml` describes the `fk` namespace as keyed by FK target and as
+"additionally" carrying the v2 relation view, but does not clearly call this a
+transitional compatibility state. `pipeline_step_registry.json` similarly
+lists both v1 and v2 writes for `configure_fk_helpers` without stating that
+v1 is retained only for current primitives and should narrow after the
+primitive refactor.
++
+Required fix: make the current-state transition explicit in both registries:
+v1 exists for current primitive consumers, v2 is the target producer shape,
+and the primitive FTR owns removing or narrowing the bridge.
+
+== Non-Blocking Findings
+
+. `_try_build_inferred_relation` has branch complexity 13. Given the current
+  shape this is reviewable, but if the blocking merge/bridge fixes add more
+  branches, split target matching, target-key resolution, and helper-column
+  construction into smaller helpers before commit.
+
+. `helper_policies.py` imports the private `_build_v2_relation` helper from
+  `fk_relations.py`. This works, but it creates hidden coupling between the
+  explicit policy path and the inference module. Prefer a public relation
+  builder/normalizer if both producers own the same shape.
+
+. Tests cover idempotent re-infer only by asserting the relation count remains
+  one. They do not assert that the retained relation is unchanged, nor do they
+  cover same-producer divergent writes.
+
+== Questions / Risks for Developer Decision
+
+* Is scanning all frames for the configured v1 `fk_column` an approved
+  transitional bridge for `configure_fk_helpers`, or should explicit v2
+  relation identity require source-frame/source-column configuration?
+* Should the `auto` parameter remain on `configure_fk_helpers` as a defaults
+  bag despite the FTR wording that says related `auto:` parameter shapes are
+  removed? If yes, the FTR and registry should say exactly which auto-derived
+  defaults remain and why they are not heuristic relation inference.
+* The technical and AI docs need a transition-state vocabulary: "v2 produced,
+  v1 consumed by current primitives" rather than "v2 planned / not current".
+
+== Validation Run During Review
+
+[cols="2,2", options="header"]
+|===
+| Command | Result
+
+| `git status --short`
+| Showed the expected runtime, registry, and test implementation files plus
+  untracked new source/test files. No demo changes.
+
+| `git diff --stat`
+| Reported modified tracked files; untracked new source/test files require
+  direct inspection because they are not included in `git diff --stat`.
+
+| Targeted diffs and direct inspection of new files
+| Reviewed runtime module, helper policy bridge, runtime registry, registries,
+  tests, and active FTR.
+
+| `pytest -q ...`
+| Could not run because `pytest` is not on PATH.
+
+| `.venv/bin/python -m pytest -q tests/unit/domain/test_fk_relations_inference.py tests/unit/pipeline/test_infer_fk_relations_step.py tests/unit/domain/test_fk_helper_policies.py`
+| Pass: 25 tests.
+
+| `.venv/bin/python -m pytest -q tests/architecture/dependency_guards/test_pipeline_step_registry.py`
+| Pass: 11 tests.
+
+| `.venv/bin/python -m pytest -q tests/architecture/semantic_invariants/test_meta_registry.py tests/architecture/semantic_invariants/test_meta_registry_hardening.py tests/architecture/pipeline_semantics/test_pipeline_semantics_guards.py`
+| Pass: 15 tests.
+
+| `.venv/bin/python -m compileall -q src/spreadsheet_handling`
+| Pass.
+
+| `git diff --check`
+| Pass.
+|===
+
+== Suggested Validation Before Commit
+
+After fixes, run:
+
+[source,console]
+----
+.venv/bin/python -m pytest -q tests/unit/domain/test_fk_relations_inference.py tests/unit/pipeline/test_infer_fk_relations_step.py tests/unit/domain/test_fk_helper_policies.py
+.venv/bin/python -m pytest -q tests/architecture/dependency_guards/test_pipeline_step_registry.py
+.venv/bin/python -m pytest -q tests/architecture/semantic_invariants/test_meta_registry.py tests/architecture/semantic_invariants/test_meta_registry_hardening.py tests/architecture/pipeline_semantics/test_pipeline_semantics_guards.py
+.venv/bin/python -m compileall -q src/spreadsheet_handling
+git diff --check
+----
+
+Also render any updated AsciiDoc documents, especially the active FTR,
+technical concept doc, AI notes, and backlog aggregate if those are changed.
+
+== Commit Recommendation
+
+Do not commit this implementation yet. Address the blocking findings first.
+
+== Re-Review After Fix Pass
+
+=== Verdict
+
+READY WITH NITS.
+
+The fix pass resolves the previous blocking findings. The implementation now
+matches the intended transition state: configuration steps produce v2 relation
+policy, current FK-helper primitives still consume v1, and v1+v2 coexistence
+is explicitly documented as temporary compatibility.
+
+=== Previous Blocking Findings
+
+[cols="1,1,4", options="header"]
+|===
+| Finding | Status | Notes
+
+| Same-producer divergent relation writes
+| Fixed
+| `apply_v2_relations` now rejects an existing relation-key overwrite unless
+  the relation body is semantically identical. Cross-producer collisions still
+  fail, identical same-producer replays are accepted, and divergent
+  same-producer changes to `target_frame`, `target_key`, helper fields /
+  columns, `helper_prefix`, or `produced_by.mode` are covered by tests. The
+  error names the relation key and producer.
+
+| v1-v2 bridge authorization and tests
+| Fixed
+| The active FTR now explicitly authorizes the
+  `configure_fk_helpers` v1 -> v2 bridge as transitional compatibility, not
+  final architecture. It documents literal `fk_column` scanning, no-match
+  behavior, multiple-source behavior, and handoff to
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`. Tests cover no matching
+  source frame, multiple source frames, and unchanged v1 primitive consumption.
+
+| stale concept / AI docs
+| Fixed
+| `fk_helper_metadata.adoc` and `concepts_fk_helpers.adoc` now state that v2
+  policy is produced by configuration steps, while current FK-helper primitives
+  still consume v1. They no longer present v2 as merely planned / not
+  produced.
+
+| registry hybrid-contract wording
+| Fixed
+| `meta_registry.yaml` and `pipeline_step_registry.json` now frame v1+v2
+  coexistence as transitional current-state compatibility. They do not claim
+  primitive v2 consumption and assign narrowing/removal to
+  `FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`.
+|===
+
+=== Remaining Findings
+
+* Blocking:
+** None.
+* Non-blocking:
+** The transition docs are necessarily verbose because both v1 and v2 are live
+   under the same root for one slice. This is acceptable for commit, but the
+   primitive FTR should simplify the contract once v2 consumption lands.
+** `build_v2_relation` is now public and documented. That is an improvement
+   over importing a private helper; keep it narrow and producer-facing unless
+   a later FTR deliberately turns relation construction into a broader public
+   API.
+
+=== Validation Run During Re-Review
+
+[cols="2,2", options="header"]
+|===
+| Command | Result
+
+| `git status --short`
+| Showed expected uncommitted implementation/fix files, the existing review
+  artifact, and the unrelated draft
+  `docs/backlog/FTR-REGISTRY-CONTRACT-LIFECYCLE-MODEL-P5.adoc`. No demo
+  changes.
+
+| `git diff --stat`
+| Showed only the tracked implementation, registry, doc, and test files for
+  this FTR. Untracked new source/test/review files were inspected directly.
+
+| `.venv/bin/python -m pytest -q tests/unit/domain/test_fk_relations_inference.py tests/unit/pipeline/test_infer_fk_relations_step.py tests/unit/domain/test_fk_helper_policies.py`
+| Pass: 34 tests.
+
+| `.venv/bin/python -m pytest -q tests/architecture/dependency_guards/test_pipeline_step_registry.py`
+| Pass: 11 tests.
+
+| `.venv/bin/python -m pytest -q tests/architecture/semantic_invariants/test_meta_registry.py tests/architecture/semantic_invariants/test_meta_registry_hardening.py tests/architecture/pipeline_semantics/test_pipeline_semantics_guards.py`
+| Pass: 15 tests.
+
+| `.venv/bin/python -m compileall -q src/spreadsheet_handling`
+| Pass.
+
+| `asciidoctor -o /dev/null docs/backlog/FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5.adoc`
+| Pass.
+
+| `asciidoctor -o /dev/null docs/backlog/FTR-INFER-FK-RELATIONS-CONFIGURATION-STEP-P5_review.adoc`
+| Pass before appending this re-review section.
+
+| `asciidoctor -o /dev/null docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`
+| Pass.
+
+| `asciidoctor -o /dev/null docs/ai_info/concepts_fk_helpers.adoc`
+| Pass.
+
+| `asciidoctor -o /dev/null docs/backlog/_ftrs_open.adoc`
+| Pass.
+
+| `asciidoctor --safe-mode=unsafe -o /tmp/backlog.html docs/backlog/backlog.adoc`
+| Pass.
+
+| `git diff --check`
+| Pass.
+|===
+
+=== Commit Recommendation
+
+Ready for commit workflow after the review artifact is staged with the FTR
+implementation. Keep the unrelated
+`docs/backlog/FTR-REGISTRY-CONTRACT-LIFECYCLE-MODEL-P5.adoc` draft out of the
+commit.
