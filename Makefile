@@ -324,7 +324,7 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 
 MARK              ?= not legacy and not prehex and not slow
 PYTEST_OPTS       ?=
-ACTIVE_TEST_PATHS ?= tests/unit tests/integration tests/architecture
+ACTIVE_TEST_PATHS ?= tests/unit tests/integration tests/roundtrip tests/architecture
 
 MARK_OPT := $(if $(strip $(MARK)),-m '$(MARK)',)
 
@@ -346,6 +346,9 @@ test-integ: deps-dev ## Integration tests only
 
 test-arch: deps-dev ## Architecture and guardrail tests only
 	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/architecture
+
+test-roundtrip: deps-dev ## Roundtrip invariant tests only (FTR-ROUNDTRIP-TEST-LAYER-P4A)
+	$(PYTEST) -q $(MARK_OPT) $(PYTEST_OPTS) tests/roundtrip
 
 test-full: deps-dev ## All tests including slow (no marker filter)
 	$(PYTEST) -q $(PYTEST_OPTS) $(ACTIVE_TEST_PATHS)

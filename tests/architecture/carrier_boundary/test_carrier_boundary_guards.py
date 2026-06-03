@@ -22,7 +22,7 @@ pytestmark = [
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TESTS_ROOT = REPO_ROOT / "tests"
 
-ACTIVE_CARRIER_ROOTS = ("unit", "integration", "architecture", "legacy_pre_hex")
+ACTIVE_CARRIER_ROOTS = ("unit", "integration", "roundtrip", "architecture", "legacy_pre_hex")
 SUPPORT_CARRIER_ROOTS = ("utils", "data", "experimental")
 QUARANTINE_CARRIER_ROOTS = ("legacy_pre_hex",)
 PATH_OWNED_TOPOLOGY_MARKERS = ("unit", "integ", "arch", "current_state", "legacy", "prehex")
