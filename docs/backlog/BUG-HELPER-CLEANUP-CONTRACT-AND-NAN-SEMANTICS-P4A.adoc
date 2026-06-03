@@ -1,0 +1,308 @@
+===== BUG-HELPER-CLEANUP-CONTRACT-AND-NAN-SEMANTICS-P4A -- Canonical reimport must not persist helper columns, and unresolved helper values need explicit semantics
+
+*Status:* Open
+*Priority:* P4A
+*Area:* Reimport / helper lifecycle / canonical persistence
+
+==== Context
+
+During continued worldbuilding adoption work, two related issues were observed
+in the canonical consumer data after roundtrip/reimport:
+
+* helper columns such as `_places_name` and `_regions_name`/`_regions_kind`
+  appeared in canonical JSON files where they do not belong;
+* unresolved helper values appeared as the literal string `nan` in canonical
+  JSON and in the workbook editing surface.
+
+Example from the worldbuilding consumer before local cleanup:
+
+[source,json]
+----
+{
+  "id": "CHAR-0022",
+  "name": "Wingo",
+  "home_place_id": "",
+  "_places_name": "nan"
+}
+----
+
+This is semantically wrong in two ways:
+
+* `_places_name` is a helper column and should not have reached canonical data
+  at all;
+* the string `nan` is not a neutral representation of "no resolved helper
+  value".
+
+==== Reproduced workflow
+
+The consumer target `make import-stories-ods` does not use a special
+reimport-only path. It delegates to the same generic import target with an
+ODS override:
+
+[source,make]
+----
+import-stories:
+    rm -rf $(REIMPORT_DIR)
+    $(RUN) --config ./pipelines/dino_insel/spreadsheet_to_json.yaml \
+      --in-kind $(SHEET_FORMAT) --in-path $(SPREADSHEET_FILE)
+
+import-stories-ods:
+    $(MAKE) import-stories SHEET_FORMAT=ods
+----
+
+So the relevant reimport behavior is defined entirely by
+`pipelines/dino_insel/spreadsheet_to_json.yaml`.
+
+==== Evidence: the reimport pipeline already contains helper-cleanup intent
+
+The worldbuilding reimport pipeline *does* explicitly invoke helper-cleanup
+behavior before reconstructing downstream relations:
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: characters
+  policy: drop
+
+- step: apply_derived_column_policy
+  source: groups
+  policy: drop
+
+- step: apply_derived_column_policy
+  source: places
+  policy: drop
+----
+
+From the current core implementation:
+
+[source,python]
+----
+"""Helper identity comes only from ``_meta.derived.sheets[source]``."""
+----
+
+So the configured cleanup intent is present, and a reader of the pipeline
+would reasonably expect helper columns to disappear during reimport.
+
+==== Evidence: helper identity was persisted on a different metadata carrier
+
+In the promoted canonical `_meta.yaml`, helper visibility/identity was
+persisted under the sheet-level workbook-view metadata:
+
+[source,yaml]
+----
+sheets:
+  characters:
+    helper_columns:
+    - _places_name
+  places:
+    helper_columns:
+    - _regions_name
+    - _regions_kind
+----
+
+However, `_meta.derived.sheets.characters`, `_meta.derived.sheets.groups`,
+and `_meta.derived.sheets.places` were absent in the same canonical `_meta`
+payload, so `apply_derived_column_policy` had no identity information to act
+on.
+
+The result is a mismatch between:
+
+* the configured reimport cleanup step,
+* the metadata carrier used by that step,
+* and the metadata carrier that actually survived canonical persistence.
+
+==== Evidence: helper enrichment remained materialized in canonical data
+
+The forward spreadsheet-building pipeline enriches helper columns explicitly.
+For `characters`, the helper is built from `home_place_id -> places.id`:
+
+[source,yaml]
+----
+- step: configure_fk_helpers
+  targets:
+    places:
+      key: id
+      allowed_helpers: [name]
+      default_helpers: [name]
+      helper_prefix: "_"
+      fk_column: home_place_id
+
+- step: add_fk_helpers
+  defaults:
+    levels: 2
+    helper_value_mode: values
+
+- step: configure_workbook_view
+  sheets:
+    - { frame: characters, sheet: characters, helper_columns: [_places_name] }
+----
+
+This is a valid editing-surface concern. The bug is that the same helper
+column then survived the reverse path back into canonical data.
+
+==== Evidence: current core cleanup concepts do not line up cleanly
+
+There are currently at least two partially overlapping helper-cleanup
+concepts:
+
+1. *Transformation-owned roundtrip cleanup*
++
+   The intuitive original model is:
++
+   * forward transformation: materialize helpers for workbook usability
+   * reverse transformation: remove helpers before reconstructing canonical
+     data
++
+   Under this model, the pipeline steps themselves carry the responsibility.
+
+2. *Metadata-assisted or metadata-driven cleanup*
++
+   The framework also persists helper-related metadata such as
+   `_meta.sheets.<frame>.helper_columns`, and the runtime has helper-related
+   provenance channels such as `_meta.derived.sheets.*.helper_columns`.
++
+   Under this model, metadata can potentially reduce or centralize cleanup
+   responsibility, or even allow canonical persistence to auto-prune helper
+   surfaces based on classification.
+
+What we observed suggests these two concepts are not currently aligned:
+
+* the pipeline signaled cleanup intent with `apply_derived_column_policy`;
+* the core implementation of that step only honored `_meta.derived`;
+* the canonical `_meta.yaml` instead carried helper identity under
+  `_meta.sheets.*.helper_columns`;
+* helper columns therefore survived into canonical JSON despite a cleanup step
+  being present in the pipeline.
+
+This is concept drift, not just a bad data row.
+
+==== Separate but related observation: `nan` semantics are unclear
+
+The concrete reproduction involved helper cells whose source FK was empty, for
+example `home_place_id: ""`.
+
+Observed outcome in the contaminated canonical consumer data:
+
+* the helper column `_places_name` existed;
+* its value appeared as the literal string `nan`.
+
+The framework currently normalizes *FK ids* via:
+
+[source,python]
+----
+def _norm_id(v) -> str | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return str(v)
+----
+
+But that only answers how *keys* are normalized during lookup. It does not
+state what the persisted/user-visible semantics of an unresolved helper value
+should be.
+
+At least three possibilities exist:
+
+* empty cell / empty string,
+* structured finding / warning metadata,
+* preservation of a spreadsheet error value if that is intentionally part of
+  the contract.
+
+What should *not* happen is silent collapse into the ordinary string `nan`,
+because that changes a missing/error state into domain data.
+
+The exact carrier of the observed `nan` still needs a precise root-cause
+classification:
+
+* spreadsheet error propagation,
+* pandas/object-stringification artifact,
+* or replay of already contaminated canonical helper values.
+
+But the product contract is unclear either way, and that ambiguity needs to be
+closed.
+
+==== Working hypothesis
+
+The bug is not just "helper columns were not removed". The deeper issue is
+that the framework currently has an unresolved relationship between:
+
+* pipeline-owned helper cleanup,
+* provenance-owned helper cleanup,
+* persisted workbook-view/helper metadata,
+* and canonical persistence rules.
+
+Until that contract is explicit, consumers can easily build pipelines that
+appear correct from the YAML surface but still leak helper state into
+canonical data.
+
+==== Scope
+
+* Clarify which mechanism owns helper removal on canonical reimport:
+** explicit reverse transformation steps,
+** metadata-driven cleanup,
+** or a defined combination of both.
+* Ensure that a canonical reimport path with declared helper cleanup does not
+  persist helper columns into canonical JSON.
+* Clarify the relationship between `_meta.derived.sheets.*.helper_columns` and
+  `_meta.sheets.*.helper_columns`.
+* Define the intended semantics for unresolved helper values so `nan` does not
+  silently become ordinary domain data.
+* Add regression coverage using the worldbuilding reproduction pattern.
+
+==== Non-goals
+
+* Do not treat the local worldbuilding consumer workaround as the product
+  solution.
+* Do not silently conflate workbook-view helper metadata with canonical helper
+  provenance unless that contract is deliberately chosen and documented.
+* Do not assume that `nan` should necessarily become an error marker; the bug
+  is first to define and enforce the semantics.
+
+==== Acceptance
+
+* Reimport pipelines that declare helper cleanup do not leave helper columns in
+  canonical JSON.
+* The framework has an explicit contract for how helper cleanup is triggered
+  on the canonical path.
+* The relationship between sheet-level helper metadata and derived helper
+  provenance is documented and made operationally coherent.
+* Unresolved helper values no longer become the literal string `nan` in
+  canonical JSON by accident.
+* Tests cover the worldbuilding-style reproduction:
+** helper-enriched workbook view,
+** canonical reimport,
+** empty FK source values,
+** promoted `_meta.yaml`,
+** repeated roundtrip.
+
+==== Validation
+
+* Reproduce the pre-fix behavior with the worldbuilding consumer:
+** helper columns present in canonical `characters.json`, `groups.json`,
+   and `places.json`;
+** literal `nan` in helper cells for empty `home_place_id`.
+* Verify the configured reimport path used by `make import-stories-ods`:
+** confirm the pipeline does contain helper cleanup intent;
+** confirm the old behavior still leaked helpers.
+* After the fix, verify:
+** helper columns are absent from canonical JSON,
+** unresolved helper values follow the chosen explicit semantics,
+** XLSX and ODS reimport both behave consistently.
+
+==== Related backlog items
+
+This bug is adjacent to, but distinct from:
+
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`
+* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`
+* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`
+* `FTR-META-LIFECYCLE-INVENTORY-P5`
+
+The persistence-boundary bug addresses runtime metadata leaking into canonical
+`_meta.yaml`. The present bug focuses on the still-unclear operational
+contract for helper cleanup and unresolved helper-value semantics on the
+canonical reimport path.
