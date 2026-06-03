@@ -311,7 +311,7 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 # Tests
 # =========================
 # Quick reference:
-#   make test                              # unit + integ + arch, no slow/prehex
+#   make test                              # unit + integ + roundtrip + arch, no slow/prehex
 #   make test-fast                         # unit only (fastest feedback)
 #   make test-arch                         # architecture / guardrail layer
 #   make test-full                         # everything including slow tests
@@ -319,7 +319,7 @@ coverage-html: deps-dev ## Coverage as HTML report (build/htmlcov/)
 #   make test-file FILE=tests/unit/...     # single file
 #   make test-node NODE=tests/unit/..::fn  # single test
 
-.PHONY: test test-fast test-unit test-integ test-arch test-full \
+.PHONY: test test-fast test-unit test-integ test-roundtrip test-arch test-full \
         test-verbose test-lastfailed test-one test-file test-node
 
 MARK              ?= not legacy and not prehex and not slow
@@ -332,7 +332,7 @@ define run_pytest
 	$(PYTEST) $(MARK_OPT) $(PYTEST_OPTS) $(1)
 endef
 
-test: deps-dev ## Active suite: unit + integ + arch (no slow/prehex)
+test: deps-dev ## Active suite: unit + integ + roundtrip + arch (no slow/prehex)
 	$(call run_pytest,$(ACTIVE_TEST_PATHS))
 
 test-fast: deps-dev ## Unit tests only — fastest feedback loop
