@@ -57,9 +57,12 @@ def apply_derived_column_policy(
     * ``fail_on_mismatch`` — drop, value-check ``enrich_lookup`` helpers, and
       raise ``ValueError`` on any mismatch.
 
-    Helper identity comes only from ``_meta.derived.sheets[source]``.  Runs
-    before ``drop_helpers``; if the channel is already cleaned it is a no-op
-    for identity/value purposes.
+    Helper identity is resolved from transient ``_meta.derived.sheets[source]``
+    when available. If that runtime provenance has already been stripped at a
+    persistence boundary, ``policy: drop`` also honors durable workbook-view
+    helper declarations at ``_meta.sheets[source].helper_columns``. Those
+    durable declarations identify columns only; mismatch value checks remain
+    limited to the richer ``_meta.derived`` provenance.
     """
     del name
     policy = _valid_policy(policy)
@@ -67,6 +70,7 @@ def apply_derived_column_policy(
 
     meta = frames.get(META_KEY) or {}
     sheet_meta = _safe_sheet_meta(meta, source)
+    durable_helper_names = _safe_durable_helper_names(meta, source)
 
     lookup_frames = {
         key: value
@@ -80,6 +84,7 @@ def apply_derived_column_policy(
         derived_meta=sheet_meta,
         lookup_frames=lookup_frames,
         policy=policy,
+        durable_helper_names=durable_helper_names,
     )
 
     failures = [finding for finding in found if finding.severity == "fail"]
@@ -108,15 +113,19 @@ def enforce_derived_column_policy_frame(
     derived_meta: Mapping[str, Any] | None,
     lookup_frames: Mapping[str, pd.DataFrame],
     policy: str,
+    durable_helper_names: set[str] | None = None,
 ) -> tuple[pd.DataFrame, list[DerivedColumnFinding]]:
     """Pure core: return (payload_without_derived_columns, findings).
 
     ``derived_meta`` is ``_meta["derived"]["sheets"].get(frame_name)`` or None.
-    Value comparison covers ``enrich_lookup`` helpers only; FK helpers are
-    dropped without a value check.
+    ``durable_helper_names`` comes from persisted workbook-view helper metadata
+    and is used for identity/drop only. Value comparison covers
+    ``enrich_lookup`` helpers only; FK helpers are dropped without a value
+    check.
     """
     policy = _valid_policy(policy)
     helper_names, enrich_spec = _resolve_derived_identity(derived_meta, frame_name=frame_name)
+    helper_names |= {str(name) for name in durable_helper_names or set()}
 
     findings: list[DerivedColumnFinding] = []
     if policy in ("warn_on_mismatch", "fail_on_mismatch") and enrich_spec is not None:
@@ -226,6 +235,33 @@ def _safe_sheet_meta(meta: Mapping[str, Any], source: str) -> Any:
             f"_meta.derived.sheets must be a mapping, got {type(sheets).__name__}"
         )
     return sheets.get(source)
+
+
+def _safe_durable_helper_names(meta: Mapping[str, Any], source: str) -> set[str]:
+    """Return persisted workbook-view helper columns for ``source``.
+
+    Missing durable metadata is a conservative no-op. Malformed present
+    containers fail clearly because they are the declared cleanup carrier once
+    transient ``_meta.derived`` has been stripped.
+    """
+    sheets = meta.get("sheets")
+    if sheets is None:
+        return set()
+    if not isinstance(sheets, Mapping):
+        raise ValueError(f"_meta.sheets must be a mapping, got {type(sheets).__name__}")
+    sheet_entry = sheets.get(source)
+    if sheet_entry is None:
+        return set()
+    if not isinstance(sheet_entry, Mapping):
+        raise ValueError(
+            f"_meta.sheets[{source!r}] must be a mapping, got {type(sheet_entry).__name__}"
+        )
+    raw_helper_columns = sheet_entry.get("helper_columns")
+    if raw_helper_columns is None:
+        return set()
+    if not isinstance(raw_helper_columns, (list, tuple)):
+        raise ValueError(f"_meta.sheets[{source!r}].helper_columns must be a list")
+    return {str(column) for column in raw_helper_columns if str(column)}
 
 
 def _strip_consumed_provenance(meta: Mapping[str, Any], source: str) -> dict[str, Any]:

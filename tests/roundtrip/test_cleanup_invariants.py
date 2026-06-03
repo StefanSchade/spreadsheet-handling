@@ -5,10 +5,12 @@ actually holds at the canonical output, independently of *which step*
 implements the invariant. Tests in this file must remain green across
 refactors of the production code that provides the invariant.
 
-Open issue: see `BUG-HELPER-CLEANUP-CONTRACT-P4A`.
+Regression coverage for `BUG-HELPER-CLEANUP-CONTRACT-P4A`.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -19,13 +21,6 @@ pytestmark = [
 ]
 
 
-@pytest.mark.xfail(
-    reason="BUG-HELPER-CLEANUP-CONTRACT-P4A: the persistence-boundary fix "
-    "removed the _meta.derived channel that apply_derived_column_policy "
-    "reads, so the cleanup step is a silent no-op on canonical reimport. "
-    "Transitions to green once the cleanup-contract fix lands.",
-    strict=True,
-)
 def test_helper_columns_absent_after_canonical_reimport(minimal_fk_workdir) -> None:
     """Helper columns must not survive into canonical JSON.
 
@@ -53,3 +48,49 @@ def test_helper_columns_absent_after_canonical_reimport(minimal_fk_workdir) -> N
         f"items.json after the documented cleanup step; leaking rows: "
         f"{leaking_rows}"
     )
+
+
+def test_no_helper_columns_validation_reports_bypassed_cleanup(minimal_fk_workdir) -> None:
+    """The recommended assertion rule must catch helper columns left behind."""
+    from tests.roundtrip.conftest import _run_cli, _write_yaml
+
+    assert minimal_fk_workdir.run_forward() == 0
+
+    reimport = minimal_fk_workdir.root / "reimport_with_assertion_only"
+    reverse_yaml = minimal_fk_workdir.root / "reverse_assertion_only.yaml"
+    _write_yaml(
+        reverse_yaml,
+        {
+            "io": {
+                "input": {"kind": "xlsx", "path": str(minimal_fk_workdir.sheet)},
+                "output": {"kind": "json_dir", "path": str(reimport)},
+            },
+            "pipeline": [
+                {
+                    "step": "apply_workbook_view_sheet_mappings",
+                    "logical_frames": ["items", "entities"],
+                },
+                {
+                    "step": "validate_references",
+                    "rules": [{"type": "no_helper_columns", "frame": "items"}],
+                },
+            ],
+        },
+    )
+
+    assert _run_cli(reverse_yaml) == 0
+    findings = json.loads((reimport / "validation_findings.json").read_text(encoding="utf-8"))
+
+    assert findings == [
+        {
+            "rule_type": "no_helper_columns",
+            "frame": "items",
+            "columns": "_entities_name",
+            "row_index": "",
+            "value": "",
+            "target_frame": "",
+            "target_columns": "",
+            "severity": "warn",
+            "message": "Helper columns must be absent after cleanup.",
+        }
+    ]

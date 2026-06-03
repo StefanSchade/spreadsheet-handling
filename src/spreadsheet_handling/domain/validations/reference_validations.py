@@ -32,7 +32,13 @@ FINDING_COLUMNS = [
 ]
 
 _VALID_MODES = {"warn", "fail", "ignore"}
-_VALID_RULE_TYPES = {"unique", "primary_key", "foreign_key", "unique_reference"}
+_VALID_RULE_TYPES = {
+    "unique",
+    "primary_key",
+    "foreign_key",
+    "unique_reference",
+    "no_helper_columns",
+}
 _CONDITION_PREDICATES = {"equals", "in", "non_empty", "is_null", "not_null"}
 
 
@@ -124,6 +130,8 @@ def _validate_rules(
             findings.extend(_validate_foreign_key(frames, rule=rule, severity=severity))
         elif rule_type == "unique_reference":
             findings.extend(_validate_unique_reference(frames, rule=rule, severity=severity))
+        elif rule_type == "no_helper_columns":
+            findings.extend(_validate_no_helper_columns(frames, rule=rule, severity=severity))
     return findings
 
 
@@ -323,6 +331,36 @@ def _validate_unique_reference(
         severity=severity,
         message="Reference tuples must not be duplicated.",
     )
+
+
+def _validate_no_helper_columns(
+    frames: Mapping[str, Any],
+    *,
+    rule: Mapping[str, Any],
+    severity: str,
+) -> list[ReferenceFinding]:
+    frame_name = _string_field(rule, "frame")
+    helper_columns = _durable_helper_columns(frames, frame_name)
+    frame = _optional_frame(frames, frame_name)
+    if frame is None:
+        return [_schema_finding("no_helper_columns", frame_name, helper_columns, [], severity)]
+    if not helper_columns:
+        return []
+
+    present = [column for column in helper_columns if column in frame.columns]
+    if not present:
+        return []
+    return [
+        ReferenceFinding(
+            rule_type="no_helper_columns",
+            frame=frame_name,
+            columns=present,
+            row_index=None,
+            value=None,
+            severity=severity,
+            message="Helper columns must be absent after cleanup.",
+        )
+    ]
 
 
 def _resolve_enabled_when(
@@ -571,6 +609,22 @@ def _schema_finding(
         severity=severity,
         message=message,
     )
+
+
+def _durable_helper_columns(frames: Mapping[str, Any], frame_name: str) -> list[str]:
+    meta = frames.get("_meta")
+    if not isinstance(meta, Mapping):
+        return []
+    sheets = meta.get("sheets")
+    if not isinstance(sheets, Mapping):
+        return []
+    sheet_entry = sheets.get(frame_name)
+    if not isinstance(sheet_entry, Mapping):
+        return []
+    helper_columns = sheet_entry.get("helper_columns")
+    if not isinstance(helper_columns, (list, tuple)):
+        return []
+    return [str(column) for column in helper_columns if str(column)]
 
 
 def _frame_and_columns(rule: Mapping[str, Any]) -> tuple[str, list[str]]:

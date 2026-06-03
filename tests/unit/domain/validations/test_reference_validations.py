@@ -373,6 +373,68 @@ def test_unique_reference_can_be_explicitly_disabled_for_template_rules() -> Non
     assert list(out["validation_findings"].columns) == FINDING_COLUMNS
 
 
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_no_helper_columns_passes_when_declared_helpers_are_absent() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame([{"order_id": "o1", "customer_id": "c1"}]),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[{"type": "no_helper_columns", "frame": "orders"}],
+    )
+
+    assert out["validation_findings"].empty
+    assert list(out["validation_findings"].columns) == FINDING_COLUMNS
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_no_helper_columns_reports_declared_helpers_still_present() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [{"order_id": "o1", "customer_id": "c1", "_customer_name": "Alice"}]
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[{"type": "no_helper_columns", "frame": "orders"}],
+    )
+
+    assert out["validation_findings"].to_dict(orient="records") == [
+        {
+            "rule_type": "no_helper_columns",
+            "frame": "orders",
+            "columns": "_customer_name",
+            "row_index": "",
+            "value": "",
+            "target_frame": "",
+            "target_columns": "",
+            "severity": "warn",
+            "message": "Helper columns must be absent after cleanup.",
+        }
+    ]
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_no_helper_columns_fail_mode_uses_reference_finding_shape() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [{"order_id": "o1", "customer_id": "c1", "_customer_name": "Alice"}]
+        ),
+    }
+
+    with pytest.raises(ValueError, match=r"no_helper_columns orders\(_customer_name\)"):
+        validate_references(
+            frames,
+            mode="fail",
+            rules=[{"type": "no_helper_columns", "frame": "orders"}],
+        )
+
+
 def test_fail_mode_raises_from_same_finding_shape() -> None:
     frames = {
         "variables": pd.DataFrame([{"ID": "v1"}]),

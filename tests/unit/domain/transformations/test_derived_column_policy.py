@@ -77,6 +77,63 @@ def test_drop_removes_fk_and_lookup_helper_columns() -> None:
     assert "derived_column_findings" not in out
 
 
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_drop_uses_durable_workbook_helper_columns_when_derived_is_absent() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [
+                {
+                    "order_id": "o1",
+                    "customer_id": "c1",
+                    "_customer_name": "Alice",
+                    "amount": 100,
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "amount"]
+    assert "_customer_name" in frames["orders"].columns
+    assert out["_meta"]["sheets"]["orders"]["helper_columns"] == ["_customer_name"]
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_no_derived_or_durable_helper_carrier_is_conservative_noop() -> None:
+    frames = {
+        "orders": pd.DataFrame(
+            [{"order_id": "o1", "customer_id": "c1", "_customer_name": "Alice"}]
+        )
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "_customer_name"]
+
+
+@pytest.mark.ftr("BUG-HELPER-CLEANUP-CONTRACT-P4A")
+def test_durable_helper_cleanup_preserves_non_helper_columns() -> None:
+    frames = {
+        "_meta": {"sheets": {"orders": {"helper_columns": ["_customer_name"]}}},
+        "orders": pd.DataFrame(
+            [
+                {
+                    "order_id": "o1",
+                    "customer_id": "c1",
+                    "_customer_name": "Alice",
+                    "_manual_note": "keep",
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="orders", policy="drop")
+
+    assert list(out["orders"].columns) == ["order_id", "customer_id", "_manual_note"]
+
+
 def test_unchanged_lookup_helper_warn_mode_emits_no_findings() -> None:
     frames = _frames_with_fk_and_lookup_helpers()
 
