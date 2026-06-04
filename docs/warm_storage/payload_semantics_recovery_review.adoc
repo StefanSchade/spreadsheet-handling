@@ -1,0 +1,669 @@
+= Review: Payload Semantics Recovery
+
+== Status
+
+* Follow-up to `collaborative_repo_roundtrip_review.adoc` (section 7)
+  which surfaced the candidate rule
+  "*Payload semantics must not exist solely in metadata*".
+* Type: exploratory architectural assessment + backlog preparation.
+* Scope: read-only. No official documentation is modified. No
+  implementation work. The companion artifact is a *draft* FTR placed
+  in the backlog (see section 4).
+* Disposition: a focused FTR is justified -- see
+  `docs/backlog/FTR-PAYLOAD-SEMANTICS-RECOVERY-P5.adoc`.
+
+== Executive summary
+
+The "salvage canonical data from metadata" framing names a real gap
+in the existing model. It is *not* a new transformation family, *not*
+fully covered by lifecycle concepts, and *not* a special case of the
+persistence-boundary rule. It is a *meta-invariant on the
+data/meta interface* that the project has so far observed informally
+in some places (`cell_codecs`, `sparse_defaults` precedence notes;
+`agent_rules.adoc` "presentation must never substitute for identity")
+and silently broken in others (the FK-helper `"nan"` BUG; visible-
+cell typing; sheet identity carried only in
+`workbook_view.sheet_mappings`).
+
+The right framing is *not* the strong form "no payload semantics may
+depend on metadata" -- that would be impractical and would contradict
+the existing canonical-meta layer. The right framing is the *load-bearing
+variant*:
+
+____
+For every metadata entry on which the *meaning of visible payload cells
+depends*, that dependency must be (a) explicitly classified in the
+registry, (b) recoverable from the canonical data layer or another
+non-metadata channel when reasonable, and (c) -- when not recoverable
+-- pinned to the canonical layer with a roundtrip guarantee that
+cannot be silently weakened.
+____
+
+That framing has three concrete consequences:
+
+. it gives the unresolved-helper-value BUG a *principled* answer
+  rather than a one-shot patch;
+. it gives `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` a backbone (typing
+  is one instance of "payload semantics in metadata");
+. it gives `FTR-META-LIFECYCLE-INVENTORY-P5` a new column to fill in
+  ("payload-semantics-bearing? recoverable? from where?").
+
+The recommendation is to draft an exploratory P5 FTR that records the
+rule, classifies the known cases, and explicitly states the
+relationship to the three referenced items. The FTR should *not*
+implement anything, *not* propose new registry roots, and *not*
+preempt the per-attribute slice decisions that the adoption strategy
+already requires.
+
+== 1. Architectural assessment
+
+=== 1.1 Is this a new transformation family?
+
+No. "Transformation family" in the project's vocabulary means a set
+of producer/consumer steps with a shared registry root (FK helpers,
+lookup helpers, xref crosstable, sparse defaults, ...). The proposed
+rule is *not* a producer or consumer set; it is a *meta-invariant on
+the data/meta interface*.
+
+Concretely, it would not show up as a new pipeline step, not as a
+new `_meta` root, and not as a new domain transformation. It would
+show up as:
+
+* a registry-level classification refinement
+  (`payload_semantics_bearing: yes|no` or equivalent);
+* a documentation section in the technical-model concepts;
+* a per-attribute review item in the lifecycle inventory.
+
+This matches the project's "rule-ready, not rule engine" posture
+(`docs/semantic_model/09_registry_role.adoc`).
+
+=== 1.2 Is it already covered by existing lifecycle concepts?
+
+Partly. The closest existing statements are:
+
+* `architecture_primer.adoc`: "Roundtrip must not depend on
+  `meta_rendering` alone -- everything needed for reconstruction
+  must be in `meta_canonical` or stably persisted from it."
+* `agent_rules.adoc`: "Presentation intent (styles, column groups,
+  outlines) is downstream of identity / provenance. Presentation
+  must never substitute for identity."
+* `metadata_canonical_vs_derived.adoc`: distinguishes *transport
+  fact* from *semantic role*; states that persisted derived metadata
+  does not promote to canonical.
+* `registries/meta_registry.yaml` -- precedence notes on
+  `xref_crosstable`, `compact_multiaxis`, `sparse_defaults`,
+  `cell_codecs`: each explicitly says "structural transformation
+  intent / generic code/token handling only; domain interpretation
+  remains outside this key".
+
+What these *together* say is: "the canonical meta layer is the
+authoritative side; the derived layer is recomputable from it".
+
+What none of them say -- and what the proposed rule adds -- is:
+"even within the canonical-meta layer, some entries *carry payload
+meaning*, and that subset has a stronger invariant than the rest of
+the canonical layer". The registry currently flattens canonical-meta
+into a single bucket; this rule would split it.
+
+=== 1.3 Is it a special case of the persistence-boundary rule?
+
+No. The persistence boundary
+(`pipeline/persistence_boundary.py`, documented in
+`docs/semantic_model/08_lifecycle_and_update_semantics.adoc`)
+filters *runtime-only carriers* (transient `derived`, `__*`-prefixed
+keys, runtime-produced FK-helper v2 relations) before writing the
+persistable form. It governs the *runtime view -> persistable
+contract* projection.
+
+The proposed rule operates on a *different axis*: not "what survives
+to the next run", but "if metadata is lost between runs, can the
+visible payload still be interpreted unambiguously". These two axes
+overlap in *one* place -- a metadata entry that is both
+roundtrip-relevant and payload-semantics-bearing must be persisted
+*and* should arguably also be reflected into a canonical-data
+channel so that interpretation is recoverable when persistence
+fails.
+
+So the persistence boundary tells you *what to persist*; the
+proposed rule tells you *what must be recoverable from canonical
+data when persistence is lost*. They are complementary, not
+substitutes.
+
+=== 1.4 Does the registry already imply this pattern?
+
+Yes, in pieces, but not coherently.
+
+Implicit support for the rule:
+
+* `cell_codecs.precedence_notes` -- "Cell codec metadata records
+  generic code/token handling only; domain interpretation remains
+  outside this key." This *implies* "domain meaning should live
+  outside metadata", which is one direction of the proposed rule.
+* `sparse_defaults.precedence_notes` -- same shape.
+* `xref_crosstable.precedence_notes` -- "cell value semantics
+  remain outside this key".
+* `compact_multiaxis.precedence_notes` -- "dense axis reconstruction
+  remains a future explicit contract and must not be inferred".
+* `column_widths.precedence_notes` -- "Width metadata records
+  presentation state only; it must not alter table shape or cell
+  semantics."
+
+Implicit *counter*-examples (entries whose absence makes payload
+uninterpretable, but where the registry does not flag the
+dependency):
+
+* `cell_codecs` itself -- if the codec metadata is lost, a compact
+  multi-token cell `"a;b;c"` becomes uninterpretable: is it one
+  string, three tokens, or N tokens? The data layer alone does not
+  carry the answer.
+* `sparse_defaults` -- a blank cell may mean "the configured
+  default value" or "missing". Lose the metadata and the cell is
+  ambiguous.
+* `xref_crosstable` / `compact_multiaxis` -- a matrix cell encodes
+  a relation tuple only if the registry of axes is present.
+* `workbook_view.sheet_mappings` -- sheet-to-frame identity is
+  *entirely* in metadata; sheet labels are user-editable and the
+  registry explicitly forbids inferring identity from them.
+* `legend_blocks` -- without it, visible legend tables look like
+  primary data tables.
+* `frame_lifecycle` -- canonical / source / projection role lives
+  here.
+* `helper_columns`, `helper_prefix`, `_meta.derived.sheets.*.helper_columns` --
+  helper-vs-canonical column identity.
+* `constraints` -- whether a value is *valid* lives here; if lost,
+  invalid data survives roundtrip.
+
+Each of these is correctly classified as canonical-meta today, and
+each correctly survives the persistence boundary. But the registry
+does not have a field that *names* the payload-semantics dependency.
+That is the missing piece.
+
+=== 1.5 What kind of artifact is this?
+
+It is best described as a *meta-invariant on the data/meta
+interface*. In the existing taxonomy
+(`semantic_model/09_registry_role.adoc`) it is "rule-ready
+structure" -- it would make the registry richer, it would inform
+guards, but it is not a runtime rule engine.
+
+In the FTR-sizing language
+(`docs/developer_guide/ch08_git_and_workflow/01_git_and_workflow.adoc`):
+
+* it is *not* a single primitive change;
+* it touches public surface (the registry);
+* it falls under "FTR Slicing for Metadata and Registry Changes"
+  (the per-attribute slice rule);
+* the rule itself is one FTR; the per-attribute slices are separate.
+
+== 2. Existing cases survey
+
+This section enumerates places in the current repository where the
+*meaning* of visible payload appears to depend on metadata, with the
+metadata source for each case. The list is *descriptive*, not
+prescriptive. Some entries are not problems; they are listed because
+they are instances of the pattern and would be classified by the
+proposed rule.
+
+=== 2.1 Confirmed problem cases (already filed)
+
+[cols="1,3,2",options="header"]
+|===
+| # | Case | Reference
+
+| C-1
+| Unresolved helper value vs in-domain `"nan"`. Visible cell value
+  alone does not distinguish "FK source empty / target missing /
+  formula error" from "the literal string nan". Today the unresolved
+  status reaches canonical JSON as the literal `"nan"`, collapsing
+  four cases into one.
+| `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+
+| C-2
+| Helper-column leak into canonical JSON. Related to C-1: the
+  helper-column lifecycle interacts with the unresolved-value
+  contract.
+| `BUG-HELPER-CLEANUP-CONTRACT-P4A`
+
+| C-3
+| Visible-cell typing. JSON `{"sequence_no": 1}` -> workbook ->
+  JSON yields `{"sequence_no": "1"}`. The type was payload
+  semantics; today it is lost without metadata to carry it.
+| `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5`
+
+| C-4
+| Lifecycle inventory of `_meta` roots. The proposed rule would
+  add a column to the inventory.
+| `FTR-META-LIFECYCLE-INVENTORY-P5`
+|===
+
+=== 2.2 Latent cases (no current BUG/FTR, but classifiable by the rule)
+
+The following are not currently filed as problems, but are
+*instances* of the pattern. Each is a future review item, not a
+current incident.
+
+[cols="1,3,2",options="header"]
+|===
+| # | Case | Metadata carrier
+
+| L-1
+| *Compact cell codecs.* A compact-encoded cell `"a;b;c"` is
+  ambiguous without the codec: one string vs N tokens vs typed
+  tuple. The visible cell alone does not carry the answer.
+| `cell_codecs`
+
+| L-2
+| *Sparse-default cells.* A blank cell in a sparse-default frame
+  means "the configured default value", not "missing". Lose the
+  metadata and `""` is indistinguishable from "missing".
+| `sparse_defaults`
+
+| L-3
+| *Matrix / crosstable cell meaning.* A cell in a contract-xref
+  matrix is a tuple in a relation; without `xref_crosstable`
+  or `compact_multiaxis` metadata the matrix is just a 2D table.
+| `xref_crosstable`, `compact_multiaxis`
+
+| L-4
+| *Discriminator-split frames.* The original origin and row order
+  of a split-by-discriminator frame is metadata.
+| `split_by_discriminator`
+
+| L-5
+| *Sheet-to-frame identity.* Visible sheet labels are user-editable;
+  the canonical mapping lives only in
+  `workbook_view.sheet_mappings`. The registry explicitly forbids
+  re-inference from labels.
+| `workbook_view.sheet_mappings`
+
+| L-6
+| *Helper-column identity.* Without `_meta.sheets.<frame>.helper_columns`
+  / `helper_prefix` / derived provenance, helper columns can be
+  mistaken for canonical data on reimport.
+| `helper_columns`, `helper_prefix`, `_meta.derived.sheets.*.helper_columns`
+
+| L-7
+| *Frame role.* Whether a frame is canonical, source, or
+  projection lives in `frame_lifecycle`. Without it, reimport
+  cannot tell what to write back.
+| `frame_lifecycle`
+
+| L-8
+| *Validation findings.* "This value is invalid" is metadata
+  (`constraints` + finding artifacts). Without it, invalid data
+  silently survives roundtrip.
+| `constraints`
+
+| L-9
+| *Legend / codebook blocks.* Without `legend_blocks` metadata,
+  visible codebook tables are indistinguishable from primary data
+  tables. The visible block alone does not signal "this is a
+  legend".
+| `legend_blocks`
+
+| L-10
+| *User-authored vs default presentation.* Whether `column_widths`
+  / `text_orientations` represent user intent or carrier defaults
+  is *implicit*. Today the metadata is the only record. (Cross-
+  cuts the collaborative-roundtrip review's "presentation
+  classification not internally uniform" finding.)
+| `column_widths`, `text_orientations`
+
+| L-11
+| *Formula-error preservation.* `#NAME?`, `#N/A`, `#REF!` are
+  typed in XLSX/ODS; after JSON roundtrip they may be lost or
+  stringified. Today nothing carries the formula-error status
+  through canonical JSON.
+| Today: nothing. (Open contract; partial overlap with C-1.)
+
+| L-12
+| *Empty vs missing.* Visible empty cell may mean "deliberately
+  empty" or "missing". Today both yield `""`. Whether a separate
+  representation is needed is a contract decision.
+| Today: nothing. (Open contract; partial overlap with C-1.)
+
+| L-13
+| *FK-helper relation policy origin.* `produced_by.step` /
+  `produced_by.mode` records whether a relation was explicit or
+  inferred. This is payload-adjacent: it changes how a downstream
+  re-resolution behaves but is not itself visible. If lost, the
+  inferred-vs-explicit distinction collapses.
+| `_meta.helper_policies.fk.relations[*].produced_by`
+
+| L-14
+| *Workbook identity.* `version`, `author`, `exported_at` carry
+  workbook-identity claims that cannot be reconstructed from
+  payload at all. Not problematic in the same way as the others
+  (no payload meaning depends on them), but listed for
+  completeness because the rule's wording must explicitly exclude
+  workbook-identity from "must be recoverable from canonical data".
+| `version`, `author`, `exported_at`
+|===
+
+=== 2.3 Summary of the survey
+
+* The rule's *load-bearing variant* would classify roughly 12 of
+  the 24 registered canonical-meta entries as
+  payload-semantics-bearing.
+* For most of them, recovery from canonical data alone is
+  impossible (a blank cell really is ambiguous without
+  `sparse_defaults`).
+* The right design move is therefore *not* "encode payload
+  semantics in canonical data"; it is "*explicitly classify which
+  metadata entries carry payload semantics, and pin them to the
+  canonical layer with a stronger roundtrip guarantee*".
+
+== 3. Contract analysis
+
+Three candidate phrasings:
+
+=== 3.1 Strong form (rejected)
+
+____
+*Payload semantics must never exist solely in metadata.*
+____
+
+Reasonable as an aspiration; impractical as a contract.
+
+Counter-cases:
+
+* `cell_codecs`, `sparse_defaults`, `xref_crosstable`,
+  `compact_multiaxis` are *load-bearing for payload meaning* by
+  design. The whole point of those transformations is that the
+  spreadsheet representation is *more compact* than the canonical
+  data, which is only possible because the metadata carries the
+  decoding rule. The strong form would force every compact cell to
+  also carry its decoding rule inline, which defeats the purpose.
+* Sheet identity in `workbook_view.sheet_mappings` cannot live in
+  canonical data without re-keying every sheet by a synthetic
+  identifier the user cannot edit. That trade-off has already been
+  considered and explicitly rejected (the project forbids
+  inferring identity from labels; the metadata IS the canonical
+  identity).
+* `frame_lifecycle` and `protection` are inherently meta-level
+  claims about frames; pushing them into the data layer would
+  require new payload columns whose meaning would itself be
+  meta-only.
+
+The strong form would also conflict with the canonical-layer
+definition (`02_meta_layer.adoc`), which exists precisely so that
+some claims can live durably and authoritatively in `_meta`.
+
+Verdict: reject the strong form.
+
+=== 3.2 Weak form (already implicit)
+
+____
+*Metadata that carries payload semantics must be classified as
+canonical-layer and persistent.*
+____
+
+This is already the project's de-facto rule. Every entry in section
+2.2 is canonical-meta in the registry today. The weak form does not
+add information; it restates the canonical-layer definition.
+
+Verdict: reject the weak form as not adding signal.
+
+=== 3.3 Load-bearing form (recommended)
+
+____
+*Every metadata entry on which the meaning of visible payload cells
+depends must be:*
+
+. *explicitly classified as payload-semantics-bearing in the
+   registry*;
+. *recoverable from canonical data or an explicit non-metadata
+   channel whenever recovery is possible without semantic loss
+   ("recovery preference")*;
+. *otherwise pinned to the canonical layer with a roundtrip
+   guarantee that cannot be silently weakened by a later
+   collaboration-default rule, persistence-boundary refinement, or
+   metadata-lifecycle decision ("pinning fallback")*.
+____
+
+This adds three concrete things to the existing model:
+
+. *a registry attribute* (e.g. `payload_semantics_bearing: yes | no`)
+   that names the dependency;
+. *a recovery-preference principle* that, when applicable, says
+   "prefer to surface the meaning into canonical data rather than
+   leave it only in metadata";
+. *a pinning fallback* that, when recovery is not possible, makes
+   the entry's canonical-layer status explicitly load-bearing -- so
+   the collaborative-roundtrip concept and the persistence boundary
+   cannot accidentally weaken it.
+
+Exceptions that the rule should explicitly call out:
+
+* *Workbook-identity meta* (`version`, `author`, `exported_at`) is
+  *not* payload-semantics-bearing; the rule does not apply.
+* *Presentation defaults reproducible from configuration*
+  (`header_fill_rgb`, `helper_fill_rgb`, `freeze_header`,
+  `auto_filter` when these are bootstrap-defaults) -- not
+  payload-semantics-bearing; the rule does not apply.
+* *Derived / transient meta* -- explicitly transient; the rule
+  applies only to its canonical projection (e.g. `helper_columns`
+  durable list, not `_meta.derived` runtime channel).
+* *Pure presentation hints* with no semantic consequence
+  (e.g. `text_orientations`) -- not payload-semantics-bearing.
+* *Operational-carrier shape* (`workbook_meta_blob`, `_hidden`) --
+  not payload-semantics-bearing; it is the serialization of other
+  entries that may or may not be.
+
+Verdict: recommend adoption *as an exploratory rule*, with the
+acknowledgement that:
+
+* the per-attribute classification work is non-trivial and would
+  be done by `FTR-META-LIFECYCLE-INVENTORY-P5`, not by the rule's
+  own FTR;
+* the recovery-preference principle is *advisory*, not normative,
+  in any single slice;
+* the pinning fallback is the only *binding* part of the rule and
+  it overlaps with the existing canonical-layer definition;
+* the rule's value is therefore not in changing what *is*
+  canonical, but in *naming why* certain canonical entries cannot
+  be downgraded.
+
+=== 3.4 Why the load-bearing form is worth writing down
+
+. *It gives BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A a
+  principled answer.* Today the three options in the BUG
+  (empty/null, structured finding, error preservation) are
+  equally plausible. The rule says: prefer recovery into canonical
+  data (option 1 or option 3 if it actually preserves the
+  distinction); accept structured finding (option 2) as a
+  pinning-fallback when recovery is impossible.
+. *It gives FTR-VISIBLE-CELL-TYPING-STRATEGY-P5 a principled
+  answer.* Today the three options (strings forever, typed
+  roadmap, defer) are equally plausible. The rule says: if visible
+  cell typing carries payload meaning, the project must either
+  surface it into canonical data (typed JSON) or accept the loss
+  explicitly. "Defer" remains valid as a release-timing decision,
+  not as a final answer.
+. *It gives FTR-META-LIFECYCLE-INVENTORY-P5 a new classification
+  column.* Today the inventory will classify entries on
+  persistence/runtime-only/user-authored/derived axes. Adding
+  "payload-semantics-bearing? recovery channel?" makes the
+  inventory operationally useful for the collaborative-roundtrip
+  concept as well.
+. *It prevents the collaborative-roundtrip rule from being
+  applied unsafely.* The companion review explicitly recommended
+  this rule as a precondition. Writing it down closes the loop.
+. *It documents an invariant the project already follows.* Several
+  precedence notes in the registry already imply the rule. Naming
+  it makes it reviewable.
+
+== 4. FTR recommendation
+
+A draft FTR is justified. The proposed file is
+`docs/backlog/FTR-PAYLOAD-SEMANTICS-RECOVERY-P5.adoc`.
+
+Reasons for proposing P5 rather than P4A or P6:
+
+* P4A would suggest near-term, beta-blocking work. The rule does
+  not change runtime behavior; it adds documentation and registry
+  classification. Not P4A.
+* P6 would suggest "longer-term, speculative". The rule directly
+  unblocks
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`,
+  `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5`, and
+  `FTR-META-LIFECYCLE-INVENTORY-P5` -- all of which are
+  near-medium-term. P6 is too remote.
+* P5 ("post-beta quality" per `_ftrs_open.adoc` conventions) is
+  the natural home: it is post-release quality work that
+  improves the project's analytical surface without requiring a
+  release decision.
+
+The FTR is exploratory, *not* an implementation ticket. Its
+acceptance criteria document the rule, classify the existing
+canonical-meta entries, and add cross-references. It does *not*
+require code changes or new tests in this slice.
+
+See `docs/backlog/FTR-PAYLOAD-SEMANTICS-RECOVERY-P5.adoc` for the
+draft text.
+
+=== 4.1 What this FTR is *not*
+
+The FTR is not:
+
+* a metadata-typing system;
+* a payload-encoding redesign;
+* a NaN-normalization fix
+  (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` remains the owner);
+* a visible-cell-typing decision
+  (`FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` remains the owner);
+* a per-attribute reclassification
+  (`FTR-META-LIFECYCLE-INVENTORY-P5` does the inventory; this FTR
+  contributes the classification axis only);
+* a new registry root;
+* a runtime rule check.
+
+=== 4.2 What this FTR *is*
+
+The FTR is:
+
+* an exploratory contract statement;
+* a survey of existing cases;
+* a per-attribute classification axis;
+* a cross-reference index that ties the
+  collaborative-roundtrip concept, the unresolved-helper-value
+  BUG, the visible-cell-typing FTR, and the lifecycle inventory
+  together.
+
+== 5. Interaction matrix
+
+[cols="2,3",options="header"]
+|===
+| Other artifact | Interaction
+
+| `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+| Direct dependency. The rule's recovery preference favors
+  options 1 or 3 (surface meaning into canonical data); the
+  pinning fallback accepts option 2 (structured finding) when
+  recovery is impossible. The BUG remains the owner of the
+  *contract decision*; the FTR provides the *framework*.
+
+| `FTR-META-LIFECYCLE-INVENTORY-P5`
+| Hosts the per-attribute classification. The proposed FTR adds
+  a column ("payload-semantics-bearing? recovery channel?") to
+  the inventory work; it does not replace it.
+
+| `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5`
+| The rule reframes the FTR's three options as instances of a
+  general pattern. The FTR may remain a release-timing decision,
+  but a future typed-payload move would consume the rule.
+
+| `FTR-PRESENTATION-DEFAULTS-SEMANTIC-CLASSIFICATION-P5`
+| Indirect interaction. The rule sharpens the split between
+  presentation entries that *do* carry payload meaning (e.g.
+  `frame_lifecycle` -- the editability of a frame is presentation
+  *and* payload-related) and those that do not (e.g.
+  `header_fill_rgb`).
+
+| Collaborative-roundtrip concept (`collaborative_repo_roundtrip.adoc`)
+| Precondition. The companion review recommended this rule as the
+  prerequisite for the collaborative-roundtrip rule to be safe.
+
+| `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`
+| Touches L-13 (`produced_by` provenance). The lifecycle FTR may
+  consume the rule's classification.
+
+| `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`
+| Touches L-6. Helper-column identity is payload-semantics-
+  bearing only in its durable projection
+  (`_meta.sheets.<frame>.helper_columns`); the transient
+  `_meta.derived` channel is not.
+
+| `FTR-WORKBOOK-VIEW-PAYLOAD-CONFLICT-PRECEDENCE-P6`
+| Compatible. Conflict precedence already rejects heuristic
+  resolution; the proposed rule sits one layer up
+  ("what *is* payload semantics in the first place").
+
+| `FTR-META-CONTRACT-VERSIONING-P4A`
+| If the registry gets a `payload_semantics_bearing` attribute,
+  its schema is in scope here.
+|===
+
+== 6. Disposition
+
+* *Accept the load-bearing form* as the project's working
+  formulation of the rule.
+* *Reject* the strong and weak forms.
+* *Treat the exceptions* (workbook-identity, regenerable
+  presentation defaults, transient derived meta,
+  operational-carrier shapes) as load-bearing parts of the rule's
+  wording.
+* *Author an exploratory P5 FTR* in the backlog with the structure
+  outlined in section 4 and the interaction matrix in section 5.
+  See `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5.adoc`.
+* *Do not modify any other documentation* in response to this
+  review; the FTR is the only artifact this review produces beside
+  itself.
+
+== 7. Validation / how to verify this review
+
+Read the following files to verify the review's references:
+
+* `docs/warm_storage/collaborative_repo_roundtrip_review.adoc` --
+  section 7 of the prior review.
+* `docs/backlog/BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A.adoc`
+* `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc`
+* `docs/backlog/FTR-VISIBLE-CELL-TYPING-STRATEGY-P5.adoc`
+* `docs/backlog/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.adoc`
+* `docs/backlog/FTR-WORKBOOK-VIEW-PAYLOAD-CONFLICT-PRECEDENCE-P6.adoc`
+* `docs/backlog/FTR-PRESENTATION-DEFAULTS-SEMANTIC-CLASSIFICATION-P5.adoc`
+* `docs/technical_model/ch04_concepts/metadata_canonical_vs_derived.adoc`
+* `docs/technical_model/ch05_registries/registry_semantics/01_data_and_meta.adoc`
+* `docs/technical_model/ch05_registries/registry_semantics/02_meta_layer.adoc`
+* `docs/technical_model/ch05_registries/registry_semantics/03_meta_classification.adoc`
+* `docs/semantic_model/04_ambiguity_policy.adoc`
+* `docs/semantic_model/07_overlapping_semantic_sets.adoc`
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc`
+* `docs/ai_info/agent_rules.adoc`
+* `docs/ai_info/architecture_primer.adoc`
+* `registries/meta_registry.yaml` -- in particular the precedence
+  notes on `cell_codecs`, `sparse_defaults`, `xref_crosstable`,
+  `compact_multiaxis`, `column_widths`, `workbook_view.sheet_mappings`.
+
+No code changes are required to verify this review.
+
+== 8. Residual risks
+
+. *Over-classification.* If the rule is interpreted enthusiastically,
+  too many entries will be tagged payload-semantics-bearing and the
+  classification loses its discriminating power. The FTR should
+  state the bar explicitly: "the meaning of a visible cell changes
+  if this entry is lost".
+. *Under-classification.* Conversely, the bar may be set so high
+  that obvious cases (the FK-helper unresolved-value case, the
+  sparse-default case) are excluded. The case survey in section 2.2
+  is the calibration set.
+. *Confusion with visible-cell typing.* Typing is *one instance*
+  of the pattern, not the whole pattern. The FTR should state this
+  explicitly to avoid being read as "do typing".
+. *Confusion with the collaborative-roundtrip rule.* The rule here
+  is a *precondition* for the collaborative-roundtrip rule, not a
+  variant of it. The FTR should state the dependency direction.
+. *Per-attribute work growing under the FTR's scope.* The FTR is
+  framework-only; per-attribute reclassification belongs to the
+  lifecycle inventory FTR.
