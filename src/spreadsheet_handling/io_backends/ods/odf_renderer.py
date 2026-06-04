@@ -128,27 +128,26 @@ def _register_cell_style(
 
     style_name = f"cell_style_{len(cache) + 1}"
     style = Style(name=style_name, family="table-cell")
+    cell_props_kwargs: dict[str, Any] = {}
     if fill_rgb:
-        style.addElement(TableCellProperties(backgroundcolor=fill_rgb))
-    tp_attrs: dict = {}
+        cell_props_kwargs["backgroundcolor"] = fill_rgb
+    if cell_props_kwargs or rotation:
+        cell_props = TableCellProperties(**cell_props_kwargs)
+        if rotation:
+            # style:rotation-angle is defined on style:table-cell-properties; on
+            # style:text-properties it is not in the ODF schema and is ignored
+            # by LibreOffice / Calc, so the rendered rotation would be invisible
+            # to external consumers even when the project parser still round-trips.
+            # ODS rotation is 0-360 CCW; XLSX uses 0-90 CCW and 91-180 for CW
+            # (stored as 90+CW). XLSX 90 -> ODS 90 (vertical text); XLSX 180 -> ODS 270.
+            if rotation <= 90:
+                ods_rotation = rotation
+            else:
+                ods_rotation = 360 - (rotation - 90)
+            cell_props.attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
+        style.addElement(cell_props)
     if bold:
-        tp_attrs["fontweight"] = "bold"
-    if tp_attrs:
-        style.addElement(TextProperties(**tp_attrs))
-    if rotation:
-        # ODS rotation is 0-360 CCW; XLSX uses 0-90 CCW and 91-180 for CW (stored as 90+CW).
-        # XLSX 90 -> ODS 90 (CCW 90 = vertical text); XLSX 180 -> ODS 270.
-        if rotation <= 90:
-            ods_rotation = rotation
-        else:
-            ods_rotation = 360 - (rotation - 90)
-        text_props = style.getElementsByType(TextProperties)
-        if text_props:
-            text_props[0].attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
-        else:
-            t = TextProperties()
-            t.attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
-            style.addElement(t)
+        style.addElement(TextProperties(fontweight="bold"))
     doc.automaticstyles.addElement(style)
     cache[key] = style_name
     return style_name

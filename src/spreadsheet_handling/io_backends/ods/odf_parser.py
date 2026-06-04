@@ -155,23 +155,42 @@ def _build_column_style_map(doc) -> dict[str, str]:
 def _extract_ods_column_widths(
     table: Element,
     col_style_map: dict[str, str],
+    *,
+    max_col: int,
+    limits: ParserLimits = DEFAULT_LIMITS,
 ) -> dict[str, dict] | None:
-    """Return {col_letter: {width, source}} for explicitly styled table columns."""
+    """Return {col_letter: {width, source}} for explicitly styled table columns.
+
+    Iteration is clipped to ``max_col`` (the parsed content extent) so that
+    sheet-wide LibreOffice column-width fillers (a styled table-column with a
+    huge ``number-columns-repeated``) do not produce one metadata entry per
+    filler column. ``limits`` is honoured on a per-axis basis as
+    defense-in-depth against inputs that still declare implausible repeats
+    within the content extent.
+    """
+    if max_col <= 0:
+        return None
     result: dict[str, dict] = {}
     table_col_name = TableColumn().qname
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}' column widths"
     col_index = 1
     for child in table.childNodes:
         if not isinstance(child, Element) or child.qname != table_col_name:
             continue
+        if col_index > max_col:
+            break
         repeat = int(child.attributes.get((TABLENS, "number-columns-repeated"), 1))
+        limits.enforce(context=context, cols=col_index + repeat - 1)
+        effective_repeat = min(repeat, max_col - col_index + 1)
         style_name = child.attributes.get((TABLENS, "style-name"))
-        if style_name:
+        if style_name and effective_repeat > 0:
             width_str = col_style_map.get(str(style_name))
             if width_str:
                 cm = _ods_length_to_cm(width_str)
                 if cm is not None:
                     excel_width = _ods_cm_to_excel_chars(cm)
-                    for i in range(repeat):
+                    for i in range(effective_repeat):
                         letter = _column_letters(col_index + i)
                         result[letter] = {"width": excel_width, "source": "workbook"}
         col_index += repeat
@@ -202,24 +221,52 @@ def _build_cell_rotation_map(doc) -> dict[str, int]:
 def _extract_ods_text_orientations(
     table: Element,
     rotation_map: dict[str, int],
+    *,
+    max_row: int,
+    max_col: int,
+    limits: ParserLimits = DEFAULT_LIMITS,
 ) -> dict[str, dict] | None:
-    """Return {cell_address: {rotation, source}} for cells with non-zero XLSX rotation."""
+    """Return {cell_address: {rotation, source}} for cells with non-zero XLSX rotation.
+
+    Iteration is clipped to ``max_row`` x ``max_col`` (the parsed content
+    extent) so that LibreOffice "select all + rotate" filler patterns do not
+    expand ``row_repeat`` x ``col_repeat`` into one metadata entry per implied
+    address. ``limits`` is honoured on per-axis and per-cell bases as
+    defense-in-depth against inputs that still declare implausible repeats
+    within the content extent.
+    """
+    if max_row <= 0 or max_col <= 0:
+        return None
     result: dict[str, dict] = {}
     table_row_name = TableRow().qname
     table_cell_name = TableCell().qname
     covered_cell_name = CoveredTableCell().qname
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}' text orientations"
 
     row_index = 1
     for child in table.childNodes:
         if not isinstance(child, Element) or child.qname != table_row_name:
             continue
+        if row_index > max_row:
+            break
         row_repeat = int(child.attributes.get((TABLENS, "number-rows-repeated"), 1))
+        limits.enforce(context=context, rows=row_index + row_repeat - 1)
+        effective_row_repeat = min(row_repeat, max_row - row_index + 1)
         col_index = 1
         for cell in child.childNodes:
             if not isinstance(cell, Element) or cell.qname not in (table_cell_name, covered_cell_name):
                 continue
+            if col_index > max_col:
+                break
             col_repeat = int(cell.attributes.get((TABLENS, "number-columns-repeated"), 1))
-            if cell.qname != covered_cell_name:
+            limits.enforce(context=context, cols=col_index + col_repeat - 1)
+            effective_col_repeat = min(col_repeat, max_col - col_index + 1)
+            if (
+                cell.qname != covered_cell_name
+                and effective_row_repeat > 0
+                and effective_col_repeat > 0
+            ):
                 style_name = cell.attributes.get((TABLENS, "style-name")) or \
                              cell.attributes.get((STYLENS, "style-name"))
                 if style_name:
@@ -227,10 +274,21 @@ def _extract_ods_text_orientations(
                     if ods_rotation:
                         xlsx_rotation = _ods_rotation_to_xlsx(ods_rotation)
                         if xlsx_rotation > 0:
-                            for r_off in range(row_repeat):
-                                for c_off in range(col_repeat):
-                                    addr = f"{_column_letters(col_index + c_off)}{row_index + r_off}"
-                                    result[addr] = {"rotation": xlsx_rotation, "source": "workbook"}
+                            limits.enforce(
+                                context=context,
+                                cells=len(result)
+                                + effective_row_repeat * effective_col_repeat,
+                            )
+                            for r_off in range(effective_row_repeat):
+                                for c_off in range(effective_col_repeat):
+                                    addr = (
+                                        f"{_column_letters(col_index + c_off)}"
+                                        f"{row_index + r_off}"
+                                    )
+                                    result[addr] = {
+                                        "rotation": xlsx_rotation,
+                                        "source": "workbook",
+                                    }
             col_index += col_repeat
         row_index += row_repeat
     return result if result else None
@@ -652,7 +710,9 @@ def parse_workbook(
         _apply_legend_table_hints(sheet, legend_hints)
         sheet.named_ranges = _extract_named_ranges(table, sheet_name=name)
 
-        column_widths = _extract_ods_column_widths(table, col_style_map)
+        column_widths = _extract_ods_column_widths(
+            table, col_style_map, max_col=parsed.max_col, limits=limits
+        )
         if column_widths:
             sheet.meta["__column_widths"] = column_widths
             raw_sheets = meta_payload.setdefault("sheets", {})
@@ -667,7 +727,13 @@ def parse_workbook(
                 raw_sheet["column_widths"] = column_widths
                 meta_changed = True
 
-        text_orientations = _extract_ods_text_orientations(table, rotation_map)
+        text_orientations = _extract_ods_text_orientations(
+            table,
+            rotation_map,
+            max_row=parsed.max_row,
+            max_col=parsed.max_col,
+            limits=limits,
+        )
         if text_orientations:
             sheet.meta["__text_orientations"] = text_orientations
             raw_sheets = meta_payload.setdefault("sheets", {})

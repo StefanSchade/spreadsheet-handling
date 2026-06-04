@@ -227,6 +227,136 @@ def test_explicit_merge_span_extends_parsed_bounds() -> None:
     assert sheet.meta.get("__header_merges") == [(1, 1, 1, 2)]
 
 
+_CONTENT_XML_TEMPLATE_WITH_STYLES = (
+    "<?xml version='1.0' encoding='UTF-8'?>"
+    "<office:document-content "
+    'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+    'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+    'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+    'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" '
+    'office:version="1.2">'
+    "<office:automatic-styles>{styles_inner}</office:automatic-styles>"
+    "<office:body><office:spreadsheet>{spreadsheet_inner}</office:spreadsheet></office:body>"
+    "</office:document-content>"
+)
+
+
+def _write_ods_with_styles(
+    tmp_path: Path,
+    name: str,
+    styles_inner: str,
+    spreadsheet_inner: str,
+) -> Path:
+    out = tmp_path / name
+    content_xml = _CONTENT_XML_TEMPLATE_WITH_STYLES.format(
+        styles_inner=styles_inner,
+        spreadsheet_inner=spreadsheet_inner,
+    )
+    with ZipFile(out, "w") as archive:
+        archive.writestr("mimetype", _ODS_MIMETYPE, compress_type=ZIP_STORED)
+        archive.writestr("content.xml", content_xml, compress_type=ZIP_DEFLATED)
+        archive.writestr("styles.xml", _STYLES_XML, compress_type=ZIP_DEFLATED)
+        archive.writestr("meta.xml", _META_XML, compress_type=ZIP_DEFLATED)
+        archive.writestr("META-INF/manifest.xml", _MANIFEST_XML, compress_type=ZIP_DEFLATED)
+    return out
+
+
+def test_display_metadata_extractors_clip_sheet_wide_rotated_filler(
+    tmp_path: Path,
+) -> None:
+    # Regression for FTR-TEXT-ORIENTATION-ROUNDTRIP-P5: the LibreOffice
+    # "select all + rotate" carrier pattern declares a single styled cell with
+    # near-maximum number-rows-repeated x number-columns-repeated. Without
+    # content-extent clipping, the text-orientation extractor would materialize
+    # ~17e9 dict entries even though only one cell actually carries data.
+    styles_inner = (
+        '<style:style style:name="rot" style:family="table-cell">'
+        '<style:table-cell-properties style:rotation-angle="90"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="rot"><text:p>only</text:p></table:table-cell>'
+        "</table:table-row>"
+        # Whole-sheet styled filler block.
+        '<table:table-row table:number-rows-repeated="1048575">'
+        '<table:table-cell table:style-name="rot" table:number-columns-repeated="16384"/>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "rot_filler.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    orients = sheet.meta.get("__text_orientations")
+    # Only the real content cell may appear; filler rotations must be dropped
+    # because they fall outside the parsed content extent.
+    assert orients == {"A1": {"rotation": 90, "source": "workbook"}}
+
+
+def test_display_metadata_extractors_reject_implausible_repeats(
+    tmp_path: Path,
+) -> None:
+    # Defense-in-depth on the new extractor code paths: the grid parser does
+    # not iterate table-column elements at all, so a column-width filler
+    # declaring more columns than ParserLimits allows reaches limit
+    # enforcement only via the column-width extractor. Without an explicit
+    # enforce there, an implausible declaration would silently materialize.
+    styles_inner = (
+        '<style:style style:name="cw" style:family="table-column">'
+        '<style:table-column-properties style:column-width="2.0cm"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:style-name="cw" table:number-columns-repeated="200"/>'
+        "<table:table-row>"
+        "<table:table-cell><text:p>data</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "cw_oversized.ods", styles_inner, spreadsheet_inner
+    )
+
+    limits = ParserLimits(max_rows=100, max_cols=100, max_cells=100_000)
+    with pytest.raises(SpreadsheetTooLargeError, match="column count 200"):
+        parse_workbook(out, limits=limits)
+
+
+def test_column_width_extractor_clips_sheet_wide_filler(tmp_path: Path) -> None:
+    # Mirror of the text-orientation guard for the column-width extractor:
+    # a sheet-wide table-column with an explicit width style must not produce
+    # 16k dict entries when actual content occupies only a handful of columns.
+    styles_inner = (
+        '<style:style style:name="cw" style:family="table-column">'
+        '<style:table-column-properties style:column-width="2.0cm"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:style-name="cw" table:number-columns-repeated="16384"/>'
+        "<table:table-row>"
+        "<table:table-cell><text:p>only</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "cw_filler.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    widths = sheet.meta.get("__column_widths") or {}
+    assert set(widths.keys()) == {"A"}
+
+
 def test_max_row_max_col_track_only_real_content() -> None:
     # Direct check on the parser's bounds: pathological filler cells around a
     # small island of real content must not inflate ParsedTable dimensions.
