@@ -15,6 +15,7 @@ EXPECTED_PASS_ORDER = [
     "FilterPass",
     "FreezePass",
     "ColumnWidthPass",
+    "TextOrientationPass",
     "NamedRangePass",
 ]
 

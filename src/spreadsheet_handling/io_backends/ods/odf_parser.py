@@ -11,7 +11,7 @@ from typing import Any
 from odf.element import Element
 from odf.namespaces import OFFICENS, STYLENS, TABLENS, TEXTNS
 from odf.opendocument import load
-from odf.style import Style, TableProperties
+from odf.style import Style, TableColumnProperties, TableProperties
 from odf.table import (
     ContentValidation as OdfContentValidation,
     CoveredTableCell,
@@ -19,6 +19,7 @@ from odf.table import (
     NamedRange as OdfNamedRange,
     Table,
     TableCell,
+    TableColumn,
     TableRow,
 )
 from odf.text import S
@@ -91,6 +92,156 @@ def _cell_value(cell: Element) -> str:
     if value_type == "time":
         return str(cell.attributes.get((OFFICENS, "time-value"), ""))
     return ""
+
+
+_CM_RE = re.compile(r"([\d.]+)\s*(cm|mm|in|pt|px)")
+_CM_PER_UNIT = {"cm": 1.0, "mm": 0.1, "in": 2.54, "pt": 2.54 / 72, "px": 2.54 / 96}
+_EXCEL_CHARS_PER_CM = 1.0 / 0.254  # 1 Excel char unit ≈ 0.254 cm
+
+
+def _ods_length_to_cm(value: str) -> float | None:
+    m = _CM_RE.search(str(value))
+    if not m:
+        return None
+    try:
+        amount = float(m.group(1))
+        return amount * _CM_PER_UNIT.get(m.group(2), 1.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ods_cm_to_excel_chars(cm: float) -> float:
+    return round(cm * _EXCEL_CHARS_PER_CM, 2)
+
+
+def _ods_rotation_to_xlsx(ods_rotation: int) -> int:
+    """Convert ODS CCW rotation (0-360) to XLSX textRotation convention (0-180).
+
+    XLSX 0-90: CCW degrees. XLSX 91-180: CW degrees stored as 90 + CW_angle.
+    ODS 90 -> XLSX 90; ODS 270 -> XLSX 180 (CW 90 degrees).
+    """
+    r = ods_rotation % 360
+    if r == 0:
+        return 0
+    if r <= 90:
+        return r
+    # ODS 91-359: clockwise component; XLSX stores CW as 90 + CW_angle
+    cw = (360 - r) % 360
+    return min(90 + cw, 180)
+
+
+def _build_column_style_map(doc) -> dict[str, str]:
+    """Return mapping {style_name -> column-width CSS string} for table-column styles."""
+    result: dict[str, str] = {}
+    col_props_name = TableColumnProperties().qname
+    for style in doc.getElementsByType(Style):
+        if style.attributes.get((STYLENS, "family")) != "table-column":
+            continue
+        name = style.attributes.get((STYLENS, "name"))
+        if not name:
+            continue
+        for child in style.childNodes:
+            if not isinstance(child, Element) or child.qname != col_props_name:
+                continue
+            width = child.attributes.get(
+                (STYLENS, "column-width"),
+                child.attributes.get((TABLENS, "column-width"), ""),
+            )
+            if width:
+                result[str(name)] = str(width)
+    return result
+
+
+def _extract_ods_column_widths(
+    table: Element,
+    col_style_map: dict[str, str],
+) -> dict[str, dict] | None:
+    """Return {col_letter: {width, source}} for explicitly styled table columns."""
+    result: dict[str, dict] = {}
+    table_col_name = TableColumn().qname
+    col_index = 1
+    for child in table.childNodes:
+        if not isinstance(child, Element) or child.qname != table_col_name:
+            continue
+        repeat = int(child.attributes.get((TABLENS, "number-columns-repeated"), 1))
+        style_name = child.attributes.get((TABLENS, "style-name"))
+        if style_name:
+            width_str = col_style_map.get(str(style_name))
+            if width_str:
+                cm = _ods_length_to_cm(width_str)
+                if cm is not None:
+                    excel_width = _ods_cm_to_excel_chars(cm)
+                    for i in range(repeat):
+                        letter = _column_letters(col_index + i)
+                        result[letter] = {"width": excel_width, "source": "workbook"}
+        col_index += repeat
+    return result if result else None
+
+
+def _build_cell_rotation_map(doc) -> dict[str, int]:
+    """Return mapping {style_name -> ods_rotation_angle} for table-cell styles with rotation."""
+    result: dict[str, int] = {}
+    for style in doc.getElementsByType(Style):
+        if style.attributes.get((STYLENS, "family")) != "table-cell":
+            continue
+        name = style.attributes.get((STYLENS, "name"))
+        if not name:
+            continue
+        for child in style.childNodes:
+            if not isinstance(child, Element):
+                continue
+            rotation = child.attributes.get((STYLENS, "rotation-angle"))
+            if rotation is not None:
+                try:
+                    result[str(name)] = int(rotation)
+                except (TypeError, ValueError):
+                    pass
+    return result
+
+
+def _extract_ods_text_orientations(
+    table: Element,
+    rotation_map: dict[str, int],
+) -> dict[str, dict] | None:
+    """Return {cell_address: {rotation, source}} for cells with non-zero XLSX rotation."""
+    result: dict[str, dict] = {}
+    table_row_name = TableRow().qname
+    table_cell_name = TableCell().qname
+    covered_cell_name = CoveredTableCell().qname
+
+    row_index = 1
+    for child in table.childNodes:
+        if not isinstance(child, Element) or child.qname != table_row_name:
+            continue
+        row_repeat = int(child.attributes.get((TABLENS, "number-rows-repeated"), 1))
+        col_index = 1
+        for cell in child.childNodes:
+            if not isinstance(cell, Element) or cell.qname not in (table_cell_name, covered_cell_name):
+                continue
+            col_repeat = int(cell.attributes.get((TABLENS, "number-columns-repeated"), 1))
+            if cell.qname != covered_cell_name:
+                style_name = cell.attributes.get((TABLENS, "style-name")) or \
+                             cell.attributes.get((STYLENS, "style-name"))
+                if style_name:
+                    ods_rotation = rotation_map.get(str(style_name))
+                    if ods_rotation:
+                        xlsx_rotation = _ods_rotation_to_xlsx(ods_rotation)
+                        if xlsx_rotation > 0:
+                            for r_off in range(row_repeat):
+                                for c_off in range(col_repeat):
+                                    addr = f"{_column_letters(col_index + c_off)}{row_index + r_off}"
+                                    result[addr] = {"rotation": xlsx_rotation, "source": "workbook"}
+            col_index += col_repeat
+        row_index += row_repeat
+    return result if result else None
+
+
+def _store_workbook_meta(ir: WorkbookIR, workbook_meta: dict[str, Any]) -> None:
+    meta_sheet = ir.hidden_sheets.setdefault("_meta", SheetIR(name="_meta"))
+    meta_sheet.meta["_hidden"] = True
+    meta_sheet.meta["workbook_meta_blob"] = json.dumps(
+        workbook_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _parse_hidden_style_names(doc) -> set[str]:
@@ -470,6 +621,10 @@ def parse_workbook(
                 meta_payload = _read_meta_payload(hidden_sheet)
             continue
 
+    col_style_map = _build_column_style_map(doc)
+    rotation_map = _build_cell_rotation_map(doc)
+    meta_changed = False
+
     for table in tables:
         name = str(table.attributes.get((TABLENS, "name"), "Sheet1"))
         if name in ir.hidden_sheets:
@@ -496,7 +651,41 @@ def parse_workbook(
         )
         _apply_legend_table_hints(sheet, legend_hints)
         sheet.named_ranges = _extract_named_ranges(table, sheet_name=name)
+
+        column_widths = _extract_ods_column_widths(table, col_style_map)
+        if column_widths:
+            sheet.meta["__column_widths"] = column_widths
+            raw_sheets = meta_payload.setdefault("sheets", {})
+            if not isinstance(raw_sheets, dict):
+                raw_sheets = {}
+                meta_payload["sheets"] = raw_sheets
+            raw_sheet = raw_sheets.setdefault(name, {})
+            if not isinstance(raw_sheet, dict):
+                raw_sheet = {}
+                raw_sheets[name] = raw_sheet
+            if raw_sheet.get("column_widths") != column_widths:
+                raw_sheet["column_widths"] = column_widths
+                meta_changed = True
+
+        text_orientations = _extract_ods_text_orientations(table, rotation_map)
+        if text_orientations:
+            sheet.meta["__text_orientations"] = text_orientations
+            raw_sheets = meta_payload.setdefault("sheets", {})
+            if not isinstance(raw_sheets, dict):
+                raw_sheets = {}
+                meta_payload["sheets"] = raw_sheets
+            raw_sheet = raw_sheets.setdefault(name, {})
+            if not isinstance(raw_sheet, dict):
+                raw_sheet = {}
+                raw_sheets[name] = raw_sheet
+            if raw_sheet.get("text_orientations") != text_orientations:
+                raw_sheet["text_orientations"] = text_orientations
+                meta_changed = True
+
         ir.sheets[name] = sheet
+
+    if meta_changed:
+        _store_workbook_meta(ir, meta_payload)
 
     return ir
 

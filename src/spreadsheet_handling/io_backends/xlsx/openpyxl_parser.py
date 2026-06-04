@@ -39,7 +39,7 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
         ir = WorkbookIR()
 
         embedded_meta = _read_meta_sheet(wb)
-        width_meta_changed = False
+        meta_changed = False
 
         for ws_name in wb.sheetnames:
             ws = wb[ws_name]
@@ -48,6 +48,7 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
                 continue
 
             column_widths = _extract_column_widths(ws)
+            text_orientations = _extract_text_orientations(ws)
             legend_hints = _legend_table_hints(embedded_meta, sheet_name=ws_name)
             legend_anchors = [
                 (hint["top"], hint["left"])
@@ -66,15 +67,21 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
             )
             if column_widths:
                 sheet_ir.meta["__column_widths"] = column_widths
-                width_meta_changed = (
+                meta_changed = (
                     _merge_column_width_meta(embedded_meta, ws_name, column_widths)
-                    or width_meta_changed
+                    or meta_changed
+                )
+            if text_orientations:
+                sheet_ir.meta["__text_orientations"] = text_orientations
+                meta_changed = (
+                    _merge_text_orientation_meta(embedded_meta, ws_name, text_orientations)
+                    or meta_changed
                 )
             ir.sheets[ws_name] = sheet_ir
             _apply_legend_table_hints(sheet_ir, legend_hints)
 
         _extract_named_ranges(wb, ir)
-        if width_meta_changed:
+        if meta_changed:
             _store_workbook_meta(ir, embedded_meta)
         return ir
     finally:
@@ -147,6 +154,56 @@ def _extract_column_widths(ws: Worksheet) -> dict[str, dict[str, Any]]:
                 "source": "workbook",
             }
     return widths
+
+
+def _extract_text_orientations(ws: Worksheet) -> dict[str, dict[str, Any]]:
+    """Extract non-zero text rotation from cells in the used range."""
+    orientations: dict[str, dict[str, Any]] = {}
+    if ws.max_row is None or ws.max_column is None:
+        return orientations
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
+        for cell in row:
+            alignment = cell.alignment
+            if alignment is None:
+                continue
+            rotation = alignment.text_rotation
+            if rotation is None or rotation == 0:
+                continue
+            try:
+                rotation = int(rotation)
+            except (TypeError, ValueError):
+                continue
+            if rotation <= 0:
+                continue
+            from openpyxl.utils import get_column_letter as gcl
+            col_letter = gcl(cell.column)
+            address = f"{col_letter}{cell.row}"
+            orientations[address] = {"rotation": rotation, "source": "workbook"}
+    return orientations
+
+
+def _merge_text_orientation_meta(
+    workbook_meta: dict[str, Any],
+    sheet_name: str,
+    text_orientations: dict[str, dict[str, Any]],
+) -> bool:
+    if not text_orientations:
+        return False
+
+    raw_sheets = workbook_meta.setdefault("sheets", {})
+    if not isinstance(raw_sheets, dict):
+        raw_sheets = {}
+        workbook_meta["sheets"] = raw_sheets
+
+    raw_sheet_meta = raw_sheets.setdefault(sheet_name, {})
+    if not isinstance(raw_sheet_meta, dict):
+        raw_sheet_meta = {}
+        raw_sheets[sheet_name] = raw_sheet_meta
+
+    if raw_sheet_meta.get("text_orientations") == text_orientations:
+        return False
+    raw_sheet_meta["text_orientations"] = text_orientations
+    return True
 
 
 def _merge_column_width_meta(

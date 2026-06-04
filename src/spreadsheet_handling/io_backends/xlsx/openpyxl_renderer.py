@@ -10,7 +10,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from spreadsheet_handling.rendering.plan import (
     RenderOp,
@@ -23,6 +23,7 @@ from spreadsheet_handling.rendering.plan import (
     SetAutoFilter,
     SetFreeze,
     SetColumnWidth,
+    SetTextOrientation,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -327,6 +328,11 @@ def _execute_render_op(
         prot = CellProtection(locked=op.locked)
         for r in range(op.from_row, op.to_row + 1):
             ws.cell(row=r, column=op.col).protection = prot
+        return
+
+    if isinstance(op, SetTextOrientation):
+        ws = _get_ws(wb, op.sheet)
+        ws.cell(row=op.row, column=op.col).alignment = Alignment(text_rotation=op.rotation)
         return
 
 

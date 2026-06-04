@@ -73,6 +73,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "exported_at": ("meta_canonical", "canonical_meta"),
         "sheets": ("meta_canonical", "canonical_meta"),
         "column_widths": ("meta_canonical", "canonical_meta"),
+        "text_orientations": ("meta_canonical", "canonical_meta"),
         "freeze_header": ("meta_canonical", "canonical_meta"),
         "auto_filter": ("meta_canonical", "canonical_meta"),
         "header_fill_rgb": ("meta_canonical", "canonical_meta"),

@@ -118,6 +118,21 @@ class ApplyCellLock:
     locked: bool = True
 
 
+@dataclass(frozen=True)
+class SetTextOrientation:
+    """Apply a text rotation angle to a specific cell (row/col 1-based).
+
+    ``rotation`` follows the XLSX textRotation convention:
+      0   = horizontal (default)
+      1–90  = counter-clockwise degrees
+      91–180 = clockwise degrees (stored as 90 + CW_angle)
+    """
+    sheet: str
+    row: int
+    col: int
+    rotation: int
+
+
 RenderOp = Union[
     DefineSheet,
     SetHeader,
@@ -127,6 +142,7 @@ RenderOp = Union[
     SetAutoFilter,
     SetFreeze,
     SetColumnWidth,
+    SetTextOrientation,
     AddValidation,
     WriteDataBlock,
     WriteMeta,

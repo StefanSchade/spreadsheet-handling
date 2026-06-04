@@ -17,6 +17,7 @@ from .plan import (
     SetAutoFilter,
     SetFreeze,
     SetColumnWidth,
+    SetTextOrientation,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -114,6 +115,46 @@ def _column_width_ops(sheet_name: str, sh: SheetIR) -> list[SetColumnWidth]:
     return sorted(ops, key=lambda op: op.col)
 
 
+def _cell_address_to_row_col(address: Any) -> tuple[int, int] | None:
+    """Parse a cell address like "B1" or (row, col) into a (row, col) 1-based int pair."""
+    if isinstance(address, (list, tuple)) and len(address) == 2:
+        try:
+            return int(address[0]), int(address[1])
+        except (TypeError, ValueError):
+            return None
+    text = str(address).strip().upper()
+    import re
+    m = re.fullmatch(r"([A-Z]+)(\d+)", text)
+    if not m:
+        return None
+    col = _column_key_to_index(m.group(1))
+    row = int(m.group(2))
+    if col is None or row < 1:
+        return None
+    return row, col
+
+
+def _text_orientation_ops(sheet_name: str, sh: SheetIR) -> list[SetTextOrientation]:
+    raw = sh.meta.get("__text_orientations")
+    if not isinstance(raw, dict):
+        return []
+    ops: list[SetTextOrientation] = []
+    for address, spec in raw.items():
+        rc = _cell_address_to_row_col(address)
+        if rc is None:
+            continue
+        row, col = rc
+        rotation = spec.get("rotation") if isinstance(spec, dict) else spec
+        try:
+            rotation = int(rotation)
+        except (TypeError, ValueError):
+            continue
+        if rotation < 0 or rotation > 180:
+            continue
+        ops.append(SetTextOrientation(sheet=sheet_name, row=row, col=col, rotation=rotation))
+    return sorted(ops, key=lambda op: (op.row, op.col))
+
+
 def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     """
     Convert the IR document into a backend-agnostic RenderPlan (sequence of RenderOps).
@@ -181,6 +222,9 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
             plan.add(SetFreeze(sheet=sheet_name, row=int(fz["row"]), col=int(fz["col"])))
 
         for op in _column_width_ops(sheet_name, sh):
+            plan.add(op)
+
+        for op in _text_orientation_ops(sheet_name, sh):
             plan.add(op)
 
         # Helper column highlighting

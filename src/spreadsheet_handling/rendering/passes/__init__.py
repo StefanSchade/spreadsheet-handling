@@ -10,6 +10,7 @@ from .meta_pass import MetaPass
 from .named_range_pass import NamedRangePass
 from .protection_pass import ProtectionPass
 from .style_pass import StylePass
+from .text_orientation_pass import TextOrientationPass
 from .validation_pass import ValidationPass
 from ..ir import WorkbookIR
 
@@ -23,6 +24,7 @@ def default_passes() -> list[IRPass]:
         FilterPass(),
         FreezePass(),
         ColumnWidthPass(),
+        TextOrientationPass(),
         NamedRangePass(),
     ]
 
@@ -52,6 +54,7 @@ __all__ = [
     "NamedRangePass",
     "ProtectionPass",
     "StylePass",
+    "TextOrientationPass",
     "ValidationPass",
     "apply_all",
     "default_passes",

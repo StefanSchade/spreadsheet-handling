@@ -5,8 +5,9 @@ from pathlib import Path
 import re
 from typing import Any
 
+from odf.namespaces import STYLENS
 from odf.opendocument import OpenDocumentSpreadsheet
-from odf.style import Style, TableCellProperties, TableProperties, TextProperties
+from odf.style import Style, TableCellProperties, TableColumnProperties, TableProperties, TextProperties
 from odf.table import (
     ContentValidation,
     ContentValidations,
@@ -17,6 +18,7 @@ from odf.table import (
     NamedRange,
     Table,
     TableCell,
+    TableColumn,
     TableRow,
 )
 from odf.text import P
@@ -31,12 +33,16 @@ from spreadsheet_handling.rendering.plan import (
     MergeCells,
     RenderPlan,
     SetAutoFilter,
+    SetColumnWidth,
     SetFreeze,
     SetHeader,
     SetSheetProtection,
+    SetTextOrientation,
     WriteDataBlock,
     WriteMeta,
 )
+
+_EXCEL_CHAR_TO_CM = 0.254
 from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
 from spreadsheet_handling.core.formulas import LookupFormulaSpec
 
@@ -50,6 +56,7 @@ class _BufferedCell:
     col_span: int = 1
     covered: bool = False
     validation_name: str | None = None
+    rotation: int = 0
 
 
 @dataclass
@@ -65,6 +72,7 @@ class _BufferedSheet:
     data_bounds: tuple[int, int] | None = None
     max_row: int = 0
     max_col: int = 0
+    column_widths: dict[int, float] = field(default_factory=dict)
 
     def ensure_cell(self, row: int, col: int) -> _BufferedCell:
         self.max_row = max(self.max_row, row)
@@ -100,19 +108,20 @@ def _sheet_validation_name(sheet: str, index: int) -> str:
     return f"{safe}_validation_{index}"
 
 
-def _style_key(*, bold: bool, fill_rgb: str | None) -> tuple[bool, str | None]:
-    return bold, fill_rgb.upper() if fill_rgb else None
+def _style_key(*, bold: bool, fill_rgb: str | None, rotation: int = 0) -> tuple[bool, str | None, int]:
+    return bold, fill_rgb.upper() if fill_rgb else None, rotation
 
 
 def _register_cell_style(
     doc: OpenDocumentSpreadsheet,
-    cache: dict[tuple[bool, str | None], str],
+    cache: dict[tuple[bool, str | None, int], str],
     *,
     bold: bool,
     fill_rgb: str | None,
+    rotation: int = 0,
 ) -> str | None:
-    key = _style_key(bold=bold, fill_rgb=fill_rgb)
-    if key == (False, None):
+    key = _style_key(bold=bold, fill_rgb=fill_rgb, rotation=rotation)
+    if key == (False, None, 0):
         return None
     if key in cache:
         return cache[key]
@@ -121,8 +130,41 @@ def _register_cell_style(
     style = Style(name=style_name, family="table-cell")
     if fill_rgb:
         style.addElement(TableCellProperties(backgroundcolor=fill_rgb))
+    tp_attrs: dict = {}
     if bold:
-        style.addElement(TextProperties(fontweight="bold"))
+        tp_attrs["fontweight"] = "bold"
+    if tp_attrs:
+        style.addElement(TextProperties(**tp_attrs))
+    if rotation:
+        # ODS rotation is 0-360 CCW; XLSX uses 0-90 CCW and 91-180 for CW (stored as 90+CW).
+        # XLSX 90 -> ODS 90 (CCW 90 = vertical text); XLSX 180 -> ODS 270.
+        if rotation <= 90:
+            ods_rotation = rotation
+        else:
+            ods_rotation = 360 - (rotation - 90)
+        text_props = style.getElementsByType(TextProperties)
+        if text_props:
+            text_props[0].attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
+        else:
+            t = TextProperties()
+            t.attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
+            style.addElement(t)
+    doc.automaticstyles.addElement(style)
+    cache[key] = style_name
+    return style_name
+
+
+def _register_column_width_style(
+    doc: OpenDocumentSpreadsheet,
+    cache: dict[str, str],
+    width_cm: float,
+) -> str:
+    key = f"col_{width_cm:.4f}"
+    if key in cache:
+        return cache[key]
+    style_name = f"col_style_{len(cache) + 1}"
+    style = Style(name=style_name, family="table-column")
+    style.addElement(TableColumnProperties(columnwidth=f"{width_cm:.4f}cm"))
     doc.automaticstyles.addElement(style)
     cache[key] = style_name
     return style_name
@@ -312,6 +354,14 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
         if isinstance(op, ApplyCellLock):
             continue  # ODS cell locking not implemented in this slice
 
+        if isinstance(op, SetColumnWidth):
+            sheet.column_widths[op.col] = op.width
+            continue
+
+        if isinstance(op, SetTextOrientation):
+            sheet.ensure_cell(op.row, op.col).rotation = op.rotation
+            continue
+
     return [sheets[name] for name in ordered_names]
 
 
@@ -319,7 +369,8 @@ def _build_table(
     doc: OpenDocumentSpreadsheet,
     sheet: _BufferedSheet,
     *,
-    cell_style_cache: dict[tuple[bool, str | None], str],
+    cell_style_cache: dict[tuple[bool, str | None, int], str],
+    col_style_cache: dict[str, str],
     table_style_cache: dict[str, str],
     spreadsheet_validations: ContentValidations | None,
     spreadsheet_database_ranges: DatabaseRanges | None,
@@ -379,6 +430,17 @@ def _build_table(
     max_row = max(sheet.max_row, 1)
     max_col = max(sheet.max_col, 1)
 
+    # Emit TableColumn elements so column widths are honoured by Calc/ODS.
+    if sheet.column_widths:
+        for col_index in range(1, max_col + 1):
+            excel_width = sheet.column_widths.get(col_index)
+            if excel_width is not None:
+                width_cm = round(excel_width * _EXCEL_CHAR_TO_CM, 4)
+                col_style = _register_column_width_style(doc, col_style_cache, width_cm)
+                table.addElement(TableColumn(stylename=col_style))
+            else:
+                table.addElement(TableColumn())
+
     for row_index in range(1, max_row + 1):
         row = TableRow()
         for col_index in range(1, max_col + 1):
@@ -394,6 +456,7 @@ def _build_table(
                     cell_style_cache,
                     bold=cell.bold,
                     fill_rgb=cell.fill_rgb,
+                    rotation=cell.rotation,
                 )
                 if style_name:
                     attributes["stylename"] = style_name
@@ -497,7 +560,8 @@ def _add_freeze_settings(
 def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
     """Render a backend-neutral RenderPlan to an ODS file."""
     doc = OpenDocumentSpreadsheet()
-    cell_style_cache: dict[tuple[bool, str | None], str] = {}
+    cell_style_cache: dict[tuple[bool, str | None, int], str] = {}
+    col_style_cache: dict[str, str] = {}
     table_style_cache: dict[str, str] = {}
 
     sheets = _collect_sheets(plan)
@@ -521,6 +585,7 @@ def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
                 doc,
                 sheet,
                 cell_style_cache=cell_style_cache,
+                col_style_cache=col_style_cache,
                 table_style_cache=table_style_cache,
                 spreadsheet_validations=spreadsheet_validations,
                 spreadsheet_database_ranges=spreadsheet_database_ranges,
