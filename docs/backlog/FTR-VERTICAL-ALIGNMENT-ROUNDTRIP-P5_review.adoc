@@ -1,0 +1,201 @@
+= Implementation Review: FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5
+:toc:
+:toclevels: 2
+
+Review date:: 2026-06-05
+Reviewed commit:: `810ccbdeda28e984dfb9a93a181dcc4629d36b26`
+FTR:: `docs/backlog/FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5.adoc`
+Assessment:: `docs/backlog/FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5_ftr_assessment.adoc`
+Survey:: `docs/warm_storage/styling_text_alignment/vertical_alignment_semantics_survey.adoc`
+Reviewer:: Codex
+Verdict:: Green
+
+== Verdict
+
+Green.
+
+The implementation satisfies the FTR. `FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5`
+is closable.
+
+The shipped slice is focused on the requested vertical-alignment metadata
+family and follows the established presentation-metadata pattern without
+introducing a generic styling framework, plugin registry, vocabulary
+consolidation, render-flow redesign, wrap-text handling, or `_merge_xlsx_alignment`
+refactor.
+
+== Findings
+
+No blocking, major, or minor findings.
+
+== Review Notes
+
+=== XLSX Roundtrip
+
+The XLSX parser extracts `cell.alignment.vertical` through
+`_extract_vertical_alignments`, emits only the canonical values `top`,
+`center`, and `bottom`, and drops `None`, `justify`, and `distributed`.
+This avoids synthesising the XLSX implicit default as canonical `bottom`.
+
+The XLSX parser wires `vertical_alignments` through
+`apply_cell_addressed_presentation_meta` unconditionally, so a cleared visible
+carrier removes stale embedded metadata.
+
+The XLSX renderer handles `SetVerticalAlignment` by calling
+`_merge_xlsx_alignment(cell, vertical=op.vertical)`. This preserves sibling
+alignment attributes, including text rotation and horizontal alignment, because
+the helper copies the existing `Alignment` and sets only the override.
+
+=== ODS Roundtrip
+
+The ODS read map is correct:
+
+* `top` -> canonical `top`
+* `middle` -> canonical `center`
+* `bottom` -> canonical `bottom`
+
+`automatic`, absent attributes, and other unmapped values are not present in
+the map and are dropped. The implementation therefore does not turn
+`automatic` into canonical `bottom`.
+
+The ODS write map is correct:
+
+* canonical `top` -> ODS `top`
+* canonical `center` -> ODS `middle`
+* canonical `bottom` -> ODS `bottom`
+
+`style:vertical-align` is emitted on `style:table-cell-properties`, the ODF
+cell vertical-alignment carrier. It is not emitted on
+`style:paragraph-properties` or `style:text-properties`.
+
+The ODS extractor applies the same content-extent clipping and
+`ParserLimits.enforce(...)` discipline as the sibling horizontal-alignment
+extractor. This protects the new carrier from LibreOffice sheet-wide repeated
+style fillers.
+
+=== Canonical Vocabulary
+
+The canonical vocabulary is exactly `top`, `center`, `bottom` at the render-op
+boundary and in the backend extractors. Direct `SetVerticalAlignment`
+construction rejects out-of-scope values including ODS-shaped `middle`,
+`automatic`, XLSX-only `justify` / `distributed`, empty strings, and case-drift
+values.
+
+=== ODS Style Cache
+
+`CellStyleKey` was extended to
+`(bold, fill_rgb, rotation, horizontal_alignment, vertical_alignment)`, and
+the no-style sentinel was updated to `(False, None, 0, None, None)`.
+
+The write path carries `vertical_alignment` through `_BufferedCell`,
+`_collect_sheets`, `_build_table`, and `_register_cell_style`. The focused
+cache tests prove styles differing only in vertical alignment get distinct
+style names, while all-default cells still avoid unnecessary style creation.
+
+=== Carrier Authority
+
+Both parsers invoke `apply_cell_addressed_presentation_meta` with
+`family_key="vertical_alignments"`. The stale-meta tests cover both public
+readback and parser/IR state where relevant:
+
+* XLSX clears embedded `vertical_alignments` when the visible carrier has no
+  vertical alignment.
+* ODS clears embedded `vertical_alignments` when visible cells have no
+  `style:vertical-align` carrier, and the visible `SheetIR.meta` also remains
+  free of stale `__vertical_alignments`.
+
+=== Registry And Pass Ordering
+
+The registry has a `vertical_alignments` `canonical_meta` entry with the
+expected producers, consumers, canonical vocabulary, carrier notes, ODS
+`middle` normalisation, and unsupported/default drop policy.
+
+`VerticalAlignmentPass` is inserted immediately after
+`HorizontalAlignmentPass` and before `NamedRangePass`, matching the FTR.
+
+== Positive Observations
+
+The implementation is a narrow, mechanical sibling of the existing
+horizontal-alignment slice. It adds one render op, one pass, one flow builder,
+one extractor/write arm per backend, one ODS cache-key extension, and one
+carrier-authority call site per backend.
+
+The ODS carrier-placement test checks the generated `content.xml`, which is
+the right level of assertion for the prior carrier-mismatch failure mode.
+
+The XLSX three-attribute composition test covers text orientation, horizontal
+alignment, and vertical alignment on the same cell through public readback.
+
+The ODS tests cover both directions of the `middle` / `center` remap, default
+suppression for `automatic`, unmapped-value drops, repeated-cell clipping,
+tightened `ParserLimits`, stale-meta clearing, and style-cache key separation.
+
+== Residual Risks
+
+The full `make test` and `make source-style-guards` results were not re-run
+during this review; the implementer-reported validation was reviewed from the
+commit message and focused tests were run locally.
+
+The composition coverage does not permute every possible render-op ordering.
+That is acceptable for this FTR because all three XLSX write arms use the same
+copy-and-override `_merge_xlsx_alignment` helper, and the focused integration
+test exercises the actual public write/read path.
+
+The docstring in `io_backends/presentation_meta.py` still describes the older
+three-family context. This is documentation drift only; the helper is
+family-key agnostic, the tests include `vertical_alignments`, and no runtime
+behaviour depends on that prose.
+
+== Validation Performed
+
+Code and tests reviewed:
+
+* `src/spreadsheet_handling/rendering/plan.py`
+* `src/spreadsheet_handling/rendering/flow.py`
+* `src/spreadsheet_handling/rendering/passes/vertical_alignment_pass.py`
+* `src/spreadsheet_handling/rendering/passes/__init__.py`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py`
+* `registries/meta_registry.yaml`
+* vertical-alignment XLSX and ODS tests
+* ODS repeated-cell and style-cache tests
+* carrier-authority helper tests
+* registry hardening and pass-ordering tests
+
+Focused validation run locally:
+
+[source,bash]
+----
+make test-file FILE=tests/integration/io_backends/xlsx/test_vertical_alignment_roundtrip.py
+# 10 passed
+
+make test-file FILE=tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py
+# 13 passed
+
+make test-file FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+# 24 passed
+
+make test-file FILE=tests/unit/io_backends/ods/test_odf_renderer_style_cache.py
+# 3 passed
+
+make test-file FILE=tests/unit/io_backends/test_presentation_meta.py
+# 19 passed
+
+make test-file FILE=tests/architecture/semantic_invariants/test_meta_registry_hardening.py
+# 4 passed
+
+make test-file FILE=tests/unit/rendering/passes/test_pass_ordering.py
+# 2 passed
+----
+
+Implementer-reported validation:
+
+* `make test`: 1017 passed, 1 xfailed
+* `make source-style-guards`: 0 errors, warnings only
+
+== Recommendation
+
+Close `FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5`.
+
+No required follow-up is needed for closure.
