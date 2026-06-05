@@ -1,0 +1,577 @@
+= Cell alignment semantics survey
+:toc: left
+:toclevels: 3
+:sectnums:
+
+Author:: Independent semantic survey for `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5` (draft)
+Date:: 2026-06-05
+Status:: Concept material, warm storage. Not a design decision and not a binding FTR.
+Scope:: Horizontal alignment, vertical alignment, text wrap. All other alignment-family
+attributes (indent, shrink-to-fit, distributed, justify, center-continuous, reading
+order) are out of scope by explicit decision in the draft FTR.
+
+== Purpose
+
+This survey scopes the problem space before
+`FTR-CELL-ALIGNMENT-ROUNDTRIP-P5` is sharpened. It is intentionally narrow:
+
+* it reports how XLSX and ODS represent the three target attributes today,
+* it lays out the carrier locations and capability mismatches,
+* it inventories the implementation traps inherited from
+  `FTR-TEXT-ORIENTATION-ROUNDTRIP-P5`, and
+* it proposes the smallest useful preservation slice consistent with the
+  0.2.x adoption-driven strategy.
+
+It does *not* propose a generic style framework. It does *not* commit to any
+particular registry shape, canonical vocabulary, or pass ordering — those
+belong to the implementing FTR.
+
+== Bridge: lessons from FTR-TEXT-ORIENTATION-ROUNDTRIP-P5
+
+These lessons are now codified in
+`docs/ai_info/review_instructions.adoc § Adapter read-path safety checks`
+(commit `ea686f5`). Any alignment slice must inherit them.
+
+[cols="1,3,4", options="header"]
+|===
+| Tag | Lesson | Concrete reuse for alignment
+
+| L1
+| Carrier-mismatch trap: parser and renderer can be self-consistent while
+  writing the attribute on the wrong ODF element. External consumers ignore
+  the attribute.
+| Each new alignment attribute needs a carrier-XML assertion test against
+  generated `content.xml`, not only a render/parse round-trip.
+
+| L2
+| Repeated-cell safety must hold for every adapter read path, not only the
+  grid parser. Display-metadata extractors can bypass `ParserLimits` and
+  re-introduce memory blow-ups via `number-rows-repeated` x
+  `number-columns-repeated` style fillers.
+| Each new ODS alignment extractor must clip to the parsed content extent
+  (`parsed.max_row` / `parsed.max_col`) and call `ParserLimits.enforce(...)`
+  on per-axis and per-cell bases. Horizontal alignment and wrap are
+  *especially* exposed because users routinely sheet-wide-align entire
+  columns.
+
+| L3
+| XLSX `cell.alignment = Alignment(text_rotation=...)` overwrites every
+  other alignment attribute on the cell. The text-orientation slice
+  accepted this as a minor finding because no other op touched alignment
+  at the time. Alignment changes that situation.
+| Before adding a second alignment-touching op to the XLSX renderer, a
+  small `_merge_xlsx_alignment(cell, **kwargs)` helper must read the
+  existing `Alignment`, copy it, and override only the named keys. Without
+  it, ops collide silently in op-order-dependent ways.
+
+| L4
+| The text-orientation canonical encoding is XLSX-shaped
+  (`0`, `1-90` CCW, `91-180` stored as `90 + CW`). That was accepted as a
+  deliberate choice but never named.
+| Pick the canonical alignment vocabulary explicitly *before* coding, and
+  document it as the project canonical encoding (not as "the obvious one").
+  Same trap reappears at higher dimensionality here.
+
+| L5
+| Implementation-confirming tests (render-then-parse with the same
+  parser) hide carrier bugs. The text-orientation slice passed `946` tests
+  with the wrong ODS carrier.
+| The carrier-XML assertion test from L1 is the structural answer.
+  Without it, every new attribute risks the same false-green.
+|===
+
+== XLSX survey
+
+=== Library surface
+
+The project uses `openpyxl`. All three target attributes live on one
+`openpyxl.styles.Alignment` object, attached to `cell.alignment`:
+
+[source,python]
+----
+from openpyxl.styles import Alignment
+cell.alignment = Alignment(
+    horizontal="left",       # or center / right / general / fill / justify / centerContinuous / distributed
+    vertical="top",          # or center / bottom / justify / distributed
+    wrap_text=True,          # bool
+    text_rotation=90,        # already preserved by FTR-TEXT-ORIENTATION
+    # also: shrink_to_fit, indent, relative_indent, justify_last_line, reading_order
+)
+----
+
+Reference: `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py:13` and `:333-336`.
+
+=== OOXML carrier
+
+Underlying carrier is the SpreadsheetML `<alignment>` element on a `<xf>`
+record in `cellXfs`, e.g.:
+
+[source,xml]
+----
+<xf ...><alignment horizontal="center" vertical="top" wrapText="1" textRotation="90"/></xf>
+----
+
+All three target attributes (and `text_rotation`) are siblings on a *single*
+element. openpyxl mirrors this with the single `Alignment` object — there
+is no orthogonal write path.
+
+=== Vocabulary
+
+[cols="1,4", options="header"]
+|===
+| Attribute | Permitted values (OOXML / openpyxl)
+
+| `horizontal`
+| `general`, `left`, `center`, `right`, `fill`, `justify`,
+  `centerContinuous`, `distributed`
+| `vertical`
+| `top`, `center`, `bottom`, `justify`, `distributed`
+| `wrapText` / `wrap_text`
+| boolean
+|===
+
+`general` and `None` are the defaults and should be treated as "no
+metadata" by the extractor — see Risk R5.
+
+=== Read path
+
+Today: `openpyxl_parser._extract_text_orientations` (`src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:159`)
+iterates the used range and reads `cell.alignment.text_rotation`. The
+shape of an alignment extractor is the same iteration with sibling
+attribute reads on the same `Alignment` object. There is no XLSX-side
+repeated-cell hazard for alignment (openpyxl materializes the used range
+already).
+
+=== Write path
+
+Today: a single render op `SetTextOrientation` calls
+`cell.alignment = Alignment(text_rotation=op.rotation)`. This overwrites
+any prior alignment. See Risk R3 / Lesson L3.
+
+== ODS survey
+
+=== Library surface
+
+The project uses `odfpy`. ODS splits the three target attributes across
+*two different* style-children elements:
+
+[cols="1,2,2", options="header"]
+|===
+| Attribute | odfpy class | ODF element
+
+| Horizontal alignment
+| `odf.style.ParagraphProperties`
+| `style:paragraph-properties`
+| Vertical alignment
+| `odf.style.TableCellProperties`
+| `style:table-cell-properties`
+| Wrap text
+| `odf.style.TableCellProperties`
+| `style:table-cell-properties`
+| (Text rotation, for reference)
+| `odf.style.TableCellProperties`
+| `style:table-cell-properties` (per the recent ODS carrier fix)
+|===
+
+Reference: current ODS renderer
+`src/spreadsheet_handling/io_backends/ods/odf_renderer.py` registers
+`TableCellProperties` (for background + rotation) and `TextProperties`
+(for bold). It does *not* yet emit `ParagraphProperties`. Verified:
+`grep -rn ParagraphProperties src/` returns nothing.
+
+This is the L1 trap in concrete form: any first attempt to write
+`fo:text-align` will, by current code shape, land on
+`TableCellProperties`. LibreOffice will silently ignore it; the project
+parser will happily read it back from any child element.
+
+=== ODF carrier locations
+
+Authoritative ODF attribute placement (verified against ODF 1.2 and odfpy
+qnames):
+
+[cols="1,3,3", options="header"]
+|===
+| Concern | Attribute | Defined-on element
+
+| Horizontal alignment
+| `fo:text-align`
+| `style:paragraph-properties`
+| Vertical alignment
+| `style:vertical-align`
+| `style:table-cell-properties`
+| Wrap
+| `fo:wrap-option`
+| `style:table-cell-properties`
+| (Rotation, reference)
+| `style:rotation-angle`
+| `style:table-cell-properties`
+|===
+
+The `fo:` namespace is `urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0`
+(odfpy `FONS`). The `style:` namespace is the usual `STYLENS`.
+
+=== Vocabulary
+
+[cols="1,4", options="header"]
+|===
+| Attribute | Permitted values (ODF 1.2)
+
+| `fo:text-align`
+| `start`, `end`, `left`, `right`, `center`, `justify` (both locale-neutral
+  `start`/`end` and absolute `left`/`right` are valid; producers vary)
+| `style:vertical-align`
+| `top`, `middle`, `bottom`, `automatic`
+| `fo:wrap-option`
+| `wrap`, `no-wrap`
+|===
+
+`style:vertical-align="middle"` versus XLSX `vertical="center"` is the
+classic capability-mismatch source. See Section 4.
+
+=== Read path
+
+There is no existing ODS alignment extractor. The pattern set by
+`_extract_ods_text_orientations` and `_extract_ods_column_widths`
+(post-fix) is the template:
+
+1. `_build_<attr>_style_map(doc) -> {style_name -> value}` from all `Style`
+   elements of `family="table-cell"` (vertical, wrap) or whichever family
+   carries the attribute. For horizontal alignment the producer is the
+   `style:paragraph-properties` child of a table-cell style — the lookup
+   walks the same `Style[family="table-cell"]` but reads from the
+   `ParagraphProperties` child rather than `TableCellProperties`.
+2. `_extract_ods_<attr>(table, style_map, *, max_row, max_col, limits) -> {address -> value}`
+   walks `TableRow` / `TableCell` children, *clips iteration to the parsed
+   content extent*, and calls `limits.enforce(...)` on per-axis and
+   per-cell bases.
+
+=== Write path
+
+The current ODS renderer caches `Style` elements keyed by `_style_key(...)`.
+Adding alignment attributes requires expanding the cache key and ensuring
+the right `ParagraphProperties` / `TableCellProperties` child is created.
+The `_register_cell_style` function already demonstrates the pattern:
+create the carrier element lazily, attach the attribute, add it once to
+the style. The same shape extended for alignment is straightforward — the
+risk is *not* implementation complexity; it is putting the attribute on
+the right element (L1).
+
+== Semantic mapping matrix
+
+XLSX is the project's canonical-encoding reference for presentation
+metadata (per L4). The proposed mapping mirrors that precedent.
+
+=== Horizontal alignment
+
+[cols="2,2,2,3", options="header"]
+|===
+| Canonical (proposed, XLSX-shaped) | XLSX `Alignment.horizontal` | ODS `fo:text-align` | Notes
+
+| `left`     | `left`            | `left`   (or `start` in LTR locales) | Use absolute `left` on write for lossless round-trip; accept both on read.
+| `center`   | `center`          | `center` | Direct.
+| `right`    | `right`           | `right`  (or `end` in LTR locales)   | Use absolute `right` on write; accept both on read.
+| `general`  | `general` or `None` | (no attribute) | Treated as "no metadata"; do not materialize.
+| `fill`            | `fill`            | (no exact equivalent) | Out of slice. ODS has no direct equivalent. Document as gap if encountered.
+| `justify`         | `justify`         | `justify` | Out of slice.
+| `distributed`     | `distributed`     | (no equivalent) | Out of slice.
+| `centerContinuous`| `centerContinuous`| (no equivalent) | Out of slice; XLSX-only.
+|===
+
+=== Vertical alignment
+
+[cols="2,2,2,3", options="header"]
+|===
+| Canonical (proposed) | XLSX `Alignment.vertical` | ODS `style:vertical-align` | Notes
+
+| `top`      | `top`    | `top`    | Direct.
+| `center`   | `center` | `middle` | Vocabulary differs: canonical uses XLSX `center`; map to ODS `middle` on write and back on read.
+| `bottom`   | `bottom` | `bottom` | Direct.
+| (default)  | `None`   | `automatic` or absent | Do not materialize default.
+| `justify`     | `justify`     | (no equivalent — falls back to `top`/`bottom` depending on consumer) | Out of slice.
+| `distributed` | `distributed` | (no equivalent) | Out of slice.
+|===
+
+=== Wrap
+
+[cols="2,2,2,3", options="header"]
+|===
+| Canonical | XLSX `Alignment.wrap_text` | ODS `fo:wrap-option` | Notes
+
+| `true`  | `True`  | `wrap`    | Direct.
+| `false` | `False` / `None` | `no-wrap` or absent | Do not materialize default (`false`).
+|===
+
+== Capability mismatches and design implications
+
+[cols="1,4", options="header"]
+|===
+| Mismatch | Implication
+
+| ODS `start` / `end` vs XLSX `left` / `right`
+| Write absolute values (`left` / `right`) to ODS to avoid locale drift on
+  re-import by RTL-configured Calc instances. Read both forms.
+| ODS `middle` vs XLSX `center`
+| Canonical vocabulary must explicitly map `center <-> middle`. A naive
+  symbol passthrough breaks vertical alignment round-trip.
+| XLSX `general`, `fill`, `centerContinuous`, `distributed`, `justify`
+| Out of slice. Document as known gaps in registry notes and release notes
+  when implementation lands.
+| ODS attribute split across two style-children
+  (`ParagraphProperties` for h-align; `TableCellProperties` for v-align +
+  wrap)
+| Single biggest carrier risk. See Risk R1. The cache key in
+  `_register_cell_style` must include all alignment dimensions; the style
+  may need to hold both children simultaneously.
+| Wrap on whole columns is extremely common (LibreOffice "Format > Cells >
+  Alignment > Wrap text automatically" applied to selection)
+| Highest exposure to L2 (repeated-cell safety). The wrap extractor must
+  be the most defensive of the three; it is also the most likely to
+  produce huge metadata dicts under naive expansion.
+|===
+
+== Risk assessment
+
+[cols="1,1,4,3", options="header"]
+|===
+| ID | Severity | Risk | Mitigation in the alignment slice
+
+| R1 | Blocker-class
+| ODS h-align placed on `TableCellProperties` (L1 repeat for a new attribute).
+  Self-roundtrip passes; LibreOffice ignores the attribute.
+| Carrier-XML assertion test required for every alignment attribute,
+  authored at the same time as the renderer change. Apply the same
+  `zipfile + ElementTree` pattern as
+  `test_ods_rotation_is_written_on_table_cell_properties`.
+
+| R2 | Blocker-class
+| ODS alignment extractor materializes
+  `row_repeat x col_repeat` entries for a sheet-wide wrap/h-align filler
+  (L2 repeat for new attributes; wrap is the highest-exposure case).
+| Extractor signature must accept `*, max_row, max_col, limits` and call
+  `limits.enforce(...)` on per-axis and per-cell bases, same shape as the
+  fixed `_extract_ods_text_orientations`. Pathological tests in
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` must
+  cover the new attributes individually.
+
+| R3 | Important
+| XLSX renderer's `cell.alignment = Alignment(...)` overwrites
+  `text_rotation` if the alignment op is processed after
+  `SetTextOrientation` (or vice versa). Op order becomes load-bearing
+  and silently lossy.
+| Introduce a small alignment-merger before adding the second op:
+  `_merge_xlsx_alignment(cell, **kwargs)` reads `cell.alignment`, copies
+  it, overrides only the named keys. `SetTextOrientation` migrates to it
+  in the same change as `SetCellAlignment` is added.
+
+| R4 | Important
+| Canonical vocabulary drift between attributes (e.g., ODS-shaped
+  `middle` leaks into canonical because the implementer copy-pastes the
+  ODS reader without normalization).
+| Canonical encoding is XLSX-shaped (see L4). Decide once in the FTR.
+  Document in `registries/meta_registry.yaml` under each new key.
+  Conversion is adapter-local on both read and write.
+
+| R5 | Important
+| Default values bloat metadata. `horizontal="general"` and
+  `wrap_text=False` appear on essentially every cell openpyxl returns.
+  Naive extraction yields millions of entries on real workbooks.
+| Extractors must treat `general` / `None` / default-False as "no
+  metadata" and skip without emitting an entry. Verify with a "default
+  alignment cell does not produce metadata" unit test per attribute.
+
+| R6 | Watch-only
+| Per-cell keying matches `text_orientations` but is inefficient when
+  users align an entire column. Future re-keying to `(column, value)` or
+  `(range, value)` is conceivable.
+| Stay cell-keyed for this slice (symmetry with existing pattern). Note
+  the future option in the FTR's "explicitly deferred" list. Do not
+  pre-design for it.
+
+| R7 | Watch-only
+| Vocabulary expansion later (adding `justify`, `fill`, `distributed`,
+  `centerContinuous`) risks drifting the canonical encoding under back-
+  pressure from real adopters.
+| The registry entry should enumerate accepted canonical values and
+  define unknown values as "preserved verbatim, behavior backend-
+  dependent" or "rejected". Either is fine if chosen explicitly. Pick
+  one in the FTR.
+
+| R8 | Watch-only
+| Cache-key explosion in `_register_cell_style`: every distinct
+  combination of (bold, fill, rotation, h-align, v-align, wrap) becomes
+  its own ODS automatic style.
+| Acceptable in practice — real workbooks have small style-combination
+  cardinality. Worth a sanity test that asserts the cache stays bounded
+  for a representative sheet. Not a blocker.
+|===
+
+== Testing implications
+
+The minimum test inventory for the alignment slice mirrors what
+`FTR-TEXT-ORIENTATION-ROUNDTRIP-P5` would have caught earlier if it
+existed:
+
+[cols="1,4", options="header"]
+|===
+| Layer | Tests required
+
+| Carrier-XML assertion (ODS, per attribute)
+| For each alignment attribute, generate a workbook with that attribute
+  set, unzip `content.xml`, assert the attribute appears on the ODF-
+  defined element and *not* on any other style child. Pattern:
+  `test_ods_rotation_is_written_on_table_cell_properties` in
+  `tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py`.
+
+| Repeated-structure safety (ODS, per extractor)
+| For each new ODS extractor, two tests:
+  (a) a sheet-wide LibreOffice-style filler with that attribute must
+  produce only the content-extent entries; and
+  (b) an implausibly large per-element repeat under custom
+  `ParserLimits` must raise `SpreadsheetTooLargeError`. Pattern:
+  `test_display_metadata_extractors_*` in
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`.
+
+| Default-value suppression (per attribute, per backend)
+| Cells with default alignment (e.g. `horizontal="general"`,
+  `wrap_text=False`) must produce no metadata entry. Prevents R5 bloat.
+
+| XLSX alignment composition
+| A cell with both rotation and h-align (and ideally also v-align /
+  wrap) must round-trip all attributes — protects against R3 silent
+  clobber regardless of op order.
+
+| Backend round-trip (parse-write-parse)
+| Existing pattern from `test_ods_display_metadata_roundtrip.py`;
+  extend with each new attribute. Required by FTR validation criteria
+  but *insufficient on its own* (this is the L5 trap).
+
+| Capability gap documentation
+| If `centerContinuous` / `distributed` / `fill` / `justify` are
+  encountered, decide between (a) preserve verbatim on the same backend
+  but document loss across backends, or (b) drop on extract with a
+  clear note. Either way, document the gap in the registry entry and
+  release notes; do not let it become an undocumented coincidence.
+|===
+
+XLSX-side repeated-cell safety is not a concern because openpyxl bounds
+iteration to the used range; the L2 hazard is ODS-specific.
+
+== Recommended minimal slice for the implementing FTR
+
+The draft FTR already proposes a two-phase plan
+(Phase 1 = horizontal; Phase 2 = vertical). This survey refines the
+contents of each phase based on the above analysis.
+
+=== Slice A — horizontal alignment only
+
+Smallest useful unit. Three canonical values: `left`, `center`, `right`.
+
+Scope::
+
+* Registry entry `horizontal_alignments` in `registries/meta_registry.yaml`,
+  classified `canonical_meta`, sibling to `text_orientations`.
+* Render op `SetHorizontalAlignment(sheet, row, col, horizontal: Literal["left","center","right"])`
+  in `src/spreadsheet_handling/rendering/plan.py`.
+* Rendering pass `HorizontalAlignmentPass` and a `_horizontal_alignment_ops`
+  builder in `src/spreadsheet_handling/rendering/flow.py`, structurally
+  identical to the existing text-orientation pieces.
+* XLSX read/write via openpyxl `Alignment.horizontal`, mediated through a
+  new `_merge_xlsx_alignment(cell, **kwargs)` helper that
+  `SetTextOrientation` *also* migrates to in the same commit (closes R3).
+* ODS read/write via `style:paragraph-properties / fo:text-align`,
+  emitted on a `ParagraphProperties` child of the table-cell `Style`.
+  Cache key extended with the new dimension.
+* Tests per the matrix above: carrier-XML, two pathological repeated-
+  structure tests, default-value suppression, XLSX composition with
+  rotation, parse-write-parse round-trip.
+* Release-notes entry under "Spreadsheet backends and roundtrip
+  behavior" with explicit mention of the ODF carrier element and the
+  extractor safety guarantee.
+
+Out of scope (explicit non-goals to write into the FTR)::
+
+* No vertical alignment, no wrap, no other alignment family attribute.
+* No generic alignment dataclass with optional fields — keep the op
+  attribute-shaped, identical to `SetTextOrientation`'s precedent.
+* No re-keying of `text_orientations`. Do not refactor existing
+  metadata.
+
+Acceptance criteria::
+
+* All criteria from the draft FTR.
+* Carrier-XML test exists and asserts `fo:text-align` is on
+  `style:paragraph-properties`.
+* Pathological repeated-style test exists for the h-align extractor.
+* `cell.alignment` composition test proves rotation + h-align survive
+  on the same XLSX cell regardless of op order.
+
+=== Slice B — vertical alignment
+
+Deferred to a successor FTR slice once Slice A has shipped and at least
+one adoption case has exercised it. Vocabulary mapping (`center` <->
+`middle`) makes this a genuinely separate semantic axis, not "more of
+the same" — keep it deferred per the draft.
+
+=== Slice C — wrap text
+
+Also deferred. Wrap is the highest-exposure case for L2 (sheet-wide
+fillers are routine), and its bool-shape makes the default-suppression
+rule (R5) materially different from the enumerated attributes. Worth a
+dedicated slice with focused test cases.
+
+=== Out of scope across all slices in 0.2.x
+
+* `justify`, `distributed`, `centerContinuous`, `fill`
+* indent / shrink-to-fit / reading order
+* generic style preservation
+* font, color, border, number format, row height
+* per-column or per-range alignment keying
+
+== Open questions for the implementing FTR
+
+The following are not blocking the survey but should be answered before
+implementation begins:
+
+. Canonical vocabulary: confirm XLSX-shaped (`left`, `center`, `right`)
+  per L4. Document explicitly in the registry entry as project
+  canonical, not as backend-inherited.
+. Op model: confirm one render op per attribute (current pattern) versus
+  a fused `SetCellAlignment` op with optional fields. The survey
+  recommends per-attribute for symmetry with `SetTextOrientation` and
+  to keep dispatch trivial.
+. Behavior for unknown / out-of-vocabulary inputs encountered during
+  read: drop, preserve verbatim, or raise. Pick one and document.
+. Whether `_merge_xlsx_alignment` is its own helper module or lives
+  inline next to the renderer's op dispatcher. Either is fine; the
+  survey has no preference beyond "exists, and `SetTextOrientation`
+  migrates to it in the same commit".
+
+== References
+
+Code touched by `FTR-TEXT-ORIENTATION-ROUNDTRIP-P5` (the precedent for
+this slice):
+
+* `src/spreadsheet_handling/rendering/plan.py` — `SetTextOrientation`
+* `src/spreadsheet_handling/rendering/flow.py` — `_text_orientation_ops`
+* `src/spreadsheet_handling/rendering/passes/text_orientation_pass.py`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py` —
+  `_extract_text_orientations` (`:159`)
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py` —
+  `SetTextOrientation` dispatch (`:333-336`)
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` —
+  `_register_cell_style` (post-carrier fix)
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` —
+  `_extract_ods_text_orientations`, `_extract_ods_column_widths`
+  (post-safety fix)
+* `registries/meta_registry.yaml` — `text_orientations`, `column_widths`
+* `tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py`
+  — carrier-XML assertion pattern
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` —
+  pathological repeated-style pattern
+
+Process material:
+
+* `docs/backlog/FTR-TEXT-ORIENTATION-ROUNDTRIP-P5.adoc`
+* `docs/backlog/FTR-TEXT-ORIENTATION-ROUNDTRIP-P5_review.adoc`
+* `docs/ai_info/review_instructions.adoc § Adapter read-path safety checks`
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc` (draft)
