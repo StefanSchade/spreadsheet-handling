@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -97,3 +99,46 @@ def test_xlsx_renderer_keeps_defaults_when_orientation_metadata_is_absent(tmp_pa
         assert ws["B1"].alignment.text_rotation in (None, 0)
     finally:
         wb.close()
+
+
+@pytest.mark.ftr("FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5")
+def test_xlsx_stale_embedded_text_orientation_is_dropped_when_carrier_is_clear(tmp_path):
+    # Regression for the separate-backlog stale-meta defect closed by
+    # FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5: a workbook that already
+    # carries embedded ``text_orientations`` metadata (e.g. written by a prior
+    # roundtrip) but whose visible cells no longer carry a rotation must be
+    # read back without the stale metadata. Otherwise the next write would
+    # silently reapply rotation the user has explicitly removed.
+    source = tmp_path / "stale_orientation.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws["A1"] = "Category"
+    ws["A2"] = "alpha"
+    # Intentionally leave A1.alignment at the default (no rotation carrier).
+
+    meta_ws = wb.create_sheet("_meta")
+    blob = json.dumps(
+        {
+            "sheets": {
+                "Data": {
+                    "text_orientations": {
+                        "A1": {"rotation": 90, "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    meta_ws["A1"] = "workbook_meta_blob"
+    meta_ws["B1"] = blob
+    meta_ws.sheet_state = "hidden"
+    wb.save(source)
+    wb.close()
+
+    frames = ExcelBackend().read_multi(str(source), header_levels=1)
+
+    data_sheet_meta = frames.get("_meta", {}).get("sheets", {}).get("Data", {})
+    assert "text_orientations" not in data_sheet_meta, (
+        "Stale embedded text_orientations must be cleared when the visible "
+        f"carrier has no rotation; got: {data_sheet_meta}"
+    )

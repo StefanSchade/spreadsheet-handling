@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -98,3 +100,49 @@ def test_xlsx_renderer_keeps_defaults_when_width_metadata_is_absent(tmp_path):
         assert "B" not in ws.column_dimensions
     finally:
         wb.close()
+
+
+@pytest.mark.ftr("FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5")
+def test_xlsx_stale_embedded_column_widths_dropped_when_carrier_is_clear(tmp_path):
+    # Regression for the separate-backlog stale-meta defect closed by
+    # FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5: a workbook that already
+    # carries embedded ``column_widths`` metadata (e.g. written by a prior
+    # roundtrip) but whose visible columns no longer carry an explicit width
+    # must be read back without the stale metadata. Otherwise the next write
+    # would silently reapply widths the user has explicitly removed.
+    source = tmp_path / "stale_widths.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws["A1"] = "id"
+    ws["B1"] = "title"
+    ws["A2"] = "P-1"
+    ws["B2"] = "label"
+    # Intentionally leave column_dimensions at default (no custom width).
+
+    meta_ws = wb.create_sheet("_meta")
+    blob = json.dumps(
+        {
+            "sheets": {
+                "Data": {
+                    "column_widths": {
+                        "A": {"width": 18.0, "source": "workbook"},
+                        "B": {"width": 42.5, "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    meta_ws["A1"] = "workbook_meta_blob"
+    meta_ws["B1"] = blob
+    meta_ws.sheet_state = "hidden"
+    wb.save(source)
+    wb.close()
+
+    frames = ExcelBackend().read_multi(str(source), header_levels=1)
+
+    data_sheet_meta = frames.get("_meta", {}).get("sheets", {}).get("Data", {})
+    assert "column_widths" not in data_sheet_meta, (
+        "Stale embedded column_widths must be cleared when the visible "
+        f"columns carry no explicit width; got: {data_sheet_meta}"
+    )

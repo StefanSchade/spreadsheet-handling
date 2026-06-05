@@ -24,6 +24,9 @@ from odf.table import (
 )
 from odf.text import S
 
+from spreadsheet_handling.io_backends.presentation_meta import (
+    apply_cell_addressed_presentation_meta,
+)
 from spreadsheet_handling.io_backends.ods.parser_interpretation import (
     ParsedTable,
     build_sheet_meta_hints,
@@ -408,49 +411,6 @@ def _extract_ods_text_orientations(
             col_index += col_repeat
         row_index += row_repeat
     return result if result else None
-
-
-def _apply_horizontal_alignment_meta(
-    workbook_meta: dict[str, Any],
-    sheet_name: str,
-    horizontal_alignments: dict[str, dict] | None,
-) -> bool:
-    """Project parsed carrier state for ``horizontal_alignments`` into the
-    embedded workbook-meta payload, with wholesale replace/clear semantics.
-
-    Carrier state is authoritative: a non-empty ``horizontal_alignments``
-    replaces any persisted entry for this sheet; an empty extraction removes
-    the persisted entry entirely. Without the clear branch, embedded meta
-    written by a previous roundtrip would silently reapply alignment the user
-    has just removed from the visible cells.
-
-    Returns ``True`` if the workbook-meta payload was modified.
-    """
-    raw_sheets = workbook_meta.get("sheets")
-    raw_sheet_meta = (
-        raw_sheets.get(sheet_name)
-        if isinstance(raw_sheets, dict) and isinstance(raw_sheets.get(sheet_name), dict)
-        else None
-    )
-
-    if not horizontal_alignments:
-        if raw_sheet_meta is not None and "horizontal_alignments" in raw_sheet_meta:
-            del raw_sheet_meta["horizontal_alignments"]
-            return True
-        return False
-
-    if not isinstance(raw_sheets, dict):
-        raw_sheets = {}
-        workbook_meta["sheets"] = raw_sheets
-    raw_sheet_meta = raw_sheets.setdefault(sheet_name, {})
-    if not isinstance(raw_sheet_meta, dict):
-        raw_sheet_meta = {}
-        raw_sheets[sheet_name] = raw_sheet_meta
-
-    if raw_sheet_meta.get("horizontal_alignments") == horizontal_alignments:
-        return False
-    raw_sheet_meta["horizontal_alignments"] = horizontal_alignments
-    return True
 
 
 def _store_workbook_meta(ir: WorkbookIR, workbook_meta: dict[str, Any]) -> None:
@@ -875,17 +835,6 @@ def parse_workbook(
         )
         if column_widths:
             sheet.meta["__column_widths"] = column_widths
-            raw_sheets = meta_payload.setdefault("sheets", {})
-            if not isinstance(raw_sheets, dict):
-                raw_sheets = {}
-                meta_payload["sheets"] = raw_sheets
-            raw_sheet = raw_sheets.setdefault(name, {})
-            if not isinstance(raw_sheet, dict):
-                raw_sheet = {}
-                raw_sheets[name] = raw_sheet
-            if raw_sheet.get("column_widths") != column_widths:
-                raw_sheet["column_widths"] = column_widths
-                meta_changed = True
 
         text_orientations = _extract_ods_text_orientations(
             table,
@@ -896,17 +845,6 @@ def parse_workbook(
         )
         if text_orientations:
             sheet.meta["__text_orientations"] = text_orientations
-            raw_sheets = meta_payload.setdefault("sheets", {})
-            if not isinstance(raw_sheets, dict):
-                raw_sheets = {}
-                meta_payload["sheets"] = raw_sheets
-            raw_sheet = raw_sheets.setdefault(name, {})
-            if not isinstance(raw_sheet, dict):
-                raw_sheet = {}
-                raw_sheets[name] = raw_sheet
-            if raw_sheet.get("text_orientations") != text_orientations:
-                raw_sheet["text_orientations"] = text_orientations
-                meta_changed = True
 
         horizontal_alignments = _extract_ods_horizontal_alignments(
             table,
@@ -917,11 +855,23 @@ def parse_workbook(
         )
         if horizontal_alignments:
             sheet.meta["__horizontal_alignments"] = horizontal_alignments
-        # Carrier is authoritative for the horizontal_alignments family:
-        # an empty extraction must clear any persisted entry for this sheet
-        # so the next roundtrip cannot silently reapply formatting the user
-        # has just removed.
-        if _apply_horizontal_alignment_meta(meta_payload, name, horizontal_alignments):
+
+        # Carrier is authoritative for all three presentation-metadata
+        # families: empty extraction must clear any persisted entry for
+        # that sheet so the next roundtrip cannot silently reapply
+        # formatting the user has just removed. The shared helper is
+        # invoked unconditionally per family for that reason.
+        if apply_cell_addressed_presentation_meta(
+            meta_payload, name, "column_widths", column_widths
+        ):
+            meta_changed = True
+        if apply_cell_addressed_presentation_meta(
+            meta_payload, name, "text_orientations", text_orientations
+        ):
+            meta_changed = True
+        if apply_cell_addressed_presentation_meta(
+            meta_payload, name, "horizontal_alignments", horizontal_alignments
+        ):
             meta_changed = True
 
         ir.sheets[name] = sheet

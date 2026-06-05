@@ -12,6 +12,9 @@ import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from spreadsheet_handling.io_backends.presentation_meta import (
+    apply_cell_addressed_presentation_meta,
+)
 from spreadsheet_handling.io_backends.xlsx.parser_interpretation import (
     build_sheet_meta_hints,
     build_visible_sheet_ir,
@@ -68,25 +71,30 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
             )
             if column_widths:
                 sheet_ir.meta["__column_widths"] = column_widths
-                meta_changed = (
-                    _merge_column_width_meta(embedded_meta, ws_name, column_widths)
-                    or meta_changed
-                )
             if text_orientations:
                 sheet_ir.meta["__text_orientations"] = text_orientations
-                meta_changed = (
-                    _merge_text_orientation_meta(embedded_meta, ws_name, text_orientations)
-                    or meta_changed
-                )
             if horizontal_alignments:
                 sheet_ir.meta["__horizontal_alignments"] = horizontal_alignments
-            # Carrier is authoritative for the horizontal_alignments family:
-            # an empty extraction must clear any persisted entry for this sheet
-            # so the next roundtrip cannot silently reapply formatting the user
-            # has just removed.
+            # Carrier is authoritative for all three presentation-metadata
+            # families: empty extraction must clear any persisted entry for
+            # that sheet so the next roundtrip cannot silently reapply
+            # formatting the user has just removed. The shared helper is
+            # invoked unconditionally per family for that reason.
             meta_changed = (
-                _apply_horizontal_alignment_meta(
-                    embedded_meta, ws_name, horizontal_alignments
+                apply_cell_addressed_presentation_meta(
+                    embedded_meta, ws_name, "column_widths", column_widths
+                )
+                or meta_changed
+            )
+            meta_changed = (
+                apply_cell_addressed_presentation_meta(
+                    embedded_meta, ws_name, "text_orientations", text_orientations
+                )
+                or meta_changed
+            )
+            meta_changed = (
+                apply_cell_addressed_presentation_meta(
+                    embedded_meta, ws_name, "horizontal_alignments", horizontal_alignments
                 )
                 or meta_changed
             )
@@ -195,30 +203,6 @@ def _extract_text_orientations(ws: Worksheet) -> dict[str, dict[str, Any]]:
     return orientations
 
 
-def _merge_text_orientation_meta(
-    workbook_meta: dict[str, Any],
-    sheet_name: str,
-    text_orientations: dict[str, dict[str, Any]],
-) -> bool:
-    if not text_orientations:
-        return False
-
-    raw_sheets = workbook_meta.setdefault("sheets", {})
-    if not isinstance(raw_sheets, dict):
-        raw_sheets = {}
-        workbook_meta["sheets"] = raw_sheets
-
-    raw_sheet_meta = raw_sheets.setdefault(sheet_name, {})
-    if not isinstance(raw_sheet_meta, dict):
-        raw_sheet_meta = {}
-        raw_sheets[sheet_name] = raw_sheet_meta
-
-    if raw_sheet_meta.get("text_orientations") == text_orientations:
-        return False
-    raw_sheet_meta["text_orientations"] = text_orientations
-    return True
-
-
 _CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX: frozenset[str] = frozenset(
     {"left", "center", "right"}
 )
@@ -252,73 +236,6 @@ def _extract_horizontal_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
             address = f"{col_letter}{cell.row}"
             alignments[address] = {"horizontal": canonical, "source": "workbook"}
     return alignments
-
-
-def _apply_horizontal_alignment_meta(
-    workbook_meta: dict[str, Any],
-    sheet_name: str,
-    horizontal_alignments: dict[str, dict[str, Any]] | None,
-) -> bool:
-    """Project parsed carrier state for ``horizontal_alignments`` into the
-    embedded workbook-meta payload, with wholesale replace/clear semantics.
-
-    Carrier state is authoritative: a non-empty ``horizontal_alignments``
-    replaces any persisted entry for this sheet; an empty extraction removes
-    the persisted entry entirely. Without the clear branch, embedded meta
-    written by a previous roundtrip would silently reapply alignment the user
-    has just removed from the visible cells.
-
-    Returns ``True`` if the workbook-meta payload was modified.
-    """
-    raw_sheets = workbook_meta.get("sheets")
-    raw_sheet_meta = (
-        raw_sheets.get(sheet_name)
-        if isinstance(raw_sheets, dict) and isinstance(raw_sheets.get(sheet_name), dict)
-        else None
-    )
-
-    if not horizontal_alignments:
-        if raw_sheet_meta is not None and "horizontal_alignments" in raw_sheet_meta:
-            del raw_sheet_meta["horizontal_alignments"]
-            return True
-        return False
-
-    if not isinstance(raw_sheets, dict):
-        raw_sheets = {}
-        workbook_meta["sheets"] = raw_sheets
-    raw_sheet_meta = raw_sheets.setdefault(sheet_name, {})
-    if not isinstance(raw_sheet_meta, dict):
-        raw_sheet_meta = {}
-        raw_sheets[sheet_name] = raw_sheet_meta
-
-    if raw_sheet_meta.get("horizontal_alignments") == horizontal_alignments:
-        return False
-    raw_sheet_meta["horizontal_alignments"] = horizontal_alignments
-    return True
-
-
-def _merge_column_width_meta(
-    workbook_meta: dict[str, Any],
-    sheet_name: str,
-    column_widths: dict[str, dict[str, Any]],
-) -> bool:
-    if not column_widths:
-        return False
-
-    raw_sheets = workbook_meta.setdefault("sheets", {})
-    if not isinstance(raw_sheets, dict):
-        raw_sheets = {}
-        workbook_meta["sheets"] = raw_sheets
-
-    raw_sheet_meta = raw_sheets.setdefault(sheet_name, {})
-    if not isinstance(raw_sheet_meta, dict):
-        raw_sheet_meta = {}
-        raw_sheets[sheet_name] = raw_sheet_meta
-
-    if raw_sheet_meta.get("column_widths") == column_widths:
-        return False
-    raw_sheet_meta["column_widths"] = column_widths
-    return True
 
 
 def _store_workbook_meta(ir: WorkbookIR, workbook_meta: dict[str, Any]) -> None:

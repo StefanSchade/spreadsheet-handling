@@ -491,6 +491,126 @@ def test_horizontal_alignment_stale_embedded_meta_is_dropped_when_carrier_clear(
     assert "__horizontal_alignments" not in ir.sheets["Sheet1"].meta
 
 
+@pytest.mark.ftr("FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5")
+def test_text_orientation_stale_embedded_meta_is_dropped_when_carrier_clear(
+    tmp_path: Path,
+) -> None:
+    # Regression for the separate-backlog stale-meta defect closed by
+    # FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5 (ODS side): an ODS file with
+    # embedded ``text_orientations`` metadata but visible cells lacking the
+    # rotation carrier must be read back without the stale entry.
+    import json
+
+    stale_blob = json.dumps(
+        {
+            "sheets": {
+                "Sheet1": {
+                    "text_orientations": {
+                        "A1": {"rotation": 90, "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    spreadsheet_inner = (
+        # Visible sheet with no rotation carrier on any cell.
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>Category</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>alpha</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+        '<table:table table:name="_meta">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>workbook_meta_blob</text:p></table:table-cell>"
+        f"<table:table-cell><text:p>{stale_blob}</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "txt_orientation_stale.ods", "", spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    meta_sheet = ir.hidden_sheets["_meta"]
+    blob = meta_sheet.meta.get("workbook_meta_blob", "")
+    parsed_blob = json.loads(blob) if blob else {}
+    data_sheet_meta = (
+        parsed_blob.get("sheets", {}).get("Sheet1", {}) if isinstance(parsed_blob, dict) else {}
+    )
+    assert "text_orientations" not in data_sheet_meta, (
+        "Stale embedded text_orientations must be cleared when the visible "
+        f"carrier has no rotation; got: {data_sheet_meta}"
+    )
+    assert "__text_orientations" not in ir.sheets["Sheet1"].meta
+
+
+@pytest.mark.ftr("FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5")
+def test_column_widths_stale_embedded_meta_is_dropped_when_carrier_clear(
+    tmp_path: Path,
+) -> None:
+    # Regression for the separate-backlog stale-meta defect closed by
+    # FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5 (ODS side): an ODS file with
+    # embedded ``column_widths`` metadata but no styled ``table-column``
+    # elements must be read back without the stale entry. ODS column-width
+    # carrier state is conveyed via styled table-column elements; an
+    # unstyled visible sheet has no width carrier and the embedded entry
+    # must therefore be cleared.
+    import json
+
+    stale_blob = json.dumps(
+        {
+            "sheets": {
+                "Sheet1": {
+                    "column_widths": {
+                        "A": {"width": 18.0, "source": "workbook"},
+                        "B": {"width": 35.0, "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    spreadsheet_inner = (
+        # Visible sheet with no table-column elements (no width carrier).
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>id</text:p></table:table-cell>"
+        "<table:table-cell><text:p>title</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>P-1</text:p></table:table-cell>"
+        "<table:table-cell><text:p>label</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+        '<table:table table:name="_meta">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>workbook_meta_blob</text:p></table:table-cell>"
+        f"<table:table-cell><text:p>{stale_blob}</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_widths_stale.ods", "", spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    meta_sheet = ir.hidden_sheets["_meta"]
+    blob = meta_sheet.meta.get("workbook_meta_blob", "")
+    parsed_blob = json.loads(blob) if blob else {}
+    data_sheet_meta = (
+        parsed_blob.get("sheets", {}).get("Sheet1", {}) if isinstance(parsed_blob, dict) else {}
+    )
+    assert "column_widths" not in data_sheet_meta, (
+        "Stale embedded column_widths must be cleared when the visible "
+        f"sheet has no width-carrying table-column elements; got: {data_sheet_meta}"
+    )
+    assert "__column_widths" not in ir.sheets["Sheet1"].meta
+
+
 def test_horizontal_alignment_extractor_drops_unsupported_values(
     tmp_path: Path,
 ) -> None:
