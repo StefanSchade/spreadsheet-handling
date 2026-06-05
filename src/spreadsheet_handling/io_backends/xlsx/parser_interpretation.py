@@ -87,9 +87,14 @@ def build_visible_sheet_ir(
     if autofilter_ref:
         sh.meta["__autofilter_ref"] = autofilter_ref
 
-    column_widths = meta_hints.get("column_widths")
-    if column_widths:
-        sh.meta["__column_widths"] = column_widths
+    # ``column_widths`` is intentionally NOT seeded from embedded meta here:
+    # FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5 made the parsed carrier
+    # authoritative for that family. ``openpyxl_parser.parse_workbook`` is
+    # the only writer of ``sh.meta["__column_widths"]`` and only sets it
+    # when the visible carrier extraction is non-empty, so a workbook with
+    # stale embedded ``_meta.sheets.<sheet>.column_widths`` and cleared
+    # visible column widths reads back with no in-memory entry. The
+    # carrier-authority helper then clears the embedded blob to match.
 
     return sh
 
