@@ -1,0 +1,532 @@
+= Review: FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5 implementation
+:toc:
+:toclevels: 2
+
+== Follow-up Re-review: B1 fix
+
+Review date:: 2026-06-05
+Fix commit reviewed:: `c7effc3 fix(FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5): close B1 stale SheetIR.meta column_widths`
+Branch:: `main`
+Reviewer:: Codex
+Verdict:: Green
+
+=== Scope
+
+This was a focused re-review of the B1 fix only.
+
+Previous Yellow finding:
+
+* B1: XLSX `column_widths` stale metadata could survive in
+  `SheetIR.meta["__column_widths"]` after the visible carrier was cleared,
+  even though the shared carrier-authority helper cleared the embedded
+  workbook-meta blob. A direct `parse_workbook()` -> `build_render_plan()`
+  path could still emit stale `SetColumnWidth` operations.
+
+This re-review did not re-review the entire FTR except where needed to confirm
+that the B1 fix preserved the carrier-authority semantics introduced by
+`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`.
+
+=== B1 Disposition
+
+Resolved.
+
+Commit `c7effc3` fully eliminates the stale XLSX
+`SheetIR.meta["__column_widths"]` path identified in the previous review.
+
+The fix removes the embedded-meta seeding of XLSX `column_widths` from
+`build_visible_sheet_ir`. That function now deliberately leaves
+`__column_widths` unset; `openpyxl_parser.parse_workbook` remains the only XLSX
+parser path that writes `sheet_ir.meta["__column_widths"]`, and it does so only
+when visible carrier extraction returns non-empty column widths.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py`, lines
+  90-99.
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  53-73.
+
+The shared helper continues to clear the embedded workbook-meta family entry
+when the visible carrier extraction is empty, so the in-memory IR cache and
+hidden `_meta.workbook_meta_blob` now agree.
+
+Manual reproduction of the previous failure now returns:
+
+[source,text]
+----
+ir.sheets["Data"].meta == {}
+ir.hidden_sheets["_meta"].meta["workbook_meta_blob"] == '{"sheets":{"Data":{}}}'
+column_width_ops == []
+----
+
+=== Regression Coverage
+
+Adequate.
+
+The new regression test exercises the exact parser/render-plan boundary that
+was missing in the original implementation review:
+
+* it builds an XLSX workbook with stale hidden
+  `_meta.sheets.Data.column_widths`;
+* it leaves the visible column dimensions at defaults, so there is no visible
+  custom-width carrier;
+* it calls `parse_workbook()` directly;
+* it asserts `__column_widths` is absent from `ir.sheets["Data"].meta`; and
+* it builds a render plan from that IR and asserts that no `SetColumnWidth`
+  operations are emitted.
+
+Evidence:
+
+* `tests/integration/io_backends/xlsx/test_column_width_roundtrip.py`, lines
+  105-163.
+
+This directly proves both required properties from the previous review's
+minimal follow-up:
+
+* no stale `__column_widths` in `SheetIR`; and
+* no emitted `SetColumnWidth`.
+
+=== Carrier-Authority Semantics
+
+Preserved.
+
+The fix strengthens the FTR's carrier-authority model for XLSX
+`column_widths`: embedded `column_widths` no longer seed the visible sheet IR
+when the visible carrier is absent. Non-empty visible carrier extraction still
+sets `sheet_ir.meta["__column_widths"]` and still goes through the shared
+helper for embedded workbook-meta replacement.
+
+The focused XLSX column-width test file still covers:
+
+* parsing visible custom widths into metadata;
+* rendering column-width metadata into visible workbook carriers;
+* parse-write-parse preservation when the carrier is present;
+* default rendering when metadata is absent;
+* stale embedded metadata removal from `SheetIR` and render plan; and
+* stale embedded metadata removal from public readback.
+
+=== Scope Control
+
+Appropriately scoped.
+
+The fix commit changed only:
+
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py`; and
+* `tests/integration/io_backends/xlsx/test_column_width_roundtrip.py`.
+
+No helper policy, ODS parser, renderer, render-flow builder, registry, plugin,
+vertical-alignment, wrap-text, or generic styling abstraction was changed.
+
+=== Findings
+
+Blocking:: None.
+
+Before release:: None.
+
+Watch-only:: The removed embedded-meta seeding path in
+`build_visible_sheet_ir` was specific to `column_widths`. That is correct for
+this FTR because `column_widths` is now carrier-authoritative on parse. Future
+work should not reintroduce embedded presentation-family seeding before the
+visible carrier has had authority.
+
+=== Residual Risks
+
+Low.
+
+The remaining naming caveat from the original review still exists: the shared
+helper name contains `cell_addressed` while `column_widths` are
+dimension-addressed. This remains acceptable because the helper is
+payload-shape agnostic and does not validate address form.
+
+No new regression risk was found in the focused B1 diff.
+
+=== FTR Closure Recommendation
+
+`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5` can now be closed.
+
+The prior B1 finding is resolved, the new regression proves the parser IR and
+render-plan consequences, and the implementation remains within the FTR's
+scope.
+
+=== Validation
+
+[source,bash]
+----
+git status --short
+git show --stat --oneline --decorate --find-renames c7effc3
+git diff --find-renames c7effc3^ c7effc3 -- \
+  src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py \
+  tests/integration/io_backends/xlsx/test_column_width_roundtrip.py
+rg -n "column_widths = meta_hints|__column_widths|build_visible_sheet_ir\(" \
+  src/spreadsheet_handling/io_backends/xlsx \
+  tests/integration/io_backends/xlsx/test_column_width_roundtrip.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_column_width_roundtrip.py
+make test-file FILE=tests/unit/io_backends/test_presentation_meta.py
+.venv/bin/python -c "<manual XLSX stale column_widths parser/render-plan reproduction>"
+.venv/bin/python tools/check_source_style.py
+git diff --check c7effc3^ c7effc3
+----
+
+Observed results:
+
+* `git status --short`: the review artifact was untracked before this
+  re-review append.
+* Commit `c7effc3` changed two files: XLSX parser interpretation and the XLSX
+  column-width integration tests.
+* Focused XLSX column-width tests: `6 passed`.
+* Helper unit tests: `18 passed`.
+* Manual stale XLSX column-width reproduction: `SheetIR.meta` was `{}`, the
+  hidden workbook-meta blob had `Data` with no `column_widths`, and the render
+  plan emitted no `SetColumnWidth` operations.
+* Source-style checker: `0 error(s), 66 warning(s), 3 allowlisted finding(s)`.
+* `git diff --check c7effc3^ c7effc3`: clean.
+
+== Original Implementation Review
+
+Review date:: 2026-06-05
+Commit reviewed:: `d01cb6398dec480d2d5fe91caa30c40a60958dbc feat(FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5): shared carrier-authority helper for cell-addressed presentation metadata`
+Branch:: `main`
+Reviewer:: Codex
+Verdict:: Yellow
+
+== Scope
+
+Reviewed the committed implementation of
+`docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc`.
+
+The review checked the implementation against:
+
+* the concept analysis in
+  `docs/warm_storage/styling_text_alignment/cell_addressed_presentation_meta_semantics.adoc`;
+* the Green FTR assessment in
+  `docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5_ftr_assessment.adoc`;
+* the reported implementation summary for the shared helper, XLSX parser,
+  ODS parser, stale-meta regressions, helper tests, and release notes; and
+* the repository review instructions in
+  `docs/ai_info/review_instructions.adoc`.
+
+Primary review questions:
+
+* whether the helper implements replace-or-clear semantics correctly;
+* whether unrelated metadata is preserved;
+* whether no-op clear avoids creating empty `_meta.sheets` structures;
+* whether all six parser call sites are migrated and unconditional;
+* whether the retired helper implementations are gone;
+* whether XLSX and ODS behaviour match the FTR;
+* whether the stale-meta tests exercise realistic carrier paths;
+* whether horizontal-alignment behaviour, including the prior B1 fix, remains
+  covered;
+* whether release notes accurately describe the behaviour change, especially
+  for `column_widths`; and
+* whether the implementation touched any FTR non-goals.
+
+No production code, tests, registry files, FTR text, or release notes were
+changed during this review. This file is the review artifact.
+
+== Verdict
+
+Yellow.
+
+The shared helper and most parser migration work satisfy the FTR. However, the
+XLSX `column_widths` path still has a stale in-memory `SheetIR.meta` case after
+the visible carrier is cleared. That means the FTR should not be closed until
+the XLSX parser clears both the embedded workbook-meta projection and the
+parser IR cache for stale column-width metadata.
+
+== Findings
+
+=== B1: XLSX `column_widths` stale metadata can survive in `SheetIR.meta`
+
+Severity:: High
+Category:: Defect / carrier-authority semantics
+Disposition:: Must fix before closing this FTR.
+
+Observation::
+
+The XLSX parser can still return stale `__column_widths` in the visible
+`SheetIR.meta` even after the new shared helper clears
+`_meta.sheets.<sheet>.column_widths` from the embedded workbook-meta blob.
+
+Evidence::
+
+`parse_workbook` builds `meta_hints` from embedded workbook metadata before
+the carrier-authority helper runs:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  63-69.
+
+`build_visible_sheet_ir` then copies embedded `column_widths` hints into the
+visible sheet IR:
+
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py`, lines
+  90-92.
+
+The new helper is invoked later and clears the embedded workbook-meta payload,
+but it does not remove the stale in-memory `sheet_ir.meta["__column_widths"]`:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  72-99.
+
+Manual reproduction with an XLSX workbook containing:
+
+* a visible `Data` sheet with default column dimensions; and
+* hidden `_meta.workbook_meta_blob` carrying stale
+  `sheets.Data.column_widths`
+
+produced this parser state:
+
+[source,text]
+----
+ir.sheets["Data"].meta == {
+    "__column_widths": {"A": {"width": 18.0, "source": "workbook"}}
+}
+
+ir.hidden_sheets["_meta"].meta["workbook_meta_blob"] == '{"sheets":{"Data":{}}}'
+----
+
+The render-flow consequence is concrete: `build_render_plan(ir)` emitted:
+
+[source,text]
+----
+SetColumnWidth(sheet='Data', col=1, width=18.0)
+----
+
+Risk::
+
+A direct XLSX parse-to-render path can still reapply a custom column width
+that the user cleared from the visible workbook carrier. This violates the
+FTR's authoritative-carrier goal for `column_widths` and leaves one stale-meta
+bug shape open.
+
+Recommended action::
+
+Fix the XLSX parse path so an empty extracted `column_widths` removes stale
+`sheet_ir.meta["__column_widths"]`, or stop seeding XLSX `SheetIR.meta` from
+embedded `column_widths` hints before visible carrier extraction decides
+authority.
+
+Add a regression that builds the stale XLSX column-width fixture, calls
+`parse_workbook()`, asserts `__column_widths` is absent from
+`ir.sheets["Data"].meta`, and preferably asserts that `build_render_plan(ir)`
+emits no `SetColumnWidth`.
+
+== Positive Observations
+
+The shared helper matches the intended replace-or-clear truth table.
+
+`apply_cell_addressed_presentation_meta`:
+
+* returns `False` when a truthy value equals the existing family entry;
+* replaces the family entry and returns `True` when a truthy value differs;
+* deletes only the requested family key and returns `True` when the value is
+  empty and the family exists; and
+* returns `False` when the value is empty and the family is absent.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/presentation_meta.py`, lines 57-81.
+* `tests/unit/io_backends/test_presentation_meta.py`, lines 31-105.
+
+The helper preserves unrelated metadata.
+
+Helper tests cover preservation of:
+
+* other families on the same sheet;
+* other sheets; and
+* top-level workbook metadata.
+
+Evidence:
+
+* `tests/unit/io_backends/test_presentation_meta.py`, lines 151-270.
+
+The helper avoids creating empty `_meta.sheets` structures on no-op clear
+paths.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/presentation_meta.py`, lines 64-68.
+* `tests/unit/io_backends/test_presentation_meta.py`, lines 110-145.
+
+All six parser call sites are migrated and unconditional.
+
+XLSX calls the shared helper for:
+
+* `column_widths`;
+* `text_orientations`; and
+* `horizontal_alignments`.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  83-99.
+
+ODS calls the shared helper for the same three families.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 864-875.
+
+The retired helpers are gone.
+
+Search found no remaining definitions of:
+
+* `_apply_horizontal_alignment_meta`;
+* `_merge_text_orientation_meta`; or
+* `_merge_column_width_meta`.
+
+The ODS behaviour matches the FTR for the reviewed stale-meta paths.
+
+The new ODS stale-meta tests use minimal ODS packages with hidden `_meta`
+payloads and visible sheets lacking the corresponding carrier. They verify
+both the re-serialized hidden meta blob and the visible sheet IR cache.
+
+Evidence:
+
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`, lines
+  495-611.
+
+The XLSX text-orientation stale-meta path matches the FTR.
+
+The test builds a real XLSX workbook with hidden `_meta` and no visible
+rotation carrier, then verifies the public readback no longer reports stale
+`text_orientations`.
+
+Evidence:
+
+* `tests/integration/io_backends/xlsx/test_text_orientation_roundtrip.py`,
+  lines 104-144.
+
+The XLSX column-width test exercises a realistic public readback carrier path,
+but does not cover the parser IR cache issue described in B1.
+
+Evidence:
+
+* `tests/integration/io_backends/xlsx/test_column_width_roundtrip.py`, lines
+  105-148.
+
+Existing horizontal-alignment tests still cover the prior B1 fix.
+
+Evidence:
+
+* `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`,
+  lines 169-207.
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`, lines
+  430-491.
+
+The release note is accurate.
+
+It names `column_widths`, `text_orientations`, and
+`horizontal_alignments`, describes authoritative carrier semantics, and calls
+out the intentional behaviour change for `column_widths`.
+
+Evidence:
+
+* `docs/release_notes/release_notes.adoc`, lines 183-195.
+
+The `cell_addressed` helper name remains acceptable.
+
+The implementation keeps the helper payload-agnostic. It stores whatever the
+extractor passes and explicitly does not validate address shape, so using the
+same helper for dimension-addressed `column_widths` does not create a semantic
+bug.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/presentation_meta.py`, lines 51-55.
+* `tests/unit/io_backends/test_presentation_meta.py`, lines 286-305.
+
+== Scope Control
+
+The commit stayed within the intended implementation boundary.
+
+The production diff is limited to:
+
+* `src/spreadsheet_handling/io_backends/presentation_meta.py`;
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`; and
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`.
+
+No changes were made to:
+
+* vertical alignment;
+* wrap text;
+* generic styling abstractions;
+* plugin registry;
+* vocabulary consolidation;
+* `_merge_xlsx_alignment`;
+* render-flow builders or renderers; or
+* registry files.
+
+== Residual Risks
+
+The remaining release-relevant risk is B1: XLSX `column_widths` can be cleared
+from the embedded workbook meta while still surviving in `SheetIR.meta`.
+
+After B1 is fixed, the residual risk is low. The helper name still has a
+minor readability mismatch because `column_widths` are dimension-addressed,
+but the implementation and tests keep the function family-payload agnostic.
+
+== FTR Closure Recommendation
+
+Do not close `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5` yet.
+
+Minimal required follow-up:
+
+. Fix the XLSX parser so stale embedded `column_widths` cannot remain in
+  visible `SheetIR.meta` after an empty visible carrier extraction.
+. Add parser/render-plan level regression coverage for that XLSX stale
+  `column_widths` case.
+. Re-run the focused XLSX column-width tests and the FTR-targeted parser /
+  helper tests.
+
+Once that follow-up is complete, this FTR should be ready for Green
+re-review.
+
+== Validation
+
+[source,bash]
+----
+git status --short
+git show --stat --oneline --decorate --find-renames d01cb6398dec480d2d5fe91caa30c40a60958dbc
+sed -n '1,260p' docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc
+sed -n '260,620p' docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc
+sed -n '1,260p' docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5_ftr_assessment.adoc
+sed -n '1,260p' docs/warm_storage/styling_text_alignment/cell_addressed_presentation_meta_semantics.adoc
+git diff d01cb6398dec480d2d5fe91caa30c40a60958dbc^ d01cb6398dec480d2d5fe91caa30c40a60958dbc -- \
+  src/spreadsheet_handling/io_backends/presentation_meta.py \
+  src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py \
+  src/spreadsheet_handling/io_backends/ods/odf_parser.py
+rg -n "apply_cell_addressed_presentation_meta|_apply_horizontal_alignment_meta|_merge_text_orientation_meta|_merge_column_width_meta" src/spreadsheet_handling/io_backends
+make test-file FILE=tests/unit/io_backends/test_presentation_meta.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_text_orientation_roundtrip.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_column_width_roundtrip.py
+make test-file FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py
+make test-file FILE=tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py
+.venv/bin/python -c "<manual XLSX stale column_widths parser/render-plan reproduction>"
+make source-style-guards
+----
+
+Observed results:
+
+* `git status --short`: clean before creating this review artifact.
+* Reviewed commit was `HEAD` on `main` in
+  `/home/stefan/repos/spreadsheet-handling/core`.
+* Commit stat matched the reported scope: release notes, two backend parsers,
+  one new shared helper, and focused tests.
+* Helper unit tests: `18 passed`.
+* XLSX text-orientation roundtrip tests: `5 passed`.
+* XLSX column-width roundtrip tests: `5 passed`.
+* ODS repeated-cell parser tests: `16 passed`.
+* XLSX horizontal-alignment roundtrip tests: `9 passed`.
+* ODS display-metadata roundtrip tests: `9 passed`.
+* Manual XLSX stale column-width reproduction confirmed B1:
+  `parse_workbook()` left stale `__column_widths` in `SheetIR.meta`, and
+  `build_render_plan(ir)` emitted `SetColumnWidth(sheet='Data', col=1,
+  width=18.0)`.
+* `make source-style-guards`: `0 error(s), 67 warning(s), 3 allowlisted
+  finding(s)`.
+
+The first `make source-style-guards` run emitted restricted-network retry
+warnings while the make wrapper attempted to refresh packaging tools. The
+command still completed and ran the style checker successfully; an escalated
+rerun also completed with the same guard result.
