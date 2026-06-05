@@ -19,6 +19,7 @@ from .plan import (
     SetColumnWidth,
     SetHorizontalAlignment,
     SetTextOrientation,
+    SetVerticalAlignment,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -29,6 +30,7 @@ from .plan import (
 
 
 _CANONICAL_HORIZONTAL_ALIGNMENTS: frozenset[str] = frozenset({"left", "center", "right"})
+_CANONICAL_VERTICAL_ALIGNMENTS: frozenset[str] = frozenset({"top", "center", "bottom"})
 
 def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
     for p in passes:
@@ -183,6 +185,30 @@ def _horizontal_alignment_ops(sheet_name: str, sh: SheetIR) -> list[SetHorizonta
     return sorted(ops, key=lambda op: (op.row, op.col))
 
 
+def _vertical_alignment_ops(sheet_name: str, sh: SheetIR) -> list[SetVerticalAlignment]:
+    raw = sh.meta.get("__vertical_alignments")
+    if not isinstance(raw, dict):
+        return []
+    ops: list[SetVerticalAlignment] = []
+    for address, spec in raw.items():
+        rc = _cell_address_to_row_col(address)
+        if rc is None:
+            continue
+        row, col = rc
+        value = spec.get("vertical") if isinstance(spec, dict) else spec
+        if not isinstance(value, str):
+            continue
+        canonical = value.strip().lower()
+        if canonical not in _CANONICAL_VERTICAL_ALIGNMENTS:
+            continue
+        ops.append(
+            SetVerticalAlignment(
+                sheet=sheet_name, row=row, col=col, vertical=canonical
+            )
+        )
+    return sorted(ops, key=lambda op: (op.row, op.col))
+
+
 def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     """
     Convert the IR document into a backend-agnostic RenderPlan (sequence of RenderOps).
@@ -256,6 +282,9 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
             plan.add(op)
 
         for op in _horizontal_alignment_ops(sheet_name, sh):
+            plan.add(op)
+
+        for op in _vertical_alignment_ops(sheet_name, sh):
             plan.add(op)
 
         # Helper column highlighting

@@ -18,6 +18,7 @@ from spreadsheet_handling.rendering.plan import (
     SetColumnWidth,
     SetHorizontalAlignment,
     SetTextOrientation,
+    SetVerticalAlignment,
     WriteDataBlock,
 )
 
@@ -256,4 +257,125 @@ def test_ods_horizontal_alignments_survive_backend_roundtrip(tmp_path):
     back = OdsBackend().read_multi(str(out), header_levels=1)
     aligns = back["_meta"]["sheets"]["Data"]["horizontal_alignments"]
     assert aligns["A1"]["horizontal"] == "center"
+    assert back["Data"].to_dict(orient="records") == [{"Category": "alpha"}]
+
+
+# ---------------------------------------------------------------------------
+# Vertical alignment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_ods_vertical_alignments_survive_render_parse_roundtrip(tmp_path):
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="T"))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=2, text="C"))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=3, text="B"))
+    plan.add(SetVerticalAlignment(sheet="Sheet1", row=1, col=1, vertical="top"))
+    plan.add(SetVerticalAlignment(sheet="Sheet1", row=1, col=2, vertical="center"))
+    plan.add(SetVerticalAlignment(sheet="Sheet1", row=1, col=3, vertical="bottom"))
+    plan.add(WriteDataBlock(sheet="Sheet1", r1=2, c1=1, data=(("x", "y", "z"),)))
+
+    out = tmp_path / "vertical.ods"
+    render_workbook(plan, out)
+
+    ir = parse_workbook(out)
+    aligns = ir.sheets["Sheet1"].meta["__vertical_alignments"]
+    assert aligns["A1"]["vertical"] == "top"
+    assert aligns["B1"]["vertical"] == "center"
+    assert aligns["C1"]["vertical"] == "bottom"
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_ods_vertical_alignment_uses_style_vertical_align_on_table_cell_properties(tmp_path):
+    # Carrier-level assertion: per ODF, style:vertical-align is defined on
+    # style:table-cell-properties. Placing it on style:paragraph-properties
+    # or style:text-properties is not in the ODF schema and is silently
+    # ignored by LibreOffice / Calc, which would make the alignment
+    # invisible to external consumers even when our own parser
+    # round-trips it.
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="Aligned"))
+    plan.add(SetVerticalAlignment(sheet="Sheet1", row=1, col=1, vertical="center"))
+
+    out = tmp_path / "vertical_carrier.ods"
+    render_workbook(plan, out)
+
+    with ZipFile(out) as archive:
+        content_xml = archive.read("content.xml").decode("utf-8")
+    root = ET.fromstring(content_xml)
+
+    align_on_cell = root.findall(
+        f".//{{{_STYLENS}}}table-cell-properties[@{{{_STYLENS}}}vertical-align]"
+    )
+    align_on_para = root.findall(
+        f".//{{{_STYLENS}}}paragraph-properties[@{{{_STYLENS}}}vertical-align]"
+    )
+    align_on_text = root.findall(
+        f".//{{{_STYLENS}}}text-properties[@{{{_STYLENS}}}vertical-align]"
+    )
+
+    assert align_on_cell, (
+        "style:vertical-align must be on style:table-cell-properties; "
+        f"content.xml contained: {content_xml}"
+    )
+    assert not align_on_para, (
+        "style:vertical-align on style:paragraph-properties is not in the ODF schema."
+    )
+    assert not align_on_text, (
+        "style:vertical-align on style:text-properties is not in the ODF schema."
+    )
+    # Canonical ``center`` must be emitted as ODF ``middle`` (the intrinsic
+    # ODF ↔ OOXML vocabulary remap).
+    assert align_on_cell[0].attrib[f"{{{_STYLENS}}}vertical-align"] == "middle"
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_ods_vertical_alignment_writes_middle_for_canonical_center(tmp_path):
+    # Pin the write direction of the vocabulary remap: canonical ``center``
+    # serialises as ODF ``style:vertical-align="middle"``. Reads back as
+    # canonical ``center`` so the full roundtrip stays stable.
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="C"))
+    plan.add(SetVerticalAlignment(sheet="Sheet1", row=1, col=1, vertical="center"))
+
+    out = tmp_path / "vertical_center.ods"
+    render_workbook(plan, out)
+
+    with ZipFile(out) as archive:
+        content_xml = archive.read("content.xml").decode("utf-8")
+    root = ET.fromstring(content_xml)
+    cell_props = root.findall(
+        f".//{{{_STYLENS}}}table-cell-properties[@{{{_STYLENS}}}vertical-align]"
+    )
+    assert cell_props and cell_props[0].attrib[f"{{{_STYLENS}}}vertical-align"] == "middle"
+
+    ir = parse_workbook(out)
+    aligns = ir.sheets["Sheet1"].meta["__vertical_alignments"]
+    assert aligns["A1"]["vertical"] == "center"
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_ods_vertical_alignments_survive_backend_roundtrip(tmp_path):
+    frames = {
+        "Data": pd.DataFrame({"Category": ["alpha"]}),
+        "_meta": {
+            "sheets": {
+                "Data": {
+                    "vertical_alignments": {
+                        "A1": {"vertical": "center", "source": "workbook"},
+                    }
+                }
+            }
+        },
+    }
+    out = tmp_path / "vertical_backend.ods"
+    OdsBackend().write_multi(frames, str(out))
+
+    back = OdsBackend().read_multi(str(out), header_levels=1)
+    aligns = back["_meta"]["sheets"]["Data"]["vertical_alignments"]
+    assert aligns["A1"]["vertical"] == "center"
     assert back["Data"].to_dict(orient="records") == [{"Category": "alpha"}]

@@ -46,9 +46,17 @@ from spreadsheet_handling.rendering.plan import (
     SetHorizontalAlignment,
     SetSheetProtection,
     SetTextOrientation,
+    SetVerticalAlignment,
     WriteDataBlock,
     WriteMeta,
 )
+
+
+_ODS_VERTICAL_ALIGNMENT_WRITE_MAP: dict[str, str] = {
+    "top": "top",
+    "center": "middle",  # canonical ``center`` ↔ ODF ``middle``.
+    "bottom": "bottom",
+}
 
 _EXCEL_CHAR_TO_CM = 0.254
 from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
@@ -66,6 +74,7 @@ class _BufferedCell:
     validation_name: str | None = None
     rotation: int = 0
     horizontal_alignment: str | None = None
+    vertical_alignment: str | None = None
 
 
 @dataclass
@@ -117,7 +126,7 @@ def _sheet_validation_name(sheet: str, index: int) -> str:
     return f"{safe}_validation_{index}"
 
 
-CellStyleKey = tuple[bool, str | None, int, str | None]
+CellStyleKey = tuple[bool, str | None, int, str | None, str | None]
 
 
 def _style_key(
@@ -126,12 +135,14 @@ def _style_key(
     fill_rgb: str | None,
     rotation: int = 0,
     horizontal_alignment: str | None = None,
+    vertical_alignment: str | None = None,
 ) -> CellStyleKey:
     return (
         bold,
         fill_rgb.upper() if fill_rgb else None,
         rotation,
         horizontal_alignment,
+        vertical_alignment,
     )
 
 
@@ -143,14 +154,16 @@ def _register_cell_style(
     fill_rgb: str | None,
     rotation: int = 0,
     horizontal_alignment: str | None = None,
+    vertical_alignment: str | None = None,
 ) -> str | None:
     key = _style_key(
         bold=bold,
         fill_rgb=fill_rgb,
         rotation=rotation,
         horizontal_alignment=horizontal_alignment,
+        vertical_alignment=vertical_alignment,
     )
-    if key == (False, None, 0, None):
+    if key == (False, None, 0, None, None):
         return None
     if key in cache:
         return cache[key]
@@ -160,7 +173,7 @@ def _register_cell_style(
     cell_props_kwargs: dict[str, Any] = {}
     if fill_rgb:
         cell_props_kwargs["backgroundcolor"] = fill_rgb
-    if cell_props_kwargs or rotation:
+    if cell_props_kwargs or rotation or vertical_alignment:
         cell_props = TableCellProperties(**cell_props_kwargs)
         if rotation:
             # style:rotation-angle is defined on style:table-cell-properties; on
@@ -174,6 +187,15 @@ def _register_cell_style(
             else:
                 ods_rotation = 360 - (rotation - 90)
             cell_props.attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
+        if vertical_alignment:
+            # style:vertical-align is defined on style:table-cell-properties.
+            # The canonical XLSX-shaped vocabulary (``top``/``center``/``bottom``)
+            # maps to ODF as ``top``/``middle``/``bottom``; the ``middle`` /
+            # ``center`` remap is intrinsic to ODF vs OOXML and is mandatory
+            # in both directions.
+            cell_props.attributes[(STYLENS, "vertical-align")] = (
+                _ODS_VERTICAL_ALIGNMENT_WRITE_MAP[vertical_alignment]
+            )
         style.addElement(cell_props)
     if horizontal_alignment:
         # fo:text-align is defined on style:paragraph-properties (cells render
@@ -404,6 +426,10 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
             sheet.ensure_cell(op.row, op.col).horizontal_alignment = op.horizontal
             continue
 
+        if isinstance(op, SetVerticalAlignment):
+            sheet.ensure_cell(op.row, op.col).vertical_alignment = op.vertical
+            continue
+
     return [sheets[name] for name in ordered_names]
 
 
@@ -500,6 +526,7 @@ def _build_table(
                     fill_rgb=cell.fill_rgb,
                     rotation=cell.rotation,
                     horizontal_alignment=cell.horizontal_alignment,
+                    vertical_alignment=cell.vertical_alignment,
                 )
                 if style_name:
                     attributes["stylename"] = style_name

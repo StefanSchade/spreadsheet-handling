@@ -11,7 +11,13 @@ from typing import Any
 from odf.element import Element
 from odf.namespaces import FONS, OFFICENS, STYLENS, TABLENS, TEXTNS
 from odf.opendocument import load
-from odf.style import ParagraphProperties, Style, TableColumnProperties, TableProperties
+from odf.style import (
+    ParagraphProperties,
+    Style,
+    TableCellProperties,
+    TableColumnProperties,
+    TableProperties,
+)
 from odf.table import (
     ContentValidation as OdfContentValidation,
     CoveredTableCell,
@@ -309,6 +315,119 @@ def _extract_ods_horizontal_alignments(
                                 )
                                 result[addr] = {
                                     "horizontal": canonical,
+                                    "source": "workbook",
+                                }
+            col_index += col_repeat
+        row_index += row_repeat
+    return result if result else None
+
+
+_ODS_VERTICAL_ALIGNMENT_MAP: dict[str, str] = {
+    "top": "top",
+    "middle": "center",  # the one intrinsic ODF ↔ OOXML vocabulary remap.
+    "bottom": "bottom",
+    # `automatic` and any other unmapped value are dropped on read — they are
+    # "no value" sentinels by ODF design, and mapping them to a concrete
+    # canonical value would synthesise metadata that never existed.
+}
+
+
+def _build_cell_vertical_alignment_map(doc) -> dict[str, str]:
+    """Return mapping {style_name -> canonical vertical alignment}.
+
+    Reads ``style:vertical-align`` from any ``style:table-cell-properties``
+    child of a table-cell style. Out-of-vocabulary values (``automatic``,
+    etc.) are dropped silently so they do not bloat canonical metadata.
+    """
+    result: dict[str, str] = {}
+    cell_props_name = TableCellProperties().qname
+    for style in doc.getElementsByType(Style):
+        if style.attributes.get((STYLENS, "family")) != "table-cell":
+            continue
+        name = style.attributes.get((STYLENS, "name"))
+        if not name:
+            continue
+        for child in style.childNodes:
+            if not isinstance(child, Element) or child.qname != cell_props_name:
+                continue
+            raw = child.attributes.get((STYLENS, "vertical-align"))
+            if raw is None:
+                continue
+            canonical = _ODS_VERTICAL_ALIGNMENT_MAP.get(str(raw).strip().lower())
+            if canonical:
+                result[str(name)] = canonical
+                break
+    return result
+
+
+def _extract_ods_vertical_alignments(
+    table: Element,
+    alignment_map: dict[str, str],
+    *,
+    max_row: int,
+    max_col: int,
+    limits: ParserLimits = DEFAULT_LIMITS,
+) -> dict[str, dict] | None:
+    """Return {cell_address: {vertical, source}} for cells with a canonical
+    vertical alignment style.
+
+    Iteration is clipped to ``max_row`` x ``max_col`` (the parsed content
+    extent) so that LibreOffice "select all + vertical-center" filler
+    patterns do not expand ``row_repeat`` x ``col_repeat`` into one metadata
+    entry per implied address. ``limits`` is honoured on per-axis and per-cell
+    bases as defense-in-depth against inputs that still declare implausible
+    repeats within the content extent.
+    """
+    if max_row <= 0 or max_col <= 0:
+        return None
+    result: dict[str, dict] = {}
+    table_row_name = TableRow().qname
+    table_cell_name = TableCell().qname
+    covered_cell_name = CoveredTableCell().qname
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}' vertical alignments"
+
+    row_index = 1
+    for child in table.childNodes:
+        if not isinstance(child, Element) or child.qname != table_row_name:
+            continue
+        if row_index > max_row:
+            break
+        row_repeat = int(child.attributes.get((TABLENS, "number-rows-repeated"), 1))
+        limits.enforce(context=context, rows=row_index + row_repeat - 1)
+        effective_row_repeat = min(row_repeat, max_row - row_index + 1)
+        col_index = 1
+        for cell in child.childNodes:
+            if not isinstance(cell, Element) or cell.qname not in (table_cell_name, covered_cell_name):
+                continue
+            if col_index > max_col:
+                break
+            col_repeat = int(cell.attributes.get((TABLENS, "number-columns-repeated"), 1))
+            limits.enforce(context=context, cols=col_index + col_repeat - 1)
+            effective_col_repeat = min(col_repeat, max_col - col_index + 1)
+            if (
+                cell.qname != covered_cell_name
+                and effective_row_repeat > 0
+                and effective_col_repeat > 0
+            ):
+                style_name = cell.attributes.get((TABLENS, "style-name")) or \
+                             cell.attributes.get((STYLENS, "style-name"))
+                if style_name:
+                    canonical = alignment_map.get(str(style_name))
+                    if canonical:
+                        limits.enforce(
+                            context=context,
+                            cells=len(result)
+                            + effective_row_repeat * effective_col_repeat,
+                        )
+                        for r_off in range(effective_row_repeat):
+                            for c_off in range(effective_col_repeat):
+                                addr = (
+                                    f"{_column_letters(col_index + c_off)}"
+                                    f"{row_index + r_off}"
+                                )
+                                result[addr] = {
+                                    "vertical": canonical,
                                     "source": "workbook",
                                 }
             col_index += col_repeat
@@ -801,6 +920,7 @@ def parse_workbook(
     col_style_map = _build_column_style_map(doc)
     rotation_map = _build_cell_rotation_map(doc)
     horizontal_alignment_map = _build_cell_horizontal_alignment_map(doc)
+    vertical_alignment_map = _build_cell_vertical_alignment_map(doc)
     meta_changed = False
 
     for table in tables:
@@ -856,7 +976,17 @@ def parse_workbook(
         if horizontal_alignments:
             sheet.meta["__horizontal_alignments"] = horizontal_alignments
 
-        # Carrier is authoritative for all three presentation-metadata
+        vertical_alignments = _extract_ods_vertical_alignments(
+            table,
+            vertical_alignment_map,
+            max_row=parsed.max_row,
+            max_col=parsed.max_col,
+            limits=limits,
+        )
+        if vertical_alignments:
+            sheet.meta["__vertical_alignments"] = vertical_alignments
+
+        # Carrier is authoritative for all four presentation-metadata
         # families: empty extraction must clear any persisted entry for
         # that sheet so the next roundtrip cannot silently reapply
         # formatting the user has just removed. The shared helper is
@@ -871,6 +1001,10 @@ def parse_workbook(
             meta_changed = True
         if apply_cell_addressed_presentation_meta(
             meta_payload, name, "horizontal_alignments", horizontal_alignments
+        ):
+            meta_changed = True
+        if apply_cell_addressed_presentation_meta(
+            meta_payload, name, "vertical_alignments", vertical_alignments
         ):
             meta_changed = True
 

@@ -53,6 +53,7 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
             column_widths = _extract_column_widths(ws)
             text_orientations = _extract_text_orientations(ws)
             horizontal_alignments = _extract_horizontal_alignments(ws)
+            vertical_alignments = _extract_vertical_alignments(ws)
             legend_hints = _legend_table_hints(embedded_meta, sheet_name=ws_name)
             legend_anchors = [
                 (hint["top"], hint["left"])
@@ -75,7 +76,9 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
                 sheet_ir.meta["__text_orientations"] = text_orientations
             if horizontal_alignments:
                 sheet_ir.meta["__horizontal_alignments"] = horizontal_alignments
-            # Carrier is authoritative for all three presentation-metadata
+            if vertical_alignments:
+                sheet_ir.meta["__vertical_alignments"] = vertical_alignments
+            # Carrier is authoritative for all four presentation-metadata
             # families: empty extraction must clear any persisted entry for
             # that sheet so the next roundtrip cannot silently reapply
             # formatting the user has just removed. The shared helper is
@@ -95,6 +98,12 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
             meta_changed = (
                 apply_cell_addressed_presentation_meta(
                     embedded_meta, ws_name, "horizontal_alignments", horizontal_alignments
+                )
+                or meta_changed
+            )
+            meta_changed = (
+                apply_cell_addressed_presentation_meta(
+                    embedded_meta, ws_name, "vertical_alignments", vertical_alignments
                 )
                 or meta_changed
             )
@@ -208,6 +217,11 @@ _CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX: frozenset[str] = frozenset(
 )
 
 
+_CANONICAL_VERTICAL_ALIGNMENTS_XLSX: frozenset[str] = frozenset(
+    {"top", "center", "bottom"}
+)
+
+
 def _extract_horizontal_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
     """Extract horizontal alignment from cells in the used range.
 
@@ -235,6 +249,36 @@ def _extract_horizontal_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
             col_letter = gcl(cell.column)
             address = f"{col_letter}{cell.row}"
             alignments[address] = {"horizontal": canonical, "source": "workbook"}
+    return alignments
+
+
+def _extract_vertical_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
+    """Extract vertical alignment from cells in the used range.
+
+    Only canonical values (``top`` / ``center`` / ``bottom``) are emitted.
+    The XLSX default (``None``) and the openpyxl-only values
+    (``justify`` / ``distributed``) are dropped so they do not bloat the
+    canonical metadata.
+    """
+    alignments: dict[str, dict[str, Any]] = {}
+    if ws.max_row is None or ws.max_column is None:
+        return alignments
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
+        for cell in row:
+            alignment = cell.alignment
+            if alignment is None:
+                continue
+            vertical = alignment.vertical
+            if not isinstance(vertical, str):
+                continue
+            canonical = vertical.strip().lower()
+            if canonical not in _CANONICAL_VERTICAL_ALIGNMENTS_XLSX:
+                continue
+            from openpyxl.utils import get_column_letter as gcl
+
+            col_letter = gcl(cell.column)
+            address = f"{col_letter}{cell.row}"
+            alignments[address] = {"vertical": canonical, "source": "workbook"}
     return alignments
 
 

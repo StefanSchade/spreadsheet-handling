@@ -17,6 +17,7 @@ EXPECTED_PASS_ORDER = [
     "ColumnWidthPass",
     "TextOrientationPass",
     "HorizontalAlignmentPass",
+    "VerticalAlignmentPass",
     "NamedRangePass",
 ]
 

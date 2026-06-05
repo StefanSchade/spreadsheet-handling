@@ -26,6 +26,7 @@ from spreadsheet_handling.rendering.plan import (
     SetColumnWidth,
     SetHorizontalAlignment,
     SetTextOrientation,
+    SetVerticalAlignment,
     AddValidation,
     WriteDataBlock,
     WriteMeta,
@@ -364,6 +365,13 @@ def _execute_render_op(
         ws = _get_ws(wb, op.sheet)
         _merge_xlsx_alignment(
             ws.cell(row=op.row, column=op.col), horizontal=op.horizontal
+        )
+        return
+
+    if isinstance(op, SetVerticalAlignment):
+        ws = _get_ws(wb, op.sheet)
+        _merge_xlsx_alignment(
+            ws.cell(row=op.row, column=op.col), vertical=op.vertical
         )
         return
 

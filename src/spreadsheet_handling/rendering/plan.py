@@ -138,6 +138,11 @@ _CANONICAL_HORIZONTAL_ALIGNMENTS: frozenset[str] = frozenset(
 )
 
 
+_CANONICAL_VERTICAL_ALIGNMENTS: frozenset[str] = frozenset(
+    {"top", "center", "bottom"}
+)
+
+
 @dataclass(frozen=True)
 class SetHorizontalAlignment:
     """Apply a horizontal text alignment to a specific cell (row/col 1-based).
@@ -168,6 +173,37 @@ class SetHorizontalAlignment:
             )
 
 
+@dataclass(frozen=True)
+class SetVerticalAlignment:
+    """Apply a vertical text alignment to a specific cell (row/col 1-based).
+
+    ``vertical`` is the project canonical encoding (XLSX-shaped) and is
+    restricted to ``"top"``, ``"center"``, or ``"bottom"`` in this slice.
+    Backend adapters convert to their carrier vocabulary on write; ODS
+    emits ``style:vertical-align="middle"`` for canonical ``"center"``.
+
+    The vocabulary is enforced at construction so that direct ``RenderPlan``
+    construction cannot bypass the canonical filter applied by the
+    ``rendering.flow`` builder. Out-of-slice values
+    (``justify`` / ``distributed`` from XLSX, ``automatic`` from ODS,
+    ``middle`` as the unnormalized ODS form) raise ``ValueError`` here
+    rather than reaching a backend renderer that would either drop them
+    silently or emit a value the receiving carrier cannot interpret.
+    """
+    sheet: str
+    row: int
+    col: int
+    vertical: str
+
+    def __post_init__(self) -> None:
+        if self.vertical not in _CANONICAL_VERTICAL_ALIGNMENTS:
+            raise ValueError(
+                "SetVerticalAlignment.vertical must be one of "
+                f"{sorted(_CANONICAL_VERTICAL_ALIGNMENTS)!r}; "
+                f"got {self.vertical!r}"
+            )
+
+
 RenderOp = Union[
     DefineSheet,
     SetHeader,
@@ -179,6 +215,7 @@ RenderOp = Union[
     SetColumnWidth,
     SetTextOrientation,
     SetHorizontalAlignment,
+    SetVerticalAlignment,
     AddValidation,
     WriteDataBlock,
     WriteMeta,

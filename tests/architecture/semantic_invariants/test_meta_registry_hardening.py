@@ -75,6 +75,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "column_widths": ("meta_canonical", "canonical_meta"),
         "text_orientations": ("meta_canonical", "canonical_meta"),
         "horizontal_alignments": ("meta_canonical", "canonical_meta"),
+        "vertical_alignments": ("meta_canonical", "canonical_meta"),
         "freeze_header": ("meta_canonical", "canonical_meta"),
         "auto_filter": ("meta_canonical", "canonical_meta"),
         "header_fill_rgb": ("meta_canonical", "canonical_meta"),

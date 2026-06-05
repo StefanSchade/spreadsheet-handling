@@ -638,6 +638,192 @@ def test_horizontal_alignment_extractor_drops_unsupported_values(
     assert sheet.meta.get("__horizontal_alignments") is None
 
 
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_vertical_alignment_extractor_clips_sheet_wide_filler(
+    tmp_path: Path,
+) -> None:
+    # Sheet-wide "select all + vertical-center" filler must not expand
+    # row_repeat × col_repeat into one canonical metadata entry per
+    # implied address.
+    styles_inner = (
+        '<style:style style:name="val" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="middle"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="val"><text:p>only</text:p></table:table-cell>'
+        "</table:table-row>"
+        '<table:table-row table:number-rows-repeated="1048575">'
+        '<table:table-cell table:style-name="val" table:number-columns-repeated="16384"/>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "val_filler.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    aligns = sheet.meta.get("__vertical_alignments")
+    # Only the real content cell may appear; the canonical encoding maps
+    # ODF ``middle`` to ``center``.
+    assert aligns == {"A1": {"vertical": "center", "source": "workbook"}}
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_vertical_alignment_extractor_rejects_implausible_repeats(
+    tmp_path: Path,
+) -> None:
+    # Defense-in-depth on the new extractor path: a row with real content
+    # declaring an implausible number-rows-repeated must raise before the
+    # extractor materialises one metadata entry per implied address.
+    styles_inner = (
+        '<style:style style:name="val" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="top"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-row table:number-rows-repeated="500">'
+        '<table:table-cell table:style-name="val"><text:p>data</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "val_oversized.ods", styles_inner, spreadsheet_inner
+    )
+
+    limits = ParserLimits(max_rows=100, max_cols=100, max_cells=100_000)
+    with pytest.raises(SpreadsheetTooLargeError, match="row count 500"):
+        parse_workbook(out, limits=limits)
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_vertical_alignment_extractor_normalizes_middle_to_center(
+    tmp_path: Path,
+) -> None:
+    # ODF ``style:vertical-align="middle"`` is the canonical ``center``;
+    # the read normalisation must apply that remap regardless of order.
+    styles_inner = (
+        '<style:style style:name="val_top" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="top"/>'
+        "</style:style>"
+        '<style:style style:name="val_mid" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="middle"/>'
+        "</style:style>"
+        '<style:style style:name="val_bot" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="bottom"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="val_top"><text:p>t</text:p></table:table-cell>'
+        '<table:table-cell table:style-name="val_mid"><text:p>m</text:p></table:table-cell>'
+        '<table:table-cell table:style-name="val_bot"><text:p>b</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "val_normalize.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__vertical_alignments"]
+    assert aligns["A1"]["vertical"] == "top"
+    assert aligns["B1"]["vertical"] == "center"
+    assert aligns["C1"]["vertical"] == "bottom"
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+@pytest.mark.parametrize("unmapped", ["automatic", "justify", "baseline", ""])
+def test_vertical_alignment_extractor_drops_unmapped_values(
+    tmp_path: Path, unmapped: str
+) -> None:
+    # ``automatic`` is a "no value" sentinel by ODF design; ``justify`` /
+    # ``baseline`` are not canonical for cell vertical alignment; an empty
+    # attribute value is meaningless. All must produce no canonical entry.
+    styles_inner = (
+        '<style:style style:name="val_unmapped" style:family="table-cell">'
+        f'<style:table-cell-properties style:vertical-align="{unmapped}"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="val_unmapped"><text:p>x</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "val_unmapped.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    assert sheet.meta.get("__vertical_alignments") is None
+
+
+@pytest.mark.ftr("FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5")
+def test_vertical_alignment_stale_embedded_meta_is_dropped_when_carrier_clear(
+    tmp_path: Path,
+) -> None:
+    # Stale-meta regression for vertical_alignments (ODS side): a file with
+    # embedded ``vertical_alignments`` metadata but no styled vertical
+    # carrier on visible cells must read back without the stale entry.
+    import json
+
+    stale_blob = json.dumps(
+        {
+            "sheets": {
+                "Sheet1": {
+                    "vertical_alignments": {
+                        "A1": {"vertical": "top", "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>Category</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>alpha</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+        '<table:table table:name="_meta">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>workbook_meta_blob</text:p></table:table-cell>"
+        f"<table:table-cell><text:p>{stale_blob}</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "val_stale.ods", "", spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    meta_sheet = ir.hidden_sheets["_meta"]
+    blob = meta_sheet.meta.get("workbook_meta_blob", "")
+    parsed_blob = json.loads(blob) if blob else {}
+    data_sheet_meta = (
+        parsed_blob.get("sheets", {}).get("Sheet1", {}) if isinstance(parsed_blob, dict) else {}
+    )
+    assert "vertical_alignments" not in data_sheet_meta, (
+        "Stale embedded vertical_alignments must be cleared when the visible "
+        f"carrier has no alignment; got: {data_sheet_meta}"
+    )
+    assert "__vertical_alignments" not in ir.sheets["Sheet1"].meta
+
+
 def test_column_width_extractor_clips_sheet_wide_filler(tmp_path: Path) -> None:
     # Mirror of the text-orientation guard for the column-width extractor:
     # a sheet-wide table-column with an explicit width style must not produce

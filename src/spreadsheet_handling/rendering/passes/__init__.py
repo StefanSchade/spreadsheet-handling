@@ -13,6 +13,7 @@ from .protection_pass import ProtectionPass
 from .style_pass import StylePass
 from .text_orientation_pass import TextOrientationPass
 from .validation_pass import ValidationPass
+from .vertical_alignment_pass import VerticalAlignmentPass
 from ..ir import WorkbookIR
 
 
@@ -27,6 +28,7 @@ def default_passes() -> list[IRPass]:
         ColumnWidthPass(),
         TextOrientationPass(),
         HorizontalAlignmentPass(),
+        VerticalAlignmentPass(),
         NamedRangePass(),
     ]
 
@@ -59,6 +61,7 @@ __all__ = [
     "StylePass",
     "TextOrientationPass",
     "ValidationPass",
+    "VerticalAlignmentPass",
     "apply_all",
     "default_passes",
 ]

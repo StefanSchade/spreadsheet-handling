@@ -281,6 +281,7 @@ def test_clear_preserves_top_level_workbook_keys():
     "family_key,value",
     [
         ("horizontal_alignments", {"A1": {"horizontal": "left"}}),
+        ("vertical_alignments", {"A1": {"vertical": "top"}}),
         ("text_orientations", {"A1": {"rotation": 90}}),
         ("column_widths", {"A": {"width": 20.0}}),
         # Dimension-keyed values are accepted unchanged — the helper does not
