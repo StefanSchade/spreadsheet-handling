@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -146,6 +148,63 @@ def test_xlsx_unsupported_horizontal_values_are_dropped_on_read(tmp_path):
     frames = ExcelBackend().read_multi(str(source), header_levels=1)
     sheets_meta = frames.get("_meta", {}).get("sheets", {})
     assert "horizontal_alignments" not in sheets_meta.get("Data", {})
+
+
+def test_set_horizontal_alignment_op_rejects_out_of_vocabulary_value():
+    # Regression for M3: direct RenderPlan construction must not bypass the
+    # canonical-vocabulary filter applied by rendering.flow. Passing an
+    # out-of-slice value to the render op raises at construction time, so
+    # invalid intent never reaches an XLSX or ODS renderer.
+    from spreadsheet_handling.rendering.plan import SetHorizontalAlignment
+
+    for invalid in ("justify", "fill", "distributed", "centerContinuous", "general", ""):
+        with pytest.raises(ValueError, match="must be one of"):
+            SetHorizontalAlignment(sheet="Data", row=1, col=1, horizontal=invalid)
+
+    # Canonical values still construct without error.
+    for valid in ("left", "center", "right"):
+        SetHorizontalAlignment(sheet="Data", row=1, col=1, horizontal=valid)
+
+
+def test_xlsx_stale_embedded_alignment_is_dropped_when_carrier_is_clear(tmp_path):
+    # Regression for B1: a workbook that already carries embedded
+    # ``horizontal_alignments`` metadata (e.g. written by a prior roundtrip)
+    # but whose visible cells no longer carry the alignment attribute must be
+    # read back without the stale metadata. Otherwise the next write would
+    # silently reapply formatting the user has explicitly removed.
+    source = tmp_path / "stale_alignment.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws["A1"] = "Category"
+    ws["A2"] = "alpha"
+    # Intentionally leave A1.alignment at the default (no horizontal carrier).
+
+    meta_ws = wb.create_sheet("_meta")
+    blob = json.dumps(
+        {
+            "sheets": {
+                "Data": {
+                    "horizontal_alignments": {
+                        "A1": {"horizontal": "left", "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    meta_ws["A1"] = "workbook_meta_blob"
+    meta_ws["B1"] = blob
+    meta_ws.sheet_state = "hidden"
+    wb.save(source)
+    wb.close()
+
+    frames = ExcelBackend().read_multi(str(source), header_levels=1)
+
+    data_sheet_meta = frames.get("_meta", {}).get("sheets", {}).get("Data", {})
+    assert "horizontal_alignments" not in data_sheet_meta, (
+        "Stale embedded horizontal_alignments must be cleared when the "
+        f"visible carrier has no alignment; got: {data_sheet_meta}"
+    )
 
 
 def test_xlsx_rotation_and_horizontal_alignment_coexist_on_same_cell(tmp_path):

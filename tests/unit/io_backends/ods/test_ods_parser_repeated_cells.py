@@ -427,6 +427,70 @@ def test_horizontal_alignment_extractor_normalizes_start_end(
     assert aligns["B1"]["horizontal"] == "right"
 
 
+def test_horizontal_alignment_stale_embedded_meta_is_dropped_when_carrier_clear(
+    tmp_path: Path,
+) -> None:
+    # Regression for B1 (ODS side): a file that carries embedded
+    # ``horizontal_alignments`` metadata (e.g. written by a prior roundtrip)
+    # but whose visible cells no longer carry the carrier style must be read
+    # back without the stale metadata. Otherwise the next write would
+    # silently reapply formatting the user has explicitly removed.
+    import json
+
+    stale_blob = json.dumps(
+        {
+            "sheets": {
+                "Sheet1": {
+                    "horizontal_alignments": {
+                        "A1": {"horizontal": "left", "source": "workbook"},
+                    }
+                }
+            }
+        }
+    )
+    spreadsheet_inner = (
+        # Visible sheet with no horizontal-alignment carrier on any cell.
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>Category</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>alpha</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+        # Hidden _meta table carrying the stale workbook_meta_blob.
+        '<table:table table:name="_meta">'
+        "<table:table-row>"
+        "<table:table-cell><text:p>workbook_meta_blob</text:p></table:table-cell>"
+        f"<table:table-cell><text:p>{stale_blob}</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "hal_stale.ods", "", spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    # Verify baseline: the file's embedded meta is being parsed back at all.
+    assert "_meta" in ir.hidden_sheets
+
+    # The stale entry must no longer be present in the re-serialised meta blob.
+    meta_sheet = ir.hidden_sheets["_meta"]
+    blob = meta_sheet.meta.get("workbook_meta_blob", "")
+    parsed_blob = json.loads(blob) if blob else {}
+    data_sheet_meta = (
+        parsed_blob.get("sheets", {}).get("Sheet1", {}) if isinstance(parsed_blob, dict) else {}
+    )
+    assert "horizontal_alignments" not in data_sheet_meta, (
+        "Stale embedded horizontal_alignments must be cleared when the "
+        f"visible carrier has no alignment; got: {data_sheet_meta}"
+    )
+
+    # And the visible sheet's IR must not carry the stale entry either.
+    assert "__horizontal_alignments" not in ir.sheets["Sheet1"].meta
+
+
 def test_horizontal_alignment_extractor_drops_unsupported_values(
     tmp_path: Path,
 ) -> None:

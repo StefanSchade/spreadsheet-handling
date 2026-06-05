@@ -133,6 +133,11 @@ class SetTextOrientation:
     rotation: int
 
 
+_CANONICAL_HORIZONTAL_ALIGNMENTS: frozenset[str] = frozenset(
+    {"left", "center", "right"}
+)
+
+
 @dataclass(frozen=True)
 class SetHorizontalAlignment:
     """Apply a horizontal text alignment to a specific cell (row/col 1-based).
@@ -140,11 +145,27 @@ class SetHorizontalAlignment:
     ``horizontal`` is the project canonical encoding (XLSX-shaped) and is
     restricted to ``"left"``, ``"center"``, or ``"right"`` in this slice.
     Backend adapters convert to their carrier vocabulary on write.
+
+    The vocabulary is enforced at construction so that direct ``RenderPlan``
+    construction cannot bypass the canonical filter applied by the
+    ``rendering.flow`` builder. Out-of-slice values
+    (``general`` / ``fill`` / ``justify`` / ``distributed`` /
+    ``centerContinuous``) raise ``ValueError`` here rather than reaching a
+    backend renderer that would either drop them silently or emit a value
+    the receiving carrier cannot interpret.
     """
     sheet: str
     row: int
     col: int
     horizontal: str
+
+    def __post_init__(self) -> None:
+        if self.horizontal not in _CANONICAL_HORIZONTAL_ALIGNMENTS:
+            raise ValueError(
+                "SetHorizontalAlignment.horizontal must be one of "
+                f"{sorted(_CANONICAL_HORIZONTAL_ALIGNMENTS)!r}; "
+                f"got {self.horizontal!r}"
+            )
 
 
 RenderOp = Union[
