@@ -1,0 +1,480 @@
+= Review: FTR-CELL-ALIGNMENT-ROUNDTRIP-P5 implementation
+:toc:
+:toclevels: 2
+
+== Follow-up Re-review: B1/M2/M3 fixes
+
+Review date:: 2026-06-05
+Follow-up commit reviewed:: `0416989 fix(FTR-CELL-ALIGNMENT-ROUNDTRIP-P5): close B1/M2/M3 review findings`
+Branch:: `main`
+Reviewer:: Codex
+Verdict:: Green
+
+=== Scope
+
+This was a focused re-review of the follow-up commit for the prior Yellow
+review findings only:
+
+* B1: cleared visible horizontal alignment could leave stale embedded
+  `_meta.sheets[<sheet>].horizontal_alignments` behind;
+* M2: the `horizontal_alignments` registry consumer list omitted public
+  workbook projection; and
+* M3: direct `SetHorizontalAlignment` construction could bypass the canonical
+  vocabulary filter.
+
+I did not review or design vertical alignment here, and I did not propose or
+evaluate a generic presentation framework as part of this fix.
+
+=== B1 Disposition
+
+Fixed for XLSX.
+
+The XLSX parser now calls `_apply_horizontal_alignment_meta(...)` for every
+visible sheet, even when `_extract_horizontal_alignments(...)` returns an empty
+mapping:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines 50-92.
+
+The helper uses replace-or-clear semantics:
+
+* non-empty extracted carrier metadata replaces the sheet-local
+  `horizontal_alignments` family;
+* empty extracted carrier metadata removes only the existing
+  `horizontal_alignments` key for that sheet; and
+* unrelated workbook metadata, unrelated sheet metadata families, and other
+  sheets are preserved.
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  257-297.
+* `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`,
+  lines 169-207.
+
+The XLSX stale-meta test is not too synthetic for the bug it pins. It builds
+the same hidden `_meta` shape that the backend reads publicly through
+`ExcelBackend.read_multi(...)`, while intentionally leaving the visible cell
+at the default horizontal carrier state. That exercises the release-relevant
+public readback path.
+
+Fixed for ODS.
+
+The ODS parser now applies the equivalent replace-or-clear helper after
+extracting horizontal alignment carrier metadata:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 911-925.
+
+The helper has the same targeted family-level semantics as the XLSX helper:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 413-453.
+
+Evidence:
+
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`, lines
+  430-491.
+
+The ODS stale-meta test is sufficient for this follow-up. It uses a minimal
+ODS package with a visible sheet lacking a horizontal-alignment carrier and a
+hidden `_meta` table containing stale `horizontal_alignments`. It verifies
+both the re-serialized hidden meta blob and the visible sheet IR. That covers
+the parser-level state that `OdsBackend.read_multi(...)` later projects.
+
+=== M2 Disposition
+
+Fixed.
+
+The registry now lists `rendering.workbook_projection.workbookir_to_frames` as
+a consumer for `horizontal_alignments`, matching the convention already used
+by `column_widths` and reflecting the public readback dependency:
+
+* `registries/meta_registry.yaml`, lines 189-194.
+
+The architecture registry hardening tests pass with the new reference.
+
+=== M3 Disposition
+
+Fixed.
+
+`SetHorizontalAlignment` now validates its canonical vocabulary at
+construction time:
+
+* `src/spreadsheet_handling/rendering/plan.py`, lines 136-168.
+
+The guard is local and appropriately narrow. It only affects the horizontal
+alignment render op, enforces the same three-value Slice A vocabulary already
+documented in the FTR, and does not validate unrelated render operations or
+backend carrier internals.
+
+Evidence:
+
+* `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`,
+  lines 153-166.
+* Existing ODS direct-`RenderPlan` tests for valid values still pass.
+
+=== Preservation of unrelated metadata
+
+The replace-or-clear helpers preserve unrelated metadata.
+
+Manual helper reproduction confirmed that clearing `Data.horizontal_alignments`
+left the following intact for both XLSX and ODS helpers:
+
+* top-level workbook metadata such as `author`;
+* other sheet-local families on the same sheet, including `text_orientations`
+  and `column_widths`; and
+* `horizontal_alignments` on other sheets.
+
+The helper implementation supports that reading: it deletes only
+`raw_sheet_meta["horizontal_alignments"]` when the carrier extraction is empty,
+and otherwise replaces only that key.
+
+=== Existing analogous stale-meta shape
+
+The same stale embedded metadata shape appears to remain possible for
+`text_orientations` and `column_widths`.
+
+Evidence:
+
+* XLSX `_merge_text_orientation_meta(...)` and `_merge_column_width_meta(...)`
+  return without clearing when extraction is empty:
+  `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  198-219 and 300-321.
+* ODS column-width and text-orientation metadata are still updated only inside
+  non-empty branches:
+  `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 873-909.
+
+Classification:: Separate backlog defect.
+
+This is not a blocker for closing `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5`, because
+the FTR under review is the horizontal-alignment slice and the follow-up
+commit fixes the horizontal-alignment behavior without expanding scope. It
+should nevertheless be captured separately because the user-visible bug shape
+is real for the older presentation families.
+
+=== Remaining Findings
+
+Blocking:: None.
+
+Before release:: None for the horizontal-alignment slice.
+
+Before vertical alignment:: Carry M1 forward: do not copy the duplicated
+alignment vocabulary / metadata replacement logic again. The next concept or
+FTR should explicitly introduce a small shared helper for cell-addressed
+presentation metadata before adding vertical alignment.
+
+Separate backlog defect:: Investigate and fix stale embedded metadata clearing
+for `text_orientations` and `column_widths`.
+
+=== FTR Closure Recommendation
+
+From the horizontal-alignment perspective, the FTR is closable.
+
+The original B1 release-relevant defect is fixed for both XLSX and ODS, the
+registry cleanup is consistent with existing conventions, and the render-op
+guard closes the low-level bypass risk without crossing architecture
+boundaries.
+
+=== Validation
+
+[source,bash]
+----
+git status --short
+git show --stat --oneline --decorate 0416989
+git diff --find-renames 218a25a..0416989 -- \
+  src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py \
+  src/spreadsheet_handling/io_backends/ods/odf_parser.py \
+  src/spreadsheet_handling/rendering/plan.py \
+  registries/meta_registry.yaml
+git diff --find-renames 218a25a..0416989 -- \
+  tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py \
+  tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py
+make test-file FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+make test-file FILE=tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py
+make test-file FILE=tests/architecture/semantic_invariants/test_meta_registry_hardening.py
+.venv/bin/python -c "<manual helper preservation reproduction>"
+----
+
+Observed results:
+
+* `git status --short`: this review artifact was untracked in the working tree.
+* Follow-up commit stat matched the reported scope: six files changed across
+  XLSX parser, ODS parser, registry, render plan, and focused tests.
+* Focused XLSX horizontal-alignment tests: `9 passed`.
+* Focused ODS repeated-cell parser tests: `14 passed`.
+* Focused ODS display-metadata tests: `9 passed`.
+* Meta registry hardening tests: `4 passed`.
+* Manual helper preservation reproduction: both XLSX and ODS helpers removed
+  only `Data.horizontal_alignments` and preserved unrelated metadata.
+
+The implementer-reported broader validation was not rerun in this review:
+`make test` reportedly passed with `968 passed, 1 xfailed`, and
+`make source-style-guards` reportedly exited 0 with warnings only.
+
+== Original Review
+
+Review date:: 2026-06-05
+Commit reviewed:: `218a25a feat(FTR-CELL-ALIGNMENT-ROUNDTRIP-P5): preserve horizontal alignment across XLSX and ODS roundtrips`
+Branch:: `main`
+Reviewer:: Codex
+Verdict:: Yellow
+
+== Scope
+
+Reviewed the committed implementation of
+`docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc`, limited to Slice A:
+basic horizontal alignment roundtrip for the canonical values `left`,
+`center`, and `right`.
+
+Primary focus areas:
+
+* architecture fit with canonical metadata and registry-driven ownership;
+* Render IR / `RenderOp` boundaries;
+* XLSX parser and renderer isolation;
+* ODS parser and renderer carrier correctness;
+* repeated ODS carrier safety;
+* metadata persistence and public readback behavior;
+* test coverage and readiness for a future vertical-alignment slice.
+
+No runtime code, tests, release notes, or registry entries were changed during
+this review.
+
+== Verdict
+
+Yellow.
+
+The implementation is broadly aligned with the repository architecture and the
+FTR scope. It adds the expected canonical metadata family, backend-neutral
+render operation, XLSX and ODS support, registry entry, and focused regression
+coverage.
+
+However, the read path can return stale embedded alignment metadata after a
+user clears visible carrier alignment in an existing roundtripped workbook.
+That is a release-relevant roundtrip defect and should be fixed before this
+FTR is closed as complete.
+
+== Findings
+
+=== B1: Cleared visible alignment can leave stale canonical metadata
+
+Severity:: High
+Category:: Defect / metadata-model inconsistency
+Disposition:: Fix before release / before closing the FTR.
+
+Observation::
+If a workbook already contains hidden `_meta` alignment metadata and the user
+clears the visible carrier alignment, the parser does not remove the stale
+`horizontal_alignments` family from the embedded workbook metadata payload.
+
+Evidence::
+The XLSX extractor intentionally drops default or unsupported values:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  223-250.
+
+But `parse_workbook` only merges horizontal alignment metadata when the newly
+extracted map is non-empty:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  50-88.
+
+The public read facade later projects the hidden `_meta` payload back into
+`frames["_meta"]`:
+
+* `src/spreadsheet_handling/rendering/workbook_projection.py`, lines 40-61.
+
+The ODS parser has the same non-empty-only update shape:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 868-887.
+
+I also reproduced the XLSX case locally: write a workbook with
+`horizontal_alignments.A1=center`, change visible `A1` alignment to
+`general`, then read it back through `ExcelBackend.read_multi(...)`. The
+returned `_meta` still contained `A1=center`.
+
+Risk::
+The canonical metadata no longer represents the carrier workbook the user
+edited. A subsequent write can silently reapply alignment the user removed.
+This breaks the intended spreadsheet roundtrip behavior and becomes more
+dangerous as additional cell-alignment families are added.
+
+Recommendation::
+Treat parsed carrier state as authoritative for this presentation family. For
+each visible sheet, replace the embedded `horizontal_alignments` family with
+the extracted map when non-empty and remove the family when extraction returns
+empty. Add XLSX and ODS tests for "metadata present, visible alignment
+cleared".
+
+=== M1: Alignment vocabulary and metadata merge policy are duplicated
+
+Severity:: Medium
+Category:: Maintainability risk
+Disposition:: Address before or during the vertical-alignment slice.
+
+Observation::
+The canonical horizontal-alignment vocabulary and related normalization logic
+are spread across the generic render flow, XLSX parser, and ODS parser:
+
+* `src/spreadsheet_handling/rendering/flow.py`, lines 31 and 162-183.
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`, lines
+  223-250.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`, lines 204-238.
+
+Risk::
+Vertical alignment will likely copy this structure again. That increases the
+chance that render validation, read normalization, stale-meta replacement, or
+unsupported-value suppression diverge by backend or by alignment family.
+
+Recommendation::
+Before adding vertical alignment, introduce a small shared helper for
+cell-addressed presentation metadata. It should own the canonical value set,
+embedded sheet-family replacement/removal behavior, and common address/value
+validation where practical.
+
+=== M2: Registry consumer list omits public projection for horizontal alignment
+
+Severity:: Low
+Category:: Registry consistency
+Disposition:: Clean up before closing or when touching the registry next.
+
+Observation::
+The `column_widths` registry entry lists
+`rendering.workbook_projection.workbookir_to_frames` as a consumer, while the
+`horizontal_alignments` entry does not, even though the public read path
+depends on projection of the hidden workbook metadata payload:
+
+* `registries/meta_registry.yaml`, lines 139-144.
+* `registries/meta_registry.yaml`, lines 189-193.
+
+Risk::
+The registry is less useful as an ownership map for future maintainers. This
+is not a current behavior defect, but it weakens the metadata-driven
+architecture's documentation value.
+
+Recommendation::
+Either add `rendering.workbook_projection.workbookir_to_frames` as a consumer
+for `horizontal_alignments`, or document why projection is intentionally not
+listed for this cell presentation family.
+
+=== M3: Direct RenderPlan construction can pass unsupported alignment values
+
+Severity:: Low
+Category:: Abstraction boundary risk
+Disposition:: Consider hardening with the shared alignment helper.
+
+Observation::
+`SetHorizontalAlignment` documents the canonical value restriction, and the
+generic metadata-to-op path filters values. Direct `RenderPlan` construction
+can still pass arbitrary strings, and backend renderers apply those strings
+directly:
+
+* `src/spreadsheet_handling/rendering/plan.py`, lines 136-146.
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py`, lines
+  363-368.
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py`, lines 178-187.
+
+Risk::
+A future test or caller using low-level render plans can emit carrier-specific
+or invalid values and bypass the canonical metadata contract.
+
+Recommendation::
+Add a render-op validation guard or backend assertion against the shared
+canonical vocabulary.
+
+== Positive Observations
+
+The implementation stayed inside the intended Slice A scope. It did not expand
+into vertical alignment, wrapping, generic styles, range-keyed alignment, or
+font/color/border preservation.
+
+The metadata model fits the existing presentation-metadata pattern:
+`horizontal_alignments` is a canonical, sheet-local, cell-addressed family and
+is registered as `canonical_meta`.
+
+The new `SetHorizontalAlignment` render operation is backend-neutral. Carrier
+details remain in the XLSX and ODS adapters rather than leaking into the
+domain or render-flow contract.
+
+The XLSX writer uses `_merge_xlsx_alignment(...)` for both text orientation
+and horizontal alignment. This is the right fix for openpyxl's destructive
+`Alignment(...)` assignment behavior and protects composition on a single
+cell.
+
+The ODS writer places `fo:text-align` on `style:paragraph-properties`, not on
+`style:table-cell-properties` or `style:text-properties`. That is the correct
+carrier boundary and is verified by a carrier XML assertion.
+
+The ODS reader normalizes `start` / `end` to absolute canonical values and
+the renderer writes absolute `left` / `center` / `right`. This is a reasonable
+choice because it avoids locale-dependent drift on re-import.
+
+The ODS repeated-carrier protections follow the prior text-orientation lesson:
+display-metadata extraction is clipped to parsed content extent and guarded
+with `ParserLimits`.
+
+== Test Assessment
+
+The focused test suite is convincing for the intended happy path and known
+adapter hazards:
+
+* XLSX parse, render, parse/write/parse, default suppression, unsupported
+  value dropping, and composition with text rotation are covered.
+* ODS render/parse, backend roundtrip, carrier XML placement, and absolute
+  write values are covered.
+* ODS repeated-cell parser tests cover sheet-wide alignment filler clipping,
+  implausible repeat rejection, `start` / `end` normalization, and unsupported
+  value dropping.
+
+The main missing tests are for stale embedded metadata after visible carrier
+formatting is cleared. Those should be added for both XLSX and ODS.
+
+== Vertical Alignment Readiness
+
+The slice creates a usable foundation for vertical alignment, but the next
+slice should not duplicate the current merge/update pattern as-is.
+
+Vertical alignment will introduce a real vocabulary mismatch, especially XLSX
+`center` versus ODS `middle`. A shared alignment metadata helper should be
+created before or during that work so horizontal and vertical alignment share:
+
+* canonical vocabulary definitions;
+* unsupported-value suppression;
+* embedded metadata replacement/removal semantics;
+* low-level render-op validation; and
+* common stale-meta regression tests.
+
+With B1 fixed and the common helper in place, the architecture should be clean
+enough for the vertical-alignment slice.
+
+== Validation
+
+[source,bash]
+----
+git status --short
+git rev-parse --abbrev-ref HEAD
+git rev-parse --short HEAD
+git log --oneline -1
+make test-file FILE=tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py
+make test-file FILE=tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py
+make test-file FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+.venv/bin/python -c "<manual stale-meta reproduction>"
+----
+
+Observed results:
+
+* `git status --short`: clean before creating this review artifact.
+* Branch: `main`.
+* Reviewed commit: `218a25a`.
+* Focused XLSX horizontal-alignment tests: `7 passed`.
+* Focused ODS display-metadata tests: `9 passed`.
+* Focused ODS repeated-cell parser tests: `13 passed`.
+* Manual stale-meta reproduction: after visible XLSX `A1` alignment was reset
+  to `general`, `ExcelBackend.read_multi(...)` still returned
+  `{'A1': {'horizontal': 'center', 'source': 'workbook'}}` in
+  `_meta.sheets.Data.horizontal_alignments`.
+
+== Review Artifact Status
+
+This review artifact records the required findings, dispositions, residual
+risks, and validation commands. It has not been committed by this review turn.
+Per `AGENT.md`, the review artifact should be committed separately from any
+follow-up fixes.
