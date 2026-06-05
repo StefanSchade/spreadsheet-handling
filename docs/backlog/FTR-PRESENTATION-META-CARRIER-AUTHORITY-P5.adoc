@@ -1,0 +1,408 @@
+= FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5
+
+== Status
+
+Open
+
+== Type
+
+Roundtrip / Presentation Metadata / Maintainability
+
+== Context
+
+The horizontal-alignment slice
+(`FTR-CELL-ALIGNMENT-ROUNDTRIP-P5`) shipped under the established
+`column_widths` / `text_orientations` pattern. Its Codex re-review of
+commit `0416989` produced two carry-forward items that this FTR addresses
+together because they share one root cause:
+
+* *M1 (carry-forward to the next slice).* The replace-or-clear logic
+  introduced for `horizontal_alignments` is now duplicated, identically,
+  in two backend parsers. Vertical alignment would copy it a third time
+  per backend (fourth and fifth copies overall). The Codex review's
+  explicit recommendation: "introduce a small shared helper for
+  cell-addressed presentation metadata *before* adding vertical
+  alignment."
+* *Separate-backlog defect.* The stale-embedded-metadata bug fixed for
+  `horizontal_alignments` still exists for `text_orientations` and
+  `column_widths`. Their meta-update helpers
+  (`_merge_text_orientation_meta`,
+  `_merge_column_width_meta`) and the equivalent ODS inline blocks
+  early-exit on empty extraction with no clear branch. A user who
+  clears a rotated header or a custom column width in an existing
+  roundtripped workbook will silently get the prior state reapplied on
+  the next write — the same shape of bug, the same class of
+  release-relevant risk.
+
+A concept analysis preceded this FTR and is its source of scope,
+non-goals, and rejected expansions:
+`docs/warm_storage/styling_text_allignment/cell_addressed_presentation_meta_semantics.adoc`.
+
+Bundling these two carry-forward items into a single FTR is deliberate.
+Shipping a shared helper used by only one family would defeat the
+maintainability point of consolidation; shipping the stale-meta fix
+without consolidating would create the third and fourth copies of the
+same function that the M1 finding asks us to avoid. The two changes
+are mutually load-bearing and small enough to fit one focused commit.
+
+== Problem
+
+Three classes of presentation metadata persist sheet-local state in
+the hidden `workbook_meta_blob` payload:
+
+* `column_widths` — dimension-addressed (column letter → width spec),
+  XLSX and ODS;
+* `text_orientations` — cell-addressed (A1-style → rotation spec),
+  XLSX and ODS;
+* `horizontal_alignments` — cell-addressed (A1-style → horizontal spec),
+  XLSX and ODS.
+
+After the horizontal-alignment slice, the code-side shape per family is:
+
+. *XLSX extractor* — pulls the carrier value off `openpyxl` cell or
+  dimension attributes; drops defaults and unsupported values.
+. *ODS extractor* — walks `odfpy` style maps with content-extent
+  clipping and `ParserLimits` enforcement; drops defaults and
+  unsupported values.
+. *Embedded-meta update* — writes the extracted family entry into the
+  workbook-meta payload that gets re-serialised on save.
+
+(1) and (2) are genuinely backend-local and share no code today; they
+are correct in this state. (3) is identical in shape across backends
+and across families, *except* that `horizontal_alignments` uses
+replace-or-clear semantics (carrier authoritative) while
+`text_orientations` and `column_widths` still use merge-only (carrier
+optional, embedded persistent). The asymmetry is a defect, not a design.
+
+The user-visible consequence of the asymmetry: clearing visible
+rotation or visible column width in an existing roundtripped workbook
+does not clear the embedded metadata, and the next render reapplies
+what the user removed.
+
+The maintainability consequence of the duplication: the next slice
+(vertical alignment) is structurally a fourth copy of the same shape,
+and the next slice after that (wrap) is a fifth. Without
+consolidation now, the duplication hardens into a project convention.
+
+== Goal
+
+. Make the carrier authoritative for embedded `column_widths`,
+  `text_orientations`, and `horizontal_alignments` on parse, with
+  wholesale replace-or-clear semantics for the affected family.
+. Eliminate the three+three code paths that implement the same logic
+  by introducing one shared helper used by both backends for all three
+  families.
+. Leave every backend-local concern — extraction, normalisation,
+  `ParserLimits` enforcement, carrier-element placement, render-time
+  composition — exactly where it lives today.
+. Add stale-meta regression coverage for `text_orientations` and
+  `column_widths` to close the separate-backlog defect Codex flagged
+  during the horizontal-alignment review.
+
+== Scope
+
+In scope::
+
+* New module `src/spreadsheet_handling/io_backends/presentation_meta.py`
+  containing a single public function:
++
+[source,python]
+----
+def apply_cell_addressed_presentation_meta(
+    workbook_meta: dict[str, Any],
+    sheet_name: str,
+    family_key: str,
+    value: dict[str, dict] | None,
+) -> bool: ...
+----
++
+with replace-or-clear semantics:
++
+* `value` truthy and equal to existing entry → no-op, return `False`;
+* `value` truthy and different →
+  wholesale replace `workbook_meta["sheets"][sheet_name][family_key]`,
+  return `True`;
+* `value` empty / `None` and entry exists →
+  `del workbook_meta["sheets"][sheet_name][family_key]`, return `True`;
+* `value` empty / `None` and entry absent → no-op, return `False`.
++
+The helper is the only home for the replace-or-clear policy. It is
+intentionally one function with three explicit parameters: no class,
+no registry, no dispatch table.
+
+* XLSX parser migration:
+** `_apply_horizontal_alignment_meta` is removed; its call sites in
+   `parse_workbook` call the shared helper with
+   `family_key="horizontal_alignments"`.
+** `_merge_text_orientation_meta` is removed; its call sites in
+   `parse_workbook` call the shared helper with
+   `family_key="text_orientations"` and are invoked
+   *unconditionally* (regardless of whether extraction returned
+   entries), gaining the clear branch.
+** `_merge_column_width_meta` is removed; its call sites in
+   `parse_workbook` call the shared helper with
+   `family_key="column_widths"` and are invoked unconditionally.
+
+* ODS parser migration:
+** `_apply_horizontal_alignment_meta` (in `odf_parser.py`) is removed;
+   its single call site calls the shared helper.
+** The inline meta-update blocks for `text_orientations` and
+   `column_widths` are replaced with unconditional calls to the
+   shared helper, also gaining the clear branch.
+
+* Test coverage:
+** Stale-meta regression for `text_orientations` on XLSX and ODS,
+   mirroring the existing horizontal-alignment patterns in
+   `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`
+   (XLSX side) and
+   `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`
+   (ODS side).
+** Stale-meta regression for `column_widths` on XLSX and ODS, same
+   shape.
+** Helper-level unit test proving that the replace branch leaves
+   unrelated sheet-meta families on the same sheet intact, leaves
+   other sheets intact, and leaves top-level workbook metadata
+   intact.
+** Helper-level unit test proving that the clear branch leaves the
+   same set of unrelated state intact.
+
+* Release-notes entry under "Spreadsheet backends and roundtrip
+  behavior" naming the three families now under authoritative-carrier
+  semantics and the new behaviour of clearing embedded entries when
+  the visible carrier is cleared.
+
+Decisions resolved at FTR-draft time (from the concept's open
+questions)::
+
+* *Module location and name.* `src/spreadsheet_handling/io_backends/presentation_meta.py`.
+  Sibling to the two backend directories, importable without circular
+  risk, no underscore prefix because the function is the
+  public-within-the-package contract.
+* *Helper return value.* `bool` only. The current call sites need a
+  "modified vs not" flag to update `meta_changed`; nothing needs the
+  prior value. YAGNI.
+* *Family-key argument shape.* String, not enum. The three current
+  family keys are already string-typed throughout the parsers and the
+  `workbook_meta_blob`; introducing an enum here would create a second
+  source of truth without a consumer.
+
+== Non-Goals
+
+* No vertical alignment, no wrap text. Those are separate FTRs.
+* No new render ops, no new presentation-metadata family keys, no new
+  registry entries.
+* No abstract base class, plugin registry, or dynamic dispatch over
+  presentation families. The shared helper is one function with
+  three explicit parameters.
+* No central canonical-vocabulary module or enum across families.
+  Each render op continues to own its own vocabulary via its own
+  `__post_init__` and frozen-set, as established by
+  `SetHorizontalAlignment`.
+* No consolidation of the two `_CANONICAL_HORIZONTAL_ALIGNMENTS`
+  constants in `plan.py` and `flow.py`. Recommended cleanup per the
+  concept doc, but a different class of change; leave for follow-up.
+* No consolidation of the XLSX `_CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX`
+  with the `plan.py` constant. They are conceptually distinct
+  ("strict on construction" vs "lenient on carrier read") even when
+  identical in value today.
+* No refactor of `_merge_xlsx_alignment`. That helper addresses
+  `openpyxl`'s destructive `cell.alignment = Alignment(...)`
+  assignment and is unrelated to embedded-meta semantics.
+* No refactor of the flow's `_*_ops` builders
+  (`_horizontal_alignment_ops`, `_text_orientation_ops`,
+  `_column_width_ops`). Same shape but different per-family
+  validation; consolidating would force a generic
+  "metadata → ops" abstraction this FTR rejects.
+* No unification of address keying between dimension-keyed
+  (`column_widths`) and cell-keyed families. The shared helper stores
+  whatever the extractor returns.
+* No change to the carrier extraction code on either backend. No
+  change to `ParserLimits` plumbing. No change to ODS carrier
+  placement. No change to XLSX read iteration.
+* No font, color, border, indent, shrink-to-fit, reading-order, or
+  row-height work.
+* No generic styling framework.
+
+== Backend Strategy
+
+The shared helper is backend-neutral by construction: it operates
+purely on the `workbook_meta` dict that both backends already build
+and re-serialise via `_store_workbook_meta`. It does not import from,
+or reference, any `openpyxl` or `odfpy` API.
+
+Per-backend call sites:
+
+[cols="1,3", options="header"]
+|===
+| Backend | Call sites after migration
+
+| XLSX
+| Three unconditional calls in `openpyxl_parser.parse_workbook`, one
+  per family, immediately after the corresponding extractor returns.
+  The three removed helpers
+  (`_apply_horizontal_alignment_meta`,
+  `_merge_text_orientation_meta`,
+  `_merge_column_width_meta`) are deleted.
+
+| ODS
+| Three unconditional calls in `odf_parser.parse_workbook`, one per
+  family, immediately after the corresponding extractor returns. The
+  ODS `_apply_horizontal_alignment_meta` is deleted; the inline
+  meta-update blocks for `text_orientations` and `column_widths` are
+  removed.
+|===
+
+The `if <value>: sheet.meta["__<family>"] = <value>` lines that set
+the in-memory `SheetIR.meta` cache are kept conditional and unchanged.
+The shared helper acts only on the `workbook_meta_blob` projection.
+
+== Acceptance Criteria
+
+Functional (required)::
+
+* For each of the three families, on both backends: a workbook with
+  embedded `<family>` metadata for a sheet *and* a visible carrier
+  cleared on that sheet reads back without the embedded entry.
+* For each of the three families, on both backends: a workbook with
+  non-empty visible carrier reads back with the carrier value, and a
+  subsequent parse-write-parse cycle preserves it bit-for-bit.
+* A workbook with `_meta.sheets.<sheet>.<family>` removed by the
+  helper retains every other key under `_meta.sheets.<sheet>`, every
+  other sheet under `_meta.sheets`, and every top-level
+  `_meta.<key>`.
+* The existing horizontal-alignment behavior is unchanged:
+  `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`
+  and the ODS horizontal-alignment tests in
+  `tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py`
+  and
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`
+  pass without modification beyond import-path changes.
+
+Architectural (required)::
+
+* The replace-or-clear policy lives in exactly one place:
+  `src/spreadsheet_handling/io_backends/presentation_meta.py`.
+* No backend parser contains a copy of the replace-or-clear logic.
+  No deleted helper is reintroduced under a new name.
+* The shared module has zero imports from `openpyxl`, `odfpy`,
+  `pandas`, or any backend-specific package.
+* The shared helper has exactly one public function. No classes, no
+  dispatch tables, no plugin entry points, no abstract base classes.
+
+Test coverage (required)::
+
+* Stale-meta regression test for `text_orientations` on XLSX and ODS.
+* Stale-meta regression test for `column_widths` on XLSX and ODS.
+* Helper unit test for the replace branch's preservation guarantees
+  (other families on the same sheet, other sheets, top-level workbook
+  keys).
+* Helper unit test for the clear branch's preservation guarantees.
+
+Registry / documentation (required)::
+
+* No registry entry changes are required (the three family entries
+  already list their producers and consumers; the shared helper is
+  an implementation detail, not a new metadata key).
+* Release-notes entry exists under "Spreadsheet backends and
+  roundtrip behavior", explicitly naming the three families now under
+  authoritative-carrier semantics, or the implementer records in the
+  review artifact why no release note is needed.
+
+Style guards (required)::
+
+* `make test` continues to pass.
+* `make source-style-guards` introduces no new error-level findings.
+  Warnings on the new shared module should stay below the existing
+  thresholds; the function body is small enough that this is not a
+  concern.
+
+== Validation
+
+The implementer is expected to run, at minimum:
+
+[source,bash]
+----
+make test
+make source-style-guards
+make test-file FILE=tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py
+make test-file FILE=tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py
+make test-file FILE=tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_text_orientation_roundtrip.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_column_width_roundtrip.py
+----
+
+and the new test files introduced for `text_orientations` and
+`column_widths` stale-meta regression.
+
+The Codex review's manual stale-meta reproduction recipe (write
+embedded meta + cleared visible carrier; assert readback drops the
+entry) should be exercisable for all three families.
+
+== Risks and Notes
+
+Risks::
+
+* *Mismatched call-site migration.* If any one of the six unconditional
+  call sites is left conditional, the stale-meta bug persists for that
+  family on that backend. Reviewers should confirm all six call sites
+  by name, not by sampling.
+* *Accidental scope creep.* The temptation to "tidy up" the
+  `_*_ops` flow builders or the two vocab constants is real. Both are
+  explicitly out of scope; each can absorb the FTR into a multi-commit
+  refactor if allowed. Hold the line.
+* *Behavioural drift for `column_widths`.* The semantics change here is
+  small but non-zero: previously, removing a custom column width from
+  the visible carrier left the embedded entry. After this FTR it
+  removes it. This is a deliberate alignment of behaviour across the
+  three families and matches user intent ("I cleared this; do not
+  reapply it"), but the release notes must call it out so downstream
+  users do not interpret it as a regression.
+
+Notes::
+
+* This FTR does not introduce any new canonical metadata key, render
+  op, pass, or registry entry. It is a maintenance and bug-fix
+  consolidation, not a feature.
+* After this FTR ships, the vertical-alignment slice is mechanically
+  smaller: it adds one render op + `__post_init__`, one pass, one
+  flow builder, one XLSX extractor, one ODS extractor with carrier
+  placement on `style:table-cell-properties` (not
+  `style:paragraph-properties`), and three call sites to the existing
+  shared helper. No new shared infrastructure required.
+* The `_apply_horizontal_alignment_meta` function name is being
+  retired. Any future Codex review of horizontal-alignment behaviour
+  should reference the shared helper instead.
+
+== References
+
+Concept analysis (source of scope and rejected expansions)::
+
+* `docs/warm_storage/styling_text_allignment/cell_addressed_presentation_meta_semantics.adoc`
+
+Precedent FTRs and reviews::
+
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc`
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5_review.adoc`
+  — Codex Yellow (`218a25a`) and Green follow-up (`0416989`)
+* `docs/backlog/FTR-TEXT-ORIENTATION-ROUNDTRIP-P5.adoc`
+* `docs/backlog/FTR-TEXT-ORIENTATION-ROUNDTRIP-P5_review.adoc`
+
+Codified lessons::
+
+* `docs/ai_info/review_instructions.adoc § Adapter read-path safety
+  checks`
+
+Code paths touched by this FTR (not redesigned)::
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+  — three call sites in `parse_workbook`; three helper deletions.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
+  — three call sites in `parse_workbook`; one helper deletion;
+  two inline-block replacements.
+* `src/spreadsheet_handling/io_backends/presentation_meta.py`
+  — new module with the single shared helper.
+
+Test patterns to copy (not redesign)::
+
+* `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py::test_xlsx_stale_embedded_alignment_is_dropped_when_carrier_is_clear`
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py::test_horizontal_alignment_stale_embedded_meta_is_dropped_when_carrier_clear`

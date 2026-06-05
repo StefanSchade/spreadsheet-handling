@@ -1,0 +1,451 @@
+= Cell-addressed presentation metadata: shared semantics concept
+:toc: left
+:toclevels: 3
+:sectnums:
+
+Author:: Concept analysis to scope the M1 carry-forward from
+`FTR-CELL-ALIGNMENT-ROUNDTRIP-P5_review.adoc`.
+Date:: 2026-06-05
+Status:: Concept material, warm storage. Decision-ready but not a binding FTR.
+
+== Status
+
+Draft concept. Reviewed against post-`0416989` codebase.
+
+Inputs:
+
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc`
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5_review.adoc` (Green follow-up
+  re-review + original Yellow review)
+* `docs/warm_storage/styling_text_allignment/alignment_semantics_survey.adoc`
+* `docs/ai_info/review_instructions.adoc § Adapter read-path safety checks`
+
+Companion to the survey above; this document is narrower and decision-focused.
+
+== Context
+
+The horizontal-alignment slice (`Slice A`) of
+`FTR-CELL-ALIGNMENT-ROUNDTRIP-P5` is Green per the Codex re-review of commit
+`0416989`. From the slice's own perspective the FTR is closable.
+
+Two items carry forward to the next slice:
+
+* *M1 (carry-forward):* duplication of canonical-vocabulary handling and
+  embedded-meta replacement/removal logic across `horizontal_alignments`,
+  `text_orientations`, and (latently) `column_widths`. Codex's
+  recommendation: introduce a small shared helper for cell-addressed
+  presentation metadata *before* adding vertical alignment.
+
+* *Separate backlog defect:* the stale-meta bug fixed for
+  `horizontal_alignments` by `_apply_horizontal_alignment_meta` still exists
+  for `text_orientations` and `column_widths`. Their meta-update helpers
+  (`_merge_text_orientation_meta`, `_merge_column_width_meta`) early-exit on
+  empty extraction with no clear branch.
+
+This concept analysis answers whether M1 should be handled as
+(1) a tiny local helper, (2) a reusable metadata helper for cell-addressed
+presentation families, or (3) a larger styling abstraction that should be
+rejected for now.
+
+The expected answer is *(2), strictly bounded*; this document tests that
+expectation against the actual code paths.
+
+== Problem
+
+After the horizontal-alignment slice, the codebase carries three
+near-identical sets of artifacts per presentation family:
+
+[cols="2,3,3,3", options="header"]
+|===
+| Concern | `column_widths` | `text_orientations` | `horizontal_alignments`
+
+| Address scope
+| Dimension (column letter)
+| Cell address
+| Cell address
+
+| XLSX extractor
+| `_extract_column_widths` (parser:133)
+| `_extract_text_orientations` (parser:159)
+| `_extract_horizontal_alignments` (parser:227)
+
+| XLSX meta-update helper
+| `_merge_column_width_meta` (parser:300) — *no clear branch*
+| `_merge_text_orientation_meta` (parser:198) — *no clear branch*
+| `_apply_horizontal_alignment_meta` (parser:257) — replace-or-clear
+
+| ODS extractor
+| `_extract_ods_column_widths` (odf_parser:155)
+| `_extract_ods_text_orientations` (odf_parser:337)
+| `_extract_ods_horizontal_alignments` (odf_parser:241)
+
+| ODS meta-update site
+| inline at odf_parser:876-888 — *no clear branch*
+| inline at odf_parser:897-908 — *no clear branch*
+| `_apply_horizontal_alignment_meta` (odf_parser:413) — replace-or-clear
+
+| Canonical vocabulary
+| Open (positive floats); validated inline in flow:91-97
+| Numeric range 0-180; validated inline in flow:148-153
+| Enumerated set; duplicated in plan.py and flow.py
+|===
+
+The XLSX renderer additionally has `_merge_xlsx_alignment` (introduced in
+this slice) used by both `SetTextOrientation` and
+`SetHorizontalAlignment`. That helper is unrelated to embedded-meta semantics
+and is *not* part of M1.
+
+== Relevant current families
+
+* *`column_widths`*: sheet-local, dimension-addressed (column letter →
+  width spec). Renderer-facing.
+* *`text_orientations`*: sheet-local, cell-addressed (A1-style →
+  rotation spec).
+* *`horizontal_alignments`*: sheet-local, cell-addressed (A1-style →
+  horizontal spec). Authoritative-carrier semantics since `0416989`.
+
+The proposed *`vertical_alignments`* family is structurally identical to
+`horizontal_alignments`:
+
+* cell-addressed, sheet-local;
+* enumerated canonical vocabulary (`top` / `center` / `bottom` in the
+  XLSX-shaped encoding);
+* one XLSX–ODS vocabulary mismatch (XLSX `center` ↔ ODS `middle`); and
+* same carrier-on-`paragraph-properties` risk class as horizontal alignment
+  in the survey (vertical alignment lives on
+  `style:table-cell-properties` in ODS, *not* on `paragraph-properties`, but
+  the carrier-mismatch lesson still applies).
+
+== Lessons from horizontal alignment
+
+Codified for reuse:
+
+. *L-A — Carrier is authoritative for cell-addressed presentation
+  metadata.* When the visible carrier is cleared, the embedded family entry
+  for that sheet must be removed. Merge-only update is a latent stale-meta
+  bug. (`B1` in the original Codex review.)
+
+. *L-B — Canonical-vocabulary filter must be enforced at the construction
+  boundary, not only at the extraction boundary.* `__post_init__` on the
+  render-op dataclass is sufficient. (`M3` in the original Codex review.)
+
+. *L-C — Two near-identical helper functions duplicated between backends
+  is the threshold for extracting a shared helper.* The replace-or-clear
+  function is identical between XLSX `_apply_horizontal_alignment_meta` and
+  ODS `_apply_horizontal_alignment_meta` (40 lines, modulo docstring). Going
+  to a third backend or a third family without consolidation is the
+  point at which copy-paste becomes the failure mode. (`M1` in the
+  original Codex review.)
+
+. *L-D — Carrier extraction and carrier-side normalization are not
+  shareable across backends.* openpyxl iterates the used range and reads
+  `cell.alignment.horizontal`; odfpy walks `table-cell-properties` /
+  `paragraph-properties` and clips to parsed content extent via
+  `ParserLimits`. The two have nothing in common at the IO layer.
+
+== Shared semantics
+
+Exactly one operation has identical-body duplication today and would
+duplicate a third or fourth time when vertical alignment lands:
+
+[source,text]
+----
+apply_cell_addressed_presentation_meta(
+    workbook_meta: dict[str, Any],
+    sheet_name: str,
+    family_key: str,                    # e.g. "horizontal_alignments"
+    value: dict[str, dict] | None,
+) -> bool
+----
+
+Replace-or-clear semantics:
+
+* `value` truthy and equal to existing entry → no-op, return `False`.
+* `value` truthy and different → wholesale replace
+  `workbook_meta["sheets"][sheet_name][family_key]`, return `True`.
+* `value` empty / `None` and entry exists →
+  `del workbook_meta["sheets"][sheet_name][family_key]`, return `True`.
+* `value` empty / `None` and entry absent → no-op, return `False`.
+
+This is *exclusively* the logic that is already duplicated. Nothing else
+in the presentation-metadata code path shows the same symmetry.
+
+== Backend-local responsibilities
+
+The following remain in the backend adapters; they are *not* part of the
+shared helper:
+
+* *Carrier extraction.* openpyxl `cell.alignment.*` iteration; odfpy
+  style-map building and `_parse_table_grid`-bounded walks.
+* *Carrier-specific normalization.* ODS `start` / `end` → `left` / `right`
+  (LTR-locale absolute encoding); openpyxl `None` vs `"general"` default
+  handling; ODS `middle` ↔ XLSX `center` (future, for vertical).
+* *`ParserLimits` enforcement.* ODS only; per-axis and per-cell, with
+  content-extent clipping. The XLSX side has no analogous risk.
+* *Carrier element placement.* ODS `fo:text-align` on
+  `style:paragraph-properties` (horizontal) vs `style:vertical-align` on
+  `style:table-cell-properties` (future vertical) vs
+  `style:rotation-angle` on `style:table-cell-properties` (rotation).
+* *Carrier write composition.* The XLSX renderer's
+  `_merge_xlsx_alignment` is openpyxl-specific (works around openpyxl's
+  destructive `cell.alignment = Alignment(...)` assignment); it does not
+  belong in a shared module.
+
+The shared helper has *one* responsibility — embedded-meta replace-or-clear
+— and nothing else.
+
+== Canonical vocabulary ownership
+
+After the slice, `_CANONICAL_HORIZONTAL_ALIGNMENTS` exists in two places:
+
+* `src/spreadsheet_handling/rendering/plan.py:124` (used by
+  `SetHorizontalAlignment.__post_init__`)
+* `src/spreadsheet_handling/rendering/flow.py:31` (used by
+  `_horizontal_alignment_ops`)
+
+Plus the XLSX-side variant:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:222`
+  (used by `_extract_horizontal_alignments` to drop unsupported carrier
+  values)
+
+And the ODS-side normalization map:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:189`
+  (`_ODS_HORIZONTAL_ALIGNMENT_MAP`, which both normalizes `start` / `end`
+  to absolute and restricts to canonical values implicitly via the dict
+  keys)
+
+Going to vertical alignment would copy the first two and add a different
+shape of XLSX/ODS variants. That is duplication, but *not the same
+duplication as the meta-helper*. The vocabulary is a per-family fact,
+not cross-backend identical state. The right consolidation is local:
+
+* keep one canonical-vocabulary constant per render op, in `plan.py`,
+  exported and imported by `flow.py`; and
+* let backend parsers do their own carrier-side membership check using
+  the same constant where it is enumerated, or a backend-specific
+  normalization map (ODS) where it is not.
+
+No central vocabulary module is needed. No `AlignmentValue` enum.
+
+== Render-op validation
+
+`SetHorizontalAlignment.__post_init__` works. The pattern is small,
+local, and survives review (`M3 Fixed.`).
+
+Vertical alignment should follow the same pattern with its own
+`__post_init__` and its own canonical frozen-set, *not* a generic
+"alignment op base class". Two `__post_init__` blocks of three lines each
+are not duplication worth eliminating.
+
+== Proposed narrow helper
+
+One module. One function. Used by both backends. Replaces:
+
+* `_apply_horizontal_alignment_meta` (XLSX) — already replace-or-clear.
+* `_apply_horizontal_alignment_meta` (ODS) — already replace-or-clear.
+* `_merge_text_orientation_meta` (XLSX) — currently merge-only; carries
+  the latent stale-meta bug.
+* `_merge_column_width_meta` (XLSX) — currently merge-only; carries the
+  latent stale-meta bug.
+* The inline ODS meta-update blocks for `text_orientations` and
+  `column_widths` — currently merge-only; carry the latent stale-meta
+  bug.
+
+Candidate home: `src/spreadsheet_handling/io_backends/presentation_meta.py`,
+sibling to the backend directories. Exact path is an FTR-time decision.
+
+The helper signature passes the `family_key` as a string parameter:
+
+* it is short and avoids dispatch on type;
+* it makes the migration of `text_orientations` and `column_widths`
+  one-line per call site; and
+* it stays inside the existing "manual registry" model — there is no
+  plugin registry, no abstract base class, no dynamic dispatch.
+
+== Explicitly rejected broader abstractions
+
+These are *not* part of the proposed FTR:
+
+* A `PresentationMetaFamily` abstract base class with `extract()` and
+  `apply()` methods. The two backends have nothing in common in
+  extraction; ABCs would only obscure that.
+* A plugin registry for presentation families. The current "manual
+  registry of family keys" model in `meta_registry.yaml` is what the
+  project chose; runtime introspection is forbidden by the registry's
+  maintenance contract.
+* A central `Alignment` value enum spanning horizontal and vertical.
+  The two have different vocabulary, different ODF carriers, and
+  different XLSX→ODS mismatches; sharing an enum would obscure the
+  per-family policy that is the whole point of registering them
+  separately.
+* Unification of address keying. `column_widths` is keyed by column
+  letter; `text_orientations` and the alignment families are keyed by
+  A1-style cell address. The shared helper does not care — it stores
+  whatever the extractor returns. Address-shape unification is a
+  separate question that should not block this work.
+* Refactor of `_merge_xlsx_alignment`. That helper is about openpyxl's
+  destructive `Alignment` assignment, not embedded-meta. Out of scope.
+* Refactor of the flow's `_*_ops` builders. The per-family
+  `_horizontal_alignment_ops` / `_text_orientation_ops` /
+  `_column_width_ops` pattern is doing the same shape of work, but
+  consolidating it would force a generic "metadata → ops" abstraction
+  that this concept explicitly rejects.
+
+== Relationship to vertical alignment
+
+With the proposed helper in place, the vertical-alignment slice
+becomes structurally smaller:
+
+* new render op `SetVerticalAlignment` with its own
+  `__post_init__` vocab guard, in `plan.py`;
+* new pass and flow builder mirroring horizontal alignment;
+* new XLSX extractor + canonical filter;
+* new ODS extractor with `style:vertical-align` on
+  `style:table-cell-properties`, content-extent clipping, and
+  `middle` ↔ `center` normalization on read/write;
+* call `apply_cell_addressed_presentation_meta(..., "vertical_alignments", ...)`
+  from both backends (no new helper required); and
+* the standard set of tests (carrier-XML, pathological repeated, default
+  suppression, parse-write-parse, composition with rotation + horizontal).
+
+Without the helper, the vertical-alignment slice would duplicate the
+replace-or-clear code *again* (helper #3 and #4) and the inline
+non-empty-branch pattern would harden into a project convention,
+locking the latent bug in for the older families.
+
+== Handling of existing stale-meta risks
+
+The `text_orientations` and `column_widths` stale-meta bug is a
+release-relevant defect of the same shape as `horizontal_alignments` B1,
+but classified as separate-backlog rather than blocker because no
+adopter has hit it yet.
+
+Three options:
+
+[cols="1,3", options="header"]
+|===
+| Option | Trade-off
+
+| Separate FTR after the helper FTR
+| Smallest helper FTR, but a half-completed helper used by only one
+  family would defeat the purpose. The next maintainer would have to
+  re-establish the M1 conclusion.
+
+| Included in the helper FTR (recommended)
+| Migration is one-line per call site once the helper exists. Adding
+  the two regression tests is mechanical. Net effect: the helper FTR
+  fixes the latent stale-meta bug for all three current families in
+  one coherent change.
+
+| Skipped until an adopter hits it
+| Leaves a known same-shape bug in the codebase. Inconsistent with
+  the B1 fix policy for `horizontal_alignments`.
+|===
+
+*Recommendation:* include the retrofit in the helper FTR. The cost is
+trivial (two helper migrations + two regression tests per backend) and
+the value is high (one consistent rule for the entire cell-addressed
+presentation-metadata family).
+
+== Candidate FTR outline
+
+Working title: `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`.
+
+Scope::
+
+* New module `io_backends/presentation_meta.py` (or equivalent) with
+  one function `apply_cell_addressed_presentation_meta(workbook_meta,
+  sheet_name, family_key, value) -> bool` implementing replace-or-clear.
+* XLSX parser migrates `_apply_horizontal_alignment_meta` to call the
+  shared function; `_merge_text_orientation_meta` and
+  `_merge_column_width_meta` are replaced with calls to the shared
+  function and the call sites in `parse_workbook` now always invoke it
+  (regardless of carrier emptiness).
+* ODS parser migrates `_apply_horizontal_alignment_meta` similarly;
+  the inline meta-update blocks for `text_orientations` and
+  `column_widths` are replaced with calls to the shared function.
+* New regression tests (mirroring the horizontal-alignment stale-meta
+  pattern from `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`
+  and `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`)
+  for `text_orientations` and `column_widths` on both backends.
+* One test that proves the helper preserves unrelated sheet-meta
+  families and other sheets (the manual reproduction the Codex review
+  performed, formalized as a unit test).
+* Release-notes entry under "Spreadsheet backends and roundtrip
+  behavior" naming the families now under authoritative-carrier
+  semantics.
+
+Out of scope::
+
+* Vertical alignment, wrap, font, color, border, indent, shrink-to-fit.
+* Any abstraction over canonical vocabulary across families.
+* Any refactor of the flow-side `_*_ops` builders.
+* Any refactor of `_merge_xlsx_alignment`.
+* Any address-keying unification.
+
+Estimated change surface::
+
+* one new module file;
+* two parsers touched, one short function each (XLSX) plus three call
+  sites each;
+* six new tests (stale-meta drop × 2 families × 2 backends + helper
+  preservation × 2 backends, or one combined per-backend);
+* one release-notes paragraph;
+* one registry entry update (none required if the family-key arg is
+  not registered as its own canonical key — recommended).
+
+== Open questions
+
+. *Module location and name.* Candidates:
+  `io_backends/presentation_meta.py`,
+  `rendering/presentation_meta_writer.py`,
+  `io_backends/_meta_authority.py`. Decision can wait until the FTR.
+. *Whether the helper should also return the prior value* for diagnostics.
+  Current callers only need a `bool` "modified" flag. YAGNI; do not add
+  unless an actual diagnostic consumer exists at FTR-time.
+. *Whether to consolidate the two
+  `_CANONICAL_HORIZONTAL_ALIGNMENTS` constants* (`plan.py` and `flow.py`)
+  in the same change. Recommended yes, in-scope, and tiny: import from
+  `plan.py` in `flow.py`. Not strictly required.
+. *Whether the XLSX-side `_CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX` should
+  be merged with the `plan.py` constant.* They are the same set today
+  but conceptually distinct (one is "what the render op accepts", the
+  other is "what the XLSX carrier should be filtered to"). Recommended:
+  keep separate, document the alignment in the parser comment, do not
+  add cross-package imports. This is the same "lenient on read, strict
+  on construction" pattern used elsewhere.
+
+== Recommendation
+
+*Option 2* — a reusable metadata helper for cell-addressed presentation
+families — is the right call, *strictly bounded* to the single
+replace-or-clear function described in Section 6.
+
+Justification:
+
+* *Option 1 (tiny local helper)* would mean a fourth copy of the same
+  40-line function when vertical alignment lands. The duplication is
+  already real, already cross-backend, and already silently buggy for
+  two of three families. Option 1 hardens that into convention.
+
+* *Option 3 (larger styling abstraction)* would absorb scope that has
+  no shared code today — extraction, normalization, carrier placement,
+  render composition — and would require a plugin registry or ABC that
+  the project's own registry-maintenance contract forbids.
+
+* *Option 2 (this concept)* removes exactly the duplication that exists,
+  fixes the same-shape latent bug while the policy is fresh in the
+  codebase, and leaves every backend-local concern where it lives today.
+
+The smallest coherent FTR before vertical alignment is one that:
+
+. introduces `apply_cell_addressed_presentation_meta`;
+. migrates all three current families to it; and
+. adds stale-meta regression tests for the two retrofit families.
+
+Once that lands, the vertical-alignment FTR is mechanically smaller
+and cannot reintroduce the same class of bug.
+
+Ready to derive a concrete FTR.
