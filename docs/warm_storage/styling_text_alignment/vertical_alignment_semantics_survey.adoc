@@ -1,0 +1,664 @@
+= Vertical alignment semantics survey
+:toc: left
+:toclevels: 3
+:sectnums:
+
+Author:: Concept analysis to scope the next presentation-metadata slice
+after `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5` and
+`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`.
+Date:: 2026-06-05
+Status:: Concept material, warm storage. Decision-ready but not a binding FTR.
+
+== Status
+
+Draft concept. Reviewed against post-`c7effc3` codebase.
+
+Inputs:
+
+* `docs/warm_storage/styling_text_alignment/alignment_semantics_survey.adoc`
+  (original three-attribute survey)
+* `docs/warm_storage/styling_text_alignment/cell_addressed_presentation_meta_semantics.adoc`
+  (carrier-authority concept)
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc` and its review artifact
+* `docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc` and its
+  review artifact
+* `docs/ai_info/review_instructions.adoc § Adapter read-path safety checks`
+
+This document is decision-focused: it confirms the architecture is ready,
+identifies the small concrete differences from horizontal alignment, and
+proposes the smallest first slice.
+
+== Context
+
+The horizontal-alignment slice closed Green. The carrier-authority slice
+closed Green (post `c7effc3`). Both established the patterns that vertical
+alignment now reuses:
+
+* one `canonical_meta` registry entry per presentation family
+  (`text_orientations`, `column_widths`, `horizontal_alignments`);
+* one render op per attribute, with `__post_init__` vocabulary validation
+  on the dataclass;
+* a tiny per-attribute pass and `flow._*_ops` builder;
+* per-backend extractors with content-extent clipping and `ParserLimits`
+  enforcement on the ODS side;
+* per-backend write paths through `_merge_xlsx_alignment` (XLSX) and
+  `_register_cell_style` (ODS); and
+* one shared helper, `apply_cell_addressed_presentation_meta`, that owns
+  replace-or-clear authority of the embedded `workbook_meta_blob` payload.
+
+The architecture predicted by the original alignment survey is now real
+infrastructure. Vertical alignment is the first follow-on slice for which
+*no new shared infrastructure is required*.
+
+== Carrier survey
+
+=== XLSX
+
+* *Carrier location:* `cell.alignment.vertical` on `openpyxl.styles.Alignment`,
+  serialised as the `vertical` attribute on OOXML
+  `<alignment>` inside an `<xf>` record in `cellXfs`.
+* *Supported values* (openpyxl-validated):
+  `top`, `center`, `bottom`, `justify`, `distributed`.
+* *Default value:* `None`. Verified empirically:
+  `openpyxl.Workbook().active['A1'].alignment.vertical` is `None`, not
+  `"bottom"`. The XLSX default rendering of a missing `vertical` attribute
+  is "bottom" in Excel, but openpyxl exposes that as `None`. Treat `None`
+  as "no metadata"; do not synthesise `"bottom"` on read.
+* *Carrier-specific aliases:* none. openpyxl enforces the vocabulary at
+  construction (`Alignment(vertical="middle")` raises). No alternative
+  spellings to normalise.
+* *Carrier-specific edge cases:*
+  ** The `Alignment` object is *shared* with `horizontal`, `wrap_text`,
+     `text_rotation`, `shrink_to_fit`, `indent`, etc. The existing
+     `_merge_xlsx_alignment(cell, **kwargs)` helper (introduced by
+     FTR-CELL-ALIGNMENT-ROUNDTRIP-P5) already preserves unrelated attributes
+     when one alignment attribute is updated. No new composition work
+     needed.
+  ** openpyxl bounds extraction iteration to `ws.iter_rows(min_row=1,
+     max_row=ws.max_row, max_col=ws.max_column)`. There is no XLSX-side
+     repeated-cell safety hazard; `ParserLimits` is irrelevant on this
+     backend.
+
+Verified: `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py:60-77`
+(`_merge_xlsx_alignment`), `:211-238` (`_extract_horizontal_alignments`,
+the pattern to copy).
+
+=== ODS
+
+* *Carrier location:* `style:vertical-align` attribute on
+  `style:table-cell-properties`. Same element that today carries
+  `style:rotation-angle` (text orientation) and `fo:background-color`
+  (header fills) on table-cell styles registered by
+  `_register_cell_style`.
+* *Supported values* (per ODF 1.2 / 1.3):
+  `top`, `middle`, `bottom`, `automatic`.
+* *Default value:* `automatic` (which renderers interpret as the
+  consumer's default; LibreOffice Calc treats it as `bottom`). Treat
+  both `automatic` and an absent attribute as "no metadata"; do not
+  synthesise `bottom` on read.
+* *Carrier-specific aliases:* the value `middle` corresponds to
+  canonical `center`. No locale-dependent aliases (unlike horizontal's
+  `start`/`end`).
+* *Carrier-specific edge cases:*
+  ** odfpy accepts the attribute through a native constructor kwarg:
+     `TableCellProperties(verticalalign="middle")` serialises to
+     `style:vertical-align="middle"`. The current renderer already builds
+     a `TableCellProperties` element when `rotation` or `fill_rgb` is set;
+     vertical alignment slots in next to those without creating a new
+     element. (Compare with horizontal alignment, which required a brand
+     new `ParagraphProperties` element.)
+  ** The ODS read path needs the same content-extent clipping and
+     `ParserLimits` defence as the existing horizontal-alignment and
+     text-orientation extractors. `style:vertical-align` is at least as
+     commonly applied sheet-wide as horizontal alignment (Format > Cells
+     > Alignment > Vertical, applied to a whole-column or whole-sheet
+     selection in LibreOffice).
+
+Verified: `src/spreadsheet_handling/io_backends/ods/odf_renderer.py:120-191`
+(cache key, `_register_cell_style`, `TableCellProperties` usage); odfpy
+API confirmed empirically with
+`TableCellProperties(verticalalign="middle").attributes`.
+
+== Canonical vocabulary
+
+Recommended first-slice vocabulary, XLSX-shaped to match the established
+project canonical encoding:
+
+[cols="1,3", options="header"]
+|===
+| Canonical value | Meaning
+
+| `top`    | Cell content aligned to the top edge.
+| `center` | Cell content vertically centred.
+| `bottom` | Cell content aligned to the bottom edge.
+|===
+
+Three values. The same enumerated-set shape as horizontal alignment.
+
+Other carrier values:
+
+[cols="1,1,3", options="header"]
+|===
+| Value | Source | Treatment in this slice
+
+| `justify`     | XLSX | Defer. No common ODS equivalent;
+                          vertical-justify rendering is rare in real
+                          workbooks.
+| `distributed` | XLSX | Defer. Same reason.
+| `automatic`   | ODS  | Drop on read (it is a "no value" sentinel).
+                          Never emit on write — write the attribute only
+                          when the canonical value is `top`/`center`/`bottom`.
+| `baseline`    | (Not on `style:vertical-align`; only on
+                  `fo:vertical-align` for inline text in
+                  `style:text-properties`. Not relevant to cell vertical
+                  alignment.) | Out of scope by definition.
+| `None`        | XLSX | "No metadata" sentinel. Do not surface.
+|===
+
+The XLSX defaults (`general` for horizontal, `bottom` for vertical) are
+implicit at the consumer; the project's contract is to not materialise
+implicit defaults. Same rule as horizontal `general`.
+
+== Normalization rules
+
+The single non-trivial normalisation in this slice is XLSX `center` ↔
+ODS `middle`. It is intrinsic to ODF, not locale-dependent (compare with
+horizontal's `start`/`end`). It is bidirectional and mandatory.
+
+[cols="1,2,2,3", options="header"]
+|===
+| Canonical | XLSX `Alignment.vertical` | ODS `style:vertical-align` | Notes
+
+| `top`     | `top`     | `top`     | Direct.
+| `center`  | `center`  | `middle`  | Vocabulary mismatch; the only
+                                       normalising step. Canonical uses
+                                       XLSX `center`; map to ODS `middle`
+                                       on write and back on read.
+| `bottom`  | `bottom`  | `bottom`  | Direct.
+| (default) | `None`    | `automatic` or attribute absent | Drop on read;
+                                                            do not emit
+                                                            on write.
+| (out-of-vocab) | `justify` / `distributed` | (no ODF equivalent) | Drop
+                                                                     on read;
+                                                                     never emit
+                                                                     on write.
+|===
+
+ODS read-side normalisation map (analogue of
+`_ODS_HORIZONTAL_ALIGNMENT_MAP` in
+`io_backends/ods/odf_parser.py:189`):
+
+[source,python]
+----
+_ODS_VERTICAL_ALIGNMENT_MAP: dict[str, str] = {
+    "top":    "top",
+    "middle": "center",   # the one intrinsic vocabulary remap
+    "bottom": "bottom",
+    # "automatic" and any other value: drop (not in the dict)
+}
+----
+
+XLSX read-side filter (analogue of
+`_CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX` in
+`io_backends/xlsx/openpyxl_parser.py`):
+
+[source,python]
+----
+_CANONICAL_VERTICAL_ALIGNMENTS_XLSX: frozenset[str] = frozenset(
+    {"top", "center", "bottom"}
+)
+----
+
+Render op vocabulary (`__post_init__` set on `SetVerticalAlignment`):
+the same three canonical values.
+
+== Backend differences
+
+The differences from the horizontal-alignment slice are small and
+favourable; this is the table to keep in mind when copying the pattern.
+
+[cols="1,3,3", options="header"]
+|===
+| Concern | Horizontal alignment (precedent) | Vertical alignment (this slice)
+
+| ODS carrier element
+| `style:paragraph-properties` (a *new* element that did not previously
+  exist in the renderer's style tree).
+| `style:table-cell-properties` (the element the renderer *already*
+  creates for rotation and background fill).
+| ODS write-path impact
+| Required adding `ParagraphProperties` to the imports and a new
+  conditional block in `_register_cell_style` that constructs a fresh
+  `ParagraphProperties` element.
+| Requires only extending the existing `TableCellProperties` block in
+  `_register_cell_style`. No new element type imported. Carrier-XML
+  assertion still required as defence-in-depth.
+| ODS vocabulary mismatch
+| `start` / `end` vs `left` / `right` — *locale-dependent*. Normalisation
+  on read is bidirectional: read accepts both forms, write emits absolute
+  only.
+| `middle` vs `center` — *intrinsic to ODF*, no locale dimension. One
+  bidirectional remap, no per-direction asymmetry.
+| XLSX `Alignment` composition
+| Required introducing `_merge_xlsx_alignment` to stop the second
+  alignment-touching op from clobbering the first.
+| `_merge_xlsx_alignment` already exists; the dispatcher just adds one
+  more arm.
+| Carrier-authority infrastructure
+| Required two parallel `_apply_horizontal_alignment_meta` helpers (one
+  per backend), later consolidated by
+  `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`.
+| `apply_cell_addressed_presentation_meta` already exists and is
+  family-key agnostic. One new call site per backend with
+  `family_key="vertical_alignments"`. No new shared infrastructure.
+| Cache-key shape (ODS)
+| Extended `CellStyleKey` from 3 to 4 fields by adding
+  `horizontal_alignment`.
+| Extends `CellStyleKey` from 4 to 5 fields by adding
+  `vertical_alignment`. Sentinel grows correspondingly.
+| Tests
+| New carrier-XML, new pathological repeated-cell, new composition
+  (rotation + horizontal), new stale-meta + standard roundtrip.
+| Same shape; assertion targets shift to the right element and the right
+  vocabulary; composition test expands to (rotation + horizontal +
+  vertical).
+|===
+
+== Interaction analysis
+
+* *Text orientation.* No semantic interaction. Both attributes coexist on
+  the same XLSX `Alignment` object and on the same ODS
+  `TableCellProperties` element. Composition is preserved by the existing
+  helpers. Test: a single cell with rotation + vertical alignment must
+  round-trip both.
+
+* *Horizontal alignment.* No semantic interaction. Independent attribute
+  on independent ODS carrier elements (`paragraph-properties` for
+  horizontal vs `table-cell-properties` for vertical). On XLSX, sibling
+  attributes on `Alignment`. Composition is preserved by
+  `_merge_xlsx_alignment`. Test: a cell with horizontal + vertical must
+  round-trip both.
+
+* *Existing alignment composition.* `_merge_xlsx_alignment` accepts
+  arbitrary alignment kwargs via `setattr`; adding `vertical=...` is a
+  one-line caller change. No helper-side changes needed.
+
+* *ODS style caching.* `_register_cell_style` caches styles by
+  `CellStyleKey = (bold, fill_rgb, rotation, horizontal_alignment)`. The
+  fifth field becomes `vertical_alignment`. Cardinality is small in real
+  workbooks (most cells share one of a handful of vertical-alignment
+  values). No performance concern.
+
+* *openpyxl alignment handling.* Strict vocabulary enforcement at
+  construction (`Alignment(vertical="middle")` raises `ValueError`) means
+  the XLSX render path *cannot* accidentally emit ODS-shape values, even
+  if a buggy normalisation lets one slip through. This is helpful
+  defence-in-depth and matches the project's "strict on construction"
+  preference.
+
+* *Carrier-authority helper.* No interaction beyond a new call site per
+  backend. The helper is family-key agnostic and has unit-test coverage
+  proving it (`tests/unit/io_backends/test_presentation_meta.py:286-305`
+  parametrises across the existing families; adding `vertical_alignments`
+  to the parametrised set is one-line).
+
+* *Stale-meta defect class.* Carrier-authority semantics extend
+  automatically to `vertical_alignments` the moment the new call site
+  is wired. No new latent stale-meta risk.
+
+* *Render-flow ordering.* The vertical-alignment pass joins the standing
+  order (Meta → Validation → Style → Protection → Filter → Freeze →
+  ColumnWidth → TextOrientation → HorizontalAlignment → NEW
+  VerticalAlignment → NamedRange). Order between alignment passes is not
+  load-bearing because each pass writes a distinct meta key
+  (`__horizontal_alignments` vs `__vertical_alignments`); flow builders
+  read the corresponding key and emit independent render ops.
+
+No hidden coupling identified.
+
+== Proposed first slice
+
+In scope::
+
+* New canonical metadata key `vertical_alignments` in
+  `registries/meta_registry.yaml`, classified `canonical_meta`, sibling to
+  `horizontal_alignments`. Producer/consumer lists match the
+  horizontal-alignment entry exactly except for the function names.
+* New render op
+  `SetVerticalAlignment(sheet, row, col, vertical: Literal["top", "center", "bottom"])`
+  in `src/spreadsheet_handling/rendering/plan.py`, with
+  `__post_init__` vocabulary guard against
+  `{"top", "center", "bottom"}`.
+* New rendering pass `VerticalAlignmentPass`, inserted between
+  `HorizontalAlignmentPass` and `NamedRangePass`.
+* New builder `_vertical_alignment_ops(sheet_name, sh)` in
+  `rendering/flow.py`, structurally identical to
+  `_horizontal_alignment_ops`.
+* XLSX read path: `_extract_vertical_alignments(ws)` that drops `None`
+  and any value outside `{"top", "center", "bottom"}`
+  (i.e. `justify`/`distributed` are silently dropped).
+* XLSX write path: new dispatch arm
+  `if isinstance(op, SetVerticalAlignment): _merge_xlsx_alignment(cell,
+  vertical=op.vertical)`. One line.
+* ODS read path: `_build_cell_vertical_alignment_map(doc)` walks
+  table-cell styles for `style:vertical-align`;
+  `_extract_ods_vertical_alignments(table, alignment_map, *, max_row,
+  max_col, limits)` mirrors `_extract_ods_horizontal_alignments` with
+  the same content-extent clipping and `ParserLimits` enforcement.
+* ODS write path: extend `_register_cell_style` cache key to include
+  `vertical_alignment`; set `verticalalign=<value>` on the existing
+  `TableCellProperties` element. The cache sentinel grows from
+  `(False, None, 0, None)` to `(False, None, 0, None, None)`.
+* Carrier-authority integration: one new call site per backend's
+  `parse_workbook` with `family_key="vertical_alignments"`.
+* Release-notes entry under "Spreadsheet backends and roundtrip behavior",
+  consistent with the horizontal-alignment entry.
+
+Canonical vocabulary::
+
+* `top`, `center`, `bottom`. XLSX-shaped. Same three-value pattern as
+  horizontal alignment.
+
+Backend mapping::
+
+* XLSX: identity (`top`/`center`/`bottom` on `Alignment.vertical`).
+* ODS write: emit `top` / `middle` / `bottom` on `style:vertical-align`
+  attached to the existing `TableCellProperties` element.
+* ODS read: map `top` → `top`, `middle` → `center`, `bottom` → `bottom`;
+  drop `automatic`, missing attribute, and any other value.
+
+== Deferred scope
+
+The following are explicitly out of scope for the first vertical-alignment
+slice and should *not* be bundled in:
+
+* `justify`, `distributed` — XLSX-only with no commonly used ODS
+  vertical equivalent. Defer until an adopter reports a real workflow
+  need.
+* `automatic` as a canonical value — it is a "no value" sentinel by ODF
+  design. Drop on read, never emit on write.
+* `baseline` — ODF defines `fo:vertical-align="baseline"` on
+  `style:text-properties` for inline text, not on
+  `style:table-cell-properties` for cell content. Not part of cell
+  vertical alignment.
+* Wrap text — separate Slice C from the original alignment survey, with
+  a different default-suppression rule (boolean, default `False`).
+* Per-column or per-range vertical-alignment keying. Cell-keyed
+  addressing matches the established pattern; per-column keying is the
+  same address-shape question raised (and deferred) for horizontal
+  alignment.
+* Any cross-family vocabulary unification, generic styling abstraction,
+  plugin registry, ABC, or render-flow refactor. All explicitly excluded
+  by the original concept analysis and unchanged here.
+* Behaviour for unknown values on read other than "silently drop". This
+  matches horizontal-alignment's documented behaviour; the registry
+  entry's `precedence_notes` should say so explicitly.
+
+== Test strategy
+
+Minimum test matrix, mirroring the patterns established by
+horizontal alignment and adapting the assertion targets. No XLSX-side
+repeated-cell safety is needed (openpyxl is bounded); all
+repeated-structure tests are ODS-only.
+
+[cols="1,4,2", options="header"]
+|===
+| Layer | Test | Pattern to copy
+
+| XLSX parse
+| Workbook with `vertical=top`/`center`/`bottom` produces canonical
+  metadata under `vertical_alignments`.
+| `test_xlsx_horizontal_alignments_are_parsed_into_sheet_metadata`
+
+| XLSX render
+| Frames with `_meta.sheets.<sheet>.vertical_alignments` apply the
+  correct `Alignment.vertical` value to each cell.
+| `test_xlsx_renderer_applies_horizontal_alignment_metadata`
+
+| XLSX parse-write-parse roundtrip
+| All three values survive a full roundtrip; non-alignment data is
+  unaffected.
+| `test_xlsx_horizontal_alignments_survive_parse_write_parse_roundtrip`
+
+| XLSX default suppression
+| A workbook with no `Alignment.vertical` carrier produces no
+  `vertical_alignments` entries on read.
+| `test_xlsx_default_general_alignment_is_not_emitted_into_metadata`
+
+| XLSX unsupported drop
+| `justify` and `distributed` produced by an external author are dropped
+  on read and not surfaced into canonical metadata.
+| `test_xlsx_unsupported_horizontal_values_are_dropped_on_read`
+
+| XLSX composition
+| A cell carrying rotation + horizontal alignment + vertical alignment
+  survives parse-write-parse with all three attributes intact, regardless
+  of op-dispatch order.
+| `test_xlsx_rotation_and_horizontal_alignment_coexist_on_same_cell`
+  (extend to three attributes)
+
+| ODS parse-write-parse roundtrip
+| All three values survive a render → parse → render → parse cycle on
+  both the project parser and the public `OdsBackend` facade.
+| `test_ods_horizontal_alignments_survive_render_parse_roundtrip` +
+  `test_ods_horizontal_alignments_survive_backend_roundtrip`
+
+| ODS carrier-XML assertion (required, L1 defence)
+| The rendered `content.xml` carries `style:vertical-align` on
+  `style:table-cell-properties` and *not* on
+  `style:paragraph-properties` or `style:text-properties`.
+| `test_ods_horizontal_alignment_uses_fo_text_align_on_paragraph_properties`
+  (assertion targets the opposite element)
+
+| ODS normalisation
+| Input with `style:vertical-align="middle"` reads back as canonical
+  `center`; renderer emits `middle`, not `center`, in the output XML.
+| `test_horizontal_alignment_extractor_normalizes_start_end`
+
+| ODS default suppression
+| Input with `style:vertical-align="automatic"` (or no attribute) produces
+  no `vertical_alignments` entry.
+| `test_horizontal_alignment_extractor_drops_unsupported_values`
+  (adapted)
+
+| ODS pathological repeated-cell safety
+| Sheet-wide `style:vertical-align` filler with
+  `number-rows-repeated` × `number-columns-repeated` clips to parsed
+  content extent; an implausible-repeat declaration under tightened
+  `ParserLimits` raises `SpreadsheetTooLargeError`.
+| `test_horizontal_alignment_extractor_clips_sheet_wide_filler` +
+  `test_horizontal_alignment_extractor_rejects_implausible_repeats`
+
+| Stale-meta drop (both backends)
+| File with embedded `vertical_alignments` and cleared visible carrier
+  reads back without the stale entry. Validates the carrier-authority
+  call site is wired correctly.
+| `test_xlsx_stale_embedded_alignment_is_dropped_when_carrier_is_clear` +
+  `test_horizontal_alignment_stale_embedded_meta_is_dropped_when_carrier_clear`
+
+| Helper-test parametrisation
+| Add `vertical_alignments` to the existing parametrised family-key
+  agnosticism test for `apply_cell_addressed_presentation_meta`.
+| `test_helper_is_family_key_agnostic`
+|===
+
+No new helper unit tests are required for the carrier-authority side.
+No registry-hardening test changes beyond adding the new key to the
+expected-profile dict.
+
+== Risks
+
+[cols="1,1,4,3", options="header"]
+|===
+| ID | Severity | Risk | Mitigation in the first slice
+
+| R1 | Important
+| Vocabulary mismatch silent drop: a missing or incorrect
+  `middle` ↔ `center` normalisation makes ODS-authored vertical-centre
+  cells round-trip as no metadata.
+| Mandatory normalisation test (read and write directions). Pin both
+  directions in the same test file.
+
+| R2 | Important
+| Carrier-mismatch trap (mirror of horizontal alignment's L1):
+  copy-pasting the horizontal-alignment ODS renderer would land
+  `style:vertical-align` on `style:paragraph-properties`.
+| Carrier-XML assertion test that asserts the attribute is on
+  `style:table-cell-properties` and *not* on `paragraph-properties` or
+  `text-properties`. Written at the same time as the renderer change.
+
+| R3 | Important
+| Cache-key migration in `_register_cell_style`: the cache sentinel grows
+  from 4 to 5 fields. A missed `_style_key(...)` call site or a
+  stale sentinel literal would either over-cache (rendering identical
+  styles for different alignments) or always miss the cache (creating
+  unique styles per cell).
+| Single call site for `_register_cell_style` today (in `_build_table`).
+  Migration is mechanical. Pin with a focused test that registers two
+  styles differing only in vertical alignment and asserts they get
+  distinct style names.
+
+| R4 | Important
+| openpyxl strict vocabulary: if the canonical vocabulary or the read
+  filter ever lets a non-XLSX value (e.g. `middle`) reach the XLSX
+  renderer, `Alignment(vertical=...)` will raise at write time.
+| `SetVerticalAlignment.__post_init__` guards the render op
+  construction. The XLSX dispatcher only ever passes values that already
+  passed the guard. The strict vocabulary becomes defence-in-depth, not
+  a bug source.
+
+| R5 | Watch-only
+| `automatic` is rare but real. Some ODS producers emit it explicitly to
+  mean "use the default". A naive read map that included `"automatic":
+  "center"` (or `"bottom"`) would synthesise canonical metadata that
+  never existed.
+| Drop `automatic` (and any other unmapped value) on read by omitting it
+  from `_ODS_VERTICAL_ALIGNMENT_MAP`. Focused test required.
+
+| R6 | Watch-only
+| Composition combinatorics grow: a single cell can now carry rotation,
+  horizontal alignment, and vertical alignment simultaneously. Three
+  attributes × two backends × two op-dispatch orderings is 12 combinations.
+| The XLSX merger already handles unordered composition. A single
+  composition test with all three attributes set is sufficient — testing
+  every permutation is overkill.
+
+| R7 | Watch-only
+| Style-cache growth in ODS: cardinality of `(bold, fill_rgb, rotation,
+  horizontal_alignment, vertical_alignment)` tuples in real workbooks.
+| Real workbooks use a small number of style combinations; the existing
+  cache scales fine. A sanity test that asserts the cache stays bounded
+  on a representative sheet is sufficient. Not a blocker.
+
+| R8 | Non-risk
+| Carrier-authority retrofit: was a concern pre-FTR-PRESENTATION-META-
+  CARRIER-AUTHORITY-P5. Now resolved.
+| No action. One new call site per backend; the shared helper is already
+  family-key agnostic and tested.
+|===
+
+== Recommendation
+
+*Is vertical alignment a straightforward follow-on slice?*
+
+Yes. Architecturally smaller than horizontal alignment was at the
+equivalent point in its slice, because:
+
+* the ODS carrier element (`style:table-cell-properties`) is already
+  emitted by the renderer — no new element type, no
+  `ParagraphProperties`-equivalent first-introduction;
+* the XLSX composition fix (`_merge_xlsx_alignment`) already exists —
+  no destructive-assignment workaround to introduce;
+* the carrier-authority helper already exists and is family-key
+  agnostic — one new call site per backend, no new shared module; and
+* the normalisation question (`middle` ↔ `center`) is single and
+  intrinsic, not locale-dependent like horizontal's `start`/`end`.
+
+*Is any prerequisite work required before an FTR can be drafted?*
+
+No. The architecture is ready. The patterns to copy are all in tree
+and reviewed Green. The only outstanding concept-level decision is
+whether to include `justify` / `distributed` in the first slice
+(recommendation: no, defer until an adopter need surfaces).
+
+*What should the likely FTR be called?*
+
+`FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5`.
+
+This matches the naming established by `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5`
+and the "Slice B" label used in the original alignment survey.
+Alternative `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5-VERTICAL` would also work
+but the suffix-form is heavier; the original survey called it the
+vertical-alignment *slice*, not the cell-alignment *FTR*'s second slice.
+
+*Is the architecture ready for implementation after the FTR stage?*
+
+Yes. No prerequisite refactor is needed. The likely FTR is a
+straightforward, single-commit implementation that:
+
+* adds one registry entry, one render op, one pass, one flow builder,
+  two extractors (XLSX + ODS), two write-path extensions (`Alignment`
+  kwarg + cache key + `TableCellProperties` attribute);
+* wires one new carrier-authority call site per backend;
+* adds the test matrix above (≈10 new tests + parametrise the helper
+  agnosticism test); and
+* adds one release-notes paragraph.
+
+No new shared infrastructure. No abstraction. No follow-on prerequisites
+between this slice and the wrap-text slice that the original survey
+labels as Slice C.
+
+== References
+
+Survey:
+
+* `docs/warm_storage/styling_text_alignment/alignment_semantics_survey.adoc`
+  — original three-attribute survey (proposed Slice B already)
+* `docs/warm_storage/styling_text_alignment/cell_addressed_presentation_meta_semantics.adoc`
+  — carrier-authority concept
+
+Precedent FTRs and reviews:
+
+* `docs/backlog/FTR-CELL-ALIGNMENT-ROUNDTRIP-P5.adoc` + review
+  (`218a25a` Yellow → `0416989` Green)
+* `docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc` +
+  review (`d01cb63` Yellow → `c7effc3` Green follow-up)
+* `docs/backlog/FTR-TEXT-ORIENTATION-ROUNDTRIP-P5.adoc` + review
+
+Codified lessons:
+
+* `docs/ai_info/review_instructions.adoc § Adapter read-path safety
+  checks`
+
+Code paths to copy (not redesign):
+
+* `src/spreadsheet_handling/rendering/plan.py` —
+  `SetHorizontalAlignment` (op + `__post_init__` guard)
+* `src/spreadsheet_handling/rendering/flow.py` —
+  `_horizontal_alignment_ops`
+* `src/spreadsheet_handling/rendering/passes/horizontal_alignment_pass.py`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py` —
+  `_extract_horizontal_alignments` (`:211`) and the carrier-authority
+  call site (`:84-99`)
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py` —
+  `_merge_xlsx_alignment` (`:60-77`) and the `SetHorizontalAlignment`
+  dispatch arm
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` —
+  `_build_cell_horizontal_alignment_map` and
+  `_extract_ods_horizontal_alignments`; the carrier-authority call site
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` —
+  `_register_cell_style` cache key and `TableCellProperties` usage
+  (`:120-191`)
+* `src/spreadsheet_handling/io_backends/presentation_meta.py` —
+  `apply_cell_addressed_presentation_meta` (no changes)
+* `registries/meta_registry.yaml` — `horizontal_alignments` entry shape
+
+Test patterns to copy (not redesign):
+
+* `tests/integration/io_backends/xlsx/test_horizontal_alignment_roundtrip.py`
+* `tests/integration/io_backends/ods/test_ods_display_metadata_roundtrip.py`
+  (the horizontal-alignment block, including the carrier-XML assertion)
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`
+  (horizontal-alignment pathological + stale-meta tests)
+* `tests/unit/io_backends/test_presentation_meta.py` (extend the
+  `test_helper_is_family_key_agnostic` parametrisation)
