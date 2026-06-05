@@ -133,6 +133,20 @@ class SetTextOrientation:
     rotation: int
 
 
+@dataclass(frozen=True)
+class SetHorizontalAlignment:
+    """Apply a horizontal text alignment to a specific cell (row/col 1-based).
+
+    ``horizontal`` is the project canonical encoding (XLSX-shaped) and is
+    restricted to ``"left"``, ``"center"``, or ``"right"`` in this slice.
+    Backend adapters convert to their carrier vocabulary on write.
+    """
+    sheet: str
+    row: int
+    col: int
+    horizontal: str
+
+
 RenderOp = Union[
     DefineSheet,
     SetHeader,
@@ -143,6 +157,7 @@ RenderOp = Union[
     SetFreeze,
     SetColumnWidth,
     SetTextOrientation,
+    SetHorizontalAlignment,
     AddValidation,
     WriteDataBlock,
     WriteMeta,

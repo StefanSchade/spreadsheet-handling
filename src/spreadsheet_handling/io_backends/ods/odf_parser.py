@@ -9,9 +9,9 @@ import re
 from typing import Any
 
 from odf.element import Element
-from odf.namespaces import OFFICENS, STYLENS, TABLENS, TEXTNS
+from odf.namespaces import FONS, OFFICENS, STYLENS, TABLENS, TEXTNS
 from odf.opendocument import load
-from odf.style import Style, TableColumnProperties, TableProperties
+from odf.style import ParagraphProperties, Style, TableColumnProperties, TableProperties
 from odf.table import (
     ContentValidation as OdfContentValidation,
     CoveredTableCell,
@@ -194,6 +194,122 @@ def _extract_ods_column_widths(
                         letter = _column_letters(col_index + i)
                         result[letter] = {"width": excel_width, "source": "workbook"}
         col_index += repeat
+    return result if result else None
+
+
+_ODS_HORIZONTAL_ALIGNMENT_MAP: dict[str, str] = {
+    "left": "left",
+    "center": "center",
+    "right": "right",
+    # ODS locale-neutral alignment values: in LTR locales `start` reads as
+    # `left` and `end` as `right`. Normalize on read so the canonical
+    # representation stays absolute (`left` / `right`), matching what the
+    # renderer writes.
+    "start": "left",
+    "end": "right",
+}
+
+
+def _build_cell_horizontal_alignment_map(doc) -> dict[str, str]:
+    """Return mapping {style_name -> canonical horizontal alignment}.
+
+    Reads ``fo:text-align`` from any ``style:paragraph-properties`` child of
+    a table-cell style. Out-of-vocabulary values (``justify``, etc.) are
+    dropped silently so they do not bloat canonical metadata.
+    """
+    result: dict[str, str] = {}
+    para_props_name = ParagraphProperties().qname
+    for style in doc.getElementsByType(Style):
+        if style.attributes.get((STYLENS, "family")) != "table-cell":
+            continue
+        name = style.attributes.get((STYLENS, "name"))
+        if not name:
+            continue
+        for child in style.childNodes:
+            if not isinstance(child, Element) or child.qname != para_props_name:
+                continue
+            raw = child.attributes.get((FONS, "text-align"))
+            if raw is None:
+                continue
+            canonical = _ODS_HORIZONTAL_ALIGNMENT_MAP.get(str(raw).strip().lower())
+            if canonical:
+                result[str(name)] = canonical
+                break
+    return result
+
+
+def _extract_ods_horizontal_alignments(
+    table: Element,
+    alignment_map: dict[str, str],
+    *,
+    max_row: int,
+    max_col: int,
+    limits: ParserLimits = DEFAULT_LIMITS,
+) -> dict[str, dict] | None:
+    """Return {cell_address: {horizontal, source}} for cells with a canonical
+    horizontal alignment style.
+
+    Iteration is clipped to ``max_row`` x ``max_col`` (the parsed content
+    extent) so that LibreOffice "select all + left-align" filler patterns do
+    not expand ``row_repeat`` x ``col_repeat`` into one metadata entry per
+    implied address. ``limits`` is honoured on per-axis and per-cell bases as
+    defense-in-depth against inputs that still declare implausible repeats
+    within the content extent.
+    """
+    if max_row <= 0 or max_col <= 0:
+        return None
+    result: dict[str, dict] = {}
+    table_row_name = TableRow().qname
+    table_cell_name = TableCell().qname
+    covered_cell_name = CoveredTableCell().qname
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}' horizontal alignments"
+
+    row_index = 1
+    for child in table.childNodes:
+        if not isinstance(child, Element) or child.qname != table_row_name:
+            continue
+        if row_index > max_row:
+            break
+        row_repeat = int(child.attributes.get((TABLENS, "number-rows-repeated"), 1))
+        limits.enforce(context=context, rows=row_index + row_repeat - 1)
+        effective_row_repeat = min(row_repeat, max_row - row_index + 1)
+        col_index = 1
+        for cell in child.childNodes:
+            if not isinstance(cell, Element) or cell.qname not in (table_cell_name, covered_cell_name):
+                continue
+            if col_index > max_col:
+                break
+            col_repeat = int(cell.attributes.get((TABLENS, "number-columns-repeated"), 1))
+            limits.enforce(context=context, cols=col_index + col_repeat - 1)
+            effective_col_repeat = min(col_repeat, max_col - col_index + 1)
+            if (
+                cell.qname != covered_cell_name
+                and effective_row_repeat > 0
+                and effective_col_repeat > 0
+            ):
+                style_name = cell.attributes.get((TABLENS, "style-name")) or \
+                             cell.attributes.get((STYLENS, "style-name"))
+                if style_name:
+                    canonical = alignment_map.get(str(style_name))
+                    if canonical:
+                        limits.enforce(
+                            context=context,
+                            cells=len(result)
+                            + effective_row_repeat * effective_col_repeat,
+                        )
+                        for r_off in range(effective_row_repeat):
+                            for c_off in range(effective_col_repeat):
+                                addr = (
+                                    f"{_column_letters(col_index + c_off)}"
+                                    f"{row_index + r_off}"
+                                )
+                                result[addr] = {
+                                    "horizontal": canonical,
+                                    "source": "workbook",
+                                }
+            col_index += col_repeat
+        row_index += row_repeat
     return result if result else None
 
 
@@ -681,6 +797,7 @@ def parse_workbook(
 
     col_style_map = _build_column_style_map(doc)
     rotation_map = _build_cell_rotation_map(doc)
+    horizontal_alignment_map = _build_cell_horizontal_alignment_map(doc)
     meta_changed = False
 
     for table in tables:
@@ -746,6 +863,27 @@ def parse_workbook(
                 raw_sheets[name] = raw_sheet
             if raw_sheet.get("text_orientations") != text_orientations:
                 raw_sheet["text_orientations"] = text_orientations
+                meta_changed = True
+
+        horizontal_alignments = _extract_ods_horizontal_alignments(
+            table,
+            horizontal_alignment_map,
+            max_row=parsed.max_row,
+            max_col=parsed.max_col,
+            limits=limits,
+        )
+        if horizontal_alignments:
+            sheet.meta["__horizontal_alignments"] = horizontal_alignments
+            raw_sheets = meta_payload.setdefault("sheets", {})
+            if not isinstance(raw_sheets, dict):
+                raw_sheets = {}
+                meta_payload["sheets"] = raw_sheets
+            raw_sheet = raw_sheets.setdefault(name, {})
+            if not isinstance(raw_sheet, dict):
+                raw_sheet = {}
+                raw_sheets[name] = raw_sheet
+            if raw_sheet.get("horizontal_alignments") != horizontal_alignments:
+                raw_sheet["horizontal_alignments"] = horizontal_alignments
                 meta_changed = True
 
         ir.sheets[name] = sheet

@@ -329,6 +329,131 @@ def test_display_metadata_extractors_reject_implausible_repeats(
         parse_workbook(out, limits=limits)
 
 
+def test_horizontal_alignment_extractor_clips_sheet_wide_filler(
+    tmp_path: Path,
+) -> None:
+    # Regression for FTR-CELL-ALIGNMENT-ROUNDTRIP-P5: the LibreOffice
+    # "select all + left-align" carrier pattern declares a styled-cell with
+    # near-maximum number-rows-repeated x number-columns-repeated. Without
+    # content-extent clipping, the horizontal-alignment extractor would
+    # materialize ~17e9 dict entries even though only one cell actually
+    # carries data.
+    styles_inner = (
+        '<style:style style:name="hal" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="center"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="hal"><text:p>only</text:p></table:table-cell>'
+        "</table:table-row>"
+        # Whole-sheet styled filler block.
+        '<table:table-row table:number-rows-repeated="1048575">'
+        '<table:table-cell table:style-name="hal" table:number-columns-repeated="16384"/>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "hal_filler.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    aligns = sheet.meta.get("__horizontal_alignments")
+    assert aligns == {"A1": {"horizontal": "center", "source": "workbook"}}
+
+
+def test_horizontal_alignment_extractor_rejects_implausible_repeats(
+    tmp_path: Path,
+) -> None:
+    # Defense-in-depth on the alignment extractor path: a row with real
+    # content declaring an implausible number-rows-repeated must raise
+    # before the extractor reaches it. The grid parser would also raise on
+    # the same row, but this test pins the behaviour explicitly so a future
+    # refactor cannot silently drop alignment-side enforcement.
+    styles_inner = (
+        '<style:style style:name="hal" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="left"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-row table:number-rows-repeated="500">'
+        '<table:table-cell table:style-name="hal"><text:p>data</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "hal_oversized.ods", styles_inner, spreadsheet_inner
+    )
+
+    limits = ParserLimits(max_rows=100, max_cols=100, max_cells=100_000)
+    with pytest.raises(SpreadsheetTooLargeError, match="row count 500"):
+        parse_workbook(out, limits=limits)
+
+
+def test_horizontal_alignment_extractor_normalizes_start_end(
+    tmp_path: Path,
+) -> None:
+    # ODS allows locale-neutral fo:text-align values `start` and `end`. The
+    # canonical encoding is absolute (`left` / `right`), so the extractor
+    # must normalize on read.
+    styles_inner = (
+        '<style:style style:name="hal_start" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="start"/>'
+        "</style:style>"
+        '<style:style style:name="hal_end" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="end"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="hal_start"><text:p>s</text:p></table:table-cell>'
+        '<table:table-cell table:style-name="hal_end"><text:p>e</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "hal_normalize.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "left"
+    assert aligns["B1"]["horizontal"] == "right"
+
+
+def test_horizontal_alignment_extractor_drops_unsupported_values(
+    tmp_path: Path,
+) -> None:
+    # Out-of-vocabulary alignment (`justify`) must not appear in canonical
+    # metadata; the renderer has no contract for it across backends.
+    styles_inner = (
+        '<style:style style:name="hal_justify" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="justify"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="hal_justify"><text:p>x</text:p></table:table-cell>'
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "hal_unsupported.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    sheet = ir.sheets["Sheet1"]
+    assert sheet.meta.get("__horizontal_alignments") is None
+
+
 def test_column_width_extractor_clips_sheet_wide_filler(tmp_path: Path) -> None:
     # Mirror of the text-orientation guard for the column-width extractor:
     # a sheet-wide table-column with an explicit width style must not produce

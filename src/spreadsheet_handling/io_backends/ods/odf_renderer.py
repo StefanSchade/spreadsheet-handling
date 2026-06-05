@@ -5,9 +5,16 @@ from pathlib import Path
 import re
 from typing import Any
 
-from odf.namespaces import STYLENS
+from odf.namespaces import FONS, STYLENS
 from odf.opendocument import OpenDocumentSpreadsheet
-from odf.style import Style, TableCellProperties, TableColumnProperties, TableProperties, TextProperties
+from odf.style import (
+    ParagraphProperties,
+    Style,
+    TableCellProperties,
+    TableColumnProperties,
+    TableProperties,
+    TextProperties,
+)
 from odf.table import (
     ContentValidation,
     ContentValidations,
@@ -36,6 +43,7 @@ from spreadsheet_handling.rendering.plan import (
     SetColumnWidth,
     SetFreeze,
     SetHeader,
+    SetHorizontalAlignment,
     SetSheetProtection,
     SetTextOrientation,
     WriteDataBlock,
@@ -57,6 +65,7 @@ class _BufferedCell:
     covered: bool = False
     validation_name: str | None = None
     rotation: int = 0
+    horizontal_alignment: str | None = None
 
 
 @dataclass
@@ -108,20 +117,40 @@ def _sheet_validation_name(sheet: str, index: int) -> str:
     return f"{safe}_validation_{index}"
 
 
-def _style_key(*, bold: bool, fill_rgb: str | None, rotation: int = 0) -> tuple[bool, str | None, int]:
-    return bold, fill_rgb.upper() if fill_rgb else None, rotation
+CellStyleKey = tuple[bool, str | None, int, str | None]
 
 
-def _register_cell_style(
-    doc: OpenDocumentSpreadsheet,
-    cache: dict[tuple[bool, str | None, int], str],
+def _style_key(
     *,
     bold: bool,
     fill_rgb: str | None,
     rotation: int = 0,
+    horizontal_alignment: str | None = None,
+) -> CellStyleKey:
+    return (
+        bold,
+        fill_rgb.upper() if fill_rgb else None,
+        rotation,
+        horizontal_alignment,
+    )
+
+
+def _register_cell_style(
+    doc: OpenDocumentSpreadsheet,
+    cache: dict[CellStyleKey, str],
+    *,
+    bold: bool,
+    fill_rgb: str | None,
+    rotation: int = 0,
+    horizontal_alignment: str | None = None,
 ) -> str | None:
-    key = _style_key(bold=bold, fill_rgb=fill_rgb, rotation=rotation)
-    if key == (False, None, 0):
+    key = _style_key(
+        bold=bold,
+        fill_rgb=fill_rgb,
+        rotation=rotation,
+        horizontal_alignment=horizontal_alignment,
+    )
+    if key == (False, None, 0, None):
         return None
     if key in cache:
         return cache[key]
@@ -146,6 +175,16 @@ def _register_cell_style(
                 ods_rotation = 360 - (rotation - 90)
             cell_props.attributes[(STYLENS, "rotation-angle")] = str(ods_rotation)
         style.addElement(cell_props)
+    if horizontal_alignment:
+        # fo:text-align is defined on style:paragraph-properties (cells render
+        # their value through an implicit paragraph). Placing it on
+        # style:table-cell-properties is not in the ODF schema and is ignored
+        # by LibreOffice / Calc. Absolute `left`/`right`/`center` survive
+        # locale changes on re-import; locale-neutral `start`/`end` are
+        # accepted on read but not emitted on write.
+        para_props = ParagraphProperties()
+        para_props.attributes[(FONS, "text-align")] = horizontal_alignment
+        style.addElement(para_props)
     if bold:
         style.addElement(TextProperties(fontweight="bold"))
     doc.automaticstyles.addElement(style)
@@ -361,6 +400,10 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
             sheet.ensure_cell(op.row, op.col).rotation = op.rotation
             continue
 
+        if isinstance(op, SetHorizontalAlignment):
+            sheet.ensure_cell(op.row, op.col).horizontal_alignment = op.horizontal
+            continue
+
     return [sheets[name] for name in ordered_names]
 
 
@@ -368,7 +411,7 @@ def _build_table(
     doc: OpenDocumentSpreadsheet,
     sheet: _BufferedSheet,
     *,
-    cell_style_cache: dict[tuple[bool, str | None, int], str],
+    cell_style_cache: dict[CellStyleKey, str],
     col_style_cache: dict[str, str],
     table_style_cache: dict[str, str],
     spreadsheet_validations: ContentValidations | None,
@@ -456,6 +499,7 @@ def _build_table(
                     bold=cell.bold,
                     fill_rgb=cell.fill_rgb,
                     rotation=cell.rotation,
+                    horizontal_alignment=cell.horizontal_alignment,
                 )
                 if style_name:
                     attributes["stylename"] = style_name
@@ -559,7 +603,7 @@ def _add_freeze_settings(
 def render_workbook(plan: RenderPlan, out_path: Path | str) -> None:
     """Render a backend-neutral RenderPlan to an ODS file."""
     doc = OpenDocumentSpreadsheet()
-    cell_style_cache: dict[tuple[bool, str | None, int], str] = {}
+    cell_style_cache: dict[CellStyleKey, str] = {}
     col_style_cache: dict[str, str] = {}
     table_style_cache: dict[str, str] = {}
 

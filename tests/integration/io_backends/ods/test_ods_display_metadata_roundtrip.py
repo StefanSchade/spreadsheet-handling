@@ -16,11 +16,13 @@ from spreadsheet_handling.rendering.plan import (
     DefineSheet,
     SetHeader,
     SetColumnWidth,
+    SetHorizontalAlignment,
     SetTextOrientation,
     WriteDataBlock,
 )
 
 _STYLENS = "urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+_FONS = "urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
 
 
 pytestmark = pytest.mark.ftr("FTR-TEXT-ORIENTATION-ROUNDTRIP-P5")
@@ -145,4 +147,113 @@ def test_ods_text_orientations_survive_backend_roundtrip(tmp_path):
     back = OdsBackend().read_multi(str(out), header_levels=1)
     orients = back["_meta"]["sheets"]["Data"]["text_orientations"]
     assert orients["A1"]["rotation"] == 90
+    assert back["Data"].to_dict(orient="records") == [{"Category": "alpha"}]
+
+
+# ---------------------------------------------------------------------------
+# Horizontal alignment
+# ---------------------------------------------------------------------------
+
+
+def test_ods_horizontal_alignments_survive_render_parse_roundtrip(tmp_path):
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="L"))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=2, text="C"))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=3, text="R"))
+    plan.add(SetHorizontalAlignment(sheet="Sheet1", row=1, col=1, horizontal="left"))
+    plan.add(SetHorizontalAlignment(sheet="Sheet1", row=1, col=2, horizontal="center"))
+    plan.add(SetHorizontalAlignment(sheet="Sheet1", row=1, col=3, horizontal="right"))
+    plan.add(WriteDataBlock(sheet="Sheet1", r1=2, c1=1, data=(("x", "y", "z"),)))
+
+    out = tmp_path / "alignment.ods"
+    render_workbook(plan, out)
+
+    ir = parse_workbook(out)
+    aligns = ir.sheets["Sheet1"].meta["__horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "left"
+    assert aligns["B1"]["horizontal"] == "center"
+    assert aligns["C1"]["horizontal"] == "right"
+
+
+def test_ods_horizontal_alignment_uses_fo_text_align_on_paragraph_properties(tmp_path):
+    # Carrier-level assertion: per ODF, fo:text-align is defined on
+    # style:paragraph-properties. Placing it on style:table-cell-properties or
+    # style:text-properties is not in the ODF schema and is silently ignored
+    # by LibreOffice / Calc, which would make the alignment invisible to
+    # external consumers even when our own parser round-trips it.
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="Aligned"))
+    plan.add(SetHorizontalAlignment(sheet="Sheet1", row=1, col=1, horizontal="center"))
+
+    out = tmp_path / "alignment_carrier.ods"
+    render_workbook(plan, out)
+
+    with ZipFile(out) as archive:
+        content_xml = archive.read("content.xml").decode("utf-8")
+    root = ET.fromstring(content_xml)
+
+    align_on_para = root.findall(
+        f".//{{{_STYLENS}}}paragraph-properties[@{{{_FONS}}}text-align]"
+    )
+    align_on_cell = root.findall(
+        f".//{{{_STYLENS}}}table-cell-properties[@{{{_FONS}}}text-align]"
+    )
+    align_on_text = root.findall(
+        f".//{{{_STYLENS}}}text-properties[@{{{_FONS}}}text-align]"
+    )
+
+    assert align_on_para, (
+        "fo:text-align must be on style:paragraph-properties; "
+        f"content.xml contained: {content_xml}"
+    )
+    assert not align_on_cell, (
+        "fo:text-align on style:table-cell-properties is not in the ODF schema."
+    )
+    assert not align_on_text, (
+        "fo:text-align on style:text-properties is not in the ODF schema."
+    )
+    assert align_on_para[0].attrib[f"{{{_FONS}}}text-align"] == "center"
+
+
+def test_ods_horizontal_alignment_writes_absolute_values(tmp_path):
+    # Absolute `left`/`right` survive locale changes on re-import; the
+    # renderer must not emit `start`/`end` even though ODF allows them.
+    plan = RenderPlan()
+    plan.add(DefineSheet(sheet="Sheet1", order=0))
+    plan.add(SetHeader(sheet="Sheet1", row=1, col=1, text="L"))
+    plan.add(SetHorizontalAlignment(sheet="Sheet1", row=1, col=1, horizontal="left"))
+
+    out = tmp_path / "alignment_absolute.ods"
+    render_workbook(plan, out)
+
+    with ZipFile(out) as archive:
+        content_xml = archive.read("content.xml").decode("utf-8")
+    root = ET.fromstring(content_xml)
+    para = root.findall(
+        f".//{{{_STYLENS}}}paragraph-properties[@{{{_FONS}}}text-align]"
+    )
+    assert para and para[0].attrib[f"{{{_FONS}}}text-align"] == "left"
+
+
+def test_ods_horizontal_alignments_survive_backend_roundtrip(tmp_path):
+    frames = {
+        "Data": pd.DataFrame({"Category": ["alpha"]}),
+        "_meta": {
+            "sheets": {
+                "Data": {
+                    "horizontal_alignments": {
+                        "A1": {"horizontal": "center", "source": "workbook"},
+                    }
+                }
+            }
+        },
+    }
+    out = tmp_path / "alignment_backend.ods"
+    OdsBackend().write_multi(frames, str(out))
+
+    back = OdsBackend().read_multi(str(out), header_levels=1)
+    aligns = back["_meta"]["sheets"]["Data"]["horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "center"
     assert back["Data"].to_dict(orient="records") == [{"Category": "alpha"}]

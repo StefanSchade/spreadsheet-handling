@@ -17,6 +17,7 @@ from .plan import (
     SetAutoFilter,
     SetFreeze,
     SetColumnWidth,
+    SetHorizontalAlignment,
     SetTextOrientation,
     AddValidation,
     WriteDataBlock,
@@ -25,6 +26,9 @@ from .plan import (
     SetSheetProtection,
     ApplyCellLock,
 )
+
+
+_CANONICAL_HORIZONTAL_ALIGNMENTS: frozenset[str] = frozenset({"left", "center", "right"})
 
 def apply_ir_passes(doc: WorkbookIR, passes: List[IRPass]) -> WorkbookIR:
     for p in passes:
@@ -155,6 +159,30 @@ def _text_orientation_ops(sheet_name: str, sh: SheetIR) -> list[SetTextOrientati
     return sorted(ops, key=lambda op: (op.row, op.col))
 
 
+def _horizontal_alignment_ops(sheet_name: str, sh: SheetIR) -> list[SetHorizontalAlignment]:
+    raw = sh.meta.get("__horizontal_alignments")
+    if not isinstance(raw, dict):
+        return []
+    ops: list[SetHorizontalAlignment] = []
+    for address, spec in raw.items():
+        rc = _cell_address_to_row_col(address)
+        if rc is None:
+            continue
+        row, col = rc
+        value = spec.get("horizontal") if isinstance(spec, dict) else spec
+        if not isinstance(value, str):
+            continue
+        canonical = value.strip().lower()
+        if canonical not in _CANONICAL_HORIZONTAL_ALIGNMENTS:
+            continue
+        ops.append(
+            SetHorizontalAlignment(
+                sheet=sheet_name, row=row, col=col, horizontal=canonical
+            )
+        )
+    return sorted(ops, key=lambda op: (op.row, op.col))
+
+
 def build_render_plan(doc: WorkbookIR) -> RenderPlan:
     """
     Convert the IR document into a backend-agnostic RenderPlan (sequence of RenderOps).
@@ -225,6 +253,9 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
             plan.add(op)
 
         for op in _text_orientation_ops(sheet_name, sh):
+            plan.add(op)
+
+        for op in _horizontal_alignment_ops(sheet_name, sh):
             plan.add(op)
 
         # Helper column highlighting

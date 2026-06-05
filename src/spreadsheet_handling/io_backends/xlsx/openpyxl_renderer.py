@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import io
 from pathlib import Path
@@ -23,6 +24,7 @@ from spreadsheet_handling.rendering.plan import (
     SetAutoFilter,
     SetFreeze,
     SetColumnWidth,
+    SetHorizontalAlignment,
     SetTextOrientation,
     AddValidation,
     WriteDataBlock,
@@ -51,6 +53,27 @@ def _get_ws(wb: Workbook, name: str) -> Worksheet:
     if name in wb.sheetnames:
         return wb[name]
     return wb.create_sheet(title=name)
+
+
+def _merge_xlsx_alignment(cell: Any, **overrides: Any) -> None:
+    """Update only the named alignment attributes on ``cell`` without
+    clobbering unrelated ones.
+
+    openpyxl's ``cell.alignment = Alignment(text_rotation=...)`` replaces the
+    entire Alignment record, so two render ops that each touch one alignment
+    attribute would silently overwrite each other. This helper copies the
+    existing Alignment and applies overrides via ``setattr``, leaving every
+    other attribute intact. Both snake_case (``text_rotation``) and openpyxl
+    camelCase (``textRotation``) override names are accepted.
+    """
+    current = cell.alignment
+    if current is None:
+        cell.alignment = Alignment(**overrides)
+        return
+    merged = copy.copy(current)
+    for name, value in overrides.items():
+        setattr(merged, name, value)
+    cell.alignment = merged
 
 
 def _write(ws: Worksheet, row: int, col: int, value: Any) -> None:
@@ -332,7 +355,16 @@ def _execute_render_op(
 
     if isinstance(op, SetTextOrientation):
         ws = _get_ws(wb, op.sheet)
-        ws.cell(row=op.row, column=op.col).alignment = Alignment(text_rotation=op.rotation)
+        _merge_xlsx_alignment(
+            ws.cell(row=op.row, column=op.col), text_rotation=op.rotation
+        )
+        return
+
+    if isinstance(op, SetHorizontalAlignment):
+        ws = _get_ws(wb, op.sheet)
+        _merge_xlsx_alignment(
+            ws.cell(row=op.row, column=op.col), horizontal=op.horizontal
+        )
         return
 
 

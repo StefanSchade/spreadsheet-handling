@@ -6,6 +6,7 @@ from ._base import IRPass
 from .column_width_pass import ColumnWidthPass
 from .filter_pass import FilterPass
 from .freeze_pass import FreezePass
+from .horizontal_alignment_pass import HorizontalAlignmentPass
 from .meta_pass import MetaPass
 from .named_range_pass import NamedRangePass
 from .protection_pass import ProtectionPass
@@ -25,6 +26,7 @@ def default_passes() -> list[IRPass]:
         FreezePass(),
         ColumnWidthPass(),
         TextOrientationPass(),
+        HorizontalAlignmentPass(),
         NamedRangePass(),
     ]
 
@@ -49,6 +51,7 @@ __all__ = [
     "ColumnWidthPass",
     "FilterPass",
     "FreezePass",
+    "HorizontalAlignmentPass",
     "IRPass",
     "MetaPass",
     "NamedRangePass",
