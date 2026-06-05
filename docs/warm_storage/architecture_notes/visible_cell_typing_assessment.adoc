@@ -1,0 +1,325 @@
+= Visible cell typing: architecture-decision assessment
+:toc: left
+:toclevels: 2
+:sectnums:
+
+Author:: Architecture review input for
+`docs/backlog/FTR-VISIBLE-CELL-TYPING-STRATEGY-P5.adoc`.
+Date:: 2026-06-05
+Status:: Concept material. Decision-focused. Not an FTR draft and not an
+implementation review.
+Source FTR:: `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` (Cutline 0.2:
+Semantic Decisions — self-declared `0.2.0` release-readiness gate).
+
+== Files read
+
+* `docs/backlog/FTR-VISIBLE-CELL-TYPING-STRATEGY-P5.adoc` (in full)
+* `docs/backlog/FTR-PAYLOAD-SEMANTICS-RECOVERY-P5.adoc` (header + purpose)
+* `docs/backlog/_ftrs_open.adoc` (Cutline 0.2 section)
+* `registries/meta_registry.yaml` (entries
+  `cell_codecs`, `sparse_defaults`, `compact_multiaxis`)
+
+== Code paths inspected
+
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py:138-142`
+  — XLSX visible payload is forced to `str(val) if val is not None
+  else ""` at the table-block boundary. openpyxl has already typed the
+  cell (int / float / datetime / bool); the project actively discards
+  that typing.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:91-102` —
+  ODS `_cell_value` reads `office:value-type`
+  (`string` / `float` / `boolean` / `date` / `time`), uses it to
+  resolve the carrier value field, and *then* immediately collapses
+  the result to `str(...)`. The carrier holds the type; the parser
+  discards it.
+
+The string contract is therefore not "the carrier didn't tell us" — it
+is "we deliberately collapse at our boundary." That is an
+architecturally significant property worth naming.
+
+== Questions
+
+=== 1. Is the current "visible values remain strings" strategy still the correct choice?
+
+Yes for `0.2.0`, with the caveat below.
+
+The single named pain point (worldbuilding `sequence_no: 1` → `"1"`) is
+real but does not justify a typed-IR redesign at this stage. The
+project has shipped four presentation-metadata families on top of the
+string substrate without the string contract being load-bearing in
+their design. No existing FTR depends on typed visible values. The
+risk side of the FTR ("a premature adoption could become a large
+functional endeavor and endanger stability ahead of the upcoming
+release") is correct as stated.
+
+The caveat is recommendation C below: keep strings but record an
+explicit migration path so the decision is reversible without
+regret.
+
+=== 2. What architectural benefits does the current approach provide?
+
+* *Single boundary at which type information is lost.* Both backends
+  collapse to `str` at the same point. The IR has no type field to
+  keep synchronised between adapters.
+* *No backend can carry a richer typed model than the other.* The
+  carrier-mismatch trap that bit text orientation (B1) and horizontal
+  alignment (L1) cannot recur at the value-typing layer because there
+  is no typed contract for the backends to diverge on.
+* *Domain semantics live in the opt-in `cell_codecs` family,
+  separate from substrate semantics.* The registry already encodes
+  the right shape: codecs are workbook-level, transform-keyed, and
+  explicitly classified as `canonical_meta` with
+  `roundtrip_relevance: preserves configured codec mode`. Typing is
+  available *where the project knows what it means*, not as a
+  universal claim.
+* *Trivially testable equivalence.* String-equality is decidable;
+  cross-backend round-trip tests stay shallow.
+* *Defers the locale problem.* Numeric parsing is locale-sensitive
+  (`"1,234.5"` vs `"1.234,5"`). The current model never encounters
+  it; an inferential typed model cannot avoid it.
+
+=== 3. What architectural costs does the current approach impose?
+
+* *Lossy at the spreadsheet → JSON boundary.* Numeric workbook input
+  loses its type on round-trip when no codec is configured.
+* *Discarded information at the ODS boundary.* `_cell_value` reads a
+  typed carrier and collapses it. Even without typed IR semantics,
+  the discarded `office:value-type` could in principle be preserved
+  as carrier-side metadata (read-path hint) without disturbing the
+  string substrate.
+* *Downstream users must learn the contract.* Without explicit
+  documentation, consumers can assume type preservation that the
+  project does not guarantee.
+* *Forces consumers to handle typing per-domain.* Anyone who needs
+  typed JSON must configure a codec or post-process — a real cost
+  on first use, but a one-time cost per consumer.
+
+=== 4. Which future capabilities become harder if visible values remain strings?
+
+* Out-of-the-box typed JSON roundtrip (no codec configuration).
+* Boolean and datetime preservation as native types.
+* Generic validation built on top of typed cell values
+  (range checks, datetime formatting).
+* Any feature that reasons about the *type of an empty cell*
+  (numeric `0`-default vs blank string).
+
+None of these are on the current roadmap.
+
+=== 5. Which future capabilities become harder if visible typing is introduced now?
+
+* *Carrier-mismatch debugging.* openpyxl's `cell.data_type` and
+  odfpy's `office:value-type` infer differently for the same input;
+  real workbooks mix types within a column; "`""`" vs `None` vs `0`
+  becomes a decision per backend.
+* *Locale-aware numeric parsing.* Out of stated scope but unavoidable
+  in real adoption.
+* *IR ripple effects.* Every consumer of `table.data`
+  (DataFrames, JSON, validation, transformations) needs to know
+  whether values are typed or stringified, with a backwards-
+  compatibility flag for old callers. The presentation-metadata
+  pattern that has worked so well (opt-in, sheet-local, registry-
+  declared) does not transfer cleanly to the substrate.
+* *Migration risk to existing consumers.* Today they call
+  `str(val)`; tomorrow they may receive `int` and crash on string
+  operations.
+
+=== 6. Does the project currently show any real pressure that would justify typed visible values?
+
+Limited. One concrete signal:
+
+* The worldbuilding adoption (Adoption-001) hit the
+  `sequence_no: 1` → `"1"` case during JSON round-trip. One adopter,
+  one case.
+
+Counter-signal:
+
+* The recent six FTRs (text orientation, cell alignment, carrier
+  authority, vertical alignment) all shipped without typed-value
+  requirements. The hardest review findings (B1 stale-meta classes,
+  carrier-mismatch traps, repeated-cell memory explosion) are
+  *substrate-independent*. Adding visible typing now would not have
+  prevented any of them.
+
+The pressure is documented in the FTR but is not load-bearing for
+`0.2.0`.
+
+=== 7. Is there evidence that current users, current features, or current roadmap items would benefit from visible typing?
+
+* *Current users:* one adopter has reported the symptom; no
+  recurring pattern across adopters.
+* *Current features:* the `cell_codecs` registry entry already
+  provides opt-in typing where it matters. No shipped feature needs
+  more than that.
+* *Roadmap:* Phase 3d (Consumer Ergonomics) is about *projection*
+  management, not value typing. Phase 4 (Semantic and Metadata
+  Stabilization) is about metadata meaning, not substrate type.
+  Neither phase produces a hard requirement for typed visible cells.
+* `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` (exploratory, sibling) is the
+  most relevant adjacent item, and it explicitly says it "does not
+  implement a typing system." It addresses payload semantics on a
+  per-attribute, recovery/pinning basis. That is a *different*
+  contract than universal value typing.
+
+No evidence justifies opening visible typing as a slice now.
+
+=== 8. Does the current registry / metadata / carrier architecture naturally support postponing this decision?
+
+Yes. Three observations:
+
+* The registry has a vacant slot exactly the right shape: a future
+  `cell_types` or `payload_types` family classified as
+  `canonical_meta` would slot in next to `cell_codecs` and
+  `sparse_defaults` without touching the existing four
+  presentation-metadata families.
+* The carrier-authority helper
+  (`apply_cell_addressed_presentation_meta`) is family-key
+  agnostic. A future typing family would reuse the same helper
+  with no infrastructure change. That match has already been
+  demonstrated four times.
+* The substrate is honest: `table.data` is `list[list[str]]` in
+  practice. There is no half-typed legacy to undo if typing is
+  introduced later.
+
+=== 9. What migration path would remain available if typed visible values become necessary later?
+
+Several, ordered by least to most disruptive:
+
+. *Carrier-type preservation as read-path hint.* Both parsers
+  record `cell.value_type` / `cell.data_type` per address as a
+  `read_path_hint` family. Substrate stays stringified; consumers
+  who want typing read the hint. Structurally identical to the
+  presentation-metadata pattern.
+. *Codec-driven typing.* Extend `cell_codecs` (or add an
+  `int_codec` / `bool_codec` sibling) so a workbook can declare
+  "this column is int". Already the project's pattern; opt-in by
+  consumer.
+. *Frame-level type hints.* Columns declare type at the frame
+  boundary (matches DataFrame mental model). Independent of cell
+  carrier.
+. *Typed IR substrate.* `table.data` becomes
+  `list[list[CellValue]]` where `CellValue` is a union. Disruptive;
+  reserved for the case where the first three are demonstrably
+  insufficient.
+
+The presence of multiple non-disruptive migration paths is the
+strongest argument that postponing is safe.
+
+=== 10. Is there any hidden technical debt accumulating by postponing visible typing?
+
+Two small, fixable items — neither is debt that grows with time:
+
+* *Discarded ODS carrier type.* `_cell_value` reads
+  `office:value-type` and throws it away. If the project ever wants
+  carrier-type preservation, the ODS read path needs a small
+  change. The XLSX side reads the same information via openpyxl's
+  cell object. Neither change is large.
+* *Implicit user contract.* The string contract is not yet
+  documented for users. That is exactly what the FTR is supposed to
+  fix. Once documented, debt stops accumulating regardless of which
+  option is chosen.
+
+There is *no* compounding debt in the IR substrate, the registry,
+or the carrier layer.
+
+=== 11. Are there alternative strategies between the two extremes?
+
+Yes. The realistic options are not a binary:
+
+[cols="1,3,3", options="header"]
+|===
+| Option | Shape | Cost
+
+| Status quo (A)
+| Strings everywhere; opt-in `cell_codecs` for domain typing
+| Zero
+| Strings + carrier-type read hint
+| Substrate stays stringified; parsers preserve carrier type as a
+  registry-declared `read_path_hint` family
+| One small parser change per backend; one registry entry
+| Strings + frame-level type hints
+| Columns declare type at frame boundary; consumers opt in
+| Schema-shaped; needs a contract decision
+| Strings + per-column codecs
+| `cell_codecs` extended with column scopes; one codec per logical
+  column
+| Existing registry entry grows; no IR change
+| Typed IR (B)
+| `table.data` carries `CellValue` union
+| IR redesign; backwards-compat shim; cross-backend type inference
+  semantics; locale rules
+|===
+
+The middle three are all "strings at the substrate, typing as
+optional metadata" — i.e. variations on the project's existing
+opt-in metadata pattern.
+
+=== 12. Which decision would you recommend today?
+
+*C — Keep visible values as strings, and record a migration strategy.*
+
+Not A, because the FTR risk section is correct that the topic
+must not silently disappear from project planning, and the
+discarded ODS carrier type is small enough to be worth naming
+explicitly as a future option.
+
+Not B, because there is no compounding architectural pressure, no
+recurring adopter signal, no roadmap dependency, and the recent
+six-FTR run shipped Green without typed substrate.
+
+C is the smallest commitment consistent with both:
+
+* the FTR's own discussion note ("0.2.0 formally adopts a
+  string-based visible-cell contract while collecting operational
+  experience"); and
+* the FTR's own acceptance criterion that "the topic cannot
+  silently disappear from project planning."
+
+The migration strategy does not need to be implemented now. It
+needs to be *written* — one paragraph in the FTR's body or release
+notes naming the carrier-type-preservation hint, the codec-extension
+path, and the frame-level type-hint path as the three documented
+options for reopening, with their relative disruption ranked.
+
+== Triggers for re-opening
+
+The topic should be re-opened (a successor FTR drafted, the migration
+strategy chosen) when *any* of the following becomes true:
+
+. A second independent adopter reports the same shape of pain
+  (numeric or boolean round-trip loss without an obvious codec
+  solution).
+. A roadmap item depends on typed visible values
+  (none today; would have to come from the consumer-ergonomics or
+  semantic-stabilization phases).
+. The `cell_codecs` family proves insufficient for a real recurring
+  use case (signal: codec configuration becomes copy-paste boilerplate
+  across adopters).
+. A measurable validation gap appears that is currently filled by
+  ad-hoc per-consumer type-coercion code, and the cost of the
+  ad-hoc fix exceeds the cost of preserving carrier-type metadata.
+. A locale-related bug surfaces that a typed model would have
+  prevented (unlikely without an inferential typed model, but worth
+  watching).
+
+None of these signals are present today. The status quo is the right
+call for `0.2.0`. Documenting the migration paths makes it the right
+call without lock-in.
+
+== Recommendation summary
+
+[cols="1,4", options="header"]
+|===
+| Choice | Rationale
+
+| *C* — Keep strings; record a migration strategy
+| Architecture is sound; no pressure justifies a redesign; the carrier
+  already provides the information needed for a future preservation
+  path; the FTR's own acceptance criterion requires a visible
+  tracking mechanism. Migration paths are non-disruptive and
+  enumerable today.
+|===
+
+The FTR should land with option C selected and a short
+"Migration strategy" section enumerating the three non-disruptive
+paths (carrier-type read hint, codec extension, frame-level type
+hint) so that any future re-opening starts from a documented baseline.

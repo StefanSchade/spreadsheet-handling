@@ -1,0 +1,198 @@
+=== ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE -- Visible spreadsheet payload is a string substrate; typing is opt-in metadata
+
+Status: accepted
+Date: 2026-06-05
+Related backlog: FTR-VISIBLE-CELL-TYPING-STRATEGY-P5
+Related ADRs: ADR-003 (IR layer), ADR-004 (Meta as persistent and mergeable
+configuration), ADR-META-BLOB-SERIALIZATION
+Related FTRs: FTR-PAYLOAD-SEMANTICS-RECOVERY-P5 (exploratory; per-attribute
+recovery/pinning contract, not a typing system)
+Architectural assessment input::
+`docs/warm_storage/architecture_notes/visible_cell_typing_assessment.adoc`
+
+==== Context
+
+`FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` was a self-declared `0.2.0`
+release-readiness gate ("Cutline 0.2: Semantic Decisions"). It required
+the project to take an explicit position on how visible spreadsheet
+payload cells participate in roundtrips.
+
+Both backend parsers force visible payload to text at their table-block
+boundary:
+
+* XLSX (`io_backends/xlsx/parser_interpretation.py`) calls
+  `str(val) if val is not None else ""` for every cell.
+* ODS (`io_backends/ods/odf_parser.py`) reads `office:value-type`
+  (`string` / `float` / `boolean` / `date` / `time`), uses it to
+  resolve the carrier value field, and immediately collapses the
+  result to `str(...)`.
+
+The carrier therefore *does* hold value-type information. The project
+deliberately collapses it at its substrate boundary. This is an
+architecturally significant property: the string contract is a chosen
+narrowness, not a forced ignorance.
+
+The motivating concrete pain point was a single adopter case
+(worldbuilding repository, Adoption-001): a JSON → workbook → JSON
+roundtrip returned `"sequence_no": 1` as `"sequence_no": "1"`.
+
+==== Decision
+
+Visible spreadsheet payload is a *string substrate*. Both backend
+parsers continue to stringify cell payload at the table-block
+boundary; the IR's `table.data` is `list[list[str]]` in practice.
+
+Typing is an *opt-in metadata concern*, layered on top of the
+substrate via the registry-declared `cell_codecs` family (and any
+future per-attribute typing families). The substrate itself stays
+neutral.
+
+This decision is recorded as an architectural position, not as
+implementation work. No code change is required; the parsers already
+honour it.
+
+==== Alternatives Considered
+
+. *Typed visible-cell IR substrate.* Rejected.
+  `table.data` would carry a `CellValue` union; every downstream
+  consumer (DataFrames, JSON, validation, transformations) would
+  need to know whether values are typed or stringified.
+  Backend type inference is asymmetric (openpyxl's `cell.data_type`
+  vs odfpy's `office:value-type`); real workbooks mix types within a
+  column; locale-aware numeric parsing becomes unavoidable.
+  No present pressure justifies the IR ripple effects.
+
+. *Frame-level type hints (column-typed at the frame boundary).*
+  Deferred, not rejected. A future migration option (see
+  "Migration strategy" below). Not adopted now because no roadmap
+  item requires it and the `cell_codecs` family already supports
+  per-column typing where it is needed.
+
+. *Codec-only typing without substrate change* (status quo, made
+  explicit). Adopted as the default path: where a consumer needs
+  typed JSON / native booleans / datetime preservation, they declare
+  a codec via `cell_codecs`. The registry entry already exists,
+  classified as `canonical_meta`, with documented producer/consumer
+  surfaces.
+
+. *Carrier-type preservation as read-path hint* (no substrate
+  change, parsers record `cell.value_type` / `cell.data_type` per
+  address as a registry-declared `read_path_hint` family).
+  Deferred, not rejected. A non-disruptive migration option (see
+  "Migration strategy"). Not adopted now because there is no shipped
+  consumer for the hint, and writing carrier metadata that nobody
+  reads accumulates surface without value.
+
+==== Rationale
+
+The architectural benefits of the chosen position are concrete and
+verifiable in the codebase today:
+
+* *Single boundary at which type information is lost.* Both
+  backends collapse to `str` at the same point. The IR has no type
+  field to keep synchronised between adapters.
+
+* *No backend can carry a richer typed model than the other.* The
+  carrier-mismatch trap class (text-orientation B1, horizontal-
+  alignment L1) cannot recur at the value-typing layer because no
+  typed contract exists for the backends to diverge on.
+
+* *Domain semantics live in opt-in metadata families, separate from
+  substrate semantics.* `cell_codecs` carries domain typing where
+  it is meaningful. The substrate stays neutral. This matches
+  ADR-004's "Meta as persistent and mergeable configuration"
+  posture.
+
+* *Trivially testable equivalence.* String-equality is decidable;
+  cross-backend round-trip tests stay shallow. The recent
+  presentation-metadata FTR sequence (text orientation, horizontal /
+  vertical alignment, carrier authority) shipped Green without any
+  test depending on typed substrate.
+
+* *Avoids the locale problem.* Numeric parsing is locale-sensitive
+  (`"1,234.5"` vs `"1.234,5"`). The current model never encounters
+  it; an inferential typed model cannot avoid it.
+
+The single named pain point (one adopter, one case) does not
+justify the disruption that a typed IR redesign would entail. The
+sibling exploratory FTR `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`
+explicitly disclaims being a typing system; it addresses payload
+semantics on a per-attribute, recovery/pinning basis. That is a
+*different* contract than universal value typing and is the right
+home for the worldbuilding signal if it recurs.
+
+==== Migration strategy
+
+The project records three non-disruptive migration paths so that the
+decision is reversible without lock-in. None of these requires
+changing the IR substrate.
+
+. *Carrier-type preservation as read-path hint.* Both parsers
+  already read `cell.value_type` (ODS) / `cell.data_type` (XLSX);
+  preserving that as a registry-declared `read_path_hint` family
+  keyed by cell address is the smallest possible step toward
+  typed roundtrip. The substrate stays stringified; consumers that
+  want typing read the hint. The shared carrier-authority helper
+  (`apply_cell_addressed_presentation_meta`) is family-key agnostic
+  and would extend with no infrastructure change.
+
+. *Codec extension.* Extend `cell_codecs` (or add a sibling
+  `int_codec` / `bool_codec` family) so a workbook declares "this
+  column is int". Already the project's pattern; opt-in by consumer;
+  no IR ripple. This is the path consumers should use *today* when
+  they need typed JSON for known columns.
+
+. *Frame-level type hints.* Columns declare type at the frame
+  boundary (matches DataFrame mental model). Independent of cell
+  carrier. The most adopter-visible of the three but still leaves
+  the IR substrate as strings.
+
+The most disruptive option — a typed IR substrate — is reserved for
+the case where all three above prove demonstrably insufficient. No
+present evidence suggests that case.
+
+==== Revisit criteria
+
+The decision should be re-opened (a successor FTR drafted, the
+migration strategy chosen) when *any* of the following becomes true:
+
+* A second independent adopter reports the same shape of pain
+  (numeric or boolean round-trip loss without an obvious codec
+  solution).
+* A roadmap item depends on typed visible values. None exists
+  today; the signal would come from the consumer-ergonomics or
+  semantic-stabilization phases.
+* The `cell_codecs` family proves insufficient for a recurring
+  use case (signal: codec configuration becomes copy-paste
+  boilerplate across adopters).
+* A measurable validation gap appears that is currently filled by
+  ad-hoc per-consumer type-coercion code, and the cost of the
+  ad-hoc fix exceeds the cost of carrier-type preservation.
+* A locale-related bug surfaces that an inferential typed model
+  would have prevented.
+
+None of these signals is present at the time of acceptance.
+
+==== Consequences
+
+* The user-facing contract is: visible spreadsheet payload is text.
+  Consumers requiring typed JSON / native booleans / datetime
+  preservation declare a codec via `cell_codecs`.
+
+* The ODS parser's discarded `office:value-type` is a *named option
+  for future preservation*, not a latent bug. It is the natural
+  starting point for the read-path-hint migration if reopened.
+
+* The four shipped presentation-metadata families (`column_widths`,
+  `text_orientations`, `horizontal_alignments`,
+  `vertical_alignments`) remain orthogonal to this decision: they
+  describe presentation, not payload value. The shared
+  carrier-authority helper continues to be family-key agnostic.
+
+* Release notes record the contract under "Known limitations" for
+  `0.2.0`, satisfying the FTR's acceptance criterion that "users
+  can determine whether type preservation is guaranteed."
+
+* `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` is closed by this ADR. No
+  implementation work follows. The FTR moves to
+  `docs/cold_storage/backlog/ftrs_done/`.
