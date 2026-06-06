@@ -1,0 +1,252 @@
+= Project Decision: FTR-DYNAMIC-FRAME-PROJECTION-P5
+:toc:
+:toclevels: 2
+
+[cols="1,3"]
+|===
+| Type      | Project-decision artifact (read-only).
+| Outcome   | *Adopt Option C as the baseline + a minimal Option-B-style surface.* Implement in a separate follow-up slice; record the slice as `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` (working title). Plugins remain importable through one release cycle.
+| Inputs    | `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-P5.adoc`, `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-P5_alignment_review.adoc`, `docs/backlog/FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5.adoc`, `docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`, worldbuilding plugin source under `worldbuilding/plugins/`, core pipeline-step infrastructure under `core/src/spreadsheet_handling/`.
+| Modifies  | This file only. No code, test, registry, release-notes, or other FTR change is performed by this artifact.
+| Date      | 2026-06-06
+|===
+
+== Executive summary
+
+The FTR's Acceptance Criteria require *a recorded project decision* and a *documented architectural direction*; they do not require implementation in this slice ("No implementation commitment" is a Non-Goal). This artifact discharges those criteria.
+
+The project decision is to adopt *Architectural Option C* (consume the column-role classification provided by `FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5`) with a *minimal Option-B-style declarative surface* on top -- specifically, one new pipeline step `project_by_role` with `direction: outbound | inbound`. Consumer plugins are *not* the long-term recommended solution; the worldbuilding workaround should be migrated to the core step. The migration is staged: the plugin functions remain importable for one release cycle while the YAML moves to the core step. Implementation is *not* in this slice; it is delegated to a follow-up implementation FTR.
+
+This decision respects the foundation FTR (no parallel role taxonomy introduced) and the FTR boundary with `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` (no targeting / selector work).
+
+== Decision (recorded)
+
+* *Architectural Option chosen:* *Option C (Consume the Foundation Classification)*, with a minimal *Option B (Add Projection Ergonomics)* surface on top. The "what" comes from the foundation FTR; the "how" is one new pipeline step.
+* *Option A (Keep Plugins) is rejected as the long-term answer.* It remains the *interim* answer until the implementation slice ships, but is not the recommended end state. The driver review (`review_dynamic_projection_analysis.adoc`, §1) records that the same role partition is reconstructed at four consumer pipeline points using positional parameters for facts the framework already knows; that pattern recurs and benefits from framework-level support.
+* *Consumer plugins are not the recommended end-state solution* for the worldbuilding matrix surfaces. They remain the interim solution and remain valid as a *general extensibility mechanism*; only the specific projection plugins are slated for migration.
+
+== Architectural direction (concrete)
+
+The direction below is the brief that the implementation FTR (see "Implementation slice plan") inherits. It is not itself the implementation contract; the slice owns its own design review.
+
+=== Where the projection surface lives
+
+* A *new dedicated pipeline step* `project_by_role`, registered in `core/registries/pipeline_step_registry.json`, implemented under `core/src/spreadsheet_handling/domain/...` next to the existing role-touching transforms (`contract_xref`, `expand_xref`, `join_frames`).
+* The step is *backend-neutral*: it operates on Frames and meta; it does not know XLSX or ODS. Per the FTR-slicing rules in `docs/developer_guide/ch08_git_and_workflow/01_git_and_workflow.adoc` ("Backend parity"), no asymmetry between adapters is introduced.
+
+Rationale for a dedicated step (not folded into `configure_workbook_view`):
+
+* `configure_workbook_view` is render-side; projection runs symmetrically on the reimport path too (the inbound mirror). A render-side home cannot serve the inbound direction without overloading the view step's semantics.
+* The foundation FTR's *Future Design Pressure (Non-Scope)* requires that `display_helper` semantics are positional-neutral; co-locating projection with the view step risks re-introducing positional assumptions.
+
+=== Step signature (sketch, not contract)
+
+[source,python]
+----
+def project_by_role(
+    frames,
+    *,
+    frame: str,
+    direction: Literal["outbound", "inbound"] = "outbound",
+    helper_columns: Sequence[str] | None = None,   # explicit override
+    key_columns: Sequence[str] | None = None,      # explicit override
+    role_order: Sequence[Literal["display_helper", "row_identity", "matrix_value"]] | None = None,
+):
+    """Apply role-based projection to `frame`.
+
+    Roles are resolved from existing metadata sources (see "Role-source
+    resolution" below). Explicit parameters override the resolved values
+    and are intended primarily as an interim affordance until the
+    foundation FTR's metadata channel ships.
+    """
+----
+
+* No selector syntax. No wildcard grammar. `role_order` is an *enumeration of three role names*; `matrix_value` always appears (it is the rest-by-exclusion on this projected surface, per the foundation FTR's narrowed definition).
+* `direction` is the only non-trivial knob; the symmetric pair is encoded by a single step type rather than two step types, because both consume the same role classification.
+
+=== YAML surface
+
+Two illustrative invocations (the *Examples* section of the FTR is the canonical reference; this is the same surface phrased for the worldbuilding case):
+
+[source,yaml]
+----
+# Outbound: render matrix view
+- step: project_by_role
+  frame: story_cast_cells
+  direction: outbound
+  # role_order defaults to [display_helper, row_identity, matrix_value]
+----
+
+[source,yaml]
+----
+# Inbound: reduce matrix payload back to canonical contract_xref input
+- step: project_by_role
+  frame: story_cast_cells
+  direction: inbound
+----
+
+No `helper_columns` / `key_columns` parameters are needed in the worldbuilding case: `configure_workbook_view` already declares `helper_columns: [title]` and `contract_xref` already declares `row_keys: [story_id]`. The explicit parameters exist for edge cases and for testability.
+
+=== Outbound semantics (deterministic)
+
+* Retain `row_identity ∪ display_helper ∪ matrix_value`.
+* Default order: `display_helper`, then `row_identity`, then `matrix_value` (the worldbuilding rendering). The order is configurable via `role_order` but the *default* is what removes the worldbuilding plugin's call sites.
+* Within a role, columns appear in the order they appear on the input frame; `project_by_role` does not impose alphabetic or any other intra-role ordering.
+
+=== Inbound semantics (symmetric)
+
+* Retain `row_identity ∪ matrix_value`.
+* Drop `display_helper`.
+* Order: `row_identity` first (so that the downstream `expand_xref` can read keys), then `matrix_value` in input order.
+* This is the role-based statement of what `build_story_cast_matrix_payload` does today (`worldbuilding/plugins/story_cast_views.py`).
+
+=== Role-source resolution
+
+Until the foundation FTR's metadata channel ships in code, `project_by_role` *computes* the role classification by reading existing scattered sources:
+
+* `row_identity`: explicit `key_columns` parameter, else `row_keys` declared on `contract_xref` for the same `frame`, else the columns that the FK-relation policy treats as the natural key.
+* `display_helper`: explicit `helper_columns` parameter, else `helper_columns` declared on `configure_workbook_view`, else the FK-helper `derived` provenance entries under `_meta.derived.sheets.<frame>.helper_columns`.
+* `matrix_value`: everything else on the projected frame (the foundation FTR's narrowed rest-by-exclusion, scoped to this projected matrix / view surface).
+
+This is *computed* role classification, not *consumed* role classification. The decision is to ship Computed first; once the foundation FTR's first code slice lands a unified channel (e.g. `_meta.derived.sheets.<frame>.column_roles`), `project_by_role` switches its source of truth without surface change. This is explicitly recorded in the implementation FTR's coordination notes.
+
+=== Backend neutrality
+
+* Projection runs on the Frame layer; no XLSX or ODS code paths are touched. Backend parity is trivially satisfied per the slicing rules.
+
+== Worldbuilding-case evaluation
+
+Refined-FTR Acceptance Criterion: "The worldbuilding use case is evaluated, expressed in terms of the foundation FTR's role taxonomy. The evaluation explicitly covers *both* outbound projection and the inbound mirror."
+
+=== Outbound (`build_story_cast_matrix_view`)
+
+* Roles on the projected `story_cast_cells` surface, per the driver review §1:
+** `display_helper`: `title`.
+** `row_identity`: `story_id`.
+** `matrix_value`: the dynamic per-character columns (set grows with the cast).
+* Current behavior: outbound plugin orders `[helpers] + [keys] + [remaining]`.
+* `project_by_role(frame=story_cast_cells, direction=outbound)` produces exactly that ordering with the default `role_order`.
+* Conclusion: *the plugin is replaceable.*
+
+=== Inbound (`build_story_cast_matrix_payload`)
+
+* Current behavior: inbound plugin drops `display_helper`, retains `row_identity ∪ matrix_value` so `expand_xref` can read the matrix back.
+* `project_by_role(frame=story_cast_cells, direction=inbound)` produces exactly that retention with the default semantics.
+* Conclusion: *the plugin is replaceable.*
+
+=== Adjacent functions (not in this FTR's scope, recorded only)
+
+* `add_from_legend_constraints_for_matrix` (`worldbuilding/plugins/matrix_meta.py`): targeting; belongs to `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`.
+* `ensure_frame_columns`, `drop_columns`, `strip_trailing_header_separator`, `keep_frames`: per the driver review §3, these are degenerate-static or unrelated-tidy-up utilities and do *not* motivate framework change here.
+
+== Plugin disposition (recommendation)
+
+* *`build_story_cast_matrix_view` and `build_story_cast_matrix_payload`*: keep importable, switch YAML to the core step in the implementation slice. Mark as candidates for removal *one release cycle after* the core step lands. Rationale: the worldbuilding consumer must not regress at the same commit that introduces the new core surface; rollback is one YAML edit if the core step has a bug.
+* *Adjacent worldbuilding plugins* (those listed under "Adjacent functions" above): *unchanged*. They are outside this FTR's scope.
+* *Consumer-plugin mechanism in general*: *retained*. Only the two named projection plugins are slated for migration. The FTR's *Non-Goal* "No removal of plugin support" is honored.
+
+== Implementation slice plan (follow-up FTR)
+
+The FTR's Acceptance Criterion "If additional functionality is desired, a concrete follow-up item is created" is discharged here.
+
+=== Recommended follow-up FTR
+
+* *Working title*: `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`.
+* *Status*: Not yet created. The maintainer should register it under Phase 3d in `docs/backlog/_ftrs_open.adoc` after this decision is accepted.
+* *Inherits from this decision artifact*: the architectural direction above.
+* *Slice contents (estimated)*:
+** New step `project_by_role` (~30-40 LOC) under `core/src/spreadsheet_handling/domain/...`.
+** Registration in `core/registries/pipeline_step_registry.json`.
+** Unit tests for outbound and inbound under `core/tests/unit/pipeline/` (~80-120 LOC).
+** Integration test for the worldbuilding case roundtrip (~30-50 LOC).
+** Worldbuilding YAML migration: replace `plugin:build_story_cast_matrix_view` and `plugin:build_story_cast_matrix_payload` step references with `project_by_role`.
+** Release-notes entry in `core/docs/release_notes/release_notes.adoc` under the "0.3.0 -- planned" section.
+* *Gates the slice must clear*:
+** Public-surface gate: the new step name `project_by_role` and its YAML keys are a gated YAML-surface change per `docs/ai_info/interfaces_and_gates.adoc`. The implementation FTR owns gate registration.
+** Lifecycle/precedence rule: explicit ordering between `project_by_role` and `contract_xref` / `expand_xref` / `configure_workbook_view` must be documented; no "we will see during implementation" deferral.
+** Alignment guard (per the refined FTR's *Validation*): the slice must not introduce a parallel role taxonomy.
+
+=== Optional later slice (not committed)
+
+* Once the foundation FTR ships its first code slice (a `_meta.derived.sheets.<frame>.column_roles` channel or equivalent), `project_by_role` switches role-source resolution from the scattered current sources to that unified channel. No YAML-surface change. This slice belongs to whichever FTR introduces the foundation channel; it is *not* a child of `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`.
+
+== What this decision does NOT do
+
+Recorded explicitly so future readers cannot quietly expand scope:
+
+* No code is added, modified, or removed in this slice.
+* No tests are added, modified, or removed.
+* No registry entry is created.
+* No release-notes line is added.
+* No foundation-FTR code is shipped; the foundation remains a textual modelling decision.
+* No selector / targeting / editability / merge-back / collaboration / lifecycle / registry-rule-engine work is introduced or implied.
+* No removal of `consumer-plugin` extensibility in general; only the two named projection plugins are slated for *migration*, not removal of the mechanism.
+
+== Coordination with FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5
+
+* The decision *consumes* the role taxonomy; it does not introduce a parallel one. The step name `project_by_role`, the `direction` parameter, and the `role_order` enumeration all use the foundation's role names verbatim.
+* The decision honors the foundation's *Future Design Pressure (Non-Scope)*:
+** *Composed, not centralized*: `project_by_role` is one consumer; it does not take over role authority from `contract_xref`, `configure_workbook_view`, or FK-helper configuration.
+** *Helper semantics are not row-only*: the default `role_order` is configurable; the projection step does not hardwire `display_helper` to a leading position.
+** *Editable derived columns / distinct axes*: this decision does *not* attach editability or merge-back semantics to any role.
+* The "Role-source resolution" subsection above acknowledges that the foundation has no code yet and frames the interim computed-roles approach as *temporary*, with a clean migration path.
+
+== Coordination with FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5
+
+* No targeting / selector work is introduced. The constraint fan-out used by `add_from_legend_constraints_for_matrix` is *not* covered by `project_by_role` and remains a worldbuilding consumer plugin until the targeting FTR is acted on.
+* The implementation FTR should *not* add a targeting parameter to `project_by_role`; that would silently expand into the targeting FTR's territory.
+
+== Release-notes checkpoint
+
+* *This decision artifact*: no release-notes update required. It is a backlog / decision document and changes no user-facing behavior.
+* *The follow-up implementation slice*: WILL require a release-notes entry, because adding a new pipeline step is a public YAML-surface change. The implementation FTR owns that entry.
+
+== Residual risks
+
+* *Implementation slice not yet sized in detail.* The LOC estimates above are based on the worldbuilding plugin's substantive line count (~155 LOC across 7 functions in `worldbuilding/plugins/`, of which only the two projection functions are in scope) and on the existing core pipeline-step shape `(Frames) -> Frames`. The slice could over-run if role-source resolution turns out to be more intricate (e.g. multiple `contract_xref` declarations for one frame). Mitigation: the implementation FTR opens with a survey commit.
+* *Computed-role drift.* Until the foundation channel ships, the role classification computed by `project_by_role` is the projection step's *local* read of existing sources. If two consumers compute differently, role classification diverges. Mitigation: factor role-source resolution into one helper inside the step file; document that it is the canonical interim resolver; mark it for replacement when the foundation channel lands.
+* *Plugin migration regression.* If the core step has a bug, the worldbuilding consumer breaks at the same commit. Mitigation (already in the plugin-disposition recommendation): keep the plugin functions importable and rollback-able for one release cycle.
+* *Targeting FTR drift.* If `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` is not aligned to the foundation in a parallel pass, the two consumer FTRs may use different language for the same role concept. Mitigation: a follow-up alignment review on the targeting FTR (already recommended in the FTR-DYNAMIC-FRAME-PROJECTION-P5 alignment review's coordination notes).
+
+== Acceptance Criteria check (against the refined FTR)
+
+[cols="3,1,3"]
+|===
+| Criterion (verbatim) | Status | Where discharged
+
+| The worldbuilding use case is evaluated, expressed in terms of the foundation FTR's role taxonomy.
+| Done
+| "Worldbuilding-case evaluation" section above (outbound + inbound, role-mapped).
+
+| The evaluation explicitly covers *both* outbound projection and the inbound mirror (reimport-side retention), since both consume the same role classification.
+| Done
+| "Worldbuilding-case evaluation" sub-sections "Outbound" and "Inbound".
+
+| A project decision is recorded.
+| Done
+| "Decision (recorded)" section: Option C + minimal Option-B surface; Option A rejected as end-state.
+
+| The preferred architectural direction is documented.
+| Done
+| "Architectural direction (concrete)" section: step name, signature, YAML, semantics, role-source resolution, backend neutrality.
+
+| It is explicitly documented whether consumer plugins remain the recommended solution.
+| Done
+| "Plugin disposition (recommendation)" section: the two named projection plugins are *not* the long-term recommended solution; consumer-plugin mechanism in general is retained.
+
+| If additional functionality is desired, a concrete follow-up item is created.
+| Done
+| "Implementation slice plan (follow-up FTR)" section: `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` proposed with slice contents, gates, and LOC estimates.
+
+| The topic cannot silently disappear from future planning.
+| Done
+| Follow-up FTR is named and the maintainer is asked to register it under Phase 3d in `_ftrs_open.adoc`.
+|===
+
+== Verdict
+
+* *Project decision*: *Adopt Option C + minimal Option-B surface.* Implementation in a separate follow-up slice. Consumer plugins for the two named projection functions are interim only.
+* *State change required next*:
+. Maintainer reviews this artifact.
+. If accepted, register `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` under Phase 3d in `docs/backlog/_ftrs_open.adoc`.
+. The implementation slice can then be picked up; it is no longer blocked by an undecided architectural question.
