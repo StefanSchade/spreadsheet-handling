@@ -1,0 +1,364 @@
+===== FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5 -- Make projected-frame column roles explicit as foundation metadata
+
+*Status:* New (exploratory, foundation)
+
+*Priority:* P5
+
+*Type:* Foundational concept (metadata / column-role taxonomy)
+
+*Driver review:* `docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`
+
+[NOTE]
+====
+This FTR is a *small foundation stone*. It names the minimum column-role
+semantics that today are repeatedly reconstructed by the worldbuilding
+workaround (`build_story_cast_matrix_view`,
+`build_story_cast_matrix_payload`,
+`add_from_legend_constraints_for_matrix`, `ensure_frame_columns`).
+
+It does *not* design a selector language, a projection mechanism, a
+targeting mechanism, an editability/merge model, a registry rule engine,
+or a column-role lifecycle. Those are scoped to follow-up FTRs and are
+listed under *Non-Goals* below.
+====
+
+*Purpose:*::
+Establish the smallest explicit column-role taxonomy on projected frames
+(and the workbook view bound to them) so that later FTRs can *consume*
+the classification instead of *re-deriving* it from consumer-supplied
+constants on every transform.
+
+The motivating observation, from
+`docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`,
+is that the same derived information -- "which columns of this matrix
+are row identity, which are display, which are the matrix-value cells?"
+-- is currently restated by the consumer at four pipeline points using
+positional parameters for facts the framework already knows
+(`row_keys: [story_id]` on `contract_xref`,
+`helper_columns: [title]` on `configure_workbook_view`,
+the `derived` provenance shape on FK-helper columns).
+
+This FTR names those roles so they become *queryable column-role
+metadata on the projected frame*. Naming is the foundation step.
+Selector and projection ergonomics build on top.
+
+*Context:*::
+
+Today the role information is partially present but write-only or
+single-use:
+
+* `row_keys: [story_id]` on `contract_xref` is consumed by the
+  transform and then dropped from the column inventory.
+* `helper_columns: [title]` on `configure_workbook_view` is a
+  *render-side* declaration. It does not survive backwards through
+  reimport, so `build_story_cast_matrix_payload` cannot read it; the
+  consumer restates it as a Python default.
+* FK-helper provenance (the `derived` shape under
+  `_meta.derived.sheets.*.helper_columns`) is the only role-like
+  classification that *is* retained on the frame and is already used by
+  helper-cleanup logic. It is proof that the framework can carry role
+  metadata when it chooses to.
+* The remaining columns of a projected matrix view -- the *value cells*
+  of the projection -- have no positive classification today. They are
+  defined only by exclusion: "everything that is not a helper and not a
+  key".
+
+The two dependent FTRs each independently propose ad-hoc vocabularies
+(`"*"`, `keep_remaining`, `exclude_helper_columns: true`,
+`exclude_key_columns: true`) that converge on the same hidden concept
+from opposite ends of the pipeline. That convergence is the strongest
+evidence that the concept itself is missing, not just mis-named.
+
+*Scope:*::
+
+In-scope:
+
+* Name a *minimum* set of column roles on projected frames. The
+  recommended starting set is three:
++
+[cols="1,3"]
+|===
+| Role | Definition
+
+| `row_identity`
+| Columns that identify a row of the underlying canonical relation
+  (e.g. `story_id`). Source: `row_keys` of `contract_xref` or
+  equivalent declared key. Survives reimport.
+
+| `display_helper`
+| Columns introduced for human consumption of the view rather than
+  to identify or carry projected value (e.g. `title` on a
+  `story_cast` matrix; FK-helper materializations such as
+  `_regions_name` on a place sheet). Source: `helper_columns`
+  declaration on `configure_workbook_view`, FK-helper provenance,
+  or enrichment join. Survives reimport.
+
+| `matrix_value`
+| Columns that carry the *value cells of the projection* -- the
+  derived/rest columns whose existence and count depend on domain
+  data (e.g. dynamic per-character columns of a story-cast matrix).
+  Defined *only within a projected matrix or view surface whose
+  intended column roles are exactly `row_identity`, `display_helper`,
+  and `matrix_value` cells* as: every column on that surface that
+  is not `row_identity` and not `display_helper`. This is *not* a
+  global rule that any unclassified column anywhere is a
+  `matrix_value`; rest-by-exclusion applies only on a frame or view
+  that is explicitly a projected matrix / view surface with this
+  intended role partition. The set itself does not need to be
+  persisted; it is recoverable by exclusion as long as the other
+  two roles are recorded on that surface.
+|===
+
+* Document that "payload" is *not* used as a primary undefined
+  category. Where the existing codebase or reviews refer to "payload"
+  columns of a matrix view, the meaning is the `matrix_value` role
+  defined above (the *projection's value cells*), and only that.
+  This is a deliberate disambiguation against
+  `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`, which uses "payload" in the
+  unrelated sense of "visible spreadsheet cells whose meaning depends
+  on metadata". Those are distinct concerns and must not be conflated.
+
+* Distinguish *data derivation* from *metadata lifecycle*:
+** *Data derivation* describes how a column's *values* came to exist
+   (joined from another frame, materialized from FK, computed, sourced
+   from canonical data).
+** *Metadata lifecycle* describes how a column's *role classification*
+   is recorded, persisted, and recovered across roundtrips.
++
+The two are orthogonal. A column whose data is derived (e.g. an
+FK-helper column) may still carry *persistent* role metadata
+(`display_helper`). Conversely, a column whose data is canonical
+(e.g. `story_id`) carries role metadata that is no less persistent.
+The FTR records this orthogonality as a project-level note; per-key
+classification work belongs to `FTR-META-LIFECYCLE-INVENTORY-P5`.
+
+* State the minimal *reimport-survival* requirement:
+** `row_identity` and `display_helper` classifications must survive at
+   least one outbound -> inbound roundtrip on the same workbook,
+   because the inbound side (`expand_xref` and friends) currently
+   restates them as Python constants. Once they survive, the inbound
+   `matrix_value` set is recoverable by exclusion without any further
+   metadata.
+** The `matrix_value` classification itself is *not required to
+   persist* in this foundation FTR. It is the rest-by-exclusion. A
+   later FTR may promote it to first-class metadata if a use case
+   requires positive marking.
+
+* State minimal *metadata source / consumer expectations*:
+** *Expected metadata sources* (the steps that are *likely* to
+   record or preserve column-role classification for the columns
+   within their own concern). None of the steps below is the
+   monolithic owner of column-role metadata; each contributes only
+   for columns it introduces or already declares, and additional
+   steps may contribute more later:
+*** `contract_xref` is a likely source for `row_identity` on the
+    columns named in its declared `row_keys`; it may record or
+    preserve that classification when it consumes the key list.
+*** FK-helper configuration is a likely source for `display_helper`
+    on materialized helper columns; this aligns with the existing
+    `derived` provenance shape and should reuse it rather than
+    duplicate it.
+*** `configure_workbook_view`'s `helper_columns` provides
+    `display_helper` for view-declared helpers (e.g. `title`) --
+    one source among several, not the monolithic owner of the
+    role.
+*** `join_frames` used for enrichment may provide `display_helper`
+    when the joined column is intended for human consumption only;
+    canonical-payload joins remain unclassified at this stage
+    (their role, if any, belongs to a later FTR).
+** *Consumers* (the steps that read role metadata instead of taking
+   column-name parameters):
+*** Future dynamic-projection step (per
+    `FTR-DYNAMIC-FRAME-PROJECTION-P5`): orders by role.
+*** Future view-column-targeting step (per
+    `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`): targets by role.
+*** Inbound mirror (e.g. the role currently played by
+    `build_story_cast_matrix_payload`): retains
+    `row_identity ∪ matrix_value` by exclusion.
+** No new transforms are *required* to consume role metadata as a
+   precondition for this FTR. The contract is that the metadata
+   *exists and is queryable*; consumption is the dependents' work.
+
+* Identify the dependencies for follow-up FTRs:
+** `FTR-DYNAMIC-FRAME-PROJECTION-P5` consumes the role metadata to
+   order columns declaratively
+   (`row_identity`, `display_helper`, `matrix_value`-rest). The
+   inbound mirror (retain `row_identity ∪ matrix_value`) is the same
+   primitive used symmetrically.
+** `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` consumes the role metadata
+   to target rule fan-out at the `matrix_value` set without
+   enumerating concrete column names.
++
+Both dependent FTRs should cite this FTR as a *precondition* once it
+is accepted. This FTR does not edit them. See *Recommendation* below.
+
+*Non-Goals:*::
+
+The following are explicitly deferred to other FTRs or to follow-up
+work, and *must not* be designed inside this FTR:
+
+* *Selector syntax.* No YAML shape, wildcard convention, or rule-
+  expression grammar is defined here. (`"*"`, `keep_remaining`,
+  `exclude_helper_columns`, `target.selector`, etc. all belong to the
+  two dependent FTRs.)
+* *Dynamic projection implementation.* How a step actually orders or
+  trims columns by role is `FTR-DYNAMIC-FRAME-PROJECTION-P5`'s scope.
+* *Dynamic view-column targeting implementation.* How a rule binds
+  to a role-based column set is
+  `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`'s scope.
+* *Editability / merge-policy model.* Whether a column role implies
+  editable, derived-read-only, formula-backed, or merge-conflict
+  semantics is out of scope. Those questions are touched by
+  `FTR-PRESENTATION-DEFAULTS-SEMANTIC-CLASSIFICATION-P5`,
+  `FTR-WORKBOOK-VIEW-PAYLOAD-CONFLICT-PRECEDENCE-P6`, and the
+  collaboration-roundtrip concept; this FTR neither extends nor
+  refutes them.
+* *Collaboration conflict handling.* No statement about how two
+  authors writing different role classifications should be merged.
+* *Full column-role lifecycle model.* No state machine, no
+  classification phase, no rename/rebind protocol. The per-attribute
+  lifecycle work belongs to `FTR-META-LIFECYCLE-INVENTORY-P5`.
+* *Registry / runtime rule engine.* No new registry root, no rule
+  evaluator, no constraint compiler.
+* *Monolithic column meta model.* This FTR does not define a
+  generic column-meta schema covering provenance, lifecycle,
+  editability, formatting, validation, and i18n. It names exactly
+  three roles. Future axes are explicitly out of scope.
+* *Reclassification of existing canonical-meta entries.* That work
+  belongs to `FTR-META-LIFECYCLE-INVENTORY-P5`.
+* *Aliasing of FK-helper column names.* The
+  `_regions_name` -> `region_name` ergonomics observation in
+  `FTR-DYNAMIC-FRAME-PROJECTION-P5` is a *projection ergonomics*
+  question, not a role-classification question.
+
+*Future Design Pressure (Non-Scope):*::
+
+These constraints are recorded so this FTR does not accidentally
+foreclose them. None of them is in scope here; each is the concern of
+a later FTR. They are listed because the *shape* of the minimal
+foundation must not contradict them.
+
+* *Composed, not centralized.* Column-role metadata is expected to be
+  written by *multiple small pipeline steps*, not centralized into a
+  monolithic `contract_xref` responsibility. `contract_xref` may
+  introduce or preserve `row_identity`; helper enrichment, FK-helper
+  configuration, view declaration, and later projection/enrichment
+  steps may each contribute their own role metadata for the columns
+  they introduce.
+* *Helper semantics are not row-only.* Future helper / enrichment
+  concepts may apply not only to leading row-side columns but also to
+  matrix axes or header structures (e.g. column-axis legends, grouped
+  matrix headers). This FTR therefore must not hardwire
+  `display_helper` to "leading columns" or to a row-only position.
+  The role is positional-neutral.
+* *Editable derived columns are anticipated.* Projected or enriched
+  columns that are nevertheless intended to be edited by the user are
+  a plausible future requirement. *Editability and merge-back policy
+  remain explicitly out of scope here* and are not implied by any
+  role; they are a separate axis, owned by a later FTR.
+* *Distinct axes.* Column role, editability, merge policy, data
+  derivation, and metadata lifecycle must remain *distinct axes*.
+  This FTR names only the minimal column-role foundation; the other
+  axes must not be folded into the role taxonomy by future
+  refinement.
+
+*Relationship to existing concepts:*::
+
+* `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` and the corresponding review
+  artifact (`docs/warm_storage/payload_semantics_recovery_review.adoc`)
+  use "payload" in the sense of "visible spreadsheet cells whose
+  meaning depends on metadata". *That is a different concept.* This
+  FTR's `matrix_value` is the *projection-shape* meaning of "the value
+  cells of a matrix view" and is unrelated to the recovery /
+  pinning contract of the payload-semantics-recovery rule. The two
+  FTRs are coordinated reads, not dependencies.
+* Helper provenance under `_meta.derived.sheets.*.helper_columns`
+  (the `derived` shape; see
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`)
+  already encodes a `display_helper`-like classification for
+  FK-helper materializations. The role taxonomy here should *reuse
+  and unify with* that shape rather than introduce a parallel one.
+  The technical decision of "where exactly on the frame the
+  classification lives" is left to the implementing FTR; this FTR
+  only requires that the chosen home is queryable.
+* Frame lifecycle (`frame_lifecycle` registry entry) is orthogonal:
+  it describes when a frame exists, not what roles its columns play.
+* Workbook view metadata (`configure_workbook_view`,
+  `workbook_view.sheet_mappings`) is the current home of
+  `helper_columns` and a natural metadata source for the
+  `display_helper` role on view-declared helpers -- one source
+  among several, not the monolithic owner. Whether the
+  classification also lives on the frame or only on the view is an
+  implementation decision deferred to the implementing FTR; both
+  consumer sides (render and reimport) must be able to read it.
+
+*Acceptance Criteria:*::
+
+* A documented column-role taxonomy exists, containing exactly the
+  three roles `row_identity`, `display_helper`, `matrix_value`, with
+  the definitions and exclusion-by-default rule for `matrix_value`
+  recorded above.
+* The taxonomy explicitly disclaims overlap with
+  `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`'s use of "payload".
+* The data-derivation vs metadata-lifecycle orthogonality is recorded
+  as a project-level note, with the explicit clarification that
+  derived data may still carry persistent role metadata.
+* The reimport-survival requirement is stated: `row_identity` and
+  `display_helper` classifications must survive at least one
+  outbound -> inbound roundtrip; `matrix_value` is recoverable by
+  exclusion and need not be positively persisted by this FTR.
+* The minimum expected metadata sources (`contract_xref`, FK-helper
+  configuration, `configure_workbook_view`, enrichment `join_frames`
+  when applicable) -- recorded *as likely sources, not as monolithic
+  owners* -- and the consumer set (the dependents listed below) are
+  recorded.
+* `FTR-DYNAMIC-FRAME-PROJECTION-P5` and
+  `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` are recorded as the
+  primary downstream consumers and the FTR documents the dependency
+  direction (those FTRs depend on this one, not the reverse).
+* The non-goals list above is preserved verbatim or in equivalent
+  form, so that follow-up reviewers cannot silently expand scope.
+
+*Validation:*::
+
+* Read-only. No code, no test, no registry, no warm-storage doc, no
+  release notes, no existing FTR is modified by this FTR.
+* The acceptance is by review of the FTR text against the driver
+  review (`review_dynamic_projection_analysis.adoc`, sections 4-6)
+  and against the worldbuilding workaround sites listed in the
+  driver review's section 1.
+
+*Recommendation (no edits performed by this FTR):*::
+
+Once this foundation FTR is accepted, the two dependent FTRs should
+later be adjusted as follows. *These adjustments are recommendations
+only; this FTR does not modify either file.*
+
+* `FTR-DYNAMIC-FRAME-PROJECTION-P5`:
+** Add this FTR as an explicit dependency.
+** Restate scope in terms of *ordering and retention by role*
+   (`row_identity`, `display_helper`, `matrix_value`) rather than
+   in terms of "fixed leading + dynamic remainder".
+** Add the *inbound* projection mirror
+   (`build_story_cast_matrix_payload`) to its scope. The driver
+   review's section 7 flags this explicitly.
+
+* `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`:
+** Add this FTR as an explicit dependency.
+** Stop assuming a fresh selector language is required. Addressing
+   by role (`matrix_value`, optionally `display_helper`,
+   `row_identity`) is sufficient for the worldbuilding case and is
+   the smallest change that removes the workaround.
+
+*Discussion Note:*::
+
+The frequent failure mode in this kind of FTR is to start at
+ergonomics ("what should the YAML look like?") and work down; that
+produces two parallel selector languages -- one for projection, one
+for targeting -- and a hidden classification concept that lives
+nowhere. The driver review's section 5 recommends the inverse order:
+*modelling first, pipeline/wiring next, rendering re-use after that,
+ergonomics last*. This FTR is the modelling step. It must remain that
+size. Any acceptance criterion that drifts toward selector design,
+projection mechanics, or a rule engine is a sign that scope has
+expanded beyond the foundation and should be pushed back.
