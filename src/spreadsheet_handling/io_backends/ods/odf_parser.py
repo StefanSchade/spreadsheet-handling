@@ -206,6 +206,42 @@ def _extract_ods_column_widths(
     return result if result else None
 
 
+def _build_ods_column_default_cell_style_map(
+    table: Element,
+    *,
+    max_col: int,
+    limits: ParserLimits = DEFAULT_LIMITS,
+) -> dict[int, str]:
+    """Return {col_index: default_cell_style_name} for table-column elements within max_col.
+
+    Used as a fallback by alignment and rotation extractors: when a cell carries no
+    explicit ``table:style-name``, the containing column's ``table:default-cell-style-name``
+    provides the style to resolve.  Clipped to ``max_col`` so that LibreOffice sheet-wide
+    column fillers do not produce one entry per theoretical column position.
+    """
+    if max_col <= 0:
+        return {}
+    result: dict[int, str] = {}
+    table_col_name = TableColumn().qname
+    table_name = str(table.attributes.get((TABLENS, "name"), "<unnamed>"))
+    context = f"ODS sheet '{table_name}' column default cell styles"
+    col_index = 1
+    for child in table.childNodes:
+        if not isinstance(child, Element) or child.qname != table_col_name:
+            continue
+        if col_index > max_col:
+            break
+        repeat = int(child.attributes.get((TABLENS, "number-columns-repeated"), 1))
+        limits.enforce(context=context, cols=col_index + repeat - 1)
+        effective_repeat = min(repeat, max_col - col_index + 1)
+        default_style = child.attributes.get((TABLENS, "default-cell-style-name"))
+        if default_style and effective_repeat > 0:
+            for i in range(effective_repeat):
+                result[col_index + i] = str(default_style)
+        col_index += repeat
+    return result
+
+
 _ODS_HORIZONTAL_ALIGNMENT_MAP: dict[str, str] = {
     "left": "left",
     "center": "center",
@@ -263,11 +299,15 @@ def _extract_ods_horizontal_alignments(
     not expand ``row_repeat`` x ``col_repeat`` into one metadata entry per
     implied address. ``limits`` is honoured on per-axis and per-cell bases as
     defense-in-depth against inputs that still declare implausible repeats
-    within the content extent.
+    within the content extent.  When a cell carries no explicit style the
+    column's ``table:default-cell-style-name`` is used as a fallback.
     """
     if max_row <= 0 or max_col <= 0:
         return None
     result: dict[str, dict] = {}
+    col_default_style_map = _build_ods_column_default_cell_style_map(
+        table, max_col=max_col, limits=limits
+    )
     table_row_name = TableRow().qname
     table_cell_name = TableCell().qname
     covered_cell_name = CoveredTableCell().qname
@@ -297,10 +337,12 @@ def _extract_ods_horizontal_alignments(
                 and effective_row_repeat > 0
                 and effective_col_repeat > 0
             ):
-                style_name = cell.attributes.get((TABLENS, "style-name")) or \
-                             cell.attributes.get((STYLENS, "style-name"))
-                if style_name:
-                    canonical = alignment_map.get(str(style_name))
+                cell_style_name = (
+                    cell.attributes.get((TABLENS, "style-name"))
+                    or cell.attributes.get((STYLENS, "style-name"))
+                )
+                if cell_style_name:
+                    canonical = alignment_map.get(str(cell_style_name))
                     if canonical:
                         limits.enforce(
                             context=context,
@@ -317,6 +359,30 @@ def _extract_ods_horizontal_alignments(
                                     "horizontal": canonical,
                                     "source": "workbook",
                                 }
+                elif col_default_style_map:
+                    # Per-column fallback: each column in a repeated span may
+                    # carry a different default-cell-style-name.
+                    limits.enforce(
+                        context=context,
+                        cells=len(result)
+                        + effective_row_repeat * effective_col_repeat,
+                    )
+                    for r_off in range(effective_row_repeat):
+                        for c_off in range(effective_col_repeat):
+                            fallback_style = col_default_style_map.get(col_index + c_off)
+                            if not fallback_style:
+                                continue
+                            canonical = alignment_map.get(str(fallback_style))
+                            if not canonical:
+                                continue
+                            addr = (
+                                f"{_column_letters(col_index + c_off)}"
+                                f"{row_index + r_off}"
+                            )
+                            result[addr] = {
+                                "horizontal": canonical,
+                                "source": "workbook",
+                            }
             col_index += col_repeat
         row_index += row_repeat
     return result if result else None
@@ -376,11 +442,15 @@ def _extract_ods_vertical_alignments(
     patterns do not expand ``row_repeat`` x ``col_repeat`` into one metadata
     entry per implied address. ``limits`` is honoured on per-axis and per-cell
     bases as defense-in-depth against inputs that still declare implausible
-    repeats within the content extent.
+    repeats within the content extent.  When a cell carries no explicit style
+    the column's ``table:default-cell-style-name`` is used as a fallback.
     """
     if max_row <= 0 or max_col <= 0:
         return None
     result: dict[str, dict] = {}
+    col_default_style_map = _build_ods_column_default_cell_style_map(
+        table, max_col=max_col, limits=limits
+    )
     table_row_name = TableRow().qname
     table_cell_name = TableCell().qname
     covered_cell_name = CoveredTableCell().qname
@@ -410,10 +480,12 @@ def _extract_ods_vertical_alignments(
                 and effective_row_repeat > 0
                 and effective_col_repeat > 0
             ):
-                style_name = cell.attributes.get((TABLENS, "style-name")) or \
-                             cell.attributes.get((STYLENS, "style-name"))
-                if style_name:
-                    canonical = alignment_map.get(str(style_name))
+                cell_style_name = (
+                    cell.attributes.get((TABLENS, "style-name"))
+                    or cell.attributes.get((STYLENS, "style-name"))
+                )
+                if cell_style_name:
+                    canonical = alignment_map.get(str(cell_style_name))
                     if canonical:
                         limits.enforce(
                             context=context,
@@ -430,6 +502,30 @@ def _extract_ods_vertical_alignments(
                                     "vertical": canonical,
                                     "source": "workbook",
                                 }
+                elif col_default_style_map:
+                    # Per-column fallback: each column in a repeated span may
+                    # carry a different default-cell-style-name.
+                    limits.enforce(
+                        context=context,
+                        cells=len(result)
+                        + effective_row_repeat * effective_col_repeat,
+                    )
+                    for r_off in range(effective_row_repeat):
+                        for c_off in range(effective_col_repeat):
+                            fallback_style = col_default_style_map.get(col_index + c_off)
+                            if not fallback_style:
+                                continue
+                            canonical = alignment_map.get(str(fallback_style))
+                            if not canonical:
+                                continue
+                            addr = (
+                                f"{_column_letters(col_index + c_off)}"
+                                f"{row_index + r_off}"
+                            )
+                            result[addr] = {
+                                "vertical": canonical,
+                                "source": "workbook",
+                            }
             col_index += col_repeat
         row_index += row_repeat
     return result if result else None
@@ -471,11 +567,15 @@ def _extract_ods_text_orientations(
     expand ``row_repeat`` x ``col_repeat`` into one metadata entry per implied
     address. ``limits`` is honoured on per-axis and per-cell bases as
     defense-in-depth against inputs that still declare implausible repeats
-    within the content extent.
+    within the content extent.  When a cell carries no explicit style the
+    column's ``table:default-cell-style-name`` is used as a fallback.
     """
     if max_row <= 0 or max_col <= 0:
         return None
     result: dict[str, dict] = {}
+    col_default_style_map = _build_ods_column_default_cell_style_map(
+        table, max_col=max_col, limits=limits
+    )
     table_row_name = TableRow().qname
     table_cell_name = TableCell().qname
     covered_cell_name = CoveredTableCell().qname
@@ -505,10 +605,12 @@ def _extract_ods_text_orientations(
                 and effective_row_repeat > 0
                 and effective_col_repeat > 0
             ):
-                style_name = cell.attributes.get((TABLENS, "style-name")) or \
-                             cell.attributes.get((STYLENS, "style-name"))
-                if style_name:
-                    ods_rotation = rotation_map.get(str(style_name))
+                cell_style_name = (
+                    cell.attributes.get((TABLENS, "style-name"))
+                    or cell.attributes.get((STYLENS, "style-name"))
+                )
+                if cell_style_name:
+                    ods_rotation = rotation_map.get(str(cell_style_name))
                     if ods_rotation:
                         xlsx_rotation = _ods_rotation_to_xlsx(ods_rotation)
                         if xlsx_rotation > 0:
@@ -527,6 +629,33 @@ def _extract_ods_text_orientations(
                                         "rotation": xlsx_rotation,
                                         "source": "workbook",
                                     }
+                elif col_default_style_map:
+                    # Per-column fallback: each column in a repeated span may
+                    # carry a different default-cell-style-name.
+                    limits.enforce(
+                        context=context,
+                        cells=len(result)
+                        + effective_row_repeat * effective_col_repeat,
+                    )
+                    for r_off in range(effective_row_repeat):
+                        for c_off in range(effective_col_repeat):
+                            fallback_style = col_default_style_map.get(col_index + c_off)
+                            if not fallback_style:
+                                continue
+                            ods_rotation = rotation_map.get(str(fallback_style))
+                            if not ods_rotation:
+                                continue
+                            xlsx_rotation = _ods_rotation_to_xlsx(ods_rotation)
+                            if xlsx_rotation <= 0:
+                                continue
+                            addr = (
+                                f"{_column_letters(col_index + c_off)}"
+                                f"{row_index + r_off}"
+                            )
+                            result[addr] = {
+                                "rotation": xlsx_rotation,
+                                "source": "workbook",
+                            }
             col_index += col_repeat
         row_index += row_repeat
     return result if result else None

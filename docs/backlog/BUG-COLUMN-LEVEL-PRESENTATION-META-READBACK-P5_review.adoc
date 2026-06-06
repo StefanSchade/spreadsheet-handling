@@ -1,0 +1,342 @@
+= Review: BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5
+
+== Verdict
+
+Yellow.
+
+The implementation is in the intended read-path area and covers the common
+column-default carrier cases for XLSX and ODS. It does not appear to add wrap
+text, render-path changes, metadata-schema changes, registry changes, or write
+path changes.
+
+It should not be committed as-is. Two focused correctness gaps remain:
+
+* XLSX fallback currently overrides explicit cell-level default/non-canonical
+  values, violating the "explicit cell formatting wins" rule.
+* ODS fallback currently applies the first column's fallback style across a
+  repeated cell span, so repeated cells can read the wrong column default.
+
+== Findings
+
+=== P1: XLSX fallback overrides explicit cell-level defaults
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:263-279`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:297-313`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:219-235`
+
+The XLSX extractors use the column fallback whenever the current cell value is
+absent or not canonical:
+
+* horizontal: fallback when `horizontal` is not one of `left`, `center`,
+  `right`;
+* vertical: fallback when `vertical` is not one of `top`, `center`, `bottom`;
+* rotation: fallback when `rotation is None or rotation == 0`.
+
+That conflates "no cell-level formatting" with "explicit cell-level default or
+suppressed value". For example, a cell explicitly set to
+`Alignment(horizontal="general")` in a column whose default is
+`horizontal="center"` is emitted as `center`, even though `general` is an
+explicit cell carrier value and should suppress canonical metadata. Likewise, a
+cell with an explicit style whose `text_rotation` is `0` can inherit the column
+rotation even though `0` is the default/suppression value that should produce no
+orientation metadata for that cell.
+
+I verified this locally against the current implementation: after saving and
+reloading an XLSX file with column `A` set to `center`/`90`, cell `A1` set to
+`horizontal="general"` was emitted as `{"horizontal": "center"}`, and a cell
+with default rotation inherited `{"rotation": 90}`.
+
+Expected behavior: use the column fallback only when the relevant cell carrier
+is absent, not when the cell carrier is explicitly present with a default or
+non-canonical value that should be suppressed.
+
+=== P1: ODS repeated cells do not use per-column fallback styles
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:340-360`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:459-480`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:560-583`
+
+Each ODS extractor resolves one `style_name` before expanding
+`effective_col_repeat`. If the repeated cell has no explicit style, that single
+style is fetched from `col_default_style_map.get(col_index)` and then reused for
+every `c_off` in the repeated span.
+
+That is correct only when every repeated address shares the same column default.
+If a repeated content cell spans `A:B` and column `A` has default `left` while
+column `B` has default `right`, the current horizontal extractor emits both
+addresses using column `A`'s default. If column `A` has no default and column
+`B` does, column `B` receives no metadata.
+
+Expected behavior: for fallback styles, resolve
+`col_default_style_map.get(col_index + c_off)` per emitted column address. This
+preserves bounded expansion while respecting column-level defaults.
+
+=== P2: XLSX column fallback map does not expand column dimension spans
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:197-208`
+* contrast with `_extract_column_widths` span handling at
+  `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:179-184`
+
+`_build_xlsx_column_alignment_fallbacks` stores only `fallbacks[str(key)] =
+align`. It ignores `ColumnDimension.min` / `ColumnDimension.max`, even though
+the existing width extractor expands those spans.
+
+If an XLSX producer stores a shared column style as a `<col min="N" max="M"
+style="...">` span, only the dimension holder key will receive fallback
+metadata. Other columns in the span can be missed.
+
+Expected behavior: mirror `_extract_column_widths` and expand column dimension
+spans, clipped by the parsed worksheet extent used by the extractors.
+
+=== P3: Scope creep in the current worktree
+
+Evidence:
+
+`git status --short --untracked-files=all` shows unrelated changes:
+
+* `docs/backlog/FTR-RELEASE-PROCESS-AUTOMATION-P5.adoc`
+* `docs/backlog/_ftrs_open.adoc`
+* `docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`
+
+The parser and tests are within the bug scope. The release-process backlog
+status/docs and warm-storage review are unrelated to this bug and should not be
+included in the bug commit. The `_ftrs_open.adoc` inclusion of the new BUG may
+be acceptable if the project convention requires registering new backlog items,
+but the release-process status edit is unrelated.
+
+== Scope Check
+
+No wrap-text support was added in the implementation files reviewed.
+
+No render path, render op, metadata schema, registry, or write-path changes are
+present in the tracked implementation diff. The changed implementation files are
+limited to:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
+
+The new metadata remains cell-addressed.
+
+ODS column default map construction is bounded by `max_col` during
+materialization:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:232-240`
+
+ODS extractors remain clipped to parsed `max_row` / `max_col` and enforce
+`ParserLimits` during row/column/cell expansion:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:321-334`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:347-351`
+* same pattern in vertical and rotation extractors.
+
+XLSX `Alignment()` defaults are not treated as meaningful by
+`_build_xlsx_column_alignment_fallbacks`: `horizontal is None`, `vertical is
+None`, and `text_rotation == 0` do not enter the fallback map. The issue is not
+default `Alignment()` on column dimensions; it is fallback use when a cell has
+an explicit default/suppressed value.
+
+== Test Adequacy
+
+The added tests are carrier-level rather than parser-render self-consistency:
+
+* XLSX tests construct workbooks using `ws.column_dimensions["A"].alignment` in
+  `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py:20-35`.
+* ODS tests construct raw `<table:table-column
+  table:default-cell-style-name="...">` carriers in
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py:901-910`,
+  `935-944`, and `969-978`.
+
+Coverage gaps:
+
+* no XLSX test for explicit default/non-canonical cell value suppressing column
+  fallback (`horizontal="general"`, `vertical` default/non-canonical, or
+  explicit rotation `0`);
+* no ODS test for repeated cells spanning columns with different column default
+  styles;
+* no XLSX test for column-dimension spans (`min` / `max`);
+* no explicit extent-boundary test for column defaults outside parsed content
+  in the new BUG-specific tests.
+
+I ran the currently added targeted tests:
+
+[source,text]
+----
+.venv/bin/pytest tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py -q
+................................                                         [100%]
+----
+
+== Commit Readiness
+
+Can be committed as-is: no.
+
+Recommended before commit:
+
+* fix XLSX fallback to distinguish absent cell carrier from explicit
+  default/suppressed cell values;
+* fix ODS repeated-cell fallback to resolve column defaults per emitted column;
+* add regression tests for those two cases;
+* consider expanding XLSX column-dimension spans to match the width extractor;
+* keep unrelated backlog/review doc edits out of the bug commit.
+
+== Follow-up Review After Fixes
+
+=== Verdict
+
+Yellow.
+
+The follow-up implementation closes the ODS repeated-span issue and the XLSX
+column-dimension span issue. The XLSX explicit-default issue is only partially
+closed because text orientation fallback now uses whole-cell `has_style` as the
+absence test. That suppresses column-level rotation for any styled cell,
+including cells whose explicit style is unrelated to alignment or rotation.
+
+The implementation is still scoped to the read path. No wrap-text support,
+render path changes, render ops, metadata schema / registry changes, or
+write-path changes were found in the reviewed diff.
+
+=== Original Findings Status
+
+==== XLSX fallback overrode explicit cell-level defaults: Partially closed
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:281-283`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:312-314`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:233-239`
+* `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py:100-149`
+
+Horizontal and vertical are now property-level fallbacks: the column fallback is
+used only when the cell's `horizontal` / `vertical` property is `None`. This
+closes the explicit `horizontal="general"` regression and keeps non-canonical
+explicit values from inheriting the column default.
+
+Text orientation now uses `not cell.has_style` before applying the column
+fallback. This protects a styled cell whose loaded `text_rotation` is `0`, but
+it is broader than the property-level rule. In openpyxl, a font-only styled
+cell has `has_style=True`, `alignmentId=0`, and `text_rotation=0`; with the
+current implementation, such a cell does not inherit column-level rotation even
+though it has no explicit text-orientation carrier. The new test forces
+`has_style=True` by adding a bold font, but after roundtrip openpyxl collapses
+the alignment to `alignmentId=0`, so the test proves whole-cell-style
+suppression rather than an explicit rotation-zero alignment carrier.
+
+==== ODS repeated cells reused first column fallback: Closed
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:370-383`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:513-526`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:640-656`
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py:1030-1066`
+
+All three ODS extractors now resolve fallback style names with
+`col_default_style_map.get(col_index + c_off)` inside the emitted-column loop.
+That preserves per-column defaults across repeated cell spans while keeping the
+existing extent clipping.
+
+==== XLSX column-dimension spans were not expanded: Closed
+
+Evidence:
+
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:212-217`
+* `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py:152-181`
+
+`_build_xlsx_column_alignment_fallbacks` now expands `dim.min` / `dim.max`
+column spans and clips expansion to `ws.max_column`. The regression test builds
+a B:C column dimension span and verifies both columns receive fallback metadata.
+
+==== Unrelated worktree changes must stay out of the BUG commit: Still open
+
+Evidence:
+
+Current worktree still contains unrelated changes:
+
+* `docs/backlog/FTR-RELEASE-PROCESS-AUTOMATION-P5.adoc`
+* release-process commentary hunks in `docs/backlog/_ftrs_open.adoc`
+* `docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`
+
+The BUG include in `_ftrs_open.adoc` may belong with the BUG if backlog index
+updates are normally committed with new backlog items. The release-process
+status/commentary changes are unrelated.
+
+=== Regression Check
+
+Column fallback still works for unstyled cells:
+
+* XLSX column carrier tests cover horizontal, vertical, and rotation fallback:
+  `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py:40-76`.
+* ODS raw carrier tests cover horizontal, vertical, and rotation fallback:
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py:889-988`.
+
+Explicit cell style still overrides fallback:
+
+* XLSX horizontal override:
+  `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py:79-97`.
+* ODS horizontal override:
+  `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py:991-1027`.
+
+Metadata remains cell-addressed in the existing metadata families. ODS
+expansion remains clipped by `max_row` / `max_col`, and ParserLimits
+enforcement remains present in the column-default map and extractor loops:
+
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:232-240`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:321-334`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:365-369`
+
+=== Test Adequacy
+
+The new tests are meaningful carrier-level regressions:
+
+* XLSX tests construct workbooks through `ws.column_dimensions[...]`, not
+  through the renderer.
+* ODS tests construct raw `table:default-cell-style-name` column carriers.
+* The ODS repeated-span test uses a raw `table:number-columns-repeated="2"`
+  cell and distinct column defaults, directly guarding the previous bug.
+
+Remaining test gap: the XLSX rotation-zero test currently relies on a font to
+force `has_style=True`, which validates whole-cell-style suppression rather
+than a distinct explicit alignment carrier with `textRotation=0`.
+
+Targeted validation run during follow-up review:
+
+[source,text]
+----
+.venv/bin/pytest tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py -q
+....................................                                     [100%]
+----
+
+=== Commit Readiness
+
+Can be committed as-is: no.
+
+Recommended before commit:
+
+* either fix XLSX text-orientation fallback to distinguish absent orientation
+  from unrelated cell styles, or explicitly document and accept that any cell
+  `xf` suppresses column-level text rotation;
+* keep unrelated release-process and warm-storage review changes out of the BUG
+  commit.
+
+Suggested BUG commit contents:
+
+* `docs/backlog/BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5.adoc`
+* `docs/backlog/BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5_review.adoc`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
+* `tests/integration/io_backends/xlsx/test_column_level_presentation_meta_readback.py`
+* `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py`
+* the BUG include hunk in `docs/backlog/_ftrs_open.adoc`, if backlog indexing
+  belongs with the bug item.
+
+Suggested commit message:
+
+[source,text]
+----
+Fix column-level presentation metadata readback
+----

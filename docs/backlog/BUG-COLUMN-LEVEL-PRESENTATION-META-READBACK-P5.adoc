@@ -1,0 +1,183 @@
+===== BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5 -- Column-level formatting is not detected during XLSX and ODS readback
+
+*Status:* New
+*Priority:* P5
+*Area:* Spreadsheet read path / presentation metadata / XLSX and ODS parsers
+*Release relevance:* Post-`0.2.0`. Affects only workbooks where the user applied
+horizontal alignment, vertical alignment, or text rotation to an entire column
+rather than to individual cells. Default behavior is unchanged.
+
+==== Summary
+
+When horizontal alignment, vertical alignment, or text rotation is applied to
+an entire column, the formatting is stored in the column-level style carrier,
+not in the individual cell carriers that the parsers iterate. All six extraction
+functions (three per backend) read only the cell-level carrier. Formatting
+applied at the column granularity is therefore silently dropped on read, and
+the next write does not reproduce it.
+
+The fix is a pure read-path change: add a per-column fallback lookup to each
+extractor. The write path, render ops, rendering passes, and metadata schema
+require no modification.
+
+==== Root cause
+
+Both formats provide two separate style carriers:
+
+[cols="1,2,2", options="header"]
+|===
+| Carrier | XLSX | ODS
+
+| Explicit cell style
+| `<c s="n">` → `cell.alignment` in openpyxl
+| `table:style-name` on `<table:table-cell>`
+
+| Column default style
+| `<col style="n">` → `ws.column_dimensions[letter].alignment`
+| `table:default-cell-style-name` on `<table:table-column>`
+|===
+
+Applications (Excel, LibreOffice) write the column default carrier when the
+user selects an entire column and formats it. Individual cells in that column
+do not automatically receive an explicit cell-level style; they rely on
+inheritance from the column default.
+
+The current extractors read only the cell carrier. The column-default carrier
+is never consulted for alignment or orientation, even though
+`_extract_column_widths` (XLSX) and `_extract_ods_column_widths` (ODS) already
+read from the same column-level elements correctly.
+
+Confirmed by a live test: setting
+`ws.column_dimensions['A'].alignment = Alignment(horizontal='left', vertical='top', text_rotation=45)`
+and reloading the workbook yields `cell.alignment.horizontal = None` but
+`ws.column_dimensions['A'].alignment.horizontal = 'left'`.
+
+==== Affected extractors
+
+XLSX (`src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`):
+
+* `_extract_horizontal_alignments` (line ~225)
+* `_extract_vertical_alignments` (line ~255)
+* `_extract_text_orientations` (line ~189)
+
+ODS (`src/spreadsheet_handling/io_backends/ods/odf_parser.py`):
+
+* `_extract_ods_horizontal_alignments` (line ~250)
+* `_extract_ods_vertical_alignments` (line ~363)
+* `_extract_ods_text_orientations` (line ~459)
+
+All six share the identical root cause: cell-carrier iteration with no column
+fallback.
+
+==== Tests coverage gap
+
+All existing tests apply formatting cell-by-cell:
+
+* XLSX: `ws["A1"].alignment = Alignment(...)` — direct per-cell assignment
+  via openpyxl.
+* ODS: `SetHorizontalAlignment(sheet, row=1, col=1, ...)` render ops — the
+  renderer writes per-cell styles.
+
+No existing test applies formatting via the column-level carrier and then
+asserts that `parse_workbook` returns the expected cell-addressed metadata.
+The internal parse-write-parse roundtrip tests validate the code-written path
+only, which always lands in the cell carrier.
+
+==== Scope
+
+In scope:
+
+* XLSX read path: for each of the three extractors, build a per-column
+  fallback alignment map from `ws.column_dimensions[letter].alignment` before
+  the cell loop. Apply the fallback for any cell whose alignment attribute is
+  absent or default (`None` / `0`). Mirrors how `_extract_column_widths` reads
+  from `column_dimensions`.
+* ODS read path: extend each of the three extractors to read
+  `(TABLENS, "default-cell-style-name")` from `<table:table-column>` elements
+  and treat it as a per-column fallback style for cells that carry no explicit
+  `table:style-name`. The column iteration pattern already exists in
+  `_extract_ods_column_widths`; the new path follows the same structure.
+* Tests: for each backend and each of the three attributes, one new test that
+  applies formatting via the column carrier and asserts readback into
+  cell-addressed metadata. Place alongside existing extractor tests.
+* Content-extent clipping: column defaults must expand only to cells within
+  `max_row` / `max_col`; `ParserLimits` enforcement must remain intact.
+
+==== Non-Goals
+
+* No word wrap. Column-level wrap treatment belongs in a dedicated successor
+  FTR (`FTR-WRAP-TEXT-ROUNDTRIP-P5` or equivalent). Wrap has distinct
+  default-suppression semantics (`false` is the canonical default, not an
+  enumerated value) and is the highest-exposure case for the repeated-cell
+  safety hazard. Bundling it here would re-create the scope-expansion pattern
+  the project has committed to avoiding in the presentation-metadata series.
+* No write-path change. The renderer already emits cell-level styles
+  correctly; this fix does not touch it.
+* No new render ops.
+* No per-column metadata key. The output remains cell-addressed
+  (`{"A1": {...}, "B3": {...}}`); the column default is expanded to explicit
+  cell addresses within the parsed content extent.
+* No new metadata schema entries. All three keys (`text_orientations`,
+  `horizontal_alignments`, `vertical_alignments`) are already registered.
+* No indent, shrink-to-fit, reading order, font, color, border, or
+  number-format handling.
+
+==== Acceptance
+
+* Each of the three attributes roundtrips correctly when formatted at the
+  column level on both XLSX and ODS backends.
+* Per-cell explicit formatting overrides the column default for the same cell
+  (the fallback is a true fallback, applied only when the cell carrier is
+  absent or default).
+* Column defaults do not expand beyond the parsed content extent
+  (`max_row` / `max_col`).
+* `ParserLimits` enforcement is not weakened.
+* All existing tests pass without modification.
+
+==== Validation
+
+For each of the six extractors listed above:
+
+* (required) A test workbook is constructed with formatting applied at the
+  column level (via `ws.column_dimensions[letter].alignment` for XLSX; via
+  a `<table:table-column table:default-cell-style-name="...">` element for ODS).
+* (required) `parse_workbook` returns the expected cell-addressed metadata for
+  cells within the content extent.
+* (required) Cells outside the content extent produce no metadata entries from
+  the column default.
+* (required) A cell with an explicit per-cell style overrides the column
+  default on the same column.
+
+==== Related backlog items
+
+* `FTR-TEXT-ORIENTATION-ROUNDTRIP-P5` — introduced `_extract_text_orientations`;
+  the cell-only read path was established here.
+* `FTR-CELL-ALIGNMENT-ROUNDTRIP-P5` — introduced `_extract_horizontal_alignments`
+  with the same cell-only pattern.
+* `FTR-VERTICAL-ALIGNMENT-ROUNDTRIP-P5` — introduced `_extract_vertical_alignments`;
+  same pattern inherited.
+* Word wrap roundtrip (future FTR) — explicitly deferred from this BUG. Track
+  separately to avoid mixing default-suppression semantics with this fix.
+
+==== Implementation sketch
+
+XLSX: build a per-column fallback map once before the cell loop:
+
+[source,python]
+----
+def _build_column_alignment_fallbacks(ws):
+    fallbacks = {}
+    for col_letter, dim in ws.column_dimensions.items():
+        if dim.alignment:
+            fallbacks[col_letter] = dim.alignment
+    return fallbacks
+----
+
+Each extractor checks `fallbacks.get(col_letter)` when `cell.alignment` yields
+no value for the relevant attribute.
+
+ODS: while iterating `<table:table-column>` elements (already done in
+`_extract_ods_column_widths`), also collect `(TABLENS, "default-cell-style-name")`
+into a `col_default_style_map: dict[int, str]`. In each extractor, fall back to
+`col_default_style_map.get(col_index)` when the cell has no explicit
+`table:style-name`.

@@ -186,17 +186,70 @@ def _extract_column_widths(ws: Worksheet) -> dict[str, dict[str, Any]]:
     return widths
 
 
+def _build_xlsx_column_alignment_fallbacks(ws: Worksheet) -> dict[str, Any]:
+    """Return {col_letter: Alignment} for columns that carry a column-level alignment value.
+
+    Reads from ``ws.column_dimensions`` — the carrier written by Excel and LibreOffice
+    when the user formats an entire column.  Only entries where the Alignment object
+    has at least one non-default attribute are included so the map stays sparse.
+    Dimension spans (``dim.min`` / ``dim.max``) are expanded column-by-column,
+    clipped to the worksheet's used extent, mirroring ``_extract_column_widths``.
+    """
+    fallbacks: dict[str, Any] = {}
+    max_ws_col = ws.max_column  # None for empty sheets; extractors guard this already
+    for key, dim in ws.column_dimensions.items():
+        align = getattr(dim, "alignment", None)
+        if align is None:
+            continue
+        rotation = align.text_rotation
+        has_any = (
+            align.horizontal is not None
+            or align.vertical is not None
+            or (rotation is not None and int(rotation) != 0)
+        )
+        if not has_any:
+            continue
+        min_col = dim.min or column_index_from_string(str(key))
+        max_col_dim = dim.max or min_col
+        for col_idx in range(int(min_col), int(max_col_dim) + 1):
+            if max_ws_col is not None and col_idx > max_ws_col:
+                break
+            fallbacks[get_column_letter(col_idx)] = align
+    return fallbacks
+
+
+def _cell_has_explicit_alignment(cell: Any) -> bool:
+    """Return True if the cell's xf contains an explicit <alignment> element.
+
+    openpyxl's ``StyleArray.alignmentId`` is 0 for xf records that carry no
+    alignment element (no style at all, or font/border/fill-only styles).
+    A non-zero value means the xf was written with an explicit ``<alignment>``
+    and ``cell.alignment`` is authoritative for all its properties.
+    """
+    try:
+        return bool(cell._style.alignmentId)
+    except (AttributeError, TypeError):
+        return False
+
+
 def _extract_text_orientations(ws: Worksheet) -> dict[str, dict[str, Any]]:
-    """Extract non-zero text rotation from cells in the used range."""
+    """Extract non-zero text rotation from cells and column-level defaults in the used range."""
+    from openpyxl.utils import get_column_letter as gcl
     orientations: dict[str, dict[str, Any]] = {}
     if ws.max_row is None or ws.max_column is None:
         return orientations
+    col_fallbacks = _build_xlsx_column_alignment_fallbacks(ws)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
         for cell in row:
-            alignment = cell.alignment
-            if alignment is None:
-                continue
-            rotation = alignment.text_rotation
+            col_letter = gcl(cell.column)
+            if _cell_has_explicit_alignment(cell):
+                # Explicit alignment element present: cell.alignment is authoritative.
+                # Its text_rotation (which may be 0) suppresses the column fallback.
+                rotation = cell.alignment.text_rotation
+            elif col_letter in col_fallbacks:
+                rotation = col_fallbacks[col_letter].text_rotation
+            else:
+                rotation = None
             if rotation is None or rotation == 0:
                 continue
             try:
@@ -205,8 +258,6 @@ def _extract_text_orientations(ws: Worksheet) -> dict[str, dict[str, Any]]:
                 continue
             if rotation <= 0:
                 continue
-            from openpyxl.utils import get_column_letter as gcl
-            col_letter = gcl(cell.column)
             address = f"{col_letter}{cell.row}"
             orientations[address] = {"rotation": rotation, "source": "workbook"}
     return orientations
@@ -223,60 +274,62 @@ _CANONICAL_VERTICAL_ALIGNMENTS_XLSX: frozenset[str] = frozenset(
 
 
 def _extract_horizontal_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
-    """Extract horizontal alignment from cells in the used range.
+    """Extract horizontal alignment from cells and column-level defaults in the used range.
 
     Only canonical values (``left`` / ``center`` / ``right``) are emitted.
     The XLSX default (``general``) and any other vocabulary
     (``fill`` / ``justify`` / ``distributed`` / ``centerContinuous``) are
-    dropped so they do not bloat the canonical metadata.
+    dropped so they do not bloat the canonical metadata.  When a cell carries
+    no canonical value the column-level default alignment is used as a fallback.
     """
+    from openpyxl.utils import get_column_letter as gcl
     alignments: dict[str, dict[str, Any]] = {}
     if ws.max_row is None or ws.max_column is None:
         return alignments
+    col_fallbacks = _build_xlsx_column_alignment_fallbacks(ws)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
         for cell in row:
-            alignment = cell.alignment
-            if alignment is None:
-                continue
-            horizontal = alignment.horizontal
+            col_letter = gcl(cell.column)
+            cell_align = cell.alignment
+            horizontal = cell_align.horizontal if cell_align is not None else None
+            if horizontal is None and col_letter in col_fallbacks:
+                horizontal = col_fallbacks[col_letter].horizontal
             if not isinstance(horizontal, str):
                 continue
             canonical = horizontal.strip().lower()
             if canonical not in _CANONICAL_HORIZONTAL_ALIGNMENTS_XLSX:
                 continue
-            from openpyxl.utils import get_column_letter as gcl
-
-            col_letter = gcl(cell.column)
             address = f"{col_letter}{cell.row}"
             alignments[address] = {"horizontal": canonical, "source": "workbook"}
     return alignments
 
 
 def _extract_vertical_alignments(ws: Worksheet) -> dict[str, dict[str, Any]]:
-    """Extract vertical alignment from cells in the used range.
+    """Extract vertical alignment from cells and column-level defaults in the used range.
 
     Only canonical values (``top`` / ``center`` / ``bottom``) are emitted.
     The XLSX default (``None``) and the openpyxl-only values
     (``justify`` / ``distributed``) are dropped so they do not bloat the
-    canonical metadata.
+    canonical metadata.  When a cell carries no canonical value the
+    column-level default alignment is used as a fallback.
     """
+    from openpyxl.utils import get_column_letter as gcl
     alignments: dict[str, dict[str, Any]] = {}
     if ws.max_row is None or ws.max_column is None:
         return alignments
+    col_fallbacks = _build_xlsx_column_alignment_fallbacks(ws)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
         for cell in row:
-            alignment = cell.alignment
-            if alignment is None:
-                continue
-            vertical = alignment.vertical
+            col_letter = gcl(cell.column)
+            cell_align = cell.alignment
+            vertical = cell_align.vertical if cell_align is not None else None
+            if vertical is None and col_letter in col_fallbacks:
+                vertical = col_fallbacks[col_letter].vertical
             if not isinstance(vertical, str):
                 continue
             canonical = vertical.strip().lower()
             if canonical not in _CANONICAL_VERTICAL_ALIGNMENTS_XLSX:
                 continue
-            from openpyxl.utils import get_column_letter as gcl
-
-            col_letter = gcl(cell.column)
             address = f"{col_letter}{cell.row}"
             alignments[address] = {"vertical": canonical, "source": "workbook"}
     return alignments

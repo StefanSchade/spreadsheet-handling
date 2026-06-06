@@ -879,3 +879,188 @@ def test_max_row_max_col_track_only_real_content() -> None:
     assert parsed.max_row == 1
     assert parsed.max_col == 1
     assert parsed.values == {(1, 1): "real"}
+
+
+# ---------------------------------------------------------------------------
+# BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5
+# Column default-cell-style-name as alignment / rotation fallback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.ftr("BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5")
+def test_ods_column_default_style_provides_horizontal_alignment_fallback(
+    tmp_path: Path,
+) -> None:
+    # A table-column with table:default-cell-style-name pointing to a
+    # left-aligned cell style must cause cells in that column with no
+    # explicit table:style-name to be read back with horizontal="left".
+    styles_inner = (
+        '<style:style style:name="col_left" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="left"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:default-cell-style-name="col_left"/>'
+        "<table:table-row>"
+        "<table:table-cell><text:p>header</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>value</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_default_horiz.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "left"
+    assert aligns["A2"]["horizontal"] == "left"
+
+
+@pytest.mark.ftr("BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5")
+def test_ods_column_default_style_provides_vertical_alignment_fallback(
+    tmp_path: Path,
+) -> None:
+    # A table-column with a default-cell-style-name pointing to a top-aligned
+    # cell style must cause cells in that column with no explicit style to be
+    # read back with vertical="top".
+    styles_inner = (
+        '<style:style style:name="col_top" style:family="table-cell">'
+        '<style:table-cell-properties style:vertical-align="top"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:default-cell-style-name="col_top"/>'
+        "<table:table-row>"
+        "<table:table-cell><text:p>header</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>value</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_default_vert.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__vertical_alignments"]
+    assert aligns["A1"]["vertical"] == "top"
+    assert aligns["A2"]["vertical"] == "top"
+
+
+@pytest.mark.ftr("BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5")
+def test_ods_column_default_style_provides_text_orientation_fallback(
+    tmp_path: Path,
+) -> None:
+    # A table-column with a default-cell-style-name pointing to a rotated
+    # cell style must cause cells in that column with no explicit style to be
+    # read back with the correct rotation.
+    styles_inner = (
+        '<style:style style:name="col_rot" style:family="table-cell">'
+        '<style:table-cell-properties style:rotation-angle="90"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:default-cell-style-name="col_rot"/>'
+        "<table:table-row>"
+        "<table:table-cell><text:p>header</text:p></table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>value</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_default_rot.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    orients = ir.sheets["Sheet1"].meta["__text_orientations"]
+    assert orients["A1"]["rotation"] == 90
+    assert orients["A2"]["rotation"] == 90
+
+
+@pytest.mark.ftr("BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5")
+def test_ods_explicit_cell_style_overrides_column_default(
+    tmp_path: Path,
+) -> None:
+    # An explicit table:style-name on a cell must take precedence over the
+    # column's table:default-cell-style-name.  A2 has no explicit style and
+    # receives the column default; A1 has an explicit style that overrides it.
+    styles_inner = (
+        '<style:style style:name="col_left" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="left"/>'
+        "</style:style>"
+        '<style:style style:name="cell_right" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="right"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:default-cell-style-name="col_left"/>'
+        "<table:table-row>"
+        '<table:table-cell table:style-name="cell_right">'
+        "<text:p>override</text:p>"
+        "</table:table-cell>"
+        "</table:table-row>"
+        "<table:table-row>"
+        "<table:table-cell><text:p>default</text:p></table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_default_override.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "right"
+    assert aligns["A2"]["horizontal"] == "left"
+
+
+@pytest.mark.ftr("BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5")
+def test_ods_repeated_cell_uses_per_column_fallback_styles(
+    tmp_path: Path,
+) -> None:
+    # A table-cell with number-columns-repeated="2" spans columns A and B.
+    # Column A has default-cell-style-name="style_left" and column B has
+    # default-cell-style-name="style_right".  The cell itself carries no
+    # explicit table:style-name, so the per-column fallback must produce
+    # A1="left" and B1="right" independently — not both from column A's style.
+    styles_inner = (
+        '<style:style style:name="style_left" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="left"/>'
+        "</style:style>"
+        '<style:style style:name="style_right" style:family="table-cell">'
+        '<style:paragraph-properties fo:text-align="right"/>'
+        "</style:style>"
+    )
+    spreadsheet_inner = (
+        '<table:table table:name="Sheet1">'
+        '<table:table-column table:default-cell-style-name="style_left"/>'
+        '<table:table-column table:default-cell-style-name="style_right"/>'
+        "<table:table-row>"
+        '<table:table-cell table:number-columns-repeated="2">'
+        "<text:p>val</text:p>"
+        "</table:table-cell>"
+        "</table:table-row>"
+        "</table:table>"
+    )
+    out = _write_ods_with_styles(
+        tmp_path, "col_per_col_fallback.ods", styles_inner, spreadsheet_inner
+    )
+
+    ir = parse_workbook(out)
+
+    aligns = ir.sheets["Sheet1"].meta["__horizontal_alignments"]
+    assert aligns["A1"]["horizontal"] == "left"
+    assert aligns["B1"]["horizontal"] == "right"
