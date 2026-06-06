@@ -1,0 +1,335 @@
+= Review: Dynamic Projection Analysis (worldbuilding workaround)
+:toc: macro
+:toclevels: 2
+
+[cols="1,3"]
+|===
+| Scope     | Design analysis (read-only) of the worldbuilding consumer workaround that motivates `FTR-DYNAMIC-FRAME-PROJECTION-P5` and `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`.
+| Inputs    | `worldbuilding/plugins/{story_cast_views,matrix_meta,character_views,frame_sets}.py`, `worldbuilding/pipelines/dino_insel/{json_to_spreadsheet,spreadsheet_to_json}.yaml`, `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-P5.adoc`, `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5.adoc`.
+| Output    | Problem identification and FTR-boundary recommendation. No API, no syntax, no implementation.
+| Modifies  | This file only.
+|===
+
+toc::[]
+
+== 1. Workaround summary
+
+The `worldbuilding` consumer drives a matrix-style workbook view over
+`story_cast_cells` (and one analogous view over `story_groups`). To get the
+generated workbook into the desired shape and to attach validation rules to it,
+the pipeline currently leans on four consumer-side plugin modules:
+
+[cols="1,2,3"]
+|===
+| Module | Functions used | Role in the workaround
+
+| `plugins.story_cast_views`
+| `build_story_cast_matrix_view`, `build_story_cast_matrix_payload`
+| Outbound and inbound *column projection*. Outbound: reorder
+  `[helper columns] + [key columns] + [all remaining dynamic columns]`.
+  Inbound: drop helpers, keep `[key columns] + [all remaining dynamic columns]`
+  so `expand_xref` can read the matrix back.
+
+| `plugins.matrix_meta`
+| `ensure_frame_columns`, `add_from_legend_constraints_for_matrix`
+| `ensure_frame_columns` forces a known column shape on a frame that may be
+  empty. `add_from_legend_constraints_for_matrix` enumerates the matrix view's
+  *dynamic* columns (everything that is not a helper and not a key) and emits
+  one `from_legend` constraint per column into `_meta.constraints`.
+
+| `plugins.character_views`
+| `drop_columns`, `strip_trailing_header_separator`
+| Local trimming and header-normalization utilities. `drop_columns` is the
+  ad-hoc "remove these named columns" inverse used after FK-helper materialization.
+
+| `plugins.frame_sets`
+| `keep_frames`
+| Late-stage filtering of which frames reach the output sink.
+|===
+
+Pattern as seen in `json_to_spreadsheet.yaml`: for every dynamic matrix surface
+the pipeline runs the canonical sequence
+`contract_xref -> join_frames(enrichment) -> plugin:build_*_matrix_view`,
+and again for the `_meta.constraints` rule fan-out. The mirror sequence on the
+return path is `apply_workbook_view_sheet_mappings -> plugin:build_*_matrix_payload -> expand_xref`.
+
+The workaround is functional, deterministic, and small. It is awkward because
+the same derived information ("which columns of this matrix are payload?") is
+recomputed by the consumer at four different pipeline points, using
+*consumer-supplied constants* for facts the framework already knows
+(`helper_columns=("title",)`, `key_columns=("story_id",)`).
+
+== 2. Generic pattern
+
+In every awkward step the consumer is computing the same derived quantity:
+
+____
+*The set of payload columns of a projected (matrix) frame, defined as*
+`all columns minus (helpers ∪ keys)`.
+____
+
+Once that set is named, the four uses become the same primitive seen from
+different sides:
+
+[cols="2,3"]
+|===
+| Use site | What the primitive is used for
+
+| `build_story_cast_matrix_view`
+| Order columns by role: `helpers, keys, payload*`.
+
+| `build_story_cast_matrix_payload`
+| Retain columns by role: `keys, payload*`.
+
+| `add_from_legend_constraints_for_matrix`
+| Fan a rule across every member of `payload*`.
+
+| `ensure_frame_columns` / `drop_columns`
+| Force or trim a frame to a known role-derived shape. These are
+  degenerate (constant-list) variants of the same idea.
+|===
+
+Helpers and keys are not unknown to the pipeline:
+
+* `configure_workbook_view` already declares `helper_columns: [title]`.
+* `contract_xref` knows `row_keys: [story_id]`.
+* The FK-helper machinery already classifies its own columns
+  (`_regions_name`, `_regions_kind`) with a `derived` provenance shape.
+
+What is missing is that none of these classifications survive as
+*queryable column-role metadata on the projected frame*. They are facts that
+were known at one transform, then thrown away, then re-stated by the consumer
+at the next transform as positional parameters.
+
+== 3. Mapping to existing FTRs
+
+[cols="1,2,2"]
+|===
+| Workaround element | FTR it belongs to | Notes
+
+| `build_story_cast_matrix_view` (outbound order: helpers, keys, payload*)
+| `FTR-DYNAMIC-FRAME-PROJECTION-P5`
+| Direct match. The "fixed leading + dynamic remainder" pattern is the
+  motivating example in the FTR text.
+
+| `build_story_cast_matrix_payload` (inbound projection: keys, payload*)
+| `FTR-DYNAMIC-FRAME-PROJECTION-P5`
+| Same primitive applied on the return path. Currently not called out in the
+  FTR; should be, because it implies projection must work *symmetrically*
+  through reimport, not only at workbook-render time.
+
+| `add_from_legend_constraints_for_matrix`
+| `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`
+| Direct match. The FTR's representative example is exactly this case
+  (`from_legend` rule applied to `payload*`).
+
+| `ensure_frame_columns`, `drop_columns`, `strip_trailing_header_separator`,
+  `keep_frames`
+| Out of scope for these FTRs
+| `ensure_frame_columns` is the empty-frame degenerate case of dynamic
+  projection (forces a static shape when no dynamic source exists yet).
+  The rest are unrelated tidy-up utilities and should not influence the
+  problem boundary.
+|===
+
+The two FTRs together cover the *symptomatic* parts of the workaround. Neither
+alone is sufficient.
+
+== 4. Missing concepts
+
+A modelling-level concept is missing that both FTRs silently presuppose:
+
+____
+*Column-role classification as first-class, queryable metadata on a projected
+frame (or on the workbook view bound to it).*
+____
+
+Today the role information is partially present but write-only or single-use:
+
+* `helper_columns: [title]` on `configure_workbook_view` is a *render-side*
+  declaration. It does not survive backwards through reimport, so
+  `build_story_cast_matrix_payload` cannot read it; the consumer re-states it
+  as a Python default.
+* `row_keys: [story_id]` on `contract_xref` is consumed by the transform and
+  then dropped from the column inventory.
+* FK-helper provenance (the `derived` shape) is the only role-like
+  classification that *is* retained on the frame, and it is already used by
+  helper-cleanup logic — proof that the framework can carry role metadata when
+  it chooses to.
+* The "payload" role is purely implicit (anything not classified above).
+
+The two existing FTRs each independently propose ad-hoc selector vocabularies
+(`"*"`, `keep_remaining`, `exclude_helper_columns: true`,
+`exclude_key_columns: true`). That those vocabularies are converging on the
+same hidden concept *from opposite ends of the pipeline* is the strongest
+evidence that the underlying concept is missing rather than mis-named.
+
+Naming this concept explicitly is the modelling step. Everything else
+(reordering by role, addressing by role) becomes thin sugar on top of it.
+
+== 5. Concern separation
+
+To keep the FTR boundary debate clean, the workaround sits across four
+concerns; only one is load-bearing:
+
+[cols="1,3"]
+|===
+| Concern | What part of the workaround lives here
+
+| *Modelling (primary)*
+| Column-role classification on projected frames. This is the missing
+  abstraction.
+
+| *Rendering*
+| `configure_workbook_view`'s `helper_columns` already encodes part of the
+  classification, but only for render output (header styling, future column
+  groups). It does not flow back through reimport. Render-side use should
+  consume the classification, not own it.
+
+| *Pipeline / transforms*
+| `contract_xref` and `join_frames` produce the dynamic columns; downstream
+  steps need to address them. This is the wiring, not the data. Wiring is
+  easy once the data exists.
+
+| *Consumer ergonomics*
+| `"*"` vs `keep_remaining` vs `exclude_*` selectors. These are surface
+  choices and should follow from the modelling decision, not drive it.
+|===
+
+The frequent failure mode in this kind of FTR is to start at "ergonomics" and
+work down; that produces two parallel selector languages (one for projection,
+one for targeting) and a hidden classification concept that lives nowhere.
+The recommended order is the inverse: modelling first, pipeline/wiring next,
+rendering re-use after that, ergonomics last.
+
+== 6. Recommended next FTR
+
+A new FTR should be created. Stretching either existing FTR to absorb the
+column-role classification would distort its purpose:
+
+* `FTR-DYNAMIC-FRAME-PROJECTION-P5` is rightly about *shape* (ordering and
+  retention). It should consume role metadata, not define it.
+* `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` is rightly about *addressing* (rules
+  pointed at column sets). It should consume role metadata, not define it.
+
+Proposed working title for the new foundational FTR (final ID per project
+convention; this analysis does not register it):
+
+____
+*FTR-PROJECTED-FRAME-COLUMN-ROLES-P5* (working title) -- column-role
+classification as first-class metadata on projected frames and workbook views.
+____
+
+Minimum scope to remove the workaround:
+
+* Define a small set of column roles -- at least `key`, `helper`, `payload`;
+  consider aligning with the existing FK-helper `derived` provenance shape so
+  the two concepts unify rather than duplicate.
+* Specify which transforms *write* role metadata
+  (`contract_xref`, `join_frames` for enrichment helpers, FK-helper
+  configuration) and where it lives on the frame.
+* Specify how the metadata *survives* through reimport so the inbound side
+  (`expand_xref` and friends) can address the same classes without consumer
+  re-statement.
+* Do not yet specify a selector language, an ordering language, or a wildcard.
+  Those belong to the two follow-up FTRs.
+
+If creating a new FTR is judged too heavy, the next-best fallback is to scope
+`FTR-DYNAMIC-FRAME-PROJECTION-P5` explicitly so it *introduces* the column-role
+concept (since it is the upstream side that produces the classification) and
+mark `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` as depending on the classification
+existing. This works but blurs the FTR boundary and should be the second
+choice, not the preferred one.
+
+== 7. Backlog decomposition: is the current split right?
+
+The two-FTR split (shape vs. addressing) is *direction-correct*. It correctly
+identifies that "how the view is shaped" and "how later concerns address the
+view" are different stages of the same pipeline — the discussion note inside
+`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` already says so.
+
+The split is also *premature in its current form*. As written, each FTR
+proposes its own private selector vocabulary and treats column roles as
+*parameters* the consumer keeps re-supplying, rather than as *state* the
+framework carries. That is the part that should be adjusted: pull the shared
+prerequisite out, then let each FTR shrink to its real concern.
+
+Recommended adjustments to the two existing FTRs (no rewrite of acceptance
+criteria here; flagged for follow-up):
+
+* Both FTRs should explicitly cite the new column-role FTR as a dependency.
+* `FTR-DYNAMIC-FRAME-PROJECTION-P5` should add the *inbound* projection mirror
+  (`build_story_cast_matrix_payload`) to its scope; today the FTR is phrased
+  mostly in outbound terms, but the workaround proves the inbound mirror is
+  equally important.
+* `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5` should stop assuming a fresh selector
+  language is needed; addressing by role is sufficient for the worldbuilding
+  case and is the simplest thing that removes the workaround.
+
+== 8. Recommended implementation order
+
+. *New foundation FTR* (column-role metadata). Smallest slice that lets
+  `helper`, `key`, and `payload` be addressed by role on a projected frame and
+  survive into reimport. Removes the parameter-restatement smell without
+  introducing any selector or ordering surface yet.
+. *`FTR-DYNAMIC-FRAME-PROJECTION-P5`* implemented on top of (1) as declarative
+  ordering by role. Removes `build_story_cast_matrix_view`,
+  `build_story_cast_matrix_payload`, and the matrix uses of
+  `ensure_frame_columns` / `drop_columns`.
+. *`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`* implemented on top of (1) as
+  rule targets that name a role. Removes
+  `add_from_legend_constraints_for_matrix`.
+. *(Outside this analysis)* Re-evaluate whether
+  `configure_workbook_view`'s `helper_columns` should consume the same
+  classification, so the helper list is declared once and read by both render
+  and pipeline. Likely a separate small FTR or a documented cleanup.
+
+== 9. Commit / FTR traceability notes
+
+Per repository convention, follow-up commits should use:
+
+----
+<type>: <short description> (FTR-XYZ)
+----
+
+If a new foundation FTR is created (recommended path):
+
+* `feat: introduce column-role metadata for projected frames (FTR-PROJECTED-FRAME-COLUMN-ROLES-P5)`
+  -- placeholder ID; final ID assigned at FTR creation time, per project
+  conventions.
+* `feat: support dynamic frame projection by column role (FTR-DYNAMIC-FRAME-PROJECTION-P5)`
+* `feat: support dynamic view column targeting by column role (FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5)`
+
+If the foundation is folded into the projection FTR (fallback path):
+
+* `feat: support dynamic frame projection and column-role metadata (FTR-DYNAMIC-FRAME-PROJECTION-P5)`
+* `feat: support dynamic view column targeting (FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5)`
+
+Either way, both follow-up FTRs should link back to this analysis artifact in
+their *Context* section so the modelling rationale is not lost the next time a
+selector-syntax debate flares up.
+
+== 10. Disposition
+
+* *Workaround status:* functional, deterministic, recommended to keep in the
+  worldbuilding consumer until at least step (1) of the implementation order
+  ships.
+* *Framework gap:* one missing modelling concept (column-role classification
+  on projected frames). Two existing FTRs partition its symptoms but neither
+  owns it.
+* *Recommended action:* create a new foundational FTR; rescope the two
+  existing FTRs to depend on it.
+* *No blockers identified.* No release-notes checkpoint is triggered by this
+  artifact (analysis-only, no user-facing change).
+
+== 11. Out of scope for this analysis
+
+* Selector syntax, projection syntax, YAML shapes, transform signatures.
+* Whether `configure_workbook_view`'s `helper_columns` should be deprecated,
+  renamed, or unified with role metadata. Flagged for a separate review.
+* The auxiliary plugin utilities (`drop_columns`,
+  `strip_trailing_header_separator`, `keep_frames`). These are not part of the
+  recurring projection pattern and do not motivate framework change.
+* `FTR-CONDITIONAL-FOLLOW-UP-PROJECTION-FLOWS-P5`. Adjacent in name only; it
+  is about deriving follow-up *rows* between roundtrips, not about classifying
+  *columns* on a projected frame.
