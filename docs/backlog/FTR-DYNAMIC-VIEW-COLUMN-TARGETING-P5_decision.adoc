@@ -1,0 +1,247 @@
+= Project Decision: FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5
+:toc:
+:toclevels: 2
+
+[cols="1,3"]
+|===
+| Type      | Project-decision artifact (read-only).
+| Outcome   | *Adopt Option C as the baseline + a minimal Option-B-style surface.* The Option-B surface is a single optional `roles:` field on existing rule target schemas (validation, constraint, presentation); no new pipeline step, no new selector grammar. Implement in a separate follow-up slice; record the slice as `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` (working title). Worldbuilding's `add_from_legend_constraints_for_matrix` plugin remains importable through one release cycle.
+| Inputs    | `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5.adoc` (refined), `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5_alignment_review.adoc`, `docs/backlog/FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5.adoc`, `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-P5.adoc`, `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`, `docs/warm_storage/global_reviews/review_dynamic_projection_analysis.adoc`, worldbuilding plugin source under `worldbuilding/plugins/matrix_meta.py`, core pipeline-step infrastructure under `core/src/spreadsheet_handling/`.
+| Modifies  | This file only. No code, test, registry, release-notes, FTR, or other decision artifact is changed by this artifact.
+| Date      | 2026-06-07
+|===
+
+== Executive summary
+
+The targeting FTR's Acceptance Criteria require a recorded project decision in a dedicated decision artifact analogous to `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`. This artifact discharges that criterion.
+
+The decision mirrors the projection decision: *adopt Option C (consume the foundation classification) as the baseline, with a minimal Option-B-style surface*. The Option-B surface chosen here is the *smallest possible delta*: an optional `roles: [<role name>, ...]` field added to existing rule target schemas (validation, constraint, presentation). No new pipeline step is introduced, no top-level YAML key is added, no selector grammar / wildcard / set-algebra surface is admitted. Role resolution is performed by a *shared helper* inside core -- the same resolver introduced for `project_by_role` -- so the projection step and the targeting field cannot diverge on role detection.
+
+Consumer plugins for the specific `from_legend` fan-out are *not* the recommended end state; the worldbuilding `add_from_legend_constraints_for_matrix` plugin becomes redundant once the `roles:` field on validation rule targets lands and the worldbuilding YAML migrates to it. The consumer-plugin mechanism itself is retained. Migration is staged identically to the projection plugin disposition: the plugin stays importable through one release cycle while the YAML moves to the `roles:` form.
+
+This decision respects the foundation FTR (no parallel role taxonomy introduced), the projection FTR + its decision (the projection mechanism is not re-decided, and no targeting parameter is added to `project_by_role`), and the targeting FTR's own *Non-Goals* (no selector grammar, no editability, no merge-back, no lifecycle, no presentation classification).
+
+== Decision (recorded)
+
+* *Architectural Option chosen:* *Option C (Consume the Foundation Classification)*, with a minimal *Option B (Targeting by Role)* surface on top. The "what" comes from the foundation FTR; the "how" is one optional field on existing rule target schemas.
+* *Option A (Keep Plugins) is rejected as the long-term answer* for the specific `from_legend`-over-`matrix_value` fan-out and equivalent role-targeted rule cases. It remains the *interim* answer until the implementation slice ships. It also remains valid as a *general extensibility mechanism*; only `add_from_legend_constraints_for_matrix` (and any equivalent role-targeting plugins) is slated for migration.
+* *Option B is intentionally narrowed.* "Targeting by role" means *naming one or more foundation role names in a rule target*. It does not mean introducing wildcard / set-algebra / composition operators, nor a new top-level targeting step, nor a new step name. The narrowing is captured both in the refined FTR's Non-Goals and in this decision.
+* *Option C is the baseline.* Once the foundation FTR's first code slice lands (a unified `_meta.derived.sheets.<frame>.column_roles` channel or equivalent), the shared role resolver switches from computed reads of scattered sources to the unified channel. No user-facing YAML surface change.
+
+== Architectural direction (concrete)
+
+The direction below is the brief that the implementation FTR (see "Implementation slice plan") inherits. It is *not* the implementation contract; the slice owns its own design review.
+
+=== Where the targeting surface lives
+
+The targeting surface is a *single optional field* added to existing rule target schemas:
+
+* The `target:` block on validation rules (`add_validations` / equivalent) gains an optional `roles: [<role name>, ...]`.
+* The `target:` block on workbook-constraint rules gains the same optional field.
+* The `target:` block on presentation rules gains the same optional field.
+* No new top-level pipeline step. No new top-level YAML key.
+
+When `roles:` is present:
+
+* The rule is fanned out to every column whose role on the named `frame` is one of the listed roles.
+* `roles:` and `columns:` (explicit names) are mutually exclusive on a single target block; specifying both is a validation error.
+* `roles:` accepts only the three foundation role names (`row_identity`, `display_helper`, `matrix_value`). Any other value is a validation error.
+
+Rationale for this placement (why it is the smallest, least invasive design):
+
+. *No new step name.* A dedicated targeting step would require an entry in `core/registries/pipeline_step_registry.json`, ordering decisions relative to validation / constraint / presentation rule application, and a separate user-facing surface. None of that is necessary -- the rules already have a `target:` block; we add one optional field to it.
+. *No new top-level YAML key.* The change is invisible to rules that do not use it. Backward compatibility is trivial.
+. *Composes with existing rule shapes.* Validation, constraint, and presentation rules all share the "target a column set" idiom. Adding one field there lifts the existing `target.columns` enumeration to `target.roles` enumeration for the same rule shape.
+. *No new pipeline ordering question.* The rules are applied at their existing pipeline points; only the target-resolution step gains a role-aware code path. The implementation FTR may factor this into a shared helper, but no new step ordering is required.
+
+=== Schema sketch (illustrative; not contract)
+
+[source,yaml]
+----
+# Validation rule with role-based targeting
+- step: add_validations
+  rules:
+    - target:
+        sheet: story_groups
+        frame: story_group_matrix_view
+        roles: [matrix_value]       # NEW optional field; mutually exclusive with `columns:`
+      rule:
+        type: from_legend
+        legend: story_group_codes
+
+# Equivalent explicit-name form (already supported today; remains valid):
+- step: add_validations
+  rules:
+    - target:
+        sheet: story_groups
+        columns: [col_a, col_b, col_c]
+      rule:
+        type: from_legend
+        legend: story_group_codes
+----
+
+* `frame:` (or its equivalent on the existing target schema) identifies the projected surface whose role classification is read. If absent, the rule's own sheet identity is used.
+* `roles:` accepts a list to allow rules that intentionally span more than one role (e.g. apply a presentation hint to `[display_helper, row_identity]`). Single-role lists are the common case.
+
+=== Role resolution (shared with projection)
+
+Role resolution is performed by a *single shared helper* inside core, factored out of the projection step. Both consumers (`project_by_role` and the targeting field) call the same helper.
+
+* Until the foundation FTR's metadata channel ships in code, the helper computes roles from scattered sources -- the projection decision artifact's "Role-source resolution" rules apply verbatim:
+** `row_identity`: `row_keys` declared on `contract_xref` for the same frame (the projection step's explicit override stays a projection-step parameter; the targeting field does *not* re-expose it as a YAML knob).
+** `display_helper`: `helper_columns` declared on `configure_workbook_view`, or FK-helper `derived` provenance under `_meta.derived.sheets.<frame>.helper_columns`.
+** `matrix_value`: every column on the projected surface that is not `row_identity` and not `display_helper` -- per the foundation FTR's narrowed rest-by-exclusion, scoped to projected matrix / view surfaces only.
+* When the foundation channel lands, the helper switches its source of truth without surface change. This is recorded as an interim arrangement, not an end state, and is shared with the projection decision.
+
+The implementation FTR is responsible for *not* duplicating the resolver between projection and targeting code paths.
+
+=== What is explicitly *not* added
+
+* No wildcard syntax (`"*"`, `"matrix_value/*"`, etc.).
+* No set-algebra (`roles_not_in: [...]`, `roles_intersect: [...]`).
+* No composition operators (union / intersection / difference of multiple selectors).
+* No selector-language grammar.
+* No new pipeline step (`project_by_role` remains the only role-aware step; targeting reuses its resolver, not its step shape).
+* No targeting parameter on `project_by_role`. The projection decision explicitly forbade this and is not reopened.
+* No editability / merge-back / collaboration / lifecycle / presentation-classification semantics.
+
+== Worldbuilding-case evaluation
+
+Refined-FTR Acceptance Criteria: "The worldbuilding use case is evaluated explicitly, expressed in terms of the foundation FTR's role taxonomy. The evaluation explicitly states that targeting *reads* the same role classification consumed by `FTR-DYNAMIC-FRAME-PROJECTION-P5` and does not introduce a parallel taxonomy."
+
+=== `add_from_legend_constraints_for_matrix` (`worldbuilding/plugins/matrix_meta.py`)
+
+* *Current behavior*: inspects the projected matrix view, derives the effective payload column list ("everything that is not a helper and not a key"), and emits a `from_legend` constraint into `_meta.constraints` for each column.
+* *Role mapping*: the "effective payload column list" is exactly the `matrix_value` set on the projected surface.
+* *Mapping to the decision*: with the `roles:` field on validation rule targets, the worldbuilding YAML expresses the same intent declaratively as a single `from_legend` rule with `target: { roles: [matrix_value] }`. The plugin's per-column iteration moves into the shared targeting resolver (already factored for `project_by_role`).
+* *No parallel taxonomy*: the resolver is the same as projection's; no new role concept is introduced; "payload column" wording from the plugin is replaced by `matrix_value` in the migrated YAML comments.
+* *Conclusion*: the plugin is replaceable.
+
+=== Adjacent worldbuilding plugins
+
+Listed for completeness; *none* is in this FTR's scope and *none* is touched by this decision:
+
+* `ensure_frame_columns`, `drop_columns`, `strip_trailing_header_separator`, `keep_frames`: per the driver review §3, these are degenerate-static or unrelated-tidy-up utilities and remain consumer concerns. The projection decision artifact already records this; the targeting decision honors it.
+* `build_story_cast_matrix_view`, `build_story_cast_matrix_payload`: projection plugins. Their disposition is owned by `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`. Not reopened here.
+
+== Plugin disposition (recommendation)
+
+* *`add_from_legend_constraints_for_matrix`*: keep importable, switch worldbuilding YAML to the `roles: [matrix_value]` form in the implementation slice. Mark as a candidate for removal *one release cycle after* the targeting field lands. Rationale: the worldbuilding consumer must not regress at the same commit that introduces the targeting surface; rollback is one YAML edit if the targeting code path has a bug.
+* *Adjacent worldbuilding plugins* (those listed under "Adjacent worldbuilding plugins" above): *unchanged*.
+* *Consumer-plugin mechanism in general*: *retained*. Only the specific role-targeted fan-out plugin is slated for migration. The FTR's *Non-Goal* "No mandatory removal of plugin extensibility" is honored.
+
+This disposition mirrors the projection decision artifact's plugin disposition exactly, by design: both consumer FTRs migrate one named plugin and leave the mechanism in place.
+
+== Implementation slice plan (follow-up FTR)
+
+The FTR's Acceptance Criterion "If declarative support is preferred, the design direction names only *role-based addressing* as the in-scope surface; any wildcard / set-algebra surface is recorded as a separate follow-up question" is discharged here.
+
+=== Recommended follow-up FTR
+
+* *Working title*: `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`.
+* *Status*: not yet created. The maintainer should register it under Phase 3d in `docs/backlog/_ftrs_open.adoc` once this decision is accepted, in the same way `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` is anticipated.
+* *Inherits from this decision artifact*: the architectural direction above (where the surface lives, the schema sketch, the role-resolver sharing, the non-additions).
+* *Slice contents (estimated)*:
+** Optional `roles:` field on validation / constraint / presentation rule target schemas (~20-40 LOC schema + validation across the rule families).
+** Factor the role resolver introduced for `project_by_role` into a shared helper; switch the projection step to consume it (~30-50 LOC refactor, behavior-preserving).
+** Wire the resolver into the rule-application code paths so that `roles: [...]` expands to the concrete column list at rule evaluation time (~40-80 LOC across the rule families).
+** Unit tests under `core/tests/unit/pipeline/` for each affected rule family (~120-160 LOC).
+** Integration test exercising the worldbuilding case roundtrip via the targeting field (~30-50 LOC).
+** Worldbuilding YAML migration: replace the `plugin:add_from_legend_constraints_for_matrix` step with a single `from_legend` validation rule using `target: { roles: [matrix_value] }`.
+** Release-notes entry in `core/docs/release_notes/release_notes.adoc` under the "0.3.0 -- planned" section.
+* *Gates the slice must clear*:
+** *Public-surface gate*: adding an optional field to existing target schemas is a YAML-surface change per `docs/ai_info/interfaces_and_gates.adoc`. The implementation FTR owns gate registration.
+** *Shared-resolver guard*: a test or guard ensures projection and targeting cannot diverge on role detection (single helper, single source of truth).
+** *Alignment guard*: per the refined FTR's *Validation*, the slice must not introduce a parallel role taxonomy and must not re-decide the projection mechanism. A maintenance-contract guard or review checklist item enforces this.
+** *Backend parity*: trivially satisfied (rule evaluation is backend-neutral). No new XLSX / ODS code paths.
+** *Co-dependency with the projection implementation slice*: the shared resolver is best introduced in whichever slice lands first; the second slice then reuses it. The implementation FTR should explicitly coordinate sequencing with `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`.
+
+=== Optional later slice (not committed)
+
+* If a use case ever motivates richer addressing surfaces (wildcard, set algebra, multi-role intersection beyond simple union), it is a *separate future FTR*. The refined FTR's *Non-Goals* and this decision both forbid that work from being absorbed into `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`.
+
+== What this decision does NOT do
+
+Recorded explicitly so future readers cannot quietly expand scope:
+
+* No code is added, modified, or removed in this slice.
+* No tests are added, modified, or removed.
+* No registry entry is created or modified.
+* No release-notes line is added.
+* No foundation-FTR code is shipped; the foundation remains a textual modelling decision.
+* No selector grammar, wildcard syntax, set algebra, composition operators, editability, merge-back, collaboration, lifecycle, or presentation-classification work is introduced or implied.
+* No removal of consumer-plugin extensibility in general; only `add_from_legend_constraints_for_matrix` is slated for *migration*, not removal of the mechanism.
+* The projection decision in `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc` is *not* reopened, restated, or amended. It is treated as input.
+* No targeting parameter is added to `project_by_role` (the projection decision forbade it; this decision honors it).
+* No new pipeline step is introduced. The targeting surface lives on existing rule target schemas.
+
+== Coordination with FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5
+
+* The decision *consumes* the role taxonomy; it does not introduce a parallel one. The field name `roles:`, the accepted values (`row_identity`, `display_helper`, `matrix_value`), and the error rule on unknown values all use the foundation's names verbatim.
+* The decision honors the foundation's *Future Design Pressure (Non-Scope)*:
+** *Composed, not centralized*: the targeting field is a *consumer*; role authority remains with the foundation's named metadata sources (`contract_xref`, `configure_workbook_view`, FK-helper configuration).
+** *Helper semantics are not row-only*: nothing in the targeting schema assumes `display_helper` is positionally leading.
+** *Editable derived columns / distinct axes*: this decision does *not* attach editability or merge-back semantics to any role.
+* The shared role-resolver acknowledges that the foundation has no code yet and frames the interim computed-roles approach as *temporary*, with a clean migration path to a future unified channel.
+
+== Coordination with FTR-DYNAMIC-FRAME-PROJECTION-P5 and its decision
+
+* *Projection mechanism is not re-decided.* The decision in `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc` -- Option C + minimal Option-B surface, one new `project_by_role` step with `direction: outbound | inbound` -- stands.
+* *Targeting does not extend `project_by_role`.* The projection decision artifact's "Coordination with FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5" section explicitly forbade adding a targeting parameter to `project_by_role`. This targeting decision places the surface on existing rule target schemas instead, satisfying that constraint.
+* *Shared role resolver.* The projection decision recommended factoring role resolution into one helper inside the projection step file. This targeting decision *promotes* that to a helper shared between projection and targeting; the implementation FTR owns the refactor. This is a small extension of the projection decision's intent, not a contradiction.
+* *Implementation-slice sequencing.* The two implementation FTRs (`FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` and `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`) can land in either order; whichever lands first introduces the shared resolver, and the second reuses it.
+* *Plugin disposition is parallel.* Projection migrates `build_story_cast_matrix_view` / `build_story_cast_matrix_payload`; targeting migrates `add_from_legend_constraints_for_matrix`. Both keep importable for one release cycle.
+
+== Release-notes checkpoint
+
+* *This decision artifact*: no release-notes update required. It is a backlog / decision document and changes no user-facing behavior.
+* *The follow-up implementation slice*: WILL require a release-notes entry, because adding an optional field to existing rule target schemas is a public YAML-surface change. The implementation FTR owns that entry.
+
+== Residual risks
+
+* *Implementation slice sequencing.* If `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` lands first, it must introduce the shared resolver and the projection slice then reuses it. If projection lands first, the targeting slice refactors the resolver into a shared helper. Both orderings work; the risk is that the slice that lands first under-invests in resolver shareability. Mitigation: name the shared-resolver guard as a gate the first-landing slice must clear.
+* *Mutual exclusion of `roles:` and `columns:`.* Specifying both on a single target block is a validation error per the schema sketch. If a use case ever needs both (e.g. "all `matrix_value` columns plus this one explicit extra"), it is *out of scope here* and belongs to a later FTR. Mitigation: the implementation FTR's validation message points reviewers at this decision.
+* *Computed-role drift.* Same risk as recorded in the projection decision: until the foundation channel ships in code, the resolver reads scattered sources. Two consumers using the same resolver mitigates intra-project drift. The risk remains that an *external* consumer plugin computes roles differently. Mitigation: documentation; not actionable in this slice.
+* *Plugin migration regression.* If the targeting code path has a bug, the worldbuilding consumer's validation breaks at the same commit. Mitigation (already in the plugin-disposition recommendation): keep `add_from_legend_constraints_for_matrix` importable and rollback-able for one release cycle.
+* *Surface-area creep on review.* The smallest-possible-delta design relies on reviewers rejecting wildcard / set-algebra requests during the implementation slice. Mitigation: the refined FTR's *Non-Goals* list and this decision's "What is explicitly not added" subsection are the canonical references.
+* *Foundation channel implementation might happen elsewhere.* If the foundation FTR receives a code slice that changes the role-source resolver's interface, both projection and targeting implementation slices need to track. Mitigation: the shared resolver localizes the impact to a single helper file.
+
+== Acceptance Criteria check (against the refined FTR)
+
+[cols="3,1,3"]
+|===
+| Criterion (verbatim) | Status | Where discharged
+
+| The worldbuilding use case is evaluated explicitly, expressed in terms of the foundation FTR's role taxonomy.
+| Done
+| "Worldbuilding-case evaluation" section above; `add_from_legend_constraints_for_matrix` mapped to the `matrix_value` role.
+
+| The evaluation explicitly states that targeting *reads* the same role classification consumed by `FTR-DYNAMIC-FRAME-PROJECTION-P5` and does not introduce a parallel taxonomy.
+| Done
+| "Role resolution (shared with projection)" subsection plus "Coordination with FTR-DYNAMIC-FRAME-PROJECTION-P5 and its decision" -- the shared resolver design records this explicitly.
+
+| Transferability to future business-oriented consumers is assessed.
+| Done
+| The targeting field lives on existing rule target schemas across validation / constraint / presentation rule families, which are exactly the consumption points business-oriented consumers (classification / permission / localization / feature-toggle / configuration matrices, per the FTR's *Motivation*) would use. The "Architectural direction" section records this.
+
+| A project decision is recorded in a dedicated decision artifact analogous to `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`.
+| Done
+| This artifact.
+
+| If declarative support is preferred, the design direction names only *role-based addressing* as the in-scope surface; any wildcard / set-algebra surface is recorded as a separate follow-up question.
+| Done
+| "What is explicitly *not* added" subsection plus "Optional later slice (not committed)".
+
+| It is documented whether consumer plugins remain the preferred solution.
+| Done
+| "Plugin disposition (recommendation)" section: the specific role-targeted fan-out plugin is *not* the recommended end state; the consumer-plugin mechanism in general is retained.
+|===
+
+== Verdict
+
+* *Project decision*: *Adopt Option C + minimal Option-B surface.* The Option-B surface is a single optional `roles:` field on existing rule target schemas, no new step, no new top-level YAML key. Consumer plugins for the specific role-targeted fan-out are interim only.
+* *State change required next*:
+. Maintainer reviews this artifact.
+. If accepted, register `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` under Phase 3d in `docs/backlog/_ftrs_open.adoc`.
+. The implementation slice can then be picked up; it is no longer blocked by an undecided architectural question.
+. Coordinate sequencing with `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`: whichever lands first owns the shared role-resolver helper.
