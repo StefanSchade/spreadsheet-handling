@@ -134,16 +134,28 @@ implementation slice owns its own design review; minor refinements
 during review are acceptable as long as none of the non-goals above
 is touched.
 
+*`project_by_role` is an in-place transform.* It mutates the named
+frame's column sequence; it does not produce a new output frame.
+There is no `source:` / `output:` parameter. The migration plan
+below (*Worldbuilding migration plan*) is responsible for ensuring
+that the frame to be projected already carries the intended name
+when the step runs.
+
+The illustrative examples below use the concrete dino_insel frame
+names from the worldbuilding migration; `story_cast_cells` is *not*
+used as an example because it is the canonical long-form source,
+not a projected matrix surface (see review finding High-1).
+
 Outbound:
 
 [source,yaml]
 ----
 - step: project_by_role
-  frame: story_cast_cells
+  frame: story_group_matrix_view
   direction: outbound
-  # Optional overrides (omit if upstream sources are sufficient):
-  # helper_columns: [title]
-  # key_columns: [story_id]
+  helper_columns: [title]      # required at this call site (see Role-resolution strategy)
+  key_columns: [story_id]      # required at this call site
+  # Optional:
   # role_order: [display_helper, row_identity, matrix_value]
 ----
 
@@ -152,11 +164,11 @@ Inbound:
 [source,yaml]
 ----
 - step: project_by_role
-  frame: story_cast_cells
+  frame: story_group_matrix_view
   direction: inbound
-  # Optional overrides:
-  # helper_columns: [title]
-  # key_columns: [story_id]
+  helper_columns: [title]      # required at this call site
+  key_columns: [story_id]      # required at this call site
+  # Optional:
   # role_order: [row_identity, matrix_value]
 ----
 
@@ -236,6 +248,28 @@ ships in a future slice owned by the foundation FTR (or a child of
 it), the resolver switches its source of truth in one module
 without changing the YAML surface and without changing the
 contract of `project_by_role`.
+
+*Important consequence for the worldbuilding migration:* the
+scattered-source strategy presupposes that, at the moment
+`project_by_role` runs, the resolver can reach the upstream
+declarations *for the same frame name*. In the current
+worldbuilding outbound pipeline, this is not the case:
+
+* `configure_workbook_view` runs *after* the outbound projection
+  call sites (`json_to_spreadsheet.yaml` lines 94/240-262 vs line
+  296+), so view-declared `helper_columns: [title]` is not yet
+  visible to the resolver at outbound projection time.
+* `contract_xref` declares `row_keys: [story_id]` on the upstream
+  matrix frame (e.g. `story_group_matrix`), not on the projected
+  surface (e.g. `story_group_matrix_view`). The resolver does not
+  trace frame ancestry in this slice.
+
+Therefore the outbound *and* inbound worldbuilding call sites must
+pass explicit `helper_columns: [title]` and `key_columns:
+[story_id]` overrides until either the foundation channel ships or
+the pipeline ordering changes. The migration plan below records
+this requirement and the *Tests and validation* section asserts
+the resolver inputs are reachable in the migrated YAML.
 
 The resolver module must:
 
@@ -326,39 +360,217 @@ different default orderings.
 The two worldbuilding pipeline YAMLs are migrated in the same
 commit as the core step lands. Plugin functions remain importable.
 
-Outbound (`worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml`):
+*Current call-site inventory (10 sites total).*
 
-* Replace the step reference
-  `plugin:build_story_cast_matrix_view` (with its current
-  consumer-supplied parameter constants) with:
+The current pipelines invoke the projection plugins at five
+outbound surfaces and five inbound surfaces. All ten must be
+migrated together.
+
+Outbound
+(`worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml`):
+
+[cols="1,2,2"]
+|===
+| Line(s) | Source frame | Output frame (projected `*_matrix_view`)
+
+| 94-98   | `story_group_matrix_enriched`                   | `story_group_matrix_view`
+| 240-244 | `story_cast_role_matrix_enriched`               | `story_cast_role_matrix_view`
+| 246-250 | `story_cast_notes_matrix_enriched`              | `story_cast_notes_matrix_view`
+| 252-256 | `story_cast_character_development_matrix_enriched` | `story_cast_character_development_matrix_view`
+| 258-262 | `story_cast_crystal_matrix_enriched`            | `story_cast_crystal_matrix_view`
+|===
+
+Inbound
+(`worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml`):
+
+[cols="1,2,2"]
+|===
+| Line(s) | Source frame (`*_matrix_view`)             | Output frame (`*_matrix_payload`)
+
+| 49-53 | `story_group_matrix_view`                     | `story_group_matrix_payload`
+| 77-81 | `story_cast_role_matrix_view`                 | `story_cast_role_matrix_payload`
+| 83-87 | `story_cast_notes_matrix_view`                | `story_cast_notes_matrix_payload`
+| 89-93 | `story_cast_character_development_matrix_view`| `story_cast_character_development_matrix_payload`
+| 95-99 | `story_cast_crystal_matrix_view`              | `story_cast_crystal_matrix_payload`
+|===
+
+*Mismatch with the in-place `frame:` surface.*
+
+`project_by_role` is in-place; the current plugins are
+source-to-output transforms. The migration must produce the final
+`*_matrix_view` / `*_matrix_payload` frame names *before*
+`project_by_role` runs, then call the step in place on those frames.
+No `source:` / `output:` is added to `project_by_role`.
+
+The chosen path is *upstream rename* on existing primitives. No new
+primitive is introduced; no silent wiring is invented.
+
+*Outbound rewiring (per surface).*
+
+For each outbound surface, two edits replace the plugin invocation:
+
+. Change the immediately-preceding `join_frames` step's `output:`
+  parameter from `*_matrix_enriched` to `*_matrix_view`. The
+  `*_matrix_enriched` intermediate name has no other consumer in
+  the current YAML, so retiring it is safe (a grep is part of the
+  migration review).
+. Replace the `plugin:build_story_cast_matrix_view` step with:
 +
 [source,yaml]
 ----
 - step: project_by_role
-  frame: story_cast_cells
+  frame: <*_matrix_view>
   direction: outbound
+  helper_columns: [title]
+  key_columns: [story_id]
 ----
 +
-No explicit `helper_columns` / `key_columns` are required because
-`configure_workbook_view` already declares `helper_columns: [title]`
-and `contract_xref` already declares `row_keys: [story_id]`. If the
-worldbuilding pipeline's source ordering or wiring requires them as
-overrides during the migration, they may be added; the migration
-review confirms this.
+Explicit overrides are required because `configure_workbook_view`
+runs later in the pipeline and `contract_xref`'s `row_keys` were
+declared on the upstream `*_matrix` frame, not on the projected
+`*_matrix_view` frame (see *Role-resolution strategy*).
 
-Inbound (`worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml`):
+Concrete worked example for the first outbound surface (lines 86-98 in
+`json_to_spreadsheet.yaml`):
 
-* Replace the step reference
-  `plugin:build_story_cast_matrix_payload` with:
+* Before:
++
+[source,yaml]
+----
+- step: join_frames
+  left: story_group_matrix
+  right: stories
+  output: story_group_matrix_enriched   # CHANGE this
+  ...
+- step: plugin
+  dotted: plugins.story_cast_views:build_story_cast_matrix_view
+  args:
+    source: story_group_matrix_enriched
+    output: story_group_matrix_view
+----
++
+* After:
++
+[source,yaml]
+----
+- step: join_frames
+  left: story_group_matrix
+  right: stories
+  output: story_group_matrix_view       # CHANGED from _enriched
+  ...
+- step: project_by_role
+  frame: story_group_matrix_view
+  direction: outbound
+  helper_columns: [title]
+  key_columns: [story_id]
+----
+
+The same pattern applies to the four `story_cast_*` outbound surfaces
+(lines 208-262).
+
+*Inbound rewiring (per surface).*
+
+For each inbound surface, the rewiring inverts the outbound pattern:
+
+. Replace the `plugin:build_story_cast_matrix_payload` step with an
+  in-place `project_by_role` call on the `*_matrix_view` frame
+  (which is already present after
+  `apply_workbook_view_sheet_mappings`).
+. Update the downstream consumer step's `matrix:` parameter to read
+  from `*_matrix_view` instead of `*_matrix_payload`. The
+  `*_matrix_payload` intermediate name has no other consumer.
+
+Concrete worked example for the first inbound surface (lines 49-65 in
+`spreadsheet_to_json.yaml`):
+
+* Before:
++
+[source,yaml]
+----
+- step: plugin
+  dotted: plugins.story_cast_views:build_story_cast_matrix_payload
+  args:
+    source: story_group_matrix_view
+    output: story_group_matrix_payload
+
+- step: expand_compact_multiaxis
+  matrix: story_group_matrix_payload      # CHANGE this
+  ...
+----
++
+* After:
 +
 [source,yaml]
 ----
 - step: project_by_role
-  frame: story_cast_cells
+  frame: story_group_matrix_view
   direction: inbound
+  helper_columns: [title]
+  key_columns: [story_id]
+
+- step: expand_compact_multiaxis
+  matrix: story_group_matrix_view         # CHANGED from _payload
+  ...
 ----
 
-Plugin functions:
+The same pattern applies to the four `story_cast_*` inbound surfaces
+(lines 77-135); their downstream consumer is `expand_xref` whose
+`matrix:` parameter changes from `*_matrix_payload` to `*_matrix_view`.
+
+*Plugin behavior parity (gap analysis).*
+
+The current plugins do three things that `project_by_role` does
+*not* do, by design. The migration plan addresses each explicitly.
+
+. *Row sorting (outbound only).* The plugin sorts the result by
+  `story_id` with a stable mergesort. `project_by_role` performs
+  no row-level operation; it only reorders columns. The upstream
+  `contract_xref` declares `dense_axes.rows_from: { frame: stories,
+  key: id }`, which produces deterministic row order keyed by
+  `stories.id`. The migration plan *relies on this upstream
+  determinism* and removes the plugin-side sort.
+  Migration-parity tests (*Tests and validation*) assert that the
+  observed row order on each migrated outbound surface matches the
+  pre-migration observed order on the same fixture.
+. *Empty-cell normalization (outbound and inbound).* The plugins
+  apply `result.where(pd.notnull(result), "")`, converting NaN to
+  empty string. `project_by_role` performs no value transformation
+  (its contract is "data values for retained columns are
+  unchanged"). The migration may therefore present NaN where the
+  plugin presented `""`. The migration plan accepts this as a
+  *conscious behavior change* and treats normalization as the
+  responsibility of separate value-shape steps if any downstream
+  consumer relies on `""` semantics. Migration-parity tests assert
+  end-to-end roundtrip with `expand_compact_multiaxis drop_empty:
+  true` / `expand_xref drop_empty: true` semantics; if those tests
+  fail because of the NaN-vs-"" distinction, the implementation
+  slice adds an explicit normalization step in the worldbuilding
+  YAML using an existing primitive (e.g. `sparse_defaults` or
+  equivalent). The slice does *not* add normalization to
+  `project_by_role`.
+. *Frame renaming.* The plugins rename by virtue of `source:` /
+  `output:`. The upstream-rename strategy above absorbs this work
+  into existing `join_frames` `output:` (outbound) and downstream
+  consumer `matrix:` (inbound), with no new primitive.
+
+*Fallback path (consciously not chosen here).*
+
+If implementation review concludes the upstream-rename strategy is
+unworkable (e.g. because the `*_matrix_enriched` intermediate name
+acquires a downstream consumer outside the dino_insel pipeline, or
+because the inbound downstream `matrix:` parameter rename touches
+more than the five named consumers), the fallback is a *conscious
+surface change*: add optional `source:` / `output:` parameters to
+`project_by_role`, mutually exclusive with `frame:`, with the
+in-place behavior preserved when only `frame:` is given. That
+fallback would reopen the projection decision's "no source / output"
+commitment and would require a one-line amendment to
+`FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc` recording the
+deliberate surface refinement. This implementation slice does *not*
+take that path; it is recorded here only so future implementers
+know it is an option of last resort, not silent invention.
+
+*Plugin function retention.*
 
 * `worldbuilding/plugins/story_cast_views.py` retains
   `build_story_cast_matrix_view` and
@@ -368,18 +580,16 @@ Plugin functions:
   pre-`project_by_role` implementation, kept importable for one
   release cycle, with a pointer to this FTR.
 
-Rollback:
+*Rollback.*
 
-* If a defect surfaces after migration, revert the two YAML files
-  to the pre-migration step references; the plugin functions still
-  work. No core revert is required for rollback.
-* The release notes entry must mention the rollback path in one
-  short bullet.
-
-Migration of the analogous `story_groups` matrix (if exercised in
-the dino_insel pipeline) follows the same pattern; the migration
-review identifies whether one or two `project_by_role` invocations
-are needed per direction.
+* If a defect surfaces after migration, revert the YAML edits per
+  surface. For outbound, restore the `*_matrix_enriched` `output:`
+  name and re-introduce the plugin step. For inbound, restore the
+  `*_matrix_payload` consumer `matrix:` name and re-introduce the
+  plugin step. The plugin functions still work; no core revert is
+  required for rollback.
+* The release notes entry must list the per-surface rollback path
+  in one short paragraph.
 
 *Tests and validation:*::
 
@@ -444,6 +654,66 @@ Integration test (roundtrip):
   re-read it, and run `project_by_role(inbound)`. Data values for
   retained columns must roundtrip identically.
 
+Migration-parity tests (worldbuilding-specific):
+
+The slice migrates 10 plugin call sites (5 outbound + 5 inbound). A
+single illustrative `project_by_role` test on a fabricated frame is
+*not* sufficient to certify the migration. The slice adds a
+migration-parity test fixture that exercises every current
+projection surface and asserts parity with pre-migration plugin
+behavior on the dimensions where parity is required:
+
+. *Frame-name parity.* For each of the 10 surfaces, the frame name
+  consumed by the next downstream step after the migration must be
+  exactly the frame name the migrated YAML produces. Concretely:
+** Outbound: each `configure_workbook_view` `frame:` entry on lines
+   304-308 of `json_to_spreadsheet.yaml` (`story_group_matrix_view`,
+   `story_cast_role_matrix_view`,
+   `story_cast_notes_matrix_view`,
+   `story_cast_character_development_matrix_view`,
+   `story_cast_crystal_matrix_view`) must still resolve after
+   migration.
+** Inbound: each downstream `expand_compact_multiaxis` /
+   `expand_xref` `matrix:` parameter must reference a frame that
+   exists at the point of consumption after the rename from
+   `*_matrix_payload` to `*_matrix_view`.
+. *Row-order parity (outbound only).* For each of the 5 outbound
+  surfaces, the observed row order on a fixed dino_insel fixture
+  must equal the pre-migration observed row order on the same
+  fixture. The expectation is that `contract_xref`'s
+  `dense_axes.rows_from: { frame: stories, key: id }` provides
+  deterministic row order keyed by `stories.id`, making the
+  plugin-side `sort_by=("story_id",)` redundant. If the test fails,
+  the migration is rejected; the implementation must not paper over
+  the difference by adding a sort inside `project_by_role`.
+. *Empty-cell-normalization parity (end-to-end).* For each of the 5
+  inbound surfaces, exercise the inbound roundtrip through
+  `expand_compact_multiaxis drop_empty: true` (for
+  `story_group_*`) and `expand_xref drop_empty: true` (for the four
+  `story_cast_*` surfaces). The reimported payload must equal the
+  pre-migration reimported payload byte-for-byte (or via the
+  established roundtrip-equality comparator). If the test fails due
+  to the NaN-vs-`""` distinction documented in the migration plan's
+  *Plugin behavior parity (gap analysis)*, the implementation slice
+  adds an explicit normalization step in the worldbuilding YAML
+  using an existing primitive -- *not* by adding normalization to
+  `project_by_role`.
+. *Resolver-input availability.* For each of the 10 surfaces, the
+  test fixture confirms that the explicit `helper_columns: [title]`
+  and `key_columns: [story_id]` overrides are reachable by the
+  resolver at the point `project_by_role` runs (i.e. the parameters
+  are read at step invocation, not deferred). This guards against
+  silent regression if the resolver's override-precedence rules are
+  inadvertently weakened.
+. *All current projection surfaces covered.* The test fixture
+  must exercise all 10 surfaces, not only the
+  `story_group_matrix_view` example used in *Proposed YAML
+  surface*.
+
+The migration-parity test fixture may live under
+`core/tests/integration/pipeline/` or under a worldbuilding-tagged
+test path; the implementation review chooses the placement.
+
 Backend parity:
 
 * The step is backend-neutral (Frame layer). No XLSX / ODS code
@@ -496,8 +766,44 @@ state at least:
 * *Worldbuilding regression at migration time.* If the core step
   has a bug, the worldbuilding consumer breaks at the same commit.
   Mitigation: the plugin functions remain importable; rollback is
-  a one-line YAML edit per pipeline file. The release notes
-  document the rollback path.
+  per-surface YAML edits documented in the migration plan's
+  *Rollback* subsection. The release notes document the rollback
+  path.
+* *Row-order drift on the migrated outbound surfaces.* The plugin
+  enforced `sort_by=("story_id",)` with stable mergesort. The
+  migration plan relies on upstream `contract_xref dense_axes`
+  for deterministic order. If that assumption is wrong on any of
+  the 5 outbound surfaces, the migrated row order changes.
+  Mitigation: migration-parity row-order test (item 2 of the
+  *Migration-parity tests* list) is a *blocking* test for this
+  slice; failure rejects the migration.
+* *NaN-vs-empty-string distinction on inbound payload roundtrip.*
+  The plugins normalized NaN to `""` via `.where(pd.notnull(...),
+  "")`. `project_by_role` does not. If `expand_compact_multiaxis
+  drop_empty: true` or `expand_xref drop_empty: true` treats `""`
+  and NaN differently, the reimported payload diverges.
+  Mitigation: migration-parity end-to-end test (item 3 of the
+  *Migration-parity tests* list) is a blocking test; if it fails,
+  the implementation slice adds an explicit normalization step in
+  the worldbuilding YAML using an existing primitive, *not* by
+  adding normalization to `project_by_role`.
+* *Upstream-rename collateral.* The migration plan retires the
+  `*_matrix_enriched` intermediate frame names (outbound) and the
+  `*_matrix_payload` intermediate frame names (inbound) by folding
+  their work into adjacent steps. If any external consumer (a
+  downstream pipeline file, a test, a doc example) references
+  those intermediate names, the rename breaks them silently.
+  Mitigation: a pre-merge grep for the 10 retiring frame names
+  across the worldbuilding repo and any worldbuilding-tagged
+  fixtures is part of the implementation slice's review checklist.
+* *Conscious fallback temptation.* If the implementation review
+  hits unexpected friction with the upstream-rename strategy, the
+  fallback (adding `source:` / `output:` to `project_by_role`)
+  reopens the projection decision artifact. Mitigation: the
+  fallback path requires an explicit one-line amendment to
+  `FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc` and an
+  acknowledgement in this FTR's *Worldbuilding migration plan*
+  *Fallback path* subsection. The fallback is not silent.
 * *Hidden dependence on the consumer plugins.* Tests or demos
   outside the worldbuilding consumer may import the plugin
   functions directly. Mitigation: a one-time grep for plugin
@@ -555,9 +861,30 @@ true on a single PR / branch:
 . The worldbuilding YAMLs at
   `worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml`
   and `worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml`
-  call `project_by_role` instead of the two projection plugins.
-  The pre-migration plugin functions remain importable from
+  call `project_by_role` instead of the two projection plugins on
+  *all 10* current call sites (5 outbound + 5 inbound) enumerated
+  in the migration plan's *Current call-site inventory*. The
+  pre-migration plugin functions remain importable from
   `worldbuilding/plugins/story_cast_views.py`.
+. The migration uses the *upstream-rename* wiring strategy
+  documented in the migration plan: outbound `join_frames output:`
+  renamed from `*_matrix_enriched` to `*_matrix_view`; inbound
+  downstream `expand_compact_multiaxis matrix:` / `expand_xref
+  matrix:` renamed from `*_matrix_payload` to `*_matrix_view`. No
+  `source:` / `output:` parameter is added to `project_by_role`.
+. Each of the 10 call sites passes explicit `helper_columns:
+  [title]` and `key_columns: [story_id]` overrides, because
+  `configure_workbook_view` runs later in the outbound pipeline
+  and `contract_xref` declares `row_keys` on an upstream frame
+  (per *Role-resolution strategy*).
+. Migration-parity tests covering frame names, row order,
+  empty-cell normalization end-to-end, resolver-input
+  availability, and all 10 surfaces exist and pass. The list in
+  *Tests and validation* under *Migration-parity tests* is the
+  minimum.
+. A pre-merge grep confirms no external consumer references the
+  retiring intermediate frame names (`*_matrix_enriched`,
+  `*_matrix_payload`) outside the migrated YAML files.
 . A release-notes entry is added to the active unreleased
   ("0.3.0 -- planned") section of
   `core/docs/release_notes/release_notes.adoc` covering the items
