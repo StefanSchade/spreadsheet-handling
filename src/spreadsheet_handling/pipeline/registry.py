@@ -169,6 +169,13 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
             "apply_derived_column_policy"
         ),
     ),
+    "project_by_role": StepRegistration(
+        factory=make_frames_target_step,
+        target=(
+            "spreadsheet_handling.domain.transformations.project_by_role:"
+            "project_by_role"
+        ),
+    ),
 }
 
 
