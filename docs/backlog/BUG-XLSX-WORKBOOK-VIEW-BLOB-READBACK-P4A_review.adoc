@@ -1,0 +1,181 @@
+===== BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A -- Implementation Review
+
+*Reviewed bug:* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A.adoc`
+*Review focus:* scope discipline, carrier-boundary correctness, regression coverage
+
+==== Verdict
+
+*Verdict:* Green
+
+*Scope assessment:* Moderate extension
+
+The implementation is not a broad metadata redesign. It introduces one
+workbook-meta canonicalization helper and applies it at the existing workbook
+projection and composer boundaries. That is broader than a read-path-only XLSX
+patch because the write-side composer is shared by XLSX and ODS, but the extra
+scope is justified by the bug's own root-cause direction: sheet-level
+`workbook_meta_blob` representations were being re-serialized as canonical
+workbook metadata and could bury `_meta.workbook_view`.
+
+No new lifecycle model, persistence model, projection layer, carrier-neutral
+framework, or generalized metadata infrastructure was introduced.
+
+==== Files Reviewed
+
+* `docs/ai_info/review_instructions.adoc`
+* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A.adoc`
+* `docs/release_notes/release_notes.adoc`
+* `src/spreadsheet_handling/rendering/workbook_projection.py`
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py`
+* `tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+* `Makefile`
+
+==== Findings By Severity
+
+===== Critical
+
+None.
+
+===== Major
+
+None.
+
+===== Minor
+
+None.
+
+===== Notes
+
+. The exported `canonicalize_workbook_meta` helper is a moderate extension
+  because it is reusable from both read and write code. It remains bounded:
+  the helper only recognizes the existing carrier-local
+  `workbook_meta_blob` key, unwraps JSON or legacy repr dictionary payloads,
+  and restores canonical top-level workbook meta keys such as
+  `workbook_view`.
+. Applying the helper in `compose_workbook` affects both XLSX and ODS because
+  both write paths route through the composer. This is acceptable for this
+  bug because the implementation repairs the malformed canonical workbook
+  metadata before any carrier serializes it. It does not add an ODS-specific
+  behavior branch.
+. Recursive unwrapping is narrowly scoped to chained `workbook_meta_blob`
+  wrappers. It does not add schema validation and does not define a new
+  metadata normalization framework.
+
+==== Review Questions
+
+===== Root-Cause Alignment
+
+The implementation repairs the identified carrier/readback failure.
+
+`workbookir_to_frames` now recovers `frames["_meta"]` from the hidden `_meta`
+carrier by parsing `workbook_meta_blob` and then canonicalizing away any nested
+carrier wrapper before publishing `_meta`. This directly addresses the
+observed failure where the XLSX hidden `_meta` sheet contained
+`workbook_meta_blob`, but readback exposed that carrier key instead of a
+top-level `_meta.workbook_view`.
+
+The write-side change in `compose_workbook` also aligns with the bug statement.
+The bug's root-cause section identified `layout_composer.py` as part of the
+overlap zone and observed a nested blob shape. Canonicalizing before
+serializing a new blob prevents a sheet-level representation from being
+wrapped again.
+
+===== Scope Control
+
+The implementation does not introduce:
+
+* new metadata abstractions;
+* new lifecycle concepts;
+* new persistence concepts;
+* new projection layers;
+* a carrier-neutral framework;
+* generalized meta infrastructure.
+
+The only new abstraction is a carrier-local workbook-meta helper in
+`workbook_projection.py`. It is intentionally named around workbook meta, not
+generic metadata, and it only handles the already-existing
+`workbook_meta_blob` carrier key.
+
+===== Boundary Correctness
+
+The fix is located at the correct boundary:
+
+* read-side recovery happens in `workbookir_to_frames`, where parsed
+  `WorkbookIR` hidden-sheet data becomes pipeline `frames`;
+* write-side repair happens in `compose_workbook`, where incoming
+  `frames["_meta"]` becomes canonical workbook meta before hidden-carrier
+  serialization.
+
+The existing workbook-view contract is preserved: consumers still receive
+`frames["_meta"]["workbook_view"]` as a top-level mapping after XLSX readback.
+The carrier-local `workbook_meta_blob` key is no longer allowed to shadow that
+contract.
+
+===== Regression Coverage
+
+Regression coverage is strong and exercises the real XLSX path:
+
+* `test_xlsx_carrier_roundtrip_recovers_top_level_workbook_view` writes via
+  `save_xlsx`, parses with `parse_workbook`, projects through
+  `workbookir_to_frames`, and asserts top-level `_meta.workbook_view`.
+* `test_xlsx_writer_does_not_nest_stray_workbook_meta_blob` covers the
+  write-side recurrence path where a sheet-level representation is passed
+  back into the writer.
+* `test_xlsx_reader_unwraps_nested_workbook_meta_blob` hand-crafts the
+  malformed hidden `_meta` carrier and verifies recovery.
+* `test_xlsx_carrier_end_to_end_via_excel_backend_preserves_workbook_view`
+  covers the public `ExcelBackend` facade.
+
+This is not a unit-shaped mock. It exercises actual XLSX carrier write,
+parse, and backend readback behavior.
+
+===== Risk Assessment
+
+ODS risk is low but real because the composer change is shared. A targeted ODS
+adapter roundtrip test remains green. The change does not add an ODS-specific
+carrier rule; it only prevents non-canonical workbook meta from being handed to
+the existing carrier serialization path.
+
+Existing hidden `_meta` workbooks should remain compatible. Already-canonical
+mappings are returned unchanged. JSON and legacy repr dictionary carrier blobs
+continue to parse. Carrier wrappers are stripped only when the
+`workbook_meta_blob` value decodes to a dictionary.
+
+The fix does not merely mask malformed nested blobs. It recovers the canonical
+inner workbook metadata when the malformed wrapper is the exact carrier nesting
+identified by the bug. It does not introduce broader validation or silently
+reinterpret unrelated metadata structures.
+
+==== Validation
+
+Commands run:
+
+[source,text]
+----
+make test-file FILE=tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py
+----
+
+Result:
+
+[source,text]
+----
+4 passed
+----
+
+[source,text]
+----
+make test-file FILE=tests/integration/io_backends/ods/test_ods_adapter_roundtrip.py
+----
+
+Result:
+
+[source,text]
+----
+3 passed
+----
+
+==== Recommendation
+
+Accept the implementation as the smallest correct repair for the observed bug,
+with the qualification that it is a bounded moderate extension rather than a
+pure XLSX read-path patch. No follow-up redesign is recommended for this bug.

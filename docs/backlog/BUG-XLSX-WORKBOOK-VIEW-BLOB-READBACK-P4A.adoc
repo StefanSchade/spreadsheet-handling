@@ -1,6 +1,6 @@
 ===== BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A -- XLSX readback loses `_meta.workbook_view` and breaks workbook-view roundtrip
 
-*Status:* New
+*Status:* Done
 *Priority:* P4A
 *Area:* XLSX carrier / hidden `_meta` sheet / workbook-view readback / roundtrip regression
 *Observed via:* `worldbuilding` consumer after `refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5`
@@ -306,4 +306,49 @@ Post-fix verification:
 * `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
 * `BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5`
 * `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`
+
+==== Resolution
+
+Carrier projection is now defensively idempotent on both ends of the
+hidden ``_meta`` sheet:
+
+* `canonicalize_workbook_meta` in
+  `src/spreadsheet_handling/rendering/workbook_projection.py` unwraps any
+  top-level ``workbook_meta_blob`` carrier wrapper from a workbook meta
+  mapping. Inner canonical content (``workbook_view``, ``sheets``,
+  ``legend_blocks``, ...) wins over the outer sheet-level wrapper; the
+  helper is recursive so chained wrappings collapse to a single canonical
+  mapping, and a no-op for already-canonical input.
+* `workbookir_to_frames` applies the helper to the parsed blob before
+  publishing `frames["_meta"]`, so a malformed file whose blob is itself
+  a wrapper containing a nested ``workbook_meta_blob`` still recovers
+  ``workbook_view`` at the top level.
+* `compose_workbook` in
+  `src/spreadsheet_handling/rendering/composer/layout_composer.py` calls
+  the helper before serialising the new blob, so a caller that passes
+  `frames["_meta"]` carrying a stray ``workbook_meta_blob`` string
+  (e.g. a sheet-level representation fed back into the writer) cannot
+  re-nest it. Both XLSX and ODS write paths route through this composer,
+  so the fix is backend-neutral.
+
+Regression coverage:
+
+* `tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+  exercises the real XLSX carrier path (not a unit-shaped mock):
+  +
+** write canonical meta with `workbook_view` and assert top-level
+   recovery on parse;
+** write a stray-`workbook_meta_blob` representation and assert the
+   writer does not nest it;
+** read a hand-crafted malformed XLSX with a nested wrapper and assert
+   the reader unwraps `workbook_view` to the top;
+** end-to-end through `ExcelBackend.read_multi` / `.write_multi`.
+
+Validation:
+
+* `make test` -- 1101 passed, 1 xfailed.
+* `make source-style-guards` -- 0 errors.
+* `make -C ../worldbuilding export-stories` / `check-reimport` / their
+  ODS variants all report "Reimport matches canonical data after
+  normalization."
 

@@ -4,6 +4,7 @@ from typing import Dict, Mapping, Any
 import pandas as pd
 
 from ..ir import WorkbookIR, SheetIR, TableBlock
+from ..workbook_projection import canonicalize_workbook_meta
 
 _RESERVED_FRAME_KEYS = {"_meta"}  # extend as needed
 _WORKBOOK_OPTION_KEYS = {
@@ -265,9 +266,15 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
     wb = WorkbookIR()
     workbook_meta = None
     if meta:
-        workbook_meta = dict(meta)
-        if "legend_blocks" in meta:
-            workbook_meta["legend_blocks"] = _clone_legend_blocks(meta.get("legend_blocks"))
+        # Canonical workbook meta must not contain ``workbook_meta_blob`` --
+        # that key is the hidden _meta sheet's carrier, not part of the
+        # canonical contract. Unwrap defensively so a sheet-level
+        # representation fed back into the writer cannot get re-nested
+        # (which would bury workbook_view inside the new blob and break
+        # XLSX/ODS readback). See BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A.
+        workbook_meta = canonicalize_workbook_meta(meta)
+        if "legend_blocks" in workbook_meta:
+            workbook_meta["legend_blocks"] = _clone_legend_blocks(workbook_meta.get("legend_blocks"))
 
     workbook_options = {
         key: workbook_meta[key]

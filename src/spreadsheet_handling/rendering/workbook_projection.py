@@ -4,9 +4,80 @@ from __future__ import annotations
 
 import ast
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from .ir import WorkbookIR
+
+
+CARRIER_BLOB_KEY = "workbook_meta_blob"
+
+
+def _try_parse_blob(value: Any) -> dict[str, Any] | None:
+    """Best-effort parse of a hidden-sheet carrier blob string into a dict.
+
+    Accepts the canonical JSON form first and falls back to the legacy
+    pre-JSON ``repr`` form. Returns ``None`` for anything that does not
+    decode to a dict so callers can ignore unparseable input.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError, TypeError):
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def canonicalize_workbook_meta(meta: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Strip any nested ``workbook_meta_blob`` carrier wrapper from ``meta``.
+
+    The key ``workbook_meta_blob`` is a hidden-sheet carrier convention --
+    the first cell of the hidden ``_meta`` sheet -- not part of the
+    canonical workbook meta contract. If a mapping arrives carrying it
+    (e.g. a malformed read-back where the sheet rows were serialised as
+    the new blob, or a re-export that fed a sheet-level representation
+    back into the writer), this helper unwraps the nested blob so the
+    canonical top-level content (``workbook_view``, ``sheets``,
+    ``legend_blocks``, ...) is restored.
+
+    Inner canonical content wins over the outer sheet-level wrapper. The
+    helper is recursive so chained wrappings collapse to a single
+    canonical mapping. It is a no-op for already-canonical mappings.
+    """
+    if not isinstance(meta, Mapping):
+        return {}
+
+    outer = dict(meta)
+    if CARRIER_BLOB_KEY not in outer:
+        return outer
+
+    blob_value = outer.pop(CARRIER_BLOB_KEY)
+    parsed = _try_parse_blob(blob_value)
+    if parsed is None:
+        return outer
+
+    merged = dict(parsed)
+    for key, value in outer.items():
+        merged.setdefault(key, value)
+    return canonicalize_workbook_meta(merged)
+
+
+def _hidden_meta_to_frames_meta(meta_sh: Any) -> dict[str, Any] | None:
+    blob = meta_sh.meta.get(CARRIER_BLOB_KEY, "")
+    meta_dict = _try_parse_blob(blob) if blob else None
+    if meta_dict is not None:
+        return canonicalize_workbook_meta(meta_dict)
+    kv = {k: v for k, v in meta_sh.meta.items() if k != "_hidden"}
+    if not kv:
+        return None
+    return canonicalize_workbook_meta(kv)
 
 
 def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
@@ -39,28 +110,11 @@ def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
 
     meta_sh = ir.hidden_sheets.get("_meta")
     if meta_sh:
-        blob = meta_sh.meta.get("workbook_meta_blob", "")
-        if blob:
-            try:
-                meta_dict = json.loads(blob)
-                if isinstance(meta_dict, dict):
-                    frames["_meta"] = meta_dict
-            except (json.JSONDecodeError, TypeError):
-                pass
-            if "_meta" not in frames:
-                try:
-                    # legacy: pre-JSON repr format
-                    meta_dict = ast.literal_eval(blob)
-                    if isinstance(meta_dict, dict):
-                        frames["_meta"] = meta_dict
-                except (ValueError, SyntaxError, TypeError):
-                    pass
-        if "_meta" not in frames:
-            kv = {k: v for k, v in meta_sh.meta.items() if k != "_hidden"}
-            if kv:
-                frames["_meta"] = kv
+        meta = _hidden_meta_to_frames_meta(meta_sh)
+        if meta is not None:
+            frames["_meta"] = meta
 
     return frames
 
 
-__all__ = ["workbookir_to_frames"]
+__all__ = ["CARRIER_BLOB_KEY", "canonicalize_workbook_meta", "workbookir_to_frames"]
