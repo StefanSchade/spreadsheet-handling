@@ -1,0 +1,309 @@
+===== BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A -- XLSX readback loses `_meta.workbook_view` and breaks workbook-view roundtrip
+
+*Status:* New
+*Priority:* P4A
+*Area:* XLSX carrier / hidden `_meta` sheet / workbook-view readback / roundtrip regression
+*Observed via:* `worldbuilding` consumer after `refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5`
+
+==== Summary
+
+After the `worldbuilding` consumer adopted the new declarative
+`project_by_role` path, the XLSX roundtrip regressed while the ODS path
+remained green.
+
+The failing path is:
+
+[source,text]
+----
+make -C worldbuilding export-stories
+make -C worldbuilding check-reimport
+----
+
+It aborts with:
+
+[source,text]
+----
+Error: _meta.workbook_view must be a mapping for workbook view readback
+----
+
+The same consumer and same data still succeed on ODS:
+
+[source,text]
+----
+make -C worldbuilding export-stories-ods
+make -C worldbuilding check-reimport-ods
+----
+
+with:
+
+[source,text]
+----
+Reimport matches canonical data after normalization.
+----
+
+This makes the problem highly specific: it is not the declarative projection
+feature in general, but the XLSX `_meta` carrier / readback contract.
+
+==== Reproduction context
+
+Consumer commit:
+
+[source,text]
+----
+worldbuilding 0c9d6dc refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5
+----
+
+That commit replaces the old consumer-side plugin steps:
+
+* `plugins.story_cast_views:build_story_cast_matrix_view`
+* `plugins.story_cast_views:build_story_cast_matrix_payload`
+
+with declarative `project_by_role` calls in:
+
+* `pipelines/dino_insel/json_to_spreadsheet.yaml`
+* `pipelines/dino_insel/spreadsheet_to_json.yaml`
+
+Representative pipeline excerpts:
+
+[source,yaml]
+----
+- step: project_by_role
+  frame: story_cast_role_matrix_view
+  direction: outbound
+  helper_columns: [title]
+  key_columns: [story_id]
+----
+
+and on reimport:
+
+[source,yaml]
+----
+- step: project_by_role
+  frame: story_cast_role_matrix_view
+  direction: inbound
+  helper_columns: [title]
+  key_columns: [story_id]
+----
+
+The worldbuilding worktree was clean for the verification run.
+
+==== Observed failure
+
+The failing target:
+
+[source,text]
+----
+make -C worldbuilding check-reimport
+----
+
+expands to:
+
+[source,text]
+----
+rm -rf ./tmp/dino_stories_reimported
+PYTHONPATH=. .venv/bin/sheets-run \
+  --config ./pipelines/dino_insel/spreadsheet_to_json.yaml \
+  --in-kind xlsx \
+  --in-path ./tmp/dino_stories.xlsx
+----
+
+and fails during workbook-view sheet mapping resolution:
+
+* `src/spreadsheet_handling/domain/workbook_views.py:417`
+* `src/spreadsheet_handling/domain/workbook_views.py:420`
+
+Specifically:
+
+[source,python]
+----
+def _workbook_view_mapping(meta: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(meta, Mapping):
+        raise ValueError("_meta.workbook_view is required for workbook view readback")
+    view = meta.get("workbook_view")
+    if not isinstance(view, Mapping):
+        raise ValueError("_meta.workbook_view must be a mapping for workbook view readback")
+    return view
+----
+
+==== Direct carrier inspection
+
+The generated XLSX does contain a hidden `_meta` sheet.
+
+Inspection of the first rows of `tmp/dino_stories.xlsx` showed:
+
+[source,text]
+----
+'workbook_meta_blob' -> '<large JSON string>'
+'version'            -> None
+'exported_at'        -> None
+'author'             -> None
+----
+
+Crucially:
+
+* there is **no** standalone `workbook_view` key on the hidden sheet;
+* the hidden sheet relies entirely on the `workbook_meta_blob` carrier.
+
+When parsed through the current XLSX read path:
+
+[source,python]
+----
+ir = parse_workbook("tmp/dino_stories.xlsx")
+frames = workbookir_to_frames(ir)
+meta = frames["_meta"]
+----
+
+the result was:
+
+* `meta` is a `dict`
+* `meta["workbook_view"]` is missing
+* `meta["workbook_meta_blob"]` is present
+
+That means the readback fell through to the fallback branch in:
+
+* `src/spreadsheet_handling/rendering/workbook_projection.py`
+
+rather than recovering the canonical workbook-meta mapping.
+
+==== Stronger structural clue
+
+The `workbook_meta_blob` string in the generated XLSX is JSON-parseable, but
+its outer shape is wrong for workbook-view readback.
+
+Observed properties of the parsed outer object:
+
+* it is a `dict`
+* it contains:
+** `author`
+** `exported_at`
+** `sheets`
+** `version`
+** `workbook_meta_blob`
+* it does **not** contain:
+** `workbook_view`
+
+The nested `workbook_meta_blob` key itself is again a JSON string beginning
+with canonical workbook metadata such as:
+
+* `auto_filter`
+* `cell_codecs`
+* ...
+
+This strongly suggests a carrier-boundary bug:
+
+* the outer payload being written to the hidden XLSX `_meta` sheet is not the
+  canonical workbook meta itself;
+* instead, a meta sheet representation containing `workbook_meta_blob` has
+  been wrapped and persisted again.
+
+The result is a structurally valid JSON blob that is nevertheless unusable for
+`apply_workbook_view_sheet_mappings`, because `workbook_view` is no longer at
+the expected top level.
+
+==== Why ODS still works
+
+The ODS path remains green in the same consumer run.
+
+Direct check on the parsed ODS frames showed:
+
+* `frames["_meta"]` is a `dict`
+* `frames["_meta"]["workbook_view"]` is a `dict`
+* `frames["_meta"]` does **not** expose a raw `workbook_meta_blob` fallback
+
+That indicates the declarative `project_by_role` change itself is not the
+regression driver. The bug is specific to the XLSX `_meta` carrier read/write
+path and how it interacts with the newer presentation-meta / persistence
+machinery.
+
+==== Most likely root cause direction
+
+The likely overlap zone is:
+
+* render-time hidden meta construction
+* persistence-boundary projection
+* XLSX write/read of hidden `_meta`
+* workbook-projection recovery from `workbook_meta_blob`
+
+Relevant code paths:
+
+* `src/spreadsheet_handling/rendering/passes/__init__.py`
+  - injects `workbook_meta_blob` into the hidden meta sheet when absent
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py`
+  - also stashes `workbook_meta_blob`
+* `src/spreadsheet_handling/rendering/flow.py`
+  - serialises hidden meta via `WriteMeta`
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py`
+  - writes hidden `_meta` sheet key/value rows
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+  - reads `_meta` sheet and reconstructs `workbook_meta_blob`
+* `src/spreadsheet_handling/rendering/workbook_projection.py`
+  - converts parsed hidden `_meta` sheet back into `frames["_meta"]`
+
+The precise fixing point is still for implementation to determine, but the
+contract should be:
+
+* the hidden XLSX `_meta` carrier must roundtrip the canonical workbook meta
+  as one coherent mapping;
+* `frames["_meta"]["workbook_view"]` must be recoverable after XLSX parse;
+* carrier-local helper fields such as `workbook_meta_blob` must not shadow or
+  structurally replace the canonical mapping expected by workbook-view
+  readback.
+
+==== Scope
+
+* Reproduce the regression from `worldbuilding` commit `0c9d6dc`.
+* Restore a green XLSX roundtrip for the same consumer while keeping the new
+  declarative `project_by_role` path in place.
+* Ensure hidden `_meta` carrier handling does not wrap or nest
+  `workbook_meta_blob` in a way that hides `workbook_view`.
+* Preserve the current green ODS behavior.
+* Add regression coverage that specifically exercises workbook-view readback
+  from a generated XLSX containing declarative projection metadata.
+
+==== Non-goals
+
+* Do not revert `project_by_role` in the consumer as the solution.
+* Do not treat this as an ODS bug; ODS is the control case here.
+* Do not work around this in `worldbuilding` via consumer-local plugin glue.
+* Do not flatten away workbook-view semantics merely to avoid the hidden-meta
+  carrier problem.
+
+==== Acceptance
+
+* `make -C worldbuilding check-reimport` succeeds again on the consumer state
+  introduced by commit `0c9d6dc`.
+* The generated XLSX hidden `_meta` sheet yields `frames["_meta"]` with a
+  top-level `workbook_view` mapping during readback.
+* No nested / shadowing `workbook_meta_blob` structure prevents workbook-view
+  recovery.
+* ODS remains green for the same consumer.
+* A regression test covers the XLSX carrier path, not just a unit-shaped mock.
+
+==== Validation
+
+Pre-fix evidence collected locally:
+
+* `make -C worldbuilding export-stories` succeeds.
+* `make -C worldbuilding export-stories-ods` succeeds.
+* `make -C worldbuilding check-reimport` fails with
+  `_meta.workbook_view must be a mapping for workbook view readback`.
+* `make -C worldbuilding check-reimport-ods` succeeds with
+  `Reimport matches canonical data after normalization.`
+* Inspecting `tmp/dino_stories.xlsx` shows a hidden `_meta` sheet whose first
+  key is `workbook_meta_blob`, with no separate `workbook_view` key.
+* Parsing that XLSX yields `frames["_meta"]` without a top-level
+  `workbook_view`, but with a fallback `workbook_meta_blob` string.
+
+Post-fix verification:
+
+* rerun the four commands above and confirm both XLSX and ODS are green;
+* inspect parsed XLSX `_meta` and confirm `frames["_meta"]["workbook_view"]`
+  is a mapping again.
+
+==== Related backlog items
+
+* `FTR-DYNAMIC-FRAME-PROJECTION-P5`
+* `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
+* `BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5`
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`
+
