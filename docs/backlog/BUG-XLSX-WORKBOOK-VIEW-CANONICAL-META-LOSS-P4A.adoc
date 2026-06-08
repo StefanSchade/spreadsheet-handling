@@ -1,0 +1,247 @@
+===== BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A -- XLSX readback still drops canonical workbook-view metadata after blob unwrapping fix
+
+*Status:* New
+*Priority:* P4A
+*Area:* XLSX carrier / workbook-meta canonicalization / workbook-view readback
+*Follow-up to:* `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
+
+==== Summary
+
+The original XLSX workbook-view regression (`BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`)
+was partially improved by commit:
+
+[source,text]
+----
+e939623 fix(BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A): recover workbook_view from XLSX meta blob
+----
+
+The gross nested-carrier symptom is gone, but the end-to-end consumer
+behavior is still broken.
+
+`worldbuilding` on fresh `core` HEAD `e939623` still fails on the XLSX
+roundtrip:
+
+[source,text]
+----
+make -C worldbuilding export-stories
+make -C worldbuilding check-reimport
+----
+
+with:
+
+[source,text]
+----
+Error: _meta.workbook_view must be a mapping for workbook view readback
+----
+
+ODS remains green on the same consumer and same data:
+
+[source,text]
+----
+make -C worldbuilding check-reimport-ods
+----
+
+This is therefore a distinct follow-up bug, not just an unverified report
+against the original ticket.
+
+==== Why this deserves a separate bug
+
+The original bug documented an XLSX hidden-`_meta` carrier that yielded a
+mapping like:
+
+* `author`
+* `exported_at`
+* `sheets`
+* `version`
+* `workbook_meta_blob`
+
+with `workbook_view` missing and the nested `workbook_meta_blob` carrying the
+actual workbook meta.
+
+The new observation after the fix is narrower:
+
+* `frames["_meta"]` is now a plain mapping without the raw
+  `workbook_meta_blob` key;
+* however `frames["_meta"]["workbook_view"]` is still missing;
+* the surviving top-level keys are only:
+** `author`
+** `exported_at`
+** `sheets`
+** `version`
+
+So the bug moved from:
+
+* "carrier blob still wrapped and exposed"
+
+to:
+
+* "carrier blob unwrap no longer leaks, but canonical workbook meta is still
+  not restored into `_meta`"
+
+That is a real improvement, but not a resolved consumer path.
+
+==== Reproduced behavior
+
+Verified locally against:
+
+* `core` HEAD `e939623`
+* editable install active in `worldbuilding/.venv`
+* fresh XLSX export before reimport
+
+Exact validation run:
+
+[source,text]
+----
+make -C worldbuilding export-stories
+make -C worldbuilding check-reimport
+----
+
+Result:
+
+[source,text]
+----
+Error: _meta.workbook_view must be a mapping for workbook view readback
+----
+
+The same environment succeeds on ODS:
+
+[source,text]
+----
+make -C worldbuilding export-stories-ods
+make -C worldbuilding check-reimport-ods
+----
+
+with:
+
+[source,text]
+----
+Reimport matches canonical data after normalization.
+----
+
+==== Direct inspection after the follow-up fix
+
+The freshly regenerated `tmp/dino_stories.xlsx` still contains a hidden
+`_meta` sheet whose first key is:
+
+[source,text]
+----
+workbook_meta_blob
+----
+
+Parsing that workbook via:
+
+[source,python]
+----
+from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
+from spreadsheet_handling.rendering.workbook_projection import workbookir_to_frames
+
+ir = parse_workbook("tmp/dino_stories.xlsx")
+frames = workbookir_to_frames(ir)
+meta = frames["_meta"]
+----
+
+now yields:
+
+* `type(meta) == dict`
+* `workbook_view` missing
+* `workbook_meta_blob` missing
+* keys limited to:
+
+[source,text]
+----
+author
+exported_at
+sheets
+version
+----
+
+This is the crucial post-fix residual symptom. The prior raw blob exposure has
+been suppressed, but the canonical workbook meta still does not surface.
+
+==== Most plausible fault line
+
+The affected area is now likely narrower than in the original bug.
+
+The first fix touched:
+
+* `src/spreadsheet_handling/rendering/workbook_projection.py`
+  - `canonicalize_workbook_meta`
+  - `_hidden_meta_to_frames_meta`
+
+That change appears to collapse the nested `workbook_meta_blob` carrier, but it
+still does not reconstruct the expected canonical top-level mapping that
+contains `workbook_view`.
+
+The remaining bug is likely in one of these places:
+
+* the hidden-sheet payload written into XLSX still does not contain the
+  canonical workbook meta in a recoverable form;
+* `canonicalize_workbook_meta(...)` unwraps the carrier but keeps only the
+  outer "sheet-level" metadata shell (`author`, `exported_at`, `version`,
+  `sheets`) instead of restoring the inner canonical payload;
+* or the writer/parser contract for `workbook_meta_blob` is still inconsistent
+  with what `workbookir_to_frames(...)` expects after unwrapping.
+
+This bug does *not* need the exact root cause to be fully pinned before it is
+tracked. The consumer-level broken behavior is deterministic and separately
+verified.
+
+==== Scope
+
+* Reproduce the post-`e939623` XLSX failure on the worldbuilding consumer.
+* Restore the missing canonical workbook meta fields, especially
+  `_meta.workbook_view`.
+* Ensure `workbookir_to_frames(parse_workbook(xlsx))["_meta"]` returns the same
+  canonical workbook-view mapping needed by `apply_workbook_view_sheet_mappings`.
+* Preserve the improvement already achieved:
+  do not reintroduce exposed raw `workbook_meta_blob` fallback state into
+  `frames["_meta"]`.
+
+==== Non-goals
+
+* Do not reopen `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A` unless later
+  evidence proves the original "nested blob exposed as `_meta`" state also
+  returned. At the moment the remaining symptom is distinct enough to justify
+  a follow-up ticket.
+* Do not treat ODS as suspect in this follow-up. ODS is still the green control.
+* Do not add a consumer-side fallback in `worldbuilding`.
+
+==== Acceptance
+
+* With `core` HEAD containing the fix, the following succeeds:
+
+[source,text]
+----
+make -C worldbuilding export-stories
+make -C worldbuilding check-reimport
+----
+
+* Parsing the generated XLSX via `parse_workbook(...)` +
+  `workbookir_to_frames(...)` returns:
+** `frames["_meta"]["workbook_view"]` as a mapping
+** no stray top-level `workbook_meta_blob`
+* ODS remains green for the same consumer.
+
+==== Validation
+
+Pre-fix-for-this-follow-up evidence:
+
+* `core` HEAD `e939623`
+* `worldbuilding/.venv` editable install points at `../core`
+* fresh XLSX export performed before reimport
+* `check-reimport` still fails
+* direct parse of fresh `tmp/dino_stories.xlsx` returns `_meta` with only:
+  `author`, `exported_at`, `sheets`, `version`
+
+Post-fix verification:
+
+* rerun fresh XLSX export + `check-reimport`
+* inspect parsed `_meta`
+* confirm `workbook_view` is present and mapping-typed
+
+==== Related backlog items
+
+* `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
+* `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
+* `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`
+
