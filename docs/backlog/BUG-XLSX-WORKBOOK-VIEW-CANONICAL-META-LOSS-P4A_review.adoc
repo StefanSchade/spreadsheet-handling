@@ -1,0 +1,162 @@
+===== BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A -- Implementation Review
+
+*Reviewed bug:* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc`
+*Root-cause note:* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A_root_cause_note.adoc`
+*Review focus:* carrier-boundary root cause, marker stripping safety, regression coverage, XLSX/ODS validation
+
+==== Verdict
+
+*Verdict:* Green
+
+The implementation is a narrow carrier-boundary repair. The stated root cause
+matches the code change: empty `MetaPass` marker rows (`author`,
+`exported_at`, `version`) could survive projection as apparent canonical
+workbook metadata after a degenerate nested `workbook_meta_blob`; the fix
+strips only those marker keys when they carry the empty marker signature
+(`None` or empty string).
+
+==== Root-Cause Assessment
+
+The root-cause note is consistent with the implementation.
+
+`MetaPass` initializes `version`, `exported_at`, and `author` as hidden
+`_meta` sheet marker rows with empty-string defaults. The new
+`_CARRIER_LAYER_MARKER_KEYS` set in
+`src/spreadsheet_handling/rendering/workbook_projection.py` names exactly
+those keys, and `_is_carrier_layer_marker_default` recognizes only `None` and
+`""` as strip candidates. That matches the documented roundtrip behavior where
+openpyxl can read empty cells back as `None`.
+
+The strip occurs inside `canonicalize_workbook_meta` before
+`workbook_meta_blob` unwrapping and is repeated on recursive canonicalization
+levels. That matches the root-cause note's explanation that wrapper marker
+noise may appear at any carrier nesting level.
+
+Direct inspection of the generated worldbuilding XLSX after the fix confirmed
+the intended canonical shape:
+
+[source,text]
+----
+meta_keys ['auto_filter', 'constraints', 'frame_lifecycle', 'freeze_header', 'helper_policies', 'helper_prefix', 'legend_blocks', 'sheets', 'workbook_view', 'xref_crosstable']
+workbook_view_type dict
+has_workbook_meta_blob False
+marker_values {}
+----
+
+==== Safety Assessment
+
+The marker stripping is safe and sufficiently narrow.
+
+Only these keys are eligible for removal:
+
+* `author`
+* `exported_at`
+* `version`
+
+Only these values are removed:
+
+* `None`
+* empty string
+
+Non-empty marker values are preserved. This was verified by direct
+canonicalization:
+
+[source,text]
+----
+{'author': 'alice', 'exported_at': '2026-06-08T00:00:00Z', 'version': '3.4', 'workbook_view': {'sheet_mappings': []}}
+----
+
+The fix does not broaden metadata interpretation. It does not add a new schema,
+projection layer, lifecycle rule, persistence model, or generic metadata
+framework. It also does not silently invent missing `workbook_view` content
+when a nested blob is truly empty or unparseable; it only prevents carrier
+wrapper noise from being advertised as canonical workbook meta.
+
+==== Test Adequacy
+
+The XLSX regression coverage is adequate for this bug.
+
+The new tests in
+`tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py` cover
+the exact four-key residual shape from the bug report:
+
+* `author`
+* `exported_at`
+* `sheets`
+* `version`
+
+`test_xlsx_reader_strips_carrier_layer_markers_from_canonical_meta` constructs
+that wrapper shape with a degenerate inner `workbook_meta_blob` and verifies
+that the carrier-local blob and empty marker keys do not leak into projected
+`frames["_meta"]`.
+
+`test_xlsx_writer_strips_carrier_layer_markers_from_input_meta` covers the
+writer boundary and verifies that real canonical `workbook_view` content still
+surfaces after empty marker contamination is stripped.
+
+`test_xlsx_carrier_roundtrip_recovers_workbook_view_after_degenerate_inner_blob`
+verifies the degenerate-inner case as wrapper-noise removal, not as recovery of
+`workbook_view` from absent canonical content. That behavior aligns with the
+root-cause note: the fix should avoid masking malformed metadata too broadly.
+
+Existing tests from the prior bug still verify the canonical nested-blob
+recovery path where an inner blob actually contains `workbook_view`.
+
+==== Validation
+
+[source,text]
+----
+make test-file FILE=tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py
+----
+
+Result: `7 passed`.
+
+[source,text]
+----
+make test-file FILE=tests/integration/io_backends/ods/test_ods_adapter_roundtrip.py
+----
+
+Result: `3 passed`.
+
+[source,text]
+----
+make test
+----
+
+Result: `1104 passed, 1 xfailed`.
+
+[source,text]
+----
+make source-style-guards
+----
+
+Result: `0 error(s), 71 warning(s), 3 allowlisted finding(s)`.
+
+[source,text]
+----
+git diff --check
+----
+
+Result: passed with no output.
+
+Worldbuilding consumer validation:
+
+[source,text]
+----
+make -C ../worldbuilding export-stories
+make -C ../worldbuilding check-reimport
+make -C ../worldbuilding export-stories-ods
+make -C ../worldbuilding check-reimport-ods
+----
+
+Result: XLSX and ODS both report `Reimport matches canonical data after normalization.`
+
+==== Findings
+
+None.
+
+==== Recommendation
+
+Accept the implementation. It is the smallest correct follow-up repair for the
+documented carrier-marker residual symptom and preserves the existing
+workbook-view contract without broadening metadata recovery semantics.

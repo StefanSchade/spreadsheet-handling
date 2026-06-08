@@ -11,6 +11,28 @@ from .ir import WorkbookIR
 
 CARRIER_BLOB_KEY = "workbook_meta_blob"
 
+# Sheet-level export marker keys written by ``MetaPass`` into the hidden
+# ``_meta`` sheet's cells (``version``, ``exported_at``, ``author``).
+# They describe the hidden sheet itself, not the canonical workbook meta
+# contract. ``MetaPass`` populates them with an empty string default so
+# the cells exist as export markers even when no caller set a value;
+# that empty default survives a roundtrip as ``None`` because openpyxl
+# normalises empty cells back to ``None``. Callers may also set
+# meaningful values (``"3.4"``, ``"alice"``) -- those are deliberate
+# canonical content and must round-trip unchanged. The strip therefore
+# only removes the marker keys when their value is empty (``None`` or
+# the empty string), which is the exact MetaPass-default signature the
+# carrier layer was supposed to keep on the sheet, not in canonical
+# meta. See ``BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A``.
+_CARRIER_LAYER_MARKER_KEYS: frozenset[str] = frozenset(
+    {"author", "exported_at", "version"}
+)
+
+
+def _is_carrier_layer_marker_default(value: Any) -> bool:
+    """Return True if ``value`` is the MetaPass-default empty signature."""
+    return value is None or value == ""
+
 
 def _try_parse_blob(value: Any) -> dict[str, Any] | None:
     """Best-effort parse of a hidden-sheet carrier blob string into a dict.
@@ -47,6 +69,19 @@ def canonicalize_workbook_meta(meta: Mapping[str, Any] | None) -> dict[str, Any]
     canonical top-level content (``workbook_view``, ``sheets``,
     ``legend_blocks``, ...) is restored.
 
+    Sheet-level export marker keys (see ``_CARRIER_LAYER_MARKER_KEYS``)
+    are stripped on every level when they carry the MetaPass-default
+    empty signature (``None`` or the empty string). They describe the
+    hidden ``_meta`` sheet itself (cells written by ``MetaPass``) and
+    have no place in the canonical workbook meta. Without this strip, a
+    corrupt or empty inner blob would leave the outer wrapper visible as
+    if it were canonical content, hiding the absence of ``workbook_view``
+    behind wrapper noise (see
+    ``BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A``). Marker keys
+    that carry deliberate values (e.g. ``version: "3.4"``) are preserved
+    -- callers that explicitly assign them treat them as canonical
+    workbook meta.
+
     Inner canonical content wins over the outer sheet-level wrapper. The
     helper is recursive so chained wrappings collapse to a single
     canonical mapping. It is a no-op for already-canonical mappings.
@@ -55,6 +90,9 @@ def canonicalize_workbook_meta(meta: Mapping[str, Any] | None) -> dict[str, Any]
         return {}
 
     outer = dict(meta)
+    for marker in _CARRIER_LAYER_MARKER_KEYS:
+        if marker in outer and _is_carrier_layer_marker_default(outer[marker]):
+            del outer[marker]
     if CARRIER_BLOB_KEY not in outer:
         return outer
 

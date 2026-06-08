@@ -1,6 +1,6 @@
 ===== BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A -- XLSX readback still drops canonical workbook-view metadata after blob unwrapping fix
 
-*Status:* New
+*Status:* Done
 *Priority:* P4A
 *Area:* XLSX carrier / workbook-meta canonicalization / workbook-view readback
 *Follow-up to:* `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
@@ -244,4 +244,71 @@ Post-fix verification:
 * `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
 * `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
 * `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`
+
+==== Resolution
+
+The residual symptom traced to the carrier-layer marker keys
+(``author`` / ``exported_at`` / ``version``) leaking into the canonical
+projection alongside a degenerate inner ``workbook_meta_blob``.
+
+`MetaPass` writes these keys with an empty-string default so the hidden
+``_meta`` sheet always carries the export markers as cell rows. Their
+purpose is to describe the hidden sheet itself, not the canonical
+workbook meta. Before the fix, a corrupt or empty inner blob caused
+``canonicalize_workbook_meta`` to return the outer wrapper unchanged --
+which still contained the carrier-layer markers -- so the post-read
+``frames["_meta"]`` mirrored the bug's exact observed shape:
+
+[source,text]
+----
+author
+exported_at
+sheets
+version
+----
+
+The fix is a narrow strip inside ``canonicalize_workbook_meta`` in
+``src/spreadsheet_handling/rendering/workbook_projection.py``: marker
+keys whose value is the ``MetaPass``-default empty signature (``None``
+or empty string) are removed on every recursion level *before* the
+``workbook_meta_blob`` unwrap step. Marker keys with caller-assigned
+non-empty values (e.g. ``version: "3.4"``) are preserved -- callers
+that explicitly assign them treat them as canonical workbook meta.
+
+Effect on the bug scenarios:
+
+* wrapper + canonical inner blob: ``workbook_view`` continues to surface
+  at the top level of ``frames["_meta"]`` after parse (improvement from
+  the previous bug is preserved);
+* wrapper + degenerate inner blob (this bug's residual symptom):
+  ``frames["_meta"]`` no longer advertises the wrapper-shell keys as
+  canonical content. The result is honest about the absence of canonical
+  content rather than disguising it behind wrapper noise.
+
+Regression coverage:
+
+* `tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+  adds three new tests against the real XLSX carrier path:
++
+** `test_xlsx_reader_strips_carrier_layer_markers_from_canonical_meta`
+   builds a hand-crafted malformed XLSX whose blob is a wrapper of
+   sheet-level markers plus a degenerate inner blob and asserts that
+   ``frames["_meta"]`` contains neither ``workbook_meta_blob`` nor the
+   wrapper markers (the exact post-fix residual symptom from this
+   ticket);
+** `test_xlsx_writer_strips_carrier_layer_markers_from_input_meta`
+   feeds canonical content contaminated with the carrier-layer markers
+   to ``save_xlsx`` and asserts the next read recovers ``workbook_view``
+   without the markers;
+** `test_xlsx_carrier_roundtrip_recovers_workbook_view_after_degenerate_inner_blob`
+   exercises end-to-end the worst-case carrier corruption surviving a
+   previous roundtrip.
+
+Validation:
+
+* `make test` -- 1104 passed, 1 xfailed.
+* `make source-style-guards` -- 0 errors.
+* `make -C ../worldbuilding export-stories` / `check-reimport` /
+  ODS equivalents -- all report "Reimport matches canonical data
+  after normalization."
 
