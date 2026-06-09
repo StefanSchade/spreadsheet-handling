@@ -1,0 +1,343 @@
+===== BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A -- ODS-produced sidecar meta can poison XLSX workbook-view readback
+
+*Status:* New
+*Priority:* P4A
+*Area:* canonical `_meta` boundary / carrier isolation / cross-carrier roundtrip / worldbuilding adoption
+*Observed via:* `worldbuilding` consumer after `refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5`
+*Evidence fixture:* `docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A/ods_produced_meta.yaml`
+
+==== Summary
+
+During follow-up analysis of the XLSX workbook-view readback bugs, the
+`worldbuilding` consumer exposed a deeper boundary problem.
+
+The immediate XLSX failure looked like a remaining defect in:
+
+* `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
+* `BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A`
+
+The investigation initially oscillated between:
+
+* possible stale editable installs,
+* possible missing XLSX regression coverage,
+* possible Python/dependency drift,
+* possible remaining workbook-meta canonicalization defects.
+
+After both environments were rebuilt and compared, the real trigger on the
+developer laptop was an ignored stale sidecar file:
+
+[source,text]
+----
+daten/dino_insel/_meta.yaml
+----
+
+Removing that file made the XLSX path green again.
+
+The captured `_meta.yaml` was moved out of active data state and preserved as
+evidence under:
+
+[source,text]
+----
+docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A/ods_produced_meta.yaml
+----
+
+==== What made this alarming
+
+The stale sidecar meta was not merely an inconvenient local artifact.
+
+It appears to have been produced through an ODS readback path and then reused
+as input for an XLSX export/reimport path.
+
+That should be safe.
+
+The intended architecture is:
+
+[source,text]
+----
+canonical JSON data
+
++ canonical _meta.yaml
+  |
+  v
+  domain / pipeline model
+  |
+  v
+  rendering model
+  |
+  v
+  carrier adapter: XLSX or ODS
+----
+
+Under that model:
+
+* `_meta.yaml` is part of the canonical sidecar data;
+* `_meta` may travel through the domain/pipeline as a meta frame or mapping;
+* the render layer interprets canonical workbook-view, validation, helper,
+  presentation and layout intent;
+* the XLSX/ODS adapters should serialize carrier-specific representations;
+* carrier-specific readback artifacts must not become canonical sidecar state.
+
+The observed behavior violates that boundary.
+
+A sidecar `_meta.yaml` that is accepted by the ODS path can break the XLSX
+path. That means the persisted meta is not sufficiently carrier-neutral, or
+the XLSX path still treats some carrier-shaped state as canonical workbook
+metadata.
+
+==== Current evidence
+
+After deleting the stale sidecar meta:
+
+[source,text]
+----
+mv daten/dino_insel/_meta.yaml ./tmp/
+make export-stories
+make check-reimport
+----
+
+the XLSX path became green again.
+
+The same source and environment then produced:
+
+[source,text]
+----
+Reimport matches canonical data after normalization.
+----
+
+This strongly indicates that the active data sidecar, not the current core
+code alone, induced the failure.
+
+The fixture should be inspected as evidence of the contaminated meta shape:
+
+[source,text]
+----
+docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A/ods_produced_meta.yaml
+----
+
+Initial manual inspection suggests that the file contains a mixture of
+canonical workbook-view intent and backend/readback-shaped material. Examples
+to inspect include workbook/sheet-level presentation readback state, resolved
+layout state, and source markers that look closer to carrier readback than to
+canonical user intent.
+
+This ticket intentionally does not assume that every such field is wrong.
+The point is that the current boundary is not explicit enough to prevent
+backend-produced state from affecting another backend's path.
+
+==== Why this is not just a missing test
+
+The missing test class is real:
+
+[source,text]
+----
+ODS-produced sidecar meta -> XLSX export -> XLSX reimport
+XLSX-produced sidecar meta -> ODS export -> ODS reimport
+----
+
+But the absence of cross-carrier tests is only the symptom.
+
+The deeper issue is that persisted `_meta.yaml` currently has insufficiently
+enforced layer discipline.
+
+A canonical sidecar must not contain structures whose interpretation depends
+on the backend that produced them.
+
+If ODS readback creates sidecar meta that later breaks XLSX, then at least one
+of the following is true:
+
+* ODS writes carrier-local or readback-local state into canonical sidecar meta;
+* XLSX interprets carrier-local sidecar state as canonical workbook meta;
+* the render/composer boundary does not canonicalize sidecar meta before
+  handing it to adapters;
+* the persistence boundary does not distinguish canonical meta from
+  carrier-derived reconstruction hints;
+* existing docs and guards do not make this boundary enforceable.
+
+==== Architectural boundary
+
+The intended split should be made explicit:
+
+[cols="1,2"]
+|===
+| Layer | Responsibility
+
+| Canonical sidecar `_meta.yaml`
+| Backend-neutral workbook intent, transformation policy, validation policy,
+helper policy, workbook-view mapping, and presentation intent that can be
+interpreted without knowing whether XLSX or ODS produced it.
+
+| Runtime meta
+| Temporary pipeline state and intermediate provenance. Must not be persisted
+unless explicitly promoted into canonical sidecar contract.
+
+| Render/composer meta
+| Backend-neutral render intent derived from canonical data and canonical meta.
+
+| Carrier-shape meta
+| Backend-specific representation required to store or recover canonical meta
+inside XLSX/ODS. Examples include hidden `_meta` sheet encodings,
+`workbook_meta_blob`, openpyxl/odfpy reconstruction hints, style names, and
+other carrier-specific details. Must not leak into canonical sidecar state.
+
+| Adapter internals
+| XLSX/ODS implementation detail. Must not define canonical sidecar semantics.
+|===
+
+The bug indicates that this boundary is currently porous.
+
+==== Reproduction outline
+
+Starting from the `worldbuilding` consumer at:
+
+[source,text]
+----
+0c9d6dc refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5
+----
+
+and core at:
+
+[source,text]
+----
+37dbb82 docs(backlog): update BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A status
+----
+
+the active stale file:
+
+[source,text]
+----
+daten/dino_insel/_meta.yaml
+----
+
+caused:
+
+[source,text]
+----
+make export-stories
+make check-reimport
+----
+
+to fail with:
+
+[source,text]
+----
+_meta.workbook_view must be a mapping for workbook view readback
+----
+
+After moving the stale sidecar away:
+
+[source,text]
+----
+mv daten/dino_insel/_meta.yaml ./tmp/
+make export-stories
+make check-reimport
+----
+
+the same XLSX path succeeded.
+
+ODS remained green.
+
+==== Scope
+
+This ticket should not start with a broad rewrite.
+
+The immediate scope is to understand and contain the boundary violation:
+
+* analyze the captured fixture;
+* identify which fields are canonical and which are carrier/readback-shaped;
+* determine whether ODS wrote carrier-shaped data into sidecar meta;
+* determine whether XLSX incorrectly interprets stale carrier-shaped meta;
+* define a minimal boundary rule for persisted `_meta.yaml`;
+* add at least one guard or regression that prevents this class from silently
+  returning.
+
+==== Non-goals
+
+* Do not remove `_meta.yaml` support.
+* Do not make sidecar meta XLSX-specific.
+* Do not make sidecar meta ODS-specific.
+* Do not patch `worldbuilding` with a local workaround as the final solution.
+* Do not redesign the whole metadata model in this bug.
+* Do not introduce a generic schema framework unless a separate FTR justifies it.
+* Do not treat cross-carrier tests alone as sufficient if carrier-shaped state
+  remains allowed in canonical sidecar meta.
+
+==== Acceptance
+
+Minimal acceptable outcome:
+
+* The captured fixture is classified field-by-field or family-by-family as:
+  ** canonical sidecar contract,
+  ** runtime-derived,
+  ** render-derived but backend-neutral,
+  ** carrier-shaped / adapter-local,
+  ** unclear.
+* The bug document or follow-up FTR states a clear rule for what must not be
+  persisted into canonical `_meta.yaml`.
+* A regression or guard prevents at least the observed failure class:
+  ** stale ODS-produced sidecar meta must not break XLSX workbook-view readback;
+  ** or carrier-shaped fields from the fixture must be pruned/rejected before
+  XLSX export.
+* Documentation records the canonical-meta boundary so future FTRs do not
+  silently reintroduce backend-shaped structures into sidecar meta.
+
+==== Possible implementation directions
+
+The correct repair may be small or may require a follow-up FTR.
+
+Candidate short-term containment:
+
+* Add a sidecar-meta sanitization step at the persistence boundary.
+* Extend the existing persistence-boundary projection so carrier-shaped keys
+  cannot survive into `_meta.yaml`.
+* Add a worldbuilding/core integration regression using the captured fixture.
+* Add an architecture guard that rejects known carrier-local keys in persisted
+  sidecar meta.
+* Add `make clean-meta` or equivalent consumer workflow support, but only as
+  an operator aid, not as the architectural fix.
+
+Candidate medium-term FTR:
+
+[source,text]
+----
+FTR-CANONICAL-META-BOUNDARY-P5
+----
+
+Potential goals:
+
+* define canonical sidecar meta versus runtime meta versus carrier-shape meta;
+* document allowed/preserved/pruned meta families;
+* introduce cross-carrier meta roundtrip tests;
+* add registry fields or guard checks if needed;
+* establish migration/cleanup guidance for stale local `_meta.yaml` files.
+
+==== Cross-carrier test class
+
+This bug introduces a new test category:
+
+[source,text]
+----
+cross-carrier meta roundtrip
+----
+
+Examples:
+
+[source,text]
+----
+ODS export -> ODS reimport -> persisted _meta.yaml
+then XLSX export -> XLSX reimport must pass
+
+XLSX export -> XLSX reimport -> persisted _meta.yaml
+then ODS export -> ODS reimport must pass
+----
+
+The point is not merely backend parity. The point is that canonical sidecar
+meta must remain backend-neutral across carrier transitions.
+
+==== Related backlog items
+
+* `BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A`
+* `BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A`
+* `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`
+* `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
+* `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`
+* `FTR-META-LIFECYCLE-INVENTORY-P5`
