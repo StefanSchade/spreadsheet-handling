@@ -27,8 +27,8 @@ markers as if they were canonical workbook meta. The
 ``frames["_meta"]`` never advertises wrapper noise as canonical content.
 
 See:
-* ``docs/backlog/BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A.adoc``
-* ``docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc``
+* ``docs/cold_storage/backlog/ftrs_done/BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A.adoc``
+* ``docs/cold_storage/backlog/ftrs_done/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc``
 """
 
 from __future__ import annotations
@@ -214,7 +214,7 @@ def test_xlsx_reader_strips_carrier_layer_markers_from_canonical_meta(
     canonicalize would return ``{author, exported_at, sheets, version}``
     -- the exact post-fix residual symptom reported against the original
     fix commit (see
-    ``docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc``).
+    ``docs/cold_storage/backlog/ftrs_done/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc``).
     """
     # Outer wrapper that contains the four wrapper-shell keys plus a
     # degenerate inner blob. Mirrors what the bug report observed in
@@ -349,7 +349,9 @@ def test_xlsx_carrier_roundtrip_recovers_workbook_view_after_degenerate_inner_bl
 _CROSS_CARRIER_FIXTURE_PATH = (
     Path(__file__).resolve().parents[4]
     / "docs"
+    / "cold_storage"
     / "backlog"
+    / "ftrs_done"
     / "fixtures"
     / "BUG-CROSS-CARRIER-META-ROUNDTRIP"
     / "ods_produced_meta.yaml"

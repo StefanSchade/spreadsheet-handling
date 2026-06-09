@@ -72,7 +72,9 @@ def test_canonical_registry_entries_do_not_use_carrier_shaped_names():
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[3]
     / "docs"
+    / "cold_storage"
     / "backlog"
+    / "ftrs_done"
     / "fixtures"
     / "BUG-CROSS-CARRIER-META-ROUNDTRIP"
     / "ods_produced_meta.yaml"
@@ -91,7 +93,7 @@ def test_persistence_boundary_prunes_resolution_facets_from_captured_fixture():
     """Architecture guard: the captured ODS-produced sidecar must lose its
     Intent-vs-Resolution Resolution facets when projected through the
     persistence boundary. See
-    ``docs/backlog/BUG-CROSS-CARRIER-META-ROUNDTRIP.adoc`` and
+    ``docs/cold_storage/backlog/ftrs_done/BUG-CROSS-CARRIER-META-ROUNDTRIP.adoc`` and
     ``docs/warm_storage/reviews/assess_canonical_meta_boundary.adoc``
     (E2 narrow slice).
     """

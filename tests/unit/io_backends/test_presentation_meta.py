@@ -3,7 +3,7 @@
 The helper is the single home for the replace-or-clear policy that both
 backend parsers apply when projecting parsed carrier state into the
 hidden ``workbook_meta_blob`` payload. See
-``docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc``.
+``docs/cold_storage/backlog/ftrs_done/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc``.
 
 These tests pin the four-quadrant return-value truth table, the
 preservation guarantees for unrelated metadata, and the assertion that

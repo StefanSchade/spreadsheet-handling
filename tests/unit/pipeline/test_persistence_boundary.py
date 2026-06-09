@@ -36,7 +36,9 @@ pytestmark = pytest.mark.ftr("BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A")
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[3]
     / "docs"
+    / "cold_storage"
     / "backlog"
+    / "ftrs_done"
     / "fixtures"
     / "BUG-CROSS-CARRIER-META-ROUNDTRIP"
     / "ods_produced_meta.yaml"

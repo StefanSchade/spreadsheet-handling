@@ -13,7 +13,7 @@ next roundtrip cannot silently reapply formatting the user has just removed.
 Before this helper, the policy was duplicated as four similarly-shaped
 functions plus two inline blocks across the two backend parsers, and three of
 those copies missed the clear branch entirely. See
-`docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc`.
+`docs/cold_storage/backlog/ftrs_done/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc`.
 
 This module is intentionally backend-neutral: it operates only on the
 ``workbook_meta`` dict that both backends already build and re-serialise via
