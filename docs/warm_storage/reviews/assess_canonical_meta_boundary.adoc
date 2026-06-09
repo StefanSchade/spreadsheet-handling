@@ -929,3 +929,301 @@ here)
 * `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
   (same shape on ODS side)
 * `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`
+
+'''
+
+== Addendum -- Reassessment under Intent vs Resolution
+
+[NOTE]
+====
+This addendum was written after the original assessment was complete. It
+does not retract or replace the conclusions above; those remain the
+record of how the problem looked under a Canonical-vs-Carrier framing.
+The addendum reassesses the same fixture and the same E2 proposal under
+a different architectural distinction:
+
+* *Intent* -- a declarative, backend-neutral value that expresses what
+  the user / policy wants. Stable across re-runs of the pipeline against
+  the same inputs.
+* *Resolution* -- a value materialised by running the pipeline, the
+  composer, or layout math against current data or current pipeline
+  state. Recomputable; not authoritative on its own.
+
+Provenance (`source: workbook`, `produced_by.step: ...`) is treated as a
+third axis, neither Intent nor Resolution.
+
+The addendum introduces no new implementation work and does not propose
+an FTR. It only re-examines the classification and notes what changes
+for the E2-narrow proposal.
+====
+
+=== Why Intent-vs-Resolution is a more stable boundary
+
+The original Canonical-vs-Carrier framing puts the *producer* on the
+discriminating axis: who wrote this value? That collapses awkwardly
+where the carrier is authoritative for an intent. The `column_widths`
+entries are the clearest case: the value is canonical by policy
+(`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`), yet the framing keeps
+flagging them as carrier-shaped because a parser wrote them. The
+original assessment had to insert a paragraph explaining that
+"carrier-authoritative is by design, ignore this row" to keep the
+picture coherent.
+
+Intent-vs-Resolution puts the *nature of the value* on the
+discriminating axis: is this a declarative wish, or is it the resolved
+consequence of running something against current data? That removes the
+producer from the question. A parser observing `width: 24.77` is
+capturing intent that originated with the user editing the column. The
+IR composer writing `legend_blocks[*].resolved.{left, top, n_rows,
+n_cols}` is capturing resolution that originated with `_resolve_legend_position`
+running layout math.
+
+This framing also maps cleanly onto the existing registry axis. The
+registry already has `meta_canonical` (which already *means* intent) and
+`meta_rendering` (which already *means* resolution). The persistence
+boundary does not enforce that the *facets* of a canonical-classified
+entry stay on the Intent side; the registry treats the *root* as
+canonical but says nothing about its sub-keys. Intent-vs-Resolution is
+therefore not a new model. It is the model the registry already
+implies, surfaced at the facet level instead of the root level.
+
+One consequence: any future producer adding a new facet under an
+existing canonical root can be asked one local question -- "does this
+value survive a clean re-run unchanged, or is it materialised from
+current state?" -- and the answer determines persistence behavior
+without consulting the registry. The Canonical-vs-Carrier framing needed
+the registry as a lookup.
+
+=== Reclassification of the E2 candidates
+
+The original E2-narrow seam set contained three pruning candidates and
+one soft candidate. Under Intent-vs-Resolution:
+
+[cols="3,2,2", options="header"]
+|===
+| Facet | Original (Canonical-vs-Carrier) | Reclassified (Intent vs Resolution)
+
+| `legend_blocks[*].resolved.{frame_name, kind, left, top, n_rows, n_cols, sheet}`
+| Render state (R)
+| *Resolution.* Written by `_resolve_legend_position` in
+  `layout_composer.py:246`. Frozen output of composer math.
+
+| `legend_blocks[*].{title, entries, placement, target}`
+| Canonical (C)
+| *Intent.* The legend's content and anchor directive. Distinct from the
+  resolved coordinates above.
+
+| `xref_crosstable[*].dense_axes.resolved.{column_keys, row_identities}`
+| Derived / render (D/R)
+| *Resolution.* Concrete snapshot of `characters.name` and `stories.id`
+  at one moment.
+
+| `xref_crosstable[*].column_keys: [Tim, Galli, …]`
+| Derived (D)
+| *Resolution.* The same snapshot mirrored at the top of the entry.
+
+| `xref_crosstable[*].dense_axes.{columns_from, rows_from}`
+| Canonical (C)
+| *Intent.* "Columns come from `characters.name`."
+
+| `xref_crosstable[*].{column_key, row_keys, value, relation, matrix, operation, drop_empty}`
+| Canonical (C)
+| *Intent.* Transformation policy.
+
+| `sheets[*].column_widths[*].width: 24.77`
+| Carrier-readback / canonical-by-policy (K)
+| *Intent.* The user wants this column this wide; the parser only
+  observed the intent.
+
+| `sheets[*].column_widths[*].source: workbook`
+| Carrier-readback (K)
+| *Provenance.* Third axis. Not Intent, not Resolution.
+
+| `sheets[*].horizontal_alignments[*].horizontal: center`
+| Carrier-readback (K)
+| *Intent.*
+
+| `sheets[*].horizontal_alignments[*].source: workbook`
+| Carrier-readback (K)
+| *Provenance.*
+
+| `sheets[*].vertical_alignments[*].vertical: center`
+| Carrier-readback (K)
+| *Intent.*
+
+| `sheets[*].helper_columns: [_places_name]` (matches `helper_prefix`)
+| Canonical (C)
+| *Intent.* Declared via FK / workbook-view policy.
+
+| `sheets[*].helper_columns: [title]` (no `_` prefix)
+| Suspicious; soft pruning candidate
+| *Origin-dependent.* Intent if declared via
+  `configure_workbook_view`, Resolution if parser-materialized. Cannot
+  decide by inspecting the value shape.
+
+| `frame_lifecycle.<frame>.{canonical, editable, render, role}`
+| Canonical (C)
+| *Intent.* The modeled role of the frame.
+
+| `frame_lifecycle.<frame>.{derived_from, produced_by}`
+| Canonical with derived facet (C with D)
+| *Resolution.* The pipeline reporting which step created this frame on
+  this run. Recomputed on the next run.
+
+| `helper_policies.fk.<target>` (v1 residual)
+| Canonical with derived facet
+| *Intent.* User-authored policy in an obsolete shape; obsolescence is
+  separate from intent-ness.
+|===
+
+The reclassification *confirms* the three original E2 seams as
+Resolution, but it also resurfaces two cases that change scope.
+
+=== helper_columns reconsidered
+
+Under Canonical-vs-Carrier the `helper_columns: [title]` shape was
+flagged as a soft pruning candidate, on the heuristic that
+non-prefix-matching entries look reader-observed.
+
+Under Intent-vs-Resolution the test is different: was the list
+*declared* or *resolved*? That question cannot be answered from the
+value alone -- two different producers can emit identical shapes. The
+declared-vs-resolved origin lives at the producer site, not in the
+serialized data.
+
+Three consequences for the E2 conversation:
+
+. The `helper_columns: [title]` shape **leaves E2 scope**. A boundary
+  rule that prunes by name-shape (e.g. "no `_` prefix → drop") is not
+  defensible under Intent-vs-Resolution because it would also strip
+  legitimately declared non-prefix helpers.
+. The right place to answer the declared-vs-resolved question is the
+  producer audit owned by `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` and
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`. Both already claim that
+  territory.
+. The legitimate cases (`_places_name`, `_regions_name`, `_regions_kind`)
+  are Intent regardless of which framing is used, and the original
+  assessment never proposed pruning them.
+
+Net: one less seam in E2, one more item handed off to existing FTRs
+with declared scope for the question.
+
+=== frame_lifecycle.{derived_from, produced_by}
+
+These facets were tolerated under Canonical-vs-Carrier because the
+registry classifies the *root* `frame_lifecycle` as canonical and the
+facet's producer (a pipeline step) writes alongside intent fields like
+`role` and `editable`. The framing had no leverage to separate the two.
+
+Under Intent-vs-Resolution they are unambiguous: a pipeline step
+recording which other step produced this frame is the pipeline
+reporting on itself. The value is recomputed on the next run. The
+information is useful at runtime; persisting it creates a stale-state
+risk if the pipeline configuration changes between save and re-load.
+
+This makes them visible as Resolution facets in a way the original
+framing could not. *Whether to act on that visibility in this slice is
+a separate question.* Two arguments cut both ways:
+
+* For including them in E2: consistency. The rule "Resolution under a
+  canonical root is pruned" should apply uniformly. Selective
+  exemptions would re-introduce the ad-hoc character the original
+  assessment criticised.
+* For deferring: there may be consumers reading `derived_from` /
+  `produced_by` from sidecars today. The original assessment did not
+  audit that. Pruning without the audit would create a regression that
+  the cross-carrier test class would not catch (it covers
+  workbook-view shape, not lifecycle reads).
+
+The addendum does not decide between these. It records that the
+Intent-vs-Resolution lens *raises the question*, which the
+Canonical-vs-Carrier lens did not. A short producer/consumer audit
+inside the eventual FTR (or as a pre-work note) resolves it.
+
+=== source: workbook and other provenance fields
+
+Under Canonical-vs-Carrier the `source: workbook` envelope was the
+single largest carrier-shaped pattern in the fixture and required a
+paragraph of caveats. It is the family that
+`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5` already declared
+carrier-authoritative, yet the framing kept treating it as suspicious.
+
+Under Intent-vs-Resolution the envelope decomposes cleanly:
+
+* The payload value (`width: 24.77`, `horizontal: center`,
+  `vertical: center`) is *Intent*. The user wants the column this
+  wide, the header this aligned. Persist.
+* The `source: workbook` tag is *Provenance*. It records how the intent
+  was captured (parser observation rather than caller-supplied
+  config). It does not influence behavior; it aids diagnostics.
+
+Provenance is a separate axis with its own keep-or-drop policy. The
+addendum does not propose one. The relevant point for the boundary
+question is that *Provenance is not Resolution*, so it does not enter
+the E2 pruning decision. Whether to keep the `source: workbook` tag in
+persisted output is a smaller, independent question (diagnostic value
+vs. payload churn) that can be answered on its own merits later.
+
+The same decomposition applies to other provenance fields in the
+fixture: `produced_by.step` / `produced_by.mode` under
+`helper_policies.fk.<relation>`, the `consistency_policy` envelope on
+projected frames, and `derived_from` *when read as provenance rather
+than as lifecycle resolution*. The reading depends on which producer
+wrote the field; the boundary rule does not depend on it.
+
+=== Does the E2 narrow repair change?
+
+*Mostly no, with two adjustments and one sharpened rule statement.*
+
+The three E2 seams listed in the original assessment
+(`legend_blocks[*].resolved`,
+`xref_crosstable[*].dense_axes.resolved`,
+`xref_crosstable[*].column_keys`) are all confirmed as Resolution under
+the new framing. The pruning targets do not change.
+
+What changes:
+
+* *Rule wording.* Under Canonical-vs-Carrier the rule is "strip facets
+  that look carrier-shaped under canonical roots", which is awkward for
+  future producers because it requires them to know which producer is
+  considered carrier-side. Under Intent-vs-Resolution the rule is "the
+  persistence boundary preserves Intent and drops Resolution;
+  Resolution is any facet whose value is materialised from current
+  data, current layout, or current pipeline state; Provenance rides
+  alongside Intent and is neither". This is the rule a new producer
+  can apply locally without consulting the registry.
+* *helper_columns: [title]* leaves the E2 scope entirely (see above);
+  the declared-vs-resolved question is owned by the FK-helper /
+  derived-provenance FTRs.
+* *frame_lifecycle.{derived_from, produced_by}* appears as a flagged
+  Resolution facet that the Canonical-vs-Carrier lens did not surface.
+  It is *not* added to E2 in this addendum -- the audit it requires is
+  out of scope here -- but it is recorded as the next obvious facet to
+  prune once the audit exists.
+* *Provenance fields (`source: workbook`, `produced_by`)* drop out of
+  the E2 conversation. They are neither Intent nor Resolution and the
+  persistence-boundary question does not need to take a position on
+  them.
+
+Net effect: E2 is the same fix with a clearer rule and a slightly
+tighter scope (one item out, one item flagged-not-added). The other
+options (E1, E3, E4, E5, E6) are not revisited here; their cost-benefit
+shape does not depend on the framing.
+
+=== What this addendum does *not* do
+
+* It does not retract the original assessment. The Canonical-vs-Carrier
+  reading remains a valid description of *who writes what*; the
+  addendum reads the *what* instead.
+* It does not change the answer to question (A) -- a real architectural
+  problem exists -- or to question (G) -- the FTR-vs-bug-update
+  decision is unchanged.
+* It does not propose new implementation work. The E2 seams stay as
+  described; the rule wording is the only diff that would surface in a
+  future FTR draft.
+* It does not create an FTR. If one is later written, this addendum
+  recommends adopting the Intent-vs-Resolution wording for the rule
+  statement and flagging
+  `frame_lifecycle.<frame>.{derived_from, produced_by}` as the next
+  Resolution facet to audit. Both are textual decisions, not new
+  scope.

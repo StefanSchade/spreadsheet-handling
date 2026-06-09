@@ -1,6 +1,6 @@
 ===== BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A -- ODS-produced sidecar meta can poison XLSX workbook-view readback
 
-*Status:* New
+*Status:* Narrow E2 + E6 slice implemented (Intent-vs-Resolution)
 *Priority:* P4A
 *Area:* canonical `_meta` boundary / carrier isolation / cross-carrier roundtrip / worldbuilding adoption
 *Observed via:* `worldbuilding` consumer after `refactor(worldbuilding): adopt FTR-DYNAMIC-FRAME-PROJECTION-P5`
@@ -341,3 +341,106 @@ meta must remain backend-neutral across carrier transitions.
 * `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`
 * `FTR-WORKBOOK-VIEW-ROUNDTRIP-RECOMPOSITION-P4A`
 * `FTR-META-LIFECYCLE-INVENTORY-P5`
+
+
+Independent assessment completed.
+
+Preferred framing:
+Intent vs Resolution
+
+Current evidence suggests a narrow seam set:
+
+- legend_blocks[*].resolved
+- xref_crosstable[*].dense_axes.resolved
+- xref_crosstable[*].column_keys
+
+Other previously suspected fields were reclassified as
+Intent or Provenance.
+
+==== Decision recorded -- Intent vs Resolution
+
+The Intent-vs-Resolution framing from the assessment addendum is adopted as
+the persistence-boundary rule wording for this bug:
+
+* *Intent* -- declarative, backend-neutral values that the user/policy
+  expresses. Intent is *preserved* across the persistence boundary.
+* *Resolution* -- values materialised from current data, current layout,
+  or current pipeline state. Resolution is *dropped* at the persistence
+  boundary because it is reconstructible by running the pipeline.
+* *Provenance* -- markers such as ``source: workbook`` and
+  ``produced_by``. These are a third axis and are out of scope for this
+  slice.
+
+==== Implemented slice (E2 narrow + E6 architecture guards)
+
+The persistence boundary in
+``src/spreadsheet_handling/pipeline/persistence_boundary.py`` now prunes
+exactly three Resolution facets, restricted to canonical roots that the
+captured fixture exposes:
+
+* ``legend_blocks[*].resolved`` -- layout coordinates frozen by
+  ``rendering/composer/layout_composer.py::_resolve_legend_position``.
+* ``xref_crosstable[*].dense_axes.resolved`` -- snapshot of the columns
+  and rows materialised from the current value of the source frames.
+* ``xref_crosstable[*].column_keys`` -- the same snapshot mirrored at
+  the top of the entry.
+
+Intent fields under the same roots
+(``legend_blocks[*].{title, entries, placement, target}``,
+``xref_crosstable[*].{column_key, row_keys, value, relation, matrix,
+operation, drop_empty}``, ``dense_axes.{columns_from, rows_from}``)
+remain intact.
+
+Explicitly *not* implemented in this slice (kept for the listed owners):
+
+* ``source: workbook`` envelope -- carrier-authoritative by policy
+  (FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5).
+* ``sheets[*].helper_columns`` -- declared-vs-resolved question owned
+  by FTR-FK-HELPER-POLICY-LIFECYCLE-P4A /
+  FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.
+* ``frame_lifecycle.{derived_from, produced_by}`` -- flagged as
+  Resolution but deferred pending a consumer audit.
+* Registry classification changes, schema versioning, read-side
+  sanitiser, FTR creation, generic meta framework.
+
+==== Test coverage added
+
+* ``tests/unit/pipeline/test_persistence_boundary.py`` --
+  ``TestIntentVsResolutionSlice`` exercises each of the three pruning
+  rules in isolation and loads the captured fixture to confirm the
+  rules at the same time as positive Intent-survival checks.
+* ``tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py``
+  -- adds two architecture guards on the captured fixture: one for the
+  three Resolution facets disappearing, one for Intent surviving.
+* ``tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py``
+  -- adds ``test_ods_produced_sidecar_meta_does_not_break_xlsx_roundtrip``
+  which feeds the captured ODS-produced ``_meta.yaml`` through the
+  persistence boundary, exports XLSX, reimports, and asserts that
+  ``workbook_view`` survives as a mapping (the original failure mode)
+  and that the three Resolution facets do not reappear via the carrier.
+
+==== Validation
+
+Local validation:
+
+[source,text]
+----
+make test-file FILE=tests/unit/pipeline/test_persistence_boundary.py
+make test-file FILE=tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py
+make test-file FILE=tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py
+make test
+make source-style-guards
+git diff --check
+----
+
+==== Residual risk
+
+* Sidecars produced before this slice still carry the three Resolution
+  facets on disk. They become safe on the next save through the
+  orchestrator; no read-side sanitiser is added in this slice.
+* The ``source: workbook`` envelope's cross-carrier semantics are not
+  defined here. If a different cross-carrier symptom surfaces around
+  that envelope, a follow-up bug is the right vehicle.
+* ``frame_lifecycle.{derived_from, produced_by}`` remain persisted and
+  may show similar stale-state symptoms; the consumer audit needed to
+  prune them is deliberately out of scope.

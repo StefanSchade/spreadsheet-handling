@@ -45,6 +45,23 @@ Pruned:
   ``configure_fk_helpers``. The remaining ``helper_policies`` structure
   (v1 per-target dicts, user-authored or otherwise non-runtime-produced
   relations) is preserved.
+* Resolution facets under canonical roots (added by
+  ``BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A``):
+
+  - ``legend_blocks[*].resolved`` -- coordinates frozen by
+    ``rendering/composer/layout_composer.py::_resolve_legend_position``,
+  - ``xref_crosstable[*].dense_axes.resolved`` -- snapshot of the
+    columns/rows materialised from current data,
+  - ``xref_crosstable[*].column_keys`` -- the same snapshot mirrored at
+    the top of the entry.
+
+  Rule wording: the persistence boundary preserves *Intent* and drops
+  *Resolution*. Intent is a declarative, backend-neutral value (e.g.
+  ``legend_blocks[*].placement``, ``xref_crosstable[*].dense_axes.columns_from``).
+  Resolution is materialised from current data, current layout, or
+  current pipeline state on every run. Provenance markers
+  (``source: workbook``, ``produced_by``) ride alongside Intent and are
+  neither Intent nor Resolution -- they are out of scope for this slice.
 
 Out of scope (explicit non-goals):
 
@@ -52,7 +69,15 @@ Out of scope (explicit non-goals):
 * using the meta registry as a runtime contract,
 * a generic ``persisted_by_default`` field,
 * a broader redesign of ``helper_policies``,
-* migrating historical ``_meta.yaml`` content beyond the minimum needed.
+* migrating historical ``_meta.yaml`` content beyond the minimum needed,
+* read-side sanitisation of sidecars already on disk,
+* pruning ``sheets[*].helper_columns`` -- the declared-vs-resolved
+  question lives with FTR-FK-HELPER-POLICY-LIFECYCLE-P4A,
+* pruning ``frame_lifecycle.{derived_from, produced_by}`` -- flagged as
+  Resolution but deferred pending a consumer audit,
+* pruning the ``source: workbook`` envelope on the four presentation
+  families (carrier-authoritative by policy under
+  FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5).
 
 These items are tracked separately in
 ``docs/backlog/FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.adoc`` and
@@ -109,6 +134,12 @@ def project_meta_to_persistable_contract(meta: Mapping[str, Any] | None) -> dict
             if projected_helper_policies is not None:
                 projected[key] = projected_helper_policies
             continue
+        if key == "legend_blocks":
+            projected[key] = _project_legend_blocks(value)
+            continue
+        if key == "xref_crosstable":
+            projected[key] = _project_xref_crosstable(value)
+            continue
         projected[key] = value
 
     return projected
@@ -154,6 +185,56 @@ def _is_runtime_produced_fk_relation(entry: Any) -> bool:
     if not isinstance(produced_by, Mapping):
         return False
     return produced_by.get("step") == _RUNTIME_FK_HELPER_PRODUCER_STEP
+
+
+def _project_legend_blocks(legend_blocks: Any) -> Any:
+    """Strip ``resolved`` Resolution facet from each legend block.
+
+    The ``resolved`` sub-key holds layout coordinates written by
+    ``rendering/composer/layout_composer.py::_resolve_legend_position``;
+    they are recomputed on every render. The legend's Intent facets
+    (``title``, ``entries``, ``placement``, ``target``) are preserved.
+    """
+    if not isinstance(legend_blocks, Mapping):
+        return legend_blocks
+
+    projected: dict[str, Any] = {}
+    for name, block in legend_blocks.items():
+        if isinstance(block, Mapping) and "resolved" in block:
+            projected[name] = {k: v for k, v in block.items() if k != "resolved"}
+        else:
+            projected[name] = block
+    return projected
+
+
+def _project_xref_crosstable(xref_crosstable: Any) -> Any:
+    """Strip Resolution facets from each xref_crosstable entry.
+
+    Two facets are removed:
+
+    * ``column_keys`` -- the concrete column-key list materialised from
+      the current value of the source frame's key column.
+    * ``dense_axes.resolved`` -- the same snapshot mirrored under
+      ``dense_axes``.
+
+    Intent fields (``column_key``, ``row_keys``, ``value``, ``relation``,
+    ``matrix``, ``operation``, ``drop_empty``, ``dense_axes.columns_from``,
+    ``dense_axes.rows_from``) are preserved.
+    """
+    if not isinstance(xref_crosstable, Mapping):
+        return xref_crosstable
+
+    projected: dict[str, Any] = {}
+    for name, entry in xref_crosstable.items():
+        if not isinstance(entry, Mapping):
+            projected[name] = entry
+            continue
+        cleaned = {k: v for k, v in entry.items() if k != "column_keys"}
+        dense_axes = cleaned.get("dense_axes")
+        if isinstance(dense_axes, Mapping) and "resolved" in dense_axes:
+            cleaned["dense_axes"] = {k: v for k, v in dense_axes.items() if k != "resolved"}
+        projected[name] = cleaned
+    return projected
 
 
 __all__ = [

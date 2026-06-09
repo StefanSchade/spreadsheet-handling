@@ -1,13 +1,17 @@
 """Unit tests for the orchestrator's persistence-boundary projection.
 
 Scope reflects the narrow rules established by
-BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A:
+BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A and extended by
+BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A (Intent vs Resolution slice):
 
 * drop top-level ``derived``,
 * drop top-level ``__*``-prefixed keys,
 * drop ``helper_policies.fk.relations`` entries where
   ``produced_by.step == configure_fk_helpers``,
-* preserve everything else.
+* drop ``legend_blocks[*].resolved`` (Resolution under canonical),
+* drop ``xref_crosstable[*].dense_axes.resolved`` (Resolution),
+* drop ``xref_crosstable[*].column_keys`` (Resolution),
+* preserve everything else (including ``source: workbook`` provenance).
 
 A complete ``_meta`` lifecycle inventory is intentionally out of scope. See
 ``FTR-META-LIFECYCLE-INVENTORY-P5`` for the broader follow-up.
@@ -16,8 +20,10 @@ A complete ``_meta`` lifecycle inventory is intentionally out of scope. See
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import pytest
+import yaml
 
 from spreadsheet_handling.pipeline.persistence_boundary import (
     project_meta_to_persistable_contract,
@@ -25,6 +31,23 @@ from spreadsheet_handling.pipeline.persistence_boundary import (
 
 
 pytestmark = pytest.mark.ftr("BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A")
+
+
+_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "docs"
+    / "backlog"
+    / "fixtures"
+    / "BUG-CROSS-CARRIER-META-ROUNDTRIP"
+    / "ods_produced_meta.yaml"
+)
+
+
+def _load_ods_produced_meta_fixture() -> dict:
+    with _FIXTURE_PATH.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    assert isinstance(loaded, dict)
+    return loaded
 
 
 def test_drops_top_level_derived() -> None:
@@ -197,3 +220,205 @@ def test_handles_non_mapping_helper_policies_value_gracefully() -> None:
     meta = {"helper_policies": "garbage"}
     out = project_meta_to_persistable_contract(meta)
     assert out == {"helper_policies": "garbage"}
+
+
+# ---------------------------------------------------------------------------
+# BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A -- Intent vs Resolution slice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ftr("BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A")
+class TestIntentVsResolutionSlice:
+    """Persist Intent; drop the three named Resolution facets only."""
+
+    def test_drops_legend_blocks_resolved_facet(self) -> None:
+        meta = {
+            "legend_blocks": {
+                "story_group_codes": {
+                    "title": "Story Group Codes",
+                    "entries": [{"label": "Central role", "token": "C"}],
+                    "placement": {
+                        "anchor": "right_of_table",
+                        "sheet": "story_groups",
+                        "target": "story_groups",
+                    },
+                    "resolved": {
+                        "frame_name": "legend_story_group_codes",
+                        "kind": "legend",
+                        "left": 12,
+                        "n_cols": 3,
+                        "n_rows": 3,
+                        "sheet": "story_groups",
+                        "top": 1,
+                    },
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        block = out["legend_blocks"]["story_group_codes"]
+
+        assert "resolved" not in block
+        assert block["title"] == "Story Group Codes"
+        assert block["placement"]["anchor"] == "right_of_table"
+        assert block["entries"][0]["token"] == "C"
+
+    def test_drops_xref_crosstable_column_keys_facet(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "story_cast_crystal_named": {
+                    "column_key": "character_name",
+                    "column_keys": ["Tim", "Galli", "Comphi"],
+                    "row_keys": ["story_id"],
+                    "relation": "story_cast_crystal_named",
+                    "value": "value",
+                    "drop_empty": True,
+                    "matrix": "story_cast_crystal_matrix_payload",
+                    "operation": "expand_xref",
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        entry = out["xref_crosstable"]["story_cast_crystal_named"]
+
+        assert "column_keys" not in entry
+        assert entry["column_key"] == "character_name"
+        assert entry["row_keys"] == ["story_id"]
+        assert entry["relation"] == "story_cast_crystal_named"
+        assert entry["operation"] == "expand_xref"
+
+    def test_drops_xref_dense_axes_resolved_facet_but_keeps_intent(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "story_cast_crystal_named": {
+                    "column_key": "character_name",
+                    "row_keys": ["story_id"],
+                    "dense_axes": {
+                        "columns_from": {"frame": "characters", "key": "name"},
+                        "rows_from": {"frame": "stories", "key": "id"},
+                        "resolved": {
+                            "column_keys": ["Tim", "Galli"],
+                            "row_identities": [
+                                {"story_id": "STORY-0001"},
+                                {"story_id": "STORY-0002"},
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        dense_axes = out["xref_crosstable"]["story_cast_crystal_named"]["dense_axes"]
+
+        assert "resolved" not in dense_axes
+        assert dense_axes["columns_from"] == {"frame": "characters", "key": "name"}
+        assert dense_axes["rows_from"] == {"frame": "stories", "key": "id"}
+
+    def test_captured_fixture_loses_three_resolution_facets(self) -> None:
+        """Architecture-style fixture check: loading the captured
+        ODS-produced sidecar through the persistence boundary strips the
+        three named Resolution facets but leaves Intent intact."""
+        fixture = _load_ods_produced_meta_fixture()
+
+        # Sanity: the fixture contains the facets we claim to prune.
+        assert "resolved" in fixture["legend_blocks"]["story_group_codes"]
+        any_xref = next(iter(fixture["xref_crosstable"].values()))
+        assert "column_keys" in any_xref
+        assert "resolved" in any_xref["dense_axes"]
+
+        out = project_meta_to_persistable_contract(fixture)
+
+        for block in out["legend_blocks"].values():
+            assert "resolved" not in block, (
+                "legend_blocks[*].resolved must not survive the persistence "
+                f"boundary; got keys {sorted(block)}"
+            )
+        for entry in out["xref_crosstable"].values():
+            assert "column_keys" not in entry, (
+                "xref_crosstable[*].column_keys must not survive the "
+                f"persistence boundary; got keys {sorted(entry)}"
+            )
+            dense_axes = entry.get("dense_axes")
+            if isinstance(dense_axes, dict):
+                assert "resolved" not in dense_axes, (
+                    "xref_crosstable[*].dense_axes.resolved must not survive "
+                    f"the persistence boundary; got keys {sorted(dense_axes)}"
+                )
+
+    def test_captured_fixture_preserves_intent_fields(self) -> None:
+        """Positive checks: Intent and Provenance survive the boundary."""
+        fixture = _load_ods_produced_meta_fixture()
+        out = project_meta_to_persistable_contract(fixture)
+
+        # Top-level Intent.
+        assert out["workbook_view"] == fixture["workbook_view"]
+        assert out["auto_filter"] == fixture["auto_filter"]
+        assert out["freeze_header"] == fixture["freeze_header"]
+        assert out["helper_prefix"] == fixture["helper_prefix"]
+        assert out["constraints"] == fixture["constraints"]
+        assert out["cell_codecs"] == fixture["cell_codecs"]
+        assert out["compact_multiaxis"] == fixture["compact_multiaxis"]
+        assert out["split_by_discriminator"] == fixture["split_by_discriminator"]
+        # frame_lifecycle and source: workbook are intentionally not pruned
+        # in this slice; verify they pass through unchanged.
+        assert out["frame_lifecycle"] == fixture["frame_lifecycle"]
+        sheets = out["sheets"]
+        any_sheet = next(iter(sheets.values()))
+        any_width = next(iter(any_sheet["column_widths"].values()))
+        assert any_width.get("source") == "workbook"
+
+        # legend_blocks Intent fields survive.
+        legend = out["legend_blocks"]["story_group_codes"]
+        assert legend["title"] == "Story Group Codes"
+        assert legend["entries"] == fixture["legend_blocks"]["story_group_codes"]["entries"]
+        assert legend["placement"] == fixture["legend_blocks"]["story_group_codes"]["placement"]
+
+        # xref_crosstable Intent fields survive.
+        for name, entry in out["xref_crosstable"].items():
+            source = fixture["xref_crosstable"][name]
+            for intent_key in (
+                "column_key",
+                "row_keys",
+                "relation",
+                "matrix",
+                "operation",
+                "drop_empty",
+                "value",
+            ):
+                if intent_key in source:
+                    assert entry[intent_key] == source[intent_key]
+            dense_axes = entry.get("dense_axes")
+            if isinstance(dense_axes, dict):
+                src_dense = source["dense_axes"]
+                assert dense_axes["columns_from"] == src_dense["columns_from"]
+                assert dense_axes["rows_from"] == src_dense["rows_from"]
+
+    def test_handles_non_mapping_legend_blocks_and_xref_crosstable(self) -> None:
+        """Robustness: unexpected shapes pass through unchanged rather than
+        crashing the projection."""
+        meta = {"legend_blocks": "garbage", "xref_crosstable": ["x"]}
+        out = project_meta_to_persistable_contract(meta)
+        assert out["legend_blocks"] == "garbage"
+        assert out["xref_crosstable"] == ["x"]
+
+    def test_does_not_mutate_legend_blocks_or_xref_crosstable(self) -> None:
+        meta = {
+            "legend_blocks": {
+                "x": {"title": "T", "resolved": {"left": 0}},
+            },
+            "xref_crosstable": {
+                "y": {
+                    "column_key": "k",
+                    "column_keys": ["a"],
+                    "dense_axes": {
+                        "columns_from": {"frame": "f", "key": "k"},
+                        "resolved": {"column_keys": ["a"]},
+                    },
+                },
+            },
+        }
+        snapshot = copy.deepcopy(meta)
+        project_meta_to_persistable_contract(meta)
+        assert meta == snapshot
