@@ -1,0 +1,931 @@
+= Canonical Meta Boundary -- Independent Assessment
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+
+== Metadata
+
+[cols="1,3"]
+|===
+| Field | Value
+
+| Assessment type
+| Independent architecture assessment (read-only, no implementation).
+  Analyses, classifies, and develops repair options.
+  Does *not* take an architectural decision.
+
+| Subject
+| Whether `BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A` exposes a real
+  architectural problem at the canonical `_meta` boundary, and what the
+  realistic shape of a repair would be.
+
+| Trigger
+| `worldbuilding` consumer found a stale `daten/dino_insel/_meta.yaml`
+  (produced by an earlier ODS readback) that poisoned the XLSX path with
+  ``_meta.workbook_view must be a mapping for workbook view readback``.
+  Removing the sidecar made XLSX green again. The workbook-view symptom
+  itself is understood; the bug ticket asks the bigger question.
+
+| Stance
+| Independent. Assumes nothing about which repair direction is correct.
+  Reads the registry, the architecture primer, the existing guards, and
+  the captured fixture as the input set; treats the bug ticket as one
+  input among several rather than the authoritative scoping document.
+
+| Inputs read
+a|
+* `docs/backlog/BUG-CROSS-CARRIER-META-ROUNDTRIP.adoc`
+* `docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP/ods_produced_meta.yaml`
+* `docs/ai_info/architecture_primer.adoc`
+* `docs/ai_info/concepts_fk_helpers.adoc`
+* `docs/semantic_model/13_semantic_guards.adoc`
+* `registries/meta_registry.yaml`
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py`
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py`
+  (legend block resolution; XLSX/ODS parsers for `source: workbook`)
+* `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`
+* `tests/architecture/semantic_invariants/test_meta_registry_hardening.py`
+  (file list only)
+* `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc`
+* `docs/backlog/FTR-META-CONTRACT-VERSIONING-P4A.adoc`
+* `docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc`
+* `docs/backlog/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.adoc`
+* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc`
+  (resolution section)
+* `docs/backlog/BUG-COLUMN-LEVEL-PRESENTATION-META-READBACK-P5.adoc`
+|===
+
+== A) Is this a real architectural problem?
+
+*Yes -- but not exactly where the bug ticket frames it.*
+
+The single observed failure mode (a stale ODS-produced sidecar poisoning
+XLSX workbook-view readback) is a concrete symptom. The deeper claim --
+"the persistence boundary does not separate canonical workbook intent
+from carrier-shaped reconstruction state" -- is also real, *but it is
+already partly known and partly addressed*. What is genuinely new is the
+**cross-carrier amplification surface**: once a sidecar exists, it is
+fed back into a *different* backend, and any classification weakness in
+that sidecar becomes another backend's parser bug.
+
+Three independent reasons the architectural problem is real:
+
+. *The registry already names four classifications but the persistence
+  boundary only enforces one of them.* `registries/meta_registry.yaml`
+  distinguishes `canonical_meta`, `derived_operational_view`,
+  `carrier_artifact`, and `read_path_hint`.
+  `pipeline/persistence_boundary.py` only strips top-level `derived`,
+  top-level ``__*``-prefixed keys, and runtime-produced FK-helper v2
+  relations. Every other classification distinction is *documentary*,
+  not enforced -- and `_meta.yaml` sidecars are written through the
+  same boundary.
+. *Carrier readback already writes hybrid entries into "canonical"
+  shapes.* The fixture shows
+  `column_widths`, `horizontal_alignments`, `vertical_alignments`, and
+  `text_orientations` each carrying a `source: "workbook"` provenance
+  tag inside the value object. The XLSX and ODS parsers actively write
+  these tags (`src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+  and `.../ods/odf_parser.py`).
+  These entries *are* registered as `canonical_meta` and
+  `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5` reaffirmed
+  carrier-authoritative semantics for them. So this is not a defect
+  *of that family* in isolation. The unsolved question is what
+  happens when carrier-authoritative state from backend A becomes
+  input for backend B's read path on a later run.
+. *Pre-existing FTRs anticipated this exact gap.*
+  `FTR-META-LIFECYCLE-INVENTORY-P5` and
+  `FTR-META-CONTRACT-VERSIONING-P4A` both explicitly note that the
+  persistence-boundary fix shipped under
+  `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` was a *narrow*
+  classification slice and that the rest of `_meta` remained
+  unclassified at the runtime contract level. The bug ticket is one
+  of the first concrete consumer reproductions of that anticipated
+  gap.
+
+What the bug ticket *over-states*:
+
+* It suggests "ODS writes carrier-local state into canonical sidecar
+  meta" as if that were already a violation. But the carrier-authoritative
+  policy for the four presentation families is by design (see
+  `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`). The defect is not that
+  carrier readback writes these entries; it is that the *envelope shape*
+  of the entries (the `source: workbook` discriminator) and the
+  *resolved* sub-keys on neighbouring families do not have a stated
+  cross-carrier contract.
+
+What the bug ticket *under-states*:
+
+* It frames the problem mostly as "ODS-produced state breaks XLSX",
+  i.e. write-A / read-B. The fixture also contains derived/resolved
+  state (`legend_blocks.*.resolved`, `xref_crosstable.*.dense_axes.resolved`,
+  the literal `xref_crosstable.*.column_keys` lists) that is shape-wise
+  *render-derived* and would survive any sidecar roundtrip into *the same*
+  backend as well. The cross-carrier framing is real but is only one face
+  of the broader "render-derived state is being persisted as canonical
+  policy" problem.
+
+[NOTE]
+====
+The semantic-guard guidance in
+`docs/semantic_model/13_semantic_guards.adoc` already states the bar
+for runtime rule checks: a guard is justified when "stale metadata can
+survive roundtrip and affect future output" and when "metadata conflicts
+can produce silently wrong canonical output". The fixture satisfies
+both. So even within the project's own published policy, *some*
+hardening at this seam is on-policy.
+====
+
+== B) How large is the problem?
+
+Quantitative shape:
+
+[cols="2,1,4", options="header"]
+|===
+| Dimension | Count | Notes
+
+| Meta-registry entries
+| 24
+| 20 classified `canonical_meta` / `meta_canonical`, 4 classified
+  `meta_rendering` (mix of `carrier_artifact`, `derived_operational_view`,
+  `read_path_hint`).
+
+| Distinct top-level keys observed in the captured fixture
+| 13
+| `auto_filter`, `cell_codecs`, `compact_multiaxis`, `constraints`,
+  `frame_lifecycle`, `freeze_header`, `helper_policies`, `helper_prefix`,
+  `legend_blocks`, `sheets`, `split_by_discriminator`, `workbook_view`,
+  `xref_crosstable`.
+
+| Top-level keys *not* yet pruned by `persistence_boundary.py`
+| 12 of 13
+| Only top-level `derived` is currently pruned -- not present in this
+  fixture. Everything else flows through.
+
+| Sub-key paths in the fixture with `source: workbook` provenance tags
+| 12 sheets × 4 families (max)
+| All `column_widths`, `horizontal_alignments`, `vertical_alignments`
+  entries observed carry the tag. These are by-policy canonical now.
+
+| Sub-key paths in the fixture that look render-derived rather than
+  canonical
+| 6+
+| `legend_blocks.<n>.resolved` (1×),
+  `xref_crosstable.<n>.dense_axes.resolved` (4×),
+  `xref_crosstable.<n>.column_keys` literal lists (4×),
+  `sheets.<n>.helper_columns: [title, ...]` for at least 4 sheets where
+  `title` does not match `helper_prefix: _`.
+
+| Existing architecture guards on the meta/carrier boundary
+| 3 relevant test files
+| `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`,
+  `.../test_meta_registry_hardening.py`,
+  `.../current_state/test_spreadsheet_meta_semantics.py`.
+  None of them guards *sidecar content* against carrier-shape leakage.
+|===
+
+Qualitative shape:
+
+. *Symptom-narrow.*
+  The visible failure (`_meta.workbook_view must be a mapping for
+  workbook view readback`) is plausibly fixable by adding cross-carrier
+  read tolerance plus a regression. That fix alone, however, would
+  silence the symptom without disturbing the seam that the bug ticket
+  is asking about.
+. *Class-wide.*
+  The same shape (sidecar persisted A → consumed B) reproduces for any
+  classification weakness, not just `workbook_view`. The fixture
+  contains at least six sub-key shapes whose canonical-vs-derived status
+  is unclear by inspection.
+. *Cross-cutting.*
+  The boundary lives at the intersection of four layers
+  (`pipeline/persistence_boundary.py`, the IR/render composer's
+  `_legend_block_resolve` and `xref_crosstable` writers, the
+  XLSX/ODS parsers' `source: workbook` writes, and the
+  `_meta.yaml` sidecar saver in the JSON-directory backend). No single
+  module owns the rule today.
+. *Pre-claimed scope.*
+  Three open FTRs already claim adjacent territory
+  (`FTR-META-LIFECYCLE-INVENTORY-P5`,
+  `FTR-META-CONTRACT-VERSIONING-P4A`,
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`). Any new FTR here must avoid
+  duplicating their stated scope and must not silently re-decide their
+  open questions.
+
+Summary: *medium* problem. Smaller than a meta-schema redesign, larger
+than the single XLSX symptom suggests.
+
+== C) Which meta families already exist?
+
+=== Registry-defined (executable contract)
+
+The `meta_registry.yaml` already names two layers and four
+classifications. Reproduced verbatim from the registry's
+`allowed_layers` / `allowed_classifications`:
+
+[cols="1,1,3", options="header"]
+|===
+| Layer | Classification | Stated meaning
+
+| `meta_canonical`
+| `canonical_meta`
+| Canonical spreadsheet-neutral meaning that may be persisted and
+  overridden.
+
+| `meta_rendering`
+| `derived_operational_view`
+| Derived IR-local working view for passes, planning, or projection.
+
+| `meta_rendering`
+| `carrier_artifact`
+| Backend-near persistence or control artifact that is not a second
+  canonical source.
+
+| `meta_rendering`
+| `read_path_hint`
+| Parser-derived carrier-side hint that aids reconstruction or
+  diagnostics without becoming canonical policy.
+|===
+
+Concrete registry members per cell:
+
+[cols="1,4", options="header"]
+|===
+| Family | Members
+
+| canonical_meta
+| `version`, `author`, `exported_at`, `sheets`, `column_widths`,
+  `text_orientations`, `horizontal_alignments`, `vertical_alignments`,
+  `freeze_header`, `auto_filter`, `header_fill_rgb`, `helper_fill_rgb`,
+  `helper_prefix`, `helper_columns`, `protection`, `helper_policies`,
+  `frame_lifecycle`, `workbook_view`, `workbook_view.sheet_mappings`,
+  `constraints`, `legend_blocks`, `xref_crosstable`,
+  `split_by_discriminator`, `sparse_defaults`, `cell_codecs`,
+  `compact_multiaxis`.
+
+| carrier_artifact
+| `workbook_meta_blob`, `_hidden`.
+
+| derived_operational_view
+| `options`, `__style`, `__helper_cols`, `__autofilter`, `__freeze`,
+  `derived`.
+
+| read_path_hint
+| `__autofilter_ref`, `__legend_blocks`.
+|===
+
+=== Code-introduced shapes that the registry does *not* explicitly call out
+
+The bug ticket effectively asks whether *some entries currently classified
+as canonical_meta are actually mixtures*. The fixture and the code paths
+that write them suggest at least these *sub-families* that live underneath
+canonical-classified registry entries:
+
+[cols="1,1,3", options="header"]
+|===
+| Sub-family | Lives under | Producer / shape
+
+| `*.resolved` reconstruction state
+| `legend_blocks[*]`, `xref_crosstable[*].dense_axes`
+| Written by `rendering/composer/layout_composer.py:_resolve_legend_position`
+  (`spec["resolved"] = {...}` at line ~246) and by the XRef expander.
+  Records the *resolved layout / projection coordinates* of a canonical
+  block.
+
+| `source: workbook` provenance tags
+| `sheets[*].column_widths[*]`,
+  `sheets[*].horizontal_alignments[*]`,
+  `sheets[*].vertical_alignments[*]`,
+  `sheets[*].text_orientations[*]` (not in this fixture but registry says
+  so)
+| Written by both XLSX and ODS parsers; intentional under
+  `FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`.
+
+| Materialized projection lists
+| `xref_crosstable[*].column_keys`,
+  `xref_crosstable[*].dense_axes.resolved.column_keys`,
+  `.row_identities`
+| Concrete values pulled from current data frames, persisted alongside
+  the policy block.
+
+| Helper-column lists with non-prefix names
+| `sheets[*].helper_columns`
+| Registry says canonical, but the fixture contains
+  `helper_columns: [title]` where `title` does not match
+  `helper_prefix: _`. Indicates a reader-side observation, not user
+  authorship.
+
+| Residual v1 FK policy shapes
+| `helper_policies.fk.<target_key>`
+| Written by `configure_fk_helpers` as a producer-side compatibility
+  shim; the persistence boundary already understands the v2 side but
+  leaves v1 untouched.
+|===
+
+These five sub-families are *not* new entries. They are *facets* under
+existing canonical entries. The registry classifies the *root*; the
+boundary currently has no policy for the *facets*.
+
+=== The bug ticket's proposed taxonomy (for comparison)
+
+The bug ticket sketches a five-row table:
+
+* Canonical sidecar `_meta.yaml`
+* Runtime meta
+* Render/composer meta
+* Carrier-shape meta
+* Adapter internals
+
+The first row maps to `meta_canonical` / `canonical_meta`. The fourth row
+("carrier-shape meta") is the proposed new explicit classification. Today
+the registry collapses it into either `canonical_meta` (when the carrier
+is the authoritative source for a presentation family) or
+`carrier_artifact` (for `workbook_meta_blob` / `_hidden`). There is no
+classification for "structure that *looks* canonical but was produced
+from carrier readback as resolved/materialized state". The fixture
+contains examples of exactly this missing classification.
+
+== D) Which fixture fields look carrier-shaped or derived?
+
+The captured fixture
+(`docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP/ods_produced_meta.yaml`,
+1836 lines) was inspected field-by-field. The classification below uses
+five buckets:
+
+* *C* -- canonical user-authored policy (intent that survives carrier
+  changes).
+* *D* -- derived operational view materialized from data (recomputable).
+* *R* -- render/projection state (layout coordinates, resolved
+  geometry).
+* *K* -- carrier readback of presentation state (carrier-authoritative
+  by design).
+* *?* -- unclear from inspection alone.
+
+[cols="2,1,4", options="header"]
+|===
+| Top-level key | Bucket | Notes
+
+| `auto_filter: true`
+| C
+| Boolean policy. Registry confirms `canonical_meta`. Backend-neutral.
+
+| `freeze_header: true`
+| C
+| Same shape as `auto_filter`. Registry confirms.
+
+| `helper_prefix: '_'`
+| C
+| Workbook-level scalar policy.
+
+| `cell_codecs.<name>`
+| C
+| Codec policy (mode, delimiter, drop_empty, passthrough_columns).
+  Registry confirms. *Open:* `source: __compact_multiaxis_..._xref` is
+  a synthetic frame name that may or may not be stable across
+  re-derivation; not investigated further here.
+
+| `compact_multiaxis.<name>`
+| C
+| Composed transform policy (mode, delimiter, value_columns, group).
+  Registry confirms.
+
+| `constraints[*]`
+| C
+| Validation rules (sheet/column/rule). Registry confirms.
+
+| `frame_lifecycle.<frame>`
+| C with one D facet
+| Role / editable / canonical / render fields are user intent.
+  `derived_from: [...]` and `produced_by: {step: ..., name: ...}` are
+  *derived* facets that exist because some frames are projections of
+  other frames. These derived facets are reconstructible if the
+  pipeline runs again, but they are persisted today.
+
+| `helper_policies.fk.<target>`
+| C with residual D facet
+| v1 per-target shape. Registry already documents this as a
+  producer-side residual no runtime consumer reads. Persistence boundary
+  is aware of the v2 runtime-produced relations, not this v1 residual.
+
+| `legend_blocks.<name>`
+| C with R facet
+| `title`, `entries`, `placement`, `target` -- canonical.
+  `resolved: {frame_name, kind, left, n_cols, n_rows, sheet, top}` --
+  render-time materialized layout coordinates written by
+  `_resolve_legend_position` (line 246 of `layout_composer.py`).
+  *Smoking gun for "render state persisted as canonical".*
+
+| `sheets.<sheet>.column_widths.<col>`
+| K
+| `{width: 8.89, source: workbook}`. By policy carrier-authoritative
+  (`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`). 8.89 is openpyxl's
+  default width and is materialised across nearly every column. The
+  `source: workbook` envelope is not in the registry meaning text -- it
+  is an *implicit* envelope shape that the registry's
+  `precedence_notes` does not name.
+
+| `sheets.<sheet>.horizontal_alignments.<addr>`
+| K
+| Same envelope shape with `source: workbook`. All observed entries are
+  on header cells (`A1` ... `I1`), centred.
+
+| `sheets.<sheet>.vertical_alignments.<addr>`
+| K
+| Same envelope shape.
+
+| `sheets.<sheet>.helper_columns`
+| C usually, but at least 4 entries look D
+| For `characters`, `places` the list (`_places_name`,
+  `_regions_name`, `_regions_kind`) matches `helper_prefix: _` and
+  agrees with FK relation policy intent. For
+  `story_cast_crystals` / `story_cast_development` /
+  `story_cast_notes` / `story_cast_roles` / `story_groups` the list is
+  `[title]` -- a name that does *not* match `helper_prefix`. This shape
+  reads as a *reader-side observation* persisted as canonical intent,
+  i.e. it looks like derived operational view leaking through.
+
+| `split_by_discriminator.<frame>`
+| C
+| Source/target/discriminator/column_order policy. Registry confirms.
+
+| `workbook_view`
+| C
+| `drop_redundant_data`, `mode`, `sheet_mappings`, `sheets`,
+  `unknown_frame_policy`. All canonical view policy. Note: the
+  workbook-view readback symptom is downstream of *this* mapping being
+  consumed by a backend that expects a different shape. The mapping
+  itself looks like the intended canonical contract.
+
+| `xref_crosstable.<name>`
+| C with D and R facets
+| `column_key`, `row_keys`, `value`, `relation`, `matrix`, `operation`,
+  `drop_empty` are canonical.
+  `column_keys: [...]` (literal Tim, Galli, ..., Purga) is a *materialized
+  projection* of the `characters.name` column at one point in time. It
+  is registered as canonical, but its content is data-derived.
+  `dense_axes.columns_from`, `.rows_from` are canonical.
+  `dense_axes.resolved.{column_keys, row_identities}` is the same
+  literal materialization a second time. Resolving every story_id from
+  STORY-0001 to STORY-0041 as persisted policy hardens a snapshot into
+  a contract.
+|===
+
+Highlights:
+
+* The four `source: workbook` carrier-readback families are the largest
+  bytes-wise but the *least* problematic conceptually -- their semantics
+  are already documented as carrier-authoritative.
+* The smallest fields are the most architecturally telling:
+  `legend_blocks[*].resolved` and `xref_crosstable[*].dense_axes.resolved`
+  are unambiguous render/derivation state, but they sit under
+  registry entries classified as `canonical_meta` and they survive the
+  persistence boundary.
+* The `helper_columns: [title]` entries are the suspicious shape: same
+  registry key, two different production paths (user-authored vs.
+  reader-observed) with no envelope to tell them apart.
+
+== E) Repair options
+
+Six variants, ordered by invasiveness. None is recommended yet; each is
+described enough to evaluate independently.
+
+=== E1. Symptom-narrow XLSX read tolerance + integration test
+
+*Idea.* Make the XLSX read path accept the exact `workbook_view` shape
+the captured fixture produces (or fail with a clearer error), add a
+regression that loads the fixture into the XLSX path and asserts
+recovery. Leave everything else alone.
+
+*Scope.*
+
+* One change in `rendering/workbook_projection.py` or the XLSX read
+  side that normalizes the failing shape.
+* One new integration test under
+  `tests/integration/io_backends/xlsx/`.
+* No registry change, no persistence-boundary change, no new FTR.
+
+*Cost.* Hours.
+
+*What it fixes.* The reported symptom on the worldbuilding consumer.
+
+*What it does *not* fix.*
+
+* Cross-carrier roundtrip risk for any *other* field family.
+* Render-derived state in `legend_blocks[*].resolved` and
+  `xref_crosstable[*].dense_axes.resolved` continuing to flow into
+  sidecars.
+* The `helper_columns: [title]` mismatch.
+
+*Risk.* Tactical fix without a written rule -- the next consumer's bug
+of the same shape gets the same patch with no shared boundary.
+
+=== E2. Persistence-boundary expansion at known seams
+
+*Idea.* Extend `pipeline/persistence_boundary.py` with explicit pruning
+for the *specific* facets identified in (D) as render-derived or
+operational-view shapes. Strip them only at the persistence projection;
+keep them intact in runtime `_meta`.
+
+*Scope.*
+
+* `RUNTIME_ONLY_TOP_LEVEL_META_KEYS` stays. Add a new pruning helper for
+  known nested seams:
++
+[source,text]
+----
+legend_blocks[*].resolved                  -> strip
+xref_crosstable[*].dense_axes.resolved     -> strip
+xref_crosstable[*].column_keys             -> strip (redundant
+                                              materialization)
+sheets[*].helper_columns where every entry is not
+        canonical (no `helper_prefix` match, not declared by
+        configure_workbook_view) -> strip
+----
+* Existing v2-relation pruning stays; v1 residual `helper_policies.fk`
+  pruning is added if the inventory follow-up agrees.
+* New unit tests in `tests/unit/pipeline/test_persistence_boundary.py`
+  per seam.
+* No registry classification changes.
+* One sentence in the persistence_boundary docstring per seam.
+
+*Cost.* Low-to-medium. Each seam is local; the dataclass-shaped pruning
+fits the existing module style.
+
+*What it fixes.* The render-derived facets stop entering sidecars.
+A re-import of the sidecar therefore stops carrying state that should
+have been re-derived. The cross-carrier failure mode is reduced (not
+eliminated -- carrier-authoritative families still pass through).
+
+*What it does *not* fix.*
+
+* Workbooks/sidecars already in the wild keep their stale state until
+  someone re-saves through the new boundary.
+* The `source: workbook` envelope is intentionally left intact; the
+  cross-carrier failure for it (if any) needs a separate decision.
+* No read-side defence -- if a third-party tool hand-writes the
+  pruned shapes, they re-enter the runtime via the existing readers.
+
+*Risk.* Each added rule must cite the inventory (FTR-META-LIFECYCLE-INVENTORY-P5
+non-goal) or document why it does not need to.
+
+=== E3. Read-side sanitization on sidecar load
+
+*Idea.* Introduce a small *read-side* projection symmetric to the
+write-side persistence boundary. When a `_meta.yaml` sidecar is loaded,
+run the input through a "carrier-shape sanitization" that drops the
+same nested seams from E2 *before* sidecar meta becomes runtime meta.
+
+*Scope.*
+
+* New module or new function next to `pipeline/persistence_boundary.py`.
+* Hook into the JSON-directory backend's sidecar loader (and any other
+  loader that consumes `_meta.yaml`).
+* Tests that load the fixture and assert the stripped shape.
+* No write-side change.
+
+*Cost.* Low. Mostly mirrors the same set of rules.
+
+*What it fixes.* Existing in-the-wild sidecars become safe to consume
+without a re-save.
+
+*What it does *not* fix.* The producer is still writing the offending
+shapes today; without E2 (or equivalent), every fresh write puts them
+back in. Read-side alone is the "operator aid" path the bug ticket
+calls out as *not* the architectural fix.
+
+*Risk.* Duplicates rule lists with E2 if both ship. Bridges should
+share constants if both are chosen.
+
+=== E4. Schema-version gate per FTR-META-CONTRACT-VERSIONING-P4A
+
+*Idea.* Treat untagged sidecars (no `meta_contract.schema_version`) as
+pre-contract legacy and apply a *very conservative* read-side filter
+that keeps only an explicit safelist. Future writes always emit the
+current schema marker.
+
+*Scope.*
+
+* Implements the design direction already drafted in
+  `FTR-META-CONTRACT-VERSIONING-P4A`.
+* Adds `meta_contract.schema_version: 1` on write.
+* On read, untagged input is *discarded* down to a small safelist
+  (workbook view, validation policy, transformation policy, lifecycle
+  -- the things the bug ticket lists as canonical sidecar contract).
+* Big up-front documentation work; small code change.
+
+*Cost.* Medium. Mostly policy + acceptance criteria; the runtime
+behavior change is small.
+
+*What it fixes.* Hard cut: stale sidecars from any prior version stop
+poisoning anything because they are categorically downgraded.
+
+*What it does *not* fix.* Does not classify *new* writes any better;
+the same render-derived facets continue to be persisted unless E2 also
+ships.
+
+*Risk.* Worldbuilding-style consumers may have non-trivial sidecars
+they would lose silently. The deferred FTR explicitly chooses to accept
+that risk for pre-0.2.0; this option does not change that calculation.
+
+=== E5. Complete lifecycle inventory + dual-channel sidecar
+
+*Idea.* The maximal repair. Classify every observed `_meta` root and
+sub-root (the FTR-META-LIFECYCLE-INVENTORY-P5 scope), split persisted
+sidecar into one strict "user-intent" file and one "carrier-reconstruction"
+file, and enforce the boundary through registry-driven projection.
+
+*Scope.*
+
+* Full inventory (per FTR-META-LIFECYCLE-INVENTORY-P5 acceptance
+  criteria).
+* New file shape on disk.
+* Registry promotion from "manual review artifact" to "runtime
+  classification source".
+* Migration path for existing sidecars.
+
+*Cost.* High. Multi-FTR slice.
+
+*What it fixes.* Everything in (D) and most of (B) plus future
+extensions get a written home.
+
+*What it does *not* fix.* Time-to-market; the bug ticket's "minimal
+acceptable outcome" is much smaller than this.
+
+*Risk.* The project has so far explicitly *avoided* a metadata
+governance framework
+(`FTR-META-LIFECYCLE-INVENTORY-P5` non-goals,
+`FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` non-goals,
+`registries/meta_registry.yaml` `maintenance_contract.runtime_binding:
+forbidden`). E5 would reverse that direction.
+
+=== E6. Architecture-guard tightening only
+
+*Idea.* No production code change. Add architecture-guard tests that
+fail if a known render-derived facet survives the persistence boundary
+projection, or if a registry entry's classification disagrees with the
+boundary's pruning rules.
+
+*Scope.*
+
+* Add tests in
+  `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`
+  (or sibling) that:
++
+[source,text]
+----
+- load the captured fixture,
+- call project_meta_to_persistable_contract(),
+- assert: legend_blocks[*].resolved absent
+         xref_crosstable[*].dense_axes.resolved absent
+         xref_crosstable[*].column_keys absent
+         sheets[*].helper_columns contains no name that
+            (i) does not start with helper_prefix and
+            (ii) is not declared by configure_workbook_view
+----
+* These tests fail on `main` *today* -- which is the point: they
+  document the boundary as the next thing to fix without yet fixing it.
+
+*Cost.* Trivial.
+
+*What it fixes.* The boundary becomes *visible* in CI.
+
+*What it does *not* fix.* The actual bug. This option is a *bridge*: it
+captures the contract while the team chooses among E1--E5.
+
+*Risk.* If shipped alone, the failing guards become annoying noise.
+Pair with `pytest.mark.xfail` and a tracking issue if used.
+
+== F) Which variant is least invasive?
+
+Two readings of "least invasive" lead to two different answers:
+
+. *Smallest diff that closes the reported consumer symptom.* That is
+  E1. It is also the variant the bug ticket explicitly warns against:
+  "Do not patch worldbuilding with a local workaround as the final
+  solution" and "Do not treat cross-carrier tests alone as sufficient
+  if carrier-shaped state remains allowed in canonical sidecar meta."
+  E1 satisfies the symptom but not the bar set by the ticket.
+. *Smallest diff that closes the **class** of failures without taking
+  an architectural decision.* That is *E2 with the seams strictly
+  limited to (D)'s "obvious" entries (`legend_blocks[*].resolved`,
+  `xref_crosstable[*].dense_axes.resolved`,
+  `xref_crosstable[*].column_keys`), optionally paired with E6 as a
+  visibility step*.
+
+The seams in E2 share four properties that make them low-risk to
+prune:
+
+* They are *write-time* materializations of state that is fully
+  reconstructible by running the pipeline.
+* No runtime consumer *requires* them as input (the v2/v1
+  helper_policies dance documents this pattern for a different sub-key
+  family).
+* Their producers are named in the registry / code (the IR composer
+  for `legend_blocks[*].resolved`, the XRef expander for the
+  `dense_axes.resolved` and `column_keys` block).
+* The bug ticket's "candidate short-term containment" list literally
+  includes "Extend the existing persistence-boundary projection so
+  carrier-shaped keys cannot survive into `_meta.yaml`".
+
+The riskier seam in E2 -- the `helper_columns: [title]` shape -- should
+*not* be in the first slice. It overlaps with
+`FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` and
+`FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`. Pruning it would re-decide one
+of their open questions. Leave it for the inventory.
+
+A safe least-invasive combination, *not yet a recommendation*:
+
+* *E2 (narrow seam set)* + *E6 (guard)* + *one integration regression
+  using the captured fixture*.
+* No registry classification changes.
+* No new sidecar format.
+* No read-side projection.
+* No schema versioning.
+
+This combination preserves every open FTR's scope. It also makes the
+boundary visible without committing to which FTR ultimately owns the
+classification of the gray-area seams.
+
+== G) Does this need an FTR at all?
+
+There are three honest answers.
+
+=== G.1 No FTR -- pure containment
+
+If the chosen direction is E1 alone, no FTR is justified. A regression
+test plus a clear commit message is enough. This violates the bug
+ticket's own non-goals but is technically defensible if the team
+explicitly accepts the consumer-only fix as sufficient.
+
+=== G.2 Bug-document update -- no separate FTR
+
+If the chosen direction is E2-narrow + E6 with no registry impact, the
+work can live inside the existing
+`BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A` ticket without a separate FTR.
+Each pruning rule is small and locally documented. The "Candidate
+short-term containment" section of the bug already authorizes this.
+
+This is the smallest *legitimate* outcome that satisfies the bug
+ticket's `Acceptance` section.
+
+=== G.3 Small FTR -- yes, and tightly scoped
+
+If the work extends beyond pruning -- e.g.
+
+* the registry gains a new classification (carrier-shape vs.
+  carrier-authoritative within canonical_meta), or
+* a read-side projection is introduced, or
+* the `source: workbook` envelope's cross-carrier semantics are
+  defined, or
+* the new cross-carrier-roundtrip test class is given a stable home
+  in `tests/roundtrip/` --
+
+then yes, an FTR is the right vehicle. The bug document already names a
+candidate ID: `FTR-CANONICAL-META-BOUNDARY-P5`.
+
+=== Recommendation shape (not a recommendation)
+
+The cheapest defensible posture is *G.2*. The cleanest posture is *G.3*
+narrowly scoped. Pick G.3 *only if* the team is ready to write down the
+fifth classification (carrier-shape under canonical), because once that
+is written the inventory FTR's scope changes and that conversation is
+unavoidable. Pick G.2 *only if* the team is willing to accept that the
+seam will be re-opened by the next consumer with a different field
+family.
+
+== H) FTR scope (if H.3 is chosen)
+
+Working title: `FTR-CANONICAL-META-BOUNDARY-P5` (as named by the bug
+document).
+
+[NOTE]
+====
+The scope sketch below is *not* an architectural decision. It is a
+hand-off boundary for whoever owns the next step -- if any -- so they
+do not silently re-decide what is in scope.
+====
+
+=== In scope
+
+. *Write a one-page classification rule* for what may appear in
+  persisted `_meta.yaml` after the persistence boundary runs. Three
+  buckets:
+  ** Backend-neutral user/policy intent (survives carrier changes).
+  ** Carrier-authoritative readback of presentation state (the
+     `source: workbook` envelope -- *kept* by policy, but its presence
+     must be explicit, not implicit).
+  ** Forbidden in sidecar: render-time materializations
+     (`*.resolved`), data-derived materializations (literal
+     `column_keys`, `row_identities`), reader-side observations that
+     duplicate runtime-derived shapes.
+. *Extend `pipeline/persistence_boundary.py`* with the narrow seam
+  pruning described in E2 (initial set: `legend_blocks[*].resolved`,
+  `xref_crosstable[*].dense_axes.resolved`,
+  `xref_crosstable[*].column_keys`). Each rule cites a registry entry
+  and a single-sentence reason inline.
+. *Add an architecture guard* under
+  `tests/architecture/semantic_invariants/` that loads the captured
+  fixture, projects it through the persistence boundary, and asserts the
+  three pruning rules. Add at least one positive test that
+  user-authored canonical entries survive the projection unchanged.
+. *Introduce the cross-carrier meta roundtrip test class* under
+  `tests/roundtrip/` with a single first test:
++
+[source,text]
+----
+ODS export -> sidecar persisted ->
+XLSX export -> XLSX reimport must succeed
+----
++
+  This is the test class the bug ticket explicitly names as new.
+. *Update `registries/meta_registry.yaml`* with `notes:` lines under
+  the four affected entries -- not new classifications -- naming the
+  pruned facet and the responsible producer. This avoids reopening
+  FTR-META-LIFECYCLE-INVENTORY-P5's scope while still making the
+  boundary auditable.
+. *Update `docs/ai_info/architecture_primer.adoc`* with one paragraph
+  describing the persistence-boundary rule additions, cross-referenced
+  from `docs/semantic_model/13_semantic_guards.adoc`.
+
+=== Out of scope (explicit)
+
+. No new registry classification. Promoting "carrier-shape under
+  canonical" to a fifth allowed_classifications value is owned by
+  FTR-META-LIFECYCLE-INVENTORY-P5.
+. No `meta_contract.schema_version` introduction. That is owned by
+  FTR-META-CONTRACT-VERSIONING-P4A and is a separate axis.
+. No backend-specific sidecar mode. The persistence boundary stays
+  carrier-neutral.
+. No removal or renaming of `_meta.yaml` support. The bug document
+  forbids it.
+. No redesign of `helper_policies` shape, no removal of v1 residual
+  writes. Those are owned by FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.
+. No promotion of the registry from "manual review artifact" to
+  "runtime contract". `meta_registry.yaml`'s `maintenance_contract`
+  block already forbids that and FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A
+  reaffirms it.
+. No work on `sheets[*].helper_columns: [title]` gray-area entries.
+  Those overlap with FK-helper policy lifecycle and should be decided
+  in that FTR's frame.
+. No schema framework, no generic projection DSL. The persistence
+  boundary is a Python module with literal seam rules.
+
+=== Open questions (to be decided *inside* the FTR's design slice, not
+here)
+
+. Should the persistence boundary also strip `frame_lifecycle[*].produced_by`
+  and `frame_lifecycle[*].derived_from`? These are documented as
+  canonical but read like build-time provenance. *Decision needed
+  before implementation*; defaulting to "keep" preserves consumer
+  shape today.
+. Should the `source: workbook` envelope grow an explicit
+  cross-carrier contract (e.g. "values with `source: workbook` are
+  carrier-A canonical and are reapplied verbatim by carrier-B")? If
+  yes, this FTR may need a documentation slice; if no, a follow-up
+  bug is the right home if cross-carrier divergence emerges.
+. Should the cross-carrier test class be marked `@pytest.mark.ftr`
+  with this FTR's name, or live under a separate
+  `cross_carrier_roundtrip` carrier root? The carrier-boundary guard
+  `tests/architecture/carrier_boundary/test_carrier_boundary_guards.py`
+  pins active carrier roots; introducing a new one needs that
+  guard's vocabulary update first.
+. Should the persistence boundary become symmetric (read-side
+  sanitization, option E3)? Recommend *deferring* to a follow-up bug
+  if and only if an in-the-wild sidecar surfaces a different facet
+  set.
+
+=== Acceptance shape (if the FTR is chosen)
+
+* Persistence boundary strips the three named facets and is covered by
+  unit tests for each.
+* Architecture guard exists, loads the captured fixture, asserts the
+  pruning, and asserts unchanged-shape for user-authored canonical
+  entries.
+* One cross-carrier integration regression exists using the captured
+  fixture.
+* Registry notes name the producer for each pruned facet.
+* No registry classification was added, removed, or renamed.
+* No other FTR's stated scope was silently re-decided.
+* The bug document is closed by reference to this FTR.
+
+== Cross-references
+
+* `docs/backlog/BUG-CROSS-CARRIER-META-ROUNDTRIP.adoc`
+* `docs/backlog/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP/ods_produced_meta.yaml`
+* `docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc`
+* `docs/backlog/FTR-META-CONTRACT-VERSIONING-P4A.adoc`
+* `docs/backlog/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.adoc`
+* `docs/backlog/FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5.adoc`
+* `docs/backlog/BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A.adoc`
+* `docs/ai_info/architecture_primer.adoc`
+  (§ meta_canonical vs meta_rendering)
+* `docs/semantic_model/13_semantic_guards.adoc`
+* `registries/meta_registry.yaml`
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py`
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py`
+  (`_resolve_legend_position`, line 246)
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py`
+  (`_extract_*` writers producing `source: workbook`)
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py`
+  (same shape on ODS side)
+* `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`
