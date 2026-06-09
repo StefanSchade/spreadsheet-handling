@@ -364,35 +364,35 @@ def _load_ods_produced_meta_fixture() -> dict:
 
 
 @pytest.mark.ftr("BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A")
-def test_ods_produced_sidecar_meta_does_not_break_xlsx_roundtrip(
+def test_reduced_ods_produced_sidecar_meta_survives_xlsx_carrier_smoke(
     tmp_path: Path,
 ) -> None:
-    """The captured ODS-produced ``_meta.yaml`` previously poisoned XLSX
-    readback with ``_meta.workbook_view must be a mapping for workbook
-    view readback``. With the persistence-boundary Resolution-facet pruning
-    in place (Intent-vs-Resolution slice), the same fixture must survive
-    an XLSX export and reimport cycle: ``workbook_view`` must come back as
-    a mapping and the three pruned Resolution facets must remain absent.
+    """Reduced XLSX carrier smoke test using the captured ODS-produced
+    ``_meta.yaml`` after persistence-boundary projection.
 
-    The fixture's ``workbook_view`` references the worldbuilding consumer's
-    twelve frames; this regression substitutes a single-frame
-    ``workbook_view`` so the XLSX writer has something to write while the
-    Intent-vs-Resolution facets (``legend_blocks``, ``xref_crosstable``,
-    ``sheets[*].column_widths`` with ``source: workbook`` provenance,
-    ``frame_lifecycle``, etc.) all flow through the carrier intact.
+    The captured sidecar references the worldbuilding consumer's twelve
+    frames in ``workbook_view``, ``legend_blocks``, ``xref_crosstable`` and
+    ``constraints``. A core-only test does not stand up that frame set; this
+    regression therefore *reduces* the fixture to the subset that the XLSX
+    writer can render against a single ``items`` frame and asserts only the
+    one fact a reduced test can prove: the post-projection meta survives an
+    XLSX export and reimport with ``workbook_view`` recovered as a mapping
+    -- the original failure mode.
+
+    Pruning of ``legend_blocks[*].resolved``,
+    ``xref_crosstable[*].dense_axes.resolved`` and
+    ``xref_crosstable[*].column_keys`` is covered by the unit and
+    architecture suites against the full fixture. The end-to-end
+    cross-carrier failure class is covered by the worldbuilding fixture
+    simulation documented in the bug ticket's review.
     """
     fixture = _load_ods_produced_meta_fixture()
     persistable_meta = project_meta_to_persistable_contract(fixture)
 
-    # Replace the fixture's frame-referencing sections with minimal forms
-    # so the writer's render plan has the frames it references. The
-    # remaining persistable meta -- frame_lifecycle, cell_codecs,
-    # compact_multiaxis, split_by_discriminator, helper_policies,
-    # sheets[*].column_widths with source: workbook provenance, etc. --
-    # still flows through the XLSX carrier and exercises the cross-carrier
-    # path. The Resolution-facet pruning is exercised here as a positive
-    # post-condition; the per-rule pruning itself is covered in the unit
-    # and architecture suites.
+    # Reduce the fixture to what the single-frame XLSX writer can render.
+    # The roots dropped here reference worldbuilding-only frames; the
+    # remaining content (``helper_policies``, ``helper_prefix``,
+    # ``auto_filter``, ``freeze_header``) still flows through the carrier.
     persistable_meta = dict(persistable_meta)
     persistable_meta["workbook_view"] = {
         "mode": "editable",
@@ -401,24 +401,24 @@ def test_ods_produced_sidecar_meta_does_not_break_xlsx_roundtrip(
         "sheets": [{"frame": "items", "sheet": "items", "order": 0}],
         "sheet_mappings": [{"frame": "items", "sheet": "items"}],
     }
-    # Drop content that targets worldbuilding-specific frames; this slice's
-    # test does not stand up the full twelve-frame world. The persistence
-    # boundary's pruning of these structures is verified elsewhere.
-    persistable_meta.pop("legend_blocks", None)
-    persistable_meta.pop("xref_crosstable", None)
-    persistable_meta.pop("constraints", None)
-    persistable_meta.pop("cell_codecs", None)
-    persistable_meta.pop("compact_multiaxis", None)
-    persistable_meta.pop("split_by_discriminator", None)
-    persistable_meta.pop("sheets", None)
-    persistable_meta.pop("frame_lifecycle", None)
+    for worldbuilding_root in (
+        "legend_blocks",
+        "xref_crosstable",
+        "constraints",
+        "cell_codecs",
+        "compact_multiaxis",
+        "split_by_discriminator",
+        "sheets",
+        "frame_lifecycle",
+    ):
+        persistable_meta.pop(worldbuilding_root, None)
 
     frames = {
         "items": pd.DataFrame({"id": ["a", "b"], "label": ["one", "two"]}),
         "_meta": persistable_meta,
     }
 
-    out_path = tmp_path / "cross_carrier.xlsx"
+    out_path = tmp_path / "reduced_cross_carrier.xlsx"
     save_xlsx(frames, str(out_path))
 
     read_back = load_xlsx(str(out_path))
@@ -428,24 +428,6 @@ def test_ods_produced_sidecar_meta_does_not_break_xlsx_roundtrip(
     view = meta.get("workbook_view")
     assert isinstance(view, dict), (
         "_meta.workbook_view must remain a mapping after XLSX export and "
-        f"reimport of the ODS-produced sidecar; got type={type(view).__name__}, "
-        f"meta keys={sorted(meta)}"
+        f"reimport of the reduced ODS-produced sidecar; got "
+        f"type={type(view).__name__}, meta keys={sorted(meta)}"
     )
-
-    # The three pruned Resolution facets must not reappear via the carrier.
-    for name, block in meta.get("legend_blocks", {}).items():
-        assert "resolved" not in block, (
-            f"legend_blocks[{name!r}].resolved leaked back through the "
-            "XLSX carrier; persistence boundary should have pruned it"
-        )
-    for name, entry in meta.get("xref_crosstable", {}).items():
-        assert "column_keys" not in entry, (
-            f"xref_crosstable[{name!r}].column_keys leaked back through "
-            "the XLSX carrier"
-        )
-        dense_axes = entry.get("dense_axes")
-        if isinstance(dense_axes, dict):
-            assert "resolved" not in dense_axes, (
-                f"xref_crosstable[{name!r}].dense_axes.resolved leaked back "
-                "through the XLSX carrier"
-            )
