@@ -30,6 +30,8 @@ from odf.table import (
 )
 from odf.text import P
 
+from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
+from spreadsheet_handling.core.formulas import LookupFormulaSpec
 from spreadsheet_handling.rendering.plan import (
     AddValidation,
     ApplyColumnStyle,
@@ -59,8 +61,6 @@ _ODS_VERTICAL_ALIGNMENT_WRITE_MAP: dict[str, str] = {
 }
 
 _EXCEL_CHAR_TO_CM = 0.254
-from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
-from spreadsheet_handling.core.formulas import LookupFormulaSpec
 
 
 @dataclass

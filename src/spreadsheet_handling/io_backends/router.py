@@ -7,6 +7,7 @@ import pandas as pd
 
 from .base import BackendBase
 from .csv_backend import CSVBackend, load_csv_dir, save_csv_dir
+from .discard_backend import save_discard
 from .json_backend import JSONBackend, read_json_dir, write_json_dir
 from .xml_backend import XMLBackend, read_xml_dir, write_xml_dir
 from .yaml_backend import load_yaml_dir, save_yaml_dir
@@ -46,6 +47,7 @@ LOADERS: Dict[str, Callable[..., Frames]] = {
 
 SAVERS: Dict[str, Callable[..., None]] = {
     "csv_dir": save_csv_dir,
+    "discard": save_discard,
     "ods": _lazy_callable("spreadsheet_handling.io_backends.ods.ods_backend", "save_ods"),
     "calc": _lazy_callable("spreadsheet_handling.io_backends.ods.ods_backend", "save_ods"),
     "xlsx": _lazy_callable("spreadsheet_handling.io_backends.xlsx.xlsx_backend", "save_xlsx"),
