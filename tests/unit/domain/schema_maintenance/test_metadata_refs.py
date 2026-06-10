@@ -8,16 +8,18 @@ import pytest
 from spreadsheet_handling.domain.schema_maintenance import (
     ReferenceAction,
     ReferenceRoot,
+    ReorderSpec,
     SchemaMaintenanceRequest,
     SchemaOperationKind,
     drop_column,
     rename_column,
+    reorder_columns,
 )
 
 pytestmark = pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS")
 
 
-def _base_frames(meta: dict | None = None) -> dict[str, object]:
+def _base_frames(meta: object | None = None) -> dict[str, object]:
     frames: dict[str, object] = {
         "characters": pd.DataFrame(
             {
@@ -303,6 +305,59 @@ def test_fk_target_key_and_target_field_rename_updates_only_when_target_frame_ma
     ]
 
 
+def test_fk_source_column_rename_updates_dotted_column_when_source_frame_matches() -> None:
+    meta = _fk_meta()
+    relation = meta["helper_policies"]["fk"]["relations"][0]
+    relation["source_column"] = "persona.crystal"
+    frames = _base_frames(meta)
+    frames["characters"]["persona.crystal"] = ["quartz", "amber"]
+
+    result = rename_column(
+        frames,
+        _rename(source="persona.crystal", target="persona.focus_object"),
+    )
+
+    assert not result.report.blocked
+    relation = result.frames["_meta"]["helper_policies"]["fk"]["relations"][0]
+    assert relation["source_column"] == "persona.focus_object"
+    assert result.report.metadata_changes[0].path.endswith(".source_column")
+
+
+def test_fk_target_field_rename_updates_dotted_column_when_target_frame_matches() -> None:
+    meta = _fk_meta()
+    relation = meta["helper_policies"]["fk"]["relations"][0]
+    relation["helper_columns"][0]["target_field"] = "profile.title"
+    frames = _base_frames(meta)
+    frames["places"]["profile.title"] = ["Port", "Archive"]
+
+    result = rename_column(
+        frames,
+        _rename(frame="places", source="profile.title", target="profile.display_title"),
+    )
+
+    assert not result.report.blocked
+    relation = result.frames["_meta"]["helper_policies"]["fk"]["relations"][0]
+    assert relation["helper_columns"][0]["target_field"] == "profile.display_title"
+    assert result.report.metadata_changes[0].path.endswith(".helper_columns[0].target_field")
+
+
+def test_fk_drop_blocks_dotted_source_column_reference() -> None:
+    meta = _fk_meta()
+    relation = meta["helper_policies"]["fk"]["relations"][0]
+    relation["source_column"] = "persona.crystal"
+    frames = _base_frames(meta)
+    frames["characters"]["persona.crystal"] = ["quartz", "amber"]
+
+    result = drop_column(
+        frames,
+        _drop(source="persona.crystal", prune=True),
+    )
+
+    assert result.report.blocked
+    assert result.report.metadata_changes[0].action is ReferenceAction.BLOCKED
+    assert result.report.failures[0].code == "blocking_metadata_reference"
+
+
 def test_fk_drop_blocks_even_when_prune_is_requested() -> None:
     frames = _base_frames(_fk_meta())
 
@@ -369,6 +424,93 @@ def test_derived_is_reported_ignored_but_not_rewritten() -> None:
     assert result.frames["_meta"] is frames["_meta"]
     assert result.report.metadata_changes[0].root is ReferenceRoot.DERIVED
     assert result.report.metadata_changes[0].action is ReferenceAction.IGNORED_DERIVED
+
+
+def test_meta_absent_operation_succeeds_without_metadata_changes() -> None:
+    frames = _base_frames()
+
+    result = rename_column(frames, _rename())
+
+    assert not result.report.blocked
+    assert "_meta" not in result.frames
+    assert result.report.metadata_changes == ()
+
+
+def test_reorder_with_metadata_does_not_rewrite_or_block_metadata() -> None:
+    meta = {
+        "constraints": [
+            {"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}
+        ],
+        "sheets": {
+            "characters": {
+                "helper_columns": ["home_place_id"],
+                "protection": {"editable_columns": ["name", "notes"]},
+            }
+        },
+        "helper_policies": {
+            "fk": {
+                "schema_version": 2,
+                "relations": [
+                    {
+                        "source_frame": "characters",
+                        "source_column": "home_place_id",
+                        "target_frame": "places",
+                        "target_key": "id",
+                    }
+                ],
+            }
+        },
+        "derived": {"sheets": {"characters": {"helper_columns": ["runtime_only"]}}},
+    }
+    frames = _base_frames(meta)
+
+    result = reorder_columns(
+        frames,
+        SchemaMaintenanceRequest(
+            kind=SchemaOperationKind.REORDER_COLUMNS,
+            target_frame="characters",
+            reorder=ReorderSpec(
+                mode="complete",
+                columns=("notes", "home_place_id", "name", "id"),
+            ),
+        ),
+    )
+
+    assert not result.report.blocked
+    assert result.frames["characters"].columns.tolist() == ["notes", "home_place_id", "name", "id"]
+    assert result.frames["_meta"] is frames["_meta"]
+    assert [change.action for change in result.report.metadata_changes] == [
+        ReferenceAction.IGNORED_DERIVED
+    ]
+
+
+@pytest.mark.parametrize(
+    ("meta", "expected_path"),
+    [
+        ("not-a-mapping", "_meta"),
+        ({"constraints": "not-a-list"}, "constraints"),
+        ({"constraints": ["not-a-mapping"]}, "constraints[0]"),
+        ({"sheets": "not-a-mapping"}, "sheets"),
+        ({"sheets": {"characters": "not-a-mapping"}}, "sheets.characters"),
+        (
+            {"helper_policies": {"fk": {"relations": "not-a-list"}}},
+            "helper_policies.fk.relations",
+        ),
+        ({"workbook_view": "not-a-mapping"}, "workbook_view"),
+        ({"workbook_view": {"sheet_mappings": "not-a-list"}}, "workbook_view.sheet_mappings"),
+        ({"workbook_view": {"sheets": "not-a-list"}}, "workbook_view.sheets"),
+    ],
+)
+def test_malformed_meta_shapes_block_safely(meta: object, expected_path: str) -> None:
+    frames = _base_frames(meta)
+    original_columns = frames["characters"].columns.tolist()
+
+    result = rename_column(frames, _rename())
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "malformed_meta"
+    assert result.report.failures[0].meta_path == expected_path
+    assert result.frames["characters"].columns.tolist() == original_columns
 
 
 def test_unknown_non_structured_metadata_root_is_not_heuristically_scanned_or_rewritten() -> None:

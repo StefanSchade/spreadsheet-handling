@@ -504,6 +504,15 @@ def _handle_workbook_view(meta: dict[str, Any], failures: list[SchemaMaintenance
                 meta_path="workbook_view.sheet_mappings",
             )
         )
+    sheets = value.get("sheets")
+    if sheets is not None and not _is_sequence(sheets):
+        failures.append(
+            SchemaMaintenanceFailure(
+                code="malformed_meta",
+                message="_meta.workbook_view.sheets must be a list",
+                meta_path="workbook_view.sheets",
+            )
+        )
 
 
 def _handle_blocked_roots(

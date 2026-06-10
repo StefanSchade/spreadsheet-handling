@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 from pathlib import Path
@@ -38,3 +39,29 @@ def test_cli_uses_bound_step_directly_without_config_builder() -> None:
     assert "BoundStep(" in source
     assert "build_steps_from_config" not in source
     assert "build_steps_from_yaml" not in source
+
+
+def test_domain_schema_maintenance_does_not_import_forbidden_layers() -> None:
+    package_root = Path("src/spreadsheet_handling/domain/schema_maintenance")
+    forbidden = (
+        "spreadsheet_handling.io_backends",
+        "spreadsheet_handling.cli",
+        "spreadsheet_handling.pipeline.registry",
+        "spreadsheet_handling.pipeline.build",
+        "spreadsheet_handling.pipeline.types",
+    )
+    violations: list[str] = []
+
+    for path in sorted(package_root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            imported: list[str] = []
+            if isinstance(node, ast.Import):
+                imported = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported = [node.module]
+            for name in imported:
+                if any(name == blocked or name.startswith(f"{blocked}.") for blocked in forbidden):
+                    violations.append(f"{path}:{node.lineno}: {name}")
+
+    assert violations == []

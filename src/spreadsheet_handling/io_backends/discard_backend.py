@@ -11,6 +11,7 @@ Frames = Mapping[str, Any]
 def save_discard(
     frames: Frames,
     path: str,
+    *,
     options: Mapping[str, Any] | BackendOptions | None = None,
 ) -> None:
     """Accept a frame payload and intentionally write no output artifact."""

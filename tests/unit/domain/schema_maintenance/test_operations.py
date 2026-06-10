@@ -133,6 +133,40 @@ def test_add_column_fails_on_unknown_placement_mode() -> None:
     pd.testing.assert_frame_equal(result.frames["characters"], frames["characters"])
 
 
+@pytest.mark.parametrize("mode", ["before", "after"])
+def test_add_column_before_after_fails_without_placement_column(mode: str) -> None:
+    frames = _frames()
+    result = add_column(
+        frames,
+        _request(
+            SchemaOperationKind.ADD_COLUMN,
+            target_column="role",
+            placement=ColumnPlacement(mode=mode),
+        ),
+    )
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "missing_placement_column"
+    pd.testing.assert_frame_equal(result.frames["characters"], frames["characters"])
+
+
+@pytest.mark.parametrize("mode", ["before", "after"])
+def test_add_column_before_after_fails_with_unknown_placement_column(mode: str) -> None:
+    frames = _frames()
+    result = add_column(
+        frames,
+        _request(
+            SchemaOperationKind.ADD_COLUMN,
+            target_column="role",
+            placement=ColumnPlacement(mode=mode, column="missing"),
+        ),
+    )
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "placement_column_missing"
+    pd.testing.assert_frame_equal(result.frames["characters"], frames["characters"])
+
+
 def test_drop_column_removes_existing_column() -> None:
     result = drop_column(
         _frames(),
@@ -200,6 +234,35 @@ def test_rename_column_fails_if_target_column_exists() -> None:
     assert result.report.blocked
     assert result.report.failures[0].code == "target_column_exists"
     pd.testing.assert_frame_equal(result.frames["characters"], frames["characters"])
+
+
+def test_rename_worldbuilding_dotted_column() -> None:
+    frames = {
+        "characters": pd.DataFrame(
+            {
+                "id": ["c1", "c2"],
+                "persona.crystal": ["quartz", "amber"],
+                "notes": ["first", "second"],
+            }
+        )
+    }
+
+    result = rename_column(
+        frames,
+        _request(
+            SchemaOperationKind.RENAME_COLUMN,
+            source_column="persona.crystal",
+            target_column="persona.focus_object",
+        ),
+    )
+
+    assert not result.report.blocked
+    assert list(result.frames["characters"].columns) == [
+        "id",
+        "persona.focus_object",
+        "notes",
+    ]
+    assert result.frames["characters"]["persona.focus_object"].tolist() == ["quartz", "amber"]
 
 
 def test_reorder_complete_success() -> None:
@@ -342,6 +405,42 @@ def test_named_operation_fails_on_request_kind_mismatch() -> None:
             target_column="role",
         ),
     )
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "operation_kind_mismatch"
+    pd.testing.assert_frame_equal(result.frames["characters"], frames["characters"])
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "schema_request"),
+    [
+        (
+            drop_column,
+            _request(
+                SchemaOperationKind.ADD_COLUMN,
+                target_column="role",
+            ),
+        ),
+        (
+            rename_column,
+            _request(
+                SchemaOperationKind.DROP_COLUMN,
+                source_column="name",
+                target_column="display_name",
+            ),
+        ),
+        (
+            reorder_columns,
+            _request(
+                SchemaOperationKind.ADD_COLUMN,
+                reorder=ReorderSpec(mode="listed_first", columns=("name",)),
+            ),
+        ),
+    ],
+)
+def test_named_operations_fail_on_request_kind_mismatch(wrapper, schema_request) -> None:
+    frames = _frames()
+    result = wrapper(frames, schema_request)
 
     assert result.report.blocked
     assert result.report.failures[0].code == "operation_kind_mismatch"
