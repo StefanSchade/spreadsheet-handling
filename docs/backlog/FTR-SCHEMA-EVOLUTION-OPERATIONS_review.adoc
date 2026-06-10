@@ -1,0 +1,583 @@
+===== FTR-SCHEMA-EVOLUTION-OPERATIONS -- Implementation review (Slices 1-4)
+
+*Status:* Review
+
+*Type:* Read-only implementation review prior to Slice 5 (docs / release
+checkpoint).
+
+*Scope:* Architecture, FTR-compliance, safety, public-surface, and test review
+of the implementation commits in the range
+`c447c98..d453e9e` on `core` (`d453e9e (HEAD)`).  No runtime code, tests,
+registries, backlog items, or release notes were modified by this review.
+
+==== Inputs reviewed
+
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS.adoc`
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS-ASSESSMENT.adoc`
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS_preflight.adoc`
+* `src/spreadsheet_handling/domain/schema_maintenance/{__init__,model,columns,operations,meta_refs,meta_update}.py`
+* `src/spreadsheet_handling/io_backends/discard_backend.py`
+* `src/spreadsheet_handling/io_backends/router.py`
+* `src/spreadsheet_handling/cli/apps/schema_maintain.py`
+* `src/spreadsheet_handling/application/orchestrator.py`
+* `src/spreadsheet_handling/pipeline/{types,registry,build}.py`
+* `registries/pipeline_step_registry.json`
+* `pyproject.toml`
+* `tests/unit/domain/schema_maintenance/{test_operations,test_metadata_refs}.py`
+* `tests/unit/io_backends/test_discard_backend.py`
+* `tests/integration/pipeline/test_orchestrator_discard_output.py`
+* `tests/unit/cli/test_schema_maintain_cli.py`
+* `tests/integration/schema_maintenance/test_json_dir_workflow.py`
+* `tests/architecture/test_schema_maintenance_private_step.py`
+* `docs/release_notes/release_notes.adoc`
+* `docs/ai_info/interfaces_and_gates.adoc`
+* `docs/ai_info/review_instructions.adoc`
+
+==== Verdict
+
+*Yellow.*
+
+The domain + orchestrator + CLI + discard arc satisfies the binding
+architecture rules of the FTR and preflight: domain code is carrier-neutral,
+the report stays outside `Frames`/`_meta`, the private step is sealed against
+the public step registry and YAML config surface, dry-run discards via an
+output-only saver, and blocking failures raise before `_save_frames` is
+reached.
+
+The implementation is *not* yet ready for the Slice 5 docs/release checkpoint:
+the release notes for `0.(X+1) -- planned` do not yet mention the new
+`sheets-schema-maintain` CLI or the new `discard` saver kind, the
+`interfaces_and_gates.adoc` consumer-facing surface list still references only
+`sheets-run` plus the two example shortcut commands, and no user/developer
+documentation describes the new CLI.  A small number of guard tests planned in
+the preflight are also missing (in particular the import-direction guard for
+`domain/schema_maintenance`, and structural tests for malformed `_meta` and
+absent `_meta`).  These are pre-Slice-5 items, not Slice-1-4 redesign items.
+
+==== Review questions
+
+===== 1. Carrier-neutral domain semantics
+
+Pass.
+
+* `domain/schema_maintenance/{model,columns,meta_refs,meta_update,operations}.py`
+  do not import any backend, CLI, pipeline registry, or orchestrator module.
+* `Frames` in `model.py` is a generic `dict[str, Any]` alias; the operation
+  functions take and return that mapping and have no file/directory I/O.
+* No branch tests on `json_dir`, `xlsx`, `ods`, `yaml_dir`, or any other
+  carrier kind in the domain package.
+* `columns.add_column`/`drop_column`/`rename_column`/`reorder_columns` only
+  manipulate the in-memory `pd.DataFrame` for the target frame and return a
+  fresh `Frames` view via `_copy_frames`.
+* Frame results from `columns.*` are then handed to `meta_update.apply_metadata_rules`,
+  which only inspects mapping/list structures under `_meta`.
+
+Watchpoint (non-blocking): the import-direction guard
+`test_domain_schema_maintenance_does_not_import_io_cli_or_pipeline_registry`
+called out in the preflight is not yet present; carrier neutrality is
+currently a code-review invariant rather than a guarded invariant.  See
+missing test M1.
+
+===== 2. Report boundary
+
+Pass.
+
+* `SchemaMaintenanceResult(frames, report)` is the only public return type and
+  is enforced through `SchemaMaintenanceResult` in `model.py`.
+* `SchemaMaintenanceReport` is a frozen dataclass; it is never inserted into
+  the `Frames` mapping (`test_report_is_not_added_as_frame_or_stored_under_meta`,
+  `test_report_is_still_not_added_as_frame_or_under_meta`).
+* The CLI captures the report via a local `collector: list[SchemaMaintenanceReport]`
+  in `_build_private_step`, and emits the JSON outside `Frames`/`_meta` via
+  `_emit_report` (stdout or `--report` path).
+* The persistence boundary
+  (`project_meta_to_persistable_contract`) is unchanged and there is no
+  schema-maintenance report payload routed into `_meta`.
+
+===== 3. Private BoundStep seal
+
+Pass.
+
+* `pipeline/registry.py::REGISTRY` does not contain `_schema_maintenance_private`
+  or any of the four operation names; guarded by
+  `test_private_schema_maintenance_step_is_not_in_pipeline_registry`.
+* `registries/pipeline_step_registry.json` contains no entry whose `name` or
+  `runtime_name` is `_schema_maintenance_private`; guarded by
+  `test_private_schema_maintenance_step_is_not_in_descriptive_registry`.
+* `build_steps_from_config([{ "step": "_schema_maintenance_private" }])` raises
+  `KeyError`; guarded by
+  `test_private_schema_maintenance_step_is_not_buildable_from_yaml_config`.
+* The CLI module builds the step via `BoundStep(...)` directly and does not
+  reference `build_steps_from_config` or `build_steps_from_yaml`; guarded by
+  source inspection in
+  `test_cli_uses_bound_step_directly_without_config_builder`.
+
+Watchpoint (non-blocking): `resolve_registration` still accepts a `mod:fn`
+dotted-path form, so a user who happens to know the internal callable could in
+principle reference `spreadsheet_handling.cli.apps.schema_maintain:_build_private_step`
+from a YAML pipeline.  That callable is not a `StepFactory` (it returns a
+`BoundStep` only after being given a private `request` and `collector`), so
+binding would fail with a `TypeError` rather than producing a usable step --
+i.e. the seal holds in practice, but the surface guard is by-shape rather than
+by-name.  No action required for this slice; flag if a later FTR exposes a
+factory under the schema-maintenance module.
+
+===== 4. CLI delegation to orchestrate
+
+Pass.
+
+* `schema_maintain.main` always calls `orchestrate(input=..., output=..., steps=[step])`;
+  loaders and savers are reached only via the orchestrator's existing
+  `_load_frames`/`_save_frames`.
+* Dry-run sets output to `{"kind": "discard", "path": "__discard__"}`
+  (`_output_from_args`), exercised by
+  `test_cli_builds_private_bound_step_and_calls_orchestrate` and
+  `test_json_dir_dry_run_writes_no_output_artifact`.
+* Write mode requires `--out-kind` and `--out-path`; absent values raise
+  `SystemExit("Write mode requires ...")`
+  (`test_write_mode_requires_output_path`,
+   `test_write_mode_uses_user_output_and_not_discard`).
+* Blocking failures are turned into `SchemaMaintenanceBlocked` inside the
+  private step's `run`, which raises before the function returns frames to the
+  orchestrator.  `orchestrate` therefore never reaches `_save_frames`, the
+  CLI catches the exception, emits the report, and exits with code 1
+  (`test_blocked_operation_still_emits_report`,
+   `test_blocked_json_dir_write_emits_report_and_writes_no_output`).
+
+===== 5. Discard scope
+
+Pass.
+
+* `discard_backend.save_discard(frames, path, options=...)` is output-only and
+  performs no I/O (`tests/unit/io_backends/test_discard_backend.py`).
+* `router.SAVERS["discard"] = save_discard`; `LOADERS` has no `discard` entry,
+  and `get_loader("discard")` raises
+  `ValueError("Unknown loader kind: discard")` per the same test file.
+* No `null` alias.  No registry change for `discard`.  Not used as a generic
+  dry-run framework; the FTR-specific dry-run path is implemented in the CLI
+  by selecting the discard saver, not by adding a global dry-run mode to
+  `orchestrate`.
+
+Watchpoint (non-blocking): `save_discard` accepts `options` as a positional
+parameter, whereas peer savers such as `write_json_dir` declare `options`
+keyword-only (`*,`).  Orchestrator always passes it as a keyword, so this is
+purely a signature-consistency nit; align it with the other savers when the
+discard backend is next touched.
+
+===== 6. Metadata handling conservatism
+
+Pass with notes.
+
+What is recognized and updated/pruned:
+
+* `_meta.constraints[*].column` -- updated on rename, blocked on drop (unless
+  `--prune`), pruned on drop with `--prune`, with sheet resolution via direct
+  match and `_meta.workbook_view.{sheets,sheet_mappings}` (single-frame
+  resolutions only).
+* `_meta.sheets.<sheet>.helper_columns` and
+  `_meta.sheets.<sheet>.protection.editable_columns` lists -- updated/pruned
+  symmetrically when the sheet resolves unambiguously to the target frame.
+* `_meta.helper_policies.fk.relations[*]` v2 shape -- `source_column`,
+  `target_key`, and `helper_columns[*].target_field` updated only when the
+  matching `source_frame`/`target_frame` equals the operation's target frame;
+  drops touching a relation are always blocked regardless of `--prune`.
+* `_meta.workbook_view.{sheets,sheet_mappings}` -- used only for frame
+  resolution; reported as unaffected for column ops; malformed shapes
+  reported as `malformed_meta`.
+* `_meta.frame_lifecycle` -- validated as a mapping; otherwise unaffected.
+
+Detected-but-blocked roots (any structured `frame`+`column`/`column-list`
+reference under the root that targets the affected `target_frame` +
+`affected_column`):
+
+* `_meta.cell_codecs`, `_meta.compact_multiaxis`, `_meta.legend_blocks`,
+  `_meta.sparse_defaults`, `_meta.split_by_discriminator`,
+  `_meta.xref_crosstable`.
+* Residual v1 keys under `_meta.helper_policies.fk` (everything except
+  `relations` and `schema_version`).
+* Unknown plugin-owned roots not in the supported, blocked, out-of-scope, or
+  `derived` lists -- blocked only when a structured frame/column reference is
+  detected, never on string search.
+
+Ambiguous references (e.g. a sheet name that resolves to multiple distinct
+frames across `workbook_view.sheets` and `workbook_view.sheet_mappings`)
+become `ambiguous_metadata_reference` blockers.
+
+Unsupported transformation/plugin references with no structured target are
+left untouched and unreported -- e.g.
+`test_unknown_non_structured_metadata_root_is_not_heuristically_scanned_or_rewritten`
+confirms a textual mention of `characters.name` inside `_meta.plugin_notes`
+is preserved verbatim and does not block.
+
+`_meta.derived` handling:
+
+* Reported as `ReferenceAction.IGNORED_DERIVED` whenever present, including
+  for `rename`/`drop`/`reorder`.
+* Not consulted to discover original names (the
+  `test_derived_does_not_enable_rename_*` case keeps a stale helper provenance
+  referencing a column that does not exist in the frame, and the rename is
+  blocked with `source_column_missing` rather than being rescued).
+* Not rewritten in-place by the domain.  The orchestrator's
+  `project_meta_to_persistable_contract` continues to strip
+  `_meta.derived` before the saver runs, which is what the persistence test
+  `test_orchestrate_discard_output_still_applies_persistence_boundary` and the
+  end-to-end `test_json_dir_write_mode_updates_data_and_meta` rely on
+  (`derived` is absent from the persisted output).
+
+Non-blocking notes:
+
+* `_handle_helper_policies` always reassigns
+  `meta["helper_policies"] = updated_helper_policies` even when no
+  `relations` change occurred.  Because `updated_meta` is a `deepcopy(meta)`
+  upstream, the resulting structure is value-equal to the input and the
+  `updated_meta != dict(meta)` check still reports `meta_changed=False`, so
+  this does not produce a spurious diff in the report or the written
+  `_meta`.  It is, however, more verbose than necessary and would mask a
+  future regression that silently mutated a non-`relations` v1 key without
+  recording a metadata change.  Consider tightening to "only reassign when
+  something changed" in a follow-up touch.
+* `_handle_sheets` follows a similar always-reassign pattern; same comment.
+* The `MetadataReferenceChange` for blocked roots is appended *and* a
+  matching `SchemaMaintenanceFailure` is recorded.  This is the FTR's
+  required behaviour ("Every metadata reference that blocks the operation
+  appears in the operation report").  Confirm callers that consume
+  `metadata_changes` understand `BLOCKED` entries are not applied --
+  currently both `metadata_changes` and `failures` carry the blocking
+  evidence and consumers must consult `report.blocked`/`failures`, not just
+  `metadata_changes`.
+
+===== 7. Roundtrip and dynamic-projection scope
+
+Pass.
+
+* Domain code does not look at workbook layout, sheet geometry, named ranges,
+  matrix axis members, or any rendering plan.
+* No code in `domain/schema_maintenance/` references the IR, renderer, or
+  parser packages.
+* `extract_frame`/`project_by_role` and the rest of the ordinary roundtrip
+  pipeline are untouched in this commit range.
+* Matrix axis member columns are explicitly handled as blocked when they
+  appear as structured `value_column`/`row_keys`/`column_key`/etc references
+  under `xref_crosstable` or `compact_multiaxis`
+  (`test_detected_transformation_structured_reference_blocks`).
+
+Watchpoint (non-blocking): there is no guard test asserting that a regular
+JSON→XLSX→JSON roundtrip is byte-identical before and after merely importing
+`domain/schema_maintenance` (i.e. a "loading the module has no side effect"
+guard).  Given the module has no side effects this is not currently a real
+risk, but the FTR's "Ordinary roundtrip editing remains unchanged" criterion
+is presently only asserted by code review, not by an explicit guard.  See
+missing test M5.
+
+===== 8. Public-surface gaps
+
+The FTR explicitly notes the public-surface gate and a release-notes
+checkpoint.  Both are *not* yet satisfied.
+
+* New console script `sheets-schema-maintain` is wired in `pyproject.toml`.
+* `docs/ai_info/interfaces_and_gates.adoc` still lists only `sheets-run`,
+  `sheets-example-json-to-xlsx`, and `sheets-example-xlsx-to-json` under
+  "CLI entry points"; `sheets-schema-maintain` is not mentioned, so the
+  public-surface gate is currently undocumented.
+* `docs/release_notes/release_notes.adoc` "unknown -- planned" section
+  contains no entry for the new maintenance CLI, the new `discard` saver
+  kind, or the new known limitations called out in the preflight
+  (no runtime YAML step, no generic migration framework, no
+  workbook-header inference, no dynamic-projection schema handling).
+  This is the work explicitly listed under Slice 5 in the preflight.
+* No user-facing CLI documentation describes the operation arguments
+  (`--op`, `--frame`, `--source-column`, `--target-column`, `--insert-before`,
+  `--insert-after`, `--column`, `--reorder-mode`, `--prune`,
+  `--dry-run`/`--write`, `--report`).  Until those names are documented and
+  gated, every flag introduced here is implicitly part of the public
+  surface as soon as the next release tag ships.
+
+Argument-name coherence (against the preflight table):
+
+* `--in-kind`, `--in-path`, `--out-kind`, `--out-path`, `--op`, `--frame`,
+  `--source-column`, `--target-column`, `--default`, `--prune`, `--report`,
+  `--write`/`--dry-run` all match the preflight recommendation.
+* `--insert-before` / `--insert-after` exist and are mutually exclusive,
+  matching the preflight.
+* The preflight table header says `--columns` for reorder, while the example
+  uses the repeatable singular `--column id --column name`.  The
+  implementation chose the repeatable singular form, which matches the
+  shell-safety preference in the preflight, but the public-doc table when
+  written should mention only the singular form to avoid confusion.
+* `--reorder-mode` matches.
+* `--debug` / `-v` are referenced by `cli/runtime.py` but are *not* declared
+  in `schema_maintain._build_parser`, so passing them as CLI flags would
+  fail with argparse.  Not blocking, but inconsistent with the runtime
+  convention noted in the preflight.
+
+===== 9. Test coverage
+
+Domain operations: covered (`tests/unit/domain/schema_maintenance/test_operations.py`).
+Add/drop/rename/reorder happy paths, missing target frame, missing source
+column, existing target column, invalid placement mode, duplicate / unknown
+reorder columns, unknown reorder mode, kind mismatch, meta pass-through, and
+report-not-in-frames assertions are all asserted.
+
+Metadata references: covered
+(`tests/unit/domain/schema_maintenance/test_metadata_refs.py`).
+Constraints rename via direct match, sheet mapping, and sheets entries;
+ambiguous sheet resolution; constraints drop blocked vs pruned; sheet
+helper/editable columns rename; FK v2 source/target/helper-target_field
+rename gated by frame match; FK drop always blocks even with `--prune`;
+detected transformation roots block; derived ignored not authoritative;
+plugin-owned structured reference blocks; non-structured plugin mention
+preserved.
+
+Discard backend: covered (`tests/unit/io_backends/test_discard_backend.py`).
+`get_saver("discard")` returns `save_discard`, `get_loader("discard")` raises,
+and discard writes nothing for several path variants.
+
+Orchestrator + discard integration: covered
+(`tests/integration/pipeline/test_orchestrator_discard_output.py`).
+Steps still run, no output artifact is written, and the persistence boundary
+strips `_meta.derived` regardless of saver.
+
+CLI delegation: covered (`tests/unit/cli/test_schema_maintain_cli.py`).
+Private `BoundStep` shape, default dry-run output, write-mode required
+arguments, write-mode output passthrough, JSON-to-stdout vs file report,
+and blocked-operation report-on-stdout.
+
+End-to-end `json_dir` workflow: covered
+(`tests/integration/schema_maintenance/test_json_dir_workflow.py`).
+Write mode round-trips through `read_json_dir` and asserts updated
+`constraints` and `derived` removal; dry-run produces no output directory;
+blocked write produces no output directory.
+
+Architecture: covered
+(`tests/architecture/test_schema_maintenance_private_step.py`).
+Runtime registry seal, descriptive JSON registry seal, YAML config rejection,
+CLI-uses-BoundStep source assertion.
+
+==== Missing tests
+
+[cols="1,3"]
+|===
+| ID | Coverage gap
+
+| M1
+| Import-direction guard for `domain/schema_maintenance` -- the preflight's
+  `test_domain_schema_maintenance_does_not_import_io_cli_or_pipeline_registry`
+  is not present.  Add an import-graph / source-scan style test that fails if
+  any module under `src/spreadsheet_handling/domain/schema_maintenance/`
+  imports from `spreadsheet_handling.io_backends`,
+  `spreadsheet_handling.cli`, `spreadsheet_handling.pipeline.registry`, or
+  `spreadsheet_handling.pipeline.build`.
+
+| M2
+| Worldbuilding-shaped fixture coverage -- the preflight required dotted
+  field names such as `persona.crystal`/`persona.motto`/`story.learning_goal`
+  and relation columns such as `home_place_id`, `story_id`, `character_id`.
+  The current operation tests only exercise flat columns
+  (`id`/`name`/`notes`/`home_place_id`).  Add at least one rename + one
+  drop test where the source column is a dotted name and the FK relation
+  references the dotted column under `helper_policies.fk.relations`.
+
+| M3
+| Malformed `_meta` shape -- `apply_metadata_rules` returns a
+  `malformed_meta` failure when `_meta` is not a mapping, when
+  `constraints`/`sheets`/`helper_policies.fk.relations`/`workbook_view`/
+  `workbook_view.sheet_mappings` is the wrong type, when a `constraints`
+  entry is not a mapping, when a sheet entry is not a mapping, or when a
+  `protection` block is not a mapping.  None of these paths are currently
+  asserted by tests.
+
+| M4
+| Operation request with `_meta` absent entirely -- `_handle_metadata_rules`
+  short-circuits when `meta is None`.  Add a test confirming the operation
+  succeeds without producing spurious `IGNORED_DERIVED`
+  / `UNAFFECTED` entries.
+
+| M5
+| Ordinary-roundtrip guard -- assert that importing
+  `spreadsheet_handling.domain.schema_maintenance` does not register a step,
+  does not mutate `pipeline.registry.REGISTRY`, and does not change the
+  observable behaviour of `orchestrate` on a known JSON→workbook→JSON
+  smoke fixture.  Currently covered only by reading the code.
+
+| M6
+| Reorder + `_meta` interaction -- reorder explicitly has no
+  `affected_column`, so the metadata pass short-circuits after the derived
+  report.  No test exercises a reorder against a frame whose `_meta` carries
+  `constraints` / `sheets.<sheet>.helper_columns` / FK relations to confirm
+  none of those references are spuriously rewritten or blocked.
+
+| M7
+| Placement edge cases for `add_column` -- there are no tests for missing
+  `placement.column` when `mode` is `before` or `after`
+  (`missing_placement_column`), for an unknown `placement.column`
+  (`placement_column_missing`), or for the `kind_mismatch` branch on the
+  other three operation entry points (only `add_column` is covered).
+
+| M8
+| Public surface guard for `sheets-schema-maintain` -- once a release note
+  exists, an architecture test (or doctest) should assert the console
+  script entry remains stable, the recognised `--op` values match
+  `SchemaOperationKind`, and `interfaces_and_gates.adoc` mentions
+  `sheets-schema-maintain`.
+|===
+
+==== Public-surface, release-note, and documentation obligations
+
+* *Release notes (required before tagging).*  Add an entry under
+  `== unknown -- planned` in `docs/release_notes/release_notes.adoc`
+  covering:
+
+  ** new pre-`0.3.0` maintenance CLI `sheets-schema-maintain`, including the
+     four operations and the dry-run-by-default policy;
+  ** new output-only saver kind `discard`;
+  ** known limitations (no runtime YAML step, no generic migration
+     framework, no workbook-header inference, no dynamic-projection schema
+     handling, FK relation drop is always blocked, residual v1
+     `helper_policies.fk` entries are blocked rather than rewritten).
+
+  Placement follows the `FTR-POST-RELEASE-LIFECYCLE-AND-RESET-P5` rule
+  cited by the review instructions: bullets go under the active
+  unreleased section, never under a frozen `(released)` section.
+
+* *Interfaces and gates.*  Add `sheets-schema-maintain` to the consumer-facing
+  CLI entry points list in `docs/ai_info/interfaces_and_gates.adoc` and
+  record that the four operation flags, the dry-run/write toggle, and the
+  `--report` flag are part of the gated surface.
+
+* *User/developer docs.*  Add a small section -- e.g. under the existing
+  developer-guide workflow chapter -- that explains when to use
+  `sheets-schema-maintain` versus ordinary roundtrip editing, the dry-run
+  contract, and the report shape.  The FTR's "Acceptance Criteria" list
+  expects this when the CLI ships.
+
+* *Registry artifacts.*  Do *not* add an entry to
+  `registries/pipeline_step_registry.json` for the private step.  This is
+  confirmed both by the FTR and by the existing architecture guard.
+
+* *Demo (`spreadsheet-handling-demo`).*  Not required by the FTR; the
+  consumer integration can be opened in a later FTR.  Out of scope for this
+  review.
+
+==== Recommended patch list before Slice 5
+
+Blocking before tagging (must be done in Slice 5):
+
+. Release-note bullet(s) in `docs/release_notes/release_notes.adoc` covering
+  the new CLI, the new `discard` saver, and the documented known
+  limitations.
+. Public-surface update to
+  `docs/ai_info/interfaces_and_gates.adoc` listing
+  `sheets-schema-maintain`.
+. A user-facing CLI doc section (developer-guide or user-guide, depending on
+  where consumer-facing CLI docs currently live) describing operation
+  flags, dry-run default, blocking failures, and the report shape.
+
+Recommended before Slice 5 (small additions that protect the architecture
+the FTR is enforcing):
+
+. Add missing test M1 (import-direction guard).
+. Add missing test M3 (malformed `_meta` cases).
+. Add missing test M2 (worldbuilding-shaped fixture: dotted columns,
+  relation columns under FK v2).
+. Add missing tests M4, M6, M7.
+. Tighten `_handle_helper_policies` and `_handle_sheets` so they only
+  reassign sub-mappings when `changed=True`, matching the
+  `_handle_constraints` pattern.
+. Align `save_discard` signature to declare `options` keyword-only, matching
+  `write_json_dir` / `save_csv_dir`.
+
+Nice-to-have, defer if pressed:
+
+. Add `--debug` / `-v` to `schema_maintain._build_parser` so the
+  `cli/runtime.py` traceback rule actually has a flag to read.
+. Consider asserting that resolving any
+  `spreadsheet_handling.cli.apps.schema_maintain:*` callable via
+  `build_steps_from_config(... step: ...:...)` is rejected; today the
+  rejection is incidental (TypeError on binding), not a guard.
+
+==== Out-of-scope drift noticed during review
+
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` shows a small
+  import-reordering diff in the commit range (`from spreadsheet_handling.core.formulas
+  import FormulaSpec, ListLiteralFormulaSpec` moved above
+  `_EXCEL_CHAR_TO_CM`).  This is unrelated to FTR-SCHEMA-EVOLUTION-OPERATIONS
+  and was not requested by the FTR or preflight.  Flag-only; non-blocking.
+* `.gitignore` re-includes `/docs/cold_storage/**/index.json` and the
+  commit range adds a number of cold-storage indexes.  Per the commit log
+  (`chore(docs): track cold storage indexes`,
+  `chore(docs): archive configuration FTR assessment`) those are housekeeping
+  commits that landed alongside the FTR work but are not part of its scope.
+  Mentioned here only so a future archaeologist sees the cold-storage
+  changes were intentional house-keeping and not byproducts of the FTR.
+
+==== Readiness for docs/release checkpoint
+
+*Not yet ready.*  Slices 1-4 are architecturally clean and well-tested for
+the runtime surface, but the Slice 5 obligations (release notes, public
+surface gate update, user-facing docs) are unmet, and the import-direction
+and malformed-meta guards remain on the to-do list.  Once the items under
+"Blocking before tagging" are added, and the small set of missing tests are
+filled in, the implementation can move into the Slice 5 commit and the FTR
+can be archived.
+
+==== Validation commands
+
+These were *not* executed by this review; the FTR explicitly asked for a
+read-only review.  When Slice 5 lands, the implementer should re-run at
+least:
+
+[source,console]
+----
+PYTHONPATH=src pytest tests/unit/domain/schema_maintenance \
+                    tests/unit/io_backends/test_discard_backend.py \
+                    tests/unit/cli/test_schema_maintain_cli.py \
+                    tests/integration/pipeline/test_orchestrator_discard_output.py \
+                    tests/integration/schema_maintenance \
+                    tests/architecture/test_schema_maintenance_private_step.py
+PYTHONPATH=src pytest -m "ftr('FTR-SCHEMA-EVOLUTION-OPERATIONS')"
+ruff check src/spreadsheet_handling/domain/schema_maintenance \
+           src/spreadsheet_handling/io_backends/discard_backend.py \
+           src/spreadsheet_handling/cli/apps/schema_maintain.py
+----
+
+(The `ftr` marker selector follows the convention declared in
+`pyproject.toml`.  Adjust the syntax if your pytest version requires
+`-m "ftr and ftr_id='FTR-...'`-style filtering.)
+
+==== Residual risks
+
+* Sheet resolution relies on `workbook_view.sheets` and
+  `workbook_view.sheet_mappings`.  Real-world `_meta` may carry richer
+  mapping shapes (e.g. `canonical_frame` plus `logical_frame` plus `frame`
+  on the same entry).  The current resolver collapses these into a single
+  set per sheet name and reports any plurality as ambiguous.  This is
+  conservative and correct for this slice, but mark for re-review the
+  first time a real consumer trips the `ambiguous_metadata_reference`
+  blocker.
+
+* `_meta.derived` is reported as `IGNORED_DERIVED` even on operations where
+  it could be argued to be `DROPPED_DERIVED` (because the persistence
+  boundary will strip it).  The `ReferenceAction` enum carries both
+  values; the implementation never emits `DROPPED_DERIVED`.  Confirm
+  intentional, or use `DROPPED_DERIVED` on write-mode runs to be more
+  precise.
+
+* The CLI exit-code contract is "0 on success, 1 on blocked operation, and
+  whatever `run_cli` chooses on uncaught exceptions".  No test asserts the
+  exit code on a domain-level unexpected exception path; current behaviour
+  delegates to `run_cli`'s generic `Error: ...` + `SystemExit(1)` handler,
+  which is reasonable but undocumented.
+
+* The new console script will land in the next release.  Once shipped, the
+  argument names are public per
+  `docs/ai_info/interfaces_and_gates.adoc`; renaming any flag later
+  requires the explicit-approval gate noted in that document.
+
+==== Related documents
+
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS.adoc`
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS-ASSESSMENT.adoc`
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS_preflight.adoc`
+* `docs/ai_info/review_instructions.adoc`
+* `docs/ai_info/interfaces_and_gates.adoc`
+* `docs/release_notes/release_notes.adoc`
