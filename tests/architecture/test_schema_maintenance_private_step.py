@@ -4,10 +4,12 @@ import ast
 import inspect
 import json
 from pathlib import Path
+import tomllib
 
 import pytest
 
 from spreadsheet_handling.cli.apps import schema_maintain
+from spreadsheet_handling.domain.schema_maintenance import SchemaOperationKind
 from spreadsheet_handling.pipeline.build import build_steps_from_config
 from spreadsheet_handling.pipeline.registry import REGISTRY
 
@@ -65,3 +67,47 @@ def test_domain_schema_maintenance_does_not_import_forbidden_layers() -> None:
                     violations.append(f"{path}:{node.lineno}: {name}")
 
     assert violations == []
+
+
+def test_schema_maintenance_cli_public_surface_is_documented() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    scripts = pyproject["project"]["scripts"]
+    interfaces = Path("docs/ai_info/interfaces_and_gates.adoc").read_text(encoding="utf-8")
+
+    assert (
+        scripts["sheets-schema-maintain"]
+        == "spreadsheet_handling.cli.apps.schema_maintain:cli_entry"
+    )
+    assert "sheets-schema-maintain" in interfaces
+    for flag in (
+        "--op",
+        "--frame",
+        "--source-column",
+        "--target-column",
+        "--default",
+        "--insert-before",
+        "--insert-after",
+        "--column",
+        "--reorder-mode",
+        "--prune",
+        "--dry-run",
+        "--write",
+        "--report",
+        "--in-kind",
+        "--in-path",
+        "--out-kind",
+        "--out-path",
+    ):
+        assert flag in interfaces
+
+
+def test_schema_maintenance_operation_values_are_documented() -> None:
+    documented = "\n".join(
+        [
+            Path("docs/release_notes/release_notes.adoc").read_text(encoding="utf-8"),
+            Path("docs/user_guide/ch02_workflow/01_workflow.adoc").read_text(encoding="utf-8"),
+        ]
+    )
+
+    for kind in SchemaOperationKind:
+        assert kind.value in documented
