@@ -1,0 +1,864 @@
+===== FTR-SCHEMA-EVOLUTION-OPERATIONS -- Implementation preflight
+
+*Status:* Preflight
+
+*Parent FTR:* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS.adoc`
+
+*Scope:* First implementation slice only.  This document does not implement
+runtime code, add tests, update registries, or change the FTR.
+
+==== Binding architecture summary
+
+The implementation must follow the FTR architecture exactly:
+
+* Domain operations are carrier-neutral and operate on `Frames`.
+* Domain operations return `SchemaMaintenanceResult(frames, report)`.
+* The report is not a frame and must not be stored in `_meta`.
+* A dedicated maintenance CLI app builds a private `BoundStep`
+  programmatically.
+* The private `BoundStep` adapts `SchemaMaintenanceResult` to `Frames ->
+  Frames`.
+* The CLI captures the report through a local collector.
+* The CLI delegates execution to `orchestrate()`.
+* The private schema-maintenance step must not be registered in
+  `pipeline.REGISTRY`.
+* The private schema-maintenance step must not be added to
+  `registries/pipeline_step_registry.json`.
+* The private schema-maintenance step must not be addressable from normal
+  `sheets-run` YAML.
+* Dry-run should use an output-only `discard` saver or equivalent
+  orchestrator-compatible sink.
+* The first tested storage workflow may be `json_dir -> json_dir` for write
+  mode and `json_dir -> discard` for dry-run mode.  Domain code must not
+  contain JSON-specific authority assumptions.
+
+No blocking contradiction was found in the FTR.
+
+==== Recommended implementation slices and commit boundaries
+
+[cols="1,3,3"]
+|===
+| Slice | Purpose | Commit boundary
+
+| 1. Domain model and frame operations
+| Add carrier-neutral operation request/result/report dataclasses and implement
+  pure `Frames` transformations for `add_column`, `drop_column`,
+  `rename_column`, and `reorder_columns` with no metadata mutation beyond
+  explicit report entries.  Include targeted unit tests for the domain model
+  and frame operations in the same slice.
+| `feat(FTR-SCHEMA-EVOLUTION-OPERATIONS): add schema maintenance domain model`
+
+| 2. Metadata reference scanner and updater
+| Add recognized metadata-reference support, detected-but-blocked roots, and
+  `_meta.derived` handling.  Wire metadata handling into the domain operation
+  while keeping the result shape `SchemaMaintenanceResult(frames, report)`.
+  Include metadata-reference tests in the same slice.
+| `feat(FTR-SCHEMA-EVOLUTION-OPERATIONS): handle schema maintenance metadata`
+
+| 3. Discard output sink
+| Add an orchestrator-compatible output-only saver kind for dry-run.  Keep it
+  out of the pipeline step registry because it is an I/O backend, not a
+  pipeline step.  Include backend and orchestrator tests in the same slice.
+| `feat(FTR-SCHEMA-EVOLUTION-OPERATIONS): add discard output backend`
+
+| 4. Dedicated maintenance CLI
+| Add the public maintenance CLI app and console script.  The CLI parses
+  operation arguments, builds a private `BoundStep`, delegates to
+  `orchestrate()`, captures the report locally, and emits the report outside
+  `Frames` and `_meta`.  Include CLI, integration, and architecture guard
+  tests in the same slice.
+| `feat(FTR-SCHEMA-EVOLUTION-OPERATIONS): add schema maintenance CLI`
+
+| 5. Release and docs checkpoint
+| Update release notes and user/developer docs for the new CLI surface if the
+  implementation is accepted.  Include documentation checks in the same slice.
+  Do not add registry entries for the private step.
+| `docs(FTR-SCHEMA-EVOLUTION-OPERATIONS): document schema maintenance CLI`
+|===
+
+The discard backend should be its own small slice.  It changes the
+orchestrator I/O routing surface and should be reviewed separately from the
+domain operation semantics.  It is intentionally a backend/router addition,
+not a runtime pipeline step and not a registry entry.
+
+==== Expected files by slice
+
+===== Slice 1 -- Domain model and frame operations
+
+Expected additions:
+
+* `src/spreadsheet_handling/domain/schema_maintenance/__init__.py`
+* `src/spreadsheet_handling/domain/schema_maintenance/model.py`
+* `src/spreadsheet_handling/domain/schema_maintenance/operations.py`
+* `src/spreadsheet_handling/domain/schema_maintenance/columns.py`
+* `tests/unit/domain/schema_maintenance/test_operations.py`
+
+Expected changes:
+
+* None outside the new domain package unless an existing domain package root
+  needs a deliberately small import for internal convenience.  Avoid broad
+  public import-surface expansion.
+
+===== Slice 2 -- Metadata reference handling
+
+Expected additions:
+
+* `src/spreadsheet_handling/domain/schema_maintenance/meta_refs.py`
+* `src/spreadsheet_handling/domain/schema_maintenance/meta_update.py`
+* `tests/unit/domain/schema_maintenance/test_metadata_refs.py`
+
+Expected changes:
+
+* `src/spreadsheet_handling/domain/schema_maintenance/operations.py`
+
+Do not change `registries/meta_registry.yaml` in the first slice unless the
+implementation introduces a new persistent metadata root.  The planned work
+reads and rewrites existing roots only.
+
+===== Slice 3 -- Discard output sink
+
+Expected additions:
+
+* `src/spreadsheet_handling/io_backends/discard_backend.py`
+* `tests/unit/io_backends/test_discard_backend.py`
+* `tests/integration/pipeline/test_orchestrator_discard_output.py`
+
+Expected changes:
+
+* `src/spreadsheet_handling/io_backends/router.py`
+
+Recommended saver kind:
+
+* `discard`
+
+Recommended loader support: none.  The backend should be output-only; calling
+`get_loader("discard")` should continue to fail.
+
+Do not add `null` as an initial alias.  It may be considered later only if a
+real user-facing need justifies the extra I/O kind.
+
+===== Slice 4 -- Dedicated maintenance CLI
+
+Expected additions:
+
+* `src/spreadsheet_handling/cli/apps/schema_maintain.py`
+* `tests/unit/cli/test_schema_maintain_cli.py`
+* `tests/integration/schema_maintenance/test_json_dir_workflow.py`
+* `tests/architecture/test_schema_maintenance_private_step.py`
+
+Expected changes:
+
+* `pyproject.toml` -- add one console script, recommended name
+  `sheets-schema-maintain`.
+
+The CLI app is a public surface and needs approval/review under
+`docs/ai_info/interfaces_and_gates.adoc`.  This public CLI addition does not
+authorize a public YAML step.
+
+===== Slice 5 -- Docs and release checkpoint
+
+Expected additions:
+
+* user-facing CLI documentation, if the repo has an appropriate current
+  destination at implementation time;
+* implementation review note after delivery, if required by the workflow.
+
+Expected changes:
+
+* `docs/release_notes/release_notes.adoc`, or an explicit review-note
+  rationale explaining why no release note is needed.
+
+==== Proposed domain package/module structure
+
+[source,text]
+----
+src/spreadsheet_handling/domain/schema_maintenance/
+  __init__.py
+  model.py          # dataclasses/enums and public domain result types
+  columns.py        # DataFrame column mechanics, no metadata logic
+  meta_refs.py      # scan recognized and blocked metadata references
+  meta_update.py    # apply recognized update/prune rules
+  operations.py     # orchestration of one operation over Frames
+----
+
+Dependency direction:
+
+* `columns.py` depends only on pandas and `pipeline.types.Frames`-compatible
+  typing.
+* `meta_refs.py` and `meta_update.py` depend on plain mappings/lists and the
+  model dataclasses.  They must not import I/O backends, CLI, pipeline
+  registry, or spreadsheet/rendering modules.
+* `operations.py` coordinates `columns.py`, `meta_refs.py`, and
+  `meta_update.py`.
+* The package must not read files, write files, inspect carrier kind, or
+  branch on `json_dir`.
+
+==== Proposed dataclasses and enums
+
+Recommended enum and dataclass names:
+
+[source,python]
+----
+class SchemaOperationKind(Enum):
+    ADD_COLUMN = "add_column"
+    DROP_COLUMN = "drop_column"
+    RENAME_COLUMN = "rename_column"
+    REORDER_COLUMNS = "reorder_columns"
+
+class WriteIntent(Enum):
+    DRY_RUN = "dry_run"
+    WRITE = "write"
+
+class ReferenceAction(Enum):
+    UPDATED = "updated"
+    PRUNED = "pruned"
+    BLOCKED = "blocked"
+    UNAFFECTED = "unaffected"
+    DROPPED_DERIVED = "dropped_derived"
+    IGNORED_DERIVED = "ignored_derived"
+
+class ReferenceRoot(Enum):
+    CONSTRAINTS = "constraints"
+    HELPER_POLICIES_FK = "helper_policies.fk"
+    SHEETS = "sheets"
+    WORKBOOK_VIEW = "workbook_view"
+    FRAME_LIFECYCLE = "frame_lifecycle"
+    XREF_CROSSTABLE = "xref_crosstable"
+    SPLIT_BY_DISCRIMINATOR = "split_by_discriminator"
+    COMPACT_MULTIAXIS = "compact_multiaxis"
+    CELL_CODECS = "cell_codecs"
+    SPARSE_DEFAULTS = "sparse_defaults"
+    LEGEND_BLOCKS = "legend_blocks"
+    DERIVED = "derived"
+    UNKNOWN_PLUGIN = "unknown_plugin"
+
+@dataclass(frozen=True)
+class ColumnPlacement:
+    mode: Literal["append", "before", "after"]
+    column: str | None = None
+
+@dataclass(frozen=True)
+class ReorderSpec:
+    mode: Literal["complete", "listed_first", "listed_last"]
+    columns: tuple[str, ...]
+
+@dataclass(frozen=True)
+class SchemaMaintenanceRequest:
+    kind: SchemaOperationKind
+    target_frame: str
+    source_column: str | None = None
+    target_column: str | None = None
+    default_value: Any = ""
+    placement: ColumnPlacement | None = None
+    reorder: ReorderSpec | None = None
+    prune: bool = False
+    write_intent: WriteIntent = WriteIntent.DRY_RUN
+
+@dataclass(frozen=True)
+class FrameChange:
+    frame: str
+    kind: SchemaOperationKind
+    source_column: str | None
+    target_column: str | None
+    detail: str
+
+@dataclass(frozen=True)
+class MetadataReferenceChange:
+    root: ReferenceRoot
+    path: str
+    action: ReferenceAction
+    frame: str | None
+    column: str | None
+    detail: str
+
+@dataclass(frozen=True)
+class SchemaMaintenanceFailure:
+    code: str
+    message: str
+    frame: str | None = None
+    column: str | None = None
+    meta_path: str | None = None
+
+@dataclass(frozen=True)
+class SchemaMaintenanceWarning:
+    code: str
+    message: str
+    frame: str | None = None
+    column: str | None = None
+    meta_path: str | None = None
+
+@dataclass(frozen=True)
+class SchemaMaintenanceReport:
+    operation: SchemaMaintenanceRequest
+    frame_changes: tuple[FrameChange, ...]
+    metadata_changes: tuple[MetadataReferenceChange, ...]
+    failures: tuple[SchemaMaintenanceFailure, ...]
+    warnings: tuple[SchemaMaintenanceWarning, ...]
+
+    @property
+    def blocked(self) -> bool: ...
+
+@dataclass(frozen=True)
+class SchemaMaintenanceResult:
+    frames: Frames
+    report: SchemaMaintenanceReport
+----
+
+Use immutable dataclasses where possible.  The operation function may build
+mutable local lists internally, but it should return frozen result objects.
+
+==== Proposed CLI shape
+
+Recommended module:
+
+* `spreadsheet_handling.cli.apps.schema_maintain`
+
+Recommended console script:
+
+* `sheets-schema-maintain =
+  "spreadsheet_handling.cli.apps.schema_maintain:cli_entry"`
+
+Recommended invocation shape:
+
+[source,console]
+----
+sheets-schema-maintain \
+  --in-kind json_dir \
+  --in-path daten/dino_insel \
+  --out-kind json_dir \
+  --out-path daten/dino_insel.updated \
+  --op rename_column \
+  --frame characters \
+  --source-column persona.crystal \
+  --target-column persona.focus_object \
+  --report schema-maintenance-report.json
+----
+
+Recommended arguments:
+
+[cols="1,2,2"]
+|===
+| Argument | Required | Notes
+
+| `--in-kind`
+| yes
+| Initially tested with `json_dir`; do not restrict the domain code to this
+  carrier.
+
+| `--in-path`
+| yes
+| Passed through to `orchestrate(input=...)`.
+
+| `--out-kind`
+| yes for write mode, default `discard` for dry-run
+| Dry-run should route to `discard`.
+
+| `--out-path`
+| required only for savers that need a path
+| For `discard`, accept a sentinel path such as `-` or `__discard__` because
+  `orchestrate()` currently requires a non-empty output path.
+
+| `--op`
+| yes
+| One of `add_column`, `drop_column`, `rename_column`, `reorder_columns`.
+
+| `--frame`
+| yes
+| Target frame name.
+
+| `--source-column`
+| operation-dependent
+| Required for `drop_column` and `rename_column`.
+
+| `--target-column`
+| operation-dependent
+| Required for `add_column` and `rename_column`.
+
+| `--default`
+| for `add_column` unless empty default is accepted
+| First slice should treat values as strings unless a later slice scopes typed
+  defaults.
+
+| `--insert-before` / `--insert-after`
+| optional
+| Mutually exclusive placement controls for `add_column`.
+
+| `--columns`
+| for `reorder_columns`
+| Comma-separated or repeatable option.  Prefer repeatable for shell safety:
+  `--column id --column name`.
+
+| `--reorder-mode`
+| for `reorder_columns`
+| `complete`, `listed_first`, or `listed_last`.
+
+| `--prune`
+| optional
+| Enables explicitly scoped pruning for supported roots.
+
+| `--dry-run` / `--write`
+| one required or default dry-run
+| Recommendation: default dry-run, require `--write` for user-selected output
+  writes.
+
+| `--report`
+| optional
+| Output path for JSON report.  If omitted, print JSON to stdout.
+
+| `--debug`, `-v`
+| optional
+| Follow existing CLI runtime/logging conventions.
+|===
+
+The CLI private step should be built in the CLI module, not in
+`pipeline/steps.py`:
+
+[source,python]
+----
+collector: list[SchemaMaintenanceReport] = []
+
+def run(frames: Frames) -> Frames:
+    result = apply_schema_maintenance(frames, request)
+    collector.append(result.report)
+    if result.report.blocked:
+        raise SchemaMaintenanceBlocked(result.report)
+    return result.frames
+
+step = BoundStep(name="_schema_maintenance_private", config={}, fn=run)
+orchestrate(input=inp, output=out, steps=[step])
+----
+
+The exact exception type is an implementation detail, but the CLI must avoid a
+user-selected output write when blocking failures exist.  Raising from the
+private step before returning to `orchestrate()` is the simplest way to prevent
+the saver call.
+
+==== Metadata reference roots to support in the first slice
+
+Support means the scanner has structured knowledge of the root and can either
+update, prune, or block with a precise report entry.  It does not mean every
+reference under the root is rewritable.
+
+===== `_meta.constraints`
+
+Supported references:
+
+* list entries with `sheet` and `column`;
+* list entries with `sheet` and `area` only should be treated as recognized
+  but not column-name references;
+* `rule.from_legend.legend` or similar legend references are not column
+  references and should not be rewritten.
+
+Rename:
+
+* update `column` when `sheet` resolves unambiguously to the target frame.
+
+Drop:
+
+* block by default;
+* prune the constraint only under explicit `--prune` if its only affected
+  column reference is the dropped column.
+
+Reorder:
+
+* no semantic change.
+
+Frame resolution:
+
+* direct match `sheet == target_frame`;
+* if `_meta.workbook_view.sheet_mappings` maps the visible sheet to the target
+  frame, treat it as recognized;
+* otherwise block as ambiguous rather than guessing.
+
+===== `_meta.helper_policies.fk`
+
+Supported references:
+
+* v2 `relations[*].source_frame`;
+* v2 `relations[*].source_column`;
+* v2 `relations[*].target_frame`;
+* v2 `relations[*].target_key`;
+* v2 `relations[*].helper_columns[*].column`;
+* v2 `relations[*].helper_columns[*].target_field`;
+* residual v1 per-target dicts should be detected but blocked unless the
+  implementation explicitly scopes a safe rule.
+
+Rename:
+
+* update `source_column` only when `source_frame == target_frame`;
+* update `target_key` and `target_field` only when `target_frame ==
+  target_frame` and the renamed column is the target key/field;
+* helper materialized column names are not schema fields unless they are
+  explicitly declared as helper columns; do not fuzzy-rename helper names.
+
+Drop:
+
+* block by default for any relation touching the target column;
+* do not prune FK relations in the first slice unless a later implementation
+  decision explicitly scopes relation removal.
+
+Reorder:
+
+* no semantic change.
+
+===== `_meta.sheets.<sheet>.helper_columns`
+
+Supported references:
+
+* durable helper-column declarations under sheet-local metadata.
+
+Rename:
+
+* update only when the sheet resolves unambiguously to the target frame and the
+  listed column is the renamed column.
+
+Drop:
+
+* block by default;
+* prune the helper-column entry only under explicit `--prune`.
+
+Reorder:
+
+* no semantic change.
+
+===== `_meta.sheets.<sheet>.protection.editable_columns`
+
+Supported references:
+
+* sheet-local editability lists produced by workbook view configuration or
+  caller-supplied meta.
+
+Rename:
+
+* update only when the sheet resolves unambiguously to the target frame.
+
+Drop:
+
+* block by default;
+* prune only under explicit `--prune`.
+
+Reorder:
+
+* no semantic change.
+
+===== `_meta.workbook_view`
+
+Supported references:
+
+* `workbook_view.sheets[*].frame`;
+* `workbook_view.sheets[*].sheet`;
+* `workbook_view.sheet_mappings[*].sheet` /
+  `visible_sheet`;
+* `workbook_view.sheet_mappings[*].frame` /
+  `logical_frame`;
+* `workbook_view.sheet_mappings[*].canonical_frame`.
+
+Column maintenance:
+
+* frame-name references are recognized for resolving visible sheet names to
+  target frames;
+* these are not column references for add/drop/rename/reorder and should be
+  reported as unaffected unless malformed or ambiguous.
+
+===== `_meta.frame_lifecycle`
+
+Supported references:
+
+* top-level keys as frame names;
+* entry fields `derived_from` and `superseded_by` as frame-name references.
+
+Column maintenance:
+
+* recognized for authoritative-frame detection and for blocking missing or
+  malformed lifecycle shapes;
+* not a column-reference root in the first slice.
+
+===== Explicit column-order metadata, if present
+
+Known current roots do not expose a single stable top-level column-order
+contract for authoritative frames.  If the implementation finds an explicit
+column-order list under a supported root and can prove it targets the same
+frame, `reorder_columns` may update it.  Otherwise report it as blocked or
+unaffected according to the FTR.
+
+==== Metadata roots that should be detected-but-blocked
+
+Detected-but-blocked roots are known roots with structured frame/column
+references, but the first slice should not rewrite them because their contracts
+involve transformation semantics, axis reconstruction, codecs, or unresolved
+lifecycle questions.
+
+* `_meta.xref_crosstable`
+  ** block on structured references to target frame/column in fields such as
+     row keys, column key, value column, relation frame, source/target frame,
+     or dense-axis configuration.
+* `_meta.split_by_discriminator`
+  ** block on structured references to source frame, generated frames,
+     discriminator column, original column order, or merge/restore fields.
+* `_meta.compact_multiaxis`
+  ** block on structured row/column key, value column, relation frame, axis,
+     codec, sparse, or group-projection references.
+* `_meta.cell_codecs`
+  ** block on structured references to output frame, value columns,
+     allowed-value references, or token columns.
+* `_meta.sparse_defaults`
+  ** block on structured target columns, defaulted value columns, or frame
+     references.
+* `_meta.legend_blocks`
+  ** block only if a structured frame/column reference is detected.  Do not
+     string-search legend labels, display text, or codebook values.
+* residual `_meta.helper_policies.fk.<target>` v1 shapes
+  ** block when they structurally reference the target frame/column because
+     runtime consumers no longer use v1 and a safe rewrite is not worth
+     scoping in the first slice.
+* plugin-owned roots
+  ** block only when a structured frame/column reference is detected and no
+     plugin-specific reference contract exists.  No generic string-search or
+     heuristic rewrite is allowed.
+
+==== Metadata roots explicitly out of scope
+
+Out-of-scope roots should not be scanned heuristically and should not be
+rewritten.  They may appear in the report as unaffected if discovered during
+normal structured traversal of supported roots.
+
+* presentation-only sheet-local metadata keyed by cell address or display
+  setting, including `column_widths`, `text_orientations`,
+  `horizontal_alignments`, `vertical_alignments`, `freeze_header`,
+  `auto_filter`, `header_fill_rgb`, and `helper_fill_rgb`;
+* carrier-shape or read-path hints such as `_hidden`, `workbook_meta_blob`,
+  `__autofilter_ref`, and `__legend_blocks`;
+* root-level `__*` keys, which are already stripped by the persistence
+  boundary and are not authoritative schema intent;
+* arbitrary unknown roots without structured frame/column reference contracts;
+* ordinary YAML pipeline files outside the loaded `Frames` payload;
+* normal `sheets-run` step specs and public pipeline registry metadata.
+
+==== `_meta.derived` handling
+
+`_meta.derived` is transient `meta_rendering` / `derived_operational_view`
+metadata.  It must not be used as authority for add/drop/rename/reorder.
+
+Recommended first-slice behavior:
+
+* ignore `_meta.derived` when deciding whether an operation is allowed;
+* report it as `IGNORED_DERIVED` in dry-run if present;
+* for write mode, rely on the existing orchestrator persistence boundary to
+  remove top-level `derived` before saving;
+* optionally remove `derived` from the returned `Frames` before returning from
+  the domain operation only if tests prove this does not obscure the
+  orchestrator boundary behavior.
+
+Do not update helper provenance under `_meta.derived.sheets.*.helper_columns`
+as if it were canonical metadata.  Do not use it to discover old names, helper
+relations, or target-frame identity.
+
+==== Blocking failures and output writes
+
+The domain operation should detect all blocking failures before returning
+updated frames.  If `SchemaMaintenanceReport.blocked` is true:
+
+* the private `BoundStep` must raise a CLI-owned or domain-owned blocking
+  exception before returning frames to `orchestrate()`;
+* `orchestrate()` therefore does not reach `_save_frames(...)`;
+* no user-selected output write occurs after blocking failures are detected.
+
+This satisfies the FTR's "no partial write" rule.  The first slice does not
+need filesystem-transactional replacement.  Stable write behavior for
+`json_dir` remains the existing backend's responsibility.
+
+For dry-run:
+
+* the CLI sets output to `{"kind": "discard", "path": "__discard__"}` or
+  equivalent;
+* the private step still executes and captures the report;
+* the discard saver accepts the frames and writes nothing.
+
+==== Test plan mapped to acceptance criteria
+
+These tests are not a separate late slice.  Each implementation slice should
+include the targeted tests and guards needed for the behavior it introduces.
+
+[cols="2,3"]
+|===
+| Acceptance criterion | Test coverage
+
+| Four operations implemented
+| Unit tests in `tests/unit/domain/schema_maintenance/test_operations.py` for
+  success and basic failure paths for `add_column`, `drop_column`,
+  `rename_column`, and `reorder_columns`.
+
+| Carrier-neutral `Frames` domain operations
+| Unit tests call the domain function directly with in-memory DataFrames and no
+  `json_dir` paths or backend kinds.
+
+| `SchemaMaintenanceResult(frames, report)`
+| Unit tests assert returned result type, returned `Frames`, report contents,
+  and no report frame in the payload.
+
+| Report not in `_meta`
+| Unit and integration tests assert `_meta` contains no report payload after
+  operations and after `json_dir` write.
+
+| Private `BoundStep` adapts result to `Frames -> Frames`
+| CLI unit test monkeypatches `orchestrate()` and inspects the built
+  `BoundStep`; calling it returns `Frames` and captures report locally.
+
+| Dedicated CLI builds private step and calls `orchestrate()`
+| CLI tests call `schema_maintain.main(argv)` and assert delegation arguments.
+
+| No `pipeline.REGISTRY` registration
+| Architecture test imports `spreadsheet_handling.pipeline.registry.REGISTRY`
+  and asserts no schema-maintenance step name is present.
+
+| No `pipeline_step_registry.json` entry
+| Architecture test reads the JSON registry and asserts no entry for the
+  private step or operation names.
+
+| Not addressable from normal `sheets-run` YAML
+| Unit test for `build_steps_from_config()` with the private step name asserts
+  the current unknown-step failure.
+
+| First workflow `json_dir` plus `_meta.yaml`
+| Integration test uses temp JSON directory with `_meta.yaml`, runs CLI write
+  mode to another temp directory, and asserts stable output.
+
+| Ordinary roundtrip unchanged
+| Existing roundtrip suite remains unchanged; add an architecture/CLI guard
+  rather than modifying roundtrip behavior.
+
+| Dynamic projection excluded
+| Metadata tests with `xref_crosstable` or `compact_multiaxis` axis-member
+  references assert blocked or unaffected behavior, never schema-field rewrite.
+
+| Dry-run discard sink
+| Integration test runs CLI dry-run with `discard` output and asserts no output
+  directory/file is created while report is emitted.
+
+| Blocking failures prevent writes
+| Integration test points write mode at an output path, triggers a metadata
+  blocker, and asserts the output path was not created or not written by the
+  selected saver.
+
+| Metadata fail-fast and explicit rules
+| Metadata-reference tests cover recognized update, recognized prune,
+  ambiguous block, unsupported block, malformed `_meta` block, and
+  plugin-owned structured-reference block.
+
+| `_meta.derived` not authoritative
+| Tests include stale derived helper provenance and assert it does not enable
+  or change a rename/drop decision.
+
+| Public-surface and release-note updates
+| Documentation/release test or review checklist item verifies release notes
+  are updated or explicitly waived in the review artifact.
+|===
+
+All new/modified test files should declare:
+
+[source,python]
+----
+pytestmark = pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS")
+----
+
+==== Architecture guard plan
+
+Add architecture tests that prove the private maintenance step is not exposed
+as a normal pipeline step:
+
+* `test_schema_maintenance_step_not_in_runtime_registry`
+  ** assert no key such as `schema_maintenance`, `schema_maintain`,
+     `_schema_maintenance_private`, or the four operation names is present in
+     `pipeline.registry.REGISTRY`.
+* `test_schema_maintenance_step_not_in_pipeline_step_registry_json`
+  ** load `registries/pipeline_step_registry.json` and assert no entry with
+     the private step name or operation names exists.
+* `test_schema_maintenance_step_not_buildable_from_yaml`
+  ** call `build_steps_from_config([{"step": "_schema_maintenance_private"}])`
+     and assert `KeyError`.
+* `test_domain_schema_maintenance_does_not_import_io_cli_or_pipeline_registry`
+  ** use import-graph or source-scan style consistent with existing
+     architecture tests to ensure `domain/schema_maintenance` does not import
+     `io_backends`, `cli`, `pipeline.registry`, or `pipeline.build`.
+* `test_cli_private_step_uses_boundstep_directly`
+  ** ensure the CLI uses `BoundStep` directly rather than `build_steps_from_config`.
+
+The guard should allow importing `pipeline.types.BoundStep` in the CLI.  That
+is the FTR-approved adaptation point.
+
+==== Public-surface, release-note, and documentation impacts
+
+Public surface:
+
+* Adding `sheets-schema-maintain` is a new CLI entry point and requires the
+  public-surface gate.
+* The CLI argument names are public once shipped; keep them conservative.
+* No YAML config schema change is required.
+* No public pipeline step is added.
+* No dotted plugin callable contract changes are required.
+
+Release notes:
+
+* Required if the CLI ships in the implementation slice.
+* Recommended release-note entry: new pre-`0.3.0` maintenance CLI for explicit
+  one-shot schema column maintenance over frames, initially tested with
+  `json_dir` storage.
+* Mention known limitations: no runtime YAML step, no generic migration
+  framework, no workbook-header inference, no dynamic projection schema
+  handling.
+
+Documentation:
+
+* Add or update a user-facing CLI section only after implementation.
+* Keep the FTR and this preflight in `docs/backlog/` until the FTR is done.
+* Do not update `registries/pipeline_step_registry.json`.
+* Do not update `registries/meta_registry.yaml` unless a new persistent root is
+  introduced.
+
+==== Risks and open decisions
+
+* *CLI name:* `sheets-schema-maintain` is recommended but still a public
+  surface decision.
+* *Report encoding:* JSON is recommended for machine-readable reports.  YAML
+  can be added later if needed; first slice should avoid multiple report
+  formats.
+* *Default value typing:* first slice should treat `--default` as a string or
+  empty value.  Typed defaults would need explicit parsing rules.
+* *Drop prune scope:* pruning should be limited to supported recognized roots.
+  FK relation pruning should remain blocked in the first slice unless
+  explicitly approved.
+* *Residual v1 FK helper policy:* detect and block structured references rather
+  than updating a shape runtime consumers no longer use.
+* *Frame-to-sheet resolution:* constraints and sheet-local metadata require a
+  clear mapping.  Use direct frame/sheet name match or
+  `_meta.workbook_view.sheet_mappings`; otherwise block as ambiguous.
+* *Output sink naming:* `discard` is the only recommended first-slice sink
+  kind.  `null` may be considered later as an alias only if a real
+  user-facing need justifies widening the I/O kind surface.
+* *Filesystem write atomicity:* not required by the FTR.  If later needed for
+  `json_dir`, scope it as a separate backend hardening task.
+* *Metadata lifecycle gaps:* `FTR-META-LIFECYCLE-INVENTORY-P5` remains open.
+  This implementation should avoid pretending the registry is complete runtime
+  truth.
+
+==== Recommended first implementation slice
+
+Start with Slice 1 plus the smallest part of Slice 2 needed to prove the
+domain shape:
+
+* add `domain/schema_maintenance/model.py`;
+* add `domain/schema_maintenance/columns.py`;
+* add `domain/schema_maintenance/operations.py`;
+* implement all four DataFrame column operations on in-memory `Frames`;
+* return `SchemaMaintenanceResult(frames, report)`;
+* include blocking failures for missing frame, missing source column, duplicate
+  target column, duplicate reorder columns, and unknown reorder columns;
+* include `_meta` pass-through without report storage;
+* add the targeted domain unit tests in the same commit;
+* do not add CLI, output backend, or registry changes in this first code
+  commit unless implementing the full FTR in one review window is explicitly
+  chosen.
+
+Then add metadata-reference handling before the CLI.  The CLI should not ship
+until metadata blockers exist; otherwise it would provide a maintenance command
+that can silently drift metadata.
