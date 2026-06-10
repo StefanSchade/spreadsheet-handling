@@ -1,0 +1,458 @@
+===== FTR-SCHEMA-EVOLUTION-OPERATIONS -- Explicit one-shot schema maintenance operations
+
+*Status:* New
+
+*Priority:* P5
+
+*Type:* FTR definition / pre-`0.3.0` maintenance workflow slice.
+
+*Assessment:*::
+
+This FTR is based on the accepted assessment in
+`docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS-ASSESSMENT.adoc`.
+The assessment concluded that a narrow pre-`0.3.0` FTR is justified.
+This document does not re-open that decision.
+
+==== Purpose
+
+Define explicit one-shot schema maintenance operations for canonical frame
+columns:
+
+* `add_column`
+* `drop_column`
+* `rename_column`
+* `reorder_columns`
+
+The goal is to give consumers a controlled workflow for intentional canonical
+model-shape changes without treating arbitrary workbook edits as schema
+evolution.
+
+==== Problem
+
+The current architecture intentionally treats the canonical model as the durable
+source of truth and workbooks as editable projections.
+
+That is correct for ordinary roundtrip editing, but it leaves a maintenance
+gap: when a user wants to intentionally change the canonical frame shape,
+manual JSON editing and ad-hoc spreadsheet header editing are both weak
+workflows.
+
+Manual JSON editing is possible, but it does not help with metadata references,
+review reports, or repeated updates across many records. Spreadsheet header
+editing is worse: it blurs value editing with schema mutation and can silently
+drift from validation rules, helper policies, workbook-view metadata, and other
+configuration.
+
+The project needs an explicit, reviewable way to perform small schema
+maintenance operations over canonical frames.
+
+==== Goals
+
+* Define a small operation vocabulary for canonical frame column maintenance.
+* Keep schema maintenance separate from ordinary workbook roundtrip editing.
+* Preserve the rule that the canonical model is authoritative.
+* Prefer fail-fast behavior over silent metadata drift.
+* Update only known, explicit metadata references; reject ambiguous cases.
+* Treat `_meta.derived` and other transient materialized-state metadata as
+  non-authoritative.
+* Require dry-run / report semantics so changes can be reviewed before
+  writing.
+* Start with the current concrete consumer shape: JSON-directory canonical
+  frames plus optional `_meta.yaml` sidecar.
+* Keep the first slice small enough for pre-`0.3.0`.
+
+==== Non-Goals
+
+This FTR does not introduce:
+
+* automatic schema inference from workbook edits;
+* arbitrary spreadsheet table discovery;
+* named ranges as table anchors;
+* multiple logical tables per sheet;
+* automatic table-region detection;
+* visible cell typing;
+* automatic migration discovery;
+* migration history;
+* migration versioning;
+* migration graphs;
+* compatibility layers;
+* automatic schema evolution during normal roundtrip;
+* a generic migration framework;
+* a generic metadata rewriting framework;
+* dynamic matrix-value column handling;
+* treating dynamic matrix axis members as schema fields;
+* FK relation redesign;
+* `split_column`;
+* `merge_columns`;
+* `move_column_between_frames`;
+* `change_fk_relation`.
+
+Unknown plugin-owned metadata is not automatically rewritten in this slice.
+Unsupported metadata references must fail clearly.
+
+==== Terminology
+
+*Canonical frame*::
+A frame that owns durable model data. For the first slice, this means a frame
+loaded from canonical JSON-directory data, with optional persistent `_meta`
+sidecar data.
+
+*Schema field*::
+A named column of a canonical frame. Examples include `characters.name`,
+`characters.persona.motto`, `stories.theme`, or `story_locations.place_id`.
+
+*Schema maintenance operation*::
+An explicit user-declared operation that changes the column shape or column
+order of a canonical frame. It is a maintenance action over the machine-near
+data base, not a normal workbook edit.
+
+*Ordinary roundtrip editing*::
+Editing values in a declared workbook projection while the configured canonical
+schema stays stable. Reimport reverses known projections and validates the
+result.
+
+*Dynamic projection column*::
+A visible workbook column that represents an axis value or projected data value
+rather than a canonical schema field. Example: a per-character matrix column in
+a story-cast matrix view.
+
+*Recognized metadata reference*::
+A metadata or configuration reference whose target frame and target column are
+known to the operation. Only recognized references may be updated
+automatically.
+
+*Unsupported reference*::
+A column reference in metadata, configuration, or plugin-owned state that the
+operation cannot update with a clear frame/column target. Unsupported
+references are failures, not warnings.
+
+==== Architecture
+
+Schema maintenance is a one-shot maintenance workflow, not ordinary pipeline
+behavior.
+
+The preferred first-slice user-facing placement is an explicit maintenance
+command surface. The operation should run against canonical data before a new
+workbook is generated or before a normal roundtrip pipeline is run.
+
+The operation semantics should live in domain-level code so they are testable
+independently from CLI parsing. If a later implementation also exposes pipeline
+steps, those steps must be explicitly maintenance-oriented and must not be
+included in ordinary roundtrip pipelines by default.
+
+The same operation semantics and report contract must back every exposed
+surface. CLI and any optional maintenance-pipeline form must not diverge.
+
+The first slice targets:
+
+* canonical JSON-directory frame files;
+* an optional `_meta.yaml` sidecar;
+* explicit user-declared operations;
+* dry-run and write modes;
+* a reviewable operation report.
+
+Spreadsheet layout, visible table geometry, named ranges, sheet order, and
+workbook header edits are not inputs to schema maintenance.
+
+==== User-Visible Behavior
+
+Every schema maintenance operation must be explicit.
+
+The user identifies:
+
+* the target canonical frame;
+* the operation kind;
+* the source and/or target column names required by that operation;
+* default value or placement options where the operation requires them;
+* whether to run dry-run or write mode.
+
+By default, the operation runs safely:
+
+* no silent inference;
+* no hidden metadata repair;
+* no best-effort rename matching;
+* no destructive update if known references cannot be handled;
+* no change to ordinary roundtrip behavior.
+
+The operation produces a report that separates at least:
+
+* frame data changes;
+* metadata/configuration changes;
+* skipped or unchanged items;
+* blocking failures.
+
+Dry-run mode must produce the same report class without writing changed data.
+
+Write mode must apply the data and metadata changes atomically at the logical
+operation level. A blocking failure means no partial write.
+
+==== Operation Definitions
+
+===== `add_column`
+
+Purpose: add a new schema field to one canonical frame.
+
+Required behavior:
+
+* Target frame must exist.
+* Target column must not already exist, unless an explicit idempotent mode is
+  included in the implementation slice.
+* The operation must write a declared default value or empty value for every
+  existing row.
+* Existing row order is preserved.
+* Existing column order is preserved except for the inserted column.
+* Placement is explicit: append by default, or insert before/after a named
+  existing column if the user declares placement.
+* No validation, FK helper, workbook-view, or presentation metadata is inferred
+  for the new column.
+
+Metadata behavior:
+
+* No metadata change is required by default.
+* Optional metadata additions are out of the first slice unless they are
+  explicitly scoped by the implementation FTR.
+* If the new column should become part of validation or helper policy, that is
+  a separate explicit configuration change.
+
+===== `drop_column`
+
+Purpose: remove an existing schema field from one canonical frame.
+
+Required behavior:
+
+* Target frame must exist.
+* Target column must exist.
+* Values in the dropped column are removed from every record.
+* Existing row order is preserved.
+* Remaining column order is preserved.
+* Dropping key columns, FK columns, discriminator columns, validation columns,
+  or configured projection columns must fail unless the implementation slice
+  defines a deliberately explicit force/prune mode.
+
+Metadata behavior:
+
+* The operation must scan known metadata/configuration references.
+* If recognized references can be pruned safely under an explicit prune mode,
+  the report must list every pruned reference.
+* If no such mode is active, references to the dropped column are blocking
+  failures.
+* FK helper-policy references are blocking failures in the first slice unless
+  an implementation FTR explicitly scopes a safe update.
+* Unknown plugin-owned references are blocking failures if detected.
+* `_meta.derived` is not an authority and must not be used to justify the
+  operation.
+
+===== `rename_column`
+
+Purpose: rename one schema field in one canonical frame while preserving
+values.
+
+Required behavior:
+
+* Target frame must exist.
+* Source column must exist.
+* Target column must not already exist.
+* Values are preserved.
+* Relative column order is preserved: the target name occupies the source
+  column's position.
+* Recognized metadata references must be updated atomically or the operation
+  must fail.
+* The report must list every updated metadata reference.
+
+Metadata behavior:
+
+* Validation references are updated only when the frame and column target are
+  unambiguous.
+* FK helper-policy references are updated only when the frame/column role is
+  unambiguous and within first-slice scope; otherwise they are blocking
+  failures.
+* Workbook-view helper/editability/presentation references are updated only
+  when they clearly target the same canonical frame.
+* Frame lifecycle and projection metadata are updated only for recognized
+  frame/column references.
+* `_meta.derived` is treated as transient materialized-state metadata. It may
+  be discarded, invalidated, or ignored per the implementation contract, but it
+  must not become the authoritative rename source.
+* Similarity matching, fuzzy rename detection, and "old header changed in the
+  workbook" inference are forbidden.
+
+===== `reorder_columns`
+
+Purpose: change the stored/reviewed column order of one canonical frame without
+changing values or schema field names.
+
+Required behavior:
+
+* Target frame must exist.
+* Requested column names must be unique.
+* Unknown column names are blocking failures.
+* The operation must either require a complete column order or support a
+  bounded partial-order mode:
+  ** `listed_first`: listed columns move to the front; omitted columns retain
+     their prior relative order.
+  ** `listed_last`: listed columns move to the end; omitted columns retain
+     their prior relative order.
+* Existing row order and all values are preserved.
+* This operation does not change dynamic matrix axis order unless the target
+  frame is itself the canonical axis frame.
+
+Metadata behavior:
+
+* Most semantic metadata is unchanged.
+* Explicit column-order metadata may be updated only where it is recognized as
+  referring to the same canonical frame.
+* Unknown explicit ordering metadata is a failure only if it would become
+  inconsistent; otherwise it is reported as unaffected.
+
+==== Metadata Rules
+
+The first implementation slice must define a concrete list of recognized
+metadata references. At minimum it must account for:
+
+* validation rules (`columns`, `target_columns`);
+* FK helper policies under `_meta.helper_policies.fk`;
+* workbook-view and sheet helper-column references;
+* frame lifecycle metadata;
+* projection metadata that stores row keys, value columns, source columns, or
+  column order;
+* `_meta.derived` transient helper provenance.
+
+Rules:
+
+. Canonical/persistent metadata is in scope for validation, update, prune, or
+  fail-fast behavior.
+. Derived/transient metadata is not authoritative. It must not be used to
+  infer user intent.
+. Unknown metadata roots are not rewritten.
+. Ambiguous references fail.
+. Detected plugin-owned references fail unless a plugin-specific reference
+  contract is explicitly registered in a later slice.
+. Every metadata mutation appears in the operation report.
+. Every metadata reference that blocks the operation appears in the operation
+  report with enough context for the user to fix it manually.
+
+==== Failure Behavior
+
+Failures are preferred over silent drift.
+
+Blocking failures include at least:
+
+* missing target frame;
+* missing source column;
+* existing target column for rename/add;
+* duplicate requested column names;
+* unknown requested column names in reorder;
+* key/FK/discriminator/validation column drop without explicit safe mode;
+* known metadata reference that cannot be updated or pruned safely;
+* ambiguous metadata reference;
+* unknown plugin-owned metadata reference that names the target column;
+* malformed `_meta` shape that prevents safe reference analysis.
+
+Warnings are allowed only for non-blocking observations that cannot change the
+result, for example an unaffected metadata root.
+
+No operation may partially write data after a blocking failure.
+
+==== Dry-Run and Report Expectations
+
+Dry-run is required for this FTR.
+
+The report must be machine-readable or otherwise structured enough for tests to
+assert:
+
+* operation kind;
+* target frame;
+* source/target columns where applicable;
+* write mode vs dry-run mode;
+* frame files that would change or changed;
+* metadata files that would change or changed;
+* metadata references updated;
+* metadata references pruned;
+* blocking failures;
+* warnings.
+
+The report should be usable in consumer review workflows before committing
+schema changes to the canonical repository.
+
+==== Validation Strategy
+
+The implementation FTR must include tests in these categories:
+
+* Operation unit tests on small frame fixtures:
+  ** success cases for all four operations;
+  ** missing source column;
+  ** duplicate target column;
+  ** duplicate requested order;
+  ** unknown ordered column;
+  ** idempotent mode only if explicitly included.
+* Metadata-reference tests:
+  ** rename updates known validation references or fails;
+  ** drop fails or prunes according to explicit mode;
+  ** FK policy references are not silently broken;
+  ** workbook-view helper references are updated or rejected;
+  ** derived/transient metadata is not treated as canonical.
+* JSON-directory integration tests:
+  ** operation over canonical JSON frames;
+  ** `_meta.yaml` sidecar handling;
+  ** dry-run does not write;
+  ** write mode produces stable output.
+* Worldbuilding-shaped fixture tests:
+  ** dotted field names such as `persona.motto` and
+     `story.learning_goal`;
+  ** relation fields such as `home_place_id`, `story_id`,
+     `character_id`;
+  ** validation and helper-policy references.
+* Guardrail tests:
+  ** operation does not read workbook layout or sheet geometry;
+  ** operation is not wired into normal roundtrip pipelines by default;
+  ** advanced table-discovery concepts are not introduced.
+
+==== Architectural Placement and Gates
+
+This FTR is expected to affect a user-visible maintenance surface. Any
+implementation slice that adds CLI commands, YAML forms, registry entries, or
+documented public behavior must pass the public-surface gate in
+`docs/ai_info/interfaces_and_gates.adoc`.
+
+If an implementation adds pipeline steps, those steps must be clearly marked as
+maintenance operations and registered in `registries/pipeline_step_registry.json`.
+They must not be presented as normal JSON↔spreadsheet roundtrip steps.
+
+If an implementation adds or changes persistent metadata roots, it must follow
+the metadata/registry slicing rules and update `registries/meta_registry.yaml`.
+
+No migration-history or compatibility-layer gate is opened by this FTR because
+those topics are non-goals.
+
+==== Acceptance Criteria
+
+* The implementation defines the four in-scope operations:
+  `add_column`, `drop_column`, `rename_column`, and `reorder_columns`.
+* Operations apply only to canonical frame columns, starting with
+  JSON-directory canonical frames and optional `_meta.yaml`.
+* Ordinary roundtrip editing remains unchanged and is explicitly documented as
+  separate from schema maintenance.
+* Dynamic projection columns are explicitly excluded from schema maintenance
+  semantics.
+* Dry-run mode exists and writes no data.
+* Write mode produces a reviewable report of frame and metadata changes.
+* Blocking failures prevent partial writes.
+* Metadata handling is fail-fast for unknown or ambiguous references.
+* `_meta.derived` and other transient metadata are not treated as authoritative
+  schema intent.
+* Tests cover the operation behavior, metadata-reference behavior,
+  JSON-directory integration, worldbuilding-shaped fixtures, and guardrails
+  listed in the validation strategy.
+* Public-surface, registry, and release-note updates are included in the
+  implementation slice if a user-visible CLI/YAML/registry surface is added.
+
+==== Related Documents
+
+* `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS-ASSESSMENT.adoc`
+* `docs/functional_model/ch05_problem_space_overview/01_bridge_and_workflow.adoc`
+* `docs/technical_model/ch04_concepts/metadata_canonical_vs_derived.adoc`
+* `docs/ai_info/architecture_primer.adoc`
+* `docs/backlog/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.adoc`
+* `docs/backlog/FTR-META-CONTRACT-VERSIONING-P4A.adoc`
+* `docs/cold_storage/backlog/ftrs_done/FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A.adoc`
+* `docs/cold_storage/backlog/ftrs_done/FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`
