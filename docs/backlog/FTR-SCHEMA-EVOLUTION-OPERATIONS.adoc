@@ -13,9 +13,18 @@ This FTR is based on the accepted assessment in
 The assessment concluded that a narrow pre-`0.3.0` FTR is justified.
 This document does not re-open that decision.
 
+==== Re-anchoring note
+
+This revision supersedes earlier wording that conflated authoritative model
+data with `json_dir` carrier storage.  The first tested workflow may use
+`json_dir` plus `_meta.yaml` because that is the currently declared
+authoritative storage workflow for the consumer shape under discussion, but
+that storage choice is not a domain rule.  Git history is sufficient for the
+previous wording; no separate active `_v1` copy is kept.
+
 ==== Purpose
 
-Define explicit one-shot schema maintenance operations for canonical frame
+Define explicit one-shot schema maintenance operations for authoritative frame
 columns:
 
 * `add_column`
@@ -23,42 +32,50 @@ columns:
 * `rename_column`
 * `reorder_columns`
 
-The goal is to give consumers a controlled workflow for intentional canonical
-model-shape changes without treating arbitrary workbook edits as schema
-evolution.
+The goal is to give consumers a controlled workflow for intentional
+model-shape maintenance without treating arbitrary workbook edits, carrier
+details, or dynamic projections as schema evolution.
 
 ==== Problem
 
-The current architecture intentionally treats the canonical model as the durable
-source of truth and workbooks as editable projections.
+The current architecture intentionally separates domain frames, workbook
+projection, spreadsheet sheets, concrete carriers, and metadata roles.
+Ordinary roundtrip editing is correct when the model shape is stable: users
+edit values through a declared projection and the system reverses known
+projections back into frames.
 
-That is correct for ordinary roundtrip editing, but it leaves a maintenance
-gap: when a user wants to intentionally change the canonical frame shape,
-manual JSON editing and ad-hoc spreadsheet header editing are both weak
-workflows.
+That leaves a maintenance gap.  When a user intentionally changes the shape of
+an authoritative frame, manual storage edits and ad-hoc spreadsheet header
+edits are both weak workflows.
 
-Manual JSON editing is possible, but it does not help with metadata references,
-review reports, or repeated updates across many records. Spreadsheet header
-editing is worse: it blurs value editing with schema mutation and can silently
-drift from validation rules, helper policies, workbook-view metadata, and other
-configuration.
+Manual storage edits are possible, but they do not help with metadata
+references, review reports, or repeated updates across many records.  Workbook
+header edits are worse: they blur value editing with schema mutation and can
+silently drift from validation rules, helper policies, workbook-view metadata,
+projection configuration, and other model intent.
 
 The project needs an explicit, reviewable way to perform small schema
-maintenance operations over canonical frames.
+maintenance operations over `Frames`.
 
 ==== Goals
 
-* Define a small operation vocabulary for canonical frame column maintenance.
+* Define a small operation vocabulary for authoritative frame column
+  maintenance.
 * Keep schema maintenance separate from ordinary workbook roundtrip editing.
-* Preserve the rule that the canonical model is authoritative.
+* Keep domain operation semantics carrier-neutral and expressed over `Frames`.
+* Keep carrier kind, artifact role, data role, and meta role distinct.
+* Use the current `json_dir` plus optional `_meta.yaml` workflow as the first
+  tested storage workflow without making it a domain rule.
+* Provide a dedicated maintenance CLI app that builds a private `BoundStep`
+  programmatically and delegates execution to `orchestrate()`.
+* Keep the private maintenance step out of the public pipeline registry,
+  registry review artifact, and normal `sheets-run` YAML surface.
 * Prefer fail-fast behavior over silent metadata drift.
-* Update only known, explicit metadata references; reject ambiguous cases.
-* Treat `_meta.derived` and other transient materialized-state metadata as
+* Update, prune, or fail recognized metadata references only under explicit
+  rules; block ambiguous or unsupported references.
+* Treat `_meta.derived` and other derived/transient metadata as
   non-authoritative.
-* Require dry-run / report semantics so changes can be reviewed before
-  writing.
-* Start with the current concrete consumer shape: JSON-directory canonical
-  frames plus optional `_meta.yaml` sidecar.
+* Require dry-run/report semantics so changes can be reviewed before writing.
 * Keep the first slice small enough for pre-`0.3.0`.
 
 ==== Non-Goals
@@ -79,8 +96,10 @@ This FTR does not introduce:
 * automatic schema evolution during normal roundtrip;
 * a generic migration framework;
 * a generic metadata rewriting framework;
+* a generic dry-run framework;
 * dynamic matrix-value column handling;
 * treating dynamic matrix axis members as schema fields;
+* ordinary roundtrip editing changes;
 * FK relation redesign;
 * `split_column`;
 * `merge_columns`;
@@ -88,71 +107,124 @@ This FTR does not introduce:
 * `change_fk_relation`.
 
 Unknown plugin-owned metadata is not automatically rewritten in this slice.
-Unsupported metadata references must fail clearly.
+Plugin-owned metadata blocks only when the operation detects a structured
+frame/column reference that targets the affected column.  Generic string-search
+detection and heuristic rewrite are out of scope.  Unsupported metadata
+references must fail clearly.
 
 ==== Terminology
 
-*Canonical frame*::
-A frame that owns durable model data. For the first slice, this means a frame
-loaded from canonical JSON-directory data, with optional persistent `_meta`
-sidecar data.
+Frame::
+A domain-level tabular data object carried in `Frames`, keyed by frame name.
+A frame is not a workbook sheet and is not a persistence carrier.
 
-*Schema field*::
-A named column of a canonical frame. Examples include `characters.name`,
-`characters.persona.motto`, `stories.theme`, or `story_locations.place_id`.
+Authoritative frame::
+A frame whose data role is to hold the durable model data being maintained.
+The first implementation may load such frames from `json_dir`, but the
+operation semantics are defined for `Frames`, not for JSON files.
 
-*Schema maintenance operation*::
+Schema field::
+A named column of an authoritative frame.  Examples include
+`characters.name`, `characters.persona.motto`, `stories.theme`, or
+`story_locations.place_id`.
+
+Schema maintenance operation::
 An explicit user-declared operation that changes the column shape or column
-order of a canonical frame. It is a maintenance action over the machine-near
-data base, not a normal workbook edit.
+order of an authoritative frame.  It is a maintenance action over the
+machine-near model data, not a normal workbook edit.
 
-*Ordinary roundtrip editing*::
-Editing values in a declared workbook projection while the configured canonical
-schema stays stable. Reimport reverses known projections and validates the
+Carrier kind::
+The concrete I/O backend kind used in an `orchestrate()` descriptor, such as
+`json_dir`, `yaml_dir`, `xlsx`, or `ods`.  Carrier kind is an I/O choice and
+must not decide domain semantics.
+
+Artifact role::
+The role a concrete artifact plays in a workflow, for example input storage,
+output storage, or an operation report.  Artifact role is distinct from carrier
+kind: a `json_dir` may be an input or output artifact, and the report is a
+review artifact rather than frame data.
+
+Data role::
+The role a frame or column plays in the data model, for example authoritative
+frame, relation frame, key column, FK column, discriminator column, or dynamic
+projection column.
+
+Meta role::
+The role of metadata according to the meta-system vocabulary: canonical meta
+claims express authoritative intent; derived meta describes recomputable
+current-run or carrier-near state; operational-carrier shape is a storage form
+for meta.  These roles do not make carrier storage itself authoritative data.
+
+Ordinary roundtrip editing::
+Editing values in a declared workbook projection while the configured model
+schema stays stable.  Reimport reverses known projections and validates the
 result.
 
-*Dynamic projection column*::
+Dynamic projection column::
 A visible workbook column that represents an axis value or projected data value
-rather than a canonical schema field. Example: a per-character matrix column in
-a story-cast matrix view.
+rather than a schema field.  Example: a per-character matrix column in a
+story-cast matrix view.
 
-*Recognized metadata reference*::
+Recognized metadata reference::
 A metadata or configuration reference whose target frame and target column are
-known to the operation. Only recognized references may be updated
+known to the operation.  Only recognized references may be updated or pruned
 automatically.
 
-*Unsupported reference*::
+Unsupported reference::
 A column reference in metadata, configuration, or plugin-owned state that the
-operation cannot update with a clear frame/column target. Unsupported
-references are failures, not warnings.
+operation cannot update with a clear frame/column target and an explicit rule.
+Unsupported references are failures, not warnings.
+
+SchemaMaintenanceResult::
+The domain operation result shape:
+`SchemaMaintenanceResult(frames, report)`.  `frames` is the updated `Frames`
+payload.  `report` is a structured maintenance report.  The report is not a
+frame and must not be stored in `_meta`.
 
 ==== Architecture
 
 Schema maintenance is a one-shot maintenance workflow, not ordinary pipeline
 behavior.
 
-The preferred first-slice user-facing placement is an explicit maintenance
-command surface. The operation should run against canonical data before a new
-workbook is generated or before a normal roundtrip pipeline is run.
+The operation semantics live in domain-level code and operate on `Frames`.
+They do not read workbook layout, sheet geometry, named ranges, spreadsheet
+headers, backend objects, or carrier files directly.  Domain operations return
+`SchemaMaintenanceResult(frames, report)`.
 
-The operation semantics should live in domain-level code so they are testable
-independently from CLI parsing. If a later implementation also exposes pipeline
-steps, those steps must be explicitly maintenance-oriented and must not be
-included in ordinary roundtrip pipelines by default.
+The first user-facing surface is a dedicated maintenance CLI app.  The CLI app
+must:
 
-The same operation semantics and report contract must back every exposed
-surface. CLI and any optional maintenance-pipeline form must not diverge.
+* parse maintenance-specific user arguments;
+* build normal `orchestrate()` input and output descriptors;
+* build a private `BoundStep` programmatically;
+* call `orchestrate(input=..., output=..., steps=[...])`;
+* collect the domain report through a local collector owned by the CLI call;
+* write or print the report as a review artifact outside `Frames` and outside
+  `_meta`.
 
-The first slice targets:
+The private `BoundStep` adapts the domain result to the pipeline contract:
+`Frames -> Frames`.  Its closure calls the domain operation, stores the
+returned report in the CLI-local collector, and returns only
+`SchemaMaintenanceResult.frames` to the orchestrator.
 
-* canonical JSON-directory frame files;
-* an optional `_meta.yaml` sidecar;
-* explicit user-declared operations;
-* dry-run and write modes;
-* a reviewable operation report.
+The private maintenance step must not be registered in
+`pipeline.REGISTRY`, must not be added to
+`registries/pipeline_step_registry.json`, and must not be addressable from
+normal `sheets-run` YAML.  The dedicated CLI is the public maintenance surface
+for this slice.
 
-Spreadsheet layout, visible table geometry, named ranges, sheet order, and
-workbook header edits are not inputs to schema maintenance.
+The first tested workflow may use:
+
+* `input: {kind: json_dir, path: ...}`;
+* optional `_meta.yaml` sidecar loaded by the JSON-directory backend;
+* `output: {kind: json_dir, path: ...}` for write mode.
+
+Those are workflow and adapter choices.  They do not change the domain rule:
+schema maintenance operations are carrier-neutral operations over `Frames`.
+
+Spreadsheet layout, visible table geometry, named ranges, sheet order,
+workbook header edits, and backend carrier details are not inputs to schema
+maintenance.
 
 ==== User-Visible Behavior
 
@@ -160,11 +232,12 @@ Every schema maintenance operation must be explicit.
 
 The user identifies:
 
-* the target canonical frame;
+* the target frame;
 * the operation kind;
 * the source and/or target column names required by that operation;
 * default value or placement options where the operation requires them;
-* whether to run dry-run or write mode.
+* whether to run dry-run or write mode;
+* where the report should be emitted, if the CLI supports report output paths.
 
 By default, the operation runs safely:
 
@@ -174,23 +247,37 @@ By default, the operation runs safely:
 * no destructive update if known references cannot be handled;
 * no change to ordinary roundtrip behavior.
 
-The operation produces a report that separates at least:
+The operation produces a structured report that separates at least:
 
+* requested operation and target frame;
 * frame data changes;
 * metadata/configuration changes;
+* reference updates, prunes, and blockers;
 * skipped or unchanged items;
-* blocking failures.
+* blocking failures;
+* warnings.
 
-Dry-run mode must produce the same report class without writing changed data.
+The domain report records frame, metadata, and reference changes.  The emitted
+CLI report may enrich that domain report with carrier, input, and output
+artifact descriptors.  The report is a maintenance review artifact.  It is not
+a frame, not a sheet, not model data, and not persisted under `_meta`.
 
-Write mode must apply the data and metadata changes atomically at the logical
-operation level. A blocking failure means no partial write.
+Dry-run is implemented by routing the orchestrator output to an output-only
+null/discard saver or an equivalent orchestrator-compatible output sink.  This
+is an implementation direction for this CLI path, not a generic dry-run
+framework.  Dry-run must still execute the private step and produce the same
+report class without writing changed storage artifacts.
+
+Write mode must detect blocking failures before writing to the user-selected
+output.  "No partial write" means no user-selected output write after blocking
+failures are detected.  Filesystem-transactional replacement is not required
+by this FTR unless separately scoped.
 
 ==== Operation Definitions
 
 ===== `add_column`
 
-Purpose: add a new schema field to one canonical frame.
+Purpose: add a new schema field to one authoritative frame.
 
 Required behavior:
 
@@ -216,7 +303,7 @@ Metadata behavior:
 
 ===== `drop_column`
 
-Purpose: remove an existing schema field from one canonical frame.
+Purpose: remove an existing schema field from one authoritative frame.
 
 Required behavior:
 
@@ -231,20 +318,21 @@ Required behavior:
 
 Metadata behavior:
 
-* The operation must scan known metadata/configuration references.
+* The operation must scan recognized metadata/configuration references.
 * If recognized references can be pruned safely under an explicit prune mode,
   the report must list every pruned reference.
 * If no such mode is active, references to the dropped column are blocking
   failures.
 * FK helper-policy references are blocking failures in the first slice unless
   an implementation FTR explicitly scopes a safe update.
-* Unknown plugin-owned references are blocking failures if detected.
+* Unknown plugin-owned references are blocking failures only when detected as
+  structured frame/column references to the target column.
 * `_meta.derived` is not an authority and must not be used to justify the
   operation.
 
 ===== `rename_column`
 
-Purpose: rename one schema field in one canonical frame while preserving
+Purpose: rename one schema field in one authoritative frame while preserving
 values.
 
 Required behavior:
@@ -267,10 +355,10 @@ Metadata behavior:
   unambiguous and within first-slice scope; otherwise they are blocking
   failures.
 * Workbook-view helper/editability/presentation references are updated only
-  when they clearly target the same canonical frame.
+  when they clearly target the same authoritative frame.
 * Frame lifecycle and projection metadata are updated only for recognized
   frame/column references.
-* `_meta.derived` is treated as transient materialized-state metadata. It may
+* `_meta.derived` is treated as transient materialized-state metadata.  It may
   be discarded, invalidated, or ignored per the implementation contract, but it
   must not become the authoritative rename source.
 * Similarity matching, fuzzy rename detection, and "old header changed in the
@@ -278,8 +366,8 @@ Metadata behavior:
 
 ===== `reorder_columns`
 
-Purpose: change the stored/reviewed column order of one canonical frame without
-changing values or schema field names.
+Purpose: change the stored/reviewed column order of one authoritative frame
+without changing values or schema field names.
 
 Required behavior:
 
@@ -294,20 +382,20 @@ Required behavior:
      their prior relative order.
 * Existing row order and all values are preserved.
 * This operation does not change dynamic matrix axis order unless the target
-  frame is itself the canonical axis frame.
+  frame is itself the authoritative axis frame.
 
 Metadata behavior:
 
 * Most semantic metadata is unchanged.
 * Explicit column-order metadata may be updated only where it is recognized as
-  referring to the same canonical frame.
+  referring to the same authoritative frame.
 * Unknown explicit ordering metadata is a failure only if it would become
   inconsistent; otherwise it is reported as unaffected.
 
 ==== Metadata Rules
 
 The first implementation slice must define a concrete list of recognized
-metadata references. At minimum it must account for:
+metadata references.  At minimum it must account for:
 
 * validation rules (`columns`, `target_columns`);
 * FK helper policies under `_meta.helper_policies.fk`;
@@ -321,12 +409,15 @@ Rules:
 
 . Canonical/persistent metadata is in scope for validation, update, prune, or
   fail-fast behavior.
-. Derived/transient metadata is not authoritative. It must not be used to
+. Derived/transient metadata is not authoritative.  It must not be used to
   infer user intent.
+. `_meta.derived` may be dropped, invalidated, or ignored only under explicit
+  implementation rules; it is never the source of truth for a schema operation.
 . Unknown metadata roots are not rewritten.
 . Ambiguous references fail.
-. Detected plugin-owned references fail unless a plugin-specific reference
-  contract is explicitly registered in a later slice.
+. Detected plugin-owned structured frame/column references fail unless a
+  plugin-specific reference contract is explicitly registered in a later slice.
+  Generic string-search detection and heuristic rewrite are forbidden.
 . Every metadata mutation appears in the operation report.
 . Every metadata reference that blocks the operation appears in the operation
   report with enough context for the user to fix it manually.
@@ -345,13 +436,16 @@ Blocking failures include at least:
 * key/FK/discriminator/validation column drop without explicit safe mode;
 * known metadata reference that cannot be updated or pruned safely;
 * ambiguous metadata reference;
-* unknown plugin-owned metadata reference that names the target column;
+* unknown plugin-owned structured frame/column reference that targets the
+  affected column;
 * malformed `_meta` shape that prevents safe reference analysis.
 
 Warnings are allowed only for non-blocking observations that cannot change the
 result, for example an unaffected metadata root.
 
-No operation may partially write data after a blocking failure.
+No operation may write to the user-selected output after a blocking failure has
+been detected.  This FTR does not require filesystem-transactional replacement
+for writes unless a later implementation slice explicitly scopes it.
 
 ==== Dry-Run and Report Expectations
 
@@ -364,21 +458,27 @@ assert:
 * target frame;
 * source/target columns where applicable;
 * write mode vs dry-run mode;
-* frame files that would change or changed;
-* metadata files that would change or changed;
+* frame changes that would be applied or were applied;
+* metadata changes that would be applied or were applied;
 * metadata references updated;
 * metadata references pruned;
 * blocking failures;
 * warnings.
 
+These are domain report expectations.  The CLI may enrich the emitted report
+with review-safe carrier, input, output, and storage artifact descriptors.
+
 The report should be usable in consumer review workflows before committing
-schema changes to the canonical repository.
+schema changes to the authoritative storage repository.
+
+The report must not be encoded as a frame, injected into `Frames`, stored as a
+sheet, or persisted under `_meta`.
 
 ==== Validation Strategy
 
 The implementation FTR must include tests in these categories:
 
-* Operation unit tests on small frame fixtures:
+* Operation unit tests on small `Frames` fixtures:
   ** success cases for all four operations;
   ** missing source column;
   ** duplicate target column;
@@ -390,12 +490,24 @@ The implementation FTR must include tests in these categories:
   ** drop fails or prunes according to explicit mode;
   ** FK policy references are not silently broken;
   ** workbook-view helper references are updated or rejected;
-  ** derived/transient metadata is not treated as canonical.
-* JSON-directory integration tests:
-  ** operation over canonical JSON frames;
+  ** derived/transient metadata is not treated as authoritative.
+* `json_dir` integration tests for the first declared workflow:
+  ** operation over frames loaded from JSON-directory storage;
   ** `_meta.yaml` sidecar handling;
-  ** dry-run does not write;
+  ** dry-run uses a null/discard output sink or equivalent
+     orchestrator-compatible saver and does not write storage artifacts;
   ** write mode produces stable output.
+* Dedicated maintenance CLI tests:
+  ** CLI delegates to `orchestrate()`;
+  ** CLI builds a private `BoundStep` programmatically;
+  ** local collector captures the `SchemaMaintenanceResult.report`;
+  ** report is emitted outside `Frames` and outside `_meta`.
+* Registry and YAML guardrail tests:
+  ** private schema-maintenance step is not in `pipeline.REGISTRY`;
+  ** private schema-maintenance step is not in
+     `registries/pipeline_step_registry.json`;
+  ** private schema-maintenance step is not addressable from normal
+     `sheets-run` YAML.
 * Worldbuilding-shaped fixture tests:
   ** dotted field names such as `persona.motto` and
      `story.learning_goal`;
@@ -404,22 +516,28 @@ The implementation FTR must include tests in these categories:
   ** validation and helper-policy references.
 * Guardrail tests:
   ** operation does not read workbook layout or sheet geometry;
-  ** operation is not wired into normal roundtrip pipelines by default;
+  ** ordinary roundtrip editing behavior is unchanged;
+  ** dynamic projection columns are not treated as schema fields;
   ** advanced table-discovery concepts are not introduced.
 
 ==== Architectural Placement and Gates
 
-This FTR is expected to affect a user-visible maintenance surface. Any
-implementation slice that adds CLI commands, YAML forms, registry entries, or
-documented public behavior must pass the public-surface gate in
+This FTR is expected to affect a user-visible maintenance CLI surface.  Any
+implementation slice that adds CLI commands, flags, or documented public
+behavior must pass the public-surface gate in
 `docs/ai_info/interfaces_and_gates.adoc`.
 
-If an implementation adds pipeline steps, those steps must be clearly marked as
-maintenance operations and registered in `registries/pipeline_step_registry.json`.
-They must not be presented as normal JSON↔spreadsheet roundtrip steps.
+This FTR does not authorize a public pipeline step.  The implementation must
+not register the private schema-maintenance step in `pipeline.REGISTRY`, must
+not add it to `registries/pipeline_step_registry.json`, and must not expose it
+through normal `sheets-run` YAML.
+
+If a later FTR wants a YAML-addressable maintenance pipeline form, that later
+FTR must explicitly re-open the registry and public YAML surface question.
 
 If an implementation adds or changes persistent metadata roots, it must follow
-the metadata/registry slicing rules and update `registries/meta_registry.yaml`.
+the metadata/registry slicing rules and update the relevant metadata registry
+artifacts in that implementation slice.
 
 No migration-history or compatibility-layer gate is opened by this FTR because
 those topics are non-goals.
@@ -428,30 +546,52 @@ those topics are non-goals.
 
 * The implementation defines the four in-scope operations:
   `add_column`, `drop_column`, `rename_column`, and `reorder_columns`.
-* Operations apply only to canonical frame columns, starting with
-  JSON-directory canonical frames and optional `_meta.yaml`.
+* Domain operations are carrier-neutral and operate on `Frames`.
+* Domain operations return `SchemaMaintenanceResult(frames, report)`.
+* The schema maintenance report is not a frame and is not stored in `_meta`.
+* The private `BoundStep` adapts `SchemaMaintenanceResult` to `Frames ->
+  Frames`, and the CLI captures the report via a local collector.
+* The maintenance surface is a dedicated CLI app that builds the private
+  `BoundStep` programmatically and calls `orchestrate()`.
+* The private schema-maintenance step is not registered in `pipeline.REGISTRY`.
+* The private schema-maintenance step is not added to
+  `registries/pipeline_step_registry.json`.
+* The private schema-maintenance step is not addressable from normal
+  `sheets-run` YAML.
+* The first tested storage workflow may use `json_dir` plus optional
+  `_meta.yaml`, but carrier kind is not a domain rule.
 * Ordinary roundtrip editing remains unchanged and is explicitly documented as
   separate from schema maintenance.
 * Dynamic projection columns are explicitly excluded from schema maintenance
   semantics.
-* Dry-run mode exists and writes no data.
+* Dry-run uses an output-only null/discard saver or equivalent
+  orchestrator-compatible output sink and writes no changed storage artifacts.
 * Write mode produces a reviewable report of frame and metadata changes.
-* Blocking failures prevent partial writes.
-* Metadata handling is fail-fast for unknown or ambiguous references.
-* `_meta.derived` and other transient metadata are not treated as authoritative
-  schema intent.
-* Tests cover the operation behavior, metadata-reference behavior,
-  JSON-directory integration, worldbuilding-shaped fixtures, and guardrails
-  listed in the validation strategy.
-* Public-surface, registry, and release-note updates are included in the
-  implementation slice if a user-visible CLI/YAML/registry surface is added.
+* Blocking failures prevent writes to the user-selected output after failure
+  detection; filesystem-transactional replacement is not required unless
+  separately scoped.
+* Metadata handling is fail-fast for unknown, ambiguous, or unsupported
+  references.
+* Recognized references are updated, pruned, or failed according to explicit
+  rules.
+* `_meta.derived` and other transient metadata are not treated as
+  authoritative schema intent.
+* Tests cover operation behavior, metadata-reference behavior, the first
+  `json_dir` workflow, dedicated CLI behavior, registry/YAML guardrails,
+  worldbuilding-shaped fixtures, and the guardrails listed in the validation
+  strategy.
+* Public-surface and release-note updates are included in the implementation
+  slice if the dedicated CLI surface is added.
 
 ==== Related Documents
 
 * `docs/backlog/FTR-SCHEMA-EVOLUTION-OPERATIONS-ASSESSMENT.adoc`
 * `docs/functional_model/ch05_problem_space_overview/01_bridge_and_workflow.adoc`
 * `docs/technical_model/ch04_concepts/metadata_canonical_vs_derived.adoc`
-* `docs/ai_info/architecture_primer.adoc`
+* `docs/technical_model/ch06_architectural_layers/architectural_layers.adoc`
+* `docs/technical_model/ch09_glossary/01_terms.adoc`
+* `docs/technical_model/ch08_architecture_details/cli_shortcut_pattern.adoc`
+* `docs/ai_info/interfaces_and_gates.adoc`
 * `docs/backlog/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A.adoc`
 * `docs/backlog/FTR-META-CONTRACT-VERSIONING-P4A.adoc`
 * `docs/cold_storage/backlog/ftrs_done/FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A.adoc`
