@@ -25,7 +25,7 @@ from spreadsheet_handling.domain.finding_frame import (
     findings_to_frame,
     simple_failure_message,
 )
-from spreadsheet_handling.domain.transformations.fk_helpers.policy import (
+from spreadsheet_handling.domain.transformations.fk_helpers import (
     resolve_v2_fk_relations,
 )
 
