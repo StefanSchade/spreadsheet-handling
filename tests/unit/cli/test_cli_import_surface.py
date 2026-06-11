@@ -12,13 +12,13 @@ pytestmark = pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3")
 def test_cli_package_exports_only_intentional_mains() -> None:
     assert set(cli.__all__) == {
         "run_main",
-        "example_json_to_xlsx_main",
-        "example_xlsx_to_json_main",
+        "schema_maintain_main",
     }
 
     assert callable(cli.run_main)
-    assert callable(cli.example_json_to_xlsx_main)
-    assert callable(cli.example_xlsx_to_json_main)
+    assert callable(cli.schema_maintain_main)
+    assert not hasattr(cli, "example_json_to_xlsx_main")
+    assert not hasattr(cli, "example_xlsx_to_json_main")
     assert not hasattr(cli, "pack_main")
     assert not hasattr(cli, "unpack_main")
     assert not hasattr(cli, "pack")
@@ -26,13 +26,19 @@ def test_cli_package_exports_only_intentional_mains() -> None:
 
 
 def test_project_scripts_register_current_cli_surface_only() -> None:
-    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    import tomllib
 
-    assert "sheets-run" in pyproject
-    assert "sheets-example-json-to-xlsx" in pyproject
-    assert "sheets-example-xlsx-to-json" in pyproject
-    assert "sheets-pack" not in pyproject
-    assert "sheets-unpack" not in pyproject
+    pyproject_data = tomllib.loads(
+        Path("pyproject.toml").read_text(encoding="utf-8")
+    )
+    scripts = pyproject_data["project"]["scripts"]
+
+    assert scripts == {
+        "sheets-run": "spreadsheet_handling.cli.apps.run:cli_entry",
+        "sheets-schema-maintain": (
+            "spreadsheet_handling.cli.apps.schema_maintain:cli_entry"
+        ),
+    }
 
 
 def test_sheets_run_entry_point_routes_through_cli_entry() -> None:
