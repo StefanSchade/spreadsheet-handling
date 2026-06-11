@@ -2,16 +2,15 @@
 
 Slice 1 of FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A.
 
-This step consumes the transient ``_meta.derived`` channel in-memory, before
-``drop_helpers`` cleanup, within a single pipeline run.  It drops
-helper/derived columns from a payload frame using only registered provenance
-(no column-name heuristics) and, in the mismatch policies, value-checks
-``enrich_lookup`` helpers against their source lookup frame.
+This step consumes registered helper identity from transient
+``_meta.derived`` provenance and durable metadata fallbacks.  It drops
+helper/derived columns from a payload frame without column-name heuristics
+and, in the mismatch policies, value-checks ``enrich_lookup`` helpers against
+their source lookup frame.
 
-FK ``helper_columns`` are dropped but not value-checked in this slice because
-FK provenance does not record the target key column.  Durable file->frame
-reimport, sheet->frame view mapping, and derived-provenance persistence are
-deferred (see the FTR backlog note).
+FK ``helper_columns`` are dropped but not value-checked in this slice. Durable
+file->frame reimport, sheet->frame view mapping, and derived-provenance
+persistence are deferred (see the FTR backlog note).
 """
 from __future__ import annotations
 
@@ -25,6 +24,9 @@ from spreadsheet_handling.domain.finding_frame import (
     Finding,
     findings_to_frame,
     simple_failure_message,
+)
+from spreadsheet_handling.domain.transformations.fk_helpers.policy import (
+    resolve_v2_fk_relations,
 )
 
 Frames = dict[str, Any]
@@ -60,9 +62,10 @@ def apply_derived_column_policy(
     Helper identity is resolved from transient ``_meta.derived.sheets[source]``
     when available. If that runtime provenance has already been stripped at a
     persistence boundary, ``policy: drop`` also honors durable workbook-view
-    helper declarations at ``_meta.sheets[source].helper_columns``. Those
-    durable declarations identify columns only; mismatch value checks remain
-    limited to the richer ``_meta.derived`` provenance.
+    helper declarations at ``_meta.sheets[source].helper_columns`` and FK
+    helper policy under ``_meta.helper_policies.fk``. Those fallback
+    declarations identify columns only; mismatch value checks remain limited
+    to the richer ``_meta.derived`` provenance.
     """
     del name
     policy = _valid_policy(policy)
@@ -71,6 +74,7 @@ def apply_derived_column_policy(
     meta = frames.get(META_KEY) or {}
     sheet_meta = _safe_sheet_meta(meta, source)
     durable_helper_names = _safe_durable_helper_names(meta, source)
+    policy_helper_names = _safe_policy_helper_names(frames, source)
 
     lookup_frames = {
         key: value
@@ -84,7 +88,7 @@ def apply_derived_column_policy(
         derived_meta=sheet_meta,
         lookup_frames=lookup_frames,
         policy=policy,
-        durable_helper_names=durable_helper_names,
+        durable_helper_names=durable_helper_names | policy_helper_names,
     )
 
     failures = [finding for finding in found if finding.severity == "fail"]
@@ -262,6 +266,63 @@ def _safe_durable_helper_names(meta: Mapping[str, Any], source: str) -> set[str]
     if not isinstance(raw_helper_columns, (list, tuple)):
         raise ValueError(f"_meta.sheets[{source!r}].helper_columns must be a list")
     return {str(column) for column in raw_helper_columns if str(column)}
+
+
+def _safe_policy_helper_names(frames: Mapping[str, Any], source: str) -> set[str]:
+    """Return FK helper columns declared for ``source``.
+
+    The policy fallback is intentionally metadata-driven. It does not infer
+    helper identity from column names, so unrelated underscore-prefixed columns
+    remain payload.
+    """
+    helper_names = _v1_policy_helper_names(frames, source)
+    relations = resolve_v2_fk_relations(dict(frames))
+    if not relations:
+        return helper_names
+    for relation in relations:
+        if str(relation.get("source_frame") or "") != source:
+            continue
+        for entry in relation.get("helper_columns") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            column = entry.get("column")
+            if column:
+                helper_names.add(str(column))
+    return helper_names
+
+
+def _v1_policy_helper_names(frames: Mapping[str, Any], source: str) -> set[str]:
+    meta = frames.get(META_KEY)
+    if not isinstance(meta, Mapping):
+        return set()
+    helper_policies = meta.get("helper_policies")
+    if not isinstance(helper_policies, Mapping):
+        return set()
+    fk_policies = helper_policies.get("fk")
+    if not isinstance(fk_policies, Mapping):
+        return set()
+
+    source_frame = frames.get(source)
+    source_columns = {
+        _visible_label(column)
+        for column in getattr(source_frame, "columns", [])
+    }
+    if not source_columns:
+        return set()
+
+    helper_names: set[str] = set()
+    for target_name, policy in fk_policies.items():
+        if not isinstance(policy, Mapping):
+            continue
+        fk_column = str(policy.get("fk_column") or "")
+        if not fk_column or fk_column not in source_columns:
+            continue
+        target_frame = str(policy.get("target_sheet") or policy.get("target") or target_name)
+        raw_prefix = policy.get("helper_prefix")
+        helper_prefix = "_" if raw_prefix is None else str(raw_prefix)
+        for field in policy.get("default_helpers") or []:
+            helper_names.add(f"{helper_prefix}{target_frame}_{str(field)}")
+    return helper_names
 
 
 def _strip_consumed_provenance(meta: Mapping[str, Any], source: str) -> dict[str, Any]:

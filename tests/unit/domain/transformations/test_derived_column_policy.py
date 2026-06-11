@@ -134,6 +134,82 @@ def test_durable_helper_cleanup_preserves_non_helper_columns() -> None:
     assert list(out["orders"].columns) == ["order_id", "customer_id", "_manual_note"]
 
 
+@pytest.mark.ftr("BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A")
+def test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary() -> None:
+    frames = {
+        "_meta": {
+            "helper_policies": {
+                "fk": {
+                    "schema_version": 2,
+                    "relations": [
+                        {
+                            "source_frame": "groups",
+                            "source_column": "home_place_id",
+                            "target_frame": "places",
+                            "target_key": "id",
+                            "helper_columns": [
+                                {
+                                    "column": "_places_name",
+                                    "target_field": "name",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        },
+        "groups": pd.DataFrame(
+            [
+                {
+                    "id": "GROUP-0001",
+                    "home_place_id": "PLACE-0007",
+                    "_places_name": "Microraptorenwald",
+                    "_manual_note": "keep",
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="groups", policy="drop")
+
+    assert list(out["groups"].columns) == ["id", "home_place_id", "_manual_note"]
+    assert "_places_name" in frames["groups"].columns
+
+
+@pytest.mark.ftr("BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A")
+def test_durable_fk_policy_fallback_drops_declared_helpers() -> None:
+    frames = {
+        "_meta": {
+            "helper_policies": {
+                "fk": {
+                    "places": {
+                        "key": "id",
+                        "target": "places",
+                        "target_sheet": "places",
+                        "fk_column": "home_place_id",
+                        "helper_prefix": "_",
+                        "default_helpers": ["name"],
+                    }
+                }
+            }
+        },
+        "groups": pd.DataFrame(
+            [
+                {
+                    "id": "GROUP-0001",
+                    "home_place_id": "PLACE-0007",
+                    "_places_name": "Microraptorenwald",
+                    "_manual_note": "keep",
+                }
+            ]
+        ),
+    }
+
+    out = apply_derived_column_policy(frames, source="groups", policy="drop")
+
+    assert list(out["groups"].columns) == ["id", "home_place_id", "_manual_note"]
+
+
 def test_unchanged_lookup_helper_warn_mode_emits_no_findings() -> None:
     frames = _frames_with_fk_and_lookup_helpers()
 
