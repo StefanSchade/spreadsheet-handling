@@ -27,7 +27,8 @@ def add_validations(frames: Frames, *, rules: list[dict[str, Any]]) -> Frames:
         meta = {}
         where = "temp"
 
-    constraints = list(meta.get("constraints") or [])
+    existing_constraints = list(meta.get("constraints") or [])
+    generated_constraints: list[dict[str, Any]] = []
     for raw_rule in rules:
         target = _normalize_target(raw_rule)
         rule = (raw_rule.get("rule") or {})
@@ -55,9 +56,9 @@ def add_validations(frames: Frames, *, rules: list[dict[str, Any]]) -> Frames:
             }
             if target.get("area") is not None:
                 constraint["area"] = target.get("area")
-            constraints.append(constraint)
+            generated_constraints.append(constraint)
 
-    meta["constraints"] = constraints
+    meta["constraints"] = _merge_constraints(existing_constraints, generated_constraints)
 
     if where == "attr":
         frames.meta = meta
@@ -65,6 +66,69 @@ def add_validations(frames: Frames, *, rules: list[dict[str, Any]]) -> Frames:
         frames["_meta"] = meta
 
     return frames
+
+
+def _merge_constraints(
+    existing: list[Any],
+    generated: list[dict[str, Any]],
+) -> list[Any]:
+    """Merge generated constraints idempotently by concrete constraint shape.
+
+    Reused generated ``_meta.yaml`` sidecars can feed previous constraints
+    back into ``add_validations``.  The step should not append the same
+    concrete workbook constraint again, but it must preserve unrelated
+    constraints and distinct rules.
+    """
+    generated_ids = {_constraint_identity(constraint) for constraint in generated}
+    present_generated_ids: set[tuple[Any, ...]] = set()
+    merged: list[Any] = []
+
+    for constraint in existing:
+        identity = _constraint_identity(constraint)
+        if identity in generated_ids:
+            if identity in present_generated_ids:
+                continue
+            present_generated_ids.add(identity)
+        merged.append(constraint)
+
+    for constraint in generated:
+        identity = _constraint_identity(constraint)
+        if identity in present_generated_ids:
+            continue
+        present_generated_ids.add(identity)
+        merged.append(constraint)
+
+    return merged
+
+
+def _constraint_identity(constraint: Any) -> tuple[Any, ...]:
+    if not isinstance(constraint, Mapping):
+        return ("raw", _freeze(constraint))
+
+    parts: list[tuple[str, Any]] = [
+        ("sheet", _freeze(constraint.get("sheet"))),
+        ("column", _freeze(constraint.get("column"))),
+        ("rule", _freeze(constraint.get("rule"))),
+        ("on_violation", _freeze(constraint.get("on_violation"))),
+    ]
+    if "area" in constraint:
+        parts.append(("area", _freeze(constraint.get("area"))))
+    return tuple(parts)
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _freeze(item))
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return tuple(_freeze(item) for item in value)
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
 
 
 def _normalize_target(rule: Mapping[str, Any]) -> dict[str, Any]:

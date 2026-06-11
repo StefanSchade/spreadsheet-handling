@@ -291,3 +291,219 @@ def test_explicit_frame_overrides_workbook_view_mapping() -> None:
             "on_violation": "error",
         }
     ]
+
+
+@pytest.mark.ftr("BUG-GENERATED-META-CONSTRAINT-ACCUMULATION-P4A")
+def test_flat_add_validations_deduplicates_existing_generated_constraint() -> None:
+    frames: dict[str, object] = {
+        "_meta": {
+            "constraints": [
+                {
+                    "sheet": "audit",
+                    "column": "status",
+                    "rule": {"type": "in_list", "values": ["legacy"]},
+                    "on_violation": "warn",
+                },
+                {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "rule": {"type": "in_list", "values": ["animal_group"]},
+                    "on_violation": "error",
+                },
+                {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "rule": {"values": ["animal_group"], "type": "in_list"},
+                    "on_violation": "error",
+                },
+            ]
+        }
+    }
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "sheet": "groups",
+                "column": "kind",
+                "rule": {"type": "in_list", "values": ["animal_group"]},
+            }
+        ],
+    )
+
+    assert frames["_meta"]["constraints"] == [
+        {
+            "sheet": "audit",
+            "column": "status",
+            "rule": {"type": "in_list", "values": ["legacy"]},
+            "on_violation": "warn",
+        },
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["animal_group"]},
+            "on_violation": "error",
+        },
+    ]
+
+
+@pytest.mark.ftr("BUG-GENERATED-META-CONSTRAINT-ACCUMULATION-P4A")
+def test_role_targeted_add_validations_deduplicates_expanded_constraints() -> None:
+    frames = _matrix_frames()
+    existing = [
+        {
+            "sheet": "story_groups",
+            "column": "Alpha",
+            "rule": {
+                "include_empty": True,
+                "legend": "story_group_codes",
+                "type": "from_legend",
+            },
+            "on_violation": "error",
+        },
+        {
+            "sheet": "story_groups",
+            "column": "Alpha",
+            "rule": {
+                "type": "from_legend",
+                "legend": "story_group_codes",
+                "include_empty": True,
+            },
+            "on_violation": "error",
+        },
+        {
+            "sheet": "story_groups",
+            "column": "Beta",
+            "rule": {
+                "type": "from_legend",
+                "legend": "story_group_codes",
+                "include_empty": True,
+            },
+            "on_violation": "error",
+        },
+    ]
+    frames["_meta"]["constraints"] = existing
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "target": {
+                    "sheet": "story_groups",
+                    "roles": ["matrix_value"],
+                },
+                "rule": {
+                    "type": "from_legend",
+                    "legend": "story_group_codes",
+                    "include_empty": True,
+                },
+            }
+        ],
+    )
+
+    assert [constraint["column"] for constraint in frames["_meta"]["constraints"]] == [
+        "Alpha",
+        "Beta",
+    ]
+
+
+@pytest.mark.ftr("BUG-GENERATED-META-CONSTRAINT-ACCUMULATION-P4A")
+def test_add_validations_preserves_distinct_rules_for_same_column() -> None:
+    frames: dict[str, object] = {
+        "_meta": {
+            "constraints": [
+                {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "rule": {"type": "in_list", "values": ["animal_group"]},
+                    "on_violation": "error",
+                }
+            ]
+        }
+    }
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "sheet": "groups",
+                "column": "kind",
+                "rule": {"type": "in_list", "values": ["mythic_group"]},
+            }
+        ],
+    )
+
+    assert frames["_meta"]["constraints"] == [
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["animal_group"]},
+            "on_violation": "error",
+        },
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["mythic_group"]},
+            "on_violation": "error",
+        },
+    ]
+
+
+@pytest.mark.ftr("BUG-GENERATED-META-CONSTRAINT-ACCUMULATION-P4A")
+def test_add_validations_preserves_distinct_on_violation_and_area() -> None:
+    frames: dict[str, object] = {
+        "_meta": {
+            "constraints": [
+                {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "rule": {"type": "in_list", "values": ["animal_group"]},
+                    "on_violation": "warn",
+                },
+                {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "rule": {"type": "in_list", "values": ["animal_group"]},
+                    "on_violation": "error",
+                    "area": "A2:A10",
+                },
+            ]
+        }
+    }
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "target": {
+                    "sheet": "groups",
+                    "column": "kind",
+                    "area": "A2:A20",
+                },
+                "rule": {"type": "in_list", "values": ["animal_group"]},
+            }
+        ],
+    )
+
+    assert frames["_meta"]["constraints"] == [
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["animal_group"]},
+            "on_violation": "warn",
+        },
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["animal_group"]},
+            "on_violation": "error",
+            "area": "A2:A10",
+        },
+        {
+            "sheet": "groups",
+            "column": "kind",
+            "rule": {"type": "in_list", "values": ["animal_group"]},
+            "on_violation": "error",
+            "area": "A2:A20",
+        },
+    ]
