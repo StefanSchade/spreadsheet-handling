@@ -1,0 +1,170 @@
+= Review: FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5
+:toc:
+
+== Metadata
+
+* Reviewed commit: `41077fc25ee46acc36d7237dbcc1c74e869ae473`
+* Review date: 2026-06-11
+* Reviewer: Codex
+* Scope: review-only
+
+== Verdict
+
+Yellow -- acceptable with follow-up findings.
+
+== Summary
+
+The commit implements role-targeted `add_validations` rules for dynamic
+workbook-view columns. The public surface stays narrow: an optional `roles:`
+field on validation targets, no new selector language, no new pipeline step,
+and no change to `project_by_role`. Expansion writes the existing concrete
+`_meta.constraints` shape, so renderers remain unchanged and the path remains
+carrier-neutral.
+
+The implementation is broadly aligned with the accepted decision and reuses
+`spreadsheet_handling.domain.column_roles.resolve_column_roles`. Two follow-up
+items remain: implicit frame resolution can choose the wrong frame when a
+visible sheet name collides with an unrelated frame name, and the registry
+read contract omits the shared resolver's derived-helper metadata source.
+
+== Checks Performed
+
+Documents reviewed:
+
+* `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5.adoc`
+* `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5.adoc`
+* `docs/backlog/FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5_decision.adoc`
+* `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5.adoc`
+* `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5_impl_slice_assessment.adoc`
+* `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5_review.adoc`
+
+Commit and code paths reviewed:
+
+* `git show --stat --oneline 41077fc25ee46acc36d7237dbcc1c74e869ae473`
+* `git show --name-status 41077fc25ee46acc36d7237dbcc1c74e869ae473`
+* `src/spreadsheet_handling/domain/validations/validate_columns.py`
+* `src/spreadsheet_handling/domain/column_roles/resolver.py`
+* `registries/pipeline_step_registry.json`
+* `docs/ai_info/interfaces_and_gates.adoc`
+* `docs/release_notes/release_notes.adoc`
+* `tests/unit/domain/validations/test_role_targeted_validations.py`
+* `tests/integration/pipeline/test_dynamic_view_column_targeting.py`
+* `tests/architecture/dependency_guards/test_validation_role_targeting_uses_shared_resolver.py`
+
+Commands run:
+
+* `git status --short` -- clean before the review artifact was written.
+* `make test-file FILE=tests/unit/domain/validations/test_role_targeted_validations.py` -- passed, 6 tests.
+* `make test-file FILE=tests/integration/pipeline/test_dynamic_view_column_targeting.py` -- passed, 1 test.
+* `make test-file FILE=tests/architecture/dependency_guards/test_validation_role_targeting_uses_shared_resolver.py` -- passed, 3 tests.
+* `make test-arch` -- passed. Setup emitted transient PyPI DNS retry warnings, then architecture tests completed successfully.
+
+== Findings
+
+=== Medium-1: Implicit frame resolution can mis-target when sheet and frame names collide
+
+*Severity:* Medium
+
+*Evidence:*
+`validate_columns._target_frame` first returns `sheet` when
+`frames.get(sheet)` is a `pandas.DataFrame`, and only afterward consults
+`_meta.workbook_view.sheets` for a visible-sheet-to-frame mapping
+(`src/spreadsheet_handling/domain/validations/validate_columns.py`, lines
+133-146).
++
+The accepted implementation FTR says `frame:` is optional when the frame can
+be resolved from target `sheet:` via workbook-view metadata or when the sheet
+name is also the frame name. The current tests cover differing names without
+a collision (`sheet: story_groups` maps to `frame: story_group_matrix_view`)
+and same-name mapping, but they do not cover a case where `frames` contains an
+unrelated data frame named `story_groups` while workbook-view metadata maps
+visible sheet `story_groups` to `story_group_matrix_view`.
+
+*Why it matters:*
+Workbook-view metadata is the authoritative mapping from visible sheet names
+to projected frames. With the current fallback order, a role-targeted
+validation can silently resolve roles against the wrong frame if an unrelated
+frame happens to share the visible sheet name. That can fan out constraints to
+the wrong concrete columns or raise resolver errors that do not point at the
+real ambiguity. This is exactly the sheet/frame collision case the review
+scope called out.
+
+*Recommended follow-up:*
+Change implicit resolution to prefer workbook-view sheet mappings when they
+exist, and use the sheet-as-frame fallback only when no mapping is present.
+Add focused unit coverage for:
+
+* visible sheet differs from frame and an unrelated frame with the sheet name
+  exists;
+* visible sheet and frame intentionally have the same name;
+* explicit `target.frame` overrides implicit resolution.
+
+Consumers can avoid this defect in the interim by specifying `target.frame`
+explicitly.
+
+=== Low-1: Registry meta-contract omits derived helper metadata reads
+
+*Severity:* Low
+
+*Evidence:*
+`add_validations` delegates role expansion to the shared resolver. The resolver
+can classify `display_helper` from FK-helper derived provenance under
+`_meta.derived.sheets.<frame>.helper_columns`
+(`src/spreadsheet_handling/domain/column_roles/resolver.py`, lines 183-197 and
+251-254).
++
+The updated `add_validations` registry entry declares reads for
+`constraints`, `workbook_view`, and `xref_crosstable`, but not `derived`
+(`registries/pipeline_step_registry.json`, lines 685-707).
+
+*Why it matters:*
+The runtime behavior is correct because the shared resolver still reads the
+metadata. The registry is incomplete, however, so architecture audits and
+pipeline metadata consumers do not see the full read surface of role-targeted
+validation rules.
+
+*Recommended follow-up:*
+Add a `derived` read entry to the `add_validations` registry
+`meta_contract.reads`, with a reason such as: "Optional role-target expansion
+can resolve display_helper columns from FK-helper derived provenance through
+the shared column-role resolver."
+
+== Positive Observations
+
+* The implementation does not introduce a selector language, wildcard syntax,
+  set algebra, or a new targeting step.
+* Role names are imported from `spreadsheet_handling.domain.column_roles`
+  rather than redefined in validation code.
+* Role expansion calls `resolve_column_roles`, preserving the shared
+  foundation taxonomy used by `project_by_role`.
+* Existing flat `add_validations` rules remain backward compatible.
+* The nested `target:` shape from the decision document is supported.
+* `roles` is rejected when combined with explicit `column` or `columns`.
+* Unknown roles fail with a clear `ValueError` listing the accepted foundation
+  role names.
+* Expansion order is deterministic: requested roles are processed in caller
+  order, resolver role members preserve frame column order, and duplicates are
+  suppressed.
+* Rendering code is unchanged; role targets are lowered into ordinary concrete
+  constraints before workbook composition.
+* The integration test exercises the pipeline path through
+  `configure_workbook_view`, `add_validations`, workbook composition, and
+  `ValidationPass`.
+* The architecture guard is appropriately scoped: it verifies shared-resolver
+  import/call behavior without forcing backend-specific implementation
+  details.
+* The release notes and AI-interface gate describe the implemented public YAML
+  surface accurately for this slice.
+
+== Open Questions
+
+None.
+
+== Suggested Next Step
+
+Create a small follow-up fix for Medium-1 before relying on implicit
+sheet-to-frame resolution in consumer migrations. Consumer migration remains
+plausible without modifying the consumer repository in this commit, especially
+if migrated rules specify `target.frame` explicitly until the collision fix
+lands. Low-1 can be handled in the same follow-up as a registry-only
+correction.
