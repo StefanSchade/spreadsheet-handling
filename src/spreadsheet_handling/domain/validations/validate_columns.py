@@ -138,12 +138,12 @@ def _target_frame(frames: Frames, target: Mapping[str, Any]) -> str:
             return frame
 
     sheet = str(target["sheet"])
-    if isinstance(frames.get(sheet), pd.DataFrame):
-        return sheet
-
     mapped = _frame_for_sheet_from_workbook_view(frames.get("_meta"), sheet=sheet)
     if mapped:
         return mapped
+
+    if isinstance(frames.get(sheet), pd.DataFrame):
+        return sheet
 
     raise ValueError(
         "add_validations target with 'roles' requires 'frame' or a "

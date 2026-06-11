@@ -176,3 +176,118 @@ def test_roles_target_requires_resolvable_frame() -> None:
                 }
             ],
         )
+
+
+def test_workbook_view_mapping_wins_when_sheet_name_collides_with_frame() -> None:
+    frames = _matrix_frames()
+    frames["story_groups"] = pd.DataFrame(
+        {
+            "canonical_id": ["c1"],
+            "unrelated_value": ["not a matrix column"],
+        }
+    )
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "target": {
+                    "sheet": "story_groups",
+                    "roles": ["matrix_value"],
+                },
+                "rule": {
+                    "type": "from_legend",
+                    "legend": "story_group_codes",
+                },
+            }
+        ],
+    )
+
+    assert [constraint["column"] for constraint in frames["_meta"]["constraints"]] == [
+        "Alpha",
+        "Beta",
+    ]
+
+
+def test_roles_target_allows_sheet_name_is_frame_fallback() -> None:
+    frames = {
+        "matrix_view": pd.DataFrame(
+            {
+                "story_id": ["s1"],
+                "title": ["Alpha story"],
+                "Alpha": ["E"],
+            }
+        ),
+        "_meta": {
+            "xref_crosstable": {
+                "story_group_matrix": {
+                    "matrix": "matrix_view",
+                    "row_keys": ["story_id"],
+                },
+            },
+            "sheets": {
+                "matrix_view": {"helper_columns": ["title"]},
+            },
+        },
+    }
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "sheet": "matrix_view",
+                "roles": ["row_identity"],
+                "rule": {"type": "in_list", "values": ["E"]},
+            }
+        ],
+    )
+
+    assert [constraint["column"] for constraint in frames["_meta"]["constraints"]] == [
+        "story_id",
+    ]
+
+
+def test_explicit_frame_overrides_workbook_view_mapping() -> None:
+    frames = _matrix_frames()
+    frames["override_matrix_view"] = pd.DataFrame(
+        {
+            "story_id": ["s1"],
+            "title": ["Override story"],
+            "Gamma": ["E"],
+        }
+    )
+    frames["_meta"]["xref_crosstable"]["override_matrix"] = {
+        "matrix": "override_matrix_view",
+        "row_keys": ["story_id"],
+    }
+    frames["_meta"]["workbook_view"]["sheets"].append(
+        {
+            "frame": "override_matrix_view",
+            "sheet": "override_sheet",
+            "order": 1,
+        }
+    )
+    frames["_meta"]["sheets"]["override_sheet"] = {"helper_columns": ["title"]}
+
+    add_validations(
+        frames,
+        rules=[
+            {
+                "target": {
+                    "sheet": "story_groups",
+                    "frame": "override_matrix_view",
+                    "roles": ["matrix_value"],
+                },
+                "rule": {"type": "in_list", "values": ["E"]},
+            }
+        ],
+    )
+
+    assert frames["_meta"]["constraints"] == [
+        {
+            "sheet": "story_groups",
+            "column": "Gamma",
+            "rule": {"type": "in_list", "values": ["E"]},
+            "on_violation": "error",
+        }
+    ]
