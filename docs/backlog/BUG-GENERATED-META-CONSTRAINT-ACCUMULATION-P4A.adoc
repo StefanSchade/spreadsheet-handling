@@ -1,0 +1,175 @@
+===== BUG-GENERATED-META-CONSTRAINT-ACCUMULATION-P4A -- Generated `_meta` constraints accumulate across repeated export/promote cycles
+
+*Status:* New
+*Priority:* P4A
+*Type:* Bug / stabilization
+*Area:* Metadata lifecycle / validation metadata / roundtrip promotion
+*Discovered during:* `worldbuilding` adoption after `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`
+
+==== Summary
+
+Repeated export / import / promote cycles can reuse a generated
+`_meta.yaml` sidecar as input for a later export. When that sidecar already
+contains generated validation constraints, `add_validations` appends a new
+copy of the same constraints instead of replacing the step's previous output.
+The result is constraint accumulation in generated metadata.
+
+This was observed during the `worldbuilding` consumer migration from the
+custom `plugins.matrix_meta:add_from_legend_constraints_for_matrix` fan-out
+step to core `add_validations` role targeting.
+
+The migration itself succeeded:
+
+* the old plugin fan-out was removed from the consumer pipeline;
+* `add_validations` with `roles: [matrix_value]` was adopted;
+* final clean-source XLSX and ODS reimport checks passed;
+* the final consumer commit touched only
+  `worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml`.
+
+This BUG records a stabilization finding surfaced by real consumer adoption.
+It is probably not caused by `roles: [matrix_value]` itself. The new role
+targeting path made the issue visible because the adoption validation exercised
+repeated cross-carrier export / import / promote cycles.
+
+==== Observed behavior
+
+Representative observed workflow:
+
+[source,bash]
+----
+cd /home/stefan/repos/spreadsheet-handling/worldbuilding
+
+make export-stories-ods
+make import-stories-ods
+make diff-reimport
+make promote-reimport
+
+make export-stories
+make import-stories
+make diff-reimport
+make promote-reimport
+
+make export-stories-ods
+make import-stories-ods
+make diff-reimport
+----
+
+Observed outcome:
+
+* semantic `diff-reimport` passed after normalization;
+* generated `_meta.yaml` was present under `daten/dino_insel/_meta.yaml`;
+* repeated export / promote cycles could accumulate validation constraints;
+* Codex removed the ignored generated `_meta.yaml` before the final
+  clean-source validation;
+* final clean-source `make check-reimport` and `make check-reimport-ods`
+  passed after the generated `_meta.yaml` was removed.
+
+==== Why this matters
+
+Generated metadata can become an accumulating input even when the user-facing
+data roundtrip is semantically clean. That creates a mismatch between "the
+roundtrip data diff passed" and "the next export starts from a clean metadata
+state".
+
+For validation metadata, accumulation can duplicate workbook constraints,
+inflate sidecars, and make generated `_meta` harder to reason about. The risk
+will grow as more pipeline steps write generated metadata that may be reused
+by consumer promote workflows.
+
+==== Current evidence
+
+Core implementation clue:
+
+[source,python]
+----
+constraints = list(meta.get("constraints") or [])
+...
+constraints.append(constraint)
+meta["constraints"] = constraints
+----
+
+This behavior is expected for a normal in-memory pipeline run where multiple
+validation rules intentionally add constraints. It becomes non-idempotent when
+generated `_meta.yaml` from a previous import / promotion is reused as input
+in a later export and the same validation-producing step runs again.
+
+Consumer evidence:
+
+* The worldbuilding migration commit is
+  `f580c14 chore(dino-insel): use role-based matrix validations`.
+* The final tracked consumer commit changed only the pipeline YAML.
+* Generated `daten/dino_insel/_meta.yaml` was ignored by git and removed before
+  the final clean-source checks.
+* Final clean-source XLSX and ODS reimport checks passed, confirming the role
+  targeting migration itself remained behavior-compatible when stale generated
+  metadata was not reused.
+
+==== Likely root cause / hypotheses
+
+Likely root cause:
+
+* `add_validations` appends to existing `_meta.constraints`;
+* JSON-dir reimport / promotion can materialize a generated `_meta.yaml`
+  sidecar into the consumer data directory;
+* a later export reads that sidecar as input and appends the same generated
+  constraints again.
+
+Open hypotheses to confirm during implementation:
+
+* The bug may be a generic metadata lifecycle issue: generated `_meta` should
+  not be promoted or reused as canonical input without filtering.
+* Alternatively, validation writers may need step-local idempotency so they
+  replace their own generated constraints while preserving unrelated user- or
+  pipeline-authored constraints.
+* A mixed approach may be needed: make validation generation idempotent and
+  define which generated metadata roots are safe to promote.
+
+==== Non-goals
+
+* Do not blame `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` without evidence.
+  The role-targeting adoption surfaced this bug; it does not currently appear
+  to cause it.
+* Do not remove the ability for multiple validation rules in one pipeline run
+  to add distinct constraints.
+* Do not redesign the whole metadata persistence model in this BUG. Coordinate
+  with the metadata lifecycle FTRs instead.
+* Do not modify the `worldbuilding` consumer as part of this BUG unless the
+  chosen fix explicitly includes consumer workflow guidance or scripts.
+
+==== Recommended follow-up
+
+Evaluate these directions before implementation:
+
+* Decide whether generated `_meta.yaml` should ever be promoted or reused as
+  canonical input.
+* Make `add_validations` idempotent for constraints it owns.
+* Introduce an ownership / source marker for generated constraints so a step
+  can replace its own previous output instead of appending duplicates.
+* Add cleanup / reset guidance for consumer workflows that promote reimported
+  data.
+* Add regression coverage that repeated export / import / promote / export
+  cycles do not duplicate constraints.
+
+==== Acceptance criteria
+
+* Repeated export / import / promote / export cycles do not duplicate
+  validation constraints in generated metadata.
+* Existing validation constraints are either replaced idempotently or generated
+  metadata is excluded / reset before applying validation steps.
+* A regression test or documented workflow check covers repeated runs.
+* Existing single-pass `add_validations` behavior remains backward compatible:
+  multiple distinct rules can still add multiple distinct constraints.
+
+==== Related backlog items
+
+* `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` -- adoption of this feature
+  surfaced the bug, but current evidence does not attribute the bug to role
+  targeting.
+* `FTR-META-LIFECYCLE-INVENTORY-P5` -- owns the broader inventory of metadata
+  roots and lifecycle expectations.
+* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` -- adjacent transient metadata
+  lifecycle work.
+* `FTR-META-CONTRACT-VERSIONING-P4A` and `FTR-META-SCHEMA-VALIDATION-P5` --
+  likely homes for schema / ownership markers if the chosen fix needs them.
+* `FTR-ROUNDTRIP-TEST-LAYER-P4A` -- likely home for repeated-cycle regression
+  coverage.

@@ -1,0 +1,166 @@
+===== BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A -- Reimport promotion can write helper columns into canonical JSON
+
+*Status:* New
+*Priority:* P4A
+*Type:* Bug / stabilization
+*Area:* Reimport promotion / helper-column cleanup / canonical persistence
+*Discovered during:* `worldbuilding` adoption after `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`
+
+==== Summary
+
+Consumer promotion can copy reimported JSON files into canonical data even
+when those files still contain generated helper columns such as
+`_places_name`. The semantic comparison can still pass because the comparison
+script normalizes helper fields away, but promotion may still write those
+fields into tracked canonical JSON.
+
+This was observed during the same `worldbuilding` migration from the custom
+dynamic matrix validation fan-out plugin to core `add_validations` role
+targeting.
+
+The migration itself succeeded:
+
+* the old plugin fan-out was removed from the consumer pipeline;
+* `add_validations` with `roles: [matrix_value]` was adopted;
+* final clean-source XLSX and ODS reimport checks passed;
+* the final consumer commit touched only
+  `worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml`.
+
+This BUG records a stabilization finding surfaced by real consumer adoption.
+It appears to predate role targeting; the adoption validation made the issue
+visible again.
+
+==== Observed behavior
+
+Representative observed workflow:
+
+[source,bash]
+----
+cd /home/stefan/repos/spreadsheet-handling/worldbuilding
+
+make export-stories-ods
+make import-stories-ods
+make diff-reimport
+make promote-reimport
+git diff -- daten/dino_insel/groups.json
+----
+
+Observed outcome:
+
+* `make diff-reimport` reported:
+  `Reimport matches canonical data after normalization.`
+* `make promote-reimport` copied
+  `./tmp/dino_stories_reimported/*.json` into `./daten/dino_insel/`.
+* A tracked diff appeared in `daten/dino_insel/groups.json`.
+* The diff included generated helper keys such as `_places_name`.
+* Codex treated this as generated helper-field churn unrelated to the
+  validation-plugin migration and did not commit it.
+* After subsequent clean-source validation, tracked `groups.json` had no final
+  diff.
+
+==== Why this matters
+
+The current workflow can say the reimport is semantically clean while still
+making promotion unsafe to commit. That undermines the purpose of a checked
+promotion workflow: users may trust `diff-reimport`, run `promote-reimport`,
+and accidentally persist generated helper columns into canonical JSON.
+
+This is especially risky because helper columns are intentionally useful in
+workbook-facing views but should not silently become canonical domain fields.
+
+==== Current evidence
+
+The consumer comparison script ignores helper-like keys during semantic
+comparison:
+
+[source,python]
+----
+if str(child_key).startswith("_"):
+    continue
+----
+
+The promotion target copies JSON files directly:
+
+[source,make]
+----
+cp -f $(REIMPORT_DIR)/*.json $(DATA_DIR)/
+----
+
+During the worldbuilding adoption workflow, this combination allowed
+`diff-reimport` to pass while `promote-reimport` temporarily changed tracked
+canonical data by adding `_places_name` to `groups.json`.
+
+The user had previously seen similar uncommitted `_places_name` helper fields
+while preparing the consumer repository and reverted them. That is additional
+evidence that this bug predates the role-targeting feature.
+
+==== Likely root cause / hypotheses
+
+Likely root cause:
+
+* reimported workbook data can still contain generated helper columns;
+* `compare_reimport.py` ignores helper fields for semantic comparison;
+* `promote-reimport` copies the raw reimported JSON snapshot into canonical
+  data rather than a canonicalized / helper-stripped snapshot.
+
+Open hypotheses to confirm during implementation:
+
+* Helper stripping may belong in core import normalization before JSON output.
+* Helper stripping may belong in consumer promotion scripts, because consumers
+  own their canonical-file policy.
+* A shared canonicalization step may be needed so comparison and promotion use
+  the same normalization semantics.
+
+==== Non-goals
+
+* Do not blame `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` without evidence.
+  The role-targeting migration surfaced this bug; it does not currently appear
+  to cause it.
+* Do not remove all underscore-prefixed fields blindly. Some user-authored or
+  framework-owned fields may legitimately contain underscores. The helper
+  field rule must be explicit and carefully scoped.
+* Do not change `worldbuilding` in this backlog entry.
+* Do not collapse this issue into the unresolved-helper-value `nan` bug. This
+  BUG is about helper-column presence in canonical JSON; unresolved helper
+  value representation is separate.
+
+==== Recommended follow-up
+
+Evaluate these directions before implementation:
+
+* Ensure reimport / promotion removes generated helper columns before writing
+  canonical JSON.
+* Align `compare_reimport.py` normalization semantics with
+  `promote-reimport` output semantics.
+* Add a regression fixture where helper columns such as `_places_name` are
+  present in reimported workbook data and must not be written into canonical
+  JSON.
+* Decide whether helper stripping belongs in core import normalization,
+  consumer promote scripts, or a shared canonicalization step.
+* Add a consumer workflow guard that fails promotion when generated helper
+  keys would be written to tracked canonical files.
+
+==== Acceptance criteria
+
+* Promoted canonical JSON does not contain generated helper fields such as
+  `_places_name`.
+* Promotion behavior and semantic comparison behavior agree about ignored /
+  helper fields.
+* A regression test or workflow fixture demonstrates that helper columns in
+  reimported workbook data are stripped before canonical persistence.
+* Existing legitimate user-authored fields are not accidentally removed just
+  because their names contain underscores; the helper-field rule is defined
+  carefully.
+
+==== Related backlog items
+
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- adjacent helper-value
+  persistence bug, but a different failure class.
+* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- likely home for helper identity /
+  lifecycle contract decisions.
+* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` -- adjacent provenance cleanup and
+  persistence lifecycle work.
+* `FTR-ROUNDTRIP-TEST-LAYER-P4A` -- likely home for the regression fixture.
+* `FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5` -- adoption of this feature
+  surfaced the bug, but current evidence does not attribute the bug to role
+  targeting.
