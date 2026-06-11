@@ -372,20 +372,6 @@ test-node: deps-dev ## Single test: make test-node NODE=tests/unit/...::fn
 	$(PYTEST) -vv $(PYTEST_OPTS) $(NODE)
 
 # =========================
-# Demo run
-# =========================
-.PHONY: run
-run: deps-dev ## Demo: roundtrip on example
-	$(VENV)/bin/sheets-pack \
-	  examples/roundtrip_start.json \
-	  -o $(BUILD_DIR)/demo.xlsx \
-	  --levels 3
-	$(VENV)/bin/sheets-unpack \
-	  $(BUILD_DIR)/demo.xlsx \
-	  -o $(BUILD_DIR)/demo_out \
-	  --levels 3
-
-# =========================
 # Diagnose
 # =========================
 .PHONY: doctor
