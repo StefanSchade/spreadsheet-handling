@@ -1,0 +1,686 @@
+= FK Helper Lifecycle and Metadata Review
+
+Closing review of the FK-helper subsystem after the domain cleanup and
+package-formation waves. Not a package or code-organisation review; this
+review challenges the lifecycle, ownership, and ``_meta`` semantics of FK
+helpers from the use case outward.
+
+Inputs consulted (read-only): the FK-helper modules and their consumers in
+``src/spreadsheet_handling/domain``, the persistence boundary in
+``src/spreadsheet_handling/pipeline/persistence_boundary.py``, the step
+registry, and tests under ``tests/unit``, ``tests/integration``, and
+``tests/roundtrip`` that exercise the lifecycle (FK enrich/drop, derived
+column policy, persistence boundary, cleanup invariants, configuration
+steps). Prior audit artifacts under ``audit/`` were used as background.
+
+== Verdict
+
+Yellow
+
+The FK-helper *primitive* contract is healthy: a single declarative source
+of truth (the v2 relation policy at ``_meta.helper_policies.fk.relations``)
+plus a tightly-scoped runtime provenance carrier
+(``_meta.derived.sheets.<sheet>.helper_columns``) drive every primitive in
+one direction. The persistence boundary cleanly separates Intent
+(persisted) from Resolution (dropped). What earns the yellow is the
+configuration surface, not the primitive surface: three separate writers
+publish into the *same* ``helper_policies.fk`` root with different shapes
+(v1 per-target dicts, v2 relations, derived helper-column declarations on
+workbook views), and the reimport authority is split across four readers
+(``_meta.derived.sheets``, ``_meta.sheets.<frame>.helper_columns``,
+``_meta.helper_policies.fk[<target>]`` v1, ``_meta.helper_policies.fk.relations``
+v2). The model is recoverable, but it is overdesigned relative to the
+single use case the primitives actually serve.
+
+== FK Helper Lifecycle
+
+The complete lifecycle of an FK helper has four phases.
+
+. **Declaration / inference** -- a configuration step writes the v2
+  relation policy:
+  ** ``configure_fk_helpers`` (``domain/helper_policies.py``) -- explicit,
+     human-authored intent; constructs v1 per-target dicts *and* a
+     parallel v2 relations list via ``apply_v2_relations`` from
+     ``domain/fk_relations.py``;
+  ** ``infer_fk_relations`` (``domain/fk_relations.py``) -- heuristic
+     pattern-based inference; writes v2 relations only.
+  At end of this phase the frames carry
+  ``_meta.helper_policies.fk.schema_version: 2`` and
+  ``_meta.helper_policies.fk.relations: [...]``; each entry records
+  ``produced_by: {step: ..., mode: ...}``. No helper column has been
+  materialised yet.
+
+. **Materialisation** -- ``enrich_helpers`` reads the v2 policy, builds
+  ``FKDef`` rows via ``iter_relation_fk_defs``, calls the legacy
+  ``apply_fk_helpers`` plumbing (``core.fk``) with a value or formula
+  provider, and writes the per-sheet provenance record
+  ``_meta.derived.sheets.<sheet>.helper_columns: [{column, fk_column,
+  target, target_key, value_field}, ...]`` via ``_write_helper_provenance``.
+  At end of this phase data frames carry the materialised helper columns
+  (named ``{prefix}{target_frame}_{target_field}``) and ``_meta`` carries
+  both the declared shape (policy) and the realised shape (provenance).
+
+. **Carrier / export** -- the orchestrator calls
+  ``project_meta_to_persistable_contract`` immediately before persistence.
+  It drops the runtime-only top-level ``derived`` key wholesale and strips
+  the v2 relations whose ``produced_by.step == "configure_fk_helpers"``
+  (the runtime carrier produced by the explicit configuration step). The
+  v1 per-target dicts and any relations produced by ``infer_fk_relations``
+  or by a manual / user-authored producer survive. The persisted
+  spreadsheet therefore carries data + flattened headers + (optionally)
+  ``_meta.sheets.<frame>.helper_columns`` (from ``configure_workbook_view``)
+  and the surviving slice of ``helper_policies.fk``. Helper columns
+  themselves are written as ordinary spreadsheet columns.
+
+. **Reimport / cleanup** -- the import side loads frames and runs a
+  reimport pipeline. The relevant primitives:
+  ** ``apply_workbook_view_sheet_mappings`` -- maps visible sheets back
+     to logical frames using ``_meta.workbook_view``;
+  ** ``apply_derived_column_policy`` -- drops helper columns. It reads
+     transient ``_meta.derived.sheets.<source>.helper_columns`` first;
+     if absent, falls back to the durable workbook-view declaration at
+     ``_meta.sheets.<source>.helper_columns``; if still absent, falls
+     back to FK policy (v1 per-target dicts via
+     ``_v1_policy_helper_names`` and v2 relations via
+     ``resolve_v2_fk_relations``);
+  ** ``remove_fk_helpers`` (``drop_helpers``) -- same fallback order
+     restricted to the FK-shaped readers (no view helpers);
+  ** ``reorder_fk_helpers`` (``reorder_helpers_next_to_fk``) -- runs
+     before persistence; rebuilds FK<->helper pairings from provenance
+     first, then v2 policy;
+  ** ``validate_fk_helpers``, ``check_unexpected_helpers``,
+     ``check_missing_helpers``, ``check_helper_values``,
+     ``check_unresolvable_fks``, ``check_duplicate_ids`` -- read provenance
+     first, then v2 relations as fallback;
+  ** ``validate_references`` rule ``no_helper_columns`` -- a
+     post-cleanup assertion that reads only durable
+     ``_meta.sheets.<frame>.helper_columns``;
+  ** ``apply_derived_column_policy`` also strips consumed transient
+     provenance from ``_meta.derived`` when it replaces the source frame
+     in place.
+
+By role:
+
+* **Create FK-helper-related metadata:** ``configure_fk_helpers``
+  (writes v1 dicts + v2 relations + records ``produced_by:
+  configure_fk_helpers``), ``infer_fk_relations`` (writes v2 relations
+  with ``produced_by: infer_fk_relations``), ``configure_workbook_view``
+  (writes ``_meta.sheets.<frame>.helper_columns`` as a *declaration* of
+  which columns are helpers, not a materialisation), ``enrich_helpers``
+  (writes ``_meta.derived.sheets.<sheet>.helper_columns`` as
+  materialisation provenance), ``configure_lookup_helpers`` (writes the
+  separate ``_meta.helper_policies.lookup`` namespace -- consumed by
+  ``enrich_lookup``, not by FK primitives, but co-located under
+  ``helper_policies``).
+* **Consume:** ``enrich_helpers``, ``drop_helpers``,
+  ``reorder_helpers_next_to_fk``, ``validate_fk_helpers`` and its five
+  sub-checks, ``apply_derived_column_policy``, ``validate_references``
+  rule ``no_helper_columns``, ``column_roles/resolver.py`` (for the
+  ``display_helper`` role), ``schema_maintenance/meta_update.py``
+  ``_handle_helper_policies`` (renames/drops/adds when columns move).
+* **Mutate:** ``enrich_helpers`` writes provenance; ``drop_helpers`` and
+  ``apply_derived_column_policy`` strip provenance; ``apply_v2_relations``
+  in ``fk_relations.py`` merges relations with strict idempotency rules;
+  ``schema_maintenance`` updates relation entries when target columns are
+  renamed; the persistence boundary projects the persistable subset out
+  of the runtime mapping.
+* **Observe only:** ``validate_fk_helpers`` and the four ``check_*``
+  helpers; the ``no_helper_columns`` rule.
+
+== Metadata Ownership
+
+Five distinct FK-helper-related metadata families exist in the current
+model. Each has a different owner, writer, reader, and mutator set.
+
+. ``_meta.helper_policies.fk.<target_name>`` -- *v1 per-target dict*.
+  Owner: ``configure_fk_helpers`` (the only writer of this shape today;
+  it is also still produced when v2 is produced -- both are written in
+  the same step). Readers: ``derived_column_policy._v1_policy_helper_names``
+  (reimport cleanup fallback); ``schema_maintenance._handle_helper_policies``
+  (rename/drop propagation -- but only on the ``fk`` subtree as a whole;
+  the per-target dict is mostly an opaque payload to schema maintenance).
+  Mutators: ``configure_fk_helpers`` again on overwrite; schema maintenance
+  on column renames. Persisted by default: yes (the persistence boundary
+  preserves v1 per-target dicts; only runtime-produced v2 relations are
+  pruned).
+
+. ``_meta.helper_policies.fk.schema_version`` + ``relations`` -- *v2
+  relations list*. Owner: ``apply_v2_relations`` in
+  ``domain/fk_relations.py`` -- it is the only writer of the v2 envelope.
+  Producers that go through it: ``infer_fk_relations`` and
+  ``configure_fk_helpers`` (via ``_v2_relations_from_explicit_policies``).
+  Readers: every FK-helper primitive (enrich, drop, reorder,
+  validate) plus ``derived_column_policy._safe_policy_helper_names`` and
+  ``column_roles.resolver`` indirectly via
+  ``derived_helper_columns_by_sheet``. Mutators: same writers; conflict
+  rules in ``_assert_no_relation_conflict`` (cross-producer is an error;
+  same-producer must be byte-identical or fail). Persisted by default:
+  *conditional*. Entries from ``configure_fk_helpers`` are pruned at the
+  persistence boundary; entries from ``infer_fk_relations`` or anything
+  user-authored survive.
+
+. ``_meta.derived.sheets.<sheet>.helper_columns`` -- *runtime
+  materialisation provenance*. Owner: ``enrich_helpers`` (the only
+  primitive that writes it via ``_write_helper_provenance``). Readers:
+  every cleanup / reorder / validation primitive; ``column_roles.resolver``
+  via ``_fk_helper_provenance_columns``. Mutators: ``drop_helpers`` and
+  ``apply_derived_column_policy`` strip the entries they consume.
+  Persisted by default: *no*. The persistence boundary drops the entire
+  top-level ``derived`` key.
+
+. ``_meta.sheets.<frame>.helper_columns`` -- *durable workbook-view
+  declaration*. Owner: ``configure_workbook_view`` (the only writer that
+  publishes here, via ``_merge_sheet_options``). It is a *user-authored
+  declaration* of which columns are helpers for view purposes; it does
+  not by itself cause materialisation. Readers:
+  ``derived_column_policy._safe_durable_helper_names`` (cleanup
+  fallback), ``column_roles.resolver._view_helper_columns`` (display
+  helper detection), and ``validate_references._durable_helper_columns``
+  (``no_helper_columns`` rule). Mutators:
+  ``schema_maintenance._handle_sheets_helper_columns`` (renames/drops).
+  Persisted by default: yes (the persistence boundary preserves
+  ``_meta.sheets`` as-is; the persistence_boundary docstring explicitly
+  defers pruning ``sheets[*].helper_columns`` to a later FTR).
+
+. ``_meta.derived.sheets.<sheet>.enrich_lookup`` -- *lookup-helper
+  materialisation provenance* (FK-helper-adjacent and lives in the same
+  derived envelope, but produced by ``enrich_lookup`` rather than the FK
+  primitives). Owner: ``enrich_lookup``. Readers/mutators:
+  ``derived_column_policy._validated_enrich_spec`` and
+  ``fk_helpers/provenance._clean_helper_provenance``. Persisted by
+  default: no. Included here because it shares the
+  ``_meta.derived.sheets.<sheet>`` carrier with FK helper provenance and
+  the carrier's lifetime rules are shared.
+
+The five families have **no single ownership boundary**. Each is owned
+by a different writer, but two of them (the v1 per-target dicts and the
+v2 relations) coexist under one root and are produced by the *same*
+step. Two others (``_meta.derived.sheets.<sheet>`` and
+``_meta.sheets.<frame>.helper_columns``) are independently authoritative
+"helper column lists" with different owners, lifetimes, and persistence
+rules. The reader fan-in -- four shapes feeding the cleanup decision in
+``apply_derived_column_policy`` -- is the visible symptom of that lack
+of single ownership.
+
+== Durable vs Runtime
+
+Classifying each FK-helper-related metadata family by lifetime category.
+
+* **Durable user intent.**
+  ** ``_meta.helper_policies.fk.<target_name>`` (v1 per-target dicts).
+     Evidence: written by ``configure_fk_helpers`` from human-supplied
+     parameters; preserved by the persistence boundary; survives roundtrip
+     by design. Carries ``target``, ``key``, ``allowed_helpers``,
+     ``default_helpers``, ``helper_prefix``, ``fk_column``, optionally
+     ``label``. This is the canonical declaration of what the user wants
+     to expose as helpers for a given FK target.
+  ** ``_meta.sheets.<frame>.helper_columns`` (workbook-view durable
+     helper-column declaration). Evidence: written by
+     ``configure_workbook_view`` from explicit YAML; preserved across
+     the persistence boundary; consumed by ``no_helper_columns`` rule
+     as the authoritative post-cleanup assertion. A view-side intent,
+     declared per visible sheet.
+
+* **Durable system contract.**
+  ** Relations under ``_meta.helper_policies.fk.relations`` *that are
+     not produced by* ``configure_fk_helpers`` -- e.g. entries written
+     by ``infer_fk_relations`` or hand-authored relations. Evidence: the
+     persistence boundary keeps them. The contract here is "v2 shape
+     consumed by every FK-helper primitive"; the schema_version field
+     and the per-entry shape are stable enough to be relied on by
+     consumers across runs.
+  ** ``produced_by: {step, mode}`` on each relation. Evidence: the
+     persistence boundary's discriminator; tests pin this behaviour
+     (``test_drops_runtime_produced_fk_helper_relations``,
+     ``test_keeps_relations_without_runtime_produced_marker``).
+
+* **Runtime-derived state.**
+  ** ``_meta.derived.sheets.<sheet>.helper_columns`` (and the sibling
+     ``enrich_lookup``). Evidence: written only by ``enrich_helpers`` /
+     ``enrich_lookup`` during a run; cleared by drop / cleanup; the
+     persistence boundary drops top-level ``derived`` wholesale. Lives
+     for the duration of one pipeline run; reconstructible from the
+     declared policy on the next run.
+  ** Relations under ``helper_policies.fk.relations`` *produced by*
+     ``configure_fk_helpers``. Evidence: the persistence boundary names
+     this producer specifically as runtime-only; the docstring labels
+     it "compiled pipeline state". This is durable *intent* in v1 form
+     and runtime *resolution* in v2 form, persisted via two carriers
+     with different lifetimes for the *same* user-supplied configuration.
+
+* **Carrier / readback observations.**
+  ** The materialised helper *columns* themselves on data frames after
+     ``enrich_helpers``. Strictly speaking these are not metadata, but
+     they are the visible carrier through which a downstream run can
+     re-derive provenance. Evidence: the post-reimport cleanup tests
+     deliberately exercise the case where helpers reach the workbook
+     and must be re-identified for removal without trusting them as
+     payload.
+  ** ``FKFinding = Finding`` alias in ``validations/fk_helpers.py``;
+     ``FK_PATTERN`` and ``detect_fk_columns`` (now banned from the
+     primitive path by an architecture guard). Both are observation
+     mechanisms; the architecture guard is the only thing keeping
+     them out of the primitive read path.
+
+* **Migration / historical baggage.**
+  ** The coexistence of v1 per-target dicts under
+     ``_meta.helper_policies.fk.<target_name>`` and v2 relations under
+     ``_meta.helper_policies.fk.relations`` -- both produced by the
+     same step. Evidence: ``configure_fk_helpers`` writes both;
+     ``apply_v2_relations`` produces the v2 list from the same call.
+     The v1 shape is read only as a cleanup fallback
+     (``_v1_policy_helper_names``); every primitive consumes v2. The v1
+     shape exists today purely because the codebase carried it before
+     v2 landed and the persistence-boundary docstring explicitly
+     defers a broader redesign of ``helper_policies``.
+  ** The ``helper_prefix`` field on relations and on the older
+     per-target dicts is intentionally durable today, but it is not
+     consumed by any primitive that does *not* already know the helper
+     column name from ``helper_columns[*].column`` -- it survives as a
+     reconstruction aid rather than a load-bearing contract. The
+     ``prefix`` parameter on ``drop_helpers`` and
+     ``reorder_helpers_next_to_fk`` is dead and retained only for
+     YAML-binding compatibility.
+  ** ``label_field`` in ``build_v2_target_registry`` is set to the
+     ``target_key`` as a no-op default and is explicitly documented as
+     "intentionally a no-op default" -- a vestigial slot from the v1
+     shape that lives only because the legacy ``apply_fk_helpers``
+     plumbing expects it.
+
+== Reimport Authority
+
+The reimport pipeline must answer three questions: (a) which columns on
+a frame are helpers? (b) which helpers should be value-checked? (c)
+which helpers should be dropped before promotion to canonical?
+
+Trusted on reimport, in priority order:
+
+. ``_meta.derived.sheets.<source>.helper_columns`` -- when transient
+  provenance survived the export (i.e. there was no persistence
+  boundary between the producer and the cleanup step). Authoritative
+  for both identity and target_key/value_field, so it is the only
+  source rich enough to drive value comparisons in
+  ``apply_derived_column_policy(policy="warn_on_mismatch" |
+  "fail_on_mismatch")``.
+. ``_meta.sheets.<source>.helper_columns`` -- the durable view-side
+  declaration. Names columns only; cannot drive value checks. Used by
+  the ``no_helper_columns`` validation rule and as the
+  ``apply_derived_column_policy`` fallback.
+. ``_meta.helper_policies.fk.relations`` v2 -- where it survived
+  persistence (i.e. not produced by ``configure_fk_helpers``). Used by
+  all primitives as the declarative fallback when provenance is
+  absent.
+. ``_meta.helper_policies.fk.<target_name>`` v1 -- used only by
+  ``derived_column_policy._v1_policy_helper_names`` to widen the helper-
+  column set during cleanup. Materialised columns on the reimported
+  data frame are *not* trusted as authoritative helper identity by any
+  primitive after the ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5``
+  refactor.
+
+Should never be promoted back into canonical state:
+
+* Materialised helper columns themselves. These exist for editor
+  ergonomics; the canonical value is the FK column. The
+  ``apply_derived_column_policy`` step plus the ``no_helper_columns``
+  assertion rule together enforce this. The roundtrip test
+  ``test_helper_columns_absent_after_canonical_reimport`` is the
+  invariant that pins it.
+* ``_meta.derived.*`` of any kind. The persistence boundary drops the
+  entire top-level ``derived`` key. This rule is documented and tested
+  (``test_drops_top_level_derived``).
+* Runtime-produced v2 relations
+  (``produced_by.step == "configure_fk_helpers"``). The persistence
+  boundary drops these; tests pin this behaviour.
+
+Already follows this rule:
+
+* The persistence boundary's two pruning rules above.
+* ``apply_derived_column_policy`` stripping consumed transient
+  provenance after it replaces the source frame in place
+  (``_strip_consumed_provenance``).
+* ``drop_helpers`` cleaning provenance entries it consumed
+  (``_clean_helper_provenance``).
+* The architecture guard
+  ``test_fk_helper_primitives_consume_policy.py`` prevents primitives
+  from inferring helper identity from column-name conventions.
+
+Violates the rule (or sits in a grey zone):
+
+* ``configure_fk_helpers`` writes *both* the v1 per-target dict and a
+  v2 relation entry in one step. The v1 shape is preserved by
+  persistence and the v2 shape is dropped. After roundtrip the
+  surviving v1 dict is read back via ``_v1_policy_helper_names`` to
+  re-derive helper column names by composing
+  ``helper_prefix + target_frame + "_" + default_helper_field``. The
+  result is that "configure_fk_helpers intent" survives roundtrip via a
+  *different schema* than the one the producing run wrote. This is
+  legitimate fallback behaviour but conflates "we kept the user's
+  declaration" with "we kept the user's compiled relation list" -- the
+  two have different reliability guarantees.
+* ``_meta.sheets.<frame>.helper_columns`` is currently treated as
+  durable user intent even when it was *not* user-authored -- it can
+  be added by ``configure_workbook_view`` from YAML, but the
+  persistence boundary docstring explicitly defers the question of
+  whether it should be pruned. Today it survives every roundtrip
+  unchanged; whether that is correct depends on a decision that has
+  not been made (the FTR-FK-HELPER-POLICY-LIFECYCLE-P4A reference in
+  the docstring acknowledges this).
+
+== Minimal Sufficient Model
+
+Ignoring the current implementation, the smallest lifecycle that
+supports FK helpers needs three categories of information.
+
+* **Required durable information.** A single declaration per FK
+  relation, sufficient to re-materialise helpers on any future run:
+  ** ``source_frame``, ``source_column`` (the FK column),
+  ** ``target_frame``, ``target_key``,
+  ** the set of fields on the target to project as helpers (one or
+     more ``target_field`` values),
+  ** the convention by which each helper column is named (a prefix
+     pattern or an explicit ``column`` name).
+
+  One canonical shape covers every primitive in the current code. The
+  ``produced_by`` field is useful only to discriminate runtime
+  carriers; if the durable shape is the *only* shape persisted, the
+  field becomes unnecessary.
+
+* **Required runtime information.** Materialisation provenance for
+  the duration of a pipeline run, scoped per data frame:
+  ** the set of columns that were actually materialised (as opposed to
+     declared);
+  ** for each materialised column, enough back-reference
+     (``fk_column``, ``target``, ``target_key``, ``value_field``) to
+     drive value comparisons during the same run.
+
+  Equivalent to today's ``_meta.derived.sheets.<sheet>.helper_columns``,
+  minus any field that is recoverable from the durable declaration.
+
+* **Required carrier information.** For workbook persistence:
+  ** the helper *columns themselves* in the data frames (so the editor
+     can see them);
+  ** a per-visible-sheet declaration that those columns are helpers
+     and should be removed on reimport.
+
+  This third piece is independently useful because the workbook is a
+  human-edited carrier where the durable declaration alone is not
+  enough to identify the columns reliably (e.g. when the user has
+  renamed sheets or the durable declaration is missing on reimport).
+
+Nothing else is required by the primitives. Specifically:
+
+* ``allowed_helpers`` and ``default_helpers`` are *configuration-time*
+  inputs to the declaration step; once the relation is recorded with
+  the chosen helper columns, the allowed/default sets carry no
+  primitive-side information.
+* ``helper_prefix`` is recoverable from the helper column name when
+  the column name is recorded explicitly.
+* ``label_field`` is unused by any current primitive.
+* The v1 per-target dict, today's parallel runtime-only v2 relations,
+  and the durable workbook-view helper list could be one shape rather
+  than three (with one supplementary runtime provenance carrier).
+
+== Overdesign Assessment
+
+For each FK-helper-related metadata family:
+
+* **Clearly necessary.**
+  ** ``_meta.derived.sheets.<sheet>.helper_columns`` -- the runtime
+     provenance record. Required to support value comparisons during
+     the same run; cannot be reconstructed from policy alone because
+     it records what was *actually* materialised on this run.
+  ** Relations under ``_meta.helper_policies.fk.relations`` from
+     ``infer_fk_relations`` or user-authored sources -- the only
+     surviving carrier for the user's intent across runs. Primitives
+     consume this shape directly.
+
+* **Probably necessary.**
+  ** ``_meta.sheets.<frame>.helper_columns`` -- as the cleanup fallback
+     when transient provenance has been stripped. *Probably* necessary
+     because the workbook is a human-edited carrier and the persistence
+     boundary deliberately strips runtime provenance; without this
+     fallback the cleanup step has no name-level identity unless the
+     v1/v2 policy survives, which it does only when the producer was
+     not ``configure_fk_helpers``. A simpler model could fold this into
+     a single carrier (see Minimal Sufficient Model), but as long as
+     the configuration step is split from the materialisation step,
+     this fallback is load-bearing.
+
+* **Uncertain.**
+  ** Relations under ``_meta.helper_policies.fk.relations`` produced by
+     ``configure_fk_helpers``. They are explicitly runtime-only by the
+     persistence boundary. Two interpretations are possible: (a)
+     legitimate runtime carrier that lets primitives read one shape
+     regardless of producer; (b) a workaround that exists because the
+     primitives were refactored to consume only v2 and ``configure_fk_helpers``
+     needed to keep producing the v1 shape for compatibility. Both are
+     plausible from the code; the second is more consistent with the
+     persistence-boundary docstring, which calls the runtime v2 carrier
+     "compiled pipeline state".
+
+* **Suspicious.**
+  ** Coexistence of v1 per-target dicts under
+     ``_meta.helper_policies.fk.<target>`` and v2 relations under
+     ``_meta.helper_policies.fk.relations`` produced by the same step.
+     ``configure_fk_helpers`` writes both. Only the v1 survives
+     persistence by default; only the v2 is consumed by primitives;
+     reimport cleanup uses both. This is a real shape duplication, and
+     the persistence-boundary docstring acknowledges it ("broader
+     redesign of ``helper_policies`` is out of scope").
+  ** ``helper_prefix`` as a top-level relation field when
+     ``helper_columns[*].column`` already records the chosen name.
+     The reorder primitive and the validators only read
+     ``helper_columns[*].column`` for identity; the prefix is needed
+     only by reimport cleanup *via the v1 path*, where the column name
+     is not recorded.
+  ** ``label_field`` set to ``target_key`` as a "no-op default" in
+     ``build_v2_target_registry``. Acknowledged as a no-op in code;
+     present only because the v1 ``build_id_label_maps`` plumbing
+     expects it.
+
+* **Historical residue.**
+  ** ``FKFinding = Finding`` backward-compat alias.
+  ** The dead ``prefix`` / ``helper_prefix`` parameters on
+     ``drop_helpers`` and ``reorder_helpers_next_to_fk``. Tracked as
+     Sonnet C007.
+  ** ``label`` parameter on ``configure_fk_helpers`` -- stored on the
+     policy but read nowhere in the primitive path.
+  ** ``mode: "naming_convention"`` in ``infer_fk_relations`` declared
+     against ``_VALID_MODES = {"naming_convention"}`` -- single-member
+     frozenset; the variation slot exists but no other mode does.
+
+== Wider _meta Implications
+
+FK helpers do not reveal a new general pattern; they reveal a *specific*
+pattern that also appears in two other places, and they expose it more
+clearly than the others. The pattern is:
+
+* one *declarative intent* shape (user-authored / inferred);
+* one *runtime resolution* shape (compiled from the declaration plus
+  current frame state);
+* one *carrier-side* shape (what the persistence target can read back).
+
+The persistence boundary already calls this out by name: it preserves
+*Intent* and drops *Resolution*. The same Intent/Resolution split is
+applied to ``legend_blocks[*].resolved`` and
+``xref_crosstable[*].dense_axes.resolved`` /
+``xref_crosstable[*].column_keys``. The structure for FK helpers is the
+same:
+
+* Intent: ``_meta.helper_policies.fk`` (v1 per-target + non-runtime v2).
+* Resolution: ``_meta.derived.sheets.<sheet>.helper_columns`` and the
+  runtime-produced v2 relations from ``configure_fk_helpers``.
+* Carrier-side: helper *columns* on the data frames and the durable
+  ``_meta.sheets.<frame>.helper_columns`` declaration.
+
+The difference is that for legend blocks and xref dense axes the
+Intent and Resolution are *one entry* with a sub-key (``resolved``);
+for FK helpers Intent and Resolution use *separate root keys*
+(``helper_policies`` and ``derived``) and the runtime Resolution is
+duplicated -- once as compiled v2 relations under the Intent root and
+once as provenance under the Resolution root. This is the visible
+symptom of FK helpers being unusually complex compared to the other
+two cases, not a sign that the underlying pattern is missing.
+
+No general ontology should be inferred from one extra case. The
+concrete observation is that FK helpers should converge on the
+Intent/Resolution split already established for legend blocks and
+xref dense axes, with a single Intent root (the v2 relation list) and
+a single Resolution carrier (``_meta.derived.sheets.*``). The
+``_meta.sheets.<frame>.helper_columns`` durable view declaration is
+carrier-side -- not part of the same Intent / Resolution split.
+
+== Risks
+
+Ranked by importance.
+
+. **Lifecycle ambiguity: ``configure_fk_helpers`` writes two parallel
+  shapes that have different persistence semantics.** The v1 per-target
+  dict survives; the v2 relations it produces do not. On the producing
+  run primitives consume v2; on a later run after persistence the same
+  declaration is reconstructed via the v1 fallback in
+  ``_v1_policy_helper_names``. This is a real lifecycle ambiguity --
+  "what does configure_fk_helpers persist?" depends on whether the
+  reader is a primitive (reads v2 in-run; reads nothing across runs)
+  or a cleanup step (reads v1 across runs). It is the largest concrete
+  source of confusion in the FK helper subsystem today.
+
+. **Ownership ambiguity: four "helper column lists" live under three
+  meta roots with different owners and lifetimes.**
+  ``_meta.derived.sheets.<sheet>.helper_columns`` (runtime),
+  ``_meta.sheets.<frame>.helper_columns`` (durable view declaration),
+  ``_meta.helper_policies.fk.<target>.default_helpers`` (v1 target
+  intent), and ``_meta.helper_policies.fk.relations[*].helper_columns``
+  (v2 relation intent). Each is reduced by a different code path to
+  "names of columns that are helpers on this frame." The reduction
+  is correct today but fragile: adding a new producer or a new
+  consumer requires manually checking that the right
+  reader/precedence is updated.
+
+. **Persistence ambiguity: ``_meta.sheets.<frame>.helper_columns`` is
+  treated as durable user intent today, but the persistence-boundary
+  docstring explicitly flags this as undecided** (FTR-FK-HELPER-POLICY-
+  LIFECYCLE-P4A). Today every roundtrip preserves it; tomorrow a
+  decision may say it should be pruned, or that it should always be
+  rewritten from v2 policy. The fact that the ``no_helper_columns``
+  validation rule reads this and *only* this list to assert
+  post-cleanup invariants makes the persistence behaviour
+  observable.
+
+. **Reimport ambiguity: ``apply_derived_column_policy`` quietly walks
+  four readers in a fixed fallback order**, each of which can return a
+  different set of columns. Today the union strategy is used and the
+  default is to drop. When the fallback chain is later trimmed
+  (e.g. v1 retired), tests that exercise the longer fallback paths may
+  not surface the change because the runtime provenance path will
+  succeed first in most happy-path tests. The cleanup-contract tests
+  in ``tests/roundtrip/test_cleanup_invariants.py`` exercise *one*
+  fallback path (durable + v2). Other paths (only v1, only durable
+  workbook view, only v2 relations from ``infer_fk_relations``) have
+  less direct roundtrip coverage.
+
+. **Persistence ambiguity: ``produced_by.step`` is the discriminator
+  for "drop this v2 relation at the boundary," and only
+  ``configure_fk_helpers`` is currently named.** Any future
+  configuration step that produces compiled v2 relations would have
+  to be added to the boundary's known-runtime-producer list
+  (``_RUNTIME_FK_HELPER_PRODUCER_STEP``) or it would leak. The
+  ``configure_lookup_helpers`` step does not produce v2 relations today,
+  but a future producer easily could; the contract is implicit.
+
+. **Lifecycle ambiguity: ``apply_v2_relations`` enforces strict no-overwrite
+  conflict rules ("same key produced by a different step is an error")
+  across the in-run merge, but the persistence boundary deliberately
+  re-introduces possible conflicts at the next run** (a v1 per-target
+  dict surviving roundtrip is reconstructed into v2 only when
+  ``configure_fk_helpers`` runs again; if ``infer_fk_relations`` runs
+  instead and infers the same key, the two will collide). This is
+  unlikely in normal pipelines that pick one configuration step but
+  is a latent risk for pipelines that switch producers between runs.
+
+. **Carrier ambiguity: nothing prevents helper columns from surviving
+  reimport when no cleanup primitive is configured.** The cleanup
+  invariants in ``tests/roundtrip/test_cleanup_invariants.py``
+  assert this only for pipelines that *declare*
+  ``apply_derived_column_policy`` (or ``no_helper_columns``). A reimport
+  pipeline that forgets either will promote helper columns. This is a
+  workflow-design issue rather than a meta-model issue, but it is a
+  direct consequence of the model: helper identity is not encoded in
+  the column itself.
+
+== Missing Decisions
+
+These are decisions the system appears to need before the next FK-helper
+refactor can be cleanly scoped. None of them is implementation; each is
+a contract decision.
+
+* **Should ``configure_fk_helpers`` write v1 per-target dicts at all?**
+  Today it writes both v1 and v2. The v1 dict is consumed only as a
+  cleanup fallback. If v2 is durable, v1 is redundant. If v2 is
+  runtime-only, v1 is the durable shape and the primitives' single-shape
+  consumption is a lie. Pick one.
+* **Is ``_meta.sheets.<frame>.helper_columns`` durable user intent or a
+  runtime hint?** Today it persists like Intent, is consumed by the
+  ``no_helper_columns`` rule as Intent, but is written from a workbook-
+  view step that mixes user intent ("these are helpers") with carrier
+  configuration ("this sheet displays these columns"). A clear answer
+  would unblock whether the persistence boundary should ever rewrite or
+  prune it.
+* **Should ``configure_fk_helpers`` and ``infer_fk_relations`` produce
+  the *same* persistable shape?** Today they differ: ``infer_fk_relations``
+  output survives by default; ``configure_fk_helpers`` output is
+  selectively pruned. The user-facing difference -- "did this run
+  configure or infer?" -- is not a meaningful distinction once helpers
+  are materialised. A common rule (e.g. "both produce a single durable
+  v2 shape; the primitives consume that shape on the same and later
+  runs") would collapse the v1/v2/runtime trichotomy.
+* **What is the responsibility split between
+  ``apply_derived_column_policy`` and ``remove_fk_helpers``?** Both
+  remove FK helper columns. The first also handles enrich_lookup
+  helpers, runs value checks, and is the documented reimport-cleanup
+  step; the second is documented as a step for the *forward* pipeline
+  but is configurable in either direction. The fallback chains differ
+  slightly (``apply_derived_column_policy`` reads durable workbook-view
+  helpers; ``drop_helpers`` does not). It is not clear that two steps
+  are needed once the cleanup contract is stable.
+* **Does the model want a uniform Intent/Resolution split (the pattern
+  the persistence boundary already applies to legend blocks and xref
+  dense axes)?** If yes, FK-helper Resolution should live in one place
+  (under ``_meta.derived``) with no duplicate compiled v2 entries
+  inside ``_meta.helper_policies``. If no, the rule "Intent persists;
+  Resolution does not" must be revisited or named differently for
+  helpers.
+* **Are runtime carriers expected to carry ``produced_by`` going
+  forward?** The persistence boundary uses it as the discriminator
+  for the v2 relations carrier. If the system is meant to grow more
+  Resolution payloads under existing Intent roots, ``produced_by`` is
+  the discriminator that lets the boundary decide; if every Resolution
+  payload should live under ``_meta.derived`` instead, ``produced_by``
+  becomes vestigial.
+
+== Final Recommendation
+
+The FK-helper *primitive* contract -- "consume v2 relations or derived
+provenance, never re-derive identity from column names" -- is healthy
+and well-tested. The architecture guard, the package boundary, and the
+persistence boundary together encode that contract correctly. The
+cleanup-invariant roundtrip tests pin the load-bearing behaviour.
+
+The *configuration* and *persistence* contracts around helper metadata
+are not fully consolidated. The v1/v2 coexistence, the four "helper
+column list" carriers, and the runtime-only-v2 discriminator together
+form a model that is more complex than the use case requires. None of
+this is a bug today; tests pass and the cleanup invariants hold. But
+the model carries enough optionality that a future cleanup or a new
+producer is more likely to introduce a real lifecycle ambiguity than
+to remove one.
+
+The right next move is not a refactor. It is to answer the missing
+decisions above -- in particular the v1-vs-v2 question for
+``configure_fk_helpers`` and the durability question for
+``_meta.sheets.<frame>.helper_columns`` -- and then to align the
+configuration steps and the persistence boundary against those
+decisions. Until then, treat the subsystem as stable, lean on the
+existing tests as the guardrails, and avoid introducing additional
+shapes under ``_meta.helper_policies`` or
+``_meta.derived.sheets.<sheet>``.
