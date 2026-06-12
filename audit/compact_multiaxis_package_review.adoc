@@ -1,0 +1,207 @@
+= compact_multiaxis Package Formation Review
+
+== Verdict
+
+DEFER
+
+The slice would be mechanically safe. The gain it delivers is lower than
+the previous four slices, two pending future contracts argue for
+waiting, and one helper (``_legend_groups``) is on a separate
+consolidation track that wants to land first.
+
+== Public Surface
+
+Two symbols, both inventory-listed and exercised by tests:
+
+* ``expand_compact_multiaxis``
+* ``contract_compact_multiaxis``
+
+Importers:
+
+* ``pipeline/registry.py:141-145`` -
+  ``"...compact_multiaxis:expand_compact_multiaxis"`` and
+  ``"...compact_multiaxis:contract_compact_multiaxis"``. Resolved through
+  ``importlib.import_module + getattr``.
+* ``tests/unit/domain/transformations/test_compact_multiaxis.py:6`` -
+  imports both publics by name.
+* ``tests/integration/pipeline/test_project_by_role_migration_parity.py:24``
+  - imports ``expand_compact_multiaxis``.
+
+No other ``src/`` or ``tests/`` site reaches into any private helper. No
+sibling module imports the file (``compact_multiaxis`` is a leaf in the
+transformation dependency graph; it consumes ``cell_codec`` and
+``xref_crosstable`` but is itself consumed only by the registry and the
+tests).
+
+== Registry / YAML Exposure
+
+* Registry strings unchanged; the proposed package facade would
+  re-export both publics and ``getattr`` would continue to find them.
+* Registered step names in YAML are
+  ``expand_compact_multiaxis`` / ``contract_compact_multiaxis`` (registry
+  keys), independent of code layout.
+* No sibling re-export to update.
+
+== Hidden Coupling
+
+* ``_meta.legend_blocks`` *read* via ``_legend_groups`` - this is a
+  near-duplicate of ``cell_codec.scalar._legend_tokens`` (Sonnet
+  Candidate 005). Both readers walk the same legend-block schema; the
+  difference is that ``_legend_groups`` returns ``{token: group_value}``
+  pairs while ``_legend_tokens`` returns just the token sequence. The
+  duplication is on the existing consolidation backlog.
+* ``_meta.compact_multiaxis.<config_id>`` *write* via
+  ``_write_multiaxis_meta``. Self-owned key namespace.
+* Composes ``cell_codec`` (``decode_cell_values``, ``encode_cell_values``)
+  and ``xref_crosstable`` (``contract_xref``, ``expand_xref``).
+* External dependencies: ``frame_lifecycle`` writers (lifecycle
+  registration), pandas only otherwise.
+
+The existing dependency on ``cell_codec`` and ``xref_crosstable``
+remains stable after their package splits. Both packages re-export the
+two consumed names via their ``__init__.py`` facades; the relative
+imports (``from .cell_codec import ...``, ``from .xref_crosstable import
+...``) resolve through those facades without edit. No churn.
+
+== Cycle Risk
+
+Low if implemented.
+
+The candidate seam would be:
+
+* ``operation.py`` - both publics plus shared guards, lifecycle
+  writers, and meta IO.
+* ``group_column.py`` - ``_with_group_column``, ``_group_lookup``,
+  ``_legend_groups`` (the optional group-column extension used only by
+  ``expand_compact_multiaxis``).
+
+Helper analysis:
+
+* ``_normalize_key`` is used by ``_with_group_column``,
+  ``_group_lookup``, and ``_codec_payload``. It straddles the seam.
+  Resolution mirrors cell_codec's ``_WHOLE_CELL_CODE`` treatment:
+  co-locate with the larger consumer cluster (``group_column.py``) and
+  import back into ``operation.py``. One-way DAG, no cycle. No
+  ``primitives.py`` required.
+* ``_meta_from_frames`` is used only inside ``expand_compact_multiaxis``
+  (specifically for ``_with_group_column``); could move to
+  ``group_column.py`` or stay in ``operation.py`` and be called before
+  the group_column entry point. Either works.
+* All other helpers (``_as_list``, ``_ensure_distinct_output_columns``,
+  ``_reject_dense_axes``, ``_temp_frame_name``, ``_codec_payload``,
+  ``_write_multiaxis_meta``, ``_write_expand_lifecycle``,
+  ``_write_contract_lifecycle``) stay in ``operation.py``.
+
+== Readability Gain
+
+Low
+
+* The file is 468 LOC, smaller than xref's 785, cell_codec's 615, or
+  enrich_lookup's pre-slice 567. Most of the body (~192 LOC) **is** the
+  two public composition functions. They are thin: each is essentially
+  ``call xref + call cell_codec + write meta + write lifecycle``.
+* The largest extractable concern is the optional group-column
+  extension (``_with_group_column``, ``_group_lookup``, ``_legend_groups``
+  + the shared ``_normalize_key``): ~95 LOC. That is the only
+  meaningful lift available.
+* Lifting 95 LOC out of 468 leaves a ~370-LOC ``operation.py`` that is
+  still dominated by the public composition. The seam is shallower
+  than xref's dense_axes lift, cell_codec's scalar/frame seam, or
+  enrich_lookup's policy-resolution cluster.
+* The package-formation pattern is most rewarding when there is a
+  genuinely separable sub-concern that some readers can skip.
+  Compact_multiaxis is structurally a thin composer; readers who reach
+  it generally want to follow the composition, not skip pieces of it.
+
+== Mechanical Or Design?
+
+Mechanical, with two reasons-to-pause that argue for deferral.
+
+* ``_reject_dense_axes`` raises ``NotImplementedError`` for any
+  non-None ``dense_axes`` argument. The inventory and the Opus boundary
+  review both flag this as "a reserved future contract placeholder". If
+  ``dense_axes`` is later implemented for compact_multiaxis, the file
+  layout will gain a third real sub-concern, and the current
+  ``operation.py + group_column.py`` shape would have to be revisited.
+  Splitting before that future shape is known means doing the work
+  twice.
+* ``_legend_groups`` near-duplicates ``cell_codec.scalar._legend_tokens``
+  (Sonnet C005). The right next move for this area is consolidating the
+  two legend readers, not formalising a separate location for the
+  weaker copy. Doing the consolidation **after** any package split
+  means churning two files instead of one; doing it **before** any
+  package split means the resulting compact_multiaxis is thinner still,
+  weakening the case for a package even further.
+
+Neither concern blocks a package today, but they together suggest the
+slice is better postponed.
+
+== Recommended Package Shape
+
+If the slice is later approved, the smallest safe shape would be:
+
+----
+src/spreadsheet_handling/domain/transformations/compact_multiaxis/
+    __init__.py        # re-exports expand_compact_multiaxis,
+                       # contract_compact_multiaxis
+    operation.py       # the two publics + _as_list +
+                       # _ensure_distinct_output_columns +
+                       # _reject_dense_axes + _temp_frame_name +
+                       # _codec_payload + _write_multiaxis_meta +
+                       # _write_expand_lifecycle +
+                       # _write_contract_lifecycle +
+                       # _meta_from_frames + Frames + _META_KEY
+    group_column.py    # _with_group_column + _group_lookup +
+                       # _legend_groups + _normalize_key
+----
+
+``operation.py`` imports ``_normalize_key`` and ``_with_group_column``
+from ``.group_column``; one-way DAG. No ``primitives.py``.
+
+But this shape should only be implemented after the two concerns above
+are resolved.
+
+== Implementation Guardrails
+
+Not applicable - implementation deferred.
+
+If the slice is later approved with the shape above, the guardrails
+would mirror the prior package slices:
+
+. Verbatim moves only; no body, signature, parameter-default, error
+  message, or constant-value changes.
+. ``__init__.py`` re-exports exactly the two publics with ``__all__``.
+. ``group_column.py`` imports nothing from ``.operation``; if a circular
+  import appears during implementation, stop and report - do not invent
+  a third submodule (``primitives.py``) on the fly.
+. Do not edit ``pipeline/registry.py``, tests, docs, audit files, YAML
+  files, ``cell_codec``, ``xref_crosstable``, or any other domain
+  module.
+. After editing, run the documented test command and ``git diff
+  --check``; the test result must remain ``1087 passed, 1 xfailed``.
+
+== Is compact_multiaxis Worth Doing Now?
+
+No. The wave has been productive (four landed slices, all green,
+documented). Stopping the wave on a strong note is preferable to
+adding a fifth slice with a smaller gain-per-effort ratio than its
+predecessors. The two pending future contracts (``dense_axes``
+implementation, ``_legend_groups`` consolidation) provide concrete
+reasons to wait. If either of those moves first, the package shape
+becomes clearer; if neither moves, the file remains a thin composer
+and the absence of a package is not a real problem.
+
+== Final Recommendation
+
+Defer
+
+Hold compact_multiaxis as a flat module. Revisit when either:
+
+. ``dense_axes`` is implemented for compact_multiaxis (the
+  ``NotImplementedError`` is replaced with real handling), or
+. ``_legend_groups`` is consolidated with
+  ``cell_codec.scalar._legend_tokens`` (Sonnet Candidate 005).
+
+After either of those, the package case becomes clearer and the
+mechanical slice can be re-evaluated. Until then, the marginal
+readability gain does not justify the churn.
