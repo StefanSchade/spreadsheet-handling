@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain.frame_lifecycle import (
     mark_source_if_unclassified,
     write_frame_lifecycle,
@@ -267,17 +268,6 @@ def _duplicate_column_names(frame: pd.DataFrame) -> list[str]:
 def _ensure_boolean_predicate(value: Any, predicate: str) -> None:
     if not isinstance(value, bool):
         raise TypeError(f"where.{predicate} must be true or false")
-
-
-def _is_empty_cell(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value == ""
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def _is_non_scalar_constant(value: Any) -> bool:

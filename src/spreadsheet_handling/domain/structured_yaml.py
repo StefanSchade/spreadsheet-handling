@@ -10,6 +10,8 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
+
 Frames = dict[str, Any]
 
 
@@ -466,14 +468,3 @@ def _sort_token(value: Any) -> tuple[int, Any]:
 
 def _sort_tuple(values: tuple[Any, ...]) -> tuple[tuple[int, Any], ...]:
     return tuple(_sort_token(value) for value in values)
-
-
-def _is_empty_cell(cell_value: Any) -> bool:
-    if cell_value is None:
-        return True
-    if isinstance(cell_value, str):
-        return cell_value == ""
-    try:
-        return bool(pd.isna(cell_value))
-    except (TypeError, ValueError):
-        return False

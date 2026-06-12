@@ -12,6 +12,8 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values_equal
+
 Frames = dict[str, Any]
 
 _META_KEY = "cell_codecs"
@@ -554,24 +556,6 @@ def _ordered_groups(
 
 def _identity_equal(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
     return len(left) == len(right) and all(_values_equal(a, b) for a, b in zip(left, right))
-
-
-def _values_equal(left: Any, right: Any) -> bool:
-    try:
-        return bool(left == right)
-    except (TypeError, ValueError):
-        return False
-
-
-def _is_empty_cell(cell_value: Any) -> bool:
-    if cell_value is None:
-        return True
-    if isinstance(cell_value, str):
-        return cell_value == ""
-    try:
-        return bool(pd.isna(cell_value))
-    except (TypeError, ValueError):
-        return False
 
 
 def _duplicates(values: Iterable[str]) -> list[str]:

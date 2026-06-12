@@ -11,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values_equal
 from spreadsheet_handling.domain.finding_frame import (
     FINDING_COLUMNS,
     Finding,
@@ -422,29 +423,11 @@ def _should_omit_empty_override(value: Any, policy: ResourceOverridePolicy) -> b
     return policy.empty_override == "omit_tuple" and _is_empty_cell(value)
 
 
-def _is_empty_cell(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value == ""
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
-
-
 def _all_values_equal(values: list[Any]) -> bool:
     if not values:
         return True
     first = values[0]
     return all(_values_equal(first, value) for value in values[1:])
-
-
-def _values_equal(left: Any, right: Any) -> bool:
-    try:
-        return bool(left == right)
-    except (TypeError, ValueError):
-        return False
 
 
 def _key_tuple(value: Any) -> tuple[Any, ...]:

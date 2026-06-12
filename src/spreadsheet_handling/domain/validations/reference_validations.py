@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain.finding_frame import findings_to_frame as _serialize_findings
 
 Frames = dict[str, Any]
@@ -717,15 +718,6 @@ def _plain_value(value: Any) -> Any:
     return value
 
 
-def _is_empty_cell(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value == ""
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def _key_token(key: tuple[Any, ...]) -> tuple[str, ...]:

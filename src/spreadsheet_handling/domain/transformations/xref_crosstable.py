@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values_equal
+
 Frames = dict[str, Any]
 
 _META_KEY = "xref_crosstable"
@@ -266,17 +268,6 @@ def _ensure_output_names_do_not_collide(
         raise ValueError(f"row_keys collide with output column names: {collisions!r}")
     if column_key == value:
         raise ValueError("column_key and value output names must differ")
-
-
-def _is_empty_cell(cell_value: Any) -> bool:
-    if cell_value is None:
-        return True
-    if isinstance(cell_value, str):
-        return cell_value == ""
-    try:
-        return bool(pd.isna(cell_value))
-    except (TypeError, ValueError):
-        return False
 
 
 def _ensure_unique_pairs(
@@ -729,13 +720,6 @@ def _dense_axes_meta_payload(
     if resolved:
         payload["resolved"] = resolved
     return payload if payload else None
-
-
-def _values_equal(left: Any, right: Any) -> bool:
-    try:
-        return bool(left == right)
-    except (TypeError, ValueError):
-        return False
 
 
 def _ordered_values_equal(left: Iterable[Any], right: Iterable[Any]) -> bool:
