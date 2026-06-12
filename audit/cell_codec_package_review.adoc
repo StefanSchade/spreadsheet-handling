@@ -1,0 +1,255 @@
+= cell_codec Package Formation Review
+
+== Verdict
+
+SAFE NEXT PACKAGE SLICE
+
+== Public Surface
+
+Five symbols, all inventory-listed and exercised by tests:
+
+* ``ParsedCellValue`` (frozen dataclass)
+* ``parse_cell_value``
+* ``serialize_cell_value``
+* ``decode_cell_values``
+* ``encode_cell_values``
+
+Importers:
+
+* ``pipeline/registry.py:133-137`` -
+  ``"...cell_codec:decode_cell_values"`` and ``"...cell_codec:encode_cell_values"``.
+  Resolved through ``importlib.import_module + getattr``.
+* ``domain/transformations/compact_multiaxis.py:19`` -
+  ``from .cell_codec import decode_cell_values, encode_cell_values``.
+  Relative import; package facade satisfies it unchanged.
+* ``tests/unit/domain/transformations/test_cell_codec.py:6`` - imports all
+  five public symbols by name.
+
+No other ``src/`` or ``tests/`` site reaches into a private helper. No
+relative import from a sibling that would force a directory rename.
+
+== Registry / YAML Exposure
+
+* Registry strings unchanged; the package facade re-exports both frame
+  publics and ``getattr`` continues to find them.
+* The registered step names in YAML are ``decode_cell_values`` and
+  ``encode_cell_values`` (registry keys). Step-name resolution is
+  independent of code layout.
+* ``compact_multiaxis`` is the only sibling consumer. Its relative
+  import (``from .cell_codec import ...``) resolves through the new
+  ``__init__.py`` re-export without edit.
+* No ``__init__.py`` outside the new package needs editing.
+
+== Hidden Coupling
+
+* ``_meta.legend_blocks`` *read* shape via ``_legend_tokens`` - belongs
+  with scalar parsing; the legend reader is invoked from
+  ``_allowed_values``, which is invoked from ``parse_cell_value`` /
+  ``serialize_cell_value``. Frame side never touches it directly.
+* ``_meta.cell_codecs.<config_id>`` *write* shape via
+  ``_write_codec_meta`` - belongs with the frame publics. Frame side
+  owns ``_META_KEY``.
+* External dependencies: ``_is_empty_cell`` and ``_values_equal`` from
+  ``domain/_cell_primitives``. Leaf imports, no cycle risk.
+* No other domain-internal import. No FK helpers, no column_roles, no
+  frame_lifecycle.
+
+== Cycle Risk
+
+Lower than xref, comparable to enrich_lookup.
+
+The four frame-side publics (``decode_cell_values``, ``encode_cell_values``)
+call into the scalar side only through the public scalar entry points
+(``parse_cell_value`` on decode, ``serialize_cell_value`` on encode).
+Frame-side guards (``_require_frame``, ``_as_list``, ``_ensure_columns``,
+``_ensure_output_name_does_not_collide``, ``_ordered_groups``,
+``_identity_equal``, ``_meta_from_frames``, ``_codec_config_payload``,
+``_write_codec_meta``) are used **only** by ``decode_cell_values`` and
+``encode_cell_values``. Scalar-side helpers (``_cell_to_text``,
+``_normalize_text``, ``_structured_values``, ``_canonicalize_values``,
+``_allowed_values``, ``_legend_tokens``, ``_validate_values``,
+``_duplicates``, ``_ensure_valid_mode``, ``_ensure_valid_normalizer``,
+``_ensure_delimiter``) are used **only** by ``parse_cell_value`` and
+``serialize_cell_value``.
+
+The Opus package-boundary review listed cell_codec as needing a
+``primitives.py`` "from the start" out of caution. A line-by-line
+inspection of the actual call graph contradicts that warning: the
+scalar/frame seam is one-way and the text-normalisation helpers do not
+straddle it. **No ``primitives.py`` is required**, similar to how the
+enrich_lookup split avoided one.
+
+The only constant that crosses the seam is ``_WHOLE_CELL_CODE``: it is
+the default value for ``mode=`` on every public entry point. Resolution
+matches the enrich_lookup precedent - the constant lives in the
+submodule that owns the concept (``scalar.py``, since mode validation
+is scalar) and the frame submodule imports it for the two default
+parameter values.
+
+Constants ``_SPLIT_TOKENS``, ``_VALID_MODES``, ``_VALID_CASE_NORMALIZERS``
+are scalar-only by callers; ``_META_KEY`` is frame-only by callers. No
+ambiguity.
+
+== Readability Gain
+
+High
+
+* The scalar/frame seam is a real distinction in the domain (one cell
+  vs whole DataFrame) and is already documented in the transformation
+  inventory ("Two modes: ``whole_cell_code`` and ``split_tokens``").
+* ~285 LOC of scalar codec lifts into a sibling that can be read or
+  studied without scrolling past the DataFrame orchestration.
+* ~330 LOC of frame-shape orchestration becomes the "step" file that
+  matches what readers expect when they arrive via the pipeline
+  registry path.
+* Loses no narrative: each public still sits at the top of its file.
+* Gain is comparable to xref (the dense_axes lift). Larger than
+  enrich_lookup, because cell_codec has two natural axes of growth
+  (scalar codec semantics, frame projection semantics) that today share
+  one 615-LOC file.
+
+== Mechanical Or Design?
+
+Mechanical, with one judgement call that matches the enrich_lookup
+precedent.
+
+* The scalar/frame seam follows existing function boundaries. No body
+  rewrites, no signature changes, no error-message changes.
+* ``_WHOLE_CELL_CODE`` lives in ``scalar.py`` and is re-imported into
+  ``frame.py`` for the two default parameter values. This is the same
+  shape as the ``_FORMULA_MODES`` reverse-import in
+  ``enrich_lookup/operation.py``.
+* The frozen dataclass ``ParsedCellValue`` lives with the scalar publics;
+  the frame side never constructs one directly (it round-trips through
+  ``parse_cell_value``).
+* No new abstractions. No rename. No grouping of unrelated helpers.
+
+== Recommended Package Shape
+
+Minimum two-submodule split. Mirrors xref's "operation + dense_axes"
+and enrich_lookup's "operation + policy" shape.
+
+----
+src/spreadsheet_handling/domain/transformations/cell_codec/
+    __init__.py    # re-exports the five public symbols ONLY
+    scalar.py      # ParsedCellValue, parse_cell_value, serialize_cell_value
+                   # + _cell_to_text, _normalize_text, _structured_values,
+                   #   _canonicalize_values, _allowed_values, _legend_tokens,
+                   #   _validate_values, _duplicates
+                   # + _ensure_valid_mode, _ensure_valid_normalizer,
+                   #   _ensure_delimiter
+                   # + _WHOLE_CELL_CODE, _SPLIT_TOKENS, _VALID_MODES,
+                   #   _VALID_CASE_NORMALIZERS
+    frame.py       # decode_cell_values, encode_cell_values
+                   # + _require_frame, _as_list, _ensure_columns,
+                   #   _ensure_output_name_does_not_collide,
+                   #   _ordered_groups, _identity_equal,
+                   #   _meta_from_frames, _codec_config_payload,
+                   #   _write_codec_meta
+                   # + _META_KEY
+                   # + (re-import _WHOLE_CELL_CODE, parse_cell_value,
+                   #    serialize_cell_value from .scalar)
+                   # + Frames type alias
+----
+
+``__init__.py``:
+
+----
+from .frame import decode_cell_values, encode_cell_values
+from .scalar import ParsedCellValue, parse_cell_value, serialize_cell_value
+
+__all__ = [
+    "ParsedCellValue",
+    "decode_cell_values",
+    "encode_cell_values",
+    "parse_cell_value",
+    "serialize_cell_value",
+]
+----
+
+DAG:
+
+----
+__init__  → scalar, frame
+frame     → scalar (re-imports _WHOLE_CELL_CODE,
+                    parse_cell_value, serialize_cell_value)
+scalar    → (no package-internal imports;
+             only stdlib, pandas, domain._cell_primitives)
+----
+
+== Implementation Guardrails
+
+The follow-up implementation prompt must enforce:
+
+. Create directory
+  ``src/spreadsheet_handling/domain/transformations/cell_codec/``.
+. Move bodies verbatim into ``scalar.py`` and ``frame.py`` per the
+  shape above. Delete the flat ``cell_codec.py``.
+. ``scalar.py`` contains exactly: ``ParsedCellValue``,
+  ``parse_cell_value``, ``serialize_cell_value``, the eleven scalar-side
+  private helpers, and the four scalar-side module-level constants
+  (``_WHOLE_CELL_CODE``, ``_SPLIT_TOKENS``, ``_VALID_MODES``,
+  ``_VALID_CASE_NORMALIZERS``).
+. ``frame.py`` contains exactly: ``decode_cell_values``,
+  ``encode_cell_values``, the nine frame-side private helpers,
+  ``_META_KEY``, and the ``Frames`` type alias. It imports
+  ``_WHOLE_CELL_CODE``, ``parse_cell_value``, and ``serialize_cell_value``
+  from ``.scalar``.
+. ``scalar.py`` imports nothing from ``.frame``. If a circular import
+  appears during implementation, stop and report - do not invent a
+  third submodule (``primitives.py``) on the fly.
+. ``__init__.py`` re-exports the five public symbols and lists them in
+  ``__all__``. No other re-export.
+. Do not edit ``compact_multiaxis.py``, ``pipeline/registry.py``,
+  ``pipeline/steps.py``, any test file, any YAML file, any
+  documentation file, any audit file (other than this review), or any
+  other domain module.
+. Do not change function bodies, signatures, parameter defaults,
+  module-level constant values, or error message text.
+. Do not rename helpers.
+. Do not group helpers into new abstractions.
+. After editing, run:
+  ``.venv/bin/pytest -m 'not legacy and not prehex and not slow' tests/unit
+  tests/integration tests/roundtrip``. Expected: ``1087 passed,
+  1 xfailed``.
+. Run ``git diff --check``. Expected: clean.
+. Report: directory created, files changed, helpers moved to
+  ``scalar.py`` and ``frame.py``, cycle risk yes/no, test result,
+  diff-check result, any deviation.
+
+== Is cell_codec Better Than compact_multiaxis?
+
+Yes.
+
+* ``cell_codec.py`` is 615 LOC with a clearly two-axis design
+  (scalar codec vs DataFrame orchestration). ``compact_multiaxis`` is
+  ~470 LOC and is structurally a thin composer over ``cell_codec`` +
+  ``xref_crosstable``; its sections are not independent concerns but
+  steps of one composition.
+* Splitting ``compact_multiaxis`` would deliver a smaller readability
+  gain (most of the file is the composition itself). Splitting
+  ``cell_codec`` separates two genuinely distinct API surfaces (single
+  cell vs frame projection).
+* ``compact_multiaxis``'s ``_legend_groups`` is a near-duplicate of
+  ``cell_codec._legend_tokens`` (Sonnet candidate 005). That sits
+  better as a separate consolidation later, not bundled into a
+  package-formation slice.
+* ``cell_codec``'s public surface (five symbols) is larger than
+  ``compact_multiaxis``'s (two), but every symbol is already pinned by
+  tests, registry, or ``compact_multiaxis`` itself. There is no
+  ambiguity about what the package facade must expose.
+
+``compact_multiaxis`` remains a viable later candidate; it is just a
+smaller win than ``cell_codec`` for this slot.
+
+== Final Recommendation
+
+Proceed
+
+Land the two-submodule ``cell_codec`` package with the shape and
+guardrails above. The slice is mechanical, the seam matches existing
+function boundaries, and the cycle risk profile is closer to
+enrich_lookup than to xref. Expected outcome: tests unchanged, the
+615-LOC flat module becomes a small package with one cleanly-scoped
+``scalar.py`` and one cleanly-scoped ``frame.py``, no ``primitives.py``
+required.
