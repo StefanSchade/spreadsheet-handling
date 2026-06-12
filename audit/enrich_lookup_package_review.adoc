@@ -1,0 +1,237 @@
+= enrich_lookup Package Formation Review
+
+== Verdict
+
+SAFE NEXT PACKAGE SLICE
+
+== Public Surface
+
+One symbol: ``enrich_lookup``. Three importer sites:
+
+* `pipeline/registry.py:149` -
+  ``"spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup"``.
+  Resolved through ``importlib.import_module + getattr``, so a package's
+  ``__init__.py`` re-export is fully equivalent.
+* `tests/unit/domain/transformations/test_enrich_lookup.py:6` -
+  ``from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup``.
+* `tests/unit/domain/transformations/test_lookup_formula_mode.py:18` -
+  same import shape.
+
+No other ``src/`` or ``tests/`` file imports any private helper. No
+relative imports from sibling domain modules. ``compact_multiaxis`` does
+not compose ``enrich_lookup``; there is no internal package consumer to
+update.
+
+== Internal Structure
+
+567 LOC, 22 top-level defs, organised by two existing comment
+dividers ("Internal helpers", "Provenance"). Four cohesive sections:
+
+. **Public orchestrator** (lines 26-168): ``enrich_lookup`` itself, ~140
+  lines.
+. **Frame access + result-shape checks** (175-234): ``_require_frame``,
+  ``_check_duplicate_lookup_keys``, ``_check_column_conflict``,
+  ``_check_unmatched_rows``, ``_check_sort_columns``. ~50 lines.
+. **Policy resolution** (237-398, 462-473): ``_resolve_policy``,
+  ``_resolve_join_keys``, ``_resolve_missing``, ``_resolve_order``,
+  ``_resolve_fields``, ``_resolve_allowed``, ``_resolve_value_mode``. ~170
+  lines. The largest separable concern: reads
+  ``_meta.helper_policies.lookup.<lookup>`` and reconciles seven inline
+  arguments against the policy.
+. **Field projection + formula mode** (401-511):
+  ``_fields_with_sort_helpers``, ``_drop_temporary_sort_helpers``,
+  ``_validate_fields``, ``_check_allowed``, ``_build_helper_projection``,
+  ``_build_formula_enrichment``, ``_reorder_helpers_before_key``. ~100
+  lines.
+. **Provenance + lifecycle writes** (518-567): ``_write_provenance``,
+  ``_write_lookup_lifecycle``. ~50 lines.
+
+The natural seam is between sections 1+2+4+5 (the orchestration path) and
+section 3 (policy resolution). The policy block reads the largest single
+``_meta`` shape and is the densest concentration of conflict-check logic
+in the file.
+
+== Registry / YAML Exposure
+
+* Registry string unchanged; package facade re-exports ``enrich_lookup``
+  and ``getattr`` continues to find it.
+* The registered step name in YAML is ``add_lookup_helpers`` (registry
+  key), not the underlying module path. Step-name resolution is
+  independent of code layout.
+* No ``__init__.py`` outside the new package needs editing.
+* No test patterns assert against the registry ``target`` string for
+  ``enrich_lookup`` (the pattern-assert test
+  ``tests/unit/pipeline/test_enrich_lookup_registration.py`` would still
+  pass because the string is unchanged).
+
+== Hidden Coupling
+
+* ``_meta.helper_policies.lookup.<lookup>`` read shape: policy resolvers
+  share schema knowledge. Co-locating them in one submodule keeps that
+  knowledge contiguous; splitting them further would scatter it.
+* ``_meta.derived.sheets.<output>.enrich_lookup`` write shape: produced
+  by ``_write_provenance`` and consumed externally by
+  ``derived_column_policy`` (``_check_enrich_lookup_values``,
+  ``_strip_consumed_provenance``), ``fk_helpers/provenance.py``
+  (``_clean_helper_provenance``), and ``rendering/passes/_base.py``. All
+  consumers reach the value via dict-key navigation; none import any
+  helper from ``enrich_lookup``. Package formation is invisible.
+* External dependencies: ``core.formulas.lookup_formula`` (used only in
+  ``_build_formula_enrichment``) and ``domain.frame_lifecycle.{write_frame_lifecycle,
+  mark_source_if_unclassified}`` (used only in ``_write_lookup_lifecycle``).
+  Both are leaf boundaries with no risk of a load-time cycle.
+
+== Cycle Risk
+
+Lower than xref_crosstable.
+
+In xref the issue was that ``dense_axes`` helpers needed shared leaf
+guards (``_require_frame``, ``_as_list``, ``_ensure_*``, ``_xref_config``)
+that the public ``operation`` module also used, creating bidirectional
+imports.
+
+In enrich_lookup the policy-resolver cluster is self-contained: the
+intra-cluster calls (``_resolve_fields`` -> ``_resolve_policy``,
+``_resolve_allowed`` -> ``_resolve_policy``) are all inside the proposed
+``policy`` submodule. ``policy`` calls nothing in ``operation``. The
+public ``enrich_lookup`` calls into ``policy`` and uses ``_require_frame``
+locally. Clean one-way DAG: ``operation`` -> ``policy``.
+
+No ``primitives.py`` separation needed up front.
+
+== Risk
+
+Low
+
+== Expected Readability Gain
+
+Medium
+
+The orchestrator stays where readers expect it. The policy-resolution
+chunk (the densest part of the file, ~30% of LOC) moves to a sibling
+where it can be read or skipped as a unit. The orchestration path
+shrinks to ~400 lines and reads more like a step.
+
+Lower than xref's gain because there is no equivalent of the "optional
+dense-axes feature" - every caller still goes through every helper at
+some point. The win is structural clarity, not "skip a sub-feature".
+
+== Mechanical Or Design?
+
+Mechanical, with one minor judgement call: where does
+``_resolve_value_mode`` live? It is named like a policy resolver and
+takes ``policy`` as a parameter, but it is conceptually about the
+inline ``helper_value_mode`` vs policy fallback - same shape as the
+other ``_resolve_*`` family members. Move it with the rest of the
+policy resolvers. Document the rule "all ``_resolve_*`` helpers move to
+``policy.py``" in the implementation prompt.
+
+No new abstractions, no rename, no rewrite. Function bodies move
+verbatim. Same load-time guarantees as the xref split after the
+``primitives.py`` refinement.
+
+== Recommended Package Shape
+
+----
+src/spreadsheet_handling/domain/transformations/enrich_lookup/
+    __init__.py        # re-exports enrich_lookup ONLY
+    operation.py       # enrich_lookup + _require_frame + _check_* family
+                       # + _fields_with_sort_helpers + _drop_temporary_sort_helpers
+                       # + _validate_fields + _check_allowed + _build_helper_projection
+                       # + _build_formula_enrichment + _reorder_helpers_before_key
+                       # + _write_provenance + _write_lookup_lifecycle
+                       # + the four module-level constants
+    policy.py          # _resolve_policy + _resolve_join_keys + _resolve_missing
+                       # + _resolve_order + _resolve_fields + _resolve_allowed
+                       # + _resolve_value_mode
+----
+
+``__init__.py``:
+
+----
+from .operation import enrich_lookup
+
+__all__ = ["enrich_lookup"]
+----
+
+No ``primitives.py``. The policy submodule depends only on the standard
+library and ``typing``; the operation submodule depends on
+``policy``, ``pandas``, ``core.formulas``, and
+``domain.frame_lifecycle``. One-way DAG.
+
+== Implementation Guardrails
+
+The follow-up implementation prompt must enforce:
+
+. Create directory
+  ``src/spreadsheet_handling/domain/transformations/enrich_lookup/``.
+. Move the original file body into ``operation.py`` and ``policy.py``
+  exactly per the shape above. Delete the flat
+  ``enrich_lookup.py``.
+. ``policy.py`` contains exactly the seven ``_resolve_*`` helpers, in
+  source order. Bodies and signatures are verbatim. No rename.
+. ``operation.py`` contains everything else, including the four
+  module-level constants (``_VALID_HELPER_POSITIONS``,
+  ``_VALID_MISSING_MODES``, ``_VALUE_MODES``, ``_FORMULA_MODES``) and
+  the ``Frames`` type alias.
+. ``operation.py`` imports the seven names it needs from ``.policy``:
+  ``_resolve_policy``, ``_resolve_join_keys``, ``_resolve_missing``,
+  ``_resolve_order``, ``_resolve_fields``, ``_resolve_allowed``,
+  ``_resolve_value_mode``.
+. ``policy.py`` imports nothing from ``.operation``. It has no
+  ``pandas`` dependency (the resolvers do not call pandas APIs); confirm
+  this by inspection - if any policy helper does use pandas, keep the
+  ``import pandas as pd`` at the top of ``policy.py``.
+. ``__init__.py`` re-exports only ``enrich_lookup``. No other re-export.
+. Do not edit ``compact_multiaxis``, ``derived_column_policy``,
+  ``fk_helpers/provenance.py``, ``rendering/passes/_base.py``, or any
+  other consumer of the
+  ``_meta.derived.sheets.<output>.enrich_lookup`` shape.
+. Do not edit ``pipeline/registry.py``, ``pipeline/steps.py``,
+  ``tests/``, ``docs/``, ``audit/``, or any YAML file.
+. Do not change error messages, parameter names, parameter defaults,
+  or module-level constants.
+. Do not introduce a ``primitives.py``. If a circular import is
+  observed during implementation, stop and report - do not invent a
+  third submodule on the fly.
+. After editing, run:
+  ``.venv/bin/pytest -m 'not legacy and not prehex and not slow' tests/unit
+  tests/integration tests/roundtrip``. Expected: ``1087 passed, 1
+  xfailed``.
+. Run ``git diff --check``. Expected: clean.
+. Report: directory created, files changed, helpers moved to
+  ``policy.py``, test result, diff-check result, any deviation.
+
+== Is enrich_lookup Better Than cell_codec?
+
+Yes, for a second package slice:
+
+* **Smaller re-export surface** - one public symbol vs cell_codec's
+  five (``ParsedCellValue``, ``decode_cell_values``,
+  ``encode_cell_values``, ``parse_cell_value``, ``serialize_cell_value``).
+  Smaller ``__init__.py`` is a smaller commitment.
+* **No internal composer dependency** - ``compact_multiaxis`` imports
+  from ``cell_codec`` via a relative import; touching ``cell_codec``
+  could ripple through that composer if anything is missed.
+  ``enrich_lookup`` has no internal consumer beyond meta-key reads,
+  which are invisible to code layout.
+* **No leaf-sharing cycle risk** - cell_codec's text-normalisation
+  helpers (``_cell_to_text``, ``_normalize_text``,
+  ``_canonicalize_values``, ``_allowed_values``, ``_validate_values``)
+  are called from both parse/serialize and encode/decode entry points.
+  A naive split would create the same circular shape that xref hit and
+  would need a ``primitives.py`` round. ``enrich_lookup`` does not have
+  that shape.
+
+cell_codec remains a strong third candidate after enrich_lookup lands;
+its split should be planned with a ``primitives.py`` from the start.
+
+== Final Recommendation
+
+Proceed
+
+Land the two-submodule ``enrich_lookup`` package with the shape and
+guardrails above. The slice is mechanical, behaviour-preserving, and
+has a smaller cycle-risk profile than xref. Expected outcome: tests
+unchanged, one fewer flat 567-LOC module, one clearer
+``operation.py``, one self-contained ``policy.py``.
