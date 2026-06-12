@@ -1,0 +1,1228 @@
+= Transformation Inventory
+
+== xref_crosstable
+
+Description::
+Generic bidirectional matrix ↔ long-form relation conversion.  Treats cell
+values as opaque.  Supports dense-axis reconstruction from auxiliary frames.
+
+Public API::
+`expand_xref`, `contract_xref`
+(module: `domain/transformations/xref_crosstable.py`)
+
+Input Frames::
+`matrix` (wide DataFrame with flat columns; e.g. columns `feature_id`,
+`P-001`, `P-002`).  For `contract_xref`: `relation` (long-form with
+`row_keys`, `column_key`, `value`).  Optional dense-axis frames referenced
+by `dense_axes.rows_from.frame` and `dense_axes.columns_from.frame`.
+
+Output Frames::
+`output` (long-form relation for `expand_xref`; matrix for `contract_xref`).
+
+Modified Frames::
+None; always returns a new frames dict.
+
+Reads Meta::
+yes — reads `_meta.xref_crosstable.<config_id>` to recover stored `column_keys`
+and `dense_axes.resolved` on `contract_xref`.
+
+Writes Meta::
+yes — writes `_meta.xref_crosstable.<config_id>` with `operation`, `matrix`,
+`relation`, `row_keys`, `column_keys`, and optional `dense_axes` payload.
+
+Important Columns::
+`row_keys` (pk of the row axis), `column_key` (discriminator for matrix
+columns), `value` (cell value).
+
+Local Helpers::
+None; self-contained in the single file.
+
+Direct Dependencies::
+None outside standard library and pandas.
+
+Comprehension Notes::
+`dense_axes` adds significant complexity: two optional source frames define
+the complete row and column domains so the contracted matrix is fully dense
+even when the relation is sparse.  Dense-axis resolved values are stored in
+`_meta` to allow offline roundtrip when the axis frames are not present at
+contraction time.  `_values_equal` uses a try/except instead of `==` to
+handle numpy scalars without dtype coercion failures.
+
+---
+
+== cell_codec
+
+Description::
+Generic cell-value ↔ structured code/token conversion.  Validates syntax and
+configured value sets.  Does not assign business meaning to codes.
+
+Public API::
+`parse_cell_value`, `serialize_cell_value`, `decode_cell_values`,
+`encode_cell_values`, `ParsedCellValue`
+(module: `domain/transformations/cell_codec.py`)
+
+Input Frames::
+`source` (flat-column DataFrame with at least a `value` column for
+`decode_cell_values`; `source` with `group_by` + `code` columns for
+`encode_cell_values`).
+
+Output Frames::
+`output` (decoded rows with passthrough columns + `code`;
+or encoded rows with `group_by` columns + `value`).
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — reads `_meta.legend_blocks.<name>` when `allowed_from_legend` is set.
+
+Writes Meta::
+yes — writes `_meta.cell_codecs.<config_id>` with operation, source, output,
+mode, delimiter, and the resolved allowed values/tokens.
+
+Important Columns::
+`value` (raw compact cell string), `code` (output token column),
+`group_by` (grouping identity for encoding).
+
+Local Helpers::
+All helpers (`_cell_to_text`, `_canonicalize_values`, `_legend_tokens`, etc.)
+are private within the same file.
+
+Direct Dependencies::
+None outside pandas.
+
+Comprehension Notes::
+Two modes: `whole_cell_code` (entire cell is one code) and `split_tokens`
+(cell contains delimiter-separated tokens).  Mixing `allowed_codes` with
+`allowed_tokens` is not guarded — callers must use the right parameter for
+the mode.  `_ordered_groups` uses a linear scan instead of a dict to preserve
+insertion order and handle unhashable identity values.
+
+---
+
+== compact_multiaxis
+
+Description::
+Composes `xref_crosstable` and `cell_codec` to handle compact matrix forms
+where cell values carry multi-token codes.  Adds optional group-column
+derivation from legend.
+
+Public API::
+`expand_compact_multiaxis`, `contract_compact_multiaxis`
+(module: `domain/transformations/compact_multiaxis.py`)
+
+Input Frames::
+`matrix` (for expand); `relation` (for contract).
+
+Output Frames::
+`output`.
+
+Modified Frames::
+None; intermediate `__compact_multiaxis_*` frame is created and then popped
+before returning.
+
+Reads Meta::
+yes — via `cell_codec` (legend_blocks) and via `xref_crosstable` (column_keys).
+
+Writes Meta::
+yes — writes `_meta.compact_multiaxis.<config_id>` and delegates meta writes
+to `cell_codec` and `xref_crosstable`.  Also writes `_meta.frame_lifecycle`.
+
+Important Columns::
+`row_keys`, `column_key`, `value`, `code`, optional `group`.
+
+Local Helpers::
+`_with_group_column`, `_group_lookup`, `_legend_groups` — all private in the
+same file.
+
+Direct Dependencies::
+`domain/transformations/cell_codec.py` (`decode_cell_values`, `encode_cell_values`)
+`domain/transformations/xref_crosstable.py` (`contract_xref`, `expand_xref`)
+`domain/frame_lifecycle.py` (`mark_source_if_unclassified`, `write_frame_lifecycle`)
+
+Comprehension Notes::
+`dense_axes` parameter is declared but raises `NotImplementedError` — it is
+a reserved future contract.  The temporary intermediate frame name collision
+check (`_temp_frame_name`) guards against accidental overwrites but adds
+surprising logic for callers who reuse the same frame names.  Group lookup
+duplicates much of `cell_codec._legend_tokens` logic locally.
+
+---
+
+== discriminator_split
+
+Description::
+Partition one frame into per-discriminator-value frames (split) and reverse
+(merge).  Preserves original row order across split/merge when
+`preserve_row_order=True`.
+
+Public API::
+`split_by_discriminator`, `merge_by_discriminator`
+(package: `domain/transformations/discriminator_split/`)
+
+Input Frames::
+`source_frame` (flat-column DataFrame; discriminator must be scalar
+and non-empty).  For merge: frames matching `source_pattern` or listed in
+`source_frames`.
+
+Output Frames::
+Per-discriminator-value frames (split); `target_frame` (merge).
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — `merge_by_discriminator` reads `_meta.split_by_discriminator.<config_id>`
+to recover `values`, `column_order`, and `row_order` when neither `value_map`
+nor `source_frames` is given.
+
+Writes Meta::
+yes — both write `_meta.split_by_discriminator.<config_id>` with operation,
+source/target, values, column_order, and row_order.
+
+Important Columns::
+`discriminator_column` (the column whose values drive the partition).
+
+Local Helpers::
+`framecheck.py` (structural guards), `metadata.py` (read/write plumbing),
+`naming.py` (pattern validation, safe segment derivation, value→frame name),
+`values.py` (scalar normalization, equality, sort tokens).
+These are internal package implementation details; callers use only the two
+re-exported names.
+
+Direct Dependencies::
+None outside pandas.
+
+Comprehension Notes::
+Split columns exclude the discriminator; merge re-introduces it.  This means
+the discriminator column disappears from the split frames — a source of
+confusion.  `merge_by_discriminator` enforces uniform column sets across all
+source frames and raises on any deviation rather than attempting to reconcile.
+The `values.py._sort_token` distinguishes numeric vs. string values for
+stable sort ordering across Python type changes.
+
+---
+
+== fk_helpers
+
+Description::
+Full FK-helper lifecycle: enrichment (materializing helper columns driven by
+v2 policy), cleanup (dropping helper columns after reimport), and reordering
+(positioning helpers next to their FK column).
+
+Public API::
+`enrich_helpers`, `drop_helpers`, `resolve_v2_fk_relations`,
+`derived_helper_columns_by_sheet`, `MissingFkRelationPolicyError`,
+`missing_fk_policy_error`, `build_v2_target_registry`, `_write_helper_provenance`
+(package: `domain/transformations/fk_helpers/`)
+
+Also exposed via `domain/transformations/helpers.py`:
+`mark_helpers`, `clean_aux_columns`, `flatten_headers`, `unflatten_headers`,
+`reorder_helpers_next_to_fk`
+
+Input Frames::
+All data frames in the pipeline for `enrich_helpers`/`drop_helpers`.
+
+Output Frames::
+Same frame names (columns added or removed in place within new frames dict).
+
+Modified Frames::
+Semantically the same frames are returned with modified column sets.
+
+Reads Meta::
+yes — `_meta.helper_policies.fk.relations` (schema_version 2) and
+`_meta.derived.sheets.<sheet>.helper_columns`.
+
+Writes Meta::
+yes — `enrich_helpers` writes `_meta.derived.sheets.<sheet>.helper_columns`
+via `_write_helper_provenance`; `drop_helpers` cleans those same entries.
+
+Important Columns::
+`source_column` (FK column on source frame), `target_key` (PK column on
+target frame), helper columns named per `helper_columns[*].column`.
+
+Local Helpers::
+`enrich.py`, `drop.py`, `policy.py`, `provenance.py`, `formula_provider.py`.
+`helpers.py` in the parent `transformations/` is related but is technically
+a sibling module, not an internal helper.
+
+Direct Dependencies::
+`core/fk.py` (`apply_fk_helpers`, `build_id_value_maps`, `FKDef`,
+`normalize_sheet_key`)
+`core/formulas.py` (`lookup_formula`) via `formula_provider.py`
+`core/indexing.py` via `validations/fk_helpers.py`
+`domain/frame_keys.py` (`copy_reserved_frames`, `iter_data_frames`)
+
+Comprehension Notes::
+`prefix` parameter in `drop_helpers` and `reorder_helpers_next_to_fk` is
+retained for YAML backward compatibility but is no longer used on any normal
+path — this is a silent dead parameter that could mislead authors.
+`enrich_helpers` silently skips relations whose `source_column` is not yet
+present in the frame; this is by design for partial pipeline states but
+introduces non-obvious silent no-ops.  The v2 policy requirement is
+intentionally strict: missing policy raises `MissingFkRelationPolicyError`
+with an actionable message.
+
+---
+
+== enrich_lookup
+
+Description::
+Joins a source frame with a lookup frame by explicit keys and projects
+configured helper fields.  Supports value mode (merged copy) and formula
+mode (stores `LookupFormulaSpec` objects for live XLOOKUP in rendered
+workbooks).
+
+Public API::
+`enrich_lookup`
+(module: `domain/transformations/enrich_lookup.py`)
+
+Input Frames::
+`source`, `lookup`.
+
+Output Frames::
+`output`.
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — reads `_meta.helper_policies.lookup.<lookup>` for key, missing mode,
+order, allowed/default helpers.
+
+Writes Meta::
+yes — writes `_meta.derived.sheets.<output>.enrich_lookup` with lookup,
+join keys, and helper columns.  Also writes `_meta.frame_lifecycle`.
+
+Important Columns::
+Join key columns (declared via `key`/`keys`/`on`), helper `fields` from the
+lookup frame.
+
+Local Helpers::
+All helpers are private within the same file.
+
+Direct Dependencies::
+`core/formulas.py` (`lookup_formula`)
+`domain/frame_lifecycle.py` (`mark_source_if_unclassified`, `write_frame_lifecycle`)
+
+Comprehension Notes::
+Three join key parameters (`key`, `keys`, `on`) are all valid but mutually
+exclusive — the `on` spelling is discouraged in YAML due to YAML 1.1 boolean
+coercion.  Policy-based conflict checking: inline key/missing/order that
+differ from a matching policy entry raise rather than silently override.
+Formula mode and `missing='fail'` are incompatible (raises immediately).
+Sort by lookup-frame columns is also incompatible with formula mode.
+
+---
+
+== derived_column_policy
+
+Description::
+Reimport cleanup: drops helper/derived columns from a payload frame after
+spreadsheet editing, optionally checking `enrich_lookup` helper values
+against their source lookup frame.
+
+Public API::
+`apply_derived_column_policy`, `enforce_derived_column_policy_frame`,
+`DerivedColumnFinding`
+(module: `domain/transformations/derived_column_policy.py`)
+
+Input Frames::
+`source` (payload frame after user editing).  Lookup frames referenced
+by `_meta.derived.sheets.<source>.enrich_lookup.lookup` are read by name
+from the frames dict.
+
+Output Frames::
+`output` or `source` (in-place replacement by default);
+`findings` (only in `warn_on_mismatch` mode).
+
+Modified Frames::
+`_meta` is mutated to strip consumed `derived.sheets[source]` when the
+source frame is replaced in-place.
+
+Reads Meta::
+yes — `_meta.derived.sheets.<source>` (transient provenance),
+`_meta.sheets.<source>.helper_columns` (durable fallback),
+`_meta.helper_policies.fk` (v2 policy fallback via `resolve_v2_fk_relations`).
+
+Writes Meta::
+yes — strips `_meta.derived.sheets.<source>.helper_columns` and
+`enrich_lookup` after cleanup.
+
+Important Columns::
+Helper column names drawn from metadata; no column names are structurally
+hardcoded.
+
+Local Helpers::
+All helpers are private within the same file.
+
+Direct Dependencies::
+`domain/finding_frame.py` (`Finding`, `findings_to_frame`, `FINDING_COLUMNS`,
+`simple_failure_message`)
+`domain/transformations/fk_helpers/policy.py` (`resolve_v2_fk_relations`)
+
+Comprehension Notes::
+Three-layered fallback for identifying helper columns: (1) transient
+`_meta.derived`, (2) durable `_meta.sheets.*.helper_columns`, (3) v2 FK
+policy.  Value checking is only available for `enrich_lookup` helpers and only
+when transient provenance is present.  FK helpers are dropped silently without
+value comparison in all cases.
+
+---
+
+== join_views
+
+Description::
+Bounded declarative join of two frames into a materialized view frame.
+Supports `left`, `inner`, and `semi` join modes.  Handles column collision via
+fail-or-suffix policy.  Supports row filtering via `where` predicate.
+
+Public API::
+`join_frames`
+(module: `domain/transformations/join_views.py`)
+
+Input Frames::
+`left`, `right`.
+
+Output Frames::
+`output`.
+
+Modified Frames::
+None.
+
+Reads Meta::
+no.
+
+Writes Meta::
+yes — writes `_meta.frame_lifecycle`.
+
+Important Columns::
+Join key columns (various spellings: `key`, `keys`, `left_key`/`right_key`,
+`left_keys`/`right_keys`).
+
+Local Helpers::
+`_ColumnSpec`, `_side_work_frame`, `_semi_join`, `_apply_where`, `_join_token`
+— all private in the same file.
+
+Direct Dependencies::
+`domain/frame_lifecycle.py` (`mark_source_if_unclassified`, `write_frame_lifecycle`)
+
+Comprehension Notes::
+Empty cells are treated as non-matching join keys (`_join_token` returns
+a fresh `object()` so they never match, even NULL==NULL).  This is a
+deliberate design choice to avoid false FK matches.  `validate=m:1` is only
+applied when `right_unique` is True or defaulted on non-semi joins.  Semi join
+uses an internal numbered-row approach to handle duplicate left rows correctly.
+
+---
+
+== tabular_views
+
+Description::
+Pivot a long-form frame into a bounded display view (wide frame).
+Supports `fail` or `aggregate` (first/join) duplicate handling.
+
+Public API::
+`pivot_frame`
+(module: `domain/transformations/tabular_views.py`)
+
+Input Frames::
+`source` (long-form DataFrame with `index_columns`, `column_key`, `value_column`).
+
+Output Frames::
+`output`.
+
+Modified Frames::
+None.
+
+Reads Meta::
+no.
+
+Writes Meta::
+yes — writes `_meta.frame_lifecycle`.
+
+Important Columns::
+`index_columns` (row identity), `column_key` (the column whose values become
+output columns), `value_column` (the cell values).
+
+Local Helpers::
+`_collect_cells`, `_aggregate_cell_values`, `_hashable_token`, `_ordered_pivot_keys`
+— all private in the same file.
+
+Direct Dependencies::
+`domain/frame_lifecycle.py`
+
+Comprehension Notes::
+`column_keys` (explicit allowlist) is validated against the actual data:
+unexpected values in the source that are not in `column_keys` raise an error.
+This is stricter than pandas pivot behavior.  Empty column labels in the
+`column_key` column raise immediately.
+
+---
+
+== sparse_defaults
+
+Description::
+Collapse default values to blank for sparse editable crosstables
+(`sparse_collapse`) and restore them on reimport (`sparse_expand`).
+Integrates with `xref_crosstable` metadata to auto-detect target columns.
+
+Public API::
+`sparse_collapse`, `sparse_expand`
+(module: `domain/transformations/sparse_defaults.py`)
+
+Input Frames::
+`frame` (matrix/crosstable frame with flat columns).
+
+Output Frames::
+Same frame name (mutated copy in the frames dict).
+
+Modified Frames::
+The named frame is replaced; original is not mutated.
+
+Reads Meta::
+yes — `sparse_expand` reads `_meta.sparse_defaults.<config_id>` for
+`default_value`, `blank_value`, and `columns`.  `sparse_collapse` reads
+`_meta.xref_crosstable` to auto-detect columns when `columns` is not given.
+
+Writes Meta::
+yes — both write `_meta.sparse_defaults.<config_id>`.
+
+Important Columns::
+Target value columns (the matrix body columns declared by `columns` or
+inferred from xref metadata).
+
+Local Helpers::
+All private within the same file.
+
+Direct Dependencies::
+None outside pandas.
+
+Comprehension Notes::
+Auto-detection of target columns from `xref_crosstable` metadata is
+ambiguous-by-design: if more than one xref config references the same matrix
+frame it raises rather than guessing.  This means callers must use consistent
+`name` parameters when chaining.
+
+---
+
+== resource_overrides
+
+Description::
+Normalises context-override tuples in a long-form frame: deduplicates,
+validates required default context presence, collapses overrides that match the
+default.
+
+Public API::
+`normalize_resource_overrides`, `normalize_resource_override_frame`,
+`ResourceOverridePolicy`, `ResourceOverrideNormalizationResult`,
+`ResourceOverrideFinding`
+(module: `domain/transformations/resource_overrides.py`)
+
+Input Frames::
+`source` (long-form with `row_keys`, `discriminator_column`, `context_column`,
+`value_column`).
+
+Output Frames::
+`output` or `source` (replacement); `findings` (only in `warn` mode).
+
+Modified Frames::
+None.
+
+Reads Meta::
+no.
+
+Writes Meta::
+no.
+
+Important Columns::
+`row_keys` (pk of the resource entity), `discriminator_column` (e.g.
+resource type), `context_column` (e.g. locale), `value_column` (override
+value).
+
+Local Helpers::
+All private within the same file.  `ResourceOverridePolicy` dataclass captures
+the full behavioral contract.
+
+Direct Dependencies::
+`domain/finding_frame.py` (`Finding`, `findings_to_frame`, `FINDING_COLUMNS`,
+`simple_failure_message`)
+
+Comprehension Notes::
+`explicit_empty_marker` allows a sentinel value (e.g. `"EMPTY"`) to
+distinguish intentional blank overrides from absent overrides.  The
+`collapse_override_equal_to_default` flag removes context-specific rows whose
+value would be identical to the default, reducing storage; this is the default
+behavior and may surprise callers who expect all explicit rows to be preserved.
+
+---
+
+== project_by_role
+
+Description::
+Role-based column projection: reorder or drop columns of a named frame
+according to the `row_identity`, `display_helper`, `matrix_value` taxonomy.
+Supports `outbound` (all three roles) and `inbound` (drop display_helper)
+directions.
+
+Public API::
+`project_by_role`
+(module: `domain/transformations/project_by_role.py`)
+
+Input Frames::
+`frame` (any DataFrame in the pipeline frames dict).
+
+Output Frames::
+Same `frame` name (the frame is replaced with the reordered version).
+
+Modified Frames::
+The named frame is replaced in the returned frames dict.
+
+Reads Meta::
+yes — indirectly, via `resolve_column_roles` which reads `_meta.xref_crosstable`
+(for `row_identity`), `_meta.workbook_view.sheets`, `_meta.sheets.*.helper_columns`
+(for `display_helper`), and `_meta.derived.sheets.*.helper_columns` (FK helpers).
+
+Writes Meta::
+no.
+
+Important Columns::
+`helper_columns` (explicit override for display_helper role),
+`key_columns` (explicit override for row_identity role).
+
+Local Helpers::
+`_outbound_columns`, `_inbound_columns`, `_validate_direction`,
+`_validate_role_order` — all private in the same file.
+
+Direct Dependencies::
+`domain/column_roles/__init__.py` + `resolver.py`
+(`resolve_column_roles`, `ROLE_DISPLAY_HELPER`, `ROLE_MATRIX_VALUE`,
+`ROLE_ROW_IDENTITY`, `ROLE_NAMES`, `ColumnRoles`)
+
+Comprehension Notes::
+Step is declared as in-place ("no source:/output: parameter") but returns a
+new frames dict — this is terminology only; no mutation occurs.  Missing
+`row_identity` is a warning, not an error; the step proceeds with an empty
+identity set.  Role ordering for `outbound` defaults to
+`(display_helper, row_identity, matrix_value)`; callers may permute via
+`role_order`.
+
+---
+
+== extractions
+
+Description::
+Declarative single-frame extraction, filtering, column projection,
+renaming, and sorting.
+
+Public API::
+`extract_frame`
+(module: `domain/extractions/frame_extract.py`)
+
+Input Frames::
+`source` (any DataFrame).
+
+Output Frames::
+`output`.
+
+Modified Frames::
+None.
+
+Reads Meta::
+no.
+
+Writes Meta::
+yes — writes `_meta.frame_lifecycle`.
+
+Important Columns::
+`columns` (projection list), `where.column` (filter column),
+`sort_by` (sort key columns).
+
+Local Helpers::
+`_apply_where`, `_project_columns`, `_rename_columns`, `_add_constants`
+— all private in the same file.
+
+Direct Dependencies::
+`domain/frame_lifecycle.py`
+
+Comprehension Notes::
+`constants` allows injecting fixed-value columns not present in the source —
+useful for tagging extracted rows.  `where` predicate supports the same
+five predicates used in `join_views` and `tabular_views`, but predicates
+are duplicated across files with only minor differences.
+
+---
+
+== column_roles
+
+Description::
+Foundation column-role taxonomy: classifies frame columns into
+`row_identity`, `display_helper`, and `matrix_value` by reading scattered
+upstream metadata.  Single source of truth for role detection consumed by
+`project_by_role` and `add_validations`.
+
+Public API::
+`resolve_column_roles`, `ColumnRoles`, `UnknownRoleError`,
+`ROLE_ROW_IDENTITY`, `ROLE_DISPLAY_HELPER`, `ROLE_MATRIX_VALUE`, `ROLE_NAMES`
+(package: `domain/column_roles/`)
+
+Input Frames::
+Any frames dict; the named `frame` must be a DataFrame.
+
+Output Frames::
+None (returns a `ColumnRoles` dataclass).
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — reads `_meta.xref_crosstable` (row_keys), `_meta.workbook_view.sheets`
+and `_meta.sheets.*.helper_columns` (view helpers), and
+`_meta.derived.sheets.*.helper_columns` (FK provenance helpers).
+
+Writes Meta::
+no.
+
+Important Columns::
+None structurally fixed; classification comes entirely from metadata.
+
+Local Helpers::
+`resolver.py` (all logic); `__init__.py` re-exports.
+
+Direct Dependencies::
+`domain/transformations/fk_helpers/policy.py` (`derived_helper_columns_by_sheet`)
+
+Comprehension Notes::
+This is described as an "interim" strategy — a unified `_meta.derived.sheets.*.column_roles`
+channel is planned but not yet present.  Overlap between `row_identity` and
+`display_helper` is resolved in favor of `row_identity` with a warning.
+The `_view_helper_columns` path traverses `workbook_view.sheets` to find the
+sheet name for a frame, then looks in `_meta.sheets.<sheet>.helper_columns` —
+a two-hop indirection that can silently return nothing when the view mapping
+is absent.
+
+---
+
+== validations/reference_validations
+
+Description::
+Declarative key and reference validations: unique, primary_key, foreign_key,
+unique_reference, no_helper_columns rule types.  Supports `when` (row filter)
+and `enabled_when` (conditional activation via a switch frame) predicates.
+
+Public API::
+`validate_references`, `findings_to_frame`, `ReferenceFinding`, `FINDING_COLUMNS`
+(module: `domain/validations/reference_validations.py`)
+
+Input Frames::
+Any frames named in the rules.
+
+Output Frames::
+`findings` frame (only in `warn` mode).
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — `no_helper_columns` reads `_meta.sheets.<frame>.helper_columns` via
+`_durable_helper_columns`.
+
+Writes Meta::
+no.
+
+Important Columns::
+Rule-configured `frame`, `columns`, `target`, `target_columns`.
+
+Local Helpers::
+All private within the same file.
+
+Direct Dependencies::
+`domain/finding_frame.py` (`findings_to_frame` mechanic)
+
+Comprehension Notes::
+`enabled_when` is a per-rule conditional gate driven by a separate "switch
+frame" containing key/value feature flags.  This is a non-obvious coupling
+pattern: validation behavior changes based on the presence and contents of
+an unrelated metadata frame.  `allow_empty` on `foreign_key` defaults to
+`True` — fully empty FK tuples are not reported.
+
+---
+
+== validations/graph_validations
+
+Description::
+Validates configured node/edge networks: endpoint existence (FK-style check
+against node key sets) and unique-edge constraint.
+
+Public API::
+`validate_graph`, `NodeSpec`, `EdgeSpec`
+(module: `domain/validations/graph_validations.py`)
+
+Input Frames::
+Node frames and edge frames declared in the `nodes`/`edges` configuration.
+
+Output Frames::
+`findings` frame (only in `warn` mode).
+
+Modified Frames::
+None.
+
+Reads Meta::
+no.
+
+Writes Meta::
+no.
+
+Important Columns::
+`source_columns`, `target_columns` (on edge frames), `key`/`keys` (on node
+frames).
+
+Local Helpers::
+All private within the same file.
+
+Direct Dependencies::
+`domain/validations/reference_validations.py` (`ReferenceFinding`, `findings_to_frame`)
+
+Comprehension Notes::
+Depends on `reference_validations.ReferenceFinding` for the finding type
+rather than defining its own — this creates a cross-module coupling within
+the validations family.  Edge `unique_columns` defaults to
+`source_columns + target_columns` when not explicitly configured.
+
+---
+
+== validations/fk_helpers
+
+Description::
+Pure domain FK-helper consistency checks: unexpected helpers (declared for one
+sheet, present on another), missing helpers, value mismatches against target
+lookup, and unresolvable FK values.  Also provides `check_duplicate_ids`.
+
+Public API::
+`validate_fk_helpers`, `check_unexpected_helpers`, `check_missing_helpers`,
+`check_helper_values`, `check_unresolvable_fks`, `check_duplicate_ids`,
+`FKFinding` (alias for `Finding`)
+(module: `domain/validations/fk_helpers.py`)
+
+Input Frames::
+All data frames.
+
+Output Frames::
+Returns `Findings` list (not a frames dict); side-effect-free.
+
+Modified Frames::
+None.
+
+Reads Meta::
+yes — `_meta.helper_policies.fk.relations` and `_meta.derived.sheets.*.helper_columns`.
+
+Writes Meta::
+no.
+
+Important Columns::
+`id_field` (fallback uniqueness check), FK column, helper column, target key.
+
+Local Helpers::
+`_DeclaredHelper`, `_ExpectedSheet`, `_expected_helper_columns_by_sheet`,
+`_build_target_value_maps`, `_build_target_id_sets` — all private.
+
+Direct Dependencies::
+`domain/transformations/fk_helpers/policy.py` (`resolve_v2_fk_relations`,
+`derived_helper_columns_by_sheet`, `missing_fk_policy_error`)
+`core/fk.py` (`normalize_sheet_key`)
+`core/indexing.py` (`has_level0`, `level0_series`)
+`domain/validations/findings.py` (`Finding`)
+`domain/frame_keys.py` (`iter_data_frames`)
+
+Comprehension Notes::
+`validate_fk_helpers` raises `MissingFkRelationPolicyError` rather than
+returning findings when neither v2 policy nor derived provenance is present —
+inconsistent with the other check functions which return empty lists when
+information is absent.  `FKFinding = Finding` is a backward-compat alias;
+any existing test importing `FKFinding` will still work but sees the same
+shared `Finding` dataclass.
+
+---
+
+== validations/validate_columns
+
+Description::
+Declarative cell-level validation constraints targeting specific columns or
+role-resolved columns on a sheet.  Writes constraints to `_meta.constraints`
+rather than performing in-line validation.
+
+Public API::
+`add_validations`
+(module: `domain/validations/validate_columns.py`)
+
+Input Frames::
+Any frames dict; mutates `_meta.constraints` in-place.
+
+Output Frames::
+Returns the same frames dict with `_meta.constraints` updated.
+
+Modified Frames::
+`_meta` is mutated in-place (setdefault pattern).
+
+Reads Meta::
+yes — reads `_meta.workbook_view.sheets` for frame→sheet mapping when using
+`roles` targeting.
+
+Writes Meta::
+yes — writes/merges `_meta.constraints`.
+
+Important Columns::
+`sheet`, `column`, `roles` (targeting); constraint `rule.type` (`in_list`,
+`from_legend`).
+
+Local Helpers::
+`_merge_constraints`, `_constraint_identity`, `_freeze`, `_role_target_columns`
+— all private within the same file.
+
+Direct Dependencies::
+`domain/column_roles/__init__.py` (`ROLE_NAMES`, `resolve_column_roles`)
+
+Comprehension Notes::
+`add_validations` mutates `frames` in-place using `frames["_meta"] = meta`
+instead of returning a new frames dict — this is inconsistent with the rest of
+the transformation family which always returns a new dict.  Idempotent merge
+logic (`_merge_constraints`) is needed because YAML sidecar files can feed
+previous constraints back into the step.
+
+---
+
+== schema_maintenance
+
+Description::
+Column-level schema operations on data frames (add, drop, rename, reorder)
+with automated propagation of changes into `_meta` reference paths
+(constraints, helper_policies.fk, workbook_view, frame_lifecycle, etc.).
+
+Public API::
+`apply_schema_maintenance`, `add_column`, `drop_column`, `rename_column`,
+`reorder_columns`, `SchemaMaintenanceRequest`, `SchemaMaintenanceResult`,
+`SchemaMaintenanceReport`, `SchemaMaintenanceFailure`, `SchemaMaintenanceWarning`,
+`SchemaOperationKind`, `WriteIntent`, `ColumnPlacement`, `ReorderSpec`
+(package: `domain/schema_maintenance/`)
+
+Input Frames::
+`target_frame` (the frame being modified).
+
+Output Frames::
+Same frame name with the column change applied (or unchanged on failure).
+
+Modified Frames::
+`target_frame` (column add/drop/rename/reorder) and `_meta` (reference
+propagation).
+
+Reads Meta::
+yes — `_meta` is traversed to find all structured references to the affected
+column.
+
+Writes Meta::
+yes — updates or prunes references across all known `_meta` root paths.
+
+Important Columns::
+`source_column` (old name), `target_column` (new name for rename/add).
+
+Local Helpers::
+`columns.py` (frame mutations), `meta_update.py` (metadata rule application),
+`meta_refs.py` (structured reference detection and path resolution),
+`model.py` (dataclasses).
+
+Direct Dependencies::
+None outside pandas and standard library (self-contained domain package).
+
+Comprehension Notes::
+`meta_refs.py` maintains an explicit list of known `_meta` root names
+(`SUPPORTED_ROOT_NAMES`, `BLOCKED_ROOTS_BY_NAME`) — adding a new meta root
+requires updating this allowlist.  `_meta.derived` is explicitly ignored for
+schema maintenance decisions (recorded as `IGNORED_DERIVED` in the report).
+`WriteIntent` is modeled but DRY_RUN vs WRITE behavior must be enforced by
+callers; the domain logic always applies changes regardless.
+
+---
+
+== fk_relations / helper_policies
+
+Description::
+Heuristic FK relation inference (`infer_fk_relations`) and explicit FK/lookup
+helper policy configuration (`configure_lookup_helpers`, `configure_fk_helpers`).
+Produces the v2 `_meta.helper_policies.fk` policy block consumed by all
+FK-helper primitives.
+
+Public API::
+`infer_fk_relations`
+(module: `domain/fk_relations.py`)
+
+`configure_lookup_helpers`, `configure_fk_helpers`
+(module: `domain/helper_policies.py`)
+
+Input Frames::
+All data frames (for `infer_fk_relations`); named `lookup` or source frames
+(for configure steps).
+
+Output Frames::
+Returns frames dict with `_meta.helper_policies` updated.
+
+Modified Frames::
+`_meta` only.
+
+Reads Meta::
+yes — existing `_meta.helper_policies.fk` is read and replaced.
+
+Writes Meta::
+yes — writes `_meta.helper_policies.fk` (schema_version 2) with
+`relations` list, `produced_by`, and `schema_version`.
+
+Important Columns::
+`id_columns` (target PK patterns), `fk_patterns` (FK column naming patterns).
+
+Local Helpers::
+`domain/fk_relations.py` owns `apply_v2_relations`, `build_v2_relation`.
+
+Direct Dependencies::
+`core/fk.py` (`normalize_sheet_key`)
+`domain/frame_keys.py` (`iter_data_frames`)
+
+Comprehension Notes::
+`infer_fk_relations` is the only heuristic step in the domain; all FK-helper
+primitives are deterministic given policy.  The heuristic uses
+`naming_convention` mode only.  The pattern `id_({target})` matches FK columns
+like `id_customer` that reference a frame named `customer`.  Ambiguous
+inference (multiple matches) raises unless `on_ambiguous='ignore'`.
+
+---
+
+== workbook_views
+
+Description::
+Declarative workbook view configuration: maps logical frames to physical
+sheets, sets editable/helper column declarations, protection, and lifecycle.
+Readback mapping helpers extract the sheet→frame mapping for downstream steps.
+
+Public API::
+`configure_workbook_view`, `WorkbookViewSheetMapping`,
+`get_sheet_mappings`, `get_configured_workbook_view`
+(module: `domain/workbook_views.py`)
+
+Input Frames::
+Any frames dict.
+
+Output Frames::
+Returns frames dict with `_meta.workbook_view` and `_meta.sheets` updated,
+and `_meta.frame_lifecycle` entries for each sheet.
+
+Modified Frames::
+`_meta`.
+
+Reads Meta::
+no (inputs are all passed explicitly).
+
+Writes Meta::
+yes — `_meta.workbook_view`, `_meta.sheets`, `_meta.frame_lifecycle`.
+
+Important Columns::
+`helper_columns` (per-sheet durable helper declarations),
+`editable_columns` (per-sheet editable column list).
+
+Local Helpers::
+`_SheetSpec`, `_sheet_lifecycle`, `_parse_sheet_entries` — private.
+
+Direct Dependencies::
+`domain/frame_lifecycle.py`
+
+Comprehension Notes::
+`configure_workbook_view` has a rich transformation sub-language inside the
+`sheets` spec (`where`, `sort_by`, `join`, `pivot`, `columns`, `rename`) but
+these transformation keys are parsed and stored in `_meta.workbook_view` for
+later application by the rendering pipeline — they are not applied here.
+This deferred-execution design means the step writes meta but does not produce
+the view frames directly.
+
+---
+
+== meta_bootstrap / yaml_overrides
+
+Description::
+Meta bootstrapping: deep-merge of profile defaults, persisted meta, and CLI
+overrides.  YAML file loading and per-sheet override application.
+
+Public API::
+`bootstrap_meta`, `deep_merge`, `get_meta`, `set_meta`
+(module: `domain/meta_bootstrap.py`)
+
+`load_overrides`, `apply_overrides`
+(module: `domain/yaml_overrides.py`)
+
+Input Frames::
+Any frames container (dict or object with `.meta` attribute).
+
+Output Frames::
+Same container (mutated in place by `bootstrap_meta`/`set_meta`).
+
+Modified Frames::
+`_meta` is merged in place.
+
+Reads Meta::
+yes — reads existing `_meta` as the "persisted" layer.
+
+Writes Meta::
+yes — writes merged `_meta` back.
+
+Important Columns::
+None.
+
+Local Helpers::
+All helpers private within each file.
+
+Direct Dependencies::
+`yaml` (yaml_overrides only).
+
+Comprehension Notes::
+`deep_merge` replaces lists rather than merging them — list values in the
+overlay always win.  This is intentional (explicit profile semantics) but
+can surprise callers who expect list-append behavior.  `bootstrap_meta`
+relies on the dual-interface convention (`.meta` attribute or `["_meta"]` key)
+for compatibility with both the dict-based and class-based frames containers.
+
+---
+
+== structured_yaml / key_value_writer / artifact_manifest
+
+Description::
+Writer-side output steps: write structured YAML files, .properties-style
+key-value files, and aggregate writer report frames into a manifest.
+
+Public API::
+`write_structured_yaml`
+(module: `domain/structured_yaml.py`)
+
+`write_key_value_resources`
+(module: `domain/key_value_writer.py`)
+
+`write_artifact_manifest`
+(module: `domain/artifact_manifest.py`)
+
+Input Frames::
+Configured source frames containing the data to be written.
+
+Output Frames::
+Report frames (path/status/checksum per generated file).
+
+Modified Frames::
+None (file I/O side effects only).
+
+Reads Meta::
+yes (`artifact_manifest` reads meta for source frame listing; `structured_yaml`
+reads frames by name).
+
+Writes Meta::
+no.
+
+Important Columns::
+`key`, `value`, `file_pattern` (key_value_writer); `path`, `artifact_kind`,
+`status` (manifest).
+
+Local Helpers::
+Private within each file.
+
+Direct Dependencies::
+`yaml`, `pathlib`, `hashlib` (standard library only beyond pandas).
+
+Comprehension Notes::
+`write_structured_yaml` supports three distinct output shapes (mapping/key,
+mapping/key+sequence, list/value) in a single function — this conditional
+path complexity is non-obvious.  `write_key_value_resources` partitions the
+source frame by `file_pattern` placeholder columns; a pattern with no
+placeholders writes the whole frame to one file.
+
+---
+
+== finding_frame
+
+Description::
+Shared domain finding record protocol and tabular serialization.  Canonical
+seven-column finding-frame schema (`rule_type`, `frame`, `columns`,
+`row_index`, `value`, `severity`, `message`).
+
+Public API::
+`Finding`, `FindingRecord`, `findings_to_frame`, `FINDING_COLUMNS`,
+`simple_failure_message`
+(module: `domain/finding_frame.py`)
+
+Input Frames::
+Not a transformation; purely a shared type/serialization module.
+
+Output Frames::
+n/a
+
+Modified Frames::
+n/a
+
+Reads Meta::
+no.
+
+Writes Meta::
+no.
+
+Important Columns::
+Defines `FINDING_COLUMNS` (seven-column schema).
+
+Local Helpers::
+Protocol `FindingRecord`.
+
+Direct Dependencies::
+pandas only.
+
+Comprehension Notes::
+Intentionally distinct from `domain/validations/findings.py::Finding` which is
+the category/severity policy model for the older validation path.  The two
+`Finding` classes coexist.  `reference_validations.ReferenceFinding` adds
+`target_frame`/`target_columns` columns and re-exports `findings_to_frame` from
+this module — only the serialization mechanic is shared.
+
+---
+
+== frame_lifecycle
+
+Description::
+Shared utility for writing and reading `_meta.frame_lifecycle` entries.
+Every transformation that produces a named output frame writes a lifecycle
+entry describing its role, canonical flag, render hint, and provenance.
+
+Public API::
+`write_frame_lifecycle`, `mark_source_if_unclassified`, `frame_lifecycle`,
+`FRAME_LIFECYCLE_KEY`, `WORKBOOK_VIEW_KEY`
+(module: `domain/frame_lifecycle.py`)
+
+Input Frames::
+Any frames dict (via `MutableMapping` signature).
+
+Output Frames::
+Mutates `_meta.frame_lifecycle` in the frames dict.
+
+Modified Frames::
+`_meta`.
+
+Reads Meta::
+yes — reads existing `_meta.frame_lifecycle.<frame>` to honor
+`preserve_existing_canonical`.
+
+Writes Meta::
+yes — writes `_meta.frame_lifecycle.<frame>`.
+
+Important Columns::
+None; operates on frame names, not column names.
+
+Local Helpers::
+`_meta_dict`, `_unique_strings`, `mark_source_if_unclassified`.
+
+Direct Dependencies::
+Standard library only.
+
+Comprehension Notes::
+`preserve_existing_canonical=True` (default) means a frame already marked
+canonical cannot be demoted to non-canonical — subsequent calls are silently
+ignored for the `canonical` field.  This is load-bearing for pipeline
+step ordering safety but can mask bugs where a step tries to reclassify a frame.

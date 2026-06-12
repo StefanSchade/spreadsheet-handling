@@ -1,0 +1,325 @@
+= Refactoring Candidates
+
+== Candidate 001
+
+Name::
+Extract `_is_empty_cell` / `_values_equal` / `_plain_value` into a shared
+domain primitive module
+
+Risk::
+low
+
+Reason::
+`_is_empty_cell`, `_values_equal`, `_plain_value`, and `_is_blank_cell` are
+copy-pasted verbatim across at least eight files:
+`cell_codec.py`, `compact_multiaxis.py`, `discriminator_split/values.py`,
+`join_views.py`, `tabular_views.py`, `xref_crosstable.py`,
+`sparse_defaults.py`, `reference_validations.py`, `graph_validations.py`,
+`resource_overrides.py`.
+Each copy is semantically identical but maintains its own bugs.
+
+Expected Benefit::
+Single tested implementation.  Any future edge-case fix (e.g. `pd.Timestamp`
+handling) propagates everywhere.
+
+Potential Package Boundary::
+`domain/_cell_primitives.py` or `domain/primitives.py` (private module).
+
+Known Dependencies::
+Only `pandas` and `numbers.Number`.  No domain concepts.
+
+Expected Behaviour Change::
+none
+
+---
+
+== Candidate 002
+
+Name::
+Consolidate the `where` predicate engine into a shared module
+
+Risk::
+low
+
+Reason::
+The `_apply_where` function (with the five predicates `equals`, `in`,
+`non_empty`, `is_null`, `not_null`) is implemented independently in
+`join_views.py`, `extractions/frame_extract.py`, and
+`validations/reference_validations.py` (as `_condition_mask`/`_apply_when`).
+The implementations are close but not identical: `reference_validations`
+supports `enabled_when` and a switch-frame pattern that `join_views` lacks.
+The shared predicate core is extractable even if the switch-frame layer stays
+local.
+
+Expected Benefit::
+Eliminates silent divergence risk.  New predicates (e.g. `starts_with`) would
+need to be added only once.
+
+Potential Package Boundary::
+`domain/predicates.py` (shared filter primitive).
+
+Known Dependencies::
+Only `pandas`.
+
+Expected Behaviour Change::
+none
+
+---
+
+== Candidate 003
+
+Name::
+Separate `fk_helpers/helpers.py` from the `fk_helpers` package boundary
+
+Risk::
+medium
+
+Reason::
+`domain/transformations/helpers.py` is a top-level sibling module that imports
+from `domain/transformations/fk_helpers/policy.py` (for
+`resolve_v2_fk_relations`, `derived_helper_columns_by_sheet`,
+`missing_fk_policy_error`) but is not part of the `fk_helpers` package.  It
+also contains unrelated utilities: `mark_helpers`, `clean_aux_columns`,
+`flatten_headers`, `unflatten_headers`.  The FK-aware part (`reorder_helpers_next_to_fk`)
+belongs conceptually inside `fk_helpers`; the structural column utilities do
+not.
+
+Expected Benefit::
+Cleaner package ownership.  `reorder_helpers_next_to_fk` could be re-exported
+from `fk_helpers/__init__.py` consistently with `enrich_helpers` and
+`drop_helpers`.  Non-FK utilities become an independent utility module without
+the `fk_helpers` import.
+
+Potential Package Boundary::
+Move `reorder_helpers_next_to_fk` and `_pairings_by_sheet` into
+`domain/transformations/fk_helpers/reorder.py`.  Leave `mark_helpers`,
+`clean_aux_columns`, `flatten_headers`, `unflatten_headers` in a renamed
+`domain/transformations/column_utils.py`.
+
+Known Dependencies::
+Pipeline registry and test imports of
+`domain.transformations.helpers.reorder_helpers_next_to_fk` would need
+updating.
+
+Expected Behaviour Change::
+none
+
+---
+
+== Candidate 004
+
+Name::
+Unify the two `Finding` dataclasses
+
+Risk::
+medium
+
+Reason::
+`domain/finding_frame.py::Finding` (7-column tabular record with `rule_type`,
+`frame`, `columns`, `row_index`, `value`, `severity`, `message`) and
+`domain/validations/findings.py::Finding` (lightweight
+`category`/`sheet`/`column`/`detail`/`severity` model for severity-policy
+routing) coexist.  `validations/fk_helpers.py` aliases `FKFinding = Finding`
+referring to the older model.  The two models serve different consumers but
+the naming collision (`Finding` in both) is a source of confusion for anyone
+reading imports.
+
+Expected Benefit::
+Clearer naming.  Possible elimination of one model if the severity-policy
+mechanism (`apply_severity_policy`) can be adapted to consume the tabular form.
+
+Potential Package Boundary::
+Rename `domain/validations/findings.py::Finding` to `SeverityPolicyFinding`
+or move `apply_severity_policy` to accept the tabular `Finding` with an
+adapter.
+
+Known Dependencies::
+`validations/fk_helpers.py`, `validations/findings.py`, any pipeline step
+that calls `apply_severity_policy`.
+
+Expected Behaviour Change::
+none (rename only, no logic change)
+
+---
+
+== Candidate 005
+
+Name::
+Move compact_multiaxis legend-group logic to cell_codec
+
+Risk::
+low
+
+Reason::
+`compact_multiaxis._legend_groups` is a near-duplicate of
+`cell_codec._legend_tokens`: both parse the same `_meta.legend_blocks` shape
+and iterate the same `entries` list.  `_legend_groups` additionally reads the
+`group` field.  This duplication means any change to the legend block schema
+must be applied in two places.
+
+Expected Benefit::
+Single legend parsing path.  `_legend_groups` could call `_legend_tokens` and
+then do a second pass for the `group` field, or a combined function in
+`cell_codec` could return `(token, group)` pairs.
+
+Potential Package Boundary::
+`domain/transformations/cell_codec.py` (`_legend_entries` returning structured
+records).
+
+Known Dependencies::
+`compact_multiaxis.py` only.
+
+Expected Behaviour Change::
+none
+
+---
+
+== Candidate 006
+
+Name::
+Clarify and document the `validate_fk_helpers` raise-vs-return inconsistency
+
+Risk::
+low
+
+Reason::
+`validate_fk_helpers` raises `MissingFkRelationPolicyError` when no policy or
+provenance is present, but all its constituent `check_*` functions return
+empty lists when information is absent.  This asymmetry means the composite
+entry point has a different contract from its parts.  The inconsistency is
+documented in module docstrings but not enforced structurally.
+
+Expected Benefit::
+Consistent contract.  Either: (a) all check functions also raise when policy
+is absent (strict), or (b) `validate_fk_helpers` also returns an empty list
+when policy is absent and moves the guard into the caller (permissive).
+
+Potential Package Boundary::
+`domain/validations/fk_helpers.py` (no structural change needed).
+
+Known Dependencies::
+Any pipeline step that calls `validate_fk_helpers`.
+
+Expected Behaviour Change::
+none (internal behaviour clarification, no observable output change)
+
+---
+
+== Candidate 007
+
+Name::
+Isolate the dead `prefix` parameter in `drop_helpers` and `reorder_helpers_next_to_fk`
+
+Risk::
+low
+
+Reason::
+Both `drop_helpers(prefix=...)` and `reorder_helpers_next_to_fk(helper_prefix=...)`
+accept and immediately discard the parameter (`del prefix`).  The parameter is
+retained solely for YAML backward compatibility.  Its presence misleads
+pipeline authors and static analysis tools.
+
+Expected Benefit::
+Either: (a) deprecation warning on use so callers can clean up their YAML, or
+(b) document formally that the parameter is a no-op.
+
+Potential Package Boundary::
+`domain/transformations/fk_helpers/drop.py`,
+`domain/transformations/helpers.py`.
+
+Known Dependencies::
+Any YAML pipeline file that sets `prefix:` or `helper_prefix:` on those steps.
+
+Expected Behaviour Change::
+none (no logic change; documentation or warning addition only)
+
+---
+
+== Candidate 008
+
+Name::
+Formalize `WriteIntent` dry-run enforcement in schema_maintenance
+
+Risk::
+medium
+
+Reason::
+`schema_maintenance/model.py::WriteIntent` has `DRY_RUN` and `WRITE` values,
+but `apply_schema_maintenance` and all column operations apply changes
+regardless of the `WriteIntent` value — the enum is modeled but not
+enforced.  Callers are expected to check `report.frame_changes` manually for
+dry-run behavior.  This creates a semantic gap between the declared API and
+actual runtime behavior.
+
+Expected Benefit::
+If `WriteIntent.DRY_RUN` is honored internally, callers get safe preview
+without defensive wrappers.  If the enum is intentionally caller-controlled,
+a comment contract should make this explicit.
+
+Potential Package Boundary::
+`domain/schema_maintenance/operations.py` (`apply_schema_maintenance`).
+
+Known Dependencies::
+All callers of `apply_schema_maintenance` and the CLI maintenance commands.
+
+Expected Behaviour Change::
+none (if documentation only); possible behaviour change if DRY_RUN is
+enforced in the operations dispatcher.
+
+---
+
+== Executive Summary
+
+1. Estimated number of transformation families::
+17 distinct families (xref_crosstable, cell_codec, compact_multiaxis,
+discriminator_split, fk_helpers, enrich_lookup, derived_column_policy,
+join_views, tabular_views, sparse_defaults, resource_overrides,
+project_by_role, extractions, column_roles, validations [3 sub-families],
+schema_maintenance, fk_relations/helper_policies, workbook_views,
+meta_bootstrap/yaml_overrides, frame_lifecycle, finding_frame, writer steps).
+Counting cohesive clusters: approximately 17 separable families.
+
+2. Estimated coupling level::
+medium overall.  The domain is well-structured with clear package boundaries
+for the four main sub-packages (`transformations/`, `validations/`,
+`schema_maintenance/`, `column_roles/`).  The highest coupling concentration
+is in the `fk_helpers` cluster, which is imported by `column_roles`,
+`validations/fk_helpers`, `derived_column_policy`, and `helpers.py`.
+`frame_lifecycle` and `finding_frame` are low-coupling shared utilities.
+`_meta` is a shared mutable dict that all families read and write — this is
+the primary coupling medium.
+
+3. Whether the domain appears structurally recoverable::
+Yes.  The domain has clear intent, good module separation, and explicit
+meta-key namespacing (`xref_crosstable`, `split_by_discriminator`,
+`compact_multiaxis`, `cell_codecs`, `sparse_defaults`, `frame_lifecycle`,
+`helper_policies`, `derived`).  The main issues are copy-paste cell primitives,
+the two `Finding` classes, and the dead `prefix` parameters — all cosmetic
+or low-risk.  No circular imports were observed.
+
+4. Three safest first refactoring slices::
+a. Extract `_is_empty_cell` / `_values_equal` / `_plain_value` into a shared
+   `domain/primitives.py` (Candidate 001) — zero risk, pure copy consolidation.
+b. Consolidate the `where` predicate engine (Candidate 002) — low risk,
+   isolatable to one new module with clear test coverage.
+c. Rename `domain/validations/findings.py::Finding` to avoid collision with
+   `domain/finding_frame.py::Finding` (Candidate 004 partial) — rename only,
+   no logic change.
+
+5. Biggest unknowns discovered during the audit::
+a. `column_roles/resolver.py` is explicitly marked "interim" — a planned
+   unified `_meta.derived.sheets.*.column_roles` channel would change the
+   resolver's source of truth without changing its public API.  The scope of
+   that future change is unknown.
+b. `dense_axes` in `compact_multiaxis` raises `NotImplementedError` — it is a
+   reserved future contract placeholder.  Any code that probes for this
+   parameter would silently break if passed `dense_axes`.
+c. `workbook_views.configure_workbook_view` stores transformation sub-language
+   keys (`where`, `sort_by`, `join`, `pivot`) in `_meta.workbook_view` for
+   deferred execution by the rendering pipeline.  The rendering pipeline that
+   consumes those keys was not in scope for this audit — it is unknown how
+   completely that deferred execution is implemented.
+d. The dual-interface convention (`.meta` attribute or `["_meta"]` key) used
+   by `meta_bootstrap` and `yaml_overrides` implies a second frames container
+   type beyond `dict`.  That second type is not present in the domain package
+   and its definition was not located during this audit.

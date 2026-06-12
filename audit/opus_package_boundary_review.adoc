@@ -1,0 +1,336 @@
+= Opus Package Boundary Review
+
+== Verdict
+
+The Sonnet inventory is broadly faithful: the 17 families it names map to the
+code on disk, the public APIs match, and the meta-read/-write annotations
+agree with what the implementations actually do.  Where Sonnet drifts is in
+the refactoring candidates: a handful are framed as "consolidate near-duplicate
+helpers" when the implementations are in fact materially different.  Two
+candidates (001 cell primitives, 002 where predicates) survive review in a
+narrowed form.  Most of the rest are cosmetic, premature, or papering over
+real but out-of-scope contract questions.
+
+The domain is *not* an architecture problem.  It is mostly an autonomy
+problem: many transformations are already loosely coupled and could be
+packaged with very little risk, while a smaller core (FK helpers, column
+roles, the `_meta` namespace) is genuinely entangled and not a place to start.
+
+Recommended action: do exactly one small, behaviour-preserving consolidation
+slice as a warm-up, learn the test/CI cost, then revisit the broader plan.
+
+== Audit Reliability
+
+Reliable parts of the Sonnet audit:
+
+* Public-API listings per family.  Spot-checks against every transformation
+  module matched.
+* Reads-meta / writes-meta annotations.  The `_meta` namespacing
+  (`xref_crosstable`, `compact_multiaxis`, `cell_codecs`, `helper_policies`,
+  `derived`, `sheets`, `workbook_view`, `frame_lifecycle`,
+  `sparse_defaults`, `split_by_discriminator`) is exactly as documented.
+* The architectural shape of `fk_helpers/` as a sub-package, with `policy.py`
+  acting as a published contract surface re-exported via `__init__.py`.
+* The dependency edges in `coupling_map.json`.  All edges I sampled exist as
+  actual imports in the source.
+* The "compact_multiaxis composes xref + cell_codec" structural claim:
+  verified in `compact_multiaxis.py` imports.
+
+Questionable parts of the Sonnet audit:
+
+* Candidate 001 conflates three different primitives (`_is_empty_cell`,
+  `_values_equal`, `_plain_value`) as a single "copy-paste cluster".  In fact
+  only `_is_empty_cell` is verbatim identical across consumers.
+  `_values_equal` is verbatim in four files but extended in
+  `sparse_defaults.py` (short-circuit on missing scalars).  `_plain_value` has
+  *at least three* incompatible semantics across files (Timestamp→ISO in
+  `discriminator_split/values.py`; ""-on-empty in `tabular_views.py`;
+  None-on-empty in the validations files).  A naïve "extract to shared
+  primitive" would silently change behaviour.
+* Candidate 002 claims the `where` engine in `join_views.py`,
+  `extractions/frame_extract.py` and `validations/reference_validations.py`
+  is "close but not identical".  The first two are in fact verbatim copies
+  of each other; the third (`_condition_mask`) is materially different - it
+  normalises with `_format_scalar`/`_plain_value`, supports
+  `optional_missing`, and integrates with `enabled_when` switch frames.  The
+  candidate is sound for the join_views ↔ extractions pair, but is not a
+  three-way unification.
+* Candidate 004 ("unify the two Finding dataclasses") understates the
+  divergence.  `domain/finding_frame.py::Finding` is a tabular-row serializer;
+  `domain/validations/findings.py::Finding` is a severity-policy input.  The
+  module docstring of `finding_frame.py` already says collapsing them would
+  flatten genuinely different diagnostic semantics.  This is a naming
+  collision, not a model redundancy.
+* The executive summary's "three safest first slices" leads with 001, 002,
+  004.  Only the narrowed forms of 001 and 002 are actually safe.  004 should
+  not be touched until someone has a behaviour-level reason to.
+
+Out of scope but worth flagging:
+
+* The `dense_axes` `NotImplementedError` placeholder in
+  `compact_multiaxis.py` is correctly noted by Sonnet but not actionable.
+* The "interim" status of `column_roles/resolver.py` (planned migration to
+  `_meta.derived.sheets.*.column_roles`) is a real upcoming change; any
+  refactor of `column_roles`, `project_by_role`, or `validate_columns` now
+  is wasted work.
+
+== Natural Transformation Families
+
+The following families are genuinely autonomous at the domain level - their
+direct imports outside `pandas`/stdlib are limited to a shared writer of
+`_meta.frame_lifecycle` or the seven-column finding frame:
+
+* `xref_crosstable` - no domain-internal imports; the only meta it reads is
+  its own namespace (and its own dense-axis writeback).
+* `cell_codec` - reads `_meta.legend_blocks` (an external sidecar input,
+  not produced inside the domain).
+* `discriminator_split` package - self-contained; its own internal
+  `values.py` core is already isolated, with a docstring that explicitly
+  refuses promotion to a broad shared utility.
+* `sparse_defaults` - reads `_meta.xref_crosstable` only when auto-detecting
+  columns; an explicit `columns` parameter makes it standalone.
+* `join_views`, `tabular_views`, `extractions` - each depends only on
+  `frame_lifecycle` and pandas.
+* `resource_overrides` - depends only on `finding_frame`.
+* Writer steps (`structured_yaml`, `key_value_writer`, `artifact_manifest`)
+  - stdlib + yaml only.
+* `meta_bootstrap` / `yaml_overrides` - meta plumbing only.
+* `finding_frame`, `frame_lifecycle` - the shared utilities themselves.
+
+These could be split into clearer top-level domain packages later with very
+low risk.  None of them, however, are *under pressure* to split.  The
+package-boundary win available today is consolidation of duplicated
+primitives across them, not re-packaging them.
+
+== Coupling Hotspots
+
+Real coupling (verified by imports and meta reads):
+
+. `fk_helpers/policy.py` is the cluster's contract surface.  It is imported by
+  `column_roles/resolver.py`, `transformations/derived_column_policy.py`,
+  `transformations/helpers.py` (for `reorder_helpers_next_to_fk`), and
+  `validations/fk_helpers.py`.  Touching the policy reader shape will ripple
+  across four packages.
+. `column_roles` is read by `project_by_role` and `validate_columns` and is
+  internally bound to `fk_helpers/policy` for derived-helper detection.
+  Three packages are pinned to a module that the implementation itself
+  describes as "interim".
+. `_meta` is a shared mutable dict and the dominant coupling medium.
+  Sonnet correctly identifies this.  Cross-step coupling that looks like
+  "no import" is actually "implicit meta-key contract" in many places:
+  `sparse_defaults` ↔ `xref_crosstable`, `project_by_role` ↔
+  `xref_crosstable`/`workbook_view`/`sheets`/`derived`,
+  `derived_column_policy` ↔ `enrich_lookup`/`fk_helpers`/`workbook_view`.
+. `transformations/helpers.py` is a structural anomaly.  Four of its public
+  names (`mark_helpers`, `clean_aux_columns`, `flatten_headers`,
+  `unflatten_headers`) are pure header/prefix utilities with no FK
+  knowledge.  A fifth (`reorder_helpers_next_to_fk`) imports from
+  `fk_helpers`.  The whole file is a sibling of the `fk_helpers/` package,
+  not a member of it.  The pipeline registry pins symbol paths to this
+  module (see `pipeline/registry.py:34..42`), so a move is not zero-cost.
+
+Coupling that looks scary in the audit but is actually low-risk:
+
+* `validations/graph_validations` depending on
+  `validations/reference_validations` for `ReferenceFinding`/
+  `findings_to_frame` is intra-family by design.
+* `derived_column_policy` depending on `finding_frame` and
+  `fk_helpers/policy` is the cleanup pair of `enrich_helpers`/
+  `enrich_lookup` and a legitimate domain edge.
+* `compact_multiaxis` depending on `xref_crosstable` and `cell_codec` is
+  *the* definition of the family ("compose two primitives") and should be
+  preserved as-is.
+
+== Refactoring Candidate Assessment
+
+[cols="1,1,4"]
+|===
+| Candidate | Assessment | Reason
+
+| 001 cell primitives
+| accept (narrowed)
+| Extract only `_is_empty_cell` (verbatim identical across 5+ files) and the
+  bare `_values_equal` (verbatim in cell_codec, xref_crosstable,
+  resource_overrides, discriminator_split/values).  Do *not* include
+  `_plain_value`: at least three incompatible semantics exist
+  (Timestamp→ISO; ""-on-empty; None-on-empty).  Do *not* migrate the
+  extended `_values_equal` in `sparse_defaults.py` in this slice.  No public
+  API, no test imports of these names.
+
+| 002 where predicate engine
+| accept (narrowed)
+| `join_views._apply_where` and `extractions/frame_extract._apply_where` are
+  verbatim copies.  Extract those two only.  `reference_validations.
+  _condition_mask` is *not* the same function (different normalisation,
+  optional_missing, switch-frame integration) and should be left local in
+  this slice.  Sonnet's claim of three-way duplication is wrong.
+
+| 003 split helpers.py
+| defer
+| Correct conceptually: `helpers.py` mixes FK-aware reordering with
+  header/prefix utilities that have nothing to do with FKs.  But the
+  pipeline registry hardcodes symbol paths to
+  `domain.transformations.helpers:flatten_headers` and friends
+  (`pipeline/registry.py`).  Moving the module is a public-edge change for
+  any YAML pipeline file that references those targets.  Worth doing, but
+  not first.
+
+| 004 unify the two Finding classes
+| reject (for now)
+| Real naming collision, not real model redundancy.  The two dataclasses
+  serve different consumers and `finding_frame.py`'s own docstring states
+  that collapsing them would erase semantic distinctions.  A rename-only
+  change is mechanical noise; a model collapse needs a separate FTR.
+
+| 005 move legend_groups to cell_codec
+| defer
+| The duplication is real but localised to two files (`compact_multiaxis`,
+  `cell_codec`) and small (~30 LOC).  Moving it requires choosing whether
+  the shared API returns `(token, group)` pairs or two functions; that is a
+  cell_codec public-API decision and out of scope for a tidy-up slice.
+
+| 006 validate_fk_helpers raise vs return
+| defer
+| Internal contract clarity only.  No observable behaviour change is
+  possible without picking a new contract.  Belongs in the FK helpers
+  cluster review, not in a package-boundary slice.
+
+| 007 dead `prefix` parameter
+| defer
+| One-line deprecation warning or docstring fix.  Worth doing; not a
+  refactoring slice.  Could be a trivial follow-up commit.
+
+| 008 schema_maintenance WriteIntent
+| reject
+| Enforcing DRY_RUN is a behaviour change in a high-risk subsystem
+  (`schema_maintenance` mutates `_meta` references across the whole frames
+  dict).  Not a package-boundary question; not a first slice.
+|===
+
+== Recommended First Slice
+
+Slice::
+Extract `_is_empty_cell` and the bare-bones `_values_equal` into a private
+shared module `src/spreadsheet_handling/domain/_cell_primitives.py` and
+migrate the verbatim-identical call sites only.
+
+Why this slice::
++
+* Behaviour is preserved by construction: only verbatim-identical
+  implementations are folded together.
+* Public API impact is zero - both names are leading-underscore private
+  and no test imports them.
+* Touches files across the domain (xref, cell_codec, join_views,
+  tabular_views, extractions, reference_validations, graph_validations,
+  resource_overrides) so it doubles as a low-stakes smoke test for the
+  validation command itself.
+* It is small enough to be reverted as one PR if anything surprising
+  surfaces.
+* It deliberately *does not* preempt the FK helpers cluster or the
+  column_roles "interim" rework.
+
+Expected risk::
+very low.  The risk is dominated by Python import cycles, which are
+mechanically detectable.  The new module imports only `pandas` and
+`numbers`; nothing in the domain imports it back.
+
+Expected test impact::
+none on signatures, none on tests.  The existing test command
+(`.venv/bin/pytest -m 'not legacy and not prehex and not slow' tests/unit
+tests/integration tests/roundtrip`) should remain `1087 passed, 1 xfailed`.
+If a single assertion shifts, the slice is wrong; revert it.
+
+Files likely involved::
++
+* New: `src/spreadsheet_handling/domain/_cell_primitives.py` (or
+  `cell_primitives.py` - see open question).
+* Touched (replace local def with import):
+  ** `domain/transformations/cell_codec.py` (lines ~559, ~566)
+  ** `domain/transformations/xref_crosstable.py` (lines ~271, ~734)
+  ** `domain/transformations/join_views.py` (line ~512)
+  ** `domain/transformations/tabular_views.py` (line ~365) - only
+     `_is_empty_cell`; leave the local `_plain_value`.
+  ** `domain/transformations/resource_overrides.py` (line ~443)
+  ** `domain/extractions/frame_extract.py` (line ~272)
+  ** `domain/validations/reference_validations.py` (line ~720) - only
+     `_is_empty_cell`; leave the local `_plain_value`.
+  ** `domain/validations/graph_validations.py` (line ~409) - only
+     `_is_empty_cell`.
+* Explicitly *not* touched in this slice:
+  ** `domain/transformations/sparse_defaults.py` (extended `_values_equal`).
+  ** `domain/transformations/discriminator_split/values.py` (its docstring
+     already declares it a package-local core).
+  ** `domain/structured_yaml.py` (different needs around YAML scalar
+     rendering).
+
+Public API impact::
+none.
+
+Expected behaviour change::
+none.
+
+== Defer Explicitly
+
+The following should not be touched as part of a package-boundary effort
+right now:
+
+* The entire FK helpers cluster (`domain/transformations/fk_helpers/`,
+  `domain/validations/fk_helpers.py`, `domain/fk_relations.py`,
+  `domain/helper_policies.py`).  Per the brief: treat as a later cluster
+  review, and the cluster is already packaged.
+* `domain/column_roles/`.  The resolver is explicitly an interim
+  implementation; refactoring it now will be obsoleted by the planned
+  `_meta.derived.sheets.*.column_roles` channel.
+* `domain/transformations/project_by_role.py` and
+  `domain/validations/validate_columns.py`.  Both are pinned to
+  `column_roles`; they should move with it.
+* `domain/schema_maintenance/`.  High blast radius (it edits `_meta`
+  references across all known root names); WriteIntent semantics are
+  unresolved.  Out of scope.
+* `domain/workbook_views.configure_workbook_view`.  Its deferred-execution
+  sub-language (`where`, `sort_by`, `join`, `pivot`) couples to the
+  rendering pipeline that is out of scope for this audit.
+* The two `Finding` dataclasses.  Their coexistence is intentional and
+  documented in `finding_frame.py`.
+* `compact_multiaxis` legend-group consolidation (Candidate 005).  Small,
+  localised, not load-bearing.
+* `transformations/helpers.py` split (Candidate 003).  Worth doing *after*
+  001/002 land and the pipeline registry impact is measured.
+
+== Open Questions
+
+These are the questions that actually block the first or second slice.
+
+. Naming convention for a new private domain primitive module.  Is it
+  `_cell_primitives.py` (leading underscore, package-private convention),
+  or a bare `cell_primitives.py` re-exported from `domain/__init__.py`?
+  The current codebase prefers leading-underscore *symbols* but not
+  leading-underscore *modules*; the answer affects how future shared
+  utilities are added.
+. Is the extended `_values_equal` in `sparse_defaults.py` (with the
+  `_is_missing_scalar` short-circuit) intentional, or accidental drift?
+  Answer determines whether `sparse_defaults` joins the shared primitive
+  in a follow-up slice or stays divergent on purpose.
+. Should `transformations/discriminator_split/values.py` ever migrate to the
+  shared primitive module?  Its docstring says no; the question is whether
+  that policy is durable or was a moment-in-time choice.
+. For Slice 2 (where engine consolidation, narrowed to join_views ↔
+  extractions): should the shared module also accept an injectable
+  `is_empty` predicate so it can be used by `reference_validations` later,
+  or is that premature design?
+
+== Final Recommendation
+
+Do Slice 1 (extract `_is_empty_cell` and the bare `_values_equal` only) as a
+single small PR.  Run the documented test command.  Confirm `1087 passed,
+1 xfailed`.  Stop there for the session.
+
+The natural Slice 2, once Slice 1 is green, is the narrowed Candidate 002:
+extract the verbatim `_apply_where` shared between `join_views` and
+`extractions` only.  Defer everything else until after those two slices
+have proven the test loop is stable.
+
+Do not start a "domain package re-organisation" effort.  The package
+boundaries that exist today are mostly defensible; the genuine
+deduplication wins are small and can be taken one at a time without any
+structural commitment.
