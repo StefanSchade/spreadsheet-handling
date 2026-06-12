@@ -16,6 +16,7 @@ from spreadsheet_handling.domain.frame_lifecycle import (
     write_frame_lifecycle,
 )
 
+from ._legend_blocks import _read_legend_block
 from .cell_codec import decode_cell_values, encode_cell_values
 from .xref_crosstable import contract_xref, expand_xref
 
@@ -275,39 +276,8 @@ def _group_lookup(
 
 
 def _legend_groups(meta: Mapping[str, Any], legend_name: str) -> dict[Any, Any]:
-    raw = meta.get("legend_blocks")
-    spec: Any
-    if isinstance(raw, Mapping):
-        spec = raw.get(legend_name)
-    elif isinstance(raw, list):
-        spec = next(
-            (
-                item for index, item in enumerate(raw, start=1)
-                if isinstance(item, Mapping)
-                and str(item.get("name") or item.get("id") or f"legend_{index}") == legend_name
-            ),
-            None,
-        )
-    else:
-        spec = None
-
-    if not isinstance(spec, Mapping):
-        raise KeyError(
-            f"allowed_from_legend references legend block {legend_name!r}, "
-            "but no matching legend block was found in _meta.legend_blocks"
-        )
-    entries = spec.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError(f"Legend block {legend_name!r} requires a non-empty entries list")
-
     groups: dict[Any, Any] = {}
-    for index, entry in enumerate(entries, start=1):
-        if not isinstance(entry, Mapping):
-            raise ValueError(f"Legend block {legend_name!r} entry {index} must be a mapping")
-        token = entry.get("token")
-        if token is None or str(token) == "":
-            raise ValueError(f"Legend block {legend_name!r} entry {index} has an empty token")
-        group_value = entry.get("group", "")
+    for token, group_value in _read_legend_block(meta, legend_name):
         if token in groups and groups[token] != group_value:
             raise ValueError(f"Legend block {legend_name!r} has conflicting group values for {token!r}")
         groups[token] = group_value

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
+from spreadsheet_handling.domain.transformations._legend_blocks import _read_legend_block
 
 _WHOLE_CELL_CODE = "whole_cell_code"
 _SPLIT_TOKENS = "split_tokens"
@@ -246,44 +247,7 @@ def _allowed_values(
 
 
 def _legend_tokens(meta: Mapping[str, Any] | None, legend_name: str) -> tuple[Any, ...]:
-    if not isinstance(meta, Mapping):
-        raise KeyError(
-            f"allowed_from_legend references legend block {legend_name!r}, "
-            "but _meta.legend_blocks is missing"
-        )
-    raw = meta.get("legend_blocks")
-    if isinstance(raw, Mapping):
-        spec = raw.get(legend_name)
-    elif isinstance(raw, list):
-        spec = next(
-            (
-                item for index, item in enumerate(raw, start=1)
-                if isinstance(item, Mapping)
-                and str(item.get("name") or item.get("id") or f"legend_{index}") == legend_name
-            ),
-            None,
-        )
-    else:
-        spec = None
-
-    if not isinstance(spec, Mapping):
-        raise KeyError(
-            f"allowed_from_legend references legend block {legend_name!r}, "
-            "but no matching legend block was found in _meta.legend_blocks"
-        )
-    entries = spec.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError(f"Legend block {legend_name!r} requires a non-empty entries list")
-
-    tokens: list[Any] = []
-    for index, entry in enumerate(entries, start=1):
-        if not isinstance(entry, Mapping):
-            raise ValueError(f"Legend block {legend_name!r} entry {index} must be a mapping")
-        token = entry.get("token")
-        if _is_empty_cell(token):
-            raise ValueError(f"Legend block {legend_name!r} entry {index} has an empty token")
-        tokens.append(token)
-    return tuple(tokens)
+    return tuple(token for token, _group in _read_legend_block(meta, legend_name))
 
 
 def _validate_values(
