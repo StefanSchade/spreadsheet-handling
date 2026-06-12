@@ -1,0 +1,220 @@
+= Domain Cleanup Wave - Closing-State Review
+
+== Scope
+
+Five committed slices on branch ``domain-comprehension-audit``:
+
+* ``refactor(domain): extract shared cell primitives``
+* ``refactor(domain): extract shared where predicates``
+* ``refactor(domain): share duplicate-column detection``
+* ``refactor(domain): package xref crosstable transformation``
+* ``refactor(domain): package enrich lookup transformation``
+
+Baseline: ``1087 passed, 1 xfailed`` (unchanged from pre-wave).
+
+== Import Graph
+
+New domain-root utilities:
+
+* ``domain/_cell_primitives.py`` - leaf module, imports only ``pandas`` and
+  ``typing``. Defines ``_is_empty_cell``, ``_values_equal``. 14 importers
+  across the domain (transformations, validations, structured_yaml,
+  xref_crosstable sub-package). All one-way.
+* ``domain/_where_predicates.py`` - depends only on
+  ``domain/_cell_primitives``. Defines ``_apply_where``,
+  ``_WHERE_PREDICATES``, ``_ensure_columns``, ``_ensure_boolean_predicate``,
+  ``_duplicate_column_names``. Three importers (``extractions/frame_extract``,
+  ``transformations/join_views``, ``transformations/tabular_views``). One-way.
+
+New packages:
+
+* ``transformations/xref_crosstable/`` DAG:
++
+----
+__init__  → operation
+operation → dense_axes, primitives
+dense_axes → primitives
+primitives → (no package-internal imports)
+----
++
+The earlier ``operation``/``dense_axes`` load-order workaround was
+removed when ``primitives.py`` was introduced. No cycle remains.
+
+* ``transformations/enrich_lookup/`` DAG:
++
+----
+__init__  → operation
+operation → policy
+policy   → (no package-internal imports)
+----
+
+Cross-cluster edges that existed before the wave (``compact_multiaxis ->
+xref_crosstable``, ``compact_multiaxis -> cell_codec``, registry binding
+strings, ``derived_column_policy`` reading ``_meta.derived.sheets.*.
+enrich_lookup``, ``rendering/passes/_base`` reading the same shape) are
+unchanged.
+
+Programmatic verification (``importlib.import_module`` of every new
+module plus the registry-style ``getattr`` for ``expand_xref``,
+``contract_xref``, ``enrich_lookup``) succeeds at module-load time. No
+cycle was introduced by any slice.
+
+== Public Surface
+
+The wave added **zero** new public domain symbols.
+
+* Both new package facades re-export only the names that were public
+  before:
++
+----
+xref_crosstable/__init__.py:
+    from .operation import contract_xref, expand_xref
+    __all__ = ["contract_xref", "expand_xref"]
+
+enrich_lookup/__init__.py:
+    from .operation import enrich_lookup
+    __all__ = ["enrich_lookup"]
+----
+
+* Every shared helper introduced by Slices 1-3 is leading-underscore
+  private (``_is_empty_cell``, ``_values_equal``, ``_apply_where``,
+  ``_ensure_columns``, ``_ensure_boolean_predicate``, ``_duplicate_column_names``).
+  Tests import none of them.
+
+* The pipeline registry strings
+  (``...:expand_xref``, ``...:contract_xref``, ``...:enrich_lookup``) and
+  every test import of the two repackaged modules
+  (``test_xref_crosstable``, ``test_cell_codec``, ``test_sparse_defaults``,
+  ``test_project_by_role_migration_parity``, ``test_enrich_lookup``,
+  ``test_lookup_formula_mode``) continue to resolve through the new
+  ``__init__.py`` facades.
+
+== Package Boundaries
+
+* Pre-existing packages (``discriminator_split``, ``fk_helpers``,
+  ``schema_maintenance``, ``column_roles``, ``validations``,
+  ``extractions``) were not touched by any slice.
+* The two new packages enforce a stricter boundary than the flat
+  modules they replaced: only one symbol (``xref_crosstable``: two
+  symbols) crosses the package wall; everything else is package-private
+  by file location, not just leading underscore.
+* The new private utilities (``_cell_primitives``, ``_where_predicates``)
+  live at the ``domain/`` root rather than inside a transformation
+  package, which is consistent with their cross-cluster consumption.
+* No cross-cluster edge was weakened. No new edges from domain into
+  ``core/`` or back into ``pipeline/`` were created.
+* The Opus boundary review's "defer explicitly" list
+  (``fk_helpers`` cluster, ``column_roles``, ``schema_maintenance``,
+  ``workbook_views``, ``derived_column_policy``) was honoured. None of
+  those modules was edited.
+
+== Readability
+
+Net change is positive on every metric the slices targeted:
+
+* **Verbatim duplication removed**: ``_is_empty_cell`` (8 copies →
+  1), bare ``_values_equal`` (4 copies → 1), ``_apply_where`` and its
+  three companions (2 copies → 1), ``_duplicate_column_names`` (3
+  copies → 1).
+* **Two large flat modules became packages** with one clearly-named
+  secondary submodule each. The xref ``dense_axes`` chunk (~335 LOC, the
+  most intricate corner of the file) reads as a unit; the enrich_lookup
+  policy-resolution cluster (~190 LOC, the densest concentration of
+  conflict-checking logic) does the same.
+* **No body or signature was rewritten** for readability. Function
+  ordering inside ``xref_crosstable/operation.py`` and
+  ``enrich_lookup/operation.py`` was preserved relative to the original
+  source order, modulo the dense_axes/policy moves.
+* One "rewrite" did slip in during the enrich_lookup slice
+  (three ``_check_*`` bodies). It was caught by the existing test
+  suite and reverted to the verbatim originals before the commit
+  landed. Closing-state ``operation.py`` matches the pre-slice bodies.
+* The five-slice cadence (small, behaviour-preserving, test-green) is
+  itself a readability win for future contributors: the audit log
+  records why each slice was small.
+
+Readability cost: small. The new ``primitives.py`` in
+``xref_crosstable/`` is an extra file. The Opus enrich_lookup review
+predicted no ``primitives.py``; the actual implementation required a
+constant-relocation deviation (Option 1) but did not need a third
+submodule. Both packages are still under three Python files plus
+``__init__.py``.
+
+== Correctness Concerns
+
+Visible from static inspection: none.
+
+* All 1087 tests pass; 1 xfailed marker is pre-existing.
+* Import smoke test of every new module is green. Registry-style
+  ``getattr(import_module(path), symbol)`` resolves correctly for the
+  three repackaged registry bindings.
+* No ``__init__.py`` was modified outside the two new packages.
+* No registry, YAML, or test file was edited.
+* No public symbol was renamed, removed, or had its signature
+  changed.
+* No ``_meta`` key shape was changed. The
+  ``_meta.derived.sheets.<output>.enrich_lookup`` consumer surface in
+  ``derived_column_policy``, ``fk_helpers/provenance``, and
+  ``rendering/passes/_base`` continues to work unchanged.
+* The ``primitives.py`` deviation (xref) and the constant-relocation
+  deviation (enrich_lookup) are documented in their respective
+  ``audit/*_review.adoc`` files; both preserve identical run-time
+  behaviour.
+
+Potential future concerns flagged in earlier reviews but **not**
+addressed in this wave (intentionally - they were deferred):
+
+* ``column_roles/resolver.py`` is still flagged as "interim".
+* ``schema_maintenance`` still has the unresolved ``WriteIntent``
+  enforcement question.
+* The two ``Finding`` dataclasses still coexist.
+* ``compact_multiaxis._legend_groups`` ↔ ``cell_codec._legend_tokens``
+  duplication is still present.
+* ``transformations/helpers.py`` still mixes FK-aware reordering with
+  header utilities.
+
+None of these is a regression; all were explicitly deferred per the
+Opus review.
+
+== Cherry-Pick Readiness
+
+Ready
+
+Branch state on ``domain-comprehension-audit``:
+
+----
+12e7a57 refactor(domain): package enrich lookup transformation
+80e1f35 docs(domain): record enrich lookup package review
+fa196b0 refactor(domain): package xref crosstable transformation
+7f47b99 docs(domain): record package formation review
+d5c2f8b refactor(domain): share duplicate-column detection
+c421967 refactor(domain): extract shared where predicates
+935ac60 refactor(domain): extract shared cell primitives
+59625bb docs(domain): record documentation-blind domain audit findings
+c626a60 chore(experiment): hide documentation for domain-only audit
+----
+
+* The five ``refactor(domain): ...`` commits are linearly stacked and
+  each one leaves the test suite green. They can be cherry-picked in
+  order.
+* ``c626a60 chore(experiment): hide documentation for domain-only audit``
+  is the audit-staging commit and is exactly the one the user noted
+  should be excluded from any main-bound cherry-pick.
+* The three ``docs(domain): ...`` commits and the new
+  ``audit/domain_cleanup_wave_review.adoc`` from this review are
+  documentation-only and can be cherry-picked or skipped independently
+  per documentation policy. They do not affect the refactor commits.
+* Working tree is clean apart from this review file.
+
+== Overall Verdict
+
+Green
+
+Five slices in, the domain layer is structurally healthier than the
+pre-wave baseline. No import cycles were introduced; one was removed
+(the xref ``operation``/``dense_axes`` load-order workaround). No
+public surface was added. No package boundary was weakened. Test
+results are identical to the baseline. The deferred items called out
+by the Opus boundary review remain deferred and are still defensible.
+The branch is ready to feed cherry-picks into main once the chore
+commit is excluded.
