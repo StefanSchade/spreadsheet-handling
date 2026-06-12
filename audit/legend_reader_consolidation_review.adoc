@@ -1,0 +1,295 @@
+= Legend-Reader Consolidation Review
+
+== Verdict
+
+CONSOLIDATE
+
+The two functions share the schema walk, the four shared error
+messages, and the per-entry validation shape. They diverge only in
+what they extract from each validated entry and in one edge-case
+empty-token predicate. A small shared helper that yields validated
+``(token, group_value)`` records removes the duplication without
+changing any user-visible behaviour the tests exercise.
+
+== Responsibility Comparison
+
+Both functions:
+
+* Read ``meta.get("legend_blocks")`` and accept either the mapping
+  form (``{name: spec}``) or the list form (``[spec_with_name_or_id, ...]``).
+* Validate that a matching legend spec exists.
+* Validate that ``spec["entries"]`` is a non-empty list.
+* Walk entries with ``enumerate(start=1)`` and validate each entry is a
+  mapping with a non-empty ``token`` field.
+
+They diverge only in:
+
+* What they extract from each entry.
+* The empty-token predicate (see Error Behaviour below).
+* Post-processing - ``_legend_groups`` does a duplicate-key conflict
+  check that ``_legend_tokens`` does not need.
+
+These are *callers'* concerns layered over one shared *schema* concern.
+The schema concern is the duplication; the callers' concerns are
+genuinely different.
+
+== Supported Meta Shapes
+
+Identical between the two functions:
+
+* ``legend_blocks`` as ``Mapping[str, spec]`` - look up by exact name
+  key.
+* ``legend_blocks`` as ``list[spec]`` - scan for the first ``spec``
+  whose ``str(spec.get("name") or spec.get("id") or
+  f"legend_{index}")`` equals the requested ``legend_name``.
+* Anything else - treated as no-spec-found and triggers the "no
+  matching legend block" KeyError.
+
+The fallback ``f"legend_{index}"`` name and the ``name``-vs-``id``
+fallback ordering are byte-identical between the two implementations.
+
+Per-entry shape:
+
+* ``entry["token"]`` - the value used as a code/token. Required.
+* ``entry["group"]`` (compact_multiaxis only) - optional, defaults to
+  ``""``. Ignored by ``_legend_tokens``.
+* ``entry["label"]`` and other fields - never read by either function;
+  pass through.
+
+== Return Shape Comparison
+
+* ``_legend_tokens`` returns ``tuple[Any, ...]`` - just the tokens, in
+  source order. Caller (``_allowed_values``) treats this as a sequence
+  of allowed cell values.
+* ``_legend_groups`` returns ``dict[Any, Any]`` - token -> group_value
+  mapping. Caller (``_group_lookup``) merges with inline
+  ``code_groups`` and normalises keys.
+
+A shared helper that returns ``list[tuple[Any, Any]]`` of validated
+``(token, group_value)`` pairs supports both without behaviour change:
+
+* ``_legend_tokens`` becomes ``tuple(token for token, _ in
+  _read_legend_block(meta, name))``.
+* ``_legend_groups`` becomes ``dict`` construction with the existing
+  conflict check applied as a post-pass on the same list.
+
+Both transforms are pure and preserve element order, so neither
+caller's downstream behaviour shifts.
+
+== Error Behaviour
+
+Five error texts are emitted today; four are byte-identical between
+the two functions:
+
+[cols="1,3,3"]
+|===
+| Case | ``_legend_tokens`` | ``_legend_groups``
+
+| meta missing
+| ``KeyError("allowed_from_legend references legend block {name!r}, but _meta.legend_blocks is missing")``
+| (no check; signature is ``Mapping`` not ``Mapping \| None``)
+
+| spec not found
+| ``KeyError("...but no matching legend block was found in _meta.legend_blocks")``
+| same
+
+| entries invalid
+| ``ValueError("Legend block {name!r} requires a non-empty entries list")``
+| same
+
+| entry not a mapping
+| ``ValueError("Legend block {name!r} entry {index} must be a mapping")``
+| same
+
+| empty token
+| ``ValueError("Legend block {name!r} entry {index} has an empty token")``
+| same text, **different predicate**: ``_is_empty_cell(token)`` vs
+  ``token is None or str(token) == ""``
+|===
+
+The "different predicate" line is the only real semantic divergence.
+``_is_empty_cell`` additionally returns True for ``pd.isna(token)``
+inputs (NaN, NaT); the simpler check does not. So adopting the shared
+``_is_empty_cell`` form would *tighten* compact_multiaxis on the
+NaN-token edge case (a previously-accepted input would raise).
+
+In practice legend blocks are typed configuration (YAML or dict
+literals), so NaN tokens are not a realistic input. No test exercises
+this edge. Tightening is the safer direction (errors surface; silent
+acceptance does not), and it brings the two readers to one predicate
+across the codebase.
+
+The compact_multiaxis-only "conflicting group values" ValueError is
+emitted by the caller (``_legend_groups``), not by the schema walk; it
+stays local and is preserved verbatim.
+
+== Test Coverage
+
+Both functions are guarded by happy-path and missing-block tests:
+
+* ``tests/unit/domain/transformations/test_cell_codec.py``::
+  ** ``test_codec_can_source_allowed_values_from_legend_block`` -
+     happy path with mapping-form ``legend_blocks``.
+  ** ``test_missing_legend_block_error_points_to_allowed_from_legend``
+     - asserts ``KeyError`` matches ``"allowed_from_legend.*status_codes"``.
+  ** ``test_duplicate_explicit_and_legend_allowed_values_are_config_error``
+     - upstream of ``_legend_tokens``; preserved by consolidation.
+* ``tests/unit/domain/transformations/test_compact_multiaxis.py``::
+  ** Many happy-path tests using
+     ``allowed_from_legend="status_codes"`` with mapping-form blocks.
+  ** ``test_missing_legend_block_error_points_to_allowed_from_legend``
+     - asserts the same ``KeyError`` regex.
+
+Edge cases **not** covered by any test:
+
+* list-form ``legend_blocks``.
+* NaN-token entries (the only edge case where consolidation changes
+  behaviour).
+* The compact_multiaxis-only conflict check.
+
+Because the four shared error texts are preserved verbatim and the
+happy-path return shapes are preserved per caller, no test should
+regress. The NaN-token tightening is invisible to the test suite.
+
+== Minimal Shared Helper Shape
+
+----
+def _read_legend_block(
+    meta: Mapping[str, Any] | None,
+    legend_name: str,
+) -> list[tuple[Any, Any]]:
+    \"\"\"Return [(token, group_value), ...] for a configured legend block.
+
+    Raises KeyError when meta or the named legend block is missing.
+    Raises ValueError when the entries list is invalid or any entry is
+    malformed.
+    \"\"\"
+    # ... schema walk identical to today's two implementations ...
+    # ... per-entry: validate mapping, validate non-empty token via
+    #     _is_empty_cell, read entry.get("group", "")
+    # ... return list of (token, group_value) pairs
+----
+
+Caller becomes:
+
+* cell_codec.scalar::_legend_tokens -
+  ``return tuple(token for token, _ in _read_legend_block(meta, name))``
+* compact_multiaxis::_legend_groups -
+  ``groups: dict[Any, Any] = {}``
+  +
+  ``for token, group_value in _read_legend_block(meta, name):``
+  +
+  ``    if token in groups and groups[token] != group_value: raise ...``
+  +
+  ``    groups[token] = group_value``
+  +
+  ``return groups``
+
+The shared helper owns the schema walk and per-entry validation.
+Callers keep their per-caller post-processing.
+
+== Recommended Location
+
+``domain/transformations/_legend_blocks.py``
+
+Reasoning:
+
+* Both consumers are in ``domain/transformations/``; a transformations-
+  layer private utility matches the consumption scope.
+* Leading underscore signals "private shared helper", consistent with
+  the convention used by ``domain/_cell_primitives.py`` and
+  ``domain/_where_predicates.py`` at the domain root for similarly
+  scoped utilities.
+* Not under ``cell_codec/`` - that would force ``compact_multiaxis`` to
+  reach into another package's internals, breaking the
+  cell_codec facade contract established by the recent package split.
+* Not at ``domain/`` root - the helper reads a
+  ``_meta.legend_blocks`` schema that today only transformations
+  consume; promoting it higher would be premature. If a future
+  non-transformation consumer appears, the module can be moved to
+  ``domain/_legend_blocks.py`` with a one-line import update.
+
+Reject ``domain/transformations/legend_blocks.py`` (no underscore) -
+it would suggest a public module, but the helper is package-private to
+its two readers. Reject ``leave both local`` - that is the current
+state and the duplication is real.
+
+== Impact On compact_multiaxis Package Decision
+
+The earlier ``compact_multiaxis_package_review.adoc`` DEFER
+recommendation listed three reasons:
+
+. Small readability gain (~95 LOC group-column extension).
+. ``_legend_groups`` near-duplicates ``_legend_tokens``.
+. ``dense_axes`` ``NotImplementedError`` is a pending future contract.
+
+Consolidation resolves reason #2 (the duplication is gone), but in
+doing so *shrinks* the group-column extension from ~95 LOC to roughly
+~65 LOC. That makes reason #1 *worse*, not better: the case for a
+package shape on compact_multiaxis becomes weaker after this
+consolidation lands. Reason #3 is independent and still applies.
+
+Net effect on the package decision: consolidation makes the DEFER
+recommendation stronger. compact_multiaxis remains a thin composer
+with one small optional sub-feature, and the file becomes thinner
+still. Package formation should continue to be deferred until
+``dense_axes`` is implemented (or some other concrete pressure
+appears).
+
+== Mechanical Or Design?
+
+Mostly mechanical. Two small design decisions are required:
+
+. **Empty-token predicate**: unify on ``_is_empty_cell`` (chosen for
+  strict-direction risk; behaviour change is invisible to the test
+  suite).
+. **Shared return shape**: ``list[tuple[Any, Any]]`` of ``(token,
+  group_value)`` pairs (chosen because both callers iterate; pairs
+  cover both extraction needs).
+
+Both decisions can be made up front; neither needs implementation
+discovery. No new abstractions, no helper rename, no public API
+change.
+
+== Implementation Guardrails
+
+If the consolidation is approved, the implementation prompt should
+enforce:
+
+. Create ``src/spreadsheet_handling/domain/transformations/_legend_blocks.py``
+  with one function ``_read_legend_block`` returning
+  ``list[tuple[Any, Any]]``.
+. The new helper preserves all four shared error texts byte-for-byte.
+  It uses ``_is_empty_cell`` for the empty-token predicate (imported
+  from ``domain._cell_primitives``).
+. ``cell_codec/scalar.py::_legend_tokens`` becomes a one-line wrapper
+  that strips the group from the shared list and returns a tuple.
+. ``compact_multiaxis.py::_legend_groups`` becomes a small wrapper that
+  consumes the shared list and applies the conflict check.
+. No other helpers in either file change. No body, signature,
+  parameter-default, error-message, or constant-value changes outside
+  the two named helpers.
+. ``compact_multiaxis._legend_groups``'s NaN-token tightening is
+  documented in the commit body as a small expected behaviour change.
+. Do not edit tests, registry, docs, audit files (other than this
+  review), YAML, or any other module.
+. After editing, run the documented test command
+  (``.venv/bin/pytest -m 'not legacy and not prehex and not slow'
+  tests/unit tests/integration tests/roundtrip``); expected
+  ``1087 passed, 1 xfailed``.
+. Run ``git diff --check``; expected clean.
+. Report: file created, ``_legend_tokens`` / ``_legend_groups`` body
+  sizes before/after, NaN-token behaviour-change note, test result,
+  diff-check result.
+
+== Final Recommendation
+
+Proceed
+
+Land the consolidation as the next slice. The work is mechanical,
+preserves every error message currently exercised by tests, removes a
+real duplication, and re-confirms (rather than overturns) the recent
+DEFER on compact_multiaxis package formation. The single
+behaviour-change risk (NaN-token tightening on the compact_multiaxis
+side) is not test-detectable, is strictly safer at runtime, and is the
+right unification direction.
