@@ -1,0 +1,273 @@
+= Package Formation Feasibility Review
+
+== Verdict
+
+SAFE FIRST PACKAGE SLICE FOUND
+
+== Recommended Candidate
+
+Module::
+`src/spreadsheet_handling/domain/transformations/xref_crosstable.py`
+(currently 785 LOC after the three completed cleanup slices)
+
+Why this module::
++
+* Smallest *external* public surface among the large modules: only two
+  publicly-imported names, `expand_xref` and `contract_xref`. Both are
+  inventory-listed in `audit/transformation_inventory.adoc` as the family's
+  contract.
+* Largest concentrated readability win: ~375 LOC inside the file is
+  dense-axis machinery (lines ~351 through ~725), explicitly flagged in the
+  inventory as adding "significant complexity". Pulling that out as a
+  sibling submodule immediately makes the file approachable without any
+  behaviour change.
+* Zero domain-internal imports. The module depends only on `pandas` (after
+  Slice 1 added `_cell_primitives`). No `frame_lifecycle`, no
+  `finding_frame`, no FK helpers, no `column_roles`. This minimises the
+  surface where a stray relative import could break.
+* Established precedent: the codebase already contains four packages that
+  follow this pattern - `discriminator_split/`, `fk_helpers/`,
+  `schema_maintenance/`, `column_roles/`. The `__init__.py` re-export
+  convention is already proven for both registry binding and test imports.
+* `_meta` coupling is via key names (`_meta.xref_crosstable.<config_id>`),
+  not module identity. Splitting code that *writes* those keys cannot
+  affect code that *reads* them (sparse_defaults, project_by_role).
+
+== Proposed Package Shape
+
+Minimal two-submodule split. Anything more is design, not formation.
+
+----
+src/spreadsheet_handling/domain/transformations/xref_crosstable/
+    __init__.py        # re-exports expand_xref, contract_xref ONLY
+    operation.py       # expand_xref, contract_xref, plus the shared
+                       # guards/ordering/meta-io helpers used by both
+    dense_axes.py      # the ~15 dense-axis private helpers, moved verbatim
+----
+
+Concretely, `dense_axes.py` contains exactly these private helpers (moved
+verbatim, no rename, no signature change):
+
+* `_dense_axes_from_config_or_meta`
+* `_resolve_dense_axes`
+* `_axis_source_config`
+* `_axis_config_keys`
+* `_row_identities_from_axis_source`
+* `_column_keys_from_axis_source`
+* `_ensure_relation_within_dense_axes`
+* `_ensure_relation_rows_within_dense_axis`
+* `_ensure_relation_columns_within_dense_axis`
+* `_tuple_in`
+* `_optional_axis_frame`
+* `_stored_row_identities`
+* `_stored_column_keys`
+* `_plain_axis_value`
+* `_ensure_non_empty_axis_identity`
+* `_dense_axes_meta_payload`
+
+`operation.py` keeps everything else, including `expand_xref`,
+`contract_xref`, the shared guards (`_as_list`, `_require_frame`,
+`_ensure_flat_axis_labels`, `_ensure_columns`,
+`_ensure_output_names_do_not_collide`, `_ensure_unique_pairs`), ordering
+(`_ordered_row_identities`, `_ordered_unique`, `_ordered_values_equal`,
+`_relation_row_identity`, `_relation_column_identity`,
+`_matrix_column_keys`), and meta IO (`_xref_config`, `_write_xref_meta`,
+`_column_keys_from_meta_or_relation`). It imports the dense-axis helpers
+it needs via `from .dense_axes import ...`.
+
+`__init__.py` is two lines:
+
+----
+from .operation import contract_xref, expand_xref
+
+__all__ = ["contract_xref", "expand_xref"]
+----
+
+== Public Import Compatibility
+
+All existing imports keep working unchanged because the package's
+`__init__.py` re-exports the two public symbols.
+
+Concrete check across the four importer surfaces:
+
+. `pipeline/registry.py:110-114` binds step factories with the strings
+  `"spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref"`
+  and `:contract_xref`. The registry resolves these via
+  `importlib.import_module(mod_name)` then `getattr(mod, sym)`. Once
+  `xref_crosstable` is a package, `import_module` returns the package
+  object whose `__init__.py` exposes both symbols; `getattr` finds them.
+  No registry edits required.
+. `domain/transformations/compact_multiaxis.py:20` does
+  `from .xref_crosstable import contract_xref, expand_xref`. This relative
+  import resolves to the package's `__init__.py` re-exports. No edit
+  required.
+. Test imports - `tests/unit/domain/transformations/test_xref_crosstable.py`,
+  `test_cell_codec.py`, `test_sparse_defaults.py`, and
+  `tests/integration/pipeline/test_project_by_role_migration_parity.py` -
+  all import only `expand_xref` and/or `contract_xref` via the full
+  `spreadsheet_handling.domain.transformations.xref_crosstable` path. All
+  satisfied by the same `__init__.py`.
+. `pipeline/persistence_boundary.py:210` references the name
+  `xref_crosstable` as a local parameter; not an import.
+
+No test reaches into any private helper. Grep over the test tree for
+`xref_crosstable import` returns only public names. The dense-axis split
+therefore has zero test-visible surface.
+
+== Registry / YAML Exposure
+
+* Pipeline registry: two `module:symbol` strings, both resolved through
+  `importlib.import_module` (`pipeline/registry.py`). Package form
+  preserves resolution. No registry edit needed.
+* Test for the registry path: `tests/unit/pipeline/test_enrich_lookup_registration.py`
+  pattern-asserts a `target` string for `enrich_lookup`, not for
+  `xref_crosstable`. No equivalent test pins the `xref_crosstable` target
+  string, but if one existed it would still hold because the string is
+  unchanged.
+* YAML pipeline configs may reference `expand_xref` / `contract_xref` by
+  step name (the registry key, not the underlying path). Step-name
+  resolution is unaffected by package formation.
+* No `domain/__init__.py` re-export of `xref_crosstable` exists today, so
+  no external `__init__.py` needs updating.
+
+== Hidden Coupling
+
+* `_meta.xref_crosstable.<config_id>` is the write contract. The audit
+  inventory lists `sparse_defaults` and `project_by_role` as readers of
+  that key. Both reach the data via dict key navigation, not via
+  importing helpers from `xref_crosstable`. The split is invisible to
+  them.
+* `compact_multiaxis` composes `expand_xref` / `contract_xref`. It uses
+  the public names; private helpers are not crossed.
+* The `dense_axes.resolved` payload stored back in `_meta` for offline
+  roundtrip is produced by `_dense_axes_meta_payload` (moves to the new
+  submodule) and read by `_dense_axes_from_config_or_meta` (also moves).
+  Both producer and consumer co-locate in the same submodule, which is a
+  property the slice should preserve.
+* `dense_axes` accepts a `NotImplementedError` reservation in
+  `compact_multiaxis` (per inventory). That marker is unrelated and
+  unaffected.
+
+No hidden coupling that complicates the move.
+
+== Risk
+
+Low
+
+The move is mechanical: create a directory, split one file into two body
+files, write a three-line `__init__.py`, run tests. The most likely failure
+mode is a forgotten import in `operation.py` (a reference to a dense-axis
+helper that was not re-imported); that failure surfaces at module-load
+time with a `NameError` or `ImportError` and is recovered by adding the
+missing `from .dense_axes import ...` line. No behaviour can drift because
+no body is rewritten.
+
+== Expected Readability Gain
+
+High
+
+* `operation.py` is left as the readable narrative of the public
+  transformation: take frames, validate, build the result, write meta.
+  Around ~410 LOC of clearly-structured public-path code.
+* `dense_axes.py` collects the optional, more intricate dense-axis
+  reconstruction concern into one file (~375 LOC). Readers who do not
+  use `dense_axes` no longer need to scroll past it. Readers who do
+  have a single file to study.
+* The `_meta.xref_crosstable.<config_id>.dense_axes.resolved` storage
+  shape (round-trip support) becomes self-documenting by being defined
+  alongside its producer/consumer pair.
+* The pattern, once landed, becomes the template for the next slice
+  (likely `enrich_lookup` or `cell_codec`).
+
+== Why Not The Other Candidates
+
+* `validations/reference_validations.py` (775 LOC) - holds the
+  `_condition_mask` / `_apply_when` predicate engine that the Opus
+  package-boundary review explicitly listed as a likely future
+  consolidation target (Open Question #4). Splitting this module *now*
+  could pre-commit a structure that the future predicate-engine
+  decision invalidates. Defer until that decision is made.
+* `schema_maintenance/meta_update.py` (685 LOC) - technically the
+  *safest* by isolation: one public symbol, one internal importer
+  (`operations.py`), zero registry exposure, zero test imports of the
+  module itself. But: the Opus review placed `schema_maintenance` in
+  the "Defer Explicitly" list because the subsystem rewrites `_meta`
+  references across all known root names. Splitting per-meta-root
+  handlers (`_handle_constraints`, `_handle_sheets`,
+  `_handle_helper_policies`, etc.) is feasible but trades a known-good
+  test surface for an indirect coupling change. Better second slice,
+  not first.
+* `cell_codec.py` (615 LOC) - five public symbols (`ParsedCellValue`,
+  `decode_cell_values`, `encode_cell_values`, `parse_cell_value`,
+  `serialize_cell_value`) is the largest re-export surface among the
+  candidates and would set a precedent for `__init__.py` size that we
+  may not want for the first slice. Sections are clean, but the win is
+  smaller than for `xref_crosstable`.
+* `enrich_lookup.py` (567 LOC) - smallest single-symbol public API
+  (`enrich_lookup`), and a strong runner-up. Loses to
+  `xref_crosstable` only because the readability gain is smaller (no
+  single 375-LOC concern stands out the way `dense_axes` does) and the
+  cross-cluster dependencies (`core/formulas`, `helper_policies` meta
+  reads) are more numerous. Save for the second slice.
+* `workbook_views.py` (501 LOC) - Opus review flagged the
+  deferred-execution sub-language (`where`, `sort_by`, `join`, `pivot`
+  stored in `_meta.workbook_view` for the rendering pipeline) as
+  out-of-scope coupling. Splitting here could surface that coupling in
+  ways that affect the renderer. Defer.
+* `derived_column_policy.py` (491 LOC) - cross-cluster import of
+  `fk_helpers/policy` and a three-layered fallback for finding helper
+  columns (transient `_meta.derived`, durable
+  `_meta.sheets.*.helper_columns`, v2 FK policy). Splitting before the
+  FK-helpers cluster is itself reviewed risks freezing the fallback
+  chain in a less reviewable shape. Defer.
+* `validations/fk_helpers.py` (539 LOC) - FK helpers cluster was
+  explicitly deferred for now per the audit brief. Out of scope.
+
+== Implementation Guardrails For A Later Prompt
+
+The implementation prompt that lands this slice must enforce:
+
+. Create the directory
+  `src/spreadsheet_handling/domain/transformations/xref_crosstable/`.
+  Move the original `xref_crosstable.py` body into two new files
+  (`operation.py` and `dense_axes.py`) inside that directory. Delete the
+  flat `xref_crosstable.py`.
+. `__init__.py` re-exports exactly `expand_xref` and `contract_xref`
+  via `from .operation import ...`, plus an `__all__` list of those two
+  names. Nothing else.
+. The dense-axis helpers listed in the "Proposed Package Shape" section
+  move *verbatim* into `dense_axes.py`. Function bodies are unchanged.
+  Signatures are unchanged. No rename. No re-ordering of arguments.
+. `operation.py` keeps everything else. It imports the dense-axis
+  helpers it uses via `from .dense_axes import <names>`.
+. Do not touch `compact_multiaxis.py`, `sparse_defaults.py`,
+  `project_by_role.py`, or any test file.
+. Do not edit `pipeline/registry.py`, `pipeline/steps.py`, or any
+  pipeline configuration. The registry string must remain
+  `"spreadsheet_handling.domain.transformations.xref_crosstable:expand_xref"`
+  / `:contract_xref`.
+. Do not modify any other domain module, any `__init__.py` beyond the
+  new one, any audit file, any documentation.
+. Do not change any module-level constants, including
+  `_META_KEY = "xref_crosstable"`.
+. Do not change the `_meta` write shape or any error message text.
+. Do not split helpers beyond the dense-axis subset. Guards, ordering,
+  and meta-IO helpers stay in `operation.py` for this slice.
+. Do not introduce a `_cell_primitives` or `_where_predicates` import
+  unless the moving body already used those symbols.
+. After editing, run the documented test command:
+  `.venv/bin/pytest -m 'not legacy and not prehex and not slow' tests/unit
+  tests/integration tests/roundtrip` - expected result is unchanged
+  (`1087 passed, 1 xfailed`).
+. Run `git diff --check`; expected clean.
+. Report: files changed, directory created, symbols re-exported via
+  `__init__.py`, count of helpers moved into `dense_axes.py`,
+  deliberately untouched call sites, test result.
+
+== Important Note
+
+This is package formation only. The slice does not consolidate the dense-
+axis storage shape, does not unify the validation-finding model, does not
+move any cross-cluster dependency, and does not change any public symbol.
+If the implementing agent finds itself rewriting bodies or renaming
+helpers, stop - the slice has drifted into refactoring.
