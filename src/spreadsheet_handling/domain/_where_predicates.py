@@ -37,6 +37,11 @@ def _ensure_columns(
         )
 
 
+def _duplicate_column_names(frame: pd.DataFrame) -> list[Any]:
+    columns = list(frame.columns)
+    return list(dict.fromkeys(column for column in columns if columns.count(column) > 1))
+
+
 def _ensure_boolean_predicate(value: Any, predicate: str) -> None:
     if not isinstance(value, bool):
         raise TypeError(f"where.{predicate} must be true or false")

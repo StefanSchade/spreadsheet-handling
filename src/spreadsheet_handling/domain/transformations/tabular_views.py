@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
+from spreadsheet_handling.domain._where_predicates import _duplicate_column_names
 from spreadsheet_handling.domain.frame_lifecycle import (
     mark_source_if_unclassified,
     write_frame_lifecycle,
@@ -364,10 +365,6 @@ def _hashable_token(value: Any, *, field_name: str) -> Any:
 
 
 
-
-def _duplicate_column_names(frame: pd.DataFrame) -> list[Any]:
-    columns = list(frame.columns)
-    return list(dict.fromkeys(column for column in columns if columns.count(column) > 1))
 
 
 def _write_lifecycle(

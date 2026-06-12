@@ -7,7 +7,11 @@ from typing import Any
 
 import pandas as pd
 
-from spreadsheet_handling.domain._where_predicates import _apply_where, _ensure_columns
+from spreadsheet_handling.domain._where_predicates import (
+    _apply_where,
+    _duplicate_column_names,
+    _ensure_columns,
+)
 from spreadsheet_handling.domain.frame_lifecycle import (
     mark_source_if_unclassified,
     write_frame_lifecycle,
@@ -182,11 +186,6 @@ def _string_list(value: str | Iterable[str], field_name: str) -> list[str]:
     if duplicates:
         raise ValueError(f"{field_name} must not contain duplicate column names: {duplicates!r}")
     return result
-
-
-def _duplicate_column_names(frame: pd.DataFrame) -> list[str]:
-    columns = list(frame.columns)
-    return list(dict.fromkeys(column for column in columns if columns.count(column) > 1))
 
 
 
