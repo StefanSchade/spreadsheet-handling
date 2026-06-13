@@ -103,7 +103,7 @@ def test_meta_registry_registers_derived_channel_contract():
     assert derived["lifecycle"] == "transient"
     assert derived["producer"]
     assert derived["consumer"]
-    assert "domain.transformations.enrich_lookup._write_provenance" in derived["producer"]
+    assert "domain.transformations.enrich_lookup.operation._write_provenance" in derived["producer"]
     assert "domain.transformations.fk_helpers._write_helper_provenance" in derived["producer"]
     assert "rendering.passes._base._derived_helper_column_names" in derived["consumer"]
     assert "domain.transformations.fk_helpers.drop_helpers" in derived["consumer"]
