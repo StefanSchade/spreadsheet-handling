@@ -1,0 +1,521 @@
+= FK Helper Consolidation Post-Implementation Review
+
+:toc:
+:toclevels: 3
+
+Reviewer: fresh-context architecture / code review (read-only).
+Date: 2026-06-13.
+Scope: `spreadsheet-handling/core`, branch `main`, range `aa80215..8952050`.
+
+== Executive Summary
+
+The FK Helper consolidation does what it set out to do. Slice 1 (`cbc3b6e`)
+removes the two unread v2 relation fields (`helper_fields`, `helper_prefix`)
+and pins the surviving shape with a regression test. Slice 2 (`ba14230`)
+retires the v1 per-target producer write, makes `configure_fk_helpers`
+relations durable across the persistence boundary, and moves the Dino-shaped
+replay containment from a boundary prune to two materialisation-point controls
+(`_preserve_source_flatness` and the absent-target skip). The runtime contract
+for `configure_fk_helpers` is now coherent: no v1 write, durable v2 relations,
+`produced_by` retained only as provenance / cross-producer conflict key. The
+registry fix (`8952050`) corrects an unrelated `enrich_lookup` provenance
+reference.
+
+The *runtime* implementation is correct and well covered by tests. The
+replay/accumulation regression is genuinely closed and proven by an end-to-end
+test that exercises the real replay (not just the old boundary prune). On code
+alone this would be Green.
+
+It is not clean, however, because several **contract surfaces that this project
+treats as operational / oracle truth still describe the retired v1 producer
+write as active**. The `configure_fk_helpers` entry in
+`pipeline_step_registry.json` still *declares a v1 write* and an *active
+bridge*; the canonical `technical_model` bridge section still says "the
+residual v1 dict is still written"; `semantic_model` and the `user_guide`
+Known-limitation list still describe v1-blocking / dual-write behaviour that
+Slice 2 deleted. None of these are caught by the architecture guards (the
+guards validate `meta_registry.yaml`, which *was* updated, but not the
+pipeline registry's free-text notes or the prose docs). There is also a
+documented but undetected migration hole for pre-Slice-2 artifacts.
+
+Verdict: *Yellow*. The durable v2 contract is sound and shippable; the stale
+registry/doc surfaces (F1, F2) should be reconciled before the next slice
+because the next slice will read them as truth, and the migration risk (F3)
+should be confirmed against the controlled consumer.
+
+== Inputs Reviewed
+
+* Range `aa80215..8952050` (8 commits; the four `docs(...)`/`audit` commits are
+  concept/design/lessons, the three `refactor`/`fix` commits carry behaviour).
+* Runtime: `domain/helper_policies.py`, `domain/fk_relations.py`,
+  `domain/transformations/fk_helpers/{enrich,policy,provenance}.py`,
+  `core/fk.py` (`apply_fk_helpers`, `build_id_value_maps`),
+  `domain/transformations/derived_column_policy.py`,
+  `domain/schema_maintenance/meta_update.py`,
+  `pipeline/persistence_boundary.py`.
+* Registries: `registries/meta_registry.yaml`,
+  `registries/pipeline_step_registry.json`.
+* Docs: `docs/ai_info/concepts_fk_helpers.adoc`,
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`,
+  `docs/semantic_model/{07,12,15}*.adoc`,
+  `docs/user_guide/ch02_workflow/01_workflow.adoc`,
+  `docs/release_notes/release_notes.adoc`.
+* Tests (run as evidence): `tests/unit/domain/test_fk_helper_policies.py`,
+  `tests/unit/domain/test_fk_relations_inference.py`,
+  `tests/unit/pipeline/test_persistence_boundary.py`,
+  `tests/integration/pipeline/test_orchestrator_persistence_boundary.py`,
+  `tests/unit/domain/transformations/test_derived_column_policy.py`,
+  `tests/architecture/semantic_invariants/test_meta_registry*.py`,
+  `tests/unit/domain/schema_maintenance/test_metadata_refs.py`.
+* Sibling design doc `audit/fk_helper_slice2_v1_retirement_review.adoc` (design,
+  not post-implementation) and `audit/fk_helper_functional_model_to_implementation_review.adoc`.
+
+Validation commands (all green at `8952050`):
+
+[source,bash]
+----
+.venv/bin/python -m pytest \
+  tests/unit/domain/test_fk_helper_policies.py \
+  tests/unit/domain/test_fk_relations_inference.py \
+  tests/unit/pipeline/test_persistence_boundary.py \
+  tests/integration/pipeline/test_orchestrator_persistence_boundary.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/architecture/semantic_invariants/test_meta_registry_contract_lifecycle.py \
+  tests/architecture/semantic_invariants/test_meta_registry.py -q
+# 93 passed
+
+.venv/bin/python -m pytest tests/ -k \
+  "fk_helper or fk_relation or meta_update or helper_polic or persistence_boundary or schema_maint" -q
+# 223 passed
+----
+
+== Contract Assessment
+
+Review question 1 — `configure_fk_helpers` contract — is satisfied.
+
+* *No v1 producer write.* `configure_fk_helpers`
+  (`domain/helper_policies.py:91`) now builds policy specs, then calls only
+  `_v2_relations_from_explicit_policies` + `apply_v2_relations`
+  (`helper_policies.py:144-148`). The block that wrote
+  `_meta.helper_policies.fk.<target>` was deleted in `ba14230`. Pinned by
+  `test_configure_fk_helpers_writes_resolved_v2_relation` /
+  `_emits_durable_v2_relation` (assert `"Products" not in fk_root`).
+* *Durable v2 relations.* `apply_v2_relations` (`fk_relations.py:179`) writes
+  `schema_version: 2` + a deterministic `relations` list; the persistence
+  boundary no longer prunes them (see Persistence Boundary Assessment).
+* *`produced_by` retained as provenance / conflict key only.*
+  `build_v2_relation` keeps `produced_by`
+  (`fk_relations.py:283-293`); `apply_v2_relations` uses it solely as the
+  cross-producer conflict key (`_assert_no_relation_conflict`,
+  `fk_relations.py:233-254`); no pruning path reads it any more.
+
+Coherent. One small observation (NOTE F9): a configured target with empty
+`default_helpers` still produces a relation with `helper_columns: []`. That is
+harmless (the registry derives no fields, `iter_relation_fk_defs` yields no
+`FKDef`) but is an empty/no-op relation that survives persistence. Not a
+finding; recorded for awareness.
+
+== Slice 1 Assessment
+
+`cbc3b6e` removes `helper_fields` and `helper_prefix` from the v2 relation
+entry. These were redundant projections of `helper_columns` with no runtime
+reader (confirmed: `policy.build_v2_target_registry` /
+`iter_relation_fk_defs` read only `helper_columns[*]` and `target_*`). The
+change is clean:
+
+* `build_v2_relation` (`fk_relations.py:257-293`) emits exactly
+  `{source_frame, source_column, target_frame, target_key, helper_columns,
+  produced_by}`, pinned by `test_build_v2_relation_emits_only_consumed_fields`.
+* The two same-producer conflict tests were correctly reframed onto
+  `helper_columns[*].column` and an added `helper_columns` entry rather than the
+  deleted fields.
+* `infer_fk_relations` and `configure_fk_helpers` both already routed through
+  `build_v2_relation`, so removing the fields could not leave a divergent
+  writer.
+
+No findings in Slice 1.
+
+== Slice 2 Assessment
+
+`ba14230` is the load-bearing change. Four coordinated edits:
+
+1. *Producer* (`helper_policies.py`): v1 write removed; v2-only, durable.
+2. *Persistence boundary* (`persistence_boundary.py`): `_project_helper_policies`,
+   `_is_runtime_produced_fk_relation`, and `_RUNTIME_FK_HELPER_PRODUCER_STEP`
+   fully removed; `helper_policies` now passes through untouched.
+3. *Reimport cleanup* (`derived_column_policy.py`): `_v1_policy_helper_names`
+   removed; `_safe_policy_helper_names` is v2-only.
+4. *Schema maintenance* (`meta_update.py`): the v1 per-target "BLOCKED" branch
+   removed; only `_handle_fk_relations` maintains the v2 list.
+
+The four edits are mutually consistent and align with `meta_registry.yaml`
+(`transition_bridge.status: retired`, `runtime_writes: [v2_relation_policy]`)
+and the contract-lifecycle guards
+(`test_pilot_helper_policies_fk_current_consumers_match_runtime_truth`,
+`test_retired_bridge_does_not_still_read_source_shape`,
+`test_shape_drift_requires_non_retired_bridge` — the last now no-ops because
+`runtime_writes == runtime_reads`). Slice 1 + Slice 2 together do produce a
+clean, single-shape, durable v2 contract at runtime.
+
+The residual problems are not in the runtime — they are in the *non-runtime
+contract surfaces that were not brought along* (F1, F2, F4, F5).
+
+== Replay / Accumulation Safety
+
+Review question 2 — the old Dino replay/accumulation bug — is blocked.
+
+* *Flatness preservation.* `_preserve_source_flatness`
+  (`enrich.py:130-160`) collapses the MultiIndex-padded helper tuples back to
+  their first-level label *only when the source frame was flat*. This is the
+  real fix: `apply_fk_helpers` adds helpers as `(_helper,) + ("",)*(levels-1)`
+  (`core/fk.py:336`), which on a flat source would otherwise yield a mixed
+  flat/tuple column index and trip the downstream
+  `Frame ... must have flat columns` guard. Empirically validated:
+  `test_repeated_run_does_not_replay_stale_relation` runs the *actual* replay
+  with `levels=3` over a flat `groups` frame and asserts no tuple columns
+  remain.
+* *Missing-target skip.* `enrich.py:54-66` filters relations whose
+  `target_frame` is not loaded, before `build_id_value_maps`, preventing the
+  crash on a replayed relation whose target is absent
+  (`test_durable_relation_with_absent_target_is_skipped`).
+* *No accumulation.* `apply_fk_helpers` short-circuits
+  `if helper_col in first_cols: continue` (`core/fk.py:309`); the repeated-run
+  test asserts `count("_places_name") == 1` across two runs.
+
+These controls are sufficient for the documented failure mode. See F6/F7 for
+two minor robustness gaps in the skip, and F8 for a missing structured-source
+regression test for `_preserve_source_flatness`.
+
+== Persistence Boundary Assessment
+
+Review question 3 — the persistence boundary is now conceptually correct.
+
+* *`derived` still pruned.* `RUNTIME_ONLY_TOP_LEVEL_META_KEYS = {"derived"}`
+  (`persistence_boundary.py:112`); pruning of top-level `derived` and `__*`
+  keys is retained and tested (`test_orchestrator_*` assert
+  `"derived" not in persisted`).
+* *`helper_policies` preserved.* `project_meta_to_persistable_contract`
+  (`persistence_boundary.py:121-149`) no longer special-cases
+  `helper_policies`; it passes through unchanged. Tested by the renamed
+  `test_keeps_configure_produced_fk_helper_relations` and
+  `test_keeps_relations_schema_version_and_legacy_v1_entry`.
+* *No stale configure-v2 prune remains.* The prune helper and its constant are
+  gone; a repo-wide search finds no other site that prunes relations by
+  `produced_by.step` (only the `persistence_boundary.py:91` docstring mentions
+  it, to state that it no longer happens).
+* *Docs/tests match runtime.* The module docstring is updated and accurate; the
+  unit and integration tests assert durability across both structured
+  (`json_dir`) and spreadsheet (`xlsx`) carriers.
+
+== Reimport Cleanup Assessment
+
+Review question 4 — reimport cleanup is safe for *forward-produced* artifacts.
+
+`apply_derived_column_policy` resolves helper identity from, in order:
+transient `_meta.derived.sheets[source]`, durable
+`_meta.sheets[source].helper_columns`, and the v2 policy fallback
+`_safe_policy_helper_names` (`derived_column_policy.py:271-295`). After Slice 2
+the policy fallback is v2-only and metadata-driven — it reads
+`helper_policies.fk.relations[*].helper_columns[*].column` and never guesses
+from column names. With no runtime provenance and no
+`sheets.<frame>.helper_columns`, the durable v2 relation alone is sufficient,
+proven by `test_durable_fk_policy_fallback_drops_declared_helpers` (rewritten
+in `ba14230` from a v1 dict to a v2 relation). This is exactly the property
+that *justifies* making v2 durable, and it holds.
+
+The one gap is **older artifacts produced before Slice 2** — see F3.
+
+== Registry and Documentation Consistency
+
+Review question 6 — partially satisfied.
+
+Consistent and correct after the slice:
+
+* `meta_registry.yaml` `helper_policies` entry: `runtime_writes` v2-only,
+  `transition_bridge.status: retired`, removal condition met. The
+  contract-lifecycle architecture guards pass against it.
+* `docs/ai_info/concepts_fk_helpers.adoc`: rewritten to "writes only the v2
+  relation list … the v1 -> v2 dual_write bridge is retired."
+* No stale *code* references: all v1 helper functions
+  (`_v1_policy_helper_names`, `_project_helper_policies`,
+  `_is_runtime_produced_fk_relation`) are removed; nothing imports them.
+* No architecture guard now protects obsolete terminology — the guards were
+  updated in lock-step (`test_meta_registry_contract_lifecycle.py`).
+
+Still stale (contradicts shipped behaviour): `pipeline_step_registry.json`
+(F1), `technical_model/ch04_concepts/fk_helper_metadata.adoc` (F2),
+`semantic_model/{07,12,15}` (F5), and the `user_guide` / `release_notes`
+Known-limitation list (F4). These are not validated by any guard, which is why
+they drifted.
+
+== Migration / Consumer Impact
+
+Review question 5.
+
+* *Old artifacts with v1-only sidecars (F3, MAJOR).* A pre-Slice-2 *forward*
+  run persisted the v1 per-target dict but the *old* boundary pruned
+  configure-produced v2 relations — so such sidecars carry v1 only and no v2
+  anchor, and their transient `derived` was pruned too. Reimporting one with
+  the Slice-2 cleanup finds neither a v2 relation nor the deleted v1 fallback,
+  so FK helper columns are silently retained as payload. This is documented in
+  `release_notes.adoc:166-172` with a manual mitigation ("re-run the forward
+  pipeline once"), but there is no read-side detection. The original Dino
+  artifacts came from a controlled worldbuilding adoption; confirm those have
+  been re-bootstrapped (or are not reimported through the derived-column
+  policy) before relying on the new path.
+* *Schema-maintenance behaviour change (covered under F4).* Running
+  `sheets-schema-maintain` rename/drop over an old artifact that still carries a
+  v1 dict referencing the affected frame/column no longer *blocks*; the inert
+  v1 dict passes through with a now-stale reference. Harmless at runtime (no
+  reader), but it is a silent change from the previously-conservative
+  "block what cannot be safely rewritten" behaviour, and the docs still
+  advertise the old behaviour.
+* *Release-note migration guidance.* Present and placed under the active
+  unreleased section (`== unknown -- planned`), satisfying the placement rule.
+  Public YAML/CLI surface is unchanged; only the persisted `_meta` shape
+  shrinks.
+
+== Risks and Missing Tests
+
+* `_preserve_source_flatness` (review question 7): the structured-source guard
+  (`enrich.py:153`) is exercised only on the flat-source collapse path; the
+  "genuinely MultiIndex source is left untouched" branch has no test (F8).
+  MultiIndex handling, helper-formula behaviour, and ODS/XLSX rendering are
+  otherwise unaffected because the collapse triggers only when the source was
+  flat (in the normal forward path the source is already MultiIndex, so the
+  function returns `enriched_df` unchanged and rendering is unchanged).
+* Absent-target skip (review question 8): correct as a no-op per the functional
+  model, but silent and not distinguishable from a real mid-pipeline
+  misconfiguration (F6); and the skip uses exact name matching where the
+  registry resolves by `normalize_sheet_key` (F7).
+* No test pins the new schema-maintenance behaviour over a residual v1 dict
+  (now a pass-through, formerly a block).
+
+== Findings
+
+[discrete]
+=== F1 — Registry still declares the retired v1 write and an "active" bridge
+*MAJOR.*
+
+*Evidence:* `registries/pipeline_step_registry.json`, `configure_fk_helpers`
+entry:
+
+* `writes[0]` (line 1228-1234) declares path `helper_policies.fk.*` with note
+  "v1 per-target shape … Retained as a residual producer-side compatibility
+  write only". `configure_fk_helpers` no longer writes this path
+  (`helper_policies.py:144-148`).
+* `helper_policies.fk.relations` note (line 1240): "the bridge remains active on
+  the producer side to support the residual v1 per-target write".
+* `helper_policies.fk.schema_version` note (line 1247): "Co-exists with v1
+  per-target keys under the same root during the transition".
+
+These contradict the same file's already-updated `purpose` (line ~1196), the
+runtime, and `meta_registry.yaml` (`status: retired`,
+`runtime_writes: [v2_relation_policy]`).
+
+*Affected:* `registries/pipeline_step_registry.json` (configure_fk_helpers
+`writes` / produces-meta block).
+
+*Recommended action:* remove the `helper_policies.fk.*` v1 write entry; reword
+the `relations` and `schema_version` notes to drop "bridge active / residual
+v1 / co-exists" language; point to `meta_registry.yaml contract_lifecycle`
+(retired) as the single source.
+
+*Must fix before next slice:* *Yes.* This project uses the registries as
+operational and review-oracle truth; an internally contradictory registry will
+mislead the next slice's design and any registry-driven review.
+
+[discrete]
+=== F2 — `technical_model` bridge section still says v1 is written
+*MAJOR.*
+
+*Evidence:* `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`,
+section "Transitional v1 -> v2 bridge inside `configure_fk_helpers`":
+
+* lines 372-374: "the bridge emits no v2 entry for that policy (the residual v1
+  dict is still written)";
+* lines 379-385: "The bridge remains active on the producer side because
+  `configure_fk_helpers` still emits the legacy v1 per-target shape … Removing
+  that residual v1 write … is a follow-up clean-up that is *not* part of this
+  FTR";
+* line 395: "the residual v1 dual_write is a producer-side compatibility
+  mechanism only".
+
+The top of the *same* file (lines 333-347, updated in `ba14230`) already states
+v1 is no longer written — the file is internally inconsistent.
+
+*Affected:* `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`.
+
+*Recommended action:* rewrite the bridge subsection to "retired": the
+deterministic frame-scan identity derivation survives (it is how the v2
+relation is built), the v1 write is removed, the dual_write bridge is retired —
+matching `concepts_fk_helpers.adoc` and `meta_registry.yaml`.
+
+*Must fix before next slice:* *Yes.* The technical model is the canonical
+definition referenced by `concepts_fk_helpers.adoc`; leaving it self-
+contradictory undermines its authority for the next slice.
+
+[discrete]
+=== F3 — Pre-Slice-2 v1-only sidecars silently leak helpers on reimport
+*MAJOR.*
+
+*Evidence:* `_safe_policy_helper_names`
+(`domain/transformations/derived_column_policy.py:271-295`) is v2-only after
+`ba14230` removed `_v1_policy_helper_names`. A pre-Slice-2 forward run persisted
+the v1 dict but the old boundary pruned configure-produced v2 relations and
+pruned `derived`; so such an artifact carries v1 only. On reimport the cleanup
+finds no v2 relation, no v1 fallback, and no `derived`, so FK helper columns are
+not identified and remain as payload. Documented (`release_notes.adoc:166-172`)
+with a manual mitigation only; there is no read-side detection.
+
+*Affected:* `derived_column_policy._safe_policy_helper_names`; consumer
+artifacts; release notes (mitigation).
+
+*Recommended action:* confirm the controlled consumer (the worldbuilding
+adoption that produced the original Dino artifacts) has been re-bootstrapped or
+does not reimport through the derived-column policy; optionally add a one-time
+read-side warning when `helper_policies.fk` carries a v1 per-target dict but no
+v2 `relations`.
+
+*Must fix before next slice:* *No* — documented and consumer-controlled — but
+verify the consumer before treating reimport cleanup as safe in production.
+
+[discrete]
+=== F4 — Stale "residual v1 entries are blocked" Known limitation
+*MINOR.*
+
+*Evidence:* `meta_update.py:330-336` removed the v1 per-target "BLOCKED" branch
+in `ba14230`. But `docs/user_guide/ch02_workflow/01_workflow.adoc:92` and
+`docs/release_notes/release_notes.adoc:190` still list "residual v1
+`_meta.helper_policies.fk` entries are blocked rather than rewritten" as a
+current Known limitation — in the same active release-notes section as the
+Slice-2 bullet that says v1 is retired. The review instructions require the
+Known-limitations checkpoint to be reconciled when an FTR changes a
+limitation's validity.
+
+*Affected:* `docs/user_guide/ch02_workflow/01_workflow.adoc`,
+`docs/release_notes/release_notes.adoc`.
+
+*Recommended action:* remove or reword the limitation; optionally note the new
+inert-passthrough behaviour for old artifacts (a v1 dict referencing a
+renamed/dropped column is no longer blocked, but is also no longer read).
+
+*Must fix before next slice:* *No* (documentation reconciliation; harmless at
+runtime).
+
+[discrete]
+=== F5 — `semantic_model` docs still describe the bridge as active
+*MINOR.*
+
+*Evidence:* `docs/semantic_model/15_adoption_strategy.adoc:189-190,245-246`
+("`configure_fk_helpers` still emits the v1 shape as a residual back-compat
+write"), `docs/semantic_model/12_contract_matrices.adoc:311,337`,
+`docs/semantic_model/07_overlapping_semantic_sets.adoc:119-124`.
+
+*Affected:* `docs/semantic_model/{07,12,15}*.adoc`.
+
+*Recommended action:* update these (or annotate as superseded by FK Helper
+Slice 2). Lower priority than F1/F2 because the semantic model is narrative
+rather than the operational registry, but they are live docs now stating a
+falsehood.
+
+*Must fix before next slice:* *No.*
+
+[discrete]
+=== F6 — Absent-target skip is silent and can mask a real misconfiguration
+*MINOR.*
+
+*Evidence:* `enrich.py:54-66` filters relations whose `target_frame` is not in
+`known_data_frame_names`, with no log. The comment asserts an absent target
+"can only come from a durable relation replayed", but a target frame dropped by
+an earlier *same-run* step (e.g. `project_by_role`) would also be silently
+skipped, turning a genuine pipeline-ordering bug into a no-op. Combined with the
+per-source silent skip (`enrich.py:88-92`), enrichment can silently produce
+nothing.
+
+*Affected:* `domain/transformations/fk_helpers/enrich.py::enrich_helpers`.
+
+*Recommended action:* emit a debug/info log when a relation is skipped for an
+absent target so the no-op is diagnosable; the no-op semantics themselves are
+correct per the functional model. Consider a test for the mid-pipeline-drop
+case.
+
+*Must fix before next slice:* *No.*
+
+[discrete]
+=== F7 — Skip matches raw frame names; registry resolves by normalized key
+*MINOR.*
+
+*Evidence:* `enrich.py:61-66` compares
+`str(relation.get("target_frame")) in known_data_frame_names(frames)` (raw
+names), while `build_v2_target_registry` (`policy.py:94`) and
+`build_id_value_maps` key targets by `normalize_sheet_key`
+(`core/fk.py:38`, whitespace→`_`). A replayed relation whose stored
+`target_frame` differs from the reloaded frame key only by whitespace
+normalisation (e.g. `"My Places"` vs `"My_Places"`) is skipped even though
+`build_id_value_maps` could have resolved it — silently dropping helpers that
+should materialise.
+
+*Affected:* `enrich_helpers` skip filter; `policy.known_data_frame_names`.
+
+*Recommended action:* normalise both sides (`normalize_sheet_key`) so the skip
+is consistent with the downstream registry lookup.
+
+*Must fix before next slice:* *No* (narrow edge; current tests use already-
+normalised names).
+
+[discrete]
+=== F8 — Missing regression test for the structured-source path of `_preserve_source_flatness`
+*MINOR (missing test).*
+
+*Evidence:* the guard `if not _columns_are_flat(source_df.columns): return
+enriched_df` (`enrich.py:153`) protects genuinely MultiIndex layouts, but only
+the flat-source collapse path is tested
+(`test_orchestrator_persistence_boundary.py:211-277`). Review question 7
+("flattening of genuinely structured columns") is unprotected: a future change
+to the guard could silently collapse multi-level layouts in the normal forward
+path with no failing test.
+
+*Affected:* tests for `fk_helpers.enrich`; `_preserve_source_flatness` /
+`_columns_are_flat`.
+
+*Recommended action:* add a unit test that a `levels>1` MultiIndex source keeps
+its helper columns as padded tuples (no collapse), plus a direct unit test for
+`_columns_are_flat` including the mixed flat/tuple edge.
+
+*Must fix before next slice:* *No.*
+
+[discrete]
+=== F9 — `produced_by` provenance / conflict-key semantics are coherent
+*NOTE.*
+
+`build_v2_relation` retains `produced_by` (`fk_relations.py:283-293`);
+`apply_v2_relations` uses it only as the cross-producer conflict key
+(`fk_relations.py:233-254`); no pruning reads it. `configure_fk_helpers` writes
+`mode: "explicit"` purely as provenance. Matches the intended Slice-2 contract.
+No action.
+
+[discrete]
+=== F10 — Slice 1 is clean
+*NOTE.*
+
+Removal of the unread `helper_fields` / `helper_prefix` fields has no runtime
+reader left behind, is pinned by `test_build_v2_relation_emits_only_consumed_fields`,
+and the conflict tests were correctly reframed. No action.
+
+== Verdict
+
+*Yellow.*
+
+The durable v2 contract is correct, the replay/accumulation regression is
+genuinely closed and proven end-to-end, the persistence boundary and reimport
+fallback are coherent, and all affected tests pass. The runtime is shippable.
+
+It is Yellow rather than Green because the project's own contract surfaces —
+`pipeline_step_registry.json` (F1) and the canonical `technical_model` bridge
+section (F2) — still assert the *opposite* of what Slice 2 shipped (that v1 is
+written and the bridge is active), and these are not guarded, so they will be
+read as truth by the next slice. F1 and F2 should be reconciled before
+continuing. The migration hole (F3) is documented but undetected and should be
+confirmed against the controlled consumer. F4–F8 are minor doc/robustness/test
+gaps that can follow the next slice.
