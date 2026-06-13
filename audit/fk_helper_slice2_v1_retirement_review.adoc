@@ -1,0 +1,462 @@
+= FK Helper Slice 2: v1 Per-Target Dict Retirement — Design Review
+:toc: left
+:toclevels: 3
+:sectnums:
+
+Review type: design-only, code-grounded (read-only). *No implementation.* +
+Scope: *Slice 2 only* — replace the residual v1 FK-helper per-target dict
+(`_meta.helper_policies.fk.<target>`) with durable v2 relations for
+`configure_fk_helpers`, with no helper leakage on reimport. +
+Baseline: commit `cbc3b6e` (Slice 1 merged — `helper_prefix`/`helper_fields`
+already gone from the v2 relation shape). +
+Inputs read: `audit/fk_helper_functional_model_to_implementation_review.adoc`,
+`audit/fk_helper_meta_path_inventory.adoc`,
+`docs/functional_model/ch04_use_case_concepts/fk_helpers.adoc`, and current
+code: `domain/helper_policies.py`, `domain/fk_relations.py`,
+`pipeline/persistence_boundary.py`,
+`domain/transformations/derived_column_policy.py`,
+`domain/transformations/fk_helpers/{enrich,drop,policy}.py`, `core/fk.py`,
+`domain/schema_maintenance/meta_update.py`,
+`docs/cold_storage/backlog/ftrs_done/BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A.adoc`,
+and the relevant unit/integration/roundtrip/architecture tests. +
+Stance applied: owner-controlled project; controlled, migratable consumers;
+code/tests/consumer evidence over historical docs; backward compat is not a
+default veto.
+
+== Executive Summary
+
+The Slice-1 review's Slice-2 sketch is broadly right but *understated one
+hard constraint and over-stated one removal*:
+
+* *Hard constraint (the principal risk):* the persistence-boundary prune of
+  `configure_fk_helpers`-produced relations is not incidental — it is the
+  shipped containment for `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` (the Dino
+  `Frame 'groups' must have flat columns` failure). Making configure relations
+  *durable* removes exactly that containment. Slice 2 cannot just delete the
+  prune; it must *replace* the containment with a control that survives durable
+  relations. The carrier-neutral boundary cannot keep a relation for reverse
+  (reimport) cleanup while also stripping it on the forward sidecar, so the
+  containment must move out of the boundary.
+* *Over-stated removal:* `produced_by` must *not* be deleted. Its
+  persistence-discriminator role goes away, but `_assert_no_relation_conflict`
+  (`fk_relations.py:240`) still reads `produced_by.step` for cross-producer
+  collision detection. Slice 2 retires the *discriminator role*, keeps the
+  *field*.
+
+With those two corrections the slice is sound: stop writing v1, let
+`configure_fk_helpers` relations persist like inferred/user-authored ones,
+retain `produced_by` as provenance + conflict key, and add a single
+compensating safety control so durable relations cannot reproduce the Dino
+crash. The behavior gate is the existing falsification test
+`test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`, which
+must keep passing — *via durable v2 instead of v1*.
+
+== Why is v1 currently load-bearing?
+
+It is load-bearing on exactly one path, and *only because configure-produced v2
+is non-durable*:
+
+. `configure_fk_helpers` writes *both* shapes in one call: the v1 per-target
+  dict (`helper_policies.py:141-142`, `fk_policies[policy["target"]] = policy`)
+  and v2 relations tagged `produced_by.step = "configure_fk_helpers"`
+  (`helper_policies.py:147-149` → `_v2_relations_from_explicit_policies:178-188`).
+. The persistence boundary *prunes* those configure-produced v2 relations
+  (`_is_runtime_produced_fk_relation`, `persistence_boundary.py:181-187`;
+  applied in `_project_helper_policies:164-176`) but *preserves* the v1 dict.
+  So after the forward write, the persisted / workbook-embedded meta carries v1
+  but **not** configure-v2.
+. On reimport, runtime provenance `_meta.derived.*` was dropped at egress
+  (`RUNTIME_ONLY_TOP_LEVEL_META_KEYS = {"derived"}`,
+  `persistence_boundary.py:101`). If the forward run also did not record
+  `_meta.sheets.<frame>.helper_columns` (e.g. `configure_workbook_view` was
+  called without a `helper_columns` list), then the *only* surviving
+  helper-identity carrier is the v1 dict.
+. `apply_derived_column_policy` unions its three identity sources
+  (`derived_column_policy.py:75-91`: derived provenance ∪ durable
+  `sheets.helper_columns` ∪ policy). With the first two empty and configure-v2
+  pruned, the only non-empty contributor is `_v1_policy_helper_names`
+  (`derived_column_policy.py:294-325`), which reconstructs
+  `{helper_prefix}{target_frame}_{field}` from the v1 dict and feeds cleanup.
+
+*Proof / gate:* `tests/roundtrip/test_cleanup_invariants.py::test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`
+(line 54) builds a forward YAML whose `configure_workbook_view` carries *no*
+`helper_columns`, then asserts `_entities_name` is absent from canonical
+`items.json`. Today it passes only because v1 reconstructs the name.
+
+*Corollary:* the baseline roundtrip is **not** v1-dependent. The
+`minimal_fk_workdir` forward pipeline sets
+`configure_workbook_view ... helper_columns: ["_entities_name"]`
+(`tests/roundtrip/conftest.py:74-75`), so
+`test_helper_columns_absent_after_canonical_reimport` cleans via
+`_meta.sheets.items.helper_columns` (PATH-10), not v1. v1's *sole* live role is
+the "view-helper-metadata-absent" path above. Remove the reason it is the only
+survivor — make configure-v2 durable — and v1's role disappears.
+
+== What exact code change makes v2 durable enough to replace v1?
+
+Three coordinated changes (producer, boundary, cleanup fallback), plus one
+compensating safety control (see <<dino>>). None changes the v2 *relation
+shape*; `schema_version` is untouched.
+
+=== 1. Producer: write only durable v2 (`domain/helper_policies.py`)
+
+* Remove the v1 write loop in `configure_fk_helpers`
+  (`helper_policies.py:141-143`):
++
+[source,python]
+----
+for policy in policy_specs:
+    fk_policies[policy["target"]] = policy   # <- delete this v1 write
+helper_policies["fk"] = fk_policies          # keep the fk root / lookup ns
+----
++
+Keep the v2 emission (`_v2_relations_from_explicit_policies` →
+`apply_v2_relations`). `_build_fk_policy` and the resolved `policy_specs` are
+still needed *internally* (they compute `fk_column`, `target_key`,
+`helper_columns`); only the *persisted v1 dict* is dropped. The locals
+`helper_prefix` / `helper_fields` inside `_v2_relations_from_explicit_policies`
+(`:164-165`) remain — they build `helper_columns[*].column` / `target_field`.
+
+* `configure_fk_helpers` continues to tag relations
+  `produced_by.step = "configure_fk_helpers"`, `mode = "explicit"`
+  (`:185-186`). The tag is now provenance only (see
+  <<produced-by>>); it no longer triggers any prune.
+
+=== 2. Persistence boundary: stop pruning configure relations (`pipeline/persistence_boundary.py`)
+
+Durability is achieved by *removing the special case*, not by adding a new
+field. After this, `configure_fk_helpers` relations persist exactly like
+`infer_fk_relations` / user-authored relations already do.
+
+* Delete `_is_runtime_produced_fk_relation` (`:181-187`) and the constant
+  `_RUNTIME_FK_HELPER_PRODUCER_STEP` (`:109`).
+* In `_project_helper_policies` (`:148-178`) remove the relations-pruning block
+  (`:164-176`), including the paired empty-`relations`/`schema_version`
+  cleanup. With no prune the list never empties on this path, so
+  `schema_version` is preserved naturally — *not* by touching the field, but by
+  removing the code that used to drop it.
+* `_project_helper_policies` then reduces to a near pass-through for
+  `helper_policies` (keep the `Mapping` robustness guard at `:155-156`). The v1
+  per-target dict is no longer produced; if an *old* sidecar still carries one
+  it simply passes through and is inert (its only reader is deleted in step 3).
+  Optional hygiene (not required by this slice): strip stray `fk.<target>`
+  dicts on write. Recommend deferring that to keep the diff minimal.
+
+This is the one genuinely load-bearing edit: it reverses the narrow
+containment from `BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A`. It is safe *only*
+together with the compensating control in <<dino>>.
+
+=== 3. Cleanup fallback: drop the v1 reader (`domain/transformations/derived_column_policy.py`)
+
+* Delete `_v1_policy_helper_names` (`:294-325`).
+* In `_safe_policy_helper_names` (`:271-291`) remove the v1 call (`:278`) and
+  start from an empty set; keep the v2-relation reading (`:279-290`). After
+  Slice 2 the durable configure-v2 relation that now survives persistence is
+  what this function reads on reimport — the same code path inferred relations
+  already use.
+
+=== 4. Schema maintenance: drop the dead v1 branch (`domain/schema_maintenance/meta_update.py`)
+
+* In `_handle_helper_policies` (`:297-349`) remove the v1 blocked-reference loop
+  (`:330-345`, "Residual v1 FK helper policy is not rewritten in this slice").
+  No producer writes v1 after step 1, so the branch is dead. Keep
+  `_handle_fk_relations` (`:352-409`) — it renames `relations[*].source_column`
+  / `target_key` / `helper_columns[*].target_field` and blocks unsafe drops;
+  that is the durable-v2 rename/drop behavior and is unchanged.
+
+=== Net effect
+
+After these four edits, the durable carrier for the `configure_fk_helpers`
+reimport-cleanup path is the v2 relation list — identical in shape and
+lifetime to what `infer_fk_relations` already produces. `resolve_v2_fk_relations`
+(`fk_helpers/policy.py:32-58`) reads it unchanged. One model per concern, as
+`fk_helpers.adoc` §Simplification Note prescribes ("v1 per-target config
+treated as version mismatch → dropped, not migrated").
+
+[#produced-by]
+== What happens to `produced_by`?
+
+*Kept as a field; demoted from discriminator to provenance.*
+
+* *Removed role:* its only persistence-time consumer,
+  `_is_runtime_produced_fk_relation` (`persistence_boundary.py:181-187`), is
+  deleted. `produced_by.step == "configure_fk_helpers"` no longer means
+  "prune me."
+* *Retained role:* `_assert_no_relation_conflict` (`fk_relations.py:240-248`)
+  still reads `produced_by.step` to enforce the cross-producer collision rule
+  (two configuration steps must not silently overwrite each other on the same
+  `(source_frame, source_column)` key). That is a behavior contract independent
+  of persistence and must stay. `produced_by.mode` remains diagnostic origin
+  metadata.
+* *Consequence:* configure-produced relations now persist with
+  `produced_by = {step: configure_fk_helpers, mode: explicit}` intact. This is
+  fine — once relations are durable, all producers coexist symmetrically and
+  the field is honest provenance, not a lifetime signal.
+
+This *refines* the Slice-1 review, which listed "retire the `produced_by`
+discriminator." Code shows `produced_by` has a second, behavior-bearing
+consumer, so fully deleting the field is out of scope for Slice 2 and would
+break conflict detection. Retiring the *discriminator role* is the correct,
+bounded change. (Whether the field can ever be fully removed is a separate
+question tied to the conflict-detection design — not this slice.)
+
+== Which persistence-boundary rules change?
+
+Only the FK-relation rule. Everything else in
+`project_meta_to_persistable_contract` is untouched.
+
+[cols="2,3", options="header"]
+|===
+| Boundary rule | Slice-2 change
+
+| `derived` top-level prune (`:101,126`)
+| *Unchanged.* Runtime provenance stays `drop_at_persistence`.
+
+| `__*` top-level prune (`:128`)
+| *Unchanged.*
+
+| `helper_policies.fk.relations` configure-prune (`:164-176,181-187`)
+| *Removed.* This is the whole point: configure relations become durable.
+  `_is_runtime_produced_fk_relation` and `_RUNTIME_FK_HELPER_PRODUCER_STEP`
+  deleted.
+
+| empty-`relations` + `schema_version` cleanup (`:169-176`)
+| *Removed* (dead once nothing prunes). `schema_version` is thereby preserved
+  with the relations it describes; the field itself is not touched.
+
+| v1 per-target dict preservation (implicit pass-through)
+| *Effectively moot* — v1 is no longer produced. Pass-through remains harmless;
+  no explicit strip added in this slice.
+
+| `lookup` namespace pass-through (`:158`)
+| *Unchanged.*
+
+| `legend_blocks` / `xref_crosstable` Resolution prune (`:190-237`)
+| *Unchanged.* Out of scope (and a non-goal).
+|===
+
+The boundary stays carrier-neutral and write-side only. Its post-pipeline
+nature is exactly why it cannot be the place that contains durable-relation
+replay — see next.
+
+[#dino]
+== The principal risk and its compensating control: Dino replay
+
+`BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A` forensics (that ticket, "Forensic
+analysis result") proved the contamination carrier was the v2 `relations` list,
+*not* v1: keeping `relations + schema_version` (v1 removed) *reproduced* the
+failure; keeping v1 (relations removed) *restored* success. The failure shape:
+a promoted `_meta.yaml` carrying a durable relation for
+`source_frame=groups, target_frame=places` caused a later forward export to run
+`add_fk_helpers` over `groups` while its columns were non-flat, materializing a
+tuple-shaped helper and crashing downstream in `join_frames`
+(`Frame 'groups' must have flat columns`,
+e.g. `domain/transformations/join_views.py:209`).
+
+Slice 2 deliberately makes configure relations durable, which *re-enables that
+exact carrier*. The boundary prune was the containment; the carrier-neutral,
+post-pipeline boundary cannot both keep a relation (so reverse-pipeline cleanup
+can read it) and strip it (so forward-replay can't re-enrich). So the
+containment must move.
+
+*Existing partial guards (not sufficient alone):*
+
+* `apply_fk_helpers` skips a helper column that already exists
+  (`core/fk.py:308-310`, `if helper_col in first_cols: continue`) — prevents
+  *same-name* duplication but not the *non-flat-frame* crash, which happens
+  before/around column add (`core/fk.py:335` adds a MultiIndex tuple column).
+* `enrich_helpers` skips a relation whose source column is absent
+  (`fk_helpers/enrich.py:71-75`, `source_frame_has_column`) — but a stale
+  relation whose source column *is* present on a non-flat frame still proceeds.
+
+*Required compensating control (the load-bearing prerequisite of Slice 2):*
+make `enrich_helpers` *defensive about frame applicability* so a durable
+relation it cannot safely materialize becomes a *safe skip*, not a crash.
+Minimal form: before materializing for a sheet, require the source frame to be
+in the flat-column state the materialization path assumes (the same precondition
+`join_frames` later enforces); if not, skip that relation (optionally emit a
+diagnostic) rather than producing a tuple-shaped helper. This converts the Dino
+crash into a no-op and is consistent with the functional model's Drop-step
+principle ("the system does not guess silently"). It keeps durable relations
+safe regardless of promotion.
+
+*Why not the boundary or a load-time sanitizer?* A load-time `_meta` sanitizer
+and a general `drop_if_stale` were explicitly *deferred* by the BUG ticket to
+`FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` and the meta-lifecycle framework. They are
+broader than this slice and would drift toward the global-ontology work this
+project is avoiding. The enrich applicability guard is the smallest control
+that neutralizes the specific crash Slice 2 reopens.
+
+*Scope note:* this control is in scope for Slice 2 because without it Slice 2
+regresses a shipped fix. It is the only addition beyond removing v1.
+
+== Which tests prove helper cleanup still works?
+
+Primary gate (must stay green, assertion unchanged, mechanism changes v1→v2):
+
+* `tests/roundtrip/test_cleanup_invariants.py::test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`
+  (`:54`). Today: cleans via v1. After Slice 2: must clean via the durable
+  configure-v2 relation that now survives the forward boundary. The assertion
+  (`all("_entities_name" not in row for row in items)`, `:127`) is identical —
+  this is the proof that retiring v1 introduces no leakage.
+
+Secondary (independent of v1; should stay green, confirm no regression):
+
+* `...::test_helper_columns_absent_after_canonical_reimport` (`:24`) — cleans
+  via `sheets.helper_columns`; unaffected.
+* `...::test_no_helper_columns_validation_reports_bypassed_cleanup` (`:130`) —
+  reads `sheets.helper_columns`; unaffected.
+
+New tests required:
+
+. *Durable-v2 roundtrip (replaces the v1 mechanism explicitly):* a
+  `configure_fk_helpers` forward run, inspect the persisted / workbook-embedded
+  meta and assert (a) `helper_policies.fk.relations` is present with the
+  configure relation, (b) **no** `helper_policies.fk.<target>` v1 dict exists,
+  then reverse and assert helper columns are absent from canonical output.
+. *Dino-replay no-crash / no-dup (replaces the carrier-strip guard):* feed a
+  promoted `_meta.yaml` carrying a durable configure relation into a forward
+  pipeline that runs `add_fk_helpers` over a non-flat / mismatched frame; assert
+  it completes without `Frame ... must have flat columns` and without duplicate
+  helper columns. This pins the compensating control from <<dino>>.
+. *Unit:* `configure_fk_helpers` writes no `_meta.helper_policies.fk.<target>`
+  key (only `relations` + `schema_version`).
+
+== Which tests are old-shape only?
+
+These pin the v1 dual-write or the configure-prune containment and must be
+*re-pointed or removed*; none protects behavior that survives Slice 2.
+
+[cols="2,2,2", options="header"]
+|===
+| Test | What it pins | Disposition
+
+| `tests/unit/pipeline/test_persistence_boundary.py::test_keeps_helper_policies_v1_per_target_dicts` (`:77`)
+| v1 dict survives the boundary
+| *Remove* — v1 is no longer produced.
+
+| `...::test_drops_runtime_produced_fk_helper_relations` (`:116`)
+| configure relations are pruned at the boundary
+| *Invert / re-point* — configure relations are now *kept* (durable).
+
+| `...::test_drops_empty_relations_and_schema_version_after_full_prune` (`:142`)
+| empty-envelope cleanup after full prune (+ inline v1 entry)
+| *Remove* — the prune it exercises is gone.
+
+| `...::test_keeps_relations_without_runtime_produced_marker` (`:92`)
+| non-configure relations are kept
+| *Keep* (still true); may broaden to assert configure relations kept too.
+
+| `tests/integration/pipeline/test_orchestrator_persistence_boundary.py::test_json_dir_output_drops_runtime_produced_relations` (`:53`)
+| egress strips configure relations; v1 survives
+| *Invert / re-point* — assert configure relations survive; drop v1 assertion.
+
+| `...::test_orchestrator_returns_projected_meta_in_memory` (`:86`)
+| in-memory projected view drops configure relation
+| *Invert / re-point.*
+
+| `...::test_repeated_run_does_not_replay_stale_relation` (`:192`)
+| Dino containment = boundary strips the relation (`"relations" not in fk`)
+| *Re-point to the stronger property:* repeated run with `add_fk_helpers` over
+  the stale relation does **not crash / not duplicate** (the compensating
+  control), not "carrier stripped." Note this test today uses
+  `make_identity_step()`, so it only checks carrier-stripping, never the actual
+  crash — the re-pointed test is strictly stronger.
+
+| `tests/architecture/semantic_invariants/test_meta_registry_contract_lifecycle.py::test_pilot_helper_policies_fk_current_consumers_match_runtime_truth` (`:203`)
+| `runtime_writes` still lists both v1 and v2; bridge `active`
+| *Update* to v2-only `runtime_writes`; retire the `dual_write` transition
+  bridge in `meta_registry.yaml` (`:439-523`).
+
+| `tests/unit/domain/schema_maintenance/test_metadata_refs.py` v1-blocked cases (around `:490-500`)
+| rename/drop is *blocked* on residual v1 keys
+| *Remove* the v1-blocked cases; *keep* the v2 `relations` rename cases
+  (`:303-304`) — those are durable-v2 behavior.
+|===
+
+Helpful contrast — tests that look related but stay valid and *protect
+behavior*: the FK-helper primitives architecture guard
+(`test_fk_helper_primitives_consume_policy.py`, unchanged — primitives still
+read v2/provenance only), and the v2 relation rename behavior in
+`test_metadata_refs.py:303-304`.
+
+== Consumer / migration risk
+
+* *No demo regresses.* All three FK-touching demos use `infer_fk_relations`
+  (already durable); none uses `configure_fk_helpers`. Making configure durable
+  makes it symmetric with the infer path the demos already rely on.
+* *Transitional reimport leakage (the real migration risk).* Artifacts produced
+  by *pre-Slice-2* code carry the v1 dict (kept) but **not** configure-v2
+  (pruned). After Slice 2 deploys, reimporting such an artifact *without a fresh
+  forward run* finds: v1 now ignored (reader deleted), configure-v2 never
+  persisted, and — if `sheets.<frame>.helper_columns` was not recorded — *no
+  cleanup anchor at all* → helper columns leak into canonical output for that
+  one transitional reimport.
+  ** *Mitigation:* re-run the forward pipeline once under Slice-2 code to
+     re-bootstrap durable configure-v2 (this matches the BUG ticket's
+     "contamination cycle breaks at the next successful run" model). Consumers
+     that already set `configure_workbook_view ... helper_columns` (like the
+     roundtrip fixture) are unaffected because they clean via
+     `sheets.helper_columns`.
+  ** `schema_version` is *not* bumped (per task constraint). A bump would force
+     re-bootstrap and eliminate this transitional window, but it is out of
+     scope; the window is accepted with the migration note above.
+* *Dino replay (controlled by the compensating control).* A consumer using
+  `configure_fk_helpers` *and* the "promote `_meta.yaml` into canonical data"
+  workflow could otherwise re-trigger the Dino crash on a later export. The
+  enrich applicability guard (<<dino>>) neutralizes it; without that guard,
+  Slice 2 must not ship. Note the infer path already carries this theoretical
+  exposure today, so the guard also hardens the existing durable path.
+* *Public surface unchanged.* `configure_fk_helpers` YAML/args are identical;
+  only the persisted `_meta` shape shrinks (no v1 dict). Per project stance this
+  is a deliberate, migratable change for controlled consumers.
+
+== Slice 2 work summary (design, not implementation)
+
+. `domain/helper_policies.py` — drop the v1 write loop in `configure_fk_helpers`
+  (`:141-143`); keep v2 emission and internal `policy_specs`.
+. `pipeline/persistence_boundary.py` — delete `_is_runtime_produced_fk_relation`
+  + constant; remove the relations-prune and empty-envelope cleanup from
+  `_project_helper_policies`.
+. `domain/transformations/derived_column_policy.py` — delete
+  `_v1_policy_helper_names`; simplify `_safe_policy_helper_names` to v2-only.
+. `domain/schema_maintenance/meta_update.py` — remove the dead v1
+  blocked-reference branch; keep `_handle_fk_relations`.
+. `domain/transformations/fk_helpers/enrich.py` — *add* the frame-applicability
+  guard (compensating control) so durable relations cannot reproduce the Dino
+  crash.
+. `registries/meta_registry.yaml` — retire the `helper_policies.fk`
+  `contract_lifecycle` transition bridge; set `runtime_writes`/`current_state`
+  to v2-only.
+. Tests — re-point the boundary/lifecycle old-shape tests; add the three new
+  tests above. Keep the falsification gate green via durable v2.
+
+Suggested validation (for the implementer):
+
+[source,console]
+----
+pytest tests/roundtrip/test_cleanup_invariants.py
+pytest tests/unit/pipeline/test_persistence_boundary.py \
+       tests/integration/pipeline/test_orchestrator_persistence_boundary.py
+pytest tests/unit/domain/test_fk_helper_policies.py \
+       tests/unit/domain/test_fk_relations_inference.py \
+       tests/unit/domain/schema_maintenance/test_metadata_refs.py
+pytest tests/architecture/semantic_invariants/test_meta_registry_contract_lifecycle.py \
+       tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py
+make test
+----
+
+== Non-Goals (Slice 2)
+
+* No Slice 3 work (dead step params, `label_field`, `FKFinding`,
+  single-member `_VALID_MODES`).
+* No change to `schema_version` value or semantics.
+* No change to `derived.sheets.*.helper_columns`,
+  `sheets.<frame>.helper_columns`, or `helper_columns[*]`.
+* No full removal of the `produced_by` field (conflict-detection consumer
+  remains).
+* No general load-time `_meta` sanitizer or `drop_if_stale` engine
+  (deferred to `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`); only the narrow enrich
+  applicability guard.
+* No new global metadata ontology; no generalization to `legend_blocks` /
+  `xref_crosstable`.
