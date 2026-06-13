@@ -28,206 +28,452 @@ FK helpers are readable, derived projection values next to an identity
 reference. They help humans edit or understand a frame, but they are not
 canonical payload.
 
-== Table / Column Annotations
+== Scope and Boundary Conditions
 
-Before FK-helper enrichment happens, tables and columns may carry
-annotations.
+=== Meta Scope
 
-Examples:
+* Meta is scoped to a single app instance and a single user.
+* Not designed for collaboration; adding collaboration would require merge
+  semantics — a hard problem intentionally out of scope.
+* `_meta.yaml` is gitignored by design: it does not cross repository boundaries.
+* Meta does not enter from outside; no external import of meta is supported.
 
-* primary-key column of a table;
-* foreign-key relation from one column to another table;
-* possible helper fields of a target table;
-* default helper field of a target table;
-* possibly later: data type, editability, validation role.
+=== Consequence: Meta Can Be Lost
 
-These annotations are not themselves FK-helper materialisation. They describe
-the schema or semantic role of columns.
+* A fresh clone contains no `_meta.yaml`.
+* Essential, long-term information must not live in meta.
+* Meta loss should be at most an inconvenience (e.g. layout preferences),
+  never a data loss (e.g. error states, FK relation declarations).
+* Known gap: cell evaluation errors currently have no safe path out of meta
+  at the git boundary. A future `prune` step is the direction; for now this
+  is an accepted limitation.
+* System goal: provide the right tools to handle the boundary, not prevent
+  all possible misuse.
 
-Open naming question:
+=== App Boundary
 
-* table schema?
-* column annotations?
-* relation policy?
-* semantic column roles?
+* Intended app boundary: structured data — JSON, YAML, CSV, or similar.
+* Spreadsheet as app boundary: technically possible but discouraged.
+  The system does not aim to render arbitrary incoming workbooks.
+  Correctness in that case is user risk.
 
-== Helper Field Configuration
+=== Multi-Pipeline Scenarios and a Known Limitation
 
-For a target table, the user may define which fields are allowed as helper
-fields.
+* A workflow may consist of more than two pipelines in sequence.
+* When it does, structured data persisted by one pipeline feeds the next;
+  the meta sidecar carries forward between them.
+* The framework has no way to tell whether a given structured-data
+  persistence is an intermediate step or the final app boundary where
+  external modification may occur.
+* Known limitation: the `drop_if_stale` attribute cannot be applied
+  selectively only at true app-boundary crossings; the framework must
+  treat every structured-data persistence as a potential boundary.
+* Conservative consequence: `drop_if_stale` applies at every domain egress,
+  not only at confirmed app-boundary exits.
+* This has limited impact on the current feature set but constrains how
+  `drop_if_stale` is reasoned about in the attribute model.
 
-Example `employees`:
+=== Meta Versioning Across Releases
 
-* possible helpers:
-  ** `last_name`
-  ** `first_name`
-  ** `birth_date`
-* default helper:
-  ** `last_name`
-* forbidden as helper: (implicit)
-  ** `salary`
+* Each meta entry whose format may change across releases carries a version
+  field.
+* On read, if the stored version does not match the current expected version,
+  the entry is treated as absent — it is dropped, not migrated.
+* Consequence: a format change in a release causes a silent re-bootstrap on
+  the next forward pipeline run; the entry is recreated in the current format.
+* This is acceptable because meta is never canonical data; dropping an entry
+  is at most an inconvenience, never a data loss.
+* No compatibility shims or fallback chains for old meta formats.
+* This policy is revisited only when a concrete use case demonstrates value
+  in preserving cross-release entries.
 
-The allowed-helper list is a schema/configuration constraint. It prevents
-sensitive or unsuitable fields from being projected as read-only helper data.
+=== Plugin Steps and Meta
 
-== FK Helper Enrichment
+* Users should not modify `_meta` inside custom plugin steps.
+* The system does not prevent it; correctness is the plugin author's
+  responsibility.
+* Future: a reserved plugin namespace within `_meta` may be defined.
 
-A projection step may enrich a frame by adding helper columns next to FK
-columns.
+== Meta Carriers
 
-Input:
+Meta exists in one of three forms depending on where in the pipeline it lives:
 
-* a source frame with an FK column;
-* relation annotation or FK policy;
-* target frame;
-* configured helper fields.
+[cols="1,2,2", options="header"]
+|===
+| Carrier | Form | Properties
 
-Output:
+| Sidecar
+| `_meta.yaml` alongside structured data files
+| Persistent; gitignored; travels with the structured data
 
-* source frame plus one or more new helper columns;
-* metadata/provenance marking these columns as derived helpers.
+| Frame
+| `_meta` key in the in-memory frames dict
+| Transient; the working form during domain processing
 
-The helper values may be inserted as literal values or as spreadsheet formulas
-such as VLOOKUP/SVERWEIS.
+| Workbook-embedded
+| Hidden sheet inside the spreadsheet file
+| Persistent; embedded in the spreadsheet carrier; not gitignored
+|===
 
-The resulting helper columns are not original data. They should normally be
-read-only or visually marked during spreadsheet rendering.
+Meta transitions between carriers at Type 2 lifecycle events (see below).
 
-== Reimport / Drop
+== Event Types
 
-On reimport, helper columns must not be promoted into canonical data.
+=== Type 1: Process Steps
 
-If metadata/provenance is present:
+* Framework-provided domain transformations applied to Frames
+  (e.g. enrich FK helpers, flatten headers, apply workbook view).
+* Meta is in Frame form during these steps.
+* Steps may read, write, or update meta fields within a single pipeline run.
+* User-defined plugin steps may appear here; meta modification in plugins
+  is unsupported.
 
-* identify helper columns;
-* optionally validate helper values;
-* drop helper columns;
-* keep the FK column as canonical payload.
+=== Type 2: Lifecycle Events
 
-If metadata/provenance is missing:
+* Events where data crosses a format or system boundary.
+* Meta transitions between carriers at these points.
+* The sequence and count of Type 2 events depends entirely on the user's
+  pipeline design; no single canonical order is enforced.
+* A user may construct any number of pipelines in sequence; nothing
+  requires a simple forward-then-reverse shape.
 
-* the system cannot safely know that the column is a helper;
-* the column is treated as normal payload unless a bootstrap/configuration step
-  re-attaches the missing information.
+== Typical Workflow
 
-This is deliberate. `_meta` can be lost; the system must not guess silently.
+The most common design is a two-pipeline roundtrip:
 
-== Heuristic Inference
+* *Forward pipeline*: structured data → domain processing → spreadsheet
+* *Reverse pipeline*: spreadsheet → domain processing → structured data
 
-The original proof of concept used naming conventions:
+=== Type 2 Events in This Workflow
 
-* `ID` means primary key;
-* `ID(<table>)` means foreign key to `<table>`.
+. *App boundary ingress* — structured data files enter; meta loaded from
+  sidecar (`_meta.yaml`). If no sidecar exists, meta starts empty and
+  bootstrap steps may seed initial values.
 
-This should no longer be implicit magic.
+. *Domain ingress* — structured data mapped to Frame format; sidecar meta
+  becomes the `_meta` Frame in memory.
 
-Instead, heuristic inference may exist only as an explicit configuration step.
-That step may inspect naming conventions and then write explicit schema /
-relation annotations.
+. *Tabular write path* — Frames rendered to spreadsheet:
+  * the rendering layer reads the `_meta` Frame and produces a layout object;
+  * the layout object and all data frames (including `_meta`) are handed
+    to the spreadsheet backend;
+  * the layout object is consumed and discarded on write;
+  * `_meta` is stored in the workbook as the workbook-embedded carrier;
+  * after this point the workbook-embedded form is the authoritative carrier.
 
-Possible future parameters:
+. *Tabular read path* — spreadsheet parsed to Frames:
+  * meta is read from the workbook-embedded carrier;
+  * carrier attributes (column widths, orientation, alignment) are written
+    back into meta where the workbook-observed value takes precedence over
+    the stored meta value;
+  * the exact layer at which this enrichment happens (render layer or
+    backend) is an open implementation detail.
 
-* primary-key name pattern;
-* foreign-key name pattern;
-* target table naming convention.
+. *Domain egress* — Frames mapped back to structured data:
+  * meta is projected to its persistable subset (transient fields dropped
+    at the persistence boundary);
+  * the persistable meta is written to the sidecar alongside the
+    structured data files.
 
-== Future: Editable Projection Helpers
+=== Variations
 
-A future feature may allow helper-like projection columns that are editable.
+* More than two pipelines may be chained.
+* Forward and reverse may run as separate invocations.
+* Intermediate pipelines (further transformations on a spreadsheet) are
+  possible.
 
-These are not ordinary FK helpers.
+== Lifecycle Attributes
 
-Possible semantics:
+=== The Core Idea
 
-* values are copied from original source fields into a projection;
-* spreadsheet users edit the projection copy;
-* on reimport, edited projection values are written back to the original source;
-* write-back is authoritative; no timestamp conflict resolution unless later
-  requirements demand it.
+At each Type 2 event, the framework must decide what to do with each piece
+of meta. These decisions should not be encoded field-by-field inside the
+framework's event-handling code. Instead, each meta field should carry
+attributes that answer the questions mechanically.
 
-This feature has different semantics from read-only FK helpers.
+Consequence:
 
-Important distinction:
+* Type 2 events are field-agnostic — they read attributes and apply rules.
+* A new domain feature (Type 1 step) registers attributes in the meta
+  registry; it does not touch framework code outside its own domain module.
 
-* FK helper: derived, read-only, dropped on reimport.
-* editable projection helper: derived copy, editable, written back on reimport.
+This relation is partially captured in the meta registry today, which records
+which transformations read and write each field. The attribute model described
+here makes it systematic across Type 2 events.
 
-== Crosstable Extensions
+=== Questions Asked at Each Type 2 Event
+
+Every Type 2 event asks a subset of the following about each meta field:
+
+* *Drop at this point?* +
+  Should the field be removed at this event? +
+  Example: transient fields removed when persisting to structured data.
+
+* *Harmful if stale?* +
+  Should the field be dropped when combined with fresh incoming data, even
+  if it could technically survive? +
+  Example: a computed relation derived from a previous run's data may
+  conflict with fresh data on the next run; retaining it is unsafe.
+
+* *Precedence?* +
+  When two values exist — stored meta and freshly computed or carrier-observed —
+  which wins? +
+  Example: column widths observed in the workbook override the stored value
+  on the tabular read path.
+
+* *Essential or optional?* +
+  Is absence at this event an error, or a safe no-op? +
+  Example: a required FK relation missing when an enrich step runs is an
+  error; a missing column-width preference is silently ignored.
+
+=== Candidate Attributes (Conceptual)
+
+These are not yet formal field names; they name the concepts:
+
+* `drop_at_persistence` — remove this field when writing the persistable
+  meta subset at domain egress.
+* `drop_if_stale` — remove this field at domain egress when the incoming
+  data may have changed since it was computed.
+* `carrier_takes_precedence` — at the tabular read path, the carrier-observed
+  value overrides the stored meta value.
+* `required` — absence at a specified event triggers an error.
+* `render_consumed` — this field is consumed by the rendering layer at the
+  tabular write path; its behavior on write differs from plain pass-through.
+
+=== Current State vs. Target
+
+Currently some Type 2 event logic — in particular the persistence boundary —
+contains explicit field-level knowledge. Adding a new feature that produces
+meta in a similar pattern requires touching that framework code.
+
+Target state: Type 2 event code reads only meta registry attributes. A new
+domain step declares its attributes at registration time; the framework
+event code stays stable.
+
+== Relation to the Semantic Model
+
+=== Boundary
+
+This document and the semantic model cover overlapping territory from
+different angles.
+
+[cols="1,1", options="header"]
+|===
+| Functional model (this document) | Semantic model
+
+| Conceptual name for the information
+| Concrete field path (`_meta.foo.bar`)
+
+| Why a step needs it; pipeline-author perspective
+| Who produces and consumes it; cross-step view
+
+| Essential or optional at this step
+| Missing-value behavior and error contracts
+
+| Lifecycle attributes (drop, stale, precedence)
+| Data granularity: cell / column / row / table / workbook
+
+| One step at a time
+| All steps that touch one field, in one place
+|===
+
+=== Handover Convention
+
+* Each conceptual information piece named here should have a corresponding
+  entry in the meta registry and semantic model.
+* This document does not duplicate field paths or producer/consumer lists.
+* Where a semantic model entry exists, a cross-reference is sufficient.
+* Where it does not yet exist, the name used here is a proposal for the
+  semantic model to formalise.
+
+== Step Slices
+
+Each transformation step is one slice. Slices are independent; a new step
+can be added without touching existing slices.
+
+Each slice follows this structure:
+
+----
+=== Step: [Name]
+
+One sentence: what this step does for the pipeline author.
+
+==== Information Consumed
+
+* *[Conceptual name]* — essential or optional.
+  What happens if absent.
+
+==== Information Produced
+
+* *[Conceptual name]* — lifecycle attributes that apply
+  (drop_at_persistence / drop_if_stale / carrier_takes_precedence /
+  render_consumed).
+
+==== Semantic Model Reference
+
+Names of corresponding meta registry / semantic model entries.
+No field paths or producer lists here.
+----
+
+The slices below follow this convention. Content above the first slice
+(the sections on core use case, carriers, event types, and attribute model)
+is framework-level and not step-specific.
+
+// ---------------------------------------------------------------------------
+// STEP SLICES
+// ---------------------------------------------------------------------------
+
+=== Step: Declare FK Relations
+
+Pipeline author declares which column in a source frame is a foreign key
+to a target frame, and which fields of that target may serve as helpers.
+
+==== Information Consumed
+
+* *Frame schema* — optional.
+  If absent the step has nothing to read; it writes nothing and is a no-op.
+
+==== Information Produced
+
+* *FK relation declaration* — not `drop_at_persistence`; not `drop_if_stale`.
+  Durable; survives the sidecar boundary; must be present for any later
+  enrichment run.
+* *Allowed helper field list* — same lifecycle as FK relation declaration.
+  Constrains which fields of the target frame may be projected as helpers.
+  Prevents sensitive fields from being exposed.
+* *Default helper field* — same lifecycle.
+  Used when an enrichment step receives no explicit helper-field request.
+
+==== Variant: Heuristic Inference
+
+A sub-step that inspects naming conventions (e.g. column name patterns for
+primary and foreign keys) and writes the same FK relation declaration.
+Must be an explicit, opt-in configuration step — not silent magic.
+Produces the same output with the same lifecycle attributes.
+
+==== Semantic Model Reference
+
+`fk_relations`, `helper_policies`
+
+// ---------------------------------------------------------------------------
+
+=== Step: Enrich FK Helpers
+
+Adds read-only helper columns next to FK columns in a source frame,
+populated from the target frame according to the declared FK relation.
+
+==== Information Consumed
+
+* *FK relation declaration* — essential.
+  No enrichment is possible without it; step errors or is a no-op.
+* *Allowed helper field list* — essential.
+  Determines which target fields may be projected.
+* *Target frame* — essential.
+  The lookup data source.
+* *Requested helper fields* — optional.
+  If absent, falls back to the declared default helper field.
+
+==== Information Produced
+
+* *Helper column values* — data added to the source frame; not meta.
+  May be literal values or spreadsheet formula (e.g. VLOOKUP).
+  Should be rendered as read-only or visually marked.
+* *Runtime helper column provenance* — `drop_at_persistence`; `drop_if_stale`.
+  Identifies which columns are helpers during same-run processing.
+  Dropped at domain egress; never written to sidecar.
+* *Durable helper column marker* — `carrier_takes_precedence`.
+  Embedded in the workbook carrier on the tabular write path.
+  Read by the drop step on reimport when runtime provenance is absent.
+
+==== Semantic Model Reference
+
+`derived.sheets.*.helper_columns` (runtime provenance),
+`sheets.*.helper_columns` (durable workbook marker)
+
+// ---------------------------------------------------------------------------
+
+=== Step: Drop FK Helpers
+
+On reimport, identifies helper columns by their provenance or durable marker
+and removes them so they do not enter the canonical data set.
+
+==== Information Consumed
+
+* *Runtime helper column provenance* — optional; preferred source when present
+  (same-run scenario: enrich and drop in one pipeline).
+* *Durable helper column marker* — optional; fallback when runtime provenance
+  is absent (cross-run reimport: provenance was dropped at prior domain egress).
+* *FK relation declaration* — optional; last-resort reconstruction of expected
+  column names from declared relations.
+
+If no identification source is available, the step cannot safely identify
+helpers and treats all columns as canonical payload.
+This is intentional — the system does not guess silently.
+
+==== Information Produced
+
+* Nothing new.
+  Runtime provenance is cleaned up after the drop.
+  The durable marker is preserved (it is not the drop step's responsibility
+  to remove it).
+
+==== Semantic Model Reference
+
+`derived.sheets.*.helper_columns` (consumed, then cleared),
+`sheets.*.helper_columns` (consumed; persists across reimport),
+`fk_relations` (last-resort fallback)
+
+// ---------------------------------------------------------------------------
+// CONCEPT EXTENSIONS
+// ---------------------------------------------------------------------------
+
+== Concept Extensions
+
+=== Crosstable Axis Helpers
 
 FK-helper-like projection may also apply to crosstables.
 
-Current / near-term:
+* Current scope: helper columns on the left side of a crosstable row axis.
+* Future: helper rows above a crosstable column axis; multi-row headers.
 
-* helper columns on the left side of a crosstable row axis.
+The general concept may warrant a name broader than `helper_columns`:
+relation helper projection, axis helper projection, or projection helper marker.
 
-Future:
+=== Future: Editable Projection Helpers
 
-* helper rows above a crosstable column axis;
-* possibly multiple helper rows before data starts;
-* requires multi-row header / grouped header support.
+A possible future feature where projection columns are editable, not read-only.
 
-This suggests that the concept should not be named too narrowly as
-`helper_columns` in the long term. The general concept may be closer to:
+* Values copied from source fields into a projection column.
+* Spreadsheet users edit the projection copy.
+* On reimport, edited values are written back to the original source field.
 
-* relation helper projection;
-* axis helper projection;
-* projection helper marker.
+Key distinction from FK helpers:
 
-== Lifecycle Matrix Sketch
+* FK helper: derived, read-only, dropped on reimport.
+* Editable projection helper: derived copy, editable, written back on reimport.
 
-Instead of classifying metadata globally as canonical / derived / intent /
-runtime, classify concrete information across lifecycle stations.
+These have fundamentally different reimport semantics and would form a
+separate step slice.
 
-Stations:
+// ---------------------------------------------------------------------------
+// SIMPLIFICATION NOTE
+// ---------------------------------------------------------------------------
 
-. Bootstrap / annotation
-. Enrichment
-. Render / export
-. Persistence
-. Reimport
-. Cleanup / drop
-. Promotion to canonical data
+== Simplification Note
 
-Candidate information rows:
-
-* primary-key annotation;
-* foreign-key relation;
-* allowed helper fields;
-* default helper field;
-* materialised helper column;
-* helper column provenance;
-* workbook/view helper marker;
-* heuristic inference result;
-* editable projection copy-back marker.
-
-For each cell, decide:
-
-* created;
-* read;
-* persisted;
-* ignored;
-* dropped;
-* promoted;
-* forbidden.
-
-Only after this matrix is filled should common metadata attributes be derived.
-
-== Current Suspicion
-
-The existing FK-helper metadata model likely contains historical layering:
+The current implementation contains historical layering:
 
 * legacy v1 per-target configuration;
-* newer v2 relation policy;
+* v2 relation policy;
 * runtime provenance;
-* durable sheet/view helper markers;
-* fallback chains for reimport cleanup.
+* durable workbook marker;
+* multi-source fallback chain in the drop step.
 
-The target model should be smaller.
+Target direction (one model per concern):
 
-A plausible target direction:
-
-* one durable relation/schema annotation model;
-* one runtime projection provenance model;
-* one durable carrier/view marker for persisted helper projections;
-* no implicit heuristics outside explicit inference steps;
-* no long-term v1/v2 duality.
+* one durable relation/schema annotation (the FK relation declaration);
+* one runtime provenance record (dropped at domain egress);
+* one durable workbook marker (carrier-embedded, read on reimport);
+* heuristic inference as an explicit optional step only;
+* v1 per-target config treated as version mismatch → dropped, not migrated;
+  v1/v2 duality resolved by the meta versioning policy above.
