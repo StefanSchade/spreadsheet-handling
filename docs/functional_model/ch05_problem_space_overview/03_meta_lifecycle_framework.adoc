@@ -1,0 +1,238 @@
+== Meta Lifecycle Framework
+
+This section concretises the process-boundary questions from
+`02_information_flow.adoc` for the specific information type that
+travels alongside data throughout every pipeline: pipeline meta.
+
+=== What Pipeline Meta Is
+
+Pipeline meta is the set of annotations, provenance records, and
+configuration that transformation steps need to do their work and that
+cannot be inferred from the data alone on a fresh run.
+
+It is not canonical payload. Loss of meta is at most an inconvenience,
+never a data loss.
+
+=== Scope and Boundary Conditions
+
+==== Meta Scope
+
+* Scoped to a single app instance and a single user.
+* Not designed for collaboration; merge semantics are out of scope.
+* `_meta.yaml` is gitignored by design — does not cross repository
+  boundaries.
+* Meta does not enter from outside; no external import of meta.
+
+==== Consequence: Meta Can Be Lost
+
+* A fresh clone contains no `_meta.yaml`.
+* Essential, long-term information must not live in meta.
+* Meta loss should be at most an inconvenience (e.g. layout preferences),
+  never a data loss (e.g. FK relation declarations, error states).
+* System goal: provide the right tools to handle the boundary, not
+  prevent all possible misuse.
+
+==== App Boundary
+
+* Intended app boundary: structured data — JSON, YAML, CSV, or similar.
+* Spreadsheet as app boundary: technically possible but discouraged.
+  The system does not aim to render arbitrary incoming workbooks.
+  Correctness in that case is user risk.
+
+==== Multi-Pipeline Scenarios and a Known Limitation
+
+* A workflow may consist of more than two pipelines in sequence.
+* Structured data persisted by one pipeline feeds the next; the meta
+  sidecar carries forward between them.
+* The framework cannot tell whether a given structured-data persistence
+  is an intermediate step or the final app boundary where external
+  modification may occur.
+* Known limitation: `drop_if_stale` cannot be applied selectively only
+  at true app-boundary crossings; the framework must treat every
+  structured-data persistence as a potential boundary.
+* Conservative consequence: `drop_if_stale` applies at every domain
+  egress, not only at confirmed app-boundary exits.
+
+==== Meta Versioning Across Releases
+
+* Each meta entry whose format may change across releases carries a
+  version field.
+* On read, version mismatch → entry is treated as absent; not migrated.
+* Consequence: a format change causes a silent re-bootstrap on the next
+  forward pipeline run; the entry is recreated in the current format.
+* No compatibility shims or fallback chains for old meta formats.
+* Policy revisited only when a concrete use case demonstrates value in
+  cross-release preservation.
+
+==== Plugin Steps and Meta
+
+* Users should not modify `_meta` inside custom plugin steps.
+* The system does not prevent it; correctness is the plugin author's
+  responsibility.
+
+=== Meta Carriers
+
+Meta exists in one of three forms depending on where in the pipeline it
+lives:
+
+[cols="1,2,2", options="header"]
+|===
+| Carrier | Form | Properties
+
+| Sidecar
+| `_meta.yaml` alongside structured data files
+| Persistent; gitignored; travels with the structured data
+
+| Frame
+| `_meta` key in the in-memory frames dict
+| Transient; the working form during domain processing
+
+| Workbook-embedded
+| Hidden sheet inside the spreadsheet file
+| Persistent; embedded in the spreadsheet carrier; not gitignored
+|===
+
+Meta transitions between carriers at Type 2 lifecycle events (see below).
+
+=== Event Types
+
+==== Type 1: Process Steps
+
+* Framework-provided domain transformations applied to Frames
+  (e.g. enrich FK helpers, flatten headers, apply workbook view).
+* Meta is in Frame form during these steps.
+* Steps may read, write, or update meta fields within a single pipeline
+  run.
+
+==== Type 2: Lifecycle Events
+
+* Events where data crosses a format or system boundary.
+* Meta transitions between carriers at these points.
+* The sequence and count of Type 2 events depends entirely on the
+  pipeline design; no single canonical order is enforced.
+
+=== Typical Workflow
+
+The most common design is a two-pipeline roundtrip:
+
+* *Forward pipeline*: structured data → domain processing → spreadsheet
+* *Reverse pipeline*: spreadsheet → domain processing → structured data
+
+==== Type 2 Events in This Workflow
+
+. *App boundary ingress* — structured data files enter; meta loaded
+  from sidecar (`_meta.yaml`). If no sidecar exists, meta starts empty.
+
+. *Domain ingress* — structured data mapped to Frame format; sidecar
+  meta becomes the `_meta` Frame in memory.
+
+. *Tabular write path* — Frames rendered to spreadsheet:
+  * the rendering layer reads `_meta` and produces a layout object;
+  * the layout object and all data frames (including `_meta`) are handed
+    to the spreadsheet backend;
+  * the layout object is consumed and discarded on write;
+  * `_meta` is stored in the workbook as the workbook-embedded carrier;
+  * after this point the workbook-embedded form is authoritative.
+
+. *Tabular read path* — spreadsheet parsed to Frames:
+  * meta is read from the workbook-embedded carrier;
+  * carrier-observed values (column widths, orientation, alignment) are
+    written back into meta where the workbook value takes precedence.
+
+. *Domain egress* — Frames mapped back to structured data:
+  * meta is projected to its persistable subset (transient fields
+    dropped at the persistence boundary);
+  * the persistable meta is written to the sidecar.
+
+==== Variations
+
+* More than two pipelines may be chained.
+* Forward and reverse may run as separate invocations.
+* Intermediate pipelines (further transformations on a spreadsheet) are
+  possible.
+
+=== Lifecycle Attribute Model
+
+==== The Core Idea
+
+At each Type 2 event, the framework must decide what to do with each
+piece of meta. These decisions must not be encoded field-by-field inside
+framework event-handling code. Each meta field carries attributes that
+answer the questions mechanically.
+
+Consequence:
+
+* Type 2 events are field-agnostic — they read attributes and apply
+  rules.
+* A new domain feature (Type 1 step) registers attributes in the meta
+  registry; it does not touch framework code.
+
+==== Questions Asked at Each Type 2 Event
+
+* *Drop at this point?* — should the field be removed?
+  Example: transient fields at domain egress.
+* *Harmful if stale?* — should the field be dropped when combined with
+  fresh incoming data?
+  Example: a computed relation from a previous run may conflict with
+  fresh data on the next run.
+* *Precedence?* — when two values exist (stored meta and
+  carrier-observed), which wins?
+  Example: column widths observed in the workbook override stored meta.
+* *Essential or optional?* — is absence an error or a safe no-op?
+  Example: a missing FK relation at enrichment time is an error; a
+  missing column-width preference is silently ignored.
+
+==== Candidate Attributes
+
+These are conceptual names, not yet formal field names:
+
+* `drop_at_persistence` — remove at domain egress.
+* `drop_if_stale` — remove at domain egress when incoming data may have
+  changed since the value was computed.
+* `carrier_takes_precedence` — at tabular read path, the
+  carrier-observed value overrides stored meta.
+* `required` — absence at a specified event triggers an error.
+* `render_consumed` — consumed by the rendering layer at tabular write
+  path; not plain pass-through.
+
+==== Current State vs. Target
+
+Currently some Type 2 event logic — in particular the persistence
+boundary — contains explicit field-level knowledge. A new feature that
+produces meta in the same pattern must touch that framework code.
+
+Target: Type 2 event code reads only meta registry attributes. A new
+domain step declares its attributes at registration time; the framework
+event code stays stable.
+
+=== Relation to the Semantic Model
+
+[cols="1,1", options="header"]
+|===
+| Functional model | Semantic model
+
+| Conceptual name for the information
+| Concrete field path (`_meta.foo.bar`)
+
+| Why a step needs it; pipeline-author perspective
+| Who produces and consumes it; cross-step view
+
+| Essential or optional at this step
+| Missing-value behavior and error contracts
+
+| Lifecycle attributes (drop, stale, precedence)
+| Data granularity: cell / column / row / table / workbook
+
+| One step at a time
+| All steps that touch one field, in one place
+|===
+
+Handover convention:
+
+* Each conceptual information piece named in a feature chapter should
+  have a corresponding entry in the meta registry and semantic model.
+* Feature chapters do not duplicate field paths or producer/consumer
+  lists.
+* Where a semantic model entry exists, a cross-reference is sufficient.
+* Where it does not yet exist, the conceptual name used is a proposal
+  for the semantic model to formalise.
