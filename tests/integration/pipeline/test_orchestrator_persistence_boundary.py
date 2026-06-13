@@ -46,8 +46,6 @@ def _runtime_relation(source: str, target: str = "places") -> dict:
         "target_frame": target,
         "target_key": "id",
         "helper_columns": [{"column": "_places_name", "target_field": "name"}],
-        "helper_fields": ["name"],
-        "helper_prefix": "_",
         "produced_by": {"mode": "explicit", "step": "configure_fk_helpers"},
     }
 

@@ -170,9 +170,7 @@ def _try_build_inferred_relation(
         source_column=str(source_column),
         target_frame=target_frame_name,
         target_key=str(target_key),
-        helper_fields=helper_fields,
         helper_columns=helper_columns,
-        helper_prefix=helper_prefix,
         produced_by_step="infer_fk_relations",
         produced_by_mode=mode,
     )
@@ -195,8 +193,8 @@ def apply_v2_relations(
     * same producer, any meaningful field differs -> raise.
 
     Meaningful fields cover the whole v2 relation entry, including
-    ``target_frame``, ``target_key``, ``helper_fields``, ``helper_columns``,
-    ``helper_prefix``, and ``produced_by.mode``.
+    ``target_frame``, ``target_key``, ``helper_columns``, and
+    ``produced_by.mode``.
     """
     out = dict(frames)
     meta = dict(out.get("_meta") or {})
@@ -262,9 +260,7 @@ def build_v2_relation(
     source_column: str,
     target_frame: str,
     target_key: str,
-    helper_fields: list[str],
     helper_columns: list[dict[str, str]],
-    helper_prefix: str,
     produced_by_step: str,
     produced_by_mode: str,
 ) -> dict[str, Any]:
@@ -273,18 +269,26 @@ def build_v2_relation(
     Public so that any configuration step writing into
     ``_meta.helper_policies.fk.relations`` constructs the same shape (which
     ``apply_v2_relations`` compares for same-producer idempotency).
+
+    The entry carries only the fields runtime consumers read: relation
+    identity (``source_frame`` / ``source_column``), the join target
+    (``target_frame`` / ``target_key``), the materialized helper columns with
+    their source field (``helper_columns[*].column`` /
+    ``helper_columns[*].target_field``), and the ``produced_by`` provenance
+    marker. The former ``helper_fields`` and ``helper_prefix`` fields were
+    redundant projections of ``helper_columns`` (no runtime reader) and are
+    no longer emitted; see
+    ``audit/fk_helper_functional_model_to_implementation_review.adoc`` Slice 1.
     """
     return {
         "source_frame": source_frame,
         "source_column": source_column,
         "target_frame": target_frame,
         "target_key": target_key,
-        "helper_fields": list(helper_fields),
         "helper_columns": [
             {"column": str(entry["column"]), "target_field": str(entry["target_field"])}
             for entry in helper_columns
         ],
-        "helper_prefix": helper_prefix,
         "produced_by": {"step": produced_by_step, "mode": produced_by_mode},
     }
 

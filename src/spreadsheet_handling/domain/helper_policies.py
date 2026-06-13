@@ -181,9 +181,7 @@ def _v2_relations_from_explicit_policies(
                         source_column=fk_column,
                         target_frame=target_frame,
                         target_key=target_key,
-                        helper_fields=helper_fields,
                         helper_columns=helper_columns,
-                        helper_prefix=helper_prefix,
                         produced_by_step="configure_fk_helpers",
                         produced_by_mode="explicit",
                     )

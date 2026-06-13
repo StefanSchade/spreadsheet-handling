@@ -83,7 +83,6 @@ def test_configure_fk_helpers_emits_v2_marker_alongside_v1_keys() -> None:
     assert relation["source_column"] == "id_(Products)"
     assert relation["target_frame"] == "Products"
     assert relation["target_key"] == "id"
-    assert relation["helper_fields"] == ["name"]
     assert relation["helper_columns"] == [
         {"column": "_Products_name", "target_field": "name"}
     ]

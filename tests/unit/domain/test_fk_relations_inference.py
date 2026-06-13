@@ -45,7 +45,6 @@ def test_infer_fk_relations_writes_v2_relation_for_naming_convention() -> None:
     assert relation["source_column"] == "id_(product_manager)"
     assert relation["target_frame"] == "product_manager"
     assert relation["target_key"] == "id"
-    assert relation["helper_fields"] == ["name"]
     assert relation["helper_columns"] == [
         {"column": "_product_manager_name", "target_field": "name"}
     ]
@@ -53,7 +52,6 @@ def test_infer_fk_relations_writes_v2_relation_for_naming_convention() -> None:
         "step": "infer_fk_relations",
         "mode": "naming_convention",
     }
-    assert relation["helper_prefix"] == "_"
 
 
 def test_infer_fk_relations_does_not_materialize_helper_columns() -> None:
@@ -208,9 +206,7 @@ def _make_baseline_relation(**overrides) -> dict:
         source_column="id_(product_manager)",
         target_frame="product_manager",
         target_key="id",
-        helper_fields=["name"],
         helper_columns=[{"column": "_product_manager_name", "target_field": "name"}],
-        helper_prefix="_",
         produced_by_step="infer_fk_relations",
         produced_by_mode="naming_convention",
     )
@@ -218,10 +214,12 @@ def _make_baseline_relation(**overrides) -> dict:
     return build_v2_relation(**defaults)
 
 
-def test_apply_v2_relations_rejects_same_producer_changed_helper_prefix() -> None:
+def test_apply_v2_relations_rejects_same_producer_changed_helper_column_name() -> None:
+    # Formerly framed as a changed ``helper_prefix``; the prefix is no longer a
+    # standalone relation field, so the divergence now lives where it is
+    # actually consumed: the materialized ``helper_columns[*].column`` name.
     base = _make_baseline_relation()
     divergent = _make_baseline_relation(
-        helper_prefix="__",
         helper_columns=[{"column": "__product_manager_name", "target_field": "name"}],
     )
     state = apply_v2_relations({}, [base])
@@ -229,10 +227,11 @@ def test_apply_v2_relations_rejects_same_producer_changed_helper_prefix() -> Non
         apply_v2_relations(state, [divergent])
 
 
-def test_apply_v2_relations_rejects_same_producer_changed_helper_fields() -> None:
+def test_apply_v2_relations_rejects_same_producer_added_helper_column() -> None:
+    # Formerly framed as a changed ``helper_fields`` list; the helper field set
+    # is now expressed only through ``helper_columns[*].target_field``.
     base = _make_baseline_relation()
     divergent = _make_baseline_relation(
-        helper_fields=["name", "label"],
         helper_columns=[
             {"column": "_product_manager_name", "target_field": "name"},
             {"column": "_product_manager_label", "target_field": "label"},
@@ -241,6 +240,30 @@ def test_apply_v2_relations_rejects_same_producer_changed_helper_fields() -> Non
     state = apply_v2_relations({}, [base])
     with pytest.raises(ValueError, match="different relation body"):
         apply_v2_relations(state, [divergent])
+
+
+def test_build_v2_relation_emits_only_consumed_fields() -> None:
+    """Slice 1 regression: the v2 relation shape carries exactly the fields
+    runtime consumers read. ``helper_prefix`` / ``helper_fields`` were
+    redundant projections of ``helper_columns`` and must not reappear.
+    See audit/fk_helper_functional_model_to_implementation_review.adoc.
+    """
+    relation = _make_baseline_relation()
+
+    assert set(relation) == {
+        "source_frame",
+        "source_column",
+        "target_frame",
+        "target_key",
+        "helper_columns",
+        "produced_by",
+    }
+    assert "helper_prefix" not in relation
+    assert "helper_fields" not in relation
+    # The authoritative helper record is unchanged.
+    assert relation["helper_columns"] == [
+        {"column": "_product_manager_name", "target_field": "name"}
+    ]
 
 
 def test_apply_v2_relations_rejects_same_producer_changed_target_key() -> None:
