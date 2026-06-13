@@ -1,0 +1,823 @@
+= FK Helper Metadata Path Inventory
+
+Review scope: FK-helper-related `_meta` paths only. +
+Inputs read (code evidence only): `domain/helper_policies.py`,
+`domain/fk_relations.py`, `domain/transformations/fk_helpers/` (enrich,
+drop, policy, provenance), `domain/transformations/derived_column_policy.py`,
+`domain/transformations/helpers.py`, `domain/validations/fk_helpers.py`,
+`domain/validations/reference_validations.py`, `domain/column_roles/resolver.py`,
+`domain/schema_maintenance/meta_update.py`, `domain/workbook_views.py`,
+`pipeline/persistence_boundary.py`, and tests under `tests/unit`,
+`tests/architecture`, `tests/roundtrip`. +
+Prior audit inputs: `audit/fk_helper_lifecycle_and_meta_review.adoc`,
+`audit/meta_flattening_rg_observations.adoc`.
+
+== Scope and Purpose
+
+This document is a code-evidence inventory: producer, consumer, persistence
+behavior, test coverage, runtime dependency, controlled-consumer dependency,
+and suspicion level for every FK-helper-related `_meta` path. Each path
+receives one of four classifications:
+
+* *active feature contract* — consumed on every normal pipeline execution;
+  removing it would break behavior.
+* *runtime helper* — ephemeral cross-step carrier within a single run;
+  not persisted; the pipeline architecture requires it.
+* *carrier detail* — survives into persistence but is consumed only on a
+  fallback path or as a metadata-about-metadata discriminator; narrower
+  contract than an active feature contract.
+* *legacy residue* — present in the data model but not consumed by any
+  runtime code path; exists for backward-compat or because retirement was
+  explicitly deferred.
+
+The final section evaluates code-level evidence for and against the
+meta-flattening hypothesis stated in `meta_flattening_rg_observations.adoc`.
+
+== Inventory
+
+=== PATH-1: `_meta.helper_policies.fk.<target_name>` (v1 per-target dict)
+
+==== Producer
+`configure_fk_helpers` → `_build_fk_policy` → stored directly into the
+`fk` namespace at `fk_policies[policy["target"]] = policy`. +
+File: `domain/helper_policies.py:141-145`. +
+Shape written per target: `{target, target_sheet, key, allowed_helpers,
+default_helpers, helper_prefix, fk_column, [label]}`.
+
+==== Consumer(s)
+`_v1_policy_helper_names` in
+`domain/transformations/derived_column_policy.py:294-325` — last-resort
+cleanup fallback. Iterates the `fk` namespace, matches each per-target
+dict to the source frame by checking whether `fk_column` appears in the
+source frame's columns, and reconstructs helper column names via
+`{helper_prefix}{target_frame}_{field}` for each `default_helpers` entry.
+Called from `_safe_policy_helper_names` which is the third and lowest-priority
+input to `apply_derived_column_policy`. +
+`schema_maintenance/meta_update._handle_helper_policies` at
+`meta_update.py:297-348` — treats each non-`schema_version`, non-`relations`
+key in the `fk` namespace as an opaque v1 payload; iterates it to emit a
+warning but does not rewrite v1 content on rename/drop (only v2 relations
+are structurally updated). The v1 dict is therefore NOT kept consistent
+with target-column renames when a rename touches `key` or a
+`default_helpers` field.
+
+==== Persistence behavior
+KEPT. The persistence boundary's `_project_helper_policies` function
+(`persistence_boundary.py:148-178`) only removes runtime-produced v2
+relation entries under `fk.relations`; v1 per-target dicts are passed
+through unchanged.
+
+==== Tests protecting it
+`test_keeps_helper_policies_v1_per_target_dicts` in
+`tests/unit/pipeline/test_persistence_boundary.py:77` — asserts that a v1
+entry survives the boundary. +
+`test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`
+in `tests/roundtrip/test_cleanup_invariants.py:54` — exercises the full
+roundtrip where the forward pipeline does NOT write
+`_meta.sheets.<frame>.helper_columns`, so cleanup must fall back to the
+v1 dict (and/or v2 relations) to identify and drop helper columns.
+
+==== Current runtime dependency
+LOW on the primary execution path. `_v1_policy_helper_names` is the
+third reader in `apply_derived_column_policy`; it fires only when BOTH
+`_meta.derived.sheets.<sheet>.helper_columns` AND
+`resolve_v2_fk_relations` return nothing. `configure_fk_helpers` writes
+both v1 and v2 simultaneously, so v2 is always present during the same
+run. The v1 fallback is only reachable on reimport when the v2 entries
+produced by `configure_fk_helpers` have been dropped at the persistence
+boundary and the reimport pipeline did not re-run a configuration step.
+
+==== Controlled consumer dependency
+The v1 shape is opaque to consumer repos. Consumers configure
+`configure_fk_helpers` via YAML; they do not directly read
+`_meta.helper_policies.fk.<target_name>`. YAML-level compatibility is
+preserved as long as `configure_fk_helpers` keeps writing the v1 dict.
+
+==== Suspicion level
+MEDIUM-HIGH. The v1 dict is a parallel encoding of the same intent
+already expressed in the v2 relation list produced by the same step in
+the same call. The content reachable via v1 (`helper_prefix`,
+`default_helpers`, `fk_column`) is redundant once the relation's
+`helper_columns[*].column` is recorded. The persistence boundary
+docstring explicitly acknowledges this and defers the broader redesign
+of `helper_policies`. Schema maintenance does not keep v1 content
+consistent with target-column renames, making it subtly stale after
+any rename operation.
+
+==== Classification
+*carrier detail* — survives persistence but is read only as a last-resort
+cleanup fallback; no FK-helper primitive reads it; it can become stale
+after schema maintenance without detection.
+
+---
+
+=== PATH-2: `_meta.helper_policies.fk.schema_version`
+
+==== Producer
+`apply_v2_relations` in `domain/fk_relations.py:218`. Always sets
+`fk_root["schema_version"] = SCHEMA_VERSION` (the constant `2`) whenever
+any v2 relations are merged. Written by both `infer_fk_relations` (via
+`apply_v2_relations`) and `configure_fk_helpers` (via
+`_v2_relations_from_explicit_policies` → `apply_v2_relations`).
+
+==== Consumer(s)
+`resolve_v2_fk_relations` in
+`domain/transformations/fk_helpers/policy.py:48` — the single entry
+point through which all FK-helper primitives read relations. Returns
+`None` (triggering `MissingFkRelationPolicyError`) when `schema_version
+!= 2`. Every primitive imports `resolve_v2_fk_relations`; none bypasses
+it.
+
+==== Persistence behavior
+KEPT when any non-runtime-produced relations survive. DROPPED together
+with `relations` when all relations are runtime-produced
+(`persistence_boundary.py:174-175`): the orphaned `schema_version` would
+be semantically misleading without `relations`, so the boundary removes
+both together.
+
+==== Tests protecting it
+`test_drops_empty_relations_and_schema_version_after_full_prune` in
+`tests/unit/pipeline/test_persistence_boundary.py:142`. +
+`test_keeps_relations_without_runtime_produced_marker` at line 92.
+
+==== Current runtime dependency
+CRITICAL. Every FK-helper primitive reaches relations through
+`resolve_v2_fk_relations`, which returns `None` on version mismatch.
+Without this field a v1 dict and a v2 block could be conflated.
+
+==== Suspicion level
+LOW.
+
+==== Classification
+*active feature contract* — the single discriminator guarding primitive
+access to v2 relations; removing it would collapse the v1/v2 distinction
+that the entire primitive refactor (`FTR-FK-HELPERS-POLICY-DRIVEN-
+PRIMITIVES-P5`) depends on.
+
+---
+
+=== PATH-3a: `_meta.helper_policies.fk.relations[*]` (inferred or user-authored)
+
+Entries written by `infer_fk_relations` or hand-authored.
+`produced_by.step = "infer_fk_relations"` (or absent for hand-authored).
+
+==== Producer
+`infer_fk_relations` → `_try_build_inferred_relation` →
+`build_v2_relation` → `apply_v2_relations`. +
+File: `domain/fk_relations.py:83,168,259,181`.
+
+==== Consumer(s)
+`enrich_helpers` via `resolve_v2_fk_relations` →
+`build_v2_target_registry` + `iter_relation_fk_defs`
+(`fk_helpers/enrich.py:44-76`). +
+`drop_helpers` via `resolve_v2_fk_relations` →
+`_columns_to_drop_by_sheet` (`fk_helpers/drop.py:38,47`). +
+`reorder_helpers_next_to_fk` via `resolve_v2_fk_relations`
+(`domain/transformations/helpers.py:222`). +
+`validate_fk_helpers` and four sub-checks via `resolve_v2_fk_relations`
+(`validations/fk_helpers.py:357`). +
+`apply_derived_column_policy` via `_safe_policy_helper_names` →
+`resolve_v2_fk_relations` (`derived_column_policy.py:279`). +
+`schema_maintenance/meta_update._handle_fk_relations`
+(`meta_update.py:352-409`) — renames `helper_columns[*].target_field`
+when a target column is renamed; blocks drop when the column is still
+referenced.
+
+==== Persistence behavior
+KEPT. `_is_runtime_produced_fk_relation` returns `False` for entries
+where `produced_by.step != "configure_fk_helpers"` or `produced_by` is
+absent. The boundary preserves them.
+
+==== Tests protecting it
+`test_keeps_relations_without_runtime_produced_marker`
+(`test_persistence_boundary.py:92`). +
+`tests/unit/pipeline/test_infer_fk_relations_step.py` (multiple).
+
+==== Current runtime dependency
+PRIMARY — these are the authoritative cross-run declarations driving all
+FK-helper primitive behavior when provenance is absent.
+
+==== Suspicion level
+LOW.
+
+==== Classification
+*active feature contract* — the primary persistence-crossing carrier for
+FK helper declarations; consumed directly by every primitive.
+
+---
+
+=== PATH-3b: `_meta.helper_policies.fk.relations[*]` (produced by `configure_fk_helpers`)
+
+Entries written by `configure_fk_helpers` with
+`produced_by.step = "configure_fk_helpers"`, `produced_by.mode = "explicit"`.
+
+==== Producer
+`configure_fk_helpers` → `_v2_relations_from_explicit_policies` →
+`build_v2_relation` → `apply_v2_relations`. +
+File: `domain/helper_policies.py:147-149`.
+
+==== Consumer(s)
+Same as PATH-3a within the same pipeline run: all FK primitives consume
+v2 relations without distinguishing producer.
+
+==== Persistence behavior
+DROPPED. `_is_runtime_produced_fk_relation` at
+`persistence_boundary.py:181-187` returns `True` for
+`produced_by.step == "configure_fk_helpers"`. The persistence boundary
+docstring calls this "compiled pipeline state".
+
+==== Tests protecting it
+`test_drops_runtime_produced_fk_helper_relations`
+(`test_persistence_boundary.py:116`). +
+`test_drops_empty_relations_and_schema_version_after_full_prune`
+(`test_persistence_boundary.py:142`).
+
+==== Current runtime dependency
+WITHIN-RUN ONLY. Enables primitives to consume a uniform v2 shape
+regardless of whether declaration came from `configure_fk_helpers` or
+`infer_fk_relations`. Dropped before persistence so it never accumulates.
+
+==== Suspicion level
+MEDIUM. The docstring explicitly labels it "compiled pipeline state"
+(persistence_boundary.py:94). Its presence under the same root as durable
+v2 entries is the root cause of the `produced_by` discriminator (PATH-4).
+An alternative design would write runtime v2 entries under
+`_meta.derived.fk_relations` instead of under `helper_policies.fk`, which
+would eliminate both the discriminator and the coexistence confusion.
+
+==== Classification
+*runtime helper* — correctly dropped at the persistence boundary;
+necessary only to let primitives read a single v2 shape within a run
+started with `configure_fk_helpers`.
+
+---
+
+=== PATH-4: `_meta.helper_policies.fk.relations[*].produced_by`
+
+==== Producer
+`build_v2_relation` in `domain/fk_relations.py:288`: field
+`{"step": produced_by_step, "mode": produced_by_mode}` always present.
+
+==== Consumer(s)
+`_is_runtime_produced_fk_relation` in `pipeline/persistence_boundary.py:181-187`
+— the sole runtime consumer. Checks `produced_by.get("step") ==
+"configure_fk_helpers"`. Nothing else reads this field at runtime.
+`_assert_no_relation_conflict` (`fk_relations.py:235`) reads
+`produced_by.step` to detect cross-producer rewrites; this is an error-
+enforcement path, not a feature path.
+
+==== Persistence behavior
+KEPT on surviving relations (those not dropped by the boundary).
+
+==== Tests protecting it
+`test_drops_runtime_produced_fk_helper_relations` (the discriminator
+value is the exact test fixture). +
+`test_keeps_relations_without_runtime_produced_marker` (absence of
+`produced_by` on an entry that has none).
+
+==== Current runtime dependency
+LOW during pipeline execution. HIGH at the persistence boundary for the
+single discriminator call.
+
+==== Suspicion level
+MEDIUM. This field exists solely because runtime-produced and durable
+entries coexist under `_meta.helper_policies.fk.relations`. If runtime
+entries lived under a different root (e.g., `_meta.derived.fk_relations`),
+the discriminator would be unnecessary. As-is, the field is a metadata-
+about-metadata carrier created by an architecture ambiguity.
+
+==== Classification
+*carrier detail* — necessary only to resolve the coexistence ambiguity
+at the persistence boundary; would disappear if runtime and durable v2
+entries were placed under separate roots.
+
+---
+
+=== PATH-5: `_meta.helper_policies.fk.relations[*].helper_columns[*]`
+
+Each entry: `{"column": "<materialized column name>", "target_field":
+"<source field on target frame>"}`.
+
+==== Producer
+`build_v2_relation` in `domain/fk_relations.py:283-286`.
+`configure_fk_helpers` computes the list as
+`{helper_prefix}{target_frame}_{field}` for each `default_helpers` entry.
+`infer_fk_relations` builds it similarly from resolved label fields.
+
+==== Consumer(s)
+`iter_relation_fk_defs` (`fk_helpers/policy.py:132`) — reads `column`
+and `target_field` to produce `FKDef` objects for `apply_fk_helpers`. +
+`_columns_to_drop_by_sheet` (`fk_helpers/drop.py:94`) — reads `column`
+to build the drop set for sheets without provenance. +
+`_safe_policy_helper_names` (`derived_column_policy.py:285`) — reads
+`column` to build the durable cleanup set. +
+`_expected_helper_columns_by_sheet` (`validations/fk_helpers.py:387`) —
+reads both `column` (helper identity) and `target_field` (value check
+source) for all validation sub-checks. +
+`build_v2_target_registry` (`fk_helpers/policy.py:112`) — reads
+`target_field` to build `fields_by_target_sheet` for `build_id_value_maps`. +
+`_rename_fk_helper_target_fields` (`schema_maintenance/meta_update.py:412`)
+— renames `target_field` when the target column is renamed.
+
+==== Persistence behavior
+KEPT when relation survives.
+
+==== Tests protecting it
+Unit tests for enrich, drop, and validate all construct relations with
+`helper_columns` and assert on outcomes. The architecture guard
+`test_fk_helper_primitives_consume_policy.py` enforces that primitives
+read this shape rather than inferring from column names.
+
+==== Current runtime dependency
+CRITICAL on every execution path involving FK helpers.
+
+==== Suspicion level
+LOW.
+
+==== Classification
+*active feature contract* — the explicit, policy-driven record of which
+columns are materialized and from which target field; consumed by every
+FK-helper primitive.
+
+---
+
+=== PATH-6: `_meta.helper_policies.fk.relations[*].helper_prefix`
+
+==== Producer
+`build_v2_relation` in `domain/fk_relations.py` stores the `helper_prefix`
+argument directly on the relation dict.
+
+==== Consumer(s)
+NONE on the runtime execution path. +
+`iter_relation_fk_defs` (`fk_helpers/policy.py:119-144`) reads only
+`column` and `target_field` from each `helper_columns` entry; it does not
+read `helper_prefix` from the relation. +
+`_columns_to_drop_by_sheet` (`fk_helpers/drop.py:94`) reads
+`helper_columns[*].column` only. +
+`_safe_policy_helper_names` (`derived_column_policy.py:285`) reads
+`helper_columns[*].column` only. +
+`_v1_policy_helper_names` (`derived_column_policy.py:322`) reads
+`helper_prefix` from the v1 per-target dict, not from v2 relations. +
+`_assert_no_relation_conflict` (`fk_relations.py:249`) compares the full
+dict (including `helper_prefix`) for same-producer idempotency checks,
+which means changing the prefix value on a re-run raises an error — but
+this is enforcement of the shape contract, not feature consumption of the
+field.
+
+==== Persistence behavior
+KEPT when relation survives.
+
+==== Tests protecting it
+No test specifically asserts the behavior of the `helper_prefix` field
+on a v2 relation. Idempotency tests indirectly preserve it.
+
+==== Current runtime dependency
+NONE on the primary path.
+
+==== Suspicion level
+HIGH. The field is stored but not consumed; the actual column name is
+already fully recorded in `helper_columns[*].column`. `helper_prefix`
+is a reconstruction input (computable from: `column.removeprefix(...)` or
+from original configuration) but is never used as such by any consumer.
+Tracked as Sonnet C007 in the prior lifecycle review.
+
+==== Classification
+*legacy residue* — carried in the v2 shape but never read by any runtime
+consumer; the explicit column name in `helper_columns[*].column` makes
+it redundant.
+
+---
+
+=== PATH-7: `_meta.helper_policies.fk.relations[*].helper_fields`
+
+==== Producer
+`build_v2_relation` in `domain/fk_relations.py:282`: `"helper_fields":
+list(helper_fields)`.
+
+==== Consumer(s)
+NONE found. +
+`build_v2_target_registry` (`fk_helpers/policy.py:112`) builds
+`fields_by_target_sheet` from `relation.get("helper_columns")`, reading
+`entry.get("target_field")` — NOT from `helper_fields`. +
+`iter_relation_fk_defs` uses `helper_columns` only. +
+`_rename_fk_helper_target_fields` in `schema_maintenance/meta_update.py:412`
+renames `helper_columns[*].target_field` when a target column is renamed
+but does NOT update `helper_fields`. This means after any schema
+maintenance rename, `helper_fields` is stale relative to
+`helper_columns[*].target_field`.
+
+==== Persistence behavior
+KEPT when relation survives. Silently stale after schema maintenance
+renames.
+
+==== Tests protecting it
+None. No test asserts the content of `helper_fields` on a persisted or
+mutated relation.
+
+==== Current runtime dependency
+NONE.
+
+==== Suspicion level
+HIGH. Redundant with `helper_columns[*].target_field`. Silently diverges
+from `helper_columns` after schema maintenance without any consumer or
+test noticing.
+
+==== Classification
+*legacy residue* — stored in the v2 shape but not consumed by any runtime
+or persistence code; redundant with the `target_field` sub-keys of the
+`helper_columns` list; can become stale without detection.
+
+---
+
+=== PATH-8: `_meta.derived.sheets.<sheet>.helper_columns`
+
+==== Producer
+`_write_helper_provenance` in
+`domain/transformations/fk_helpers/provenance.py:44`. Called at the end
+of `enrich_helpers` (`fk_helpers/enrich.py:101`). Writes per-sheet:
+`[{"column": fk.helper_column, "fk_column": fk.fk_column, "target":
+fk.target_sheet_key, "target_key": fk.id_field, "value_field":
+fk.value_field}, ...]`. Key-selective merge preserves other subkeys in
+the same sheet entry (e.g., `enrich_lookup`).
+
+==== Consumer(s)
+`derived_helper_columns_by_sheet` (`fk_helpers/policy.py:159`) — the
+central accessor; returns the per-sheet list. Imported by:
+
+* `drop_helpers` (`fk_helpers/drop.py:39`) — first-priority source for
+  columns to drop; authoritative for sheets that have provenance.
+* `reorder_helpers_next_to_fk` (`domain/transformations/helpers.py:223`)
+  — first-priority source for FK/helper pairings.
+* `validate_fk_helpers` and sub-checks (`validations/fk_helpers.py:358`)
+  — first-priority source for expected helper columns.
+* `column_roles/resolver._fk_helper_provenance_columns`
+  (`resolver.py:251-254`) — source for `display_helper` role inference.
+
+`apply_derived_column_policy` via `_safe_sheet_meta` →
+`_resolve_derived_identity` → `_validated_fk_helper_names`
+(`derived_column_policy.py:169-196`) — first-priority identity source
+for the reimport cleanup step; also the only source rich enough to drive
+`enrich_lookup` value checks (FK helpers are not value-checked).
+
+Cleaned by `_clean_helper_provenance` (`provenance.py:89`) after
+`drop_helpers` has removed columns. Cleaned by `_strip_consumed_provenance`
+(`derived_column_policy.py:349`) after `apply_derived_column_policy`
+replaces the source frame.
+
+==== Persistence behavior
+DROPPED. `_meta.derived` is in `RUNTIME_ONLY_TOP_LEVEL_META_KEYS`
+(`persistence_boundary.py:101`); the entire top-level key is removed
+unconditionally.
+
+==== Tests protecting it
+`test_drops_top_level_derived` (`test_persistence_boundary.py:55`) — pins
+the drop. +
+`tests/unit/domain/transformations/test_drop_helpers_provenance.py` —
+exercises provenance write and cleanup. +
+`tests/unit/domain/transformations/test_fk_helpers_enrich.py` — asserts
+provenance is written after enrichment. +
+`tests/unit/domain/transformations/test_derived_column_policy.py` —
+asserts that provenance drives cleanup. +
+Architecture guard `test_fk_helper_primitives_consume_policy.py` — enforces
+that primitives read provenance (via `derived_helper_columns_by_sheet`)
+rather than re-deriving from column names.
+
+==== Current runtime dependency
+CRITICAL — the highest-priority source for helper column identity in every
+cleanup, reorder, and validation step within the same run.
+
+==== Suspicion level
+LOW — correctly ephemeral; correctly dropped at boundary.
+
+==== Classification
+*runtime helper* — genuine cross-step glue within a single pipeline run;
+not persisted; the pipeline architecture requires it because `enrich_helpers`
+and cleanup steps are separately configured steps with no other communication
+channel.
+
+---
+
+=== PATH-9: `_meta.derived.sheets.<sheet>.enrich_lookup`
+
+This path belongs to the `enrich_lookup` feature, not FK helpers proper,
+but it co-locates with PATH-8 under the same sheet envelope.
+
+==== Producer
+`enrich_lookup` transformation step (outside FK-helper module).
+
+==== Consumer(s) within FK-helper scope
+`_clean_helper_provenance` (`fk_helpers/provenance.py:93-105`). When
+`drop_helpers` has cleaned FK helper columns from a sheet, this function
+conditionally removes the `enrich_lookup` subkey — but only when none of
+the enrich_lookup helper columns remain in the cleaned frame. This prevents
+`drop_helpers` from orphaning `enrich_lookup` provenance when lookup helpers
+are still present.
+
+==== Persistence behavior
+DROPPED. Shares the `_meta.derived` envelope.
+
+==== Tests protecting it
+`tests/unit/domain/transformations/test_drop_helpers_provenance.py` —
+exercises the conditional cleanup: lookup helpers still present → subkey
+preserved; lookup helpers absent → subkey removed.
+
+==== Current runtime dependency
+NARROW. The FK helper module needs co-location awareness to avoid
+destroying concurrent state but does not interpret `enrich_lookup` semantics.
+
+==== Suspicion level
+LOW. The co-location awareness is minimal and correct.
+
+==== Classification
+*runtime helper* — co-located ephemeral provenance; the FK module's
+awareness is limited to not destroying it prematurely.
+
+---
+
+=== PATH-10: `_meta.sheets.<frame>.helper_columns`
+
+==== Producer
+`configure_workbook_view` via `_merge_sheet_options`
+(`domain/workbook_views.py:444-456`). Written from the
+`sheets[*].helper_columns` YAML list when present. Does not materialise
+helper columns; only records which columns are helpers for workbook-view
+purposes.
+
+==== Consumer(s)
+`_safe_durable_helper_names` (`derived_column_policy.py:244-268`) — second-
+priority fallback in `apply_derived_column_policy` when
+`_meta.derived.sheets.<source>.helper_columns` is absent (e.g., on
+reimport after the persistence boundary). Returns names only; cannot
+drive value comparisons. +
+`_view_helper_columns` (`column_roles/resolver.py:217-232`) — resolves
+the `display_helper` role for frame-projection steps. Reads via
+`_sheet_for_frame` which first maps the frame name to a sheet name via
+`_meta.workbook_view`. +
+`_durable_helper_columns` (`validations/reference_validations.py:615-628`)
+— the ONLY source for the `no_helper_columns` validation rule. Post-cleanup
+assertion reads this list to detect helper columns that survived the cleanup
+step; if this list is empty, the rule silently passes without checking. +
+`schema_maintenance/meta_update._handle_sheets`
+(`meta_update.py:202-204`) — propagates renames and drops to
+`helper_columns` lists across sheets.
+
+==== Persistence behavior
+KEPT — preserved by the persistence boundary, which explicitly defers the
+pruning question to `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`
+(`persistence_boundary.py:74-76`).
+
+==== Tests protecting it
+`test_no_helper_columns_validation_reports_bypassed_cleanup`
+(`tests/roundtrip/test_cleanup_invariants.py:130`) — the `no_helper_columns`
+rule fires only when this path is populated; if absent, the rule silently
+passes. +
+`tests/unit/domain/column_roles/test_resolver.py` — asserts `display_helper`
+role resolution from this path.
+
+==== Current runtime dependency
+MEDIUM-HIGH. Three distinct consumers, each with a different purpose and
+no single canonical authority. The `no_helper_columns` rule is the load-
+bearing contract: it is the recommended post-cleanup assertion and reads
+ONLY this path. If this path is absent, the assertion silently passes even
+when helpers are present.
+
+==== Suspicion level
+MEDIUM. The persistence boundary docstring flags its undecided status: it
+can be added by `configure_workbook_view` (a system step), so its presence
+does not reliably imply user-authored intent. The fact that the
+`no_helper_columns` rule reads ONLY this path (not provenance, not v2
+relations) makes it both load-bearing and fragile: a pipeline that calls
+`add_fk_helpers` but not `configure_workbook_view` will not populate this
+path, and the `no_helper_columns` rule will silently do nothing even if
+helper columns survive cleanup.
+
+==== Classification
+*active feature contract* — consumed by three distinct code paths
+(cleanup fallback, role resolution, post-cleanup assertion); removing it
+would break all three without a replacement path.
+
+---
+
+== Sub-field Inventory: Vestigial Slots
+
+=== SUB-1: `label_field` in `build_v2_target_registry`
+
+`build_v2_target_registry` (`fk_helpers/policy.py:100-104`) sets
+`"label_field": target_key` as a default. Code comment: "intentionally a
+no-op default." No primitive reads this field back from the registry; it
+exists because the legacy `core.fk.build_id_label_maps` plumbing expects
+a `label_field` key in the registry dict. Not a `_meta` path but
+contributes to the overdesign assessment.
+
+Classification: *legacy residue* (vestigial slot in the v1 registry bridge).
+
+=== SUB-2: `FKFinding = Finding` alias
+
+`validations/fk_helpers.py:45`. Backward-compat alias; no active contract.
+
+Classification: *legacy residue*.
+
+=== SUB-3: `prefix` parameter on `drop_helpers` and `reorder_helpers_next_to_fk`
+
+`fk_helpers/drop.py:36`: `del prefix`. +
+`domain/transformations/helpers.py:219`: `del helper_prefix`. +
+Both functions immediately discard the parameter; retained only for YAML
+step-binding compatibility.
+
+Classification: *legacy residue* (tracked as Sonnet C007 in prior review).
+
+=== SUB-4: `mode: "naming_convention"` as the only valid mode in `infer_fk_relations`
+
+`domain/fk_relations.py:25`: `_VALID_MODES: frozenset[str] =
+frozenset({"naming_convention"})`. The validation slot exists for a second
+mode that does not exist; the frozenset has one member.
+
+Classification: *carrier detail* (future extension slot with no current
+second mode; not a metadata path but the same overdesign symptom).
+
+---
+
+== Consolidated Classification Table
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Path | Classification | Producer | Persisted | Suspicion
+
+| `helper_policies.fk.<target>` (v1)
+| carrier detail
+| `configure_fk_helpers`
+| yes
+| medium-high
+
+| `helper_policies.fk.schema_version`
+| active feature contract
+| `apply_v2_relations`
+| conditional
+| low
+
+| `helper_policies.fk.relations[*]` (inferred/authored)
+| active feature contract
+| `infer_fk_relations`
+| yes
+| low
+
+| `helper_policies.fk.relations[*]` (configure_fk_helpers)
+| runtime helper
+| `configure_fk_helpers`
+| no (dropped)
+| medium
+
+| `helper_policies.fk.relations[*].produced_by`
+| carrier detail
+| `build_v2_relation`
+| conditional
+| medium
+
+| `helper_policies.fk.relations[*].helper_columns[*]`
+| active feature contract
+| `build_v2_relation`
+| conditional
+| low
+
+| `helper_policies.fk.relations[*].helper_prefix`
+| legacy residue
+| `build_v2_relation`
+| conditional
+| high
+
+| `helper_policies.fk.relations[*].helper_fields`
+| legacy residue
+| `build_v2_relation`
+| conditional
+| high
+
+| `derived.sheets.<sheet>.helper_columns`
+| runtime helper
+| `_write_helper_provenance`
+| no (dropped)
+| low
+
+| `derived.sheets.<sheet>.enrich_lookup`
+| runtime helper
+| `enrich_lookup`
+| no (dropped)
+| low
+
+| `sheets.<frame>.helper_columns`
+| active feature contract
+| `configure_workbook_view`
+| yes
+| medium
+
+|===
+
+---
+
+== Evaluation: Evidence For and Against the Meta-Flattening Hypothesis
+
+The hypothesis (from `meta_flattening_rg_observations.adoc`): +
+_`_meta` is a carrier; feature semantics should be local._
+
+=== Evidence Supporting the Hypothesis (paths that could be simplified)
+
+*v1/v2 coexistence under one root is an architecture artifact, not a
+feature requirement.* `configure_fk_helpers` writes both the v1 per-target
+dict and a runtime-only v2 relation entry in the same step. The v1 dict
+survives persistence; the v2 entry does not. The result is two shapes
+with different lifetimes under one root
+(`_meta.helper_policies.fk.<target>` vs `_meta.helper_policies.fk.relations`)
+that encode the same user intent. No primitive reads v1; v1 is only a
+cleanup fallback. If `configure_fk_helpers` were changed to write only a
+single durable v2 entry (without `produced_by.step = "configure_fk_helpers"`,
+making it permanent rather than runtime-only), both the v1 dict and the
+`produced_by` discriminator would become unnecessary.
+
+*`produced_by` is a discriminator for an architecture ambiguity, not a
+feature field.* PATH-4 (`produced_by`) exists because runtime and durable
+v2 entries coexist under `helper_policies.fk.relations`. If runtime-only
+v2 entries were placed under `_meta.derived.fk_relations` instead, the
+discriminator would be unnecessary. The field has no active feature semantics:
+nothing reads `produced_by.mode` at runtime; `produced_by.step` is read
+only at the persistence boundary.
+
+*`helper_prefix` and `helper_fields` in v2 relations are not consumed.*
+Both fields are stored in every v2 relation but no runtime consumer reads
+them (PATH-6, PATH-7). `helper_prefix` is computable from any
+`helper_columns[*].column` name; `helper_fields` is exactly
+`helper_columns[*].target_field`. Schema maintenance renames
+`target_field` without updating `helper_fields`, allowing silent staleness.
+
+*The vestigial slots (SUB-1 through SUB-4) are genuine legacy residue.*
+`label_field`, `FKFinding`, `del prefix`, and the single-member mode
+frozenset each confirm that the shape carries more surface area than the
+active use case requires.
+
+=== Evidence Contradicting the Hypothesis (paths that cannot be made local)
+
+*The pipeline architecture requires `_meta` as a cross-step carrier.*
+The pipeline is a chain of pure transformations, each receiving and
+returning `frames = {sheet_name: DataFrame, "_meta": dict}`. There is no
+mechanism for a step to pass information to a downstream step other than
+through `frames`. The following paths are cross-step dependencies that
+cannot be made local without changing the pipeline's architectural contract:
+
+. `_meta.helper_policies.fk.relations` — produced by configuration steps
+  (`configure_fk_helpers` or `infer_fk_relations`), consumed by primitive
+  steps (`enrich_helpers`, `drop_helpers`, etc.) that run separately in
+  the pipeline sequence. Localising this would require merging
+  configuration and execution into a single step, which the design
+  explicitly separates.
+
+. `_meta.derived.sheets.<sheet>.helper_columns` — produced by
+  `enrich_helpers` in step N, consumed by `drop_helpers`,
+  `apply_derived_column_policy`, and `validate_fk_helpers` in steps N+K.
+  This is the textbook case for `_meta` as a cross-step carrier. The
+  prior lifecycle review rated this path "clearly necessary."
+
+. `_meta.sheets.<frame>.helper_columns` — the only post-persistence anchor
+  for cleanup and the only source for the `no_helper_columns` assertion
+  rule. Without this path, a reimport pipeline that does not re-run a
+  configuration step has no metadata-driven basis for identifying helper
+  columns after the persistence boundary has stripped `_meta.derived`.
+
+*The architecture guard encodes an active design principle.* The test
+`test_fk_helper_primitives_consume_policy.py` statically asserts that
+primitives must NOT re-derive FK identity from column-name conventions
+(i.e., `detect_fk_columns`, `build_registry`, `FK_PATTERN` are banned).
+This guard can only be enforced if the v2 policy or derived provenance
+is in `_meta`; making them local to the feature module would mean they
+are no longer available to independent pipeline steps.
+
+*The persistence boundary's Intent/Resolution split confirms that `_meta`
+is the intentional carrier.* The boundary docstring explicitly uses the
+terms "Intent" and "Resolution" and preserves Intent while dropping
+Resolution. This is not an accident; it is a deliberate architecture
+decision that acknowledges `_meta` as the cross-run carrier for user-
+authorised declarations. The same pattern is applied consistently to
+`legend_blocks` and `xref_crosstable`, confirming a project-wide choice,
+not a local inconsistency.
+
+=== Summary Assessment
+
+The meta-flattening hypothesis is *partially supported* at the margins:
+the v1/v2 coexistence, the `produced_by` discriminator, `helper_prefix`,
+and `helper_fields` are genuine overdesign that a future cleanup can
+remove. These are legacy residue or carrier details created by the
+transitional state between v1 and v2 models.
+
+The hypothesis is *contradicted at the core*: the three primary cross-step
+and cross-run paths (`helper_policies.fk.relations`,
+`derived.sheets.<sheet>.helper_columns`, `sheets.<frame>.helper_columns`)
+are genuine pipeline carrier paths. They exist because the step-based
+pipeline architecture requires `_meta` as the only cross-step communication
+channel. Feature-local semantics are already enforced by the architecture
+guard; the guard requires that the carrier exist.
+
+The overdesign is not in `_meta` being a carrier — it is in `_meta`
+carrying more shapes than the active use case requires. Specifically: one
+canonical, durable v2 relation shape (with a single producer, no
+`produced_by` discriminator, and no parallel v1 dict) plus one ephemeral
+provenance path would cover every currently active consumer. The three
+legacy-residue paths (PATH-1 v1 dict as primary shape, PATH-6
+`helper_prefix`, PATH-7 `helper_fields`) are the consolidation targets,
+not the carrier model itself.
