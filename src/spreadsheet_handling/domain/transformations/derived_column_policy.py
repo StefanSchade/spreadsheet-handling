@@ -269,13 +269,17 @@ def _safe_durable_helper_names(meta: Mapping[str, Any], source: str) -> set[str]
 
 
 def _safe_policy_helper_names(frames: Mapping[str, Any], source: str) -> set[str]:
-    """Return FK helper columns declared for ``source``.
+    """Return FK helper columns declared for ``source`` by v2 relation policy.
 
-    The policy fallback is intentionally metadata-driven. It does not infer
-    helper identity from column names, so unrelated underscore-prefixed columns
-    remain payload.
+    The policy fallback is intentionally metadata-driven and v2-only. It reads
+    the durable v2 relation model under ``_meta.helper_policies.fk.relations``
+    (the carrier ``configure_fk_helpers`` and ``infer_fk_relations`` both
+    write). It never infers helper identity from column names, so unrelated
+    underscore-prefixed columns remain payload. The legacy v1 per-target
+    fallback was removed in FK Helper Slice 2 (v1 retirement); see
+    ``audit/fk_helper_slice2_v1_retirement_review.adoc``.
     """
-    helper_names = _v1_policy_helper_names(frames, source)
+    helper_names: set[str] = set()
     relations = resolve_v2_fk_relations(dict(frames))
     if not relations:
         return helper_names
@@ -288,40 +292,6 @@ def _safe_policy_helper_names(frames: Mapping[str, Any], source: str) -> set[str
             column = entry.get("column")
             if column:
                 helper_names.add(str(column))
-    return helper_names
-
-
-def _v1_policy_helper_names(frames: Mapping[str, Any], source: str) -> set[str]:
-    meta = frames.get(META_KEY)
-    if not isinstance(meta, Mapping):
-        return set()
-    helper_policies = meta.get("helper_policies")
-    if not isinstance(helper_policies, Mapping):
-        return set()
-    fk_policies = helper_policies.get("fk")
-    if not isinstance(fk_policies, Mapping):
-        return set()
-
-    source_frame = frames.get(source)
-    source_columns = {
-        _visible_label(column)
-        for column in getattr(source_frame, "columns", [])
-    }
-    if not source_columns:
-        return set()
-
-    helper_names: set[str] = set()
-    for target_name, policy in fk_policies.items():
-        if not isinstance(policy, Mapping):
-            continue
-        fk_column = str(policy.get("fk_column") or "")
-        if not fk_column or fk_column not in source_columns:
-            continue
-        target_frame = str(policy.get("target_sheet") or policy.get("target") or target_name)
-        raw_prefix = policy.get("helper_prefix")
-        helper_prefix = "_" if raw_prefix is None else str(raw_prefix)
-        for field in policy.get("default_helpers") or []:
-            helper_names.add(f"{helper_prefix}{target_frame}_{str(field)}")
     return helper_names
 
 

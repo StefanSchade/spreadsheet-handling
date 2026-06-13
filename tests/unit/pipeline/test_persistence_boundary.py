@@ -6,8 +6,9 @@ BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A (Intent vs Resolution slice):
 
 * drop top-level ``derived``,
 * drop top-level ``__*``-prefixed keys,
-* drop ``helper_policies.fk.relations`` entries where
-  ``produced_by.step == configure_fk_helpers``,
+* preserve ``helper_policies`` unchanged (FK Helper Slice 2: configure-produced
+  v2 relations are durable; the boundary no longer prunes relations by
+  ``produced_by.step``),
 * drop ``legend_blocks[*].resolved`` (Resolution under canonical),
 * drop ``xref_crosstable[*].dense_axes.resolved`` (Resolution),
 * drop ``xref_crosstable[*].column_keys`` (Resolution),
@@ -113,7 +114,10 @@ def test_keeps_relations_without_runtime_produced_marker() -> None:
     assert out["helper_policies"]["fk"]["schema_version"] == 2
 
 
-def test_drops_runtime_produced_fk_helper_relations() -> None:
+def test_keeps_configure_produced_fk_helper_relations() -> None:
+    # FK Helper Slice 2 (v1 retirement): configure_fk_helpers relations are
+    # durable. The boundary no longer prunes relations by produced_by.step, so
+    # configure-produced and user-authored relations alike survive.
     meta = {
         "helper_policies": {
             "fk": {
@@ -135,13 +139,13 @@ def test_drops_runtime_produced_fk_helper_relations() -> None:
     }
     out = project_meta_to_persistable_contract(meta)
     kept = out["helper_policies"]["fk"]["relations"]
-    assert len(kept) == 1
-    assert kept[0]["source_frame"] == "characters"
+    assert {relation["source_frame"] for relation in kept} == {"groups", "characters"}
+    assert out["helper_policies"]["fk"]["schema_version"] == 2
 
 
-def test_drops_empty_relations_and_schema_version_after_full_prune() -> None:
-    """If every relation was runtime-produced, drop the empty marker plus the
-    schema_version that only describes the relations envelope."""
+def test_keeps_relations_schema_version_and_legacy_v1_entry() -> None:
+    """No relation is pruned, so the relations list and its schema_version are
+    preserved; any legacy v1 per-target entry passes through untouched."""
     meta = {
         "helper_policies": {
             "fk": {
@@ -153,14 +157,14 @@ def test_drops_empty_relations_and_schema_version_after_full_prune() -> None:
                         "produced_by": {"step": "configure_fk_helpers"},
                     },
                 ],
-                "places": {"target": "places"},  # v1 entry must survive
+                "places": {"target": "places"},  # legacy v1 entry passes through
             },
         },
     }
     out = project_meta_to_persistable_contract(meta)
     fk = out["helper_policies"]["fk"]
-    assert "relations" not in fk
-    assert "schema_version" not in fk
+    assert len(fk["relations"]) == 1
+    assert fk["schema_version"] == 2
     assert fk["places"]["target"] == "places"
 
 

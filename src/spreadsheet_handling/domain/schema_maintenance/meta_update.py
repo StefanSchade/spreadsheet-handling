@@ -327,23 +327,10 @@ def _handle_helper_policies(
         else:
             updated_fk["relations"] = _handle_fk_relations(relations, request, changes, failures)
 
-    for key, value in fk.items():
-        if key in {"relations", "schema_version"}:
-            continue
-        if contains_structured_reference(value, request.target_frame, _affected_column(request) or ""):
-            path = f"helper_policies.fk.{key}"
-            changes.append(
-                _change(
-                    ReferenceRoot.HELPER_POLICIES_FK,
-                    path,
-                    ReferenceAction.BLOCKED,
-                    request.target_frame,
-                    _affected_column(request),
-                    "Residual v1 FK helper policy is not rewritten in this slice",
-                )
-            )
-            failures.append(_blocked_reference(ReferenceRoot.HELPER_POLICIES_FK, path, request, _affected_column(request)))
-
+    # The legacy v1 per-target FK helper dict is no longer produced
+    # (FK Helper Slice 2: v1 retirement), so there is no residual v1 shape
+    # to block on rename/drop here. Only the durable v2 `relations` model is
+    # maintained, by `_handle_fk_relations` above.
     updated_helper_policies = dict(helper_policies)
     updated_helper_policies["fk"] = updated_fk
     meta["helper_policies"] = updated_helper_policies

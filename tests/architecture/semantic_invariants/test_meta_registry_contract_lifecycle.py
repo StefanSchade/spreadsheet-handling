@@ -203,14 +203,11 @@ def test_retired_bridge_does_not_still_read_source_shape() -> None:
 def test_pilot_helper_policies_fk_current_consumers_match_runtime_truth() -> None:
     """The pilot ``helper_policies.fk`` lifecycle pins runtime truth.
 
-    ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`` refactored the
-    FK-helper primitives to consume the v2 relation policy. The
-    pilot lifecycle now records the v2-aware primitive consumers
-    under ``current_state.consumers`` and ``runtime_reads`` is
-    v2 only. ``configure_fk_helpers`` still writes the v1
-    per-target shape as a producer-side back-compat residual, so
-    ``runtime_writes`` continues to list both shapes and the bridge
-    remains active (dual_write) on the producer side.
+    ``FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5`` refactored the FK-helper
+    primitives to consume the v2 relation policy (``runtime_reads`` v2 only).
+    FK Helper Slice 2 (v1 retirement) then removed the v1 producer write, so
+    the entry is single-shape v2: ``runtime_writes`` is v2 only and the
+    v1 -> v2 transition bridge is retired.
     """
     registry = _load_registry()
     pilot_entry = next(
@@ -238,7 +235,10 @@ def test_pilot_helper_policies_fk_current_consumers_match_runtime_truth() -> Non
         "runtime_reads must reflect v2-only consumption after "
         "FTR-FK-HELPERS-POLICY-DRIVEN-PRIMITIVES-P5"
     )
-    assert {"v1_per_target_policy", "v2_relation_policy"} <= runtime_writes, (
-        "runtime_writes must still list v1 and v2 while configure_fk_helpers "
-        "writes the residual v1 per-target shape"
+    assert runtime_writes == {"v2_relation_policy"}, (
+        "FK Helper Slice 2: configure_fk_helpers writes the v2 relation model "
+        "only; the v1 per-target shape is retired"
+    )
+    assert lifecycle["transition_bridge"]["status"] == "retired", (
+        "the v1 -> v2 dual_write bridge must be retired after FK Helper Slice 2"
     )

@@ -134,16 +134,14 @@ def configure_fk_helpers(
     if not policy_specs:
         raise ValueError("configure_fk_helpers needs at least one target policy")
 
+    # configure_fk_helpers emits a single, durable v2 relation model.
+    # The legacy v1 per-target dict under `_meta.helper_policies.fk.<target>`
+    # is no longer written (FK Helper Slice 2: v1 retirement). The v2
+    # relations carry `produced_by.step = "configure_fk_helpers"` as
+    # provenance / conflict-detection input only; they are durable and
+    # survive the persistence boundary like inferred or user-authored
+    # relations.
     out = dict(frames)
-    meta = dict(out.get("_meta") or {})
-    helper_policies = dict(meta.get("helper_policies") or {})
-    fk_policies = dict(helper_policies.get("fk") or {})
-    for policy in policy_specs:
-        fk_policies[policy["target"]] = policy
-    helper_policies["fk"] = fk_policies
-    meta["helper_policies"] = helper_policies
-    out["_meta"] = meta
-
     v2_relations = _v2_relations_from_explicit_policies(out, policy_specs)
     if v2_relations:
         out = apply_v2_relations(out, v2_relations)

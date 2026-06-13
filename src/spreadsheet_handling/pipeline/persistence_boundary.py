@@ -40,11 +40,6 @@ Pruned:
 * top-level ``derived`` -- transient runtime helper-column provenance,
 * top-level ``__*``-prefixed keys -- carrier / derived view markers that the
   IR rendering passes own,
-* runtime-produced FK-helper v2 relation entries under
-  ``helper_policies.fk.relations`` where ``produced_by.step`` equals
-  ``configure_fk_helpers``. The remaining ``helper_policies`` structure
-  (v1 per-target dicts, user-authored or otherwise non-runtime-produced
-  relations) is preserved.
 * Resolution facets under canonical roots (added by
   ``BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A``):
 
@@ -83,15 +78,31 @@ These items are tracked separately in
 ``docs/backlog/FTR-FK-HELPER-POLICY-LIFECYCLE-P4A.adoc`` and
 ``docs/backlog/FTR-META-LIFECYCLE-INVENTORY-P5.adoc``.
 
-Note on ``produced_by.mode``
----------------------------
+FK-helper relations are durable (FK Helper Slice 2)
+---------------------------------------------------
 
-``produced_by.mode: explicit`` does *not* mean user-authored canonical
-metadata. It only records that the pipeline step that produced the entry
-was invoked explicitly. The content of runtime-produced v2 relations is
-compiled pipeline state; replaying it as canonical input on a later run is
-what caused the FK helper duplication observed in the worldbuilding
-adoption.
+``helper_policies`` is no longer projected at this boundary. As of FK Helper
+Slice 2 (v1 retirement), ``configure_fk_helpers`` writes only the durable v2
+relation model and no longer emits the legacy v1 per-target dict. v2 relations
+-- whether produced by ``configure_fk_helpers``, ``infer_fk_relations``, or
+hand-authored -- are durable declarations that must survive the boundary so
+reverse-pipeline (reimport) cleanup can identify helper columns without the v1
+dict. The boundary therefore preserves ``helper_policies`` unchanged; it no
+longer prunes relations by ``produced_by.step``.
+
+``produced_by`` is retained on each relation as provenance and as the
+cross-producer conflict key for ``apply_v2_relations``; it no longer drives any
+pruning here. ``produced_by.mode: explicit`` still does *not* mean
+user-authored canonical metadata -- it only records that the producing step was
+invoked explicitly.
+
+The Dino-shaped replay failure that originally motivated pruning
+configure-produced relations (``Frame ... must have flat columns`` when a stale
+relation re-materialised helpers onto an unintended frame) is now contained at
+the materialisation point: ``enrich_helpers`` preserves the source frame's
+column flatness, so a durable relation can no longer turn a flat frame into a
+non-flat one. See
+``audit/fk_helper_slice2_v1_retirement_review.adoc``.
 """
 
 from __future__ import annotations
@@ -105,8 +116,6 @@ Conservative initial set. The full classification belongs to
 ``FTR-META-LIFECYCLE-INVENTORY-P5``; until then, new producers that emit
 runtime-only meta on a new top-level key should extend this set.
 """
-
-_RUNTIME_FK_HELPER_PRODUCER_STEP = "configure_fk_helpers"
 
 
 def project_meta_to_persistable_contract(meta: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -129,11 +138,6 @@ def project_meta_to_persistable_contract(meta: Mapping[str, Any] | None) -> dict
             # Root-level carrier / derived-view markers. These belong to IR
             # rendering passes and are not part of the persisted contract.
             continue
-        if key == "helper_policies":
-            projected_helper_policies = _project_helper_policies(value)
-            if projected_helper_policies is not None:
-                projected[key] = projected_helper_policies
-            continue
         if key == "legend_blocks":
             projected[key] = _project_legend_blocks(value)
             continue
@@ -143,48 +147,6 @@ def project_meta_to_persistable_contract(meta: Mapping[str, Any] | None) -> dict
         projected[key] = value
 
     return projected
-
-
-def _project_helper_policies(helper_policies: Any) -> dict[str, Any] | None:
-    """Strip runtime-produced FK-helper v2 relation entries.
-
-    Preserves the rest of ``helper_policies`` (lookup namespace, v1
-    per-target dicts under ``fk``, manually authored relations). Only the
-    narrowly identified runtime carrier is removed.
-    """
-    if not isinstance(helper_policies, Mapping):
-        return helper_policies if helper_policies is not None else None
-
-    projected: dict[str, Any] = dict(helper_policies)
-    fk_section = projected.get("fk")
-    if not isinstance(fk_section, Mapping):
-        return projected
-
-    projected_fk = dict(fk_section)
-    relations = projected_fk.get("relations")
-    if isinstance(relations, list):
-        kept = [entry for entry in relations if not _is_runtime_produced_fk_relation(entry)]
-        if kept:
-            projected_fk["relations"] = kept
-        else:
-            # No legitimate relations remain. Drop the empty marker and the
-            # paired schema_version, since schema_version on its own only
-            # describes the relations envelope and would otherwise be a
-            # semantically misleading orphan.
-            projected_fk.pop("relations", None)
-            projected_fk.pop("schema_version", None)
-
-    projected["fk"] = projected_fk
-    return projected
-
-
-def _is_runtime_produced_fk_relation(entry: Any) -> bool:
-    if not isinstance(entry, Mapping):
-        return False
-    produced_by = entry.get("produced_by")
-    if not isinstance(produced_by, Mapping):
-        return False
-    return produced_by.get("step") == _RUNTIME_FK_HELPER_PRODUCER_STEP
 
 
 def _project_legend_blocks(legend_blocks: Any) -> Any:

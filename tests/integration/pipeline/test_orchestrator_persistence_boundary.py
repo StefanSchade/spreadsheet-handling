@@ -1,15 +1,18 @@
 """End-to-end coverage for the orchestrator-owned persistence boundary.
 
 Verifies that ``orchestrate()`` applies the meta projection *before*
-``_save_frames`` runs, that the projection is carrier-neutral (i.e. it also
-runs for spreadsheet outputs), and that a Dino-shaped repeated-run
-contamination is broken at the write side: an input containing the
-runtime-produced FK-helper v2 relation that historically caused
-``Frame 'groups' must have flat columns`` does not survive into the
-persisted sidecar after a clean pipeline run.
+``_save_frames`` runs and that the projection is carrier-neutral (i.e. it also
+runs for spreadsheet outputs).
 
-No real Dino data is committed; the contamination shape is synthesised from
-the public registry contract.
+FK Helper Slice 2 (v1 retirement): configure-produced v2 relations are now
+*durable* -- the boundary no longer prunes them by ``produced_by.step`` -- so a
+durable relation survives persistence and the spreadsheet carrier. The
+Dino-shaped replay (``Frame 'groups' must have flat columns``) is now contained
+at the materialisation point: ``enrich_helpers`` preserves source-frame
+flatness. See ``audit/fk_helper_slice2_v1_retirement_review.adoc``.
+
+No real Dino data is committed; the relation shape is synthesised from the
+public registry contract.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import yaml
 
 from spreadsheet_handling.application.orchestrator import orchestrate
 from spreadsheet_handling.io_backends.json_backend import write_json_dir
-from spreadsheet_handling.pipeline.steps import make_identity_step
+from spreadsheet_handling.pipeline.steps import make_apply_fks_step, make_identity_step
 
 
 pytestmark = pytest.mark.ftr("BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A")
@@ -50,8 +53,14 @@ def _runtime_relation(source: str, target: str = "places") -> dict:
     }
 
 
-def test_json_dir_output_drops_runtime_produced_relations(tmp_path: Path) -> None:
-    """Strukturelle Persistenz ruft die Meta-Projektion vor dem Schreiben auf."""
+def test_json_dir_output_keeps_durable_configure_relations(tmp_path: Path) -> None:
+    """Strukturelle Persistenz ruft die Meta-Projektion vor dem Schreiben auf.
+
+    FK Helper Slice 2: configure-produced v2 relations are durable, so they
+    survive persistence (the boundary no longer prunes by produced_by.step).
+    Transient ``derived`` is still dropped. Any legacy v1 per-target entry
+    passes through unchanged.
+    """
     meta = {
         "version": "1.0",
         "freeze_header": True,
@@ -76,9 +85,11 @@ def test_json_dir_output_drops_runtime_produced_relations(tmp_path: Path) -> Non
     persisted = yaml.safe_load((out_dir / "_meta.yaml").read_text(encoding="utf-8"))
     assert "derived" not in persisted
     fk = persisted["helper_policies"]["fk"]
-    assert "relations" not in fk, "runtime-produced relation must not survive persistence"
-    assert "schema_version" not in fk, "empty relations envelope removed with its schema_version"
-    assert fk["places"]["target"] == "places", "v1 per-target entry preserved"
+    assert [r["source_frame"] for r in fk["relations"]] == ["groups"], (
+        "durable configure-produced relation must survive persistence"
+    )
+    assert fk["schema_version"] == 2
+    assert fk["places"]["target"] == "places", "legacy v1 per-target entry passes through"
     assert persisted["version"] == "1.0"
     assert persisted["freeze_header"] is True
 
@@ -107,12 +118,16 @@ def test_orchestrator_returns_projected_meta_in_memory(tmp_path: Path) -> None:
     )
     meta = result["_meta"]
     assert "derived" not in meta
-    assert "relations" not in meta["helper_policies"]["fk"]
+    # FK Helper Slice 2: durable relations remain in the projected view.
+    assert [r["source_frame"] for r in meta["helper_policies"]["fk"]["relations"]] == ["groups"]
 
 
-def test_persistence_boundary_runs_for_spreadsheet_output(tmp_path: Path) -> None:
-    """Carrier-neutral: same projection runs for spreadsheet sinks. The
-    persisted hidden-meta blob must not carry the runtime relation either.
+def test_durable_relation_survives_spreadsheet_carrier(tmp_path: Path) -> None:
+    """Carrier-neutral: the same projection runs for spreadsheet sinks.
+
+    FK Helper Slice 2: a durable v2 relation must survive across the
+    workbook-embedded carrier so reverse-pipeline cleanup can read it after
+    reimport.
     """
     in_dir = _write_input_dir(
         tmp_path,
@@ -144,7 +159,9 @@ def test_persistence_boundary_runs_for_spreadsheet_output(tmp_path: Path) -> Non
     )
     persisted = yaml.safe_load((roundtrip_dir / "_meta.yaml").read_text(encoding="utf-8"))
     fk = persisted.get("helper_policies", {}).get("fk", {})
-    assert "relations" not in fk, "spreadsheet path must not carry the runtime relation either"
+    assert [r["source_frame"] for r in fk.get("relations", [])] == ["groups"], (
+        "durable relation must survive the spreadsheet carrier"
+    )
 
 
 def test_run_app_routes_through_persistence_boundary(tmp_path: Path) -> None:
@@ -182,22 +199,33 @@ def test_run_app_routes_through_persistence_boundary(tmp_path: Path) -> None:
     frames, _meta, _issues = run_app(app)
 
     persisted = yaml.safe_load((out_dir / "_meta.yaml").read_text(encoding="utf-8"))
+    # The routing proof is that transient ``derived`` is dropped (only the
+    # boundary does that). FK Helper Slice 2: the durable relation survives.
     assert "derived" not in persisted
-    assert "relations" not in persisted["helper_policies"]["fk"]
+    assert [r["source_frame"] for r in persisted["helper_policies"]["fk"]["relations"]] == ["groups"]
     # Returned frames also reflect the projected view, matching the
     # behaviour of orchestrate().
     assert "derived" not in frames["_meta"]
 
 
 def test_repeated_run_does_not_replay_stale_relation(tmp_path: Path) -> None:
-    """Synthetic regression for the Dino-shaped repeated-run contamination.
+    """Dino-shaped replay regression under FK Helper Slice 2 (durable relations).
 
-    Without the fix the persisted sidecar from run 1 carried the
-    runtime-produced relation and the next ``configure_fk_helpers`` +
-    ``add_fk_helpers`` cycle materialized duplicate columns on ``groups``,
-    yielding ``Frame 'groups' must have flat columns``. With the
-    persistence boundary in place run 1 strips the relation before save, so
-    run 2 starts from a clean carrier.
+    Historically the Dino failure was a durable FK relation pointing at
+    ``groups`` that, when replayed through ``add_fk_helpers``, materialised
+    tuple-shaped helper columns onto an unflattened frame and crashed
+    downstream with ``Frame 'groups' must have flat columns``. The original
+    BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A fix contained this by *stripping*
+    configure-produced relations at the persistence boundary.
+
+    Slice 2 makes those relations durable instead, so the containment moves to
+    the materialisation point: ``enrich_helpers`` preserves the source frame's
+    column flatness. This regression therefore exercises the actual replay:
+
+    * the durable relation survives persistence (run 1),
+    * a repeated ``add_fk_helpers`` run over it does **not** crash and leaves
+      ``groups`` flat (the compensating control),
+    * no duplicate helper column accumulates across runs.
     """
     contaminated_meta = {
         "helper_policies": {
@@ -207,22 +235,73 @@ def test_repeated_run_does_not_replay_stale_relation(tmp_path: Path) -> None:
             },
         },
     }
-    in_dir = _write_input_dir(tmp_path, contaminated_meta)
+    # Faithful Dino shape: the relation's target frame (``places``) is present,
+    # so enrichment actually runs and would (pre-fix) tuple-shape ``groups``.
+    in_dir = tmp_path / "in"
+    write_json_dir(
+        {
+            "groups": pd.DataFrame({"id": ["g1"], "home_place_id": ["p1"]}),
+            "places": pd.DataFrame({"id": ["p1"], "name": ["Place One"]}),
+            "_meta": contaminated_meta,
+        },
+        in_dir,
+    )
     out_dir = tmp_path / "first"
 
-    orchestrate(
+    first = orchestrate(
         input={"kind": "json_dir", "path": str(in_dir)},
         output={"kind": "json_dir", "path": str(out_dir)},
-        steps=[make_identity_step()],
+        steps=[make_apply_fks_step(defaults={"levels": 3, "helper_value_mode": "values"})],
     )
 
-    # Second run consumes the first run's output. The carrier must be clean.
+    # The durable relation survives persistence (no boundary prune in Slice 2).
+    persisted = yaml.safe_load((out_dir / "_meta.yaml").read_text(encoding="utf-8"))
+    fk = persisted.get("helper_policies", {}).get("fk", {})
+    assert [r["source_frame"] for r in fk.get("relations", [])] == ["groups"]
+
+    # The compensating control: enrich did not turn the flat ``groups`` frame
+    # into a non-flat one, so no ``Frame ... must have flat columns`` crash.
+    groups_cols = list(first["groups"].columns)
+    assert not any(isinstance(column, tuple) for column in groups_cols)
+    assert groups_cols.count("_places_name") == 1
+
+    # Second run consumes the first run's output. No crash, no accumulation.
     second_out = tmp_path / "second"
-    orchestrate(
+    second = orchestrate(
         input={"kind": "json_dir", "path": str(out_dir)},
         output={"kind": "json_dir", "path": str(second_out)},
-        steps=[make_identity_step()],
+        steps=[make_apply_fks_step(defaults={"levels": 3, "helper_value_mode": "values"})],
     )
-    persisted = yaml.safe_load((second_out / "_meta.yaml").read_text(encoding="utf-8"))
-    fk = persisted.get("helper_policies", {}).get("fk", {})
-    assert "relations" not in fk
+    second_cols = list(second["groups"].columns)
+    assert not any(isinstance(column, tuple) for column in second_cols)
+    assert second_cols.count("_places_name") == 1, "no duplicate helper accumulation"
+
+
+def test_durable_relation_with_absent_target_is_skipped(tmp_path: Path) -> None:
+    """FK Helper Slice 2 replay safety: a durable relation whose target frame
+    is not loaded in the current run must be skipped (a safe no-op), not crash
+    enrichment in ``build_id_value_maps``. Fresh configuration always validates
+    the target exists, so an absent target can only arise from a replayed
+    relation.
+    """
+    meta = {
+        "helper_policies": {
+            "fk": {
+                "schema_version": 2,
+                "relations": [_runtime_relation("groups")],  # target_frame=places
+            },
+        },
+    }
+    # Note: no ``places`` frame is present.
+    in_dir = _write_input_dir(tmp_path, meta)
+    out_dir = tmp_path / "out"
+
+    result = orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "json_dir", "path": str(out_dir)},
+        steps=[make_apply_fks_step(defaults={"levels": 3, "helper_value_mode": "values"})],
+    )
+
+    # No helper materialised, frame untouched and still flat.
+    groups_cols = list(result["groups"].columns)
+    assert groups_cols == ["id", "home_place_id"]

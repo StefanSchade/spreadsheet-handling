@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pandas as pd
+
 from ....core.fk import apply_fk_helpers, build_id_value_maps
 from ....frame_keys import copy_reserved_frames, iter_data_frames
 
@@ -18,11 +20,12 @@ from .formula_provider import _lookup_formula_provider
 from .policy import (
     build_v2_target_registry,
     iter_relation_fk_defs,
+    known_data_frame_names,
     missing_fk_policy_error,
     resolve_v2_fk_relations,
     source_frame_has_column,
 )
-from .provenance import _write_helper_provenance
+from .provenance import _visible_label, _write_helper_provenance
 
 Frames = dict[str, Any]
 
@@ -47,6 +50,20 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
 
     levels = int(defaults.get("levels", 3))
     helper_value_mode = _helper_value_mode(defaults)
+
+    # Skip relations whose target frame is not present in the current run.
+    # Fresh configuration always validates that the target frame exists
+    # (configure_fk_helpers / infer_fk_relations), so an absent target can only
+    # come from a durable relation replayed in a run that did not load that
+    # frame. Enriching it would crash in build_id_value_maps. Skipping is the
+    # safe no-op the functional model prescribes ("target frame essential; no
+    # enrichment without it") and is part of the Slice 2 replay-safety control.
+    known_names = known_data_frame_names(frames)
+    relations = [
+        relation
+        for relation in relations
+        if str(relation.get("target_frame")) in known_names
+    ]
 
     target_registry, fields_by_target_sheet = build_v2_target_registry(relations)
 
@@ -89,7 +106,7 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         if not sheet_defs:
             out[sheet_name] = df
             continue
-        out[sheet_name] = apply_fk_helpers(
+        enriched = apply_fk_helpers(
             df,
             sheet_defs,
             id_maps,
@@ -97,9 +114,50 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
             helper_prefix="_",
             helper_value_provider=helper_value_provider,
         )
+        out[sheet_name] = _preserve_source_flatness(df, enriched)
 
     _write_helper_provenance(out, fk_defs_by_sheet)
     return out
+
+
+def _columns_are_flat(columns: Any) -> bool:
+    return not (
+        isinstance(columns, pd.MultiIndex)
+        or any(isinstance(column, tuple) for column in columns)
+    )
+
+
+def _preserve_source_flatness(
+    source_df: pd.DataFrame,
+    enriched_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep an enriched frame as flat as its source frame was.
+
+    ``apply_fk_helpers`` materializes helper columns as MultiIndex tuples
+    padded to ``levels``. When the source frame had flat (single-level)
+    columns, that padding turns it into a non-flat frame. A durable FK
+    relation (``configure_fk_helpers`` relations are durable as of FK Helper
+    Slice 2) that points at a frame the current pipeline does not flatten would
+    then crash downstream flat-only steps -- ``join_frames`` and structured
+    persistence raise ``Frame ... must have flat columns``. That is exactly the
+    Dino-shaped replay failure recorded in
+    ``BUG-RUNTIME-META-PERSISTENCE-BOUNDARY-P4A``.
+
+    Collapsing the materialized helper columns back to their first-level label
+    keeps a flat frame flat and makes durable relations safe to replay. Helper
+    identity is unchanged: the first-level label is the helper column name that
+    derived provenance and ``flatten_headers`` already use. Frames that were
+    genuinely MultiIndex are left untouched so multi-level layouts are
+    preserved.
+    """
+    if not _columns_are_flat(source_df.columns):
+        return enriched_df
+    if _columns_are_flat(enriched_df.columns):
+        return enriched_df
+    flattened = [_visible_label(column) for column in enriched_df.columns]
+    result = enriched_df.copy()
+    result.columns = flattened
+    return result
 
 
 def _helper_value_mode(defaults: dict[str, Any]) -> str:

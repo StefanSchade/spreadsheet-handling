@@ -178,18 +178,27 @@ def test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary() 
 
 @pytest.mark.ftr("BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A")
 def test_durable_fk_policy_fallback_drops_declared_helpers() -> None:
+    # FK Helper Slice 2 (v1 retirement): the durable v2 relation model is the
+    # policy fallback for cleanup. With no runtime provenance and no
+    # `sheets.<frame>.helper_columns`, the v2 relation's `helper_columns`
+    # identify which columns to drop.
     frames = {
         "_meta": {
             "helper_policies": {
                 "fk": {
-                    "places": {
-                        "key": "id",
-                        "target": "places",
-                        "target_sheet": "places",
-                        "fk_column": "home_place_id",
-                        "helper_prefix": "_",
-                        "default_helpers": ["name"],
-                    }
+                    "schema_version": 2,
+                    "relations": [
+                        {
+                            "source_frame": "groups",
+                            "source_column": "home_place_id",
+                            "target_frame": "places",
+                            "target_key": "id",
+                            "helper_columns": [
+                                {"column": "_places_name", "target_field": "name"}
+                            ],
+                            "produced_by": {"step": "configure_fk_helpers", "mode": "explicit"},
+                        }
+                    ],
                 }
             }
         },
