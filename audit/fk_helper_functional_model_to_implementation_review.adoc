@@ -1,0 +1,593 @@
+= FK Helper Functional Model to Implementation Review
+:toc: left
+:toclevels: 3
+:sectnums:
+
+Review type: code-grounded implementation review (read-only). +
+Scope: FK-helper slice only. No code changes made. +
+Branch: `main` (top commit `db74113` "promote fk_helper concept to functional
+model"). +
+Stance applied: owner-controlled project; controlled consumers; maintainer
+understandability is an architecture goal; backward compatibility is not a
+default veto; historical docs/registry prose are not proof of an active runtime
+contract; code/tests/consumer evidence wins.
+
+== Executive Summary
+
+The functional model and the current code are *largely aligned on structure
+and lifecycle*. The three-step shape (Declare / Enrich / Drop), the
+runtime-provenance carrier dropped at egress, and the "no silent magic"
+inference stance are all already implemented. The divergence from the model is
+*sediment, not behavior*: parallel encodings of the same intent that survive
+from the v1→v2 transition.
+
+The most important code finding contradicts the cleanup ordering suggested in
+`meta_flattening_hypothesis.adoc` (its Step 4 names the v1 per-target dict as
+the likely first slice). Code evidence shows the v1 dict
+(`_meta.helper_policies.fk.<target>`) is *still load-bearing on exactly one
+path*: a `configure_fk_helpers` reimport where derived provenance and
+`sheets.<frame>.helper_columns` are both absent. On that path the v1 dict is
+the *only* surviving helper-identity source, and `test_helper_cleanup_uses_fk_
+policy_when_view_helper_metadata_is_absent` pins it. Removing the v1 write *by
+itself* would silently leak helper columns into canonical JSON. So v1 is not
+the smallest safe slice.
+
+The smallest safe slice is removing the two relation-level fields that have
+*zero runtime readers and no behavior test* — `helper_prefix` and
+`helper_fields` on each v2 relation. This is behavior-preserving, touches one
+producer function and a handful of shape assertions, and needs no consumer
+migration.
+
+On the document flagged for special attention
+(`ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`): its strong
+claim — that *all* Type 2 lifecycle handling should become field-agnostic and
+"read only meta registry attributes" — *does not survive contact with the
+FK-helper persistence boundary*. Three of that boundary's FK-helper decisions
+are not expressible as flat per-field attributes. Treated as a premise it would
+mandate exactly the "global meta ontology" the project's own meta-flattening
+hypothesis (and this task) rule out. See <<lifecycle-premise>>.
+
+*Does the functional model imply code changes now?* Yes, but small and
+optional, not urgent, and not on a load-bearing path. The model ratifies a
+cleanup direction the code can already absorb; the recommended first slice is a
+narrow code change (Slice 1). No documentation-only or no-op outcome is
+required, and no broad framework should be built. See <<implication>>.
+
+== Inputs Reviewed
+
+Functional model and problem-space notes:
+
+* `docs/functional_model/ch04_use_case_concepts/fk_helpers.adoc` (active
+  step-slice chapter)
+* `docs/functional_model/ch04_use_case_concepts/_chapter.adoc` (include wiring;
+  confirms `fk_helpers.adoc` is the live chapter)
+* `docs/functional_model/ch04_use_case_concepts/helper_columns.adoc`
+  (SUPERSEDED — marked so in-file, no longer included)
+* `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`
+* `docs/warm_storage/reviews/meta_flattening_hypothesis.adoc`
+* `docs/warm_storage/functional_transformation_concepts/fk_helper.adoc`
+* `audit/meta_flattening_rg_observations.adoc`
+* `audit/fk_helper_meta_path_inventory.adoc` (prior inventory — confirmed
+  against code below)
+
+Implementation read for grounding (every inventory claim used here was
+re-verified against current source):
+
+* `src/.../domain/helper_policies.py`
+* `src/.../domain/fk_relations.py`
+* `src/.../domain/transformations/fk_helpers/{policy,enrich,drop,provenance}.py`
+* `src/.../domain/transformations/derived_column_policy.py`
+* `src/.../domain/transformations/helpers.py` (`reorder_helpers_next_to_fk`)
+* `src/.../domain/schema_maintenance/meta_update.py`
+* `src/.../core/fk.py` (legacy `_resolve_helper_fields` materialization path)
+* `src/.../pipeline/persistence_boundary.py`
+
+Tests / guards / registries:
+
+* `tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`
+* `tests/unit/pipeline/test_persistence_boundary.py`
+* `tests/roundtrip/test_cleanup_invariants.py`
+* `tests/unit/domain/test_fk_relations_inference.py`,
+  `tests/unit/domain/test_fk_helper_policies.py`,
+  `tests/unit/pipeline/test_fk_helper_configuration.py`
+* `registries/meta_registry.yaml` (`helper_policies`, `derived` entries)
+* `registries/pipeline_step_registry.json` (the five FK steps)
+* `demo/pipelines/{demo_fk_helpers,demo_storyforge_characters,demo_product_business_slice}.yaml`
+
+== Functional Model vs Current Implementation
+
+=== Already aligned behavior
+
+* *Three-step structure.* The model's Declare / Enrich / Drop maps cleanly:
+  ** Declare = `configure_fk_helpers` (`helper_policies.py:91`) and
+     `infer_fk_relations` (`fk_relations.py:29`).
+  ** Enrich = `enrich_helpers` / `add_fk_helpers` (`fk_helpers/enrich.py:33`).
+  ** Drop = `drop_helpers` / `remove_fk_helpers` (`fk_helpers/drop.py:27`).
+* *"Heuristic inference is explicit, opt-in, not silent magic"* (model §Variant).
+  `configure_fk_helpers` *rejects* `targets="auto"` and points the caller at
+  `infer_fk_relations` (`helper_policies.py:114-119`). Primitives are barred
+  from re-deriving FK identity from column names, enforced statically by the
+  guard `test_fk_helper_primitives_consume_policy.py`.
+* *Runtime provenance lifecycle = `drop_at_persistence` + `drop_if_stale`*
+  (model §Enrich). `_meta.derived.sheets.*.helper_columns` is written by
+  `_write_helper_provenance` (`provenance.py:13`) and removed unconditionally
+  at egress: `RUNTIME_ONLY_TOP_LEVEL_META_KEYS = {"derived"}`
+  (`persistence_boundary.py:101`), pinned by `test_drops_top_level_derived`.
+* *Helper column values are data, not meta* (model §Enrich). `enrich_helpers`
+  adds columns to the source frame; the literal-vs-formula choice is a
+  materialization mode (`helper_value_mode`, `enrich.py:105`), not a separate
+  semantics — matching the hypothesis doc's "same meaning, different carrier".
+* *Drop precedence: provenance preferred, relation declaration as fallback*
+  (model §Drop). `drop_helpers` consumes provenance first and falls back to v2
+  relations per source frame (`drop.py:38-47`, `_columns_to_drop_by_sheet`
+  `drop.py:73-100`).
+
+=== Gaps (model target not yet reached in code)
+
+* *v1 per-target config is not "treated as version mismatch → dropped"* (model
+  §Simplification Note; framework §Meta Versioning, lines 57-65). Code still
+  *writes* the v1 dict on every `configure_fk_helpers` run
+  (`helper_policies.py:141-145`) and the persistence boundary *preserves* it
+  (`_project_helper_policies`, `persistence_boundary.py:148-178`). It is not
+  version-gated at all — it is always written and always kept. This is the
+  single clearest gap between the stated target and the code.
+* *"One durable workbook marker" vs two durable cross-run carriers.* The model
+  (§Enrich/§Drop) describes a single *Durable helper column marker*
+  (`carrier_takes_precedence`) read by the drop step on reimport. The code has
+  *two* persistence-crossing carriers with different readers:
+  ** `_meta.helper_policies.fk.relations` (read by `drop_helpers` and by
+     `apply_derived_column_policy`'s policy fallback), and
+  ** `_meta.sheets.<frame>.helper_columns` (read by
+     `apply_derived_column_policy`'s durable fallback `_safe_durable_helper_
+     names` `derived_column_policy.py:244`, by the `no_helper_columns`
+     validation rule, and by `column_roles/resolver` for the `display_helper`
+     role).
+  Critically, `drop_helpers` does *not* read `sheets.<frame>.helper_columns`
+  at all — so the model's "drop step reads the durable marker on reimport" is
+  realized via v2 relations, not via the field the model's wording most
+  resembles. This is a real "more shapes than the model needs" condition, but
+  it is *load-bearing* (see below) and explicitly out of scope for a first
+  slice.
+
+=== Overgrown / historical parts (sediment)
+
+Re-verified against code; all are written-but-effectively-unread or
+discriminators created by transitional coexistence:
+
+* `helper_policies.fk.relations[*].helper_prefix` — stored by
+  `build_v2_relation` (`fk_relations.py:287`); *no runtime reader*. The
+  materialized name already lives in `helper_columns[*].column`.
+* `helper_policies.fk.relations[*].helper_fields` — stored by
+  `build_v2_relation` (`fk_relations.py:282`); *no runtime reader*. Confirmed
+  the only `helper_fields` reader, `core/fk.py:141-142`, reads a *different*
+  `defaults` dict on the legacy `detect_fk_columns` path, never the v2
+  relation. Redundant with `helper_columns[*].target_field`.
+* `produced_by` discriminator — read only at the persistence boundary
+  (`_is_runtime_produced_fk_relation`, `persistence_boundary.py:181-187`) and
+  by the conflict guard (`_assert_no_relation_conflict`, `fk_relations.py:235`,
+  an enforcement path). Exists only because runtime and durable v2 entries
+  coexist under one root.
+* Vestigial slots: `label_field` "intentionally a no-op default"
+  (`policy.py:100-104`); `del prefix` on `drop_helpers` (`drop.py:36`) and
+  `del helper_prefix` on `reorder_helpers_next_to_fk` (`helpers.py:219`);
+  single-member `_VALID_MODES = frozenset({"naming_convention"})`
+  (`fk_relations.py:25`). The two step params are documented in the step
+  registry as "Retained for step-binding compatibility only … no longer
+  drives … behaviour" (`pipeline_step_registry.json:262`, `:600`).
+
+=== Risky load-bearing paths (do NOT open with a first slice)
+
+* `_meta.derived.sheets.*.helper_columns` — runtime cross-step glue; the
+  highest-priority identity source within a run.
+* `_meta.sheets.<frame>.helper_columns` — the only post-persistence anchor for
+  the `no_helper_columns` validation rule, which reads *only* this path
+  (`validations/reference_validations.py:615-628`); also the `display_helper`
+  role source.
+* `helper_policies.fk.relations[*].helper_columns[*]` — the live per-field
+  record every primitive consumes (`iter_relation_fk_defs` `policy.py:132`,
+  `drop.py:94`, validations `:387`, registry build `policy.py:112`).
+* `helper_policies.fk.schema_version` — the v1/v2 discriminator gating all
+  primitive access via `resolve_v2_fk_relations` (`policy.py:48`).
+
+[#lifecycle-premise]
+=== Testing the meta-lifecycle "attribute-driven Type 2" premise against FK code
+
+`03_meta_lifecycle_framework.adoc` §"Current State vs. Target" states:
+
+[quote]
+____
+Target: Type 2 event code reads only meta registry attributes. A new domain
+step declares its attributes at registration time; the framework event code
+stays stable.
+____
+
+Treated as a hypothesis and tested against the FK-helper persistence boundary,
+the *strong* form (field-agnostic, attribute-only) is *overstated*. Three of
+the boundary's FK-helper decisions are not reducible to a flat per-field
+attribute lookup:
+
+. *Per-entry, content-dependent pruning inside one list.*
+  `_project_helper_policies` keeps some entries of
+  `helper_policies.fk.relations` and drops others based on a *sub-field value*
+  (`produced_by.step == "configure_fk_helpers"`,
+  `persistence_boundary.py:166,181-187`). A `drop_at_persistence` attribute
+  attached to the *field* `relations` cannot express "drop these list members
+  but keep those" — the predicate is over entry content, not field identity.
+. *A cross-field invariant.* When pruning empties the list, the boundary also
+  removes `schema_version` because it would be a "semantically misleading
+  orphan" (`persistence_boundary.py:169-176`). That is a conditional coupling
+  between two fields, not an independent per-field rule.
+. *Nested-facet pruning.* The Intent/Resolution split removes sub-keys
+  *inside* entries (`legend_blocks[*].resolved`,
+  `xref_crosstable[*].dense_axes.resolved`, `[*].column_keys`;
+  `persistence_boundary.py:190-237`). The unit of decision is a nested path,
+  not a registered top-level field.
+
+To make the framework event code truly field-agnostic for these cases, the
+attribute language would have to grow predicates over entry content, cross-field
+conditionals, and nested-path selectors. That richer language *is* a global
+metadata ontology — precisely what `meta_flattening_hypothesis.adoc` warns
+against ("the problem … is the ontologization of `_meta`") and what this task
+forbids. So the two documents are in tension, and the FK-helper code sides with
+the meta-flattening hypothesis.
+
+The *weak* form of the framework's idea is fine and already partly true: the
+conceptual labels (`drop_at_persistence`, `drop_if_stale`,
+`carrier_takes_precedence`) are useful per-datum reasoning aids, and the one
+genuinely field-level rule today (`RUNTIME_ONLY_TOP_LEVEL_META_KEYS`) is a
+simple set that *could* be registry-sourced. The recommendation is to keep
+those labels as descriptive vocabulary in feature-local contracts and *not* to
+adopt "Type 2 code reads only attributes" as a target for the FK-helper slice.
+This is recorded as an Open Question for the doc owners, not a code action.
+
+== Metadata Sediment Assessment
+
+Confirming or challenging the five suspected cleanup targets from
+`fk_helper_meta_path_inventory.adoc`:
+
+[cols="2,1,3", options="header"]
+|===
+| Suspected target | Verdict | Code-grounded reason
+
+| `helper_policies.fk.<target>` v1 per-target dict
+| *Challenge* (not yet safe alone)
+| Sediment in intent, but *currently load-bearing* on the
+  `configure_fk_helpers` reimport-cleanup path. On that path derived
+  provenance is gone (egress), `sheets.<frame>.helper_columns` was never
+  written, and the configure-produced v2 relations were pruned at persistence
+  (`produced_by.step == configure_fk_helpers`). `apply_derived_column_policy`
+  unions its three identity sources (`derived_column_policy.py:75-91`); the
+  only non-empty contributor left is `_v1_policy_helper_names`
+  (`:294-325`). `test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_
+  is_absent` (`tests/roundtrip/test_cleanup_invariants.py:54`) pins this.
+  Safe removal requires first making `configure_fk_helpers` relations *durable*
+  (Slice 2).
+
+| `helper_policies.fk.relations[*].helper_prefix`
+| *Confirm* (truly unread)
+| No runtime reader. Only readers of any `helper_prefix` are
+  `_v1_policy_helper_names` (the v1 dict, not the relation) and the full-dict
+  idempotency compare in `_assert_no_relation_conflict`. The materialized name
+  is already in `helper_columns[*].column`.
+
+| `helper_policies.fk.relations[*].helper_fields`
+| *Confirm* (truly unread)
+| No runtime reader; redundant with `helper_columns[*].target_field`. Goes
+  stale after schema-maintenance renames (`meta_update._rename_fk_helper_
+  target_fields` updates `target_field` but never `helper_fields`,
+  `meta_update.py:412-426`), with no consumer or test noticing.
+
+| `produced_by` discriminator
+| *Confirm, but coupled*
+| A carrier-detail discriminator, not a feature field. It can only be retired
+  *together with* the architecture change that stops runtime and durable v2
+  entries from sharing one root (Slice 2). Removing it alone would break the
+  persistence-boundary prune of configure-produced relations.
+
+| Legacy `prefix` / `helper_prefix` params on drop / reorder
+| *Confirm* (dead params)
+| `del prefix` / `del helper_prefix` at function entry
+  (`drop.py:36`, `helpers.py:219`); documented as compatibility-only in the
+  step registry. Removable surface, with a YAML-acceptance caveat (Slice 3).
+|===
+
+Net: the inventory's classifications hold, with one *correction*. The inventory
+says of `helper_prefix` "No test specifically asserts the behavior of the
+`helper_prefix` field" and of `helper_fields` "None". That is *not quite
+true at the shape level* — several unit tests assert the *presence/value* of
+these fields on built relations (see <<tests>>). They are shape assertions, not
+behavior contracts, but a cleanup must touch them.
+
+== Candidate Implementation Slices
+
+[#slice1]
+=== Slice 1: Drop the unread `helper_prefix` and `helper_fields` from v2 relations
+
+* *Goal*: remove the two relation-level fields that no runtime consumer reads,
+  shrinking the v2 relation to what is actually consumed (`source_frame`,
+  `source_column`, `target_frame`, `target_key`, `helper_columns[*]`,
+  `produced_by`).
+* *Files likely touched*:
+  ** `domain/fk_relations.py` — `build_v2_relation` (`:259-289`) stops emitting
+     `helper_prefix` and `helper_fields`. The function may keep or drop the
+     corresponding parameters; callers (`helper_policies.py:179-190`,
+     `fk_relations.py:168-178`) already compute `helper_columns` themselves, so
+     the values are no longer needed for storage.
+* *Expected tests to update* (shape assertions only):
+  ** `tests/unit/domain/test_fk_relations_inference.py:48,56` — drop the
+     `helper_fields` / `helper_prefix` assertions; keep the surrounding
+     behavior assertions.
+  ** `tests/unit/domain/test_fk_helper_policies.py:86` — drop the
+     `helper_fields` assertion.
+  ** `tests/unit/domain/test_fk_relations_inference.py:221,232` — the two
+     "same-producer conflict" tests stay *green* (their divergent fixtures also
+     change `helper_columns`, so the conflict still fires via the surviving
+     fields); rename them so they no longer imply `helper_prefix`/
+     `helper_fields` drive the conflict.
+* *New tests needed*:
+  ** A unit assertion that `build_v2_relation` output keys are exactly the
+     consumed set (guards against silent re-growth).
+  ** An idempotency assertion that a real divergence in `helper_columns` still
+     raises in `apply_v2_relations` after the fields are gone.
+* *Risk*: *Low*. Zero runtime readers; column names are unaffected
+  (`test_add_fk_helpers_supports_distinct_helper_prefixes_per_relation`
+  `test_fk_helper_configuration.py:146` asserts column *names*, which come from
+  `helper_columns`, and stays green).
+* *Migration impact*: none for consumers. Persisted durable/inferred relations
+  from older runs keep the two extra keys harmlessly until the next forward run
+  re-bootstraps them; `resolve_v2_fk_relations` never reads them. No YAML
+  surface change.
+* *Rollback*: revert the `build_v2_relation` edit and the test-assertion edits;
+  fully isolated.
+
+[#slice2]
+=== Slice 2: Make `configure_fk_helpers` relations durable; retire the v1 dict and the `produced_by` discriminator
+
+* *Goal*: collapse the v1/v2 duality on the `configure_fk_helpers` path to a
+  single durable v2 relation, which (a) lets the v1 per-target dict be retired
+  per the model's "treat as version mismatch → dropped", and (b) removes the
+  reason the `produced_by` discriminator exists.
+* *Files likely touched*:
+  ** `domain/helper_policies.py` — stop writing the v1 per-target dict
+     (`:141-145`); `configure_fk_helpers` emits only v2 relations, produced as
+     *durable* (no `produced_by.step == configure_fk_helpers` runtime tag, or a
+     `mode` that the boundary treats as durable).
+  ** `pipeline/persistence_boundary.py` — `_is_runtime_produced_fk_relation`
+     and `_project_helper_policies` (`:148-187`) simplify or drop once nothing
+     produces runtime-only relations under this root.
+  ** `domain/transformations/derived_column_policy.py` — delete
+     `_v1_policy_helper_names` (`:294-325`) and the v1 branch of
+     `_safe_policy_helper_names` (`:278`).
+  ** `domain/schema_maintenance/meta_update.py` — drop the v1 "Residual v1 FK
+     helper policy is not rewritten" blocked-reference branch (`:330-345`).
+  ** `registries/meta_registry.yaml` — retire the `contract_lifecycle`
+     transition bridge (`:439-523`), which already names this slice's removal
+     condition.
+* *Expected tests to update*:
+  ** `tests/unit/pipeline/test_persistence_boundary.py` —
+     `test_keeps_helper_policies_v1_per_target_dicts` (`:77`),
+     `test_drops_empty_relations_and_schema_version_after_full_prune` (`:142`,
+     its inline v1 entry), `test_drops_runtime_produced_fk_helper_relations`
+     (`:116`) all encode the old shape and must be re-pointed.
+  ** `tests/roundtrip/test_cleanup_invariants.py:54` — the falsification test;
+     must now pass *because configure-produced relations are durable*, not via
+     the v1 dict. This is the behavior gate that proves the slice safe.
+* *New tests needed*:
+  ** Roundtrip: a `configure_fk_helpers` forward run, then reimport, asserting
+     the v2 relations survive persistence and drive cleanup with no v1 dict
+     present.
+  ** Unit: `configure_fk_helpers` writes no `_meta.helper_policies.fk.<target>`
+     key.
+* *Risk*: *Medium*. Changes a persistence-boundary contract and the cleanup
+  fallback chain; the worldbuilding-adoption duplication noted in the boundary
+  docstring (`persistence_boundary.py:86-94`) is the failure mode to re-test —
+  durable configure-relations must not be *replayed* as fresh input and
+  duplicate helpers. This is why it is not the first slice.
+* *Migration impact*: consumers using `configure_fk_helpers` get a different
+  (smaller) persisted `_meta`; controlled and migratable. Demos are unaffected
+  (they use `infer_fk_relations`).
+* *Rollback*: larger; revert the producer + boundary + fallback edits together.
+  Prefer a single reviewable commit.
+
+[#slice3]
+=== Slice 3: Trim vestigial surface (dead step params and slots)
+
+* *Goal*: remove low-risk leftover surface that the model's "one model per
+  concern" calls out.
+* *Files likely touched*:
+  ** `domain/transformations/fk_helpers/drop.py:36` (`del prefix`) and
+     `domain/transformations/helpers.py:219` (`del helper_prefix`) — remove the
+     dead params.
+  ** `registries/pipeline_step_registry.json` — drop the `prefix` /
+     `helper_prefix` param declarations on `remove_fk_helpers` (`:258`) and
+     `reorder_fk_helpers` (`:596`).
+  ** Optionally: `policy.py:100-104` `label_field` no-op,
+     `validations/fk_helpers.py:45` `FKFinding` alias,
+     `fk_relations.py:25` single-member `_VALID_MODES`.
+* *Expected tests to update*: any step-binding test that passes `prefix=` /
+  `helper_prefix=` to these steps; the YAML-acceptance behavior is the only
+  contract.
+* *New tests needed*: a step-binding test asserting the removed params are now
+  rejected (or ignored) per the chosen policy.
+* *Risk*: *Low–Medium*, gated entirely on whether any consumer YAML still
+  passes these params. The three demos do not. If strict rejection is chosen,
+  this is a deliberate (acceptable) break under project stance.
+* *Migration impact*: minimal; YAML authors drop two no-op keys.
+* *Rollback*: revert param removals and registry edits.
+
+== Recommended First Slice
+
+*Slice 1 — drop the unread `helper_prefix` and `helper_fields` from v2
+relations.*
+
+Rationale, against the task's preference for "small and behavior-preserving"
+and the exclusion of load-bearing paths:
+
+* It is the only candidate with *zero runtime readers and no behavior test* —
+  proven by grep over `src/` (only `_v1_policy_helper_names` and the legacy
+  `core/fk.py` reader touch these names, neither via the v2 relation) and by
+  the fact that helper column names derive from `helper_columns`, not from the
+  stored prefix.
+* It touches none of the excluded load-bearing paths
+  (`derived.sheets.*.helper_columns`, `sheets.<frame>.helper_columns`,
+  `relations[*].helper_columns[*]`).
+* It reduces sediment immediately and makes the v2 relation shape match what
+  primitives consume — a maintainer-understandability win.
+* It is strictly smaller and safer than the hypothesis doc's Step-4 guess (v1
+  removal), which code evidence shows is *not* behavior-preserving on its own.
+
+It deliberately leaves the deeper consolidation (Slice 2) for a second,
+behavior-reviewed step, because that one changes a persistence contract and the
+cleanup fallback chain.
+
+[#validation]
+Validation commands (for the implementer; this review changed no code):
+
+[source,console]
+----
+# Targeted behavior + shape tests for Slice 1
+pytest tests/unit/domain/test_fk_relations_inference.py \
+       tests/unit/domain/test_fk_helper_policies.py \
+       tests/unit/pipeline/test_fk_helper_configuration.py
+
+# Roundtrip cleanup invariants (must stay green; proves no helper leakage)
+pytest tests/roundtrip/test_cleanup_invariants.py
+
+# Architecture guard (primitives still consume policy/provenance only)
+pytest tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py
+
+# Full active suite
+make test
+----
+
+== Tests and Guards Impact
+[#tests]
+
+Distinguishing tests that protect *behavior* from tests that protect *old
+shape / terminology only*:
+
+[cols="3,1,3", options="header"]
+|===
+| Test | Protects | Note
+
+| `test_fk_helper_primitives_consume_policy.py` (architecture guard)
+| *Behavior / design principle*
+| Enforces no convention re-derivation in primitives. *Keep as-is* for all
+  slices. Slice 1/3 do not touch primitive imports; Slice 2 must keep it green.
+
+| `test_cleanup_invariants.py::test_helper_columns_absent_after_canonical_reimport`
+| *Behavior*
+| The core "helpers must not leak" invariant. Must stay green across every
+  slice. This is the real safety net.
+
+| `test_cleanup_invariants.py::test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`
+| *Behavior* (today via v1)
+| The falsification test for v1. *Slice 1*: unaffected. *Slice 2*: must pass
+  via durable v2 relations instead of the v1 dict — the gate that proves v1 is
+  retireable.
+
+| `test_cleanup_invariants.py::test_no_helper_columns_validation_reports_bypassed_cleanup`
+| *Behavior*
+| Pins that the validation rule reads `sheets.<frame>.helper_columns`. Out of
+  scope; do not disturb.
+
+| `test_fk_relations_inference.py:48,56`; `test_fk_helper_policies.py:86`
+| *Shape only*
+| Assert presence/value of `helper_fields` / `helper_prefix` on built
+  relations. *Slice 1* edits these lines; the surrounding behavior assertions
+  stay.
+
+| `test_fk_relations_inference.py:221,232` (same-producer conflict)
+| *Behavior, shape-framed*
+| The conflict behavior survives Slice 1 (divergent fixtures also change
+  `helper_columns`); rename to stop implying the dropped fields drive it.
+
+| `test_fk_helper_configuration.py:146` (distinct prefixes)
+| *Behavior*
+| Asserts distinct *column names*, sourced from `helper_columns`. Stays green
+  under Slice 1; only its docstring framing is shape.
+
+| `test_persistence_boundary.py` v1/`produced_by` cases (`:77,:92,:116,:142`)
+| *Shape* (v1) + *Behavior* (`produced_by` prune)
+| Untouched by Slice 1. *Slice 2* re-points the v1-shape cases and simplifies
+  the `produced_by` prune cases.
+|===
+
+Registry / guard adjustments:
+
+* `meta_registry.yaml` `helper_policies` entry already documents the v1 shape
+  as "no longer read by any runtime consumer" with an explicit
+  `transition_bridge` and `removal_condition` (`:439-523`). For *Slice 1*, no
+  registry change is required (the two relation sub-fields are not separately
+  registered). For *Slice 2*, the bridge block is retired.
+* No architecture guard protects the *presence* of `helper_prefix` /
+  `helper_fields`; the consume-policy guard is orthogonal.
+
+== Consumer / Migration Impact
+
+* *Demos / controlled consumers use the v2-only producer.* All three
+  FK-touching demo pipelines drive helpers through `infer_fk_relations`
+  (`demo_fk_helpers.yaml:17`, `demo_storyforge_characters.yaml:22`,
+  `demo_product_business_slice.yaml:46`); none call `configure_fk_helpers`.
+  Consequently no demo exercises the v1 per-target dict, and none reads
+  `helper_prefix` / `helper_fields`.
+* *Slice 1*: zero consumer-visible change. The persisted v2 relation loses two
+  keys nothing reads. Old sidecars carrying the keys remain valid (ignored on
+  read; re-bootstrapped on next forward run, consistent with the framework's
+  meta-versioning policy).
+* *Slice 2*: consumers calling `configure_fk_helpers` see a smaller, durable
+  `_meta.helper_policies.fk`; this is a deliberate, migratable change for
+  controlled consumers and aligns the producer with the model.
+* *Slice 3*: YAML authors must stop passing `prefix` / `helper_prefix` to the
+  drop / reorder steps; no demo does.
+
+[#implication]
+== Does the functional model imply code changes now?
+
+*Code changes — small and optional, not documentation-only, not "no change".*
+
+* The model now *names* a target ("one model per concern", v1 as version
+  mismatch) that the code does not yet meet. That is a genuine, code-level gap,
+  not a doc-only reconciliation.
+* But the model does *not* compel an urgent or large change. The runtime
+  behavior already matches the model; the divergence is sediment. The smallest
+  honest response is Slice 1 (a code change), with Slice 2 as the
+  behavior-reviewed follow-up that actually realizes the v1-retirement the model
+  describes.
+* The model does *not* imply building the registry-attribute-driven Type 2
+  framework; per <<lifecycle-premise>> that target is overstated and would
+  violate the project's meta-flattening stance and this task's constraints.
+
+== Open Questions
+
+. *Meta-lifecycle doc vs meta-flattening hypothesis tension.* Should
+  `03_meta_lifecycle_framework.adoc` be softened so its "Type 2 code reads only
+  attributes" target is stated as the *weak* form (descriptive per-datum
+  labels) rather than the *strong* form (field-agnostic framework)? The
+  FK-helper boundary shows the strong form needs predicates/cross-field/nested
+  selectors — i.e. an ontology. Doc-owner decision; no code action proposed.
+. *Drop step: error vs silent no-op.* The model §Drop says that with no
+  identification source the step "treats all columns as canonical payload …
+  does not guess silently." The code instead *raises*
+  `missing_fk_policy_error` when both provenance and relations are absent
+  (`drop.py:41-42`). Same spirit ("no guessing"), different behavior (hard
+  error vs pass-through). Which is the intended contract? Worth a one-line
+  model clarification; not part of any slice here.
+. *Two durable carriers.* Long term, should `sheets.<frame>.helper_columns` and
+  the durable v2 relation be unified to the single "Durable helper column
+  marker" the model describes? This is load-bearing (validation + roles) and is
+  explicitly excluded from a first slice; flag for a later, separately-reviewed
+  design step.
+
+== Non-Goals
+
+* No generalization to `legend_blocks`, `xref_crosstable`, or any other
+  transformation.
+* No new global metadata ontology, no `persisted_by_default`-style attribute
+  registry, no broad `_meta` lifecycle framework.
+* No deletion of the load-bearing paths
+  (`derived.sheets.*.helper_columns`, `sheets.<frame>.helper_columns`,
+  `relations[*].helper_columns[*]`, `schema_version`).
+* No implementation performed in this review; all slices above are proposals.
+* No rewrite of historical documentation or registry prose beyond the
+  FK-helper entries named in the slices.
