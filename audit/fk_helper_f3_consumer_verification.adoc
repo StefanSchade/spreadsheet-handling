@@ -1,0 +1,263 @@
+= FK Helper F3 — Consumer Verification
+
+:toc:
+:toclevels: 3
+
+Author: F3 consumer verification (evidence-gathering; not a code review).
+Date: 2026-06-14.
+Repository root for git: `spreadsheet-handling/core`. Consumers live in sibling
+repos under `spreadsheet-handling/`.
+Authoritative inputs: `audit/fk_helper_consolidation_post_implementation_review.adoc`
+(F3), `audit/fk_helper_consolidation_closure.adoc`.
+
+== Question
+
+F3 (MAJOR, the sole remaining gate to a Green consolidation verdict): a pre-Slice-2
+artifact can carry a *v1-only* FK-helper policy
+(`_meta.helper_policies.fk.<target>` per-target dicts, no durable v2
+`relations`). Slice 2 removed the v1 reader from reverse-pipeline cleanup
+(`derived_column_policy._v1_policy_helper_names`), so the concern is that such an
+artifact reimported with current code would silently retain FK helper columns as
+payload.
+
+This document answers: *does any known consumer still depend on v1-only
+FK-helper sidecars for correct cleanup?*
+
+== Method
+
+For every consumer (worldbuilding, demo, in-repo examples, and — discovered
+during the sweep — `ssdp`) and every sibling repo, the verification:
+
+. inventoried forward/reverse pipelines and which FK producer they use
+  (`configure_fk_helpers` = the historical v1-shape producer; `infer_fk_relations`
+  = always v2-only);
+. located every persisted FK-helper artifact (sidecar `_meta.yaml/json` and
+  workbook-embedded `_meta` in `.xlsx`/`.ods`);
+. classified each artifact's `helper_policies.fk` shape (v1-only / v2 / v1+v2 /
+  none) by loading it through the project's own backend parser;
+. checked whether each artifact is a *committed asset* or a *gitignored,
+  regenerable build output*;
+. for the one live v1-only artifact, tested the reverse-pipeline drop behaviour
+  and the alternative durable anchor.
+
+Reproduction commands are listed in <<repro>>.
+
+== Consumer inventory
+
+[cols="1,2,2,1", options="header"]
+|===
+| Consumer | FK producer (forward) | Canonical source (committed) | Reverse drop step used?
+
+| `demo`
+| `infer_fk_relations` (v2-only) — `demo/pipelines/*.yaml`
+| pipelines + JSON; guarded by `demo/tests/test_demo_pipelines_fk_contract.py`
+  (`test_demo_pipeline_uses_v2_fk_contract`)
+| yes
+
+| in-repo `examples`
+  (`core/src/spreadsheet_handling/examples/*.yml`)
+| `infer_fk_relations` (v2-only)
+| example pipelines
+| n/a (forward demos)
+
+| `worldbuilding`
+| `configure_fk_helpers` — `pipelines/dino_insel/json_to_spreadsheet.yaml`
+| committed JSON `daten/dino_insel/*.json`
+| yes (`spreadsheet_to_json.yaml`, `apply_derived_column_policy`)
+
+| `ssdp` (not in the original F3 scope; found by sweep)
+| `configure_fk_helpers` — `structured/pipelines/json_to_spreadsheet.yaml`
+| committed JSON `ssdp/structured/data/*.json`
+| yes (`spreadsheet_to_json.yaml`, `apply_derived_column_policy`)
+
+| `home-lab`, `personal`, `personal_data`
+| none (no FK-helper usage)
+| n/a
+| no
+
+| `pages`
+| none (it is built HTML documentation, not a data consumer)
+| n/a
+| no
+|===
+
+Two consumers use the historical v1-shape producer `configure_fk_helpers`
+(`worldbuilding`, `ssdp`); the rest use `infer_fk_relations`, which has always
+written v2 only and therefore never produced a v1-only sidecar.
+
+== Artifact-level findings
+
+=== Producers write durable v2 today
+
+A fresh `configure_fk_helpers` run on ssdp-shaped frames writes single-shape
+durable v2 (`schema_version: 2`, one `relations` entry, *no* v1 per-target
+dict). So every forward run today — for *all* consumers, including the two that
+use `configure_fk_helpers` — produces a reimport-safe v2 anchor. The original
+Dino scratch workbook `core/tmp/dino_stories.ods` confirms this end to end: its
+embedded `helper_policies.fk` carries `configure_fk_helpers`-produced v2
+`relations` (durable, survived the carrier).
+
+=== Committed assets carry no v1-only consumer sidecar
+
+* `worldbuilding`: *no* committed workbook/sidecar; `daten/**/_meta.*` is
+  gitignored; the canonical source is committed JSON. No build workbook is even
+  present currently.
+* `ssdp`: *no* committed workbook/sidecar; canonical source is committed JSON
+  (`structured/data/*.json`); the workbook is the gitignored build output
+  `tmp/structured/ssdp_catalog.xlsx`.
+* `demo`: build outputs live in `demo/tmp` (gitignored). The two demo sidecars
+  that carry FK policy (`product_business_slice_reimported*/_meta.yaml`) are
+  *v2* (`relations`, `produced_by.step: infer_fk_relations`).
+* All `*/tmp/` directories (`core/tmp`, `demo/tmp`, `ssdp/tmp`,
+  `worldbuilding/tmp`) are gitignored, regenerable scratch.
+
+=== The one committed v1-only file is a boundary-projection test fixture, not a reimport path
+
+`docs/cold_storage/backlog/ftrs_done/fixtures/BUG-CROSS-CARRIER-META-ROUNDTRIP/ods_produced_meta.yaml`
+is a captured pre-Slice-2 ODS `_meta` with a pure v1-only `helper_policies.fk`
+(`places`, `regions`; `fk_column`/`target_sheet`; no `relations`). It is loaded
+only by persistence-boundary / carrier tests
+(`tests/unit/pipeline/test_persistence_boundary.py`,
+`tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`,
+`tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`), all of
+which assert *Intent-vs-Resolution projection* (pruning `legend_blocks[*].resolved`,
+`xref_crosstable[*].column_keys/dense_axes.resolved`) — none exercises the
+FK-helper drop path. It documents that v1-only ODS artifacts existed; it is not a
+consumer cleanup dependency. These tests pass under current code.
+
+=== The one live v1-only build artifact: `ssdp/tmp/structured/ssdp_catalog.xlsx`
+
+This gitignored build output is genuinely v1-only:
+
+* `helper_policies.fk` keys: `['artifacts', 'people', 'topics']` (per-target v1
+  dicts); `resolve_v2_fk_relations(...) == None` (no v2 anchor).
+* It *also* records the durable workbook marker
+  `_meta.sheets.*.helper_columns` for `artifact_people`
+  (`_artifacts_title`, `_artifacts_kind`, `_people_display_name`) and
+  `artifact_topics` (`_artifacts_title`, `_artifacts_kind`, `_topics_name`).
+
+Decisive observation: the persisted helper *column headers* in this artifact are
+*stringified MultiIndex tuples* — e.g. the literal one-row header text
+`('_artifacts_title', '', '')` — a pre-`_preserve_source_flatness` symptom (the
+same tuple-leak class Slice 2 fixed on the write side). Cleanup matches helper
+identity via `_visible_label(column)`, which returns the whole stringified
+string, so it matches *neither* the durable marker name `_artifacts_title`
+*nor* anything the removed v1 reader would have computed.
+
+Consequence for F3: the *old* v1 reader (`_v1_policy_helper_names`) also computed
+clean names (`_artifacts_title`, …) and also matched on `_visible_label`. It
+would therefore have failed to drop these stringified-header columns *too*. So
+removing the v1 reader caused *no regression* for this artifact — it was already
+not cleanly reimportable, for a reason that pre-dates the v1/v2 work. Re-running
+the ssdp forward pipeline (`json_dir ./structured/data` ->
+`configure_fk_helpers` -> xlsx) with current code regenerates the workbook with
+both a durable v2 `relations` anchor *and* clean flat headers, making it fully
+reimport-safe.
+
+== Does any consumer depend on v1-only FK-helper sidecars?
+
+*No.* Evidence chain:
+
+. No consumer's canonical, committed source is a v1-only FK sidecar. Every
+  consumer's source of truth is committed JSON (or a v2 sidecar); FK-helper
+  workbooks are gitignored, regenerable build outputs.
+. Every forward pipeline produces a durable v2 anchor today: `infer_fk_relations`
+  always did; `configure_fk_helpers` does as of Slice 2 (verified at unit level
+  and in `dino_stories.ods`).
+. The only committed v1-only file is a boundary-projection test fixture that
+  never drives FK-helper drop.
+. The only live v1-only artifact (`ssdp_catalog.xlsx`) is ephemeral build
+  output, and its cleanup did not work under the v1 reader either (stringified
+  headers), so the v1 retirement removed nothing it depended on. Regeneration
+  fixes it via the v2 anchor + the flatness fix.
+
+In short: the v1 reader Slice 2 removed has no remaining consumer that relied on
+it for correct cleanup.
+
+== Why F3 can be closed
+
+F3's risk — "v1-only sidecar reimported with current code silently leaks
+helpers" — requires a consumer that (a) reimports a v1-only artifact and (b) has
+*no other* anchor (no v2 relations, no `sheets.*.helper_columns`, no `derived`).
+No such consumer dependency exists:
+
+* committed consumer sources are JSON / v2, not v1-only sidecars;
+* the documented mitigation ("re-run the forward pipeline once") is real and
+  cheap for the only two `configure_fk_helpers` consumers, because their sources
+  are committed JSON and the workbook is a build output;
+* the durable `sheets.*.helper_columns` marker — exactly the exception named in
+  the release note — is in fact present in the live v1-only build artifact;
+* removing the v1 reader produced no behavioural regression on any real
+  artifact (the only live v1-only artifact was already not cleanly reimportable
+  for an unrelated, pre-existing reason).
+
+F3 is therefore an *accepted, documented limitation with no live dependency*:
+the v1 shape is "dropped, not migrated" (the intended target direction), and no
+consumer needs it. It can be closed.
+
+== Migration effort
+
+*Effectively none.* There is no committed v1-only consumer asset to migrate and
+no code change required.
+
+Operational hygiene (one-time, optional, already covered by the release-note
+guidance) for the two `configure_fk_helpers` consumers:
+
+* `ssdp`: delete/regenerate `ssdp/tmp/structured/ssdp_catalog.xlsx` by re-running
+  the forward pipeline before any reverse reimport of that build output
+  (regenerates v2 + flat headers). Effort: one `make`/pipeline run.
+* `worldbuilding`: no current build workbook exists; the next forward run already
+  emits v2. Effort: none beyond the normal build.
+
+No data migration, no schema rewrite, no new metadata framework.
+
+== Residual watch-only items (not blockers, not F3)
+
+* *Stale ephemeral build outputs.* Old `*/tmp/` workbooks created before Slice 2
+  / before the flatness fix (e.g. the current `ssdp_catalog.xlsx`) are not
+  cleanly reimportable as-is. Mitigation is regeneration; consider a `make clean`
+  before reverse runs. This is build hygiene, not a contract defect.
+* *Stringified-tuple helper headers* in pre-flatness-fix workbooks are a
+  separate, pre-existing symptom independent of the v1/v2 lifecycle; the Slice 2
+  write-side flatness fix prevents new occurrences.
+
+== Verdict on F3
+
+*F3 RESOLVED — closeable.* No consumer depends on v1-only FK-helper sidecars.
+All consumer canonical sources are committed JSON or v2; all forward pipelines
+emit a durable v2 anchor today; the only committed v1-only file is a
+boundary-projection test fixture; and the only live v1-only artifact is an
+ephemeral, regenerable build output whose cleanup never depended on the removed
+v1 reader.
+
+With F3 closed, the FK Helper consolidation verdict can advance from *Yellow* to
+*Green* (F6–F8 remain ordinary, non-gating tracked debt).
+
+[#repro]
+== Reproduction commands
+
+[source,bash]
+----
+# (from spreadsheet-handling/)
+# 1. Which consumers use which FK producer
+grep -rnE "configure_fk_helpers|infer_fk_relations|apply_derived_column_policy" \
+  demo/pipelines worldbuilding/pipelines ssdp/structured/pipelines \
+  core/src/spreadsheet_handling/examples
+
+# 2. Sweep all siblings for FK-helper usage
+for d in home-lab ssdp personal pages personal_data worldbuilding demo; do
+  grep -rlE "configure_fk_helpers|apply_derived_column_policy|infer_fk_relations|helper_policies" \
+    "$d" | grep -vE '/\.venv/|/__pycache__/|/tmp/'
+done
+
+# 3. tmp/ build outputs are gitignored (regenerable, not assets)
+( cd ssdp && git check-ignore tmp/structured/ssdp_catalog.xlsx )
+
+# 4. Classify embedded FK shape of each workbook via the project's parser
+#    (core/.venv): load_xlsx / load_ods -> frames["_meta"]["helper_policies"]["fk"]
+#    v1-only  => per-target dict keys, resolve_v2_fk_relations(...) is None
+#    v2/safe  => "relations" + schema_version: 2
+
+# 5. Committed v1-only files are limited to a boundary-projection test fixture
+( cd core && git grep -l "fk_column" -- '*.json' '*.yaml' '*.yml' )
+----
