@@ -1,0 +1,379 @@
+= Legend Blocks Implementation Concept
+:toc:
+:toclevels: 3
+
+Companion to `FTR-LEGEND-BLOCKS-LIFECYCLE-P6`. Maps the Functional Model intent
+to the current implementation, registry, lifecycle handling, and safe follow-up
+slices.
+
+Intent source (not derived from implementation residue):
+
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`
+* `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`
+* `docs/warm_storage/functional_transformation_concepts/legend_blocks.adoc`
+
+Evidence base: `FTR-LEGEND-BLOCKS-LIFECYCLE-P6_inventory.adoc` and the code/tests
+cited inline.
+
+== 1. Scope
+
+* This is an *implementation concept*, not an implementation. No runtime change
+  is made in this step.
+* It maps Functional Model conceptual pieces to current code, registry, and
+  tests, and proposes small, independently reviewable follow-up slices.
+* *Boundary Pruning* is a cross-cutting functional-model concept (see ch05). This
+  document does *not* claim, design, or propose a registered `prune` pipeline
+  step. Where pruning is relevant it is referenced as a concept only.
+
+== 2. Functional intent summary
+
+Baseline (see the Functional Model entry; not duplicated here): a pipeline
+author restricts a spreadsheet column or range to a controlled set of compact
+codes; the workbook gets dropdown validation from that code list; optionally a
+visible legend explains the codes; optionally the reverse path resolves a code
+back into a more explicit structured value. The spreadsheet stays compact while
+the structured model stays explicit.
+
+Source modes: config-backed (built) and frame-backed (not built). Extension
+pressure (crosstable value areas, compact multi-token cells, localization) is
+out of scope here.
+
+== 3. Conceptual pieces -> implementation mapping
+
+Organised by Functional Model conceptual piece (intent first); implementation
+facts fill in current mappings, gaps, and residue.
+
+=== Legend Entry Set
+
+* *Meta path:* `_meta.legend_blocks[<name>].entries[*]`; each entry currently
+  carries `token`, optional `label`, optional `group`.
+* *Producer:* caller-supplied workbook meta / persisted input meta (config-backed).
+  Frame-backed sourcing: not implemented.
+* *Consumers:*
+  ** `domain/transformations/_legend_blocks.py::_read_legend_block` (shared
+     reader; yields `(token, group)`), used by
+     `cell_codec/scalar.py::_legend_tokens` (validation) and
+     `compact_multiaxis.py::_legend_groups` (token->group);
+  ** `rendering/composer/layout_composer.py::_validate_legend_entries` /
+     `_add_legend_blocks` (reads `token` + `label` to render the visible table);
+  ** `rendering/passes/_base.py::_legend_tokens` (reads `token` to build the
+     `from_legend` dropdown list).
+* *Lifecycle expectation (FM):* durable in its source home; `required` at
+  consuming steps; not `drop_at_persistence`; not stale-sensitive.
+* *Implementation status:* implemented for `token`/`label`/`group`. Survives both
+  carriers unchanged.
+* *Gap / open question:* the FM three-role split *code / label / long form* is
+  only partly present. Code has `token` (code), `label` (display), and `group`
+  (consumed by compact-multiaxis grouping). *There is no `long_form` field* — no
+  code reads it. The FM "long form" (the explicit structured value) is a
+  conceptual proposal, and `group` is *not* its implementation (different
+  purpose). Frame-backed sourcing is unbuilt.
+
+=== Legend Identity
+
+* *Meta path:* the `legend_blocks` mapping key, or entry `name` / `id`
+  (resolution fallback `name || id || legend_<index>`).
+* *Producer:* caller / persisted meta.
+* *Consumers:* `layout_composer.py::_legend_items`, `passes/_base.py::_legend_spec`,
+  `_read_legend_block` (list form), parser hint builders; referenced by
+  `from_legend` rules (`rule.legend`) and placement `target`.
+* *Lifecycle expectation (FM):* durable; reference-bearing; not inferred from
+  visible text.
+* *Implementation status:* implemented.
+* *Gap / residue:* the `name || id || legend_<index>` fallback chain is
+  re-implemented in four places (`_read_legend_block`, `_legend_items`,
+  `_legend_spec`, both parsers). DRY residue, not a lifecycle gap.
+
+=== Resolved Legend Working Form
+
+* *Meta path:* `_meta.legend_blocks[<name>].resolved`
+  (`kind`, `sheet`, `frame_name`, `top`, `left`, `n_rows`, `n_cols`).
+* *Producer:* `layout_composer.py::_add_legend_blocks` writes `spec["resolved"]`
+  onto the *cloned* meta copy after `_resolve_legend_position`; never onto the
+  working domain meta.
+* *Consumers:* `openpyxl_parser.py::_legend_table_hints` and
+  `odf_parser.py::_legend_table_hints` read `resolved.top` / `resolved.left` /
+  `resolved.frame_name` to re-anchor the visible legend table on readback.
+* *Lifecycle expectation (FM):* run-local; re-derived each forward run; not
+  trusted from prior `_meta`; `drop_if_stale` *and* `drop_at_persistence`;
+  carrier-durable in the workbook-embedded carrier.
+* *Implementation status:* implemented. Stripped at the sidecar by
+  `persistence_boundary.py::_project_legend_blocks` (preserves `title`,
+  `entries`, `placement`, `target`; removes only `resolved`).
+* *Gap / open question:* the strip is hard-coded field-specific persistence-
+  boundary knowledge, not attribute-driven (see section 4). The carrier-durable-
+  but-sidecar-dropped nuance is named by the FM but not expressed per facet in
+  the registry.
+
+=== Target Usage
+
+* *Meta path:* `_meta.constraints[*]` with `rule.type: from_legend`,
+  `rule.legend: <name>` (sheet/column target); also compact-multiaxis config
+  `allowed_from_legend`. Usage lives *outside* `legend_blocks`.
+* *Producer:* caller config.
+* *Consumers:* `passes/_base.py::_validation_values` / `_legend_tokens`
+  (validation/dropdown); `compact_multiaxis.py` via `allowed_from_legend`.
+* *Lifecycle expectation (FM):* durable projection intent; `render_consumed`.
+* *Implementation status:* implemented via `constraints` + `from_legend`, and via
+  the codec/multiaxis `allowed_from_legend` argument.
+* *Gap / open question:* target usage is a separate meta citizen (`constraints`,
+  codec config), not under `legend_blocks`. The `legend_blocks` registry entry
+  does not capture the usage linkage; this is a semantic-model concern.
+
+=== Visible Legend Request
+
+* *Meta path:* implicit — presence of a legend block (with optional `placement`)
+  in workbook meta at compose time. There is no explicit "render: true" flag.
+* *Producer:* caller (by including the legend block).
+* *Consumer:* `layout_composer.py::_add_legend_blocks` renders a visible table for
+  every `_legend_items(meta)` entry.
+* *Lifecycle expectation (FM):* durable workbook/projection intent; optional.
+* *Implementation status:* implemented but *implicit* — every present legend
+  block composes a visible table; there is no opt-out.
+* *Gap / open question:* the FM models a distinct optional "request"; the
+  implementation renders unconditionally. Whether an explicit opt-in/opt-out is
+  wanted is an open question (out of scope here).
+
+=== Rendered Legend Surface
+
+* *Meta path:* none — it is a `TableBlock(kind="legend")` in the WorkbookIR.
+* *Producer:* `layout_composer.py::_add_legend_blocks`.
+* *Consumer:* the spreadsheet backend on write; on read the parsers re-mark the
+  table `kind="legend"`, which `rendering/workbook_projection.py::workbookir_to_frames`
+  then honours when converting the IR back to frames (see Parser Table
+  Classification).
+* *Lifecycle expectation (FM):* workbook support surface; not ordinary payload;
+  must not reimport as a data frame.
+* *Implementation status:* implemented.
+* *Gap:* safety depends entirely on Parser Table Classification (below).
+
+=== Workbook Reconstruction Hint
+
+* *Meta path:* `legend_blocks[<name>].resolved` is the carrier-durable hint the
+  parsers consume; `sheet.meta["__legend_blocks"]` is a parser-internal read-path
+  hint derived from it.
+* *Producer:* `resolved` by the composer; `__legend_blocks` by both parsers
+  (`_apply_legend_table_hints`).
+* *Consumer:* parsers read `resolved`; `__legend_blocks` is stored but has *no
+  runtime reader* (see section 6).
+* *Lifecycle expectation (FM):* carrier-local; dropped before structured sidecar
+  persistence; recomputed on next render.
+* *Implementation status:* `resolved` implemented and sidecar-stripped;
+  `__legend_blocks` is residue.
+* *Gap / residue:* `__legend_blocks` (section 6).
+
+=== Parser Table Classification
+
+* *Meta path:* none for the load-bearing effect — `table.kind = "legend"` set on
+  `SheetIR` tables by `_apply_legend_table_hints`. The stored
+  `sheet.meta["__legend_blocks"]` is incidental.
+* *Producer:* both parsers.
+* *Consumer:* downstream frame conversion
+  (`rendering/workbook_projection.py::workbookir_to_frames`, the registry-listed
+  `legend_blocks` consumer) uses `table.kind` to keep legend tables out of
+  primary-data handling.
+* *Lifecycle expectation (FM):* transient read-path result; not project meta.
+* *Implementation status:* implemented via `table.kind`.
+* *Gap / residue:* the stored `__legend_blocks` dict is not the load-bearing
+  artifact; `table.kind` is.
+
+=== Code Resolution Rule
+
+* *Meta path:* none.
+* *Producer / consumer:* none.
+* *Lifecycle expectation (FM):* optional reverse semantics; explicit; never
+  guessed from visible labels.
+* *Implementation status:* *not implemented.* Legend entries are consumed only
+  for validation tokens, compact-multiaxis grouping (`group`), and visible
+  rendering (`label`). No reverse token->long-form substitution exists. (Confirmed
+  by absence of any `long_form`/expand-from-legend reader in `src/`.)
+* *Gap / open question:* entirely future. Relates to review finding *L4*
+  (label-as-structured-value tension). The nearest existing structure is `group`,
+  which serves multiaxis grouping, not reverse resolution.
+
+=== Allowed Combination Set
+
+* *Meta path:* compact-multiaxis transform config `allowed_codes` /
+  `allowed_tokens` / `allowed_from_legend` (persisted in the transform payload,
+  `compact_multiaxis.py`).
+* *Producer:* caller config.
+* *Consumer:* compact-multiaxis validation; `passes/_base.py::_legend_tokens`
+  builds a single-legend dropdown list with a size-warning threshold
+  (`_LEGEND_DROPDOWN_WARNING_THRESHOLD = 50`).
+* *Lifecycle expectation (FM):* durable config when supplied/constrained; or
+  derived but bounded.
+* *Implementation status:* *config-supplied allow-lists only.* There is no
+  cartesian-product derivation and no mechanism to forbid specific combinations
+  (e.g. `N/I`) beyond what the supplied list omits. The only explosion guard is
+  the single-legend dropdown size warning.
+* *Gap / open question:* "derived but bounded" and "forbidden combinations" are
+  unbuilt; matches the FM open question. Out of scope here.
+
+== 4. Lifecycle reconciliation
+
+* *Durable in config / frame / source home:* entries (`token`/`label`/`group`),
+  identity (`name`/`id`), `placement`, `target`/`title`, target usage
+  (`constraints`, `allowed_from_legend`), allowed-combination config. All
+  currently config-backed; frame-backed home is unbuilt.
+* *Run-local `_meta`:* `legend_blocks[*].resolved`.
+* *Workbook-carrier-local:* `legend_blocks[*].resolved` (survives in the
+  workbook-embedded carrier; read by the parsers). `sheet.meta["__legend_blocks"]`
+  is read-path-local (never written out).
+* *Sidecar-persistable:* the Intent facets — `entries`, `placement`, `title`,
+  `target`, identity. (`resolved` is excluded.)
+* *Must be `drop_at_persistence`:* `legend_blocks[*].resolved` (at the sidecar);
+  `__legend_blocks` is read-path only and never reaches the write path.
+* *Merely `drop_if_stale` pressure:* `resolved` is also stale-sensitive
+  (recomputed each render), but in practice it is dropped at persistence anyway,
+  so `drop_at_persistence` dominates. The durable entries are *not* stale-
+  sensitive — they are the source.
+* *Currently depends on field-specific persistence-boundary code:*
+  `persistence_boundary.py::_project_legend_blocks` hard-codes "strip
+  `legend_blocks[*].resolved`". This is exactly the field-specific knowledge the
+  ch05 lifecycle-attribute model wants to replace with attribute-driven
+  projection. (Top-level `__*` and `derived` are stripped generically; the legend
+  `resolved` strip is the field-specific case.)
+
+== 5. Registry reconciliation
+
+Current `legend_blocks` registry entry (`registries/meta_registry.yaml`):
+`classification: canonical_meta`; one entry for the whole structure;
+`persistence_behavior: persisted in the hidden workbook metadata payload,
+including resolved legend placement after compose`; consumers listed as
+`layout_composer.compose_workbook`, both parsers, and `workbookir_to_frames`.
+
+Current `__legend_blocks` entry: `classification: read_path_hint`, consumer
+`tests and diagnostics`, `persistence_behavior: read-path only helper; not
+emitted by the current write path`.
+
+Comparison to the FM conceptual pieces:
+
+* *Already correct:*
+  ** the `legend_blocks` consumer list matches the code;
+  ** `__legend_blocks` is already classified `read_path_hint` with no real
+     consumer — consistent with the section-6 residue finding.
+* *Needs small adjustment:*
+  ** `legend_blocks` `persistence_behavior` conflates the two carriers. It states
+     `resolved` is "persisted ... after compose" (true for the workbook carrier)
+     but does not state that `resolved` is *stripped at the sidecar*. Wording
+     should distinguish sidecar (resolved removed) from workbook-embedded carrier
+     (resolved kept).
+* *Unclear (design-level):*
+  ** whether the registry should gain per-facet granularity (durable `entries`
+     vs run-local `resolved`) or remain a single whole-structure entry;
+  ** whether the registry should encode the ch05 lifecycle attributes
+     (`drop_at_persistence` etc.) at all, or keep its current schema.
+* *Future semantic-model work:*
+  ** per-facet lifecycle attributes; the `code/label/long form` split; Code
+     Resolution Rule; Allowed Combination Set as a registry citizen; the
+     Target-Usage (`constraints`) linkage.
+
+The registry is *not* edited in this step.
+
+== 6. Implementation residue
+
+`__legend_blocks`:
+
+* *Status:* confirmed residue. `grep -rn '__legend_blocks' src/` returns only the
+  two writer sites (`openpyxl_parser.py`, `odf_parser.py`, each
+  `sheet.meta["__legend_blocks"] = list(hints)`); no runtime reader. Registry
+  consumer is "tests and diagnostics". The load-bearing effect of
+  `_apply_legend_table_hints` is `table.kind = "legend"`, which does not depend on
+  the stored dict.
+* *Leakage check:* the dict sits on `sheet.meta` during parse. No generic
+  `sheet.meta`->sidecar copy was found in the parser, but the full meta-merge path
+  into frame/sidecar meta was not exhaustively traced. `sheet.meta` also carries
+  `_hidden` and `workbook_meta_blob`, so a per-sheet meta projection exists and
+  must be checked.
+* *Removal safety:* *requires a focused test first.* With a test that asserts
+  (a) `__legend_blocks` never reaches the sidecar and (b) `table.kind="legend"`
+  is still set without the stored dict, removing the two assignments is safe.
+  Without that test, removal is unverified.
+
+== 7. Tests needed before code changes
+
+Proposed (not written here):
+
+. *Persistence-boundary behaviour for `legend_blocks[*].resolved`:* assert
+  `_project_legend_blocks` removes `resolved` and preserves `entries`,
+  `placement`, `title`, `target`. (extends `tests/unit/pipeline/test_persistence_boundary.py`)
+. *No sidecar leakage of workbook reconstruction hints:* after domain egress, the
+  sidecar `_meta` contains no `legend_blocks[*].resolved` and no `__legend_blocks`.
+. *No accidental payload frame from rendered legend surfaces:* a roundtrip asserts
+  a rendered legend table is re-marked `kind="legend"` on parse and is not emitted
+  as an ordinary payload frame. (extends `tests/integration/roundtrip/test_legend_blocks.py`)
+. *`__legend_blocks` non-leakage / removal safety:* assert `__legend_blocks` never
+  reaches the sidecar, and that table classification still holds when the stored
+  dict is absent (characterization test guarding the section-8 removal).
+. *Second-roundtrip reconstruction from durable source home:* forward -> edit ->
+  reverse -> forward again rebuilds legend entries, validation, and `resolved`
+  purely from the config-backed source, independent of any prior `_meta`.
+
+== 8. Proposed implementation slices
+
+Small and independently reviewable; documentation/registry/test slices precede
+runtime cleanup.
+
+=== Slice A — registry wording (docs/registry)
+
+* *Goal:* split the `legend_blocks` `persistence_behavior` wording into sidecar
+  (resolved stripped) vs workbook-embedded carrier (resolved kept).
+* *Files:* `registries/meta_registry.yaml`; possibly
+  `tests/architecture/semantic_invariants/test_meta_registry*.py` if wording is
+  asserted.
+* *Tests:* registry invariant tests still pass.
+* *Risk:* low (text only).
+* *Rollback:* revert the wording.
+* *Note:* wording-only. The asserted sidecar-strip behaviour pre-exists; it is
+  later locked by Slice B's characterization tests (test 1 on
+  `_project_legend_blocks`), so order A -> B is safe.
+
+=== Slice B — characterization tests (tests only)
+
+* *Goal:* add tests 1-5 from section 7 around *current* behaviour, before any
+  runtime change.
+* *Files:* `tests/unit/pipeline/test_persistence_boundary.py`,
+  `tests/integration/roundtrip/test_legend_blocks.py` (and a small carrier-leak
+  test).
+* *Tests:* the new tests themselves.
+* *Risk:* low (tests only; may surface a latent leak, which is the point).
+* *Rollback:* remove the added tests.
+
+=== Slice C — remove `__legend_blocks` residue (test-gated runtime)
+
+* *Goal:* drop the `sheet.meta["__legend_blocks"] = ...` assignment in both
+  parsers while preserving `table.kind = "legend"`; update/remove the registry
+  `__legend_blocks` entry.
+* *Files:* `io_backends/xlsx/openpyxl_parser.py`, `io_backends/ods/odf_parser.py`,
+  `registries/meta_registry.yaml`, and the two registry-invariant tests that
+  enumerate the key —
+  `tests/architecture/semantic_invariants/test_meta_registry.py` and
+  `tests/architecture/semantic_invariants/test_meta_registry_hardening.py` — to
+  update when the `__legend_blocks` registry entry is removed.
+* *Tests:* Slice B's non-leakage + classification tests must pass before and after.
+* *Risk:* medium (two backends; guard tests reference the key).
+* *Rollback:* re-add the two assignments and the registry entry.
+
+=== Slice D — attribute-driven boundary (deferred / design)
+
+* *Goal:* replace `_project_legend_blocks`'s hard-coded `resolved` strip with
+  registry-attribute-driven projection (the ch05 target state).
+* *Files:* `pipeline/persistence_boundary.py`, registry, framework tests.
+* *Tests:* boundary behaviour parity for legend + at least one other family.
+* *Risk:* high (framework-wide); cross-family.
+* *Rollback:* revert to field-specific projection.
+* *Note:* out of scope for this FTR unless explicitly widened; recorded as
+  direction only.
+
+Recommended order: A -> B -> C. D is deferred and cross-cutting.
+
+== 9. Explicit non-goals
+
+* No Cell Codec redesign.
+* No XRef / crosstable redesign.
+* No localization implementation.
+* No frame-backed legend implementation (it is not present today).
+* No registered `prune` pipeline step; Boundary Pruning stays a concept.
+* No renderer layout-policy redesign.
+* No implementation of the `code / label / long form` split or a Code Resolution
+  Rule — both are future semantic/feature work, not this slice.
