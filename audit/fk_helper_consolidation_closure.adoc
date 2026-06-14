@@ -1,0 +1,300 @@
+= FK Helper Consolidation Closure
+
+:toc:
+:toclevels: 3
+
+Author: closure review (synthesis; not a code review).
+Date: 2026-06-14.
+Repository: `spreadsheet-handling/core`, branch `main`.
+Authoritative input: `audit/fk_helper_consolidation_post_implementation_review.adoc`
+(post-implementation review; verdict Yellow, *no blocker*, F1/F2 resolved
+2026-06-14).
+
+== Scope
+
+This document closes the FK Helper consolidation effort and records the
+steady-state understanding of the feature. It is a closure / lessons-learned
+synthesis, not a code review, not an implementation plan, and not a search for
+new refactorings.
+
+The effort under closure is the sequence:
+
+* `docs(fk_helper)`: functional problem-space capture and functional-model
+  promotion (`docs/.../ch04_use_case_concepts/fk_helpers.adoc`,
+  `ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`);
+* meta-path inventory (`audit/fk_helper_meta_path_inventory.adoc`);
+* implementation-slice reviews
+  (`audit/fk_helper_functional_model_to_implementation_review.adoc`);
+* *Slice 1* — remove unread v2 relation fields (`cbc3b6e`);
+* *Slice 2* — retire the v1 policy bridge (`ba14230`);
+* registry consistency fix (`8952050`);
+* post-implementation review (`2c953bc`) and its F1/F2 reconciliation
+  (`8ee3877`).
+
+Per the task constraints, Slice 1 and Slice 2 are not reopened (no blocker was
+found), no new metadata framework is proposed, and the review is not broadened
+into architecture redesign.
+
+== Functional Contract
+
+FK helpers are *readable, derived projection values placed next to a foreign-key
+column*. They help a human edit or understand a frame; they are not canonical
+payload, and on reimport they are dropped so only the FK column enters the
+canonical data set. The contract is three steps (canonical statement:
+`docs/.../ch04_use_case_concepts/fk_helpers.adoc`):
+
+. *Declare FK relations.* The pipeline author declares, per source frame, which
+  column is a foreign key to which target frame, which target key it joins on,
+  and which target fields may serve as helpers (allowed/default). Output is a
+  *durable* FK relation declaration that survives the sidecar boundary and must
+  be present for any later enrichment run. Two producers write the same
+  declaration shape:
++
+--
+* `configure_fk_helpers` — explicit/manual configuration. Relation identity
+  `(source_frame, source_column)` is derived by a deterministic scan of current
+  data frames for the configured literal `fk_column` header (deterministic
+  identity derivation, *not* heuristic inference).
+* `infer_fk_relations` — the explicit, opt-in heuristic step (initial mode
+  `naming_convention`). Same output shape and lifecycle.
+--
++
+Hand-authored relations are equally valid; all three converge on one durable v2
+relation model.
+
+. *Enrich FK helpers.* `add_fk_helpers` (`enrich_helpers`) materializes
+  read-only helper columns next to FK columns, populated from the target frame
+  per the declared relation. Helper *values* may be literal or spreadsheet
+  formula. Essential inputs are the relation declaration and the target frame;
+  a missing relation raises a clear error naming the producer steps, and a
+  relation whose target frame is absent is a safe no-op (replay safety). The
+  step also writes runtime helper-column provenance.
+
+. *Drop FK helpers.* On reimport, `drop_helpers` /
+  `apply_derived_column_policy` identifies helper columns by, in order: runtime
+  provenance (same-run), the durable workbook marker (cross-run reimport), and —
+  last resort — the durable v2 relation declaration. If no identification
+  source is available, the step treats all columns as canonical payload rather
+  than guessing. Identity is always metadata-driven; helper identity is never
+  inferred from column-name heuristics.
+
+Invariants that define the steady state:
+
+* The cell-level wire format `id_(<target>)` (`core/fk.py:FK_PATTERN`) is the
+  roundtrip convention and is independent of inference and execution; retiring
+  primitive inference did not retire the wire format.
+* Primitives are deterministic executors of resolved metadata; all heuristic
+  decisions live in the explicit `infer_fk_relations` step.
+* The single durable runtime contract is v2 (`schema_version: 2`).
+
+== Active Metadata Contracts
+
+The four contracts below are load-bearing and remain by design. (Inventory:
+`audit/fk_helper_meta_path_inventory.adoc`; runtime confirmation in the
+post-implementation review.)
+
+[cols="1,2,3", options="header"]
+|===
+| Path | Lifecycle | Why it is still needed
+
+| `_meta.helper_policies.fk`
+  (`schema_version` + `relations[*]`: `source_frame`, `source_column`,
+  `target_frame`, `target_key`, `helper_columns[*].{column,target_field}`,
+  `produced_by`)
+| Durable; survives the persistence boundary.
+| The single runtime contract. Written by the two configuration producers,
+  consumed by every FK-helper primitive, and — as of Slice 2 — the durable
+  anchor that lets reverse-pipeline cleanup identify helpers without a v1 dict.
+  `produced_by` is retained *only* as provenance and as the cross-producer
+  conflict key in `apply_v2_relations`; it no longer drives any pruning.
+
+| `_meta.derived.sheets.*.helper_columns`
+| Transient: `drop_at_persistence`, `drop_if_stale`. Pruned at the persistence
+  boundary.
+| Runtime helper-column provenance. Produced by enrichment, consumed (and then
+  cleared) by the drop step within a run, and used by render passes to mark
+  helper columns. Never written to the sidecar.
+
+| `_meta.sheets.*.helper_columns`
+| Durable workbook marker (`carrier_takes_precedence`).
+| Cross-run reimport fallback for the drop step when runtime provenance is
+  absent. (Its declared-vs-resolved lifecycle question is a pre-existing
+  deferred item — see Remaining Open Items.)
+
+| `core/fk.py:FK_PATTERN` (`id_(<target>)`)
+| Wire format, not `_meta`.
+| The cross-sheet reference convention that survives XLSX/ODS roundtrips and
+  feeds `infer_fk_relations`' naming-convention mode. Not consumed by primitive
+  execution for inference.
+|===
+
+== Retired Historical Layers
+
+The consolidation removed the following, with no runtime reader left behind
+(verified in the post-implementation review and by passing architecture
+guards):
+
+* *v1 per-target FK policy dict* (`_meta.helper_policies.fk.<target_key>`).
+  No longer written by `configure_fk_helpers` (Slice 2). v1 is treated as a
+  version mismatch — dropped, not migrated — exactly the target direction
+  recorded in the functional model. A v1 dict in an older sidecar is inert.
+* *The v1 -> v2 dual_write bridge.* Retired. What survives is the deterministic
+  identity derivation itself (how a v2 relation is built), not a compatibility
+  layer. `meta_registry.yaml` records `transition_bridge.status: retired`.
+* *The persistence-boundary special-case for FK relations.* The boundary no
+  longer prunes configure-produced relations by `produced_by.step`
+  (`_project_helper_policies`, `_is_runtime_produced_fk_relation`, and the
+  producer-step constant were deleted). `helper_policies` now passes through
+  unchanged.
+* *The v1 reader in reimport cleanup* (`_v1_policy_helper_names`). The cleanup
+  policy fallback is now v2-only and metadata-driven.
+* *The v1 blocking branch in schema maintenance.* `meta_update` no longer has a
+  residual-v1 "BLOCKED" path; only the durable v2 `relations` model is
+  maintained.
+* *Unread v2 relation fields* (`helper_fields`, `helper_prefix`, Slice 1).
+  Redundant projections of `helper_columns` with no runtime reader; the
+  surviving shape is pinned by `test_build_v2_relation_emits_only_consumed_fields`.
+* *Stale registry / technical-model assertions* that the v1 write was still
+  active (F1/F2, reconciled 2026-06-14).
+
+== Genuine Complexity vs Historical Sediment
+
+The central finding of the effort was that FK Helper *implementation* complexity
+substantially exceeded FK Helper *feature* complexity. The split:
+
+*Genuine feature requirements (kept):*
+
+* Three distinct lifecycle stages (declare / enrich / drop) with genuinely
+  different information needs and reimport semantics.
+* A *durable* relation declaration separate from *transient* per-run provenance
+  — the two answer different questions (what should exist vs. what this run
+  produced) and have different persistence rules.
+* A *multi-source identification chain* in the drop step (runtime provenance →
+  durable workbook marker → relation declaration). This looks redundant but is
+  load-bearing: same-run, cross-run reimport, and provenance-stripped cases are
+  real and distinct, and the inventory confirmed each source has live
+  consumers.
+* An explicit, opt-in heuristic inference step kept separate from deterministic
+  primitives ("no silent magic").
+* The `id_(<target>)` wire format as a roundtrip-stable convention.
+* Replay safety at the materialization point (flatness preservation + absent-
+  target skip) — a genuine requirement once relations became durable.
+
+*Historical sediment (removed):* everything in "Retired Historical Layers" —
+the v1/v2 duality, the dual_write bridge, the persistence-boundary exception,
+the v1 reader/blocker, and the unread relation fields. These accumulated from a
+mid-transition state and from a bug fix (the Dino replay) that was originally
+contained at the wrong layer (a boundary prune) instead of at the
+materialization point.
+
+The decisive insight: the original Dino containment (pruning configure-produced
+relations at the persistence boundary) was itself sediment — it made relations
+*non-durable* to dodge a crash that actually belonged to enrichment. Slice 2
+moved the control to where the crash occurred, which let relations become
+durable and let four downstream compatibility layers fall away at once.
+
+== Reusable Methodology
+
+The effort produced a repeatable simplification loop worth reusing on the next
+mature feature (canonical write-up:
+`audit/domain_cleanup_procedure_lessons_fk_helper_slice.adoc`):
+
+. *Functional model first.* Reason from feature behavior (what is the feature
+  doing? which information is required, produced, consumed, persisted, removed?)
+  rather than from metadata categories (canonical/derived/intent/runtime).
+. *Inventory before refactoring.* For each metadata path record producer,
+  consumer, persistence, tests, and runtime dependency. This is what
+  distinguished load-bearing structure from residue — several "suspicious"
+  structures were genuinely load-bearing and several "reasonable" ones had no
+  consumer.
+. *Evidence instead of ontology.* Remove only what evidence (code, tests,
+  consumers) shows to be unnecessary; let abstractions emerge from repeated
+  observation rather than building a taxonomy up front.
+. *Narrow, sliced execution.* A scoped implementation review, then the smallest
+  safe slice, validated by tests, repeated. Slice 1 (unread fields) and Slice 2
+  (v1 retirement) were each independently shippable and independently reviewed.
+. *Contract surfaces are part of the change.* The one process gap this effort
+  exposed: registries and prose contracts (`pipeline_step_registry.json`,
+  technical model) drifted because no guard validates their free-text notes
+  against runtime. Future slices should treat the registry/doc reconciliation
+  as part of the slice, not a follow-up, since this project uses registries as
+  operational and review-oracle truth.
+
+Recommended candidates for the same loop (from the lessons doc): legend blocks,
+xref crosstable, compact multiaxis, workbook views, derived-column lifecycle —
+each *without* starting from a new framework or taxonomy.
+
+== Remaining Open Items
+
+The post-implementation review found *no blocker*. None of the items below gates
+starting a different feature slice; they are the gap between "usable" and
+"consolidated (Green)". Slice 1/2 are not reopened.
+
+*Mandatory to declare FK Helpers consolidated (low-touch, closure housekeeping):*
+
+* *F3 — pre-Slice-2 v1-only sidecar reimport (MAJOR, open).* Reimporting an
+  artifact produced before Slice 2 (v1 dict kept, configure-v2 pruned by the old
+  boundary, `derived` pruned) finds no cleanup anchor and silently retains
+  helper columns as payload. This is the accepted consequence of "v1 dropped,
+  not migrated" and is documented in the release notes with a manual mitigation
+  (re-run the forward pipeline once). *Required action:* a one-time
+  decision/verification — confirm the controlled consumers (the worldbuilding
+  adoption that produced the original Dino artifacts; `spreadsheet-handling-demo`)
+  have no v1-only sidecars in active reimport flows, *or* consciously accept it
+  as a permanent documented limitation (optionally a read-side warning when a v1
+  dict is present without v2 relations). No new feature work; no migration
+  framework.
+* *F4 / F5 — remaining stale docs (MINOR, deferred by prior task scope).* The
+  `semantic_model/{07,12,15}` docs and the `user_guide` / `release_notes`
+  Known-limitation list still describe v1-blocking / dual-write behaviour that
+  Slice 2 deleted. *Required action:* reconcile their wording with the shipped
+  runtime so the feature's documented description is internally consistent.
+
+*Non-mandatory tracked debt (do not gate closure or the next feature):*
+
+* *F6* — make the absent-target enrichment skip diagnosable (debug log) so a
+  mid-pipeline target drop is not silently swallowed.
+* *F7* — have the absent-target skip compare on `normalize_sheet_key`, matching
+  the downstream registry lookup, to avoid skipping a target present under a
+  normalised name.
+* *F8* — add a regression test pinning that `_preserve_source_flatness` leaves a
+  genuinely MultiIndex source untouched (only the flat-source collapse path is
+  currently tested).
+* *Pre-existing deferral* — the declared-vs-resolved lifecycle of the durable
+  workbook marker `sheets.*.helper_columns` (tracked under
+  `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`). Not introduced by this consolidation.
+
+== Consolidation Verdict
+
+*Yellow — usable, with known debt remaining.*
+
+The FK Helper *runtime* is consolidated: a single durable v2 relation contract,
+deterministic producers, a clean three-stage lifecycle, replay safety at the
+materialization point, and the retirement of the v1 dual-shape sediment and its
+four downstream compatibility layers. The post-implementation review found no
+blocker, all affected tests pass, and the F1/F2 contract-surface contradictions
+are closed. On runtime and primary contract surfaces alone the feature is
+effectively done.
+
+It is *not Green* because known debt remains by definition: F3 is an open,
+documented-but-unverified MAJOR data-correctness risk for pre-Slice-2 artifacts,
+and F4/F5 leave parts of the *documented* feature description contradicting the
+shipped runtime. "Usable but known debt remains" is the precise description, so
+Yellow is the honest verdict.
+
+It is *not Red*: there is no blocking issue and no further consolidation
+*refactoring* is required — Slice 1/2 stand, and the remaining work is
+verification and documentation, not redesign.
+
+Mandatory items to reach Green (and they are low-touch, suitable as closure
+housekeeping rather than a new slice):
+
+. Resolve F3 — verify the controlled consumers carry no v1-only sidecars in
+  active reimport, or formally accept it as a documented permanent limitation
+  (optionally add read-side detection).
+. Reconcile the remaining stale docs F4/F5 with the shipped runtime.
+
+Until those two are closed, FK Helpers should be treated as *Yellow*. Once they
+are closed, FK Helpers can be declared Green and effort can move to the next
+feature slice (e.g. legend blocks or xref crosstable) using the methodology in
+"Reusable Methodology"; F6–F8 can then be carried as ordinary tracked debt.
