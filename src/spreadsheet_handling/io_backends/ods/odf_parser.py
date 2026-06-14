@@ -899,7 +899,6 @@ def _apply_legend_table_hints(sheet: SheetIR, hints: list[dict[str, Any]]) -> No
     if not hints:
         return
     by_position = {(int(hint["top"]), int(hint["left"])): hint for hint in hints}
-    sheet.meta["__legend_blocks"] = list(hints)
     for table in sheet.tables:
         hint = by_position.get((table.top, table.left))
         if not hint:

@@ -146,11 +146,9 @@ def test_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
 def test_legend_classification_is_load_bearing_not_dunder_hint(tmp_path):
-    """``table.kind == "legend"`` is the load-bearing artifact; the stored
-    ``__legend_blocks`` sheet-meta hint is read-path-local and non-propagating.
-
-    This makes the later Slice C removal of ``__legend_blocks`` safe: the
-    behavior under test does not depend on the stored dict.
+    """``table.kind == "legend"`` is the load-bearing artifact. The
+    ``__legend_blocks`` sheet-meta hint was removed in Slice C; classification
+    and frame projection do not depend on it.
     """
     xlsx = tmp_path / "legend.xlsx"
     ExcelBackend().write_multi(_frames_with_legend(), str(xlsx))
@@ -162,12 +160,12 @@ def test_legend_classification_is_load_bearing_not_dunder_hint(tmp_path):
     kinds = [t.kind for t in sheet.tables]
     assert kinds == ["data", "legend"]
 
-    # The dunder hint is not the load-bearing artifact. It may exist in the current
-    # read path, but classification and frame projection must not depend on it.
-    if "__legend_blocks" in sheet.meta:
-        assert sheet.meta["__legend_blocks"]
+    # The __legend_blocks hint is no longer produced (Slice C). Classification
+    # via table.kind is unaffected by its removal.
+    assert "__legend_blocks" not in sheet.meta
 
-    # ... but does not become a payload frame nor reach the persistable meta.
+    # The rendered legend does not become a payload frame; the removed hint does not
+    # reach the returned/persistable meta.
     back = ExcelBackend().read_multi(str(xlsx), header_levels=1)
     assert set(back) == {"_meta", "product_matrix"}
     assert not _find_key(back["_meta"], "__legend_blocks")

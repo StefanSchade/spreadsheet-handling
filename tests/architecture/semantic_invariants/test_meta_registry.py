@@ -86,7 +86,6 @@ def test_meta_registry_seeds_current_known_entries():
         "__autofilter",
         "__freeze",
         "__autofilter_ref",
-        "__legend_blocks",
         "_hidden",
         "derived",
     } <= names
