@@ -205,3 +205,36 @@ def test_second_roundtrip_rebuilds_legend_from_config_source(tmp_path):
     # resolved is re-derived on the second pass, even though the input had none.
     back2 = ExcelBackend().read_multi(str(xlsx2), header_levels=1)
     assert _find_key(back2["_meta"]["legend_blocks"], "resolved")
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
+def test_ods_resolved_and_dunder_hint_do_not_reach_sidecar(tmp_path):
+    """ODS parity for the Slice B/C characterization: the legend is classified
+    (not payload), the workbook carrier keeps ``resolved``, the structured
+    sidecar projection strips it, and ``__legend_blocks`` is never produced or
+    propagated on the ODS path (Slice C removed the ODS assignment too)."""
+    ods = tmp_path / "legend.ods"
+    OdsBackend().write_multi(_frames_with_legend(), str(ods))
+
+    # Classification is load-bearing; __legend_blocks is no longer produced.
+    ir = parse_ods_workbook(ods)
+    sheet = ir.sheets["product_matrix"]
+    assert [t.kind for t in sheet.tables] == ["data", "legend"]
+    assert "__legend_blocks" not in sheet.meta
+
+    back = OdsBackend().read_multi(str(ods), header_levels=1)
+    back_meta = back["_meta"]
+
+    # Legend does not become a payload frame; dunder hint does not reach meta.
+    assert set(back) == {"_meta", "product_matrix"}
+    assert _find_key(back_meta["legend_blocks"], "resolved")
+    assert not _find_key(back_meta, "__legend_blocks")
+
+    # Structured sidecar projection: resolved stripped, no dunder hint, intent kept.
+    sidecar = project_meta_to_persistable_contract(back_meta)
+    block = sidecar["legend_blocks"]["status_codes"]
+    assert not _find_key(sidecar["legend_blocks"], "resolved")
+    assert not _find_key(sidecar, "__legend_blocks")
+    assert block["title"] == "Status Codes"
+    assert block["placement"]["target"] == "product_matrix"
+    assert [e["token"] for e in block["entries"]] == ["E", "E-R-K", "x"]
