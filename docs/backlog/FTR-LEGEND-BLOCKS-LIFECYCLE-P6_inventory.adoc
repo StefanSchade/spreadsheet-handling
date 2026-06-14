@@ -1,0 +1,173 @@
+= Legend-Block Metadata Path Inventory
+:toc:
+:toclevels: 2
+
+Companion to `FTR-LEGEND-BLOCKS-LIFECYCLE-P6`. Records every metadata
+facet the legend-block feature touches, with producer, consumers,
+persistence behavior at each boundary, tests, runtime dependency, and a
+four-way classification (active feature contract / runtime helper /
+carrier detail / legacy residue).
+
+Method follows the FK-helper slice
+(`audit/fk_helper_meta_path_inventory.adoc`).
+
+== Carriers Recap
+
+Two persistence targets matter for legend blocks (see
+`docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`):
+
+* *Sidecar* -- `_meta.yaml` next to structured data. The persistence
+  boundary projects meta here.
+* *Workbook-embedded* -- hidden `_meta` sheet inside the spreadsheet.
+  Written verbatim on the tabular write path; read by the parsers.
+
+The legend-block lifecycle only makes sense when these two are kept apart.
+
+== Paths
+
+=== `legend_blocks[*].entries` (token / group / label)
+
+* *Producer:* caller-supplied canonical workbook meta, or persisted input
+  meta loaded at app boundary ingress.
+* *Consumers:*
+  ** `domain.transformations.cell_codec.scalar._legend_tokens` ->
+     `_read_legend_block` -- `from_legend` allowed-value resolution.
+  ** `domain.transformations.compact_multiaxis._legend_groups` ->
+     `_read_legend_block` -- token-to-group mapping.
+  ** `rendering.composer.layout_composer._add_legend_blocks` /
+     `_validate_legend_entries` -- visible legend table data.
+  ** `rendering.passes._base._legend_tokens` -- `from_legend` validation
+     rule (Excel dropdown tokens).
+* *Persistence:* survives both sidecar and workbook carrier unchanged.
+* *Tests:* `test_cell_codec.py`, `test_compact_multiaxis.py`,
+  `test_role_targeted_validations.py`, `test_layout_composer.py`,
+  `test_legend_blocks.py`.
+* *Runtime dependency:* HIGH. Load-bearing for codec validation and
+  multiaxis grouping; absence raises `KeyError` / `ValueError`.
+* *Lifecycle attributes:* `required` (at consuming steps); not
+  `drop_at_persistence`; not `drop_if_stale`.
+* *Classification:* *active feature contract.*
+
+=== `legend_blocks[*].placement` (anchor / sheet / target / top / left)
+
+* *Producer:* caller / persisted input meta.
+* *Consumer:* `layout_composer._resolve_legend_position` and
+  `_add_legend_blocks` -- decides where the legend table is drawn.
+* *Persistence:* survives both carriers unchanged.
+* *Tests:* `test_layout_composer.py`, `test_legend_blocks.py`.
+* *Runtime dependency:* MEDIUM. Render input; defaults to
+  `anchor=right_of_table` when absent, so partially optional.
+* *Lifecycle attributes:* `render_consumed`; durable.
+* *Classification:* *active feature contract.*
+
+=== `legend_blocks[*].title` / `name` / `id` / `target`
+
+* *Producer:* caller / persisted input meta.
+* *Consumer:* identity resolution in `_legend_items`,
+  `_legend_spec`, and the parser hint builders (name fallback chain
+  `name || id || legend_<index>`).
+* *Persistence:* survives both carriers.
+* *Runtime dependency:* MEDIUM. Identity/labeling; needed to correlate
+  config, render, and readback by legend name.
+* *Lifecycle attributes:* durable; `required` only where a named
+  reference (`from_legend`, placement target) points at it.
+* *Classification:* *active feature contract* (identity) /
+  *carrier detail* (`title` cosmetic).
+
+=== `legend_blocks[*].resolved` (kind / sheet / frame_name / top / left / n_rows / n_cols)
+
+* *Producer:* `layout_composer._add_legend_blocks` writes it onto the
+  *cloned* meta copy after resolving the table position
+  (`spec["resolved"] = {...}`). Never written onto the working domain
+  meta.
+* *Consumers:*
+  ** `io_backends.xlsx.openpyxl_parser._legend_table_hints`
+  ** `io_backends.ods.odf_parser._legend_table_hints`
+  -- both read `resolved.top` / `resolved.left` / `resolved.frame_name`
+  to re-anchor the visible legend table on readback and avoid mistaking
+  it for a primary data table.
+* *Persistence:*
+  ** *Workbook-embedded carrier:* PRESENT. Must survive -- the parsers
+     depend on it for readback.
+  ** *Sidecar:* STRIPPED by
+     `persistence_boundary._project_legend_blocks`.
+* *Tests:* `test_persistence_boundary.py` (strip), `test_legend_blocks.py`
+  (roundtrip re-anchor), `test_workbook_meta_blob_carrier.py`.
+* *Runtime dependency:* HIGH on the read path; not consumed on the write
+  path beyond its own production.
+* *Lifecycle attributes:* `drop_at_persistence` (sidecar only);
+  `carrier_takes_precedence` is NOT applicable (recomputed each compose,
+  not merged back). NOT purely transient -- it is carrier-durable.
+* *Classification:* *runtime helper* with carrier-durable scope. This is
+  the legend-block analogue of FK-helper runtime provenance, but with the
+  twist that the workbook carrier is a legitimate persistence target for
+  it while the sidecar is not.
+
+=== `__legend_blocks` (on `sheet.meta`)
+
+* *Producer:* `openpyxl_parser._apply_legend_table_hints` and
+  `odf_parser._apply_legend_table_hints` -- `sheet.meta["__legend_blocks"]
+  = list(hints)`.
+* *Consumer (functional effect):* the same function sets
+  `table.kind = "legend"`, which is the behavior that actually keeps
+  legend tables out of primary-data handling. That effect does not depend
+  on the stored `__legend_blocks` dict.
+* *Consumer (stored dict):* registry records "tests and diagnostics"
+  only. No runtime reader found.
+* *Persistence:* `__`-prefixed; not emitted by the write path as a
+  separate key. Top-level `__*` keys are stripped at the persistence
+  boundary; this one sits on `sheet.meta`.
+* *Tests:* referenced in carrier-boundary guard tests.
+* *Runtime dependency:* NONE (confirmed). The load-bearing effect is
+  `table.kind = "legend"`, not the stored hint list.
+* *Lifecycle attributes:* `drop_at_persistence`; read-path only.
+* *Classification:* *legacy residue (confirmed).* `grep -rn
+  '__legend_blocks' src/` returns only the two writer sites
+  (`openpyxl_parser`, `odf_parser`); there is no runtime reader. The only
+  test references are registry-classification assertions, not value
+  consumers.
++
+*Caveat for the removal slice:* the dict sits on `sheet.meta` during
+parse and could leak into downstream frame meta via generic key copying.
+The removal slice must verify it is not propagated rather than just
+deleting the assignment.
+
+== Classification Summary
+
+[cols="3,2,1", options="header"]
+|===
+| Facet | Classification | Runtime dep
+
+| `entries` (token/group/label) | active feature contract | HIGH
+| `placement` | active feature contract | MEDIUM
+| `title` / `name` / `id` / `target` | active feature contract / carrier detail | MEDIUM
+| `resolved` | runtime helper (carrier-durable) | HIGH (read path)
+| `__legend_blocks` | legacy residue (confirmed) | NONE
+|===
+
+== Findings vs. the Meta-Flattening Hypothesis
+
+* The durable intent facets (`entries`, `placement`, identity) are
+  genuine, coherent feature contracts -- not sediment. Consumed by three
+  independent subsystems (codec, multiaxis, render).
+* `resolved` is the one facet with split-carrier behavior. It is *not*
+  residue: it is load-bearing on readback. The complexity is inherent to
+  the sidecar-vs-workbook distinction, not historical layering. The
+  functional model already names this (carrier-durable runtime facet).
+* `__legend_blocks` is confirmed residue: no runtime reader exists. The
+  load-bearing effect is `table.kind = "legend"`, not the stored dict.
+  Removable, subject to the leak check noted above.
+* Registry/runtime gap: `persistence_behavior` for `legend_blocks`
+  conflates the two carriers. The inventory recommends splitting the
+  wording so a future producer reads the sidecar rule and the carrier
+  rule separately.
+
+== Open Items for the Slice
+
+. [DONE] Grep-confirm there is no runtime reader of
+  `sheet.meta["__legend_blocks"]` -- confirmed residue (writers only).
+. Decide whether `resolved` deserves an explicit `carrier_only` lifecycle
+  marker (distinguishing it from FK-helper runtime provenance, which is
+  not carrier-durable).
+. Reconcile the registry `persistence_behavior` wording.
+. Draft the functional-model legend-block chapter from these facets.

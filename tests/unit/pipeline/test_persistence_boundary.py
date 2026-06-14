@@ -428,3 +428,66 @@ class TestIntentVsResolutionSlice:
         snapshot = copy.deepcopy(meta)
         project_meta_to_persistable_contract(meta)
         assert meta == snapshot
+
+
+# ---------------------------------------------------------------------------
+# FTR-LEGEND-BLOCKS-LIFECYCLE-P6 -- Slice B characterization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-LIFECYCLE-P6")
+class TestLegendBlocksSidecarProjection:
+    """Characterize the structured-sidecar projection for legend blocks.
+
+    Locks current behavior before any Slice C cleanup: the ``resolved``
+    Resolution facet is dropped at the sidecar, while every durable intent
+    facet (entries, placement, title, target, identity) is preserved.
+    """
+
+    def test_drops_resolved_keeps_intent_facets_including_target_and_identity(
+        self,
+    ) -> None:
+        meta = {
+            "legend_blocks": {
+                # mapping key is the legend identity
+                "status_codes": {
+                    "name": "status_codes",  # explicit identity facet
+                    "title": "Status Codes",
+                    "target": "product_matrix",
+                    "entries": [
+                        {"token": "E", "label": "Editable", "group": "input"},
+                    ],
+                    "placement": {
+                        "anchor": "right_of_table",
+                        "sheet": "product_matrix",
+                        "target": "product_matrix",
+                    },
+                    "resolved": {
+                        "frame_name": "legend_status_codes",
+                        "kind": "legend",
+                        "top": 1,
+                        "left": 5,
+                        "n_rows": 2,
+                        "n_cols": 3,
+                        "sheet": "product_matrix",
+                    },
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        block = out["legend_blocks"]["status_codes"]
+
+        # Resolution facet dropped at the sidecar.
+        assert "resolved" not in block
+        # Durable intent facets remain.
+        assert block["entries"] == [
+            {"token": "E", "label": "Editable", "group": "input"}
+        ]
+        assert block["placement"]["anchor"] == "right_of_table"
+        assert block["placement"]["target"] == "product_matrix"
+        assert block["title"] == "Status Codes"
+        assert block["target"] == "product_matrix"
+        assert block["name"] == "status_codes"
+        # Identity (mapping key) preserved.
+        assert set(out["legend_blocks"].keys()) == {"status_codes"}

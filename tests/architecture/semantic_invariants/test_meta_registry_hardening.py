@@ -101,7 +101,6 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "__autofilter": ("meta_rendering", "derived_operational_view"),
         "__freeze": ("meta_rendering", "derived_operational_view"),
         "__autofilter_ref": ("meta_rendering", "read_path_hint"),
-        "__legend_blocks": ("meta_rendering", "read_path_hint"),
         "_hidden": ("meta_rendering", "carrier_artifact"),
         "derived": ("meta_rendering", "derived_operational_view"),
     }
