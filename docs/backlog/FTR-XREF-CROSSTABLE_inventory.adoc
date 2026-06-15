@@ -1,0 +1,461 @@
+= XRef Crosstable Implementation Inventory
+:toc:
+:toclevels: 2
+
+Companion to the XRef Crosstable Functional Model at
+`docs/functional_model/ch04_use_case_concepts/xref_crosstable.adoc`.
+Maps FM intent to existing implementation, metadata paths, registry entries,
+tests, and consumer usage.  Does not propose changes.
+
+Source storylines:
+`docs/warm_storage/functional_transformation_concepts/xref_crosstable.adoc`
+and `docs/warm_storage/functional_transformation_concepts/xref_002.adoc`.
+
+== Scope
+
+Covers only what currently exists in the codebase.  Does not invent
+implementation concepts or FTR slices.
+
+In scope:
+
+* `src/spreadsheet_handling/domain/transformations/xref_crosstable/` —
+  `operation.py`, `dense_axes.py`, `primitives.py`
+* `src/spreadsheet_handling/domain/column_roles/resolver.py`
+* `src/spreadsheet_handling/pipeline/registry.py`
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py`
+* `registries/meta_registry.yaml` (`xref_crosstable` entry)
+* `tests/unit/domain/transformations/test_xref_crosstable.py`
+* `tests/integration/pipeline/test_sparse_crosstable_pipeline.py`
+
+== Functional Intent Summary
+
+The FM describes XRef as a scoped editable matrix projection over a durable
+tuple relation, with three conceptual steps:
+
+[cols="2,3", options="header"]
+|===
+| FM conceptual step | Summary
+
+| XRef Projection Declaration
+| Pipeline author declares entity frames, axis key fields, axis key sources, and
+  target relation.  Produces durable transformation intent.
+
+| Relation to Matrix Projection
+| Reads relation + resolved axis key lists → produces editable matrix frame +
+  transient XRef runtime resolution.
+
+| Matrix to Relation Recomposition
+| Reads edited matrix → resolves cell addresses → writes scoped updates to
+  target relation frame, preserving out-of-scope existing relation rows.
+|===
+
+== Current Implementation Map
+
+=== Pipeline Steps
+
+[cols="2,3", options="header"]
+|===
+| FM conceptual step | Implementation
+
+| XRef Projection Declaration
+| No standalone declaration step exists.  Declaration intent is embedded in
+  the parameters of `contract_xref` and `expand_xref`.  Intent fields are
+  written to `_meta.xref_crosstable.<config_id>` at step execution time.
+
+| Relation to Matrix Projection
+| `contract_xref` in `operation.py`.
+  Registered in `pipeline/registry.py` as YAML step name `contract_xref`.
+
+| Matrix to Relation Recomposition
+| `expand_xref` in `operation.py`.
+  Registered in `pipeline/registry.py` as YAML step name `expand_xref`.
+|===
+
+=== `contract_xref` Signature
+
+[source,python]
+----
+def contract_xref(
+    frames, *, relation, output, row_keys,
+    column_key="column_key", value="value",
+    column_keys=None, fill_value="", dense_axes=None, name=None,
+)
+----
+
+* `column_key` — field name in the source relation holding the column-axis
+  address values.
+* `column_keys` — static list of axis values (scope declaration).
+* `dense_axes` — dict with `rows_from` / `columns_from`; derives axis key
+  lists from configured entity frames.
+* `fill_value` — cell value for addresses absent from the relation (default
+  empty string).
+* `name` — config identifier used as `_meta` key; defaults to `output`.
+
+Precedence for column-axis key list (highest first):
+
+. Explicit `column_keys` parameter.
+. `dense_axes.columns_from` resolved from live entity frame.
+. Stored `dense_axes.resolved` from prior run meta.
+. Relation column order (fallback).
+
+=== `expand_xref` Signature
+
+[source,python]
+----
+def expand_xref(
+    frames, *, matrix, output, row_keys,
+    value_columns=None, column_key="column_key",
+    value="value", drop_empty=False, name=None,
+)
+----
+
+* `value_columns` — matrix columns to expand; defaults to all non-`row_keys`
+  columns when absent.
+* `column_key` — name for the output field that carries the column-axis key in
+  the resulting relation.
+* `drop_empty` — when True, omits blank cells from the output relation (sparse
+  mode).  When False, emits a row for every cell including blanks.
+* `name` — config identifier; defaults to `matrix`.
+
+== Conceptual Pieces Inventory
+
+[cols="2,2,3", options="header"]
+|===
+| FM conceptual piece | Implementation location | Notes
+
+| XRef Projection Intent (durable)
+| `_meta.xref_crosstable.<name>` fields: `operation`, `matrix`, `relation`,
+  `row_keys`, `column_key`, `value`, `drop_empty`, `dense_axes.columns_from`,
+  `dense_axes.rows_from`
+| Written by both steps.  Persistence boundary preserves these.
+
+| Axis Configuration
+| `contract_xref` params: `column_key`, `column_keys`, `dense_axes`,
+  `row_keys`
+| No separate configuration object; parameters are the declaration.
+
+| Editable Matrix Frame
+| Output DataFrame of `contract_xref`; stored in `frames[output]`.
+| Standard pipeline frame.
+
+| XRef Runtime Resolution
+| `_meta.xref_crosstable.<name>.column_keys` (resolved axis values);
+  `_meta.xref_crosstable.<name>.dense_axes.resolved` (row identities +
+  column keys from entity frames)
+| Both are stripped at the persistence boundary.
+
+| Updated Relation Frame
+| Output DataFrame of `expand_xref`; stored in `frames[output]`.
+| See gap note on scoped update below.
+|===
+
+== Metadata / Lifecycle Inventory
+
+=== `_meta.xref_crosstable.<name>`
+
+Written by both `contract_xref` and `expand_xref` via `_write_xref_meta` in
+`primitives.py`.  Config-id lookup in `_xref_config` tries by `name` first,
+then falls back to relation / matrix name match.
+
+==== Intent Fields (preserved at persistence boundary)
+
+[cols="2,3", options="header"]
+|===
+| Field | Meaning
+
+| `operation`
+| `"contract_xref"` or `"expand_xref"` — which step last wrote this entry.
+
+| `matrix`
+| Name of the matrix frame.
+
+| `relation`
+| Name of the relation frame.
+
+| `row_keys`
+| List of row-axis key field names.
+
+| `column_key`
+| Axis attribute — the configured key *field name* (not the values).
+
+| `value`
+| Name of the value field.
+
+| `drop_empty`
+| Bool; from `expand_xref`.  False = dense; True = sparse.
+
+| `dense_axes.columns_from`
+| Configured axis source for column-axis key list (frame + key field).
+
+| `dense_axes.rows_from`
+| Configured axis source for row-axis key list (frame + key field).
+|===
+
+==== Resolution Fields (stripped at persistence boundary)
+
+[cols="2,3", options="header"]
+|===
+| Field | Meaning
+
+| `column_keys`
+| Resolved list of column-axis key values for this run.
+  Distinct from `column_key` (the field name). Mirrored at top level.
+
+| `dense_axes.resolved.column_keys`
+| Snapshot of column-axis values resolved from entity frame this run.
+
+| `dense_axes.resolved.row_identities`
+| Snapshot of row-axis values resolved from entity frame this run.
+|===
+
+The meta registry classifies `xref_crosstable` as `canonical_meta` with
+`persistence_behavior: persisted in the hidden workbook metadata payload
+unchanged`.  The persistence boundary (`persistence_boundary.py`) applies
+a targeted projection that strips Resolution fields while preserving Intent
+fields.  These two descriptions are consistent: the *intent subset* persists
+unchanged; resolution sub-keys are stripped before write.
+
+=== `_meta.xref_crosstable.<name>` Consumers
+
+[cols="2,3", options="header"]
+|===
+| Consumer | Usage
+
+| `contract_xref`
+| Reads stored dense-axis config and resolved identities via
+  `_dense_axes_from_config_or_meta` when source frames are absent
+  (cross-run scenario; falls back to stored `dense_axes.resolved`).
+
+| `expand_xref`
+| Reads stored `column_keys` when `value_columns` is not supplied explicitly.
+
+| `column_roles/resolver.py`
+| Reads `_meta.xref_crosstable[*].matrix` and `.row_keys` to populate
+  `row_identity` for the column-role taxonomy (feeds `project_by_role`).
+|===
+
+=== `_meta.derived` (runtime only)
+
+Not written by XRef steps directly.  Consumed indirectly via
+`resolver.py::_fk_helper_provenance_columns` when resolving `display_helper`
+for projected frames that co-exist with XRef matrices.
+
+== Runtime Behavior Inventory
+
+=== Axis Key Resolution (`dense_axes.py`)
+
+`_dense_axes_from_config_or_meta` — tries explicit parameter first, then
+falls back to stored meta config (cross-run).
+
+`_resolve_dense_axes` — resolves `rows_from` / `columns_from` from live
+entity frames; falls back to `dense_axes.resolved` stored identities if source
+frames are absent on reimport.
+
+`_column_keys_from_axis_source` — reads entity frame, extracts key column
+values, validates uniqueness (fail-fast on duplicates).
+
+`_row_identities_from_axis_source` — reads entity frame, validates uniqueness.
+
+`_ensure_relation_within_dense_axes` — validates that relation rows / columns
+fall within the declared dense scope; error on unknown axis values.
+
+=== Validation (`primitives.py`, `operation.py`)
+
+`_ensure_unique_pairs` — validates no duplicate `(row_keys, column_key)`
+combinations in the source relation.  Implements the "duplicate relation
+entries → fail fast" requirement.
+
+`_ensure_flat_axis_labels` — validates that matrix column labels are flat
+strings (no MultiIndex).  Error message references `FTR-XREF-CROSSTABLE`
+explicitly.
+
+`_require_frame` — missing required frame → error; references
+`FTR-XREF-CROSSTABLE` in the message.
+
+=== Blank Cell Handling
+
+`expand_xref` with `drop_empty=False` (default): emits a row for every cell
+including blank / empty-string cells.  `drop_empty=True`: omits blank cells
+(sparse mode).
+
+FM interpretation: a present blank cell means "remove the relation entry for
+that address."  `drop_empty=False` preserves the blank-cell row in the output;
+`drop_empty=True` drops it.  The sparse-pipeline integration test uses the
+`drop_empty=True` path via `sparse_collapse`/`sparse_expand` composition, not
+directly.  See gap note on scoped update semantics below.
+
+== Worldbuilding Inventory
+
+The current worldbuilding pipeline uses the enrichment-before-XRef pattern
+described in the FM:
+
+[source,text]
+----
+technical relation (story_id, character_id, value)
+-> join_frames: character_id -> characters.id, name -> character_name
+-> named relation (story_id, character_name, value)
+-> contract_xref:
+     relation: story_cast_role_named
+     output:   story_cast_role_matrix
+     row_keys: [story_id]
+     column_key: character_name
+     value: value
+     dense_axes:
+       rows_from:    { frame: stories,    key: id   }
+       columns_from: { frame: characters, key: name }
+     name: story_cast_role_matrix
+----
+
+Key fields in use:
+
+* `characters.name` — configured axis source key field.
+* `character_name` — enriched relation column carrying the same address values.
+* `contract_xref` uses `character_name` as both `column_key` (relation field)
+  and the visible matrix column header.
+
+This is not an anti-pattern.  It is an explicitly configured alternate key that
+is declared unique in the `characters` entity frame.  The FM's "Configured Axis
+Keys" section covers this case.
+
+== Dynamic Projection Interaction
+
+`column_roles/resolver.py` bridges XRef and the column-role taxonomy defined
+by `FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5`:
+
+* For a projected matrix frame, `_row_keys_from_xref_meta` scans
+  `_meta.xref_crosstable[*]` for an entry whose `matrix` matches the frame
+  name, then returns the stored `row_keys` as the `row_identity` list.
+* This happens automatically from meta; no explicit `key_columns` override is
+  needed when XRef meta is present.
+* `display_helper` is resolved separately (view config or FK provenance).
+* `matrix_value` = all remaining columns (rest-by-exclusion).
+
+This is the mechanism that allows `project_by_role` (`FTR-DYNAMIC-FRAME-PROJECTION-P5`)
+and role-targeted validations (`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`) to
+address XRef matrix cells by role without hardcoding column names.
+
+The resolver is documented as *interim*: when `FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5`
+ships a unified `_meta.derived.sheets.<frame>.column_roles` channel, the
+resolver switches its source without changing its public signature.
+
+== Test Coverage
+
+=== Unit Tests (`test_xref_crosstable.py`, 496 lines)
+
+Coverage confirmed:
+
+* `expand_xref` basic round-trip
+* `contract_xref` basic shape
+* Full expand/contract round-trip
+* Named config (`name` parameter, multiple configs in meta)
+* Fallback to relation column order when no `column_keys` / `dense_axes`
+* Duplicate `(row_keys, column_key)` pair rejection (fail-fast)
+* MultiIndex matrix column rejection
+* Dense `rows_from` only (row-axis from entity frame)
+* Dense `rows_from` + `columns_from` (both axes from entity frames)
+* Empty relation → blank matrix
+* Round-trip preserving dense axis shape from meta (meta-only path)
+* Reuse of stored dense axes when source frames absent (cross-run fallback)
+* Sparse shape without dense axes
+* Duplicate dense axis key rejection (fail-fast)
+
+=== Integration Test (`test_sparse_crosstable_pipeline.py`)
+
+One test, marked `FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A`:
+
+`contract_xref` → `sparse_collapse` → `sparse_expand` → `expand_xref` using
+static `column_keys` (no `dense_axes`).  Confirms YAML pipeline composition
+and round-trip correctness.  Covers the `drop_empty` / sparse-expand path
+indirectly.
+
+=== Gaps in Test Coverage
+
+* No test for out-of-scope relation row preservation (carry-through of
+  existing relation rows whose addresses lie outside the axis scope).
+* No direct test for `drop_empty=True` as a standalone `expand_xref` call.
+* No test for the persistence boundary projection of XRef meta (`column_keys`
+  strip, `dense_axes.resolved` strip).
+* No test for `column_roles/resolver.py` reading XRef meta to derive
+  `row_identity`.
+
+== Gaps, Residue, and Open Questions
+
+=== Gap: Scoped Update Not Implemented
+
+The FM describes scoped recomposition: `expand_xref` (matrix → relation)
+should preserve existing relation rows whose addresses fall outside the
+configured axis scope.  The current `expand_xref` emits one row per matrix
+cell; it does not accept an existing relation frame and does not carry
+out-of-scope rows through.  The "scoped update" behavior described in the FM
+is not yet in the implementation.
+
+=== Gap: No Standalone Projection Declaration Step
+
+The FM models "XRef Projection Declaration" as a conceptually separable step
+that produces durable transformation intent before any matrix or relation is
+generated.  In the implementation, intent is written to meta as a side-effect
+of running `contract_xref` or `expand_xref`.  There is no standalone
+configuration step that declares the projection without also performing a
+transformation.
+
+=== Residue: `column_keys` Parameter Name Ambiguity at YAML Surface
+
+On the `contract_xref` YAML surface, `column_keys` is the static list of axis
+*values*, while `column_key` is the *field name*.  These are different kinds
+of information.  The meta payload stores both under the same `xref_crosstable`
+entry, making the distinction easy to miss when reading YAML config.
+
+The FM open question ("How should static and dense-axis key sources be unified
+in the current YAML surface...") maps directly to this ambiguity.
+
+=== Residue: Meta Registry vs. Persistence Boundary Wording
+
+The meta registry entry for `xref_crosstable` says "persisted in the hidden
+workbook metadata payload unchanged."  The persistence boundary applies a
+targeted projection that strips `column_keys` and `dense_axes.resolved`.
+Both statements are accurate when read carefully (the intent subset persists
+unchanged; resolution sub-keys are stripped), but the registry wording does
+not distinguish intent from resolution facets.
+
+=== Residue: `drop_empty` Semantics vs. FM Blank-Cell Model
+
+The FM states: "present blank cell → remove the relation entry."  The current
+`expand_xref` with `drop_empty=False` emits a row for every blank cell rather
+than removing it.  With `drop_empty=True`, blank cells are omitted from the
+output.  The mapping between the FM's blank-cell removal semantics and the
+current `drop_empty` flag is not fully defined.
+
+=== Open Question Carry-Through
+
+Open questions from the FM are repeated here for implementation-concept
+planning:
+
+. How should static `column_keys` and `dense_axes.columns_from` be unified in
+  the YAML surface?  What happens if both are present?
+. Should relation carry-through (existing relation frame as input to
+  `expand_xref`) be modeled as ordinary frame inventory or a recomposition
+  input?
+. How should `expand_xref` baseline handle blank present cells once scoped
+  update is introduced?
+. Which current `_meta.xref_crosstable` fields are load-bearing for all
+  consumers, and which are incidental residue?
+
+== Candidate Inputs for an Implementation Concept
+
+The following items are concrete enough to anchor a future implementation
+concept or FTR slice.  Listed without priority order:
+
+* *Scoped update in `expand_xref`* — accepting an existing relation frame,
+  carrying out-of-scope rows, and merging with recomposed in-scope rows.
+* *Persistence boundary test coverage* — unit test confirming that
+  `column_keys` and `dense_axes.resolved` are stripped from persisted meta,
+  and that intent fields survive.
+* *`column_roles` resolver meta sourcing* — test confirming that
+  `_row_keys_from_xref_meta` correctly populates `row_identity` for a matrix
+  frame whose config is in `_meta.xref_crosstable`.
+* *YAML surface clarification* — distinguish `column_key` (field name) from
+  `column_keys` (value list) in documentation and/or rename one at the surface
+  level.
+* *Meta registry annotation* — add Intent / Resolution classification to the
+  `xref_crosstable` entry, parallel to what `BUG-CROSS-CARRIER-META-ROUNDTRIP-P4A`
+  introduced for `dense_axes.resolved` at the boundary.

@@ -1,0 +1,692 @@
+= XRef Crosstable Implementation Concept
+:toc:
+:toclevels: 3
+
+Companion to the `FTR-XREF-CROSSTABLE` workstream.
+Maps the Functional Model intent and implementation inventory to current code,
+metadata lifecycle handling, tests, and safe follow-up slices.
+
+Intent source:
+
+* `docs/functional_model/ch04_use_case_concepts/xref_crosstable.adoc`
+* `docs/warm_storage/functional_transformation_concepts/xref_crosstable.adoc`
+* `docs/warm_storage/functional_transformation_concepts/xref_002.adoc`
+* `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`
+
+Evidence base: `docs/backlog/FTR-XREF-CROSSTABLE_inventory.adoc`
+
+== 1. Scope
+
+* This is an *implementation concept*, not an implementation. No runtime change
+  is made here.
+* It maps Functional Model conceptual pieces to current code, registry, and
+  tests, and proposes independently reviewable follow-up slices.
+* Boundary Pruning (ch05) is a cross-cutting concept; this document does not
+  propose a registered `prune` pipeline step.
+* Runtime function names (`contract_xref`, `expand_xref`) are existing surface
+  and are not renamed.
+
+== 2. Functional Intent Summary
+
+Baseline (see the FM entry; not duplicated here): a durable tuple relation is
+the storage- and processing-friendly representation of a relationship between
+two entity axes.  A matrix is the human-friendly editing surface: rows and
+columns correspond to entity axis members; each cell holds a relation entry for
+that address.
+
+The two pipeline steps implement a projection pair:
+
+[cols="2,2,3", options="header"]
+|===
+| FM conceptual step | Runtime name | Direction
+
+| Relation to Matrix Projection
+| `contract_xref`
+| relation → matrix (forward / compose path)
+
+| Matrix to Relation Recomposition
+| `expand_xref`
+| matrix → relation (reverse / reimport path)
+|===
+
+XRef is scoped: on recomposition, relation rows outside the configured axis
+scope must be preserved unchanged.  That scoping behavior is not yet
+implemented (see section 7).
+
+Axis keys may be technical primary keys or explicitly configured unique
+alternate keys (including human-readable fields such as `name`).  Visible
+labels are never parsed heuristically.  Fail-fast applies to non-unique keys,
+ambiguous values, and unknown axis values.
+
+== 3. Inventory-Derived Findings
+
+Organized by finding type; detail is in the inventory.
+
+=== Already Implemented and Aligned with FM
+
+* `contract_xref` and `expand_xref` exist and are registered in the pipeline.
+* Axis key resolution from `dense_axes.rows_from` / `dense_axes.columns_from`
+  is implemented, including entity-frame uniqueness validation and cross-run
+  meta fallback.
+* Static `column_keys` and dense-axis sources are both first-class.
+* Fail-fast validation: `_ensure_unique_pairs`, `_ensure_flat_axis_labels`,
+  `_ensure_relation_within_dense_axes`, `_require_frame`.
+* The persistence boundary (`persistence_boundary.py`) strips Resolution
+  facets (`column_keys`, `dense_axes.resolved`) and preserves Intent facets.
+* `column_roles/resolver.py` reads `_meta.xref_crosstable[*].matrix` /
+  `row_keys` to derive `row_identity` for the column-role taxonomy, feeding
+  `project_by_role` (`FTR-DYNAMIC-FRAME-PROJECTION-P5`) and role-targeted
+  validations (`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-P5`).
+* The worldbuilding enrichment pattern (relation enriched with
+  `character_name` → `contract_xref` using `character_name` as `column_key`)
+  is supported and current.
+
+=== Real Implementation Gaps
+
+* *Scoped recomposition (`expand_xref`):* The FM requires out-of-scope
+  existing relation rows to be preserved unchanged.  Current `expand_xref`
+  emits one row per matrix cell; it does not accept an existing relation frame
+  and does not carry out-of-scope rows through.
+* *No test coverage* for the scoped update behavior, the persistence boundary
+  XRef projection, or the `column_roles` resolver's XRef-meta path.
+
+=== Documentation / Registry Gaps
+
+* Meta registry entry for `xref_crosstable` says "persisted in the hidden
+  workbook metadata payload unchanged."  This is accurate for the workbook
+  carrier but omits that the sidecar persistence boundary strips `column_keys`
+  and `dense_axes.resolved`.  The two statements are not contradictory but the
+  registry wording is incomplete.
+* No per-facet Intent / Resolution annotation in the registry.
+
+=== Naming / Surface Residue
+
+* At the YAML surface `column_key` (field name) and `column_keys` (value list)
+  are different kinds of information under related names.  This is a
+  documentation/clarity concern, not a runtime bug.  No rename is proposed.
+* `drop_empty` encodes sparse-vs-dense behavior on `expand_xref`; its
+  relationship to the FM's blank-cell semantics (present blank → remove
+  relation entry) is not yet defined precisely.  This must be resolved before
+  the scoped-recomposition slice.
+
+=== Deferred Design Topics
+
+* Axis Mapping rich model (`FTR-XREF-AXIS-MAPPINGS-P4A2`): `identity_key`,
+  `address_key`, `display_label`, `order_key`, `group_key`.  Future; not
+  represented in current surface.
+* Grouped headers (`FTR-XREF-GROUPED-COLUMNS-P4A2`): structured axis display.
+* Standalone XRef Projection Declaration step: no current need; current
+  parameter-embedded intent is sufficient.
+* Attribute-driven persistence boundary (ch05 target state): cross-cutting;
+  out of scope.
+
+== 4. Conceptual Pieces → Implementation Alignment
+
+=== XRef Projection Intent (durable)
+
+* *FM conceptual piece:* durable transformation intent; must survive sidecar
+  persistence for any reimport run.
+* *Meta path:* `_meta.xref_crosstable.<name>` Intent fields: `operation`,
+  `matrix`, `relation`, `row_keys`, `column_key`, `value`, `drop_empty`,
+  `dense_axes.columns_from`, `dense_axes.rows_from`.
+* *Producer:* both `contract_xref` and `expand_xref` via `_write_xref_meta`.
+* *Consumers:* `contract_xref` (axis resolution fallback); `expand_xref`
+  (column-key list fallback); `column_roles/resolver.py` (row_identity
+  derivation); `layout_composer.compose_workbook`; `workbookir_to_frames`.
+* *Implementation status:* implemented; persists correctly via sidecar.
+* *Gap:* Intent written as side-effect of step execution; there is no prior
+  standalone declaration step.  Acceptable for now.
+
+=== XRef Runtime Resolution (transient)
+
+* *FM conceptual piece:* transient resolution data; re-derived each run;
+  not trusted from prior meta.
+* *Meta path:* `_meta.xref_crosstable.<name>.column_keys` and
+  `_meta.xref_crosstable.<name>.dense_axes.resolved`.
+* *Producer:* `contract_xref` / `dense_axes.py::_dense_axes_meta_payload`.
+* *Consumers:* `contract_xref` (cross-run fallback when entity frames absent);
+  `expand_xref` (column-key list fallback).
+* *Implementation status:* written by `contract_xref`; stripped by
+  `persistence_boundary.py::_project_xref_crosstable` before sidecar write.
+* *Gap:* the cross-run fallback path (entity frames absent → read
+  `dense_axes.resolved` from prior meta) is a deliberate design choice.
+  Its relationship to the FM's "transient" classification warrants the
+  registry wording fix in Slice B.
+
+=== Editable Matrix Frame
+
+* *FM conceptual piece:* workbook payload; the generated sheet for editing.
+* *Implementation status:* output DataFrame of `contract_xref`.  Standard
+  pipeline frame; no meta lifecycle concerns.  Implemented and aligned.
+
+=== Updated Relation Frame
+
+* *FM conceptual piece:* populated from recomposed in-scope cells plus
+  carried out-of-scope rows from the existing relation.
+* *Implementation status:* output DataFrame of `expand_xref`.  *Gap:* current
+  `expand_xref` emits rows for all matrix cells only; out-of-scope carry-through
+  is not implemented.  See Slice D.
+
+=== Axis Key Sources (configured)
+
+* *FM conceptual piece:* static configured lists and configured axis sources
+  are both first-class; neither is legacy behavior.
+* *Implementation status:*
+  ** Static: `column_keys` parameter on `contract_xref`.
+  ** Dense/dynamic: `dense_axes.columns_from` / `rows_from`.
+  ** Precedence (current): explicit `column_keys` > dense-axis resolution from
+     live frames > stored `dense_axes.resolved` fallback > relation column order.
+  ** Tests cover static, dense, fallback, and duplicate-key rejection.
+  ** Gap: the precedence chain is not documented at the YAML surface level.
+
+=== Column-Role Integration
+
+* *FM conceptual piece (implicit):* row-axis key fields are `row_identity`;
+  value cells are `matrix_value`; display helpers are separate.
+* *Implementation status:* `column_roles/resolver.py` reads XRef meta to
+  derive `row_identity`.  This is the bridge to `FTR-PROJECTED-FRAME-COLUMN-SEMANTICS-P5`
+  and `FTR-DYNAMIC-FRAME-PROJECTION-P5`.  The resolver is labeled *interim*
+  (will switch source when a unified channel ships).
+* *Gap:* no test for this meta-sourced `row_identity` derivation path.
+
+== 5. Lifecycle Reconciliation
+
+[cols="2,2,2", options="header"]
+|===
+| Information | Classification | Current boundary behavior
+
+| `operation`, `matrix`, `relation`, `row_keys`, `column_key`, `value`,
+  `drop_empty`, `dense_axes.columns_from`, `dense_axes.rows_from`
+| *Durable projection intent*
+| Preserved at sidecar boundary; survives to next run.
+
+| `column_keys`
+| *Runtime resolution* (resolved axis value list for one run)
+| Stripped by `_project_xref_crosstable` at sidecar boundary.
+
+| `dense_axes.resolved.column_keys`, `dense_axes.resolved.row_identities`
+| *Runtime resolution* (entity-frame snapshot for one run)
+| Stripped at sidecar boundary; preserved in workbook-embedded carrier for
+  cross-run axis reconstruction when source frames are absent.
+|===
+
+The intent / resolution split is already implemented and working.  The
+lifecycle framework terminology (ch05: durable intent, runtime resolution,
+transient working model) maps cleanly to the current implementation.  The
+cross-run dense-axis fallback (reading `dense_axes.resolved` from a prior run
+when entity frames are absent) is a deliberate cross-run persistence choice
+within the workbook carrier, not a lifecycle violation.
+
+Currently the boundary projection is field-specific code in
+`persistence_boundary.py::_project_xref_crosstable`.  The ch05 target state
+(attribute-driven projection keyed by lifecycle annotation in the registry) is
+out of scope for this workstream.
+
+== 6. Registry Reconciliation
+
+Current registry entry (`registries/meta_registry.yaml`):
+
+[source,yaml]
+----
+- name: xref_crosstable
+  layer: meta_canonical
+  classification: canonical_meta
+  persistence_behavior: persisted in the hidden workbook metadata payload unchanged
+  roundtrip_relevance: preserves row-key names, matrix column key order, and
+    resolved dense-axis identities for matrix/relation roundtrips
+----
+
+Comparison to the FM and inventory:
+
+* *Already correct:*
+  ** `canonical_meta` classification is consistent with Intent fields
+     persisting across runs.
+  ** Producer and consumer lists match the code.
+* *Needs small adjustment (Slice B):*
+  ** `persistence_behavior` conflates two carriers and two field classes.  It
+     is true that the workbook-embedded carrier persists the entry "unchanged,"
+     but the sidecar persistence boundary strips `column_keys` and
+     `dense_axes.resolved`.  The wording should distinguish sidecar (Intent
+     preserved, Resolution stripped) from workbook-embedded carrier (full entry
+     preserved).
+  ** `roundtrip_relevance` mentions "resolved dense-axis identities" as
+     preserved; this is the workbook-carrier behavior.  The sidecar roundtrip
+     does not carry resolution; a fresh run re-derives it.  Wording should
+     clarify which carrier.
+* *Unclear / future:*
+  ** Whether the registry gains per-facet lifecycle attribute granularity is
+     a framework question (`FTR-META-LIFECYCLE-INVENTORY-P5`), not resolved
+     here.
+  ** The `meaning` field mentions "resolved axis order" and "dense-axis
+     reconstruction contract" — both relate to Resolution facets; the current
+     entry does not distinguish them from Intent.
+
+The registry is *not* edited in this concept step.
+
+== 7. Runtime Behavior Reconciliation
+
+=== `contract_xref` (Relation → Matrix)
+
+Aligned with FM "Relation to Matrix Projection."  No gap for the forward
+direction.  Current behavior:
+
+* Reads relation frame + resolved axis key lists → produces matrix frame.
+* Axis key list sources: static `column_keys`, `dense_axes`, stored meta
+  fallback, relation-order fallback.
+* Dense-axis entity-frame uniqueness validated; unknown axis values rejected.
+* Writes XRef meta (Intent + Resolution facets).
+
+=== `expand_xref` (Matrix → Relation)
+
+Aligned with FM "Matrix to Relation Recomposition" on the cell-level
+mechanics (each matrix cell → one relation row), but *not* on scoped
+recomposition.
+
+==== Blank-Cell / `drop_empty` Semantics
+
+FM: "present blank cell → remove the relation entry for that matrix address
+inside the update scope."
+
+Current behavior:
+
+* `drop_empty=False` (default): emits a row for every cell, including blank
+  cells.  Blank cells appear as rows in the output relation.
+* `drop_empty=True`: omits blank cells from the output.  Blank cells do not
+  appear in the output relation.
+
+The `drop_empty=True` path is the closer match to the FM's blank-removal
+semantics in the context of scoped recomposition.  Whether `drop_empty=True`
+should become the scoped-recomposition default is a design decision (Slice C).
+Do not assume either polarity without a characterization test (Slice A) and a
+design lock (Slice C).
+
+==== Scoped Recomposition Gap
+
+FM: "outside the scope: existing relation rows are preserved unchanged."
+
+Current `expand_xref` does not accept an existing relation frame and does not
+carry out-of-scope rows.  It emits only the rows derived from matrix cells.
+A consumer that imports an edited matrix currently replaces the full output
+relation with matrix-derived rows, losing any tuples whose axis addresses were
+outside the XRef scope.
+
+This is the primary real implementation gap.  It requires:
+
+. Characterization tests locking current `expand_xref` behavior (Slice A).
+. A design decision on how to specify "scope" and the merge surface (Slice C).
+. Implementation of the carried relation (Slice D).
+
+=== `column_roles/resolver.py`
+
+Already aligned with the FM's implicit column-role model.  Reads XRef meta
+to derive `row_identity`; `matrix_value` is rest-by-exclusion.  The resolver
+is declared *interim* and its interface is stable; the implementation can
+switch sources without caller changes.
+
+No current test exercises the XRef-meta code path in isolation.
+
+== 8. Test Strategy Before Runtime Changes
+
+Proposed characterization tests; none exist today for these paths.
+
+=== A1 — Persistence-Boundary XRef Projection
+
+File: `tests/unit/pipeline/test_persistence_boundary.py` (extend).
+
+Assert that `_project_xref_crosstable`:
+
+* strips `column_keys` from each entry;
+* strips `dense_axes.resolved` when present;
+* preserves all Intent fields (`operation`, `matrix`, `relation`, `row_keys`,
+  `column_key`, `value`, `drop_empty`, `dense_axes.columns_from`,
+  `dense_axes.rows_from`);
+* passes entries through unchanged when neither `column_keys` nor
+  `dense_axes.resolved` is present.
+
+=== A2 — `column_roles` Resolver XRef-Meta Path
+
+File: `tests/unit/domain/column_roles/test_resolver.py` (new or extend).
+
+Assert that `resolve_column_roles` for a matrix frame name present in
+`_meta.xref_crosstable` returns the stored `row_keys` as `row_identity`,
+without providing explicit `key_columns`.
+
+=== A3 — `expand_xref` Blank-Cell Behavior
+
+File: `tests/unit/domain/transformations/test_xref_crosstable.py` (extend).
+
+Assert, explicitly, that:
+
+* `drop_empty=False` emits a row for a blank cell (value = `fill_value`);
+* `drop_empty=True` omits a blank cell (no corresponding output row).
+
+These are already implicitly covered by the roundtrip tests but benefit from
+an explicit focused assertion to document the invariant before any change.
+
+=== A4 — Static vs Dense Precedence
+
+File: `tests/unit/domain/transformations/test_xref_crosstable.py` (extend if
+not already covered).
+
+Assert that explicit `column_keys` takes precedence over `dense_axes.columns_from`
+when both are supplied.  Lock the fallback chain order.
+
+== 9. Proposed Implementation Slices
+
+Small and independently reviewable.  Documentation and test slices precede
+any runtime change.
+
+=== Slice A — Characterization Tests (tests only)
+
+* *Goal:* lock current behavior before any runtime change.
+* *Tests to add:* A1 through A4 from section 8.
+* *Files:* `tests/unit/pipeline/test_persistence_boundary.py`,
+  `tests/unit/domain/transformations/test_xref_crosstable.py`,
+  `tests/unit/domain/column_roles/test_resolver.py`.
+* *Runtime changes:* none.
+* *Risk:* low.  May surface a latent gap; that is the point.
+* *Rollback:* remove added tests.
+
+=== Slice B — Registry / Docs Wording (registry + docs only)
+
+* *Goal:* align registry `persistence_behavior` wording with the sidecar vs
+  workbook-carrier split and the Intent / Resolution distinction.
+* *Proposed wording change:* split the current single `persistence_behavior`
+  line into a brief description that (a) names which fields constitute Intent
+  and survive the sidecar boundary, and (b) notes that Resolution fields
+  (`column_keys`, `dense_axes.resolved`) are stripped at the sidecar boundary
+  but retained in the workbook-embedded carrier.
+* *Files:* `registries/meta_registry.yaml`.
+* *Do not:* redesign the registry schema; add per-facet lifecycle attributes;
+  touch runtime code.
+* *Tests:* registry invariant tests still pass.
+* *Risk:* low (text only).
+* *Rollback:* revert the wording.
+* *Note:* independent of Slice A; either order is safe.
+
+=== Slice C — Scoped Recomposition Design Lock (design doc / no runtime)
+
+*Status:* design locked.  Slice D may proceed.
+
+==== C.1 Explicit Base Relation Input
+
+Scoped recomposition is activated by an explicit optional parameter `base_relation`
+on `expand_xref`.
+
+[source,yaml]
+----
+- step: expand_xref
+  matrix: product_feature_matrix
+  output: feature_product_codes
+  base_relation: feature_product_codes_existing
+  row_keys: [feature_id]
+  column_key: product_id
+  value: value
+  value_columns: [P-001, P-002]
+  drop_empty: true
+----
+
+Rationale:
+
+* `base_relation` is a normal pipeline frame name, not a meta lookup.
+* `_meta` is intentionally not used as an implicit source of complex
+  recomposition behavior; this avoids accumulating hidden complexity in
+  metadata.
+
+==== C.2 Backward Compatibility / First-Run Behavior
+
+`base_relation` is optional.
+
+Without `base_relation`: current behavior unchanged (`matrix → relation`).
+First-run scenarios where no relation exists yet continue to work.
+
+With `base_relation`: scoped recomposition (`base_relation + matrix → updated
+relation`).
+
+There is no hidden mode switch or meta lookup.  Presence of the parameter is
+the only trigger.
+
+==== C.3 Update Scope
+
+The update scope during recomposition is defined by matrix cells that are
+actually present and validly addressable at runtime, not by the full set of
+configured axis members.
+
+[source,text]
+----
+configured axis key sources / resolved axis lists
+  describe the intended projection shape
+
+present, valid matrix cells
+  define the actual update scope during recomposition
+----
+
+[cols="2,3", options="header"]
+|===
+| Condition | Behavior
+
+| present row + present value column
+| address exists; cell participates in scoped update
+
+| missing row
+| no matrix addresses for that row; no update statements
+
+| missing column
+| no matrix addresses for that column; no update statements
+
+| invalid or ambiguous row/column identity
+| fail fast
+|===
+
+No UX-protection heuristics.  The step does not guess whether the user
+accidentally deleted a row or column.
+
+==== C.4 Merge Semantics
+
+[source,text]
+----
+present nonblank cell
+  -> set or replace addressed tuple in output
+
+present blank cell with drop_empty=True
+  -> addressed tuple absent from output (removed)
+
+present blank cell with drop_empty=False
+  -> addressed tuple emitted with empty value
+
+missing row or missing column
+  -> no update statement; base_relation row is out of scope
+
+out-of-scope base_relation row
+  -> preserved unchanged in output
+
+invalid or ambiguous address
+  -> fail fast
+----
+
+Base-relation rows whose addresses fall within the present cell scope are not
+blindly carried through; they are replaced or removed by the semantics above.
+
+==== C.5 `drop_empty` Remains the Only Blank-Cell Directive
+
+No second blank-cell flag is introduced.  `drop_empty` already characterizes
+whether blank cells are emitted.  In scoped recomposition its meaning is
+unchanged:
+
+[source,text]
+----
+drop_empty=False  blank present cell emits a tuple with empty value
+drop_empty=True   blank present cell emits no tuple
+----
+
+In the presence of `base_relation`, "emits no tuple" for an in-scope address
+means the matching base-relation tuple is removed from the output.  This is the
+merge interpretation of the existing `drop_empty` behavior, not a new semantic.
+
+==== C.6 Output Ordering
+
+Deterministic output order for Slice D tests:
+
+. Recomposed in-scope rows in matrix row order, value-column order.
+. Carried out-of-scope `base_relation` rows in their original order.
+
+Important distinction:
+
+[source,text]
+----
+out-of-scope ≠ not emitted
+----
+
+A `base_relation` row is out-of-scope only when its `(row_keys, column_key)`
+address is not present among valid matrix cell addresses.  A row whose address
+corresponds to a present blank matrix cell is *in-scope* and is governed by
+`drop_empty`.
+
+==== C.7 Relationship to FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A
+
+`sparse_collapse` / `sparse_expand` remain separate transformations.
+`expand_xref` must not interpret sparse-default metadata.
+
+[source,text]
+----
+Sparse collapse/expand:
+  compresses or reconstructs default values inside the matrix representation.
+
+Scoped recomposition:
+  merges matrix-derived relation updates with an existing base relation and
+  preserves out-of-scope relation rows.
+----
+
+If sparse-default empty cells should be reconstructed into explicit default
+values before XRef recomposition, the pipeline must run `sparse_expand` before
+`expand_xref`.  If the pipeline passes blank cells directly to `expand_xref`,
+`drop_empty` controls whether they become empty-value tuples or absent tuples.
+Sparse-default semantics are not folded into XRef.
+
+Reference: `docs/cold_storage/backlog/ftrs_done/FTR-SPARSE-CROSSTABLE-COLLAPSE-P4A.adoc`.
+
+==== C.8 Slice D Target Summary
+
+Slice D implements only:
+
+* optional `base_relation` parameter on `expand_xref`;
+* scoped recomposition when `base_relation` is supplied;
+* current behavior unchanged when `base_relation` is absent;
+* tests for all semantics in C.3–C.6.
+
+Required test cases for Slice D:
+
+* nonblank cell replaces base tuple;
+* blank cell with `drop_empty=True` removes base tuple;
+* blank cell with `drop_empty=False` keeps empty-value tuple;
+* missing row preserves base rows for that row;
+* missing column preserves base rows for that column;
+* out-of-scope base rows survive unchanged;
+* output order is deterministic (in-scope first, out-of-scope second);
+* invalid / ambiguous addresses fail fast.
+
+=== Slice D — Scoped Recomposition Implementation (first runtime change)
+
+* *Goal:* implement the carried relation / scoped update behavior in
+  `expand_xref`.
+* *Surface (locked by Slice C):* optional `base_relation` parameter.
+* *Confirmed runtime semantics (see C.3–C.6):*
+  ** Present nonblank cell → set or replace addressed relation tuple.
+  ** Present blank cell with `drop_empty=True` → addressed tuple absent from
+     output (removed from base relation).
+  ** Present blank cell with `drop_empty=False` → addressed tuple emitted with
+     empty value.
+  ** Missing matrix row or column → no update statement; base-relation rows for
+     those addresses are out of scope and preserved.
+  ** Out-of-scope base-relation rows → preserved unchanged.
+  ** Invalid or ambiguous address → fail fast.
+  ** Output order: in-scope rows in matrix order, then out-of-scope
+     base-relation rows in their original order.
+* *Test-gated by:* Slice A (characterization tests locked).
+* *Design-gated by:* Slice C (locked above).
+* *Files (expected):* `operation.py` in
+  `domain/transformations/xref_crosstable/`; extend unit tests.
+* *Risk:* medium.  Carries a behavioral change: `expand_xref` output gains
+  out-of-scope rows that were previously absent.  Any consumer that expects a
+  purely matrix-derived output will see new rows.
+* *Rollback:* revert the runtime change; Slice A tests remain as regression
+  guard.
+
+=== Slice E — Surface / Docs Clarification (deferred / low-risk)
+
+* *Goal:* address the `column_key` vs `column_keys` naming confusion at the
+  documentation and YAML surface level.
+* *Approach:* documentation only; add a note to the FM or the YAML surface
+  reference distinguishing "the key field name" from "the explicit value list."
+  Do not rename existing YAML fields.
+* *Do not:* change the runtime parameter names.  Any rename would require a
+  compatibility plan and a separate surface-versioning slice.
+* *Risk:* low if documentation-only; high if any YAML surface field is renamed.
+* *Note:* can follow any of Slices A–D; independent.
+
+== 10. Explicit Non-Goals
+
+* No runtime field rename (`column_key`, `column_keys`, `expand_xref`,
+  `contract_xref`, `drop_empty`).
+* No full Axis Mapping implementation (`FTR-XREF-AXIS-MAPPINGS-P4A2`).
+* No grouped headers implementation (`FTR-XREF-GROUPED-COLUMNS-P4A2`).
+* No compact multi-value cell implementation.
+* No composite-cell / multi-relation projection.
+* No Cell Codec redesign.
+* No Legend Block value-resolution implementation.
+* No Projection Structure Integrity implementation.
+* No workbook_view redesign.
+* No registered `prune` pipeline step (Boundary Pruning stays a concept).
+* No standalone XRef Projection Declaration step.
+* No attribute-driven persistence boundary (cross-cutting; tracked under
+  `FTR-META-LIFECYCLE-INVENTORY-P5`).
+* No Git-specific lifecycle assumptions.
+* No spreadsheet adapter refactor.
+* No changes to the Consumer / Demo integration surface.
+
+== 11. Recommended Order
+
+[cols="1,2,2,1", options="header"]
+|===
+| Slice | Type | Risk | First runtime change?
+
+| A — Characterization tests
+| Tests only
+| Low
+| No
+
+| B — Registry / docs wording
+| Docs / registry only
+| Low
+| No
+
+| C — Scoped recomposition design lock
+| Design decision; no code
+| Low (medium if skipped)
+| No
+
+| D — Scoped recomposition implementation
+| Runtime change
+| Medium
+| *Yes*
+
+| E — Surface / docs clarification
+| Docs / registry only
+| Low
+| No
+|===
+
+Recommended sequence: *A → B → C → D*.  E is independent and can follow any
+earlier slice or be deferred.
+
+Slices A and B are independent and can be done in either order.
+Slice C must precede Slice D.
+Slice D is the only slice that changes runtime behavior; all prior slices are
+reversible text or test changes.
+
+Deferred and not tracked as slices here:
+
+* `FTR-XREF-AXIS-MAPPINGS-P4A2` — richer axis model.
+* `FTR-XREF-GROUPED-COLUMNS-P4A2` — grouped axis headers.
+* Attribute-driven persistence boundary — cross-cutting framework work.
+* YAML surface rename — requires separate compatibility planning.
