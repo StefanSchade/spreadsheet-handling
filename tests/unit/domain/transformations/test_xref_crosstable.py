@@ -543,6 +543,137 @@ def test_contract_xref_rejects_tuples_outside_configured_dense_axes() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# FTR-XREF-CROSSTABLE Slice A -- characterization tests before runtime changes
+# ---------------------------------------------------------------------------
+
+
+class TestExpandXrefBlankCellBehavior:
+    """Characterize drop_empty behavior as a named invariant before Slice D.
+
+    Slice D (scoped recomposition) will change what happens to blank cells in
+    an out-of-scope vs in-scope context.  These tests lock the *current*
+    behavior of expand_xref in isolation so that any change is deliberate.
+    """
+
+    def test_drop_empty_false_emits_row_for_blank_cell(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({
+                "row_key": ["r1"],
+                "col_A": [""],
+            })
+        }
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relation",
+            row_keys=["row_key"],
+            value_columns=["col_A"],
+            drop_empty=False,
+        )
+        assert out["relation"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": ""},
+        ]
+
+    def test_drop_empty_true_omits_row_for_blank_cell(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({
+                "row_key": ["r1", "r2"],
+                "col_A": ["present", ""],
+            })
+        }
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relation",
+            row_keys=["row_key"],
+            value_columns=["col_A"],
+            drop_empty=True,
+        )
+        assert out["relation"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": "present"},
+        ]
+
+    def test_drop_empty_default_matches_false(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({
+                "row_key": ["r1"],
+                "col_A": [""],
+            })
+        }
+        out_false = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relation",
+            row_keys=["row_key"],
+            value_columns=["col_A"],
+            drop_empty=False,
+        )
+        out_default = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relation",
+            row_keys=["row_key"],
+            value_columns=["col_A"],
+        )
+        assert (
+            out_false["relation"].to_dict(orient="records")
+            == out_default["relation"].to_dict(orient="records")
+        )
+
+
+@DENSE_FTR
+class TestColumnKeysAndDenseColumnFromInteraction:
+    """Characterize the interaction when both column_keys and dense_axes.columns_from
+    are supplied.
+
+    Actual behavior: a consistency check, not a precedence relationship.
+    Both sources must agree on the same ordered list; if they disagree the step
+    fails fast.  This documents the current contract before any surface change
+    (Slice E).
+    """
+
+    def test_matching_column_keys_and_dense_columns_from_succeeds(self) -> None:
+        frames = {
+            "contexts": pd.DataFrame({"context_id": ["A", "B"]}),
+            "values": pd.DataFrame(columns=["row_key", "context_id", "text"]),
+        }
+        out = contract_xref(
+            frames,
+            relation="values",
+            output="matrix",
+            row_keys=["row_key"],
+            column_key="context_id",
+            value="text",
+            column_keys=["A", "B"],
+            dense_axes={
+                "columns_from": {"frame": "contexts", "key": "context_id"},
+            },
+            name="consistency_test",
+        )
+        assert list(out["matrix"].columns) == ["row_key", "A", "B"]
+
+    def test_mismatched_column_keys_and_dense_columns_from_fails_fast(self) -> None:
+        frames = {
+            "contexts": pd.DataFrame({"context_id": ["A", "B", "C"]}),
+            "values": pd.DataFrame(columns=["row_key", "context_id", "text"]),
+        }
+        with pytest.raises(ValueError, match="column_keys must match dense_axes.columns_from"):
+            contract_xref(
+                frames,
+                relation="values",
+                output="matrix",
+                row_keys=["row_key"],
+                column_key="context_id",
+                value="text",
+                column_keys=["A", "B"],
+                dense_axes={
+                    "columns_from": {"frame": "contexts", "key": "context_id"},
+                },
+                name="mismatch_test",
+            )
+
+
 @DENSE_FTR
 def test_contract_xref_dense_multicolumn_row_keys() -> None:
     frames = {

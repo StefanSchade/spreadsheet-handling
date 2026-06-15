@@ -491,3 +491,120 @@ class TestLegendBlocksSidecarProjection:
         assert block["name"] == "status_codes"
         # Identity (mapping key) preserved.
         assert set(out["legend_blocks"].keys()) == {"status_codes"}
+
+
+# ---------------------------------------------------------------------------
+# FTR-XREF-CROSSTABLE Slice A -- A1: sidecar projection characterization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ftr("FTR-XREF-CROSSTABLE")
+class TestXrefCrosstableSidecarProjection:
+    """Lock current sidecar boundary behavior for xref_crosstable.
+
+    Characterization tests for Slice A.  Guards the Intent vs Resolution split
+    before Slice D (scoped recomposition) touches runtime code.
+    """
+
+    def test_strips_all_resolution_preserves_all_intent_fields(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "product_feature_matrix": {
+                    "operation": "contract_xref",
+                    "matrix": "product_feature_matrix",
+                    "relation": "feature_product_codes",
+                    "row_keys": ["feature_id"],
+                    "column_key": "product_id",
+                    "value": "code",
+                    "drop_empty": True,
+                    "column_keys": ["P-001", "P-002"],
+                    "dense_axes": {
+                        "rows_from": {"frame": "features", "key": "id"},
+                        "columns_from": {"frame": "products", "key": "name"},
+                        "resolved": {
+                            "row_identities": [{"id": "f1"}],
+                            "column_keys": ["P-001", "P-002"],
+                        },
+                    },
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        entry = out["xref_crosstable"]["product_feature_matrix"]
+
+        # Resolution fields gone.
+        assert "column_keys" not in entry
+        dense = entry["dense_axes"]
+        assert "resolved" not in dense
+
+        # All intent fields intact.
+        assert entry["operation"] == "contract_xref"
+        assert entry["matrix"] == "product_feature_matrix"
+        assert entry["relation"] == "feature_product_codes"
+        assert entry["row_keys"] == ["feature_id"]
+        assert entry["column_key"] == "product_id"
+        assert entry["value"] == "code"
+        assert entry["drop_empty"] is True
+        assert dense["rows_from"] == {"frame": "features", "key": "id"}
+        assert dense["columns_from"] == {"frame": "products", "key": "name"}
+
+    def test_entry_without_resolution_fields_passes_through_unchanged(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "bare_config": {
+                    "operation": "contract_xref",
+                    "matrix": "bare_config",
+                    "relation": "bare_relation",
+                    "row_keys": ["id"],
+                    "column_key": "tag",
+                    "value": "val",
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+        entry = out["xref_crosstable"]["bare_config"]
+
+        assert entry == meta["xref_crosstable"]["bare_config"]
+
+    def test_multiple_named_configs_processed_independently(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "config_with_resolution": {
+                    "operation": "contract_xref",
+                    "matrix": "matrix_a",
+                    "relation": "relation_a",
+                    "row_keys": ["id"],
+                    "column_key": "col",
+                    "value": "v",
+                    "column_keys": ["x", "y"],
+                    "dense_axes": {
+                        "columns_from": {"frame": "f", "key": "col"},
+                        "resolved": {"column_keys": ["x", "y"]},
+                    },
+                },
+                "config_without_resolution": {
+                    "operation": "expand_xref",
+                    "matrix": "matrix_b",
+                    "relation": "relation_b",
+                    "row_keys": ["id"],
+                    "column_key": "col",
+                    "value": "v",
+                },
+            },
+        }
+
+        out = project_meta_to_persistable_contract(meta)
+
+        first = out["xref_crosstable"]["config_with_resolution"]
+        assert "column_keys" not in first
+        assert "resolved" not in first["dense_axes"]
+        assert first["dense_axes"]["columns_from"] == {"frame": "f", "key": "col"}
+        assert first["matrix"] == "matrix_a"
+
+        second = out["xref_crosstable"]["config_without_resolution"]
+        assert second["operation"] == "expand_xref"
+        assert second["matrix"] == "matrix_b"
+        assert "column_keys" not in second
+        assert "dense_axes" not in second

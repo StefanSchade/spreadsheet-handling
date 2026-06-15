@@ -278,3 +278,118 @@ def test_overlap_between_identity_and_helper_resolves_to_identity(
     assert any(
         "both row_identity and display_helper" in record.message for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# FTR-XREF-CROSSTABLE Slice A -- A2: XRef-meta row-identity path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ftr("FTR-XREF-CROSSTABLE")
+class TestXrefMetaRowIdentityPath:
+    """Characterize the resolver's XRef-meta row-identity derivation path.
+
+    Locks the interim resolver behavior: when _meta.xref_crosstable[*].matrix
+    matches the requested frame name, the stored row_keys supply row_identity
+    without an explicit key_columns override.  Guards the behavior before Slice D.
+    """
+
+    @staticmethod
+    def _cast_frame() -> pd.DataFrame:
+        return pd.DataFrame({
+            "story_id": ["s1"],
+            "story_title": ["The Cave"],
+            "Galli": ["E"],
+            "Donzo": ["N"],
+        })
+
+    def test_xref_meta_row_keys_become_row_identity(self) -> None:
+        frames = {
+            "story_cast_role_matrix": self._cast_frame(),
+            "_meta": {
+                "xref_crosstable": {
+                    "story_cast_role_matrix": {
+                        "matrix": "story_cast_role_matrix",
+                        "row_keys": ["story_id"],
+                    },
+                },
+            },
+        }
+
+        roles = resolve_column_roles(frames, frame="story_cast_role_matrix")
+
+        assert roles.row_identity == ["story_id"]
+
+    def test_non_identity_columns_become_matrix_value_by_exclusion(self) -> None:
+        frames = {
+            "story_cast_role_matrix": self._cast_frame(),
+            "_meta": {
+                "xref_crosstable": {
+                    "story_cast_role_matrix": {
+                        "matrix": "story_cast_role_matrix",
+                        "row_keys": ["story_id"],
+                    },
+                },
+            },
+        }
+
+        roles = resolve_column_roles(frames, frame="story_cast_role_matrix")
+
+        assert "story_id" not in roles.matrix_value
+        assert "story_title" in roles.matrix_value
+        assert "Galli" in roles.matrix_value
+        assert "Donzo" in roles.matrix_value
+
+    def test_xref_meta_for_different_frame_does_not_supply_row_identity(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        frames = {
+            "product_matrix": self._cast_frame(),
+            "_meta": {
+                "xref_crosstable": {
+                    "story_cast_role_matrix": {
+                        "matrix": "story_cast_role_matrix",
+                        "row_keys": ["story_id"],
+                    },
+                },
+            },
+        }
+
+        with caplog.at_level(logging.WARNING, logger="sheets.column_roles"):
+            roles = resolve_column_roles(frames, frame="product_matrix")
+
+        assert roles.row_identity == []
+        assert any("row_identity" in record.message for record in caplog.records)
+
+    def test_display_helper_from_view_config_independent_of_xref_row_identity(
+        self,
+    ) -> None:
+        frames = {
+            "story_cast_role_matrix": self._cast_frame(),
+            "_meta": {
+                "xref_crosstable": {
+                    "story_cast_role_matrix": {
+                        "matrix": "story_cast_role_matrix",
+                        "row_keys": ["story_id"],
+                    },
+                },
+                "workbook_view": {
+                    "sheets": [
+                        {
+                            "frame": "story_cast_role_matrix",
+                            "sheet": "story_cast_role",
+                            "order": 0,
+                        },
+                    ],
+                },
+                "sheets": {
+                    "story_cast_role": {"helper_columns": ["story_title"]},
+                },
+            },
+        }
+
+        roles = resolve_column_roles(frames, frame="story_cast_role_matrix")
+
+        assert roles.row_identity == ["story_id"]
+        assert roles.display_helper == ["story_title"]
+        assert roles.matrix_value == ["Galli", "Donzo"]
