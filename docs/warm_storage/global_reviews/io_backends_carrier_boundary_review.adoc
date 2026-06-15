@@ -1,0 +1,1162 @@
+= io_backends / Carrier-Boundary Architecture Review (Max-Depth, Focused)
+:toc:
+:toclevels: 3
+:reviewed-branch: main
+:reviewed-head: d2e8394 (feat(FTR-XREF-CROSSTABLE): add scoped recomposition to expand_xref)
+:review-date: 2026-06-15
+:review-type: focused architecture review -- carrier boundary (read-only)
+:baseline-review-1: docs/warm_storage/global_reviews/architecture_health_review.adoc
+:baseline-review-2: docs/warm_storage/global_reviews/next_program_sequencing_review.adoc
+
+[NOTE]
+====
+Read-only architecture review. No runtime code, tests, registries, backlog
+items, or release notes were modified. Findings are recorded here; fixes are
+not performed. Reviewed state is `main` at `d2e8394` (working tree clean apart
+from the two untracked baseline review artifacts). This review builds on the
+two baseline reviews above and does *not* redo the broad architecture health
+survey; it focuses on `io_backends` and the rendering/carrier seam.
+====
+
+== 1. Executive Summary
+
+`io_backends` is a *Mild hotspot* -- not Healthy-and-bounded, not Structural,
+and emphatically not an Immediate blocker. The carrier-boundary *architecture*
+is in good shape: the seams are fenced by AST import-graph guards, the
+rendering layer is provably carrier-neutral, domain coupling is a single
+deliberate exception (`legend_blocks`), and the safety-critical read paths are
+well characterized. What earns the "mild hotspot" label is *concentration and
+duplication inside the ODS backend*, plus a handful of carrier-neutral helpers
+that are copied across the two backends instead of shared.
+
+The dominant fact: `ods/odf_parser.py` is 1147 LOC and *~48% of it (≈555 LOC)
+is presentation-metadata extraction* organized as four families, three of which
+(`horizontal_alignments`, `vertical_alignments`, `text_orientations`) share
+~250 LOC of *near-duplicated cell-walk* code that differs only in which style
+map it consults and which value key it writes. This is the single clearest
+piece of accidental growth. Importantly, *most* of the ODS/XLSX size gap is
+*not* accidental: ODF stores presentation through named styles the parser must
+resolve, while `openpyxl` resolves them into per-cell objects -- so ODS is
+intrinsically heavier, and that part should be left alone.
+
+The right operating mode here matches the baseline reviews: *small,
+capability-driven slices*, and -- a refinement this review adds -- the *safest
+first slices are zero-runtime hygiene that is even lower-risk than ODS
+modularization*: an architecture guard locking `legend_blocks` as the sole
+permitted domain crossing, and consolidating helpers that are currently copied
+verbatim across backends (a 5-copy blob decoder, and three byte-identical
+legend/meta helpers). These reduce the blast radius of the eventual ODS
+modularization without touching the fragile core.
+
+*Bottom line:* the carrier boundary is architecturally ready to receive its
+next wave of preparation. Do the cheap cross-cutting hygiene first, then a
+*within-ODS* presentation-extractor consolidation (its characterization already
+exists), and only after that consider a presentation submodule. Do *not* start
+grouped headers or nested lists, and do *not* touch the repeated-cell safety
+core (`_parse_table_grid`) or the deliberately divergent ODS/XLSX renderer
+architectures.
+
+== 2. Relationship to Previous Reviews
+
+This review *confirms and sharpens* the baseline, and corrects two points of
+emphasis.
+
+*Confirmed:*
+
+* "The spreadsheet adapter / carrier layer is the next architectural gravity
+  point" (architecture_health_review §6). True, and localized: the gravity is
+  in the ODS parser's presentation-extraction block.
+* "ODS parser/renderer concentration is a Yellow risk, not an emergency." Exactly
+  -- this review reclassifies it precisely as a *Mild hotspot*.
+* "`legend_blocks` is the one legitimate domain crossing; all other families
+  ride `_meta` opaque." Confirmed by grep: `legend_blocks` is the *only* domain
+  family token anywhere in `io_backends` (§3).
+* "Grouped headers / nested lists should not start yet because they land in the
+  least-prepared layer." Confirmed -- with one refinement below.
+* The sequencing review's *Phase 5 (adapter preparation, bounded + guard-backed)*
+  placement is correct. This review supplies the concrete, ordered slice list
+  for that phase (§13) and its decomposition map (Appendix).
+
+*Sharpened / corrected:*
+
+. *Grouped headers are not greenfield in the carrier.* The baseline frames them
+  as needing "a generic multi-row-header render capability." In fact a multi-row
+  header path *already exists end-to-end* for pandas `MultiIndex`: compose
+  (`layout_composer._build_header_grid_and_merges`) → plan
+  (`flow.build_render_plan` emits `SetHeader` + `MergeCells`) → parse
+  (`parser_interpretation._detect_header_rows` / `_extract_header_grid` /
+  `_extract_header_merges` in *both* backends) → project
+  (`workbook_projection.workbookir_to_frames` rebuilds the `MultiIndex` by
+  splitting on `" / "`). Grouped headers is therefore an *extension of an
+  existing, duplicated path*, not a new build. That lowers the feature risk but
+  raises a maintenance point: the header machinery is already copied across
+  three places.
+. *`presentation_meta.py` consolidated policy, not extraction.* The baseline
+  cites it (correctly) as a successful extraction. This review adds the nuance
+  that it consolidated the *replace-or-clear policy*, while the *extraction
+  walk* remains duplicated within each parser -- which is the actual next
+  target (§5, §6).
+
+== 3. Responsibility Map (Carrier-Boundary Layer)
+
+The as-built layering (each arrow verified against
+`tests/architecture/spreadsheet_contract/test_adapter_contract_boundary_guards.py`):
+
+[source,text]
+----
+domain/transformations + pipeline   (produce frames + opaque _meta dict)
+        │
+        ▼
+rendering/  ............................. carrier-NEUTRAL (guard: no openpyxl/odf)
+  composer/layout_composer  frames+meta → WorkbookIR (1 table/sheet, headers, legend place)
+  frame_selection           workbook_view / frame_lifecycle → which frames render
+  passes/ (11 passes)       WorkbookIR → annotated WorkbookIR (__style/__autofilter/…)
+  flow.build_render_plan    WorkbookIR → RenderPlan (list[RenderOp])
+  plan                      ~17 frozen RenderOp dataclasses (canonical vocab enforced)
+  ir                        WorkbookIR / SheetIR / TableBlock (neutral)
+  workbook_projection       WorkbookIR → frames (read) + canonicalize_workbook_meta
+        │
+        ▼
+io_backends/spreadsheet_contract  (FACADE, neutral 2-function seam)
+  build_spreadsheet_render_plan(frames, meta) → RenderPlan
+  read_spreadsheet_frames(path, parser)       → frames
+        │
+        ▼
+io_backends/{xlsx,ods}/  ................ carrier-SPECIFIC
+  *_backend     thin BackendBase entry (write_multi/read_multi) → delegates to contract
+  *_renderer    RenderPlan → file        (consumes plan only; never reaches back)
+  *_parser      file → WorkbookIR         (stops at IR; imports only ir + interpretation)
+  parser_interpretation  carrier-neutral table interpretation (header/extent/merges)
+----
+
+[cols="3,3,1,1,1,2", options="header"]
+|===
+| Responsibility | Owning module(s) | Ownership clear? | Neutral / Specific | Leaks domain? | Disposition
+
+| Backend selection / routing
+| `router.py` (`LOADERS`/`SAVERS`/`BACKENDS`); `base.make_backend`
+| Mostly (see Finding F1: *three* parallel mechanisms)
+| Neutral
+| No
+| Stay; do not unify speculatively
+
+| Public backend API
+| `base.BackendBase` (write/read/write_multi/read_multi)
+| Yes (single-sheet `write`/`read` are vestigial -- real work is `*_multi`)
+| Neutral
+| No
+| Stay; tolerate the vestigial pair
+
+| Backend options / capability flags
+| `base.BackendOptions` + `coerce_backend_options`
+| Yes
+| Neutral
+| No
+| Stay (prompt's `options.py` does not exist; this is its home)
+
+| Carrier-neutral spreadsheet contract
+| `spreadsheet_contract.py` (facade) + `SpreadsheetParser`/`Renderer` Protocols
+| Yes -- thin and guard-fenced
+| Neutral
+| No
+| Stay thin; keep central (§14 Q5)
+
+| Carrier-neutral render intent / workbook projection
+| `rendering/composer`, `rendering/flow`, `rendering/plan`, `rendering/ir`, `rendering/passes`, `rendering/workbook_projection`, `rendering/frame_selection`
+| Yes
+| Neutral (guard-enforced no openpyxl/odf)
+| Reads `_meta` keys as *intent*, not code
+| Stay
+
+| Carrier-specific parser
+| `xlsx/openpyxl_parser.py` (499), `ods/odf_parser.py` (1147)
+| Yes
+| Specific
+| Only `legend_blocks` (string-key read)
+| ODS is the hotspot (§6)
+
+| Carrier-specific renderer
+| `xlsx/openpyxl_renderer.py` (405, live model), `ods/odf_renderer.py` (675, buffered model)
+| Yes
+| Specific
+| No
+| Divergence is legitimate (§7)
+
+| Table interpretation (header detect / extent / merges)
+| `xlsx/parser_interpretation.py` (289), `ods/parser_interpretation.py` (265)
+| Yes (guard-enforced seam)
+| Neutral logic over a carrier-specific accessor
+| No
+| *Near-duplicated across the two* (Finding F2)
+
+| Hidden-metadata carrier handling
+| XLSX hidden sheet (`sheet_state`); ODS `display:false` table style / name `_meta`
+| Yes
+| Specific mechanism, shared role
+| No
+| Stay; role is registry-classified
+
+| Workbook-level metadata handling
+| `workbook_meta_blob` (hidden `_meta` sheet, JSON) -- written by composer/passes, read by both parsers + `workbook_projection`
+| Yes
+| Carrier artifact (registry: `carrier_artifact`)
+| No
+| Stay
+
+| Presentation metadata extract / replace / clear
+| Extract: per-backend `_extract_*` ×4. Policy: `presentation_meta.apply_cell_addressed_presentation_meta` (shared)
+| Policy yes; *extraction duplicated within each parser*
+| Neutral policy + specific extraction
+| No
+| Policy: keep. Extraction: consolidate (§5/§6)
+
+| Visible support-surface classification (legend)
+| `_legend_table_hints` + `_apply_legend_table_hints` in *both* parsers
+| Yes
+| Neutral logic (byte-identical copies)
+| Reads `legend_blocks` (the one accepted crossing)
+| Hoist to shared module (Finding F3)
+
+| Sheet mapping / workbook-view reconstruction
+| `frame_selection.select_render_frames` (write); `domain.workbook_views.resolve_workbook_view_sheet_mappings` (read, domain-side)
+| Yes
+| Neutral (render side)
+| Reads `workbook_view`/`frame_lifecycle` as intent
+| Stay
+
+| Parser limits / repeated-cell protection
+| `parser_limits.ParserLimits`; `ods/odf_parser._parse_table_grid`
+| Yes
+| Shared limits + ODS-specific core
+| No
+| *Do not touch* (§9, Appendix)
+
+| XLSX/ODS parity management
+| `tests/integration/io_backends/test_ods_xlsx_parity.py`
+| Yes (test-owned)
+| Cross-carrier
+| No
+| Strong; see §10
+
+| Accepted carrier capability gaps
+| Documented-gap *tests* + ODS renderer `continue # not implemented in this slice`
+| Partial -- *scattered*, no central record
+| Cross-carrier
+| No
+| Add small profile doc (§9)
+
+| Blob decode (`json` → `ast.literal_eval` fallback)
+| `ods/odf_parser`, `xlsx/openpyxl_parser`, `rendering/workbook_projection`, `rendering/passes/_base`, `rendering/flow`
+| *No -- 5 copies* (Finding F4)
+| Neutral
+| No
+| Consolidate (§13 slice 4)
+|===
+
+*Finding F1 (low):* three parallel backend-dispatch mechanisms coexist: the OO
+`BackendBase`/`make_backend`, the `router.py` `LOADERS`/`SAVERS`/`BACKENDS`
+function/class dicts, and the `SpreadsheetParser`/`SpreadsheetRenderer`
+Protocols. They do not conflict and each has a caller, but a newcomer must learn
+all three. *Risk:* mild onboarding cost; not a hotspot. *Recommendation:*
+leave as-is; do not unify speculatively (no capability pressure).
+
+*Finding F2 (medium):* `xlsx/parser_interpretation.py` and
+`ods/parser_interpretation.py` are *structurally near-identical* --
+`build_sheet_meta_hints`, `build_visible_sheet_ir`, `_parse_table_block`,
+`_detect_header_rows`, `_find_col_extent`, `_find_row_extent`,
+`_extract_header_merges`, `_extract_header_grid`, and an identical
+`OPTION_HINT_KEYS` tuple -- differing only in the cell accessor (`_grid_value`
+over a pre-parsed `ParsedTable` vs `_cell_value` over a live `Worksheet`). This
+is the carrier-neutral table-interpretation logic, copied per backend. See §7
+for why this is the higher-value (but higher-risk) consolidation.
+
+== 4. Domain Coupling Assessment
+
+*Method:* grep for the 13 transformation-family tokens listed in the prompt
+across `io_backends/` and `rendering/`, plus a check for `domain/` *imports*.
+
+[source,text]
+----
+# domain-family tokens in io_backends  →  ONLY legend_blocks
+ods/odf_parser.py:871:        legend_blocks
+xlsx/openpyxl_parser.py:351:   legend_blocks
+
+# domain/ imports inside io_backends OR rendering  →  <none>
+----
+
+*Fact -- the boundary is data-shaped, not code-shaped.* Neither `io_backends`
+nor `rendering` imports any `spreadsheet_handling.domain` module. All
+interaction with domain output is through the opaque `_meta` dict and documented
+string keys. The "coupling" that exists is *knowledge of the `_meta` schema*,
+which is exactly what `registries/meta_registry.yaml` is for.
+
+[cols="2,2,3", options="header"]
+|===
+| Reference | Layer | Verdict
+
+| `legend_blocks`
+| `io_backends` (both parsers)
+| *Legitimate carrier-boundary concern.* A rendered legend is a *visible* table; the parser must classify it (`table.kind = "legend"`) so it is not treated as payload. Reads `_meta.legend_blocks[*].resolved.{sheet,top,left,frame_name}`. This is the accepted exception.
+
+| `legend_blocks`
+| `rendering` (`composer`, `passes/_base`, `workbook_projection`)
+| *Legitimate render intent.* Composer places legend tables and freezes `resolved` coordinates; `_base` reads legend `entries` to build `from_legend` validation dropdowns; `workbook_projection` passes the key through `canonicalize_workbook_meta`.
+
+| `workbook_view`
+| `rendering` (`frame_selection`, `composer`, `passes/_base`)
+| *Legitimate render intent.* Drives sheet selection, frame→sheet mapping, and sheet ordering. This *is* the projection spec.
+
+| `frame_lifecycle`
+| `rendering/frame_selection`
+| *Legitimate render intent.* Read to decide `render`/`role` for each frame. (The baseline rule "pipeline execution must not branch on `frame_lifecycle`" is about the *pipeline* layer; rendering is the intended consumer of lifecycle.)
+
+| `enrich_lookup`, `derived.*.helper_columns`
+| `rendering/passes/_base`
+| *Legitimate render intent.* Read to know which columns are helpers, for helper styling. Reads the `derived` operational view; never imports `enrich_lookup` code.
+
+| (everything else: `fk_helpers`, `xref_crosstable`, `cell_codecs`, `compact_multiaxis`, `sparse_defaults`, `split_by_discriminator`, `join_views`, `tabular_views`)
+| --
+| *Absent.* These ride `_meta` as opaque blobs through the carrier and rendering layers. No smell.
+|===
+
+*Architectural smell?* None active. The one residual risk is that the accepted
+`legend_blocks` crossing is *not protected by a guard* -- nothing prevents a
+future change from reading, say, `xref_crosstable` directly in a parser. The
+existing AST guards fence *imports* (no `domain` import), but a string-key read
+of a new domain family would pass.
+
+*Recommendation (guard):* add a small architecture guard asserting that
+`legend_blocks` is the *only* domain-family token permitted in
+`io_backends/**`. This locks the documented exception and converts the baseline
+prose finding into an enforced invariant. Low risk, test-only. (§13 slice 2.)
+
+== 5. `_meta` / Carrier-Boundary Assessment
+
+The `_meta` crossing is *well separated and registry-classified*. The registry
+(`meta_registry.yaml`, 919 lines) uses two layers (`meta_canonical`,
+`meta_rendering`) and four classifications, and
+`tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`
+enforces that the carrier/rendering keys are never `canonical_meta` and that
+canonical entries never use carrier-shaped (`_`-prefixed) names.
+
+[cols="2,2,3", options="header"]
+|===
+| `_meta` area | Where it lives | Classification / handling
+
+| Sidecar / persistence egress
+| `pipeline/persistence_boundary.py` (pure function, carrier-neutral)
+| Preserves *Intent*, drops *Resolution* (`legend_blocks[*].resolved`, `xref_crosstable[*].column_keys` + `dense_axes.resolved`); prunes top-level `derived` and `__*`. Same rules for json/yaml/xml/csv and spreadsheet.
+
+| Workbook-carrier embedded payload
+| `workbook_meta_blob` in hidden `_meta` sheet (JSON)
+| `carrier_artifact` / `meta_rendering`. Written by composer/passes; read by both parsers + `workbook_projection`. The current authoritative read-back carrier.
+
+| Hidden metadata carriers
+| XLSX: `ws.sheet_state == "hidden"`. ODS: table style `display:false` (`_parse_hidden_style_names`/`_table_is_hidden`) or name `_meta`.
+| Different carrier mechanisms, identical logical role.
+
+| Presentation families (widths, orientations, h/v alignments)
+| Extracted per backend; policy via `presentation_meta`
+| `canonical_meta` / `meta_canonical`, but *carrier-authoritative* (replace-or-clear). Persisted unchanged at the boundary (explicit non-goal to prune the `source: workbook` envelope).
+
+| Read-path reconstruction hints
+| `__autofilter_ref` (`read_path_hint`), `__freeze` (`derived_operational_view`)
+| Carrier-side; stripped from canonical `_meta` on readback (verified by `test_spreadsheet_parse_contract`).
+|===
+
+*Is `io_backends` reading domain intent or preserving/classifying carrier
+artifacts?* Overwhelmingly the latter. The single exception where it interprets
+*intent* is `legend_blocks` (it must, to classify a visible table). Everything
+else it either preserves opaquely (the blob) or extracts from the carrier
+(presentation families) under a carrier-authoritative policy.
+
+*Are presentation meta, workbook meta, hidden meta, and support-surface
+classification sufficiently separated?* Yes, conceptually and by guard. The one
+*implementation* blemish is duplication, not conflation: the blob decoder
+appears 5 times (Finding F4) and the legend/store-meta helpers are copied
+(Finding F3). Separation of *concerns* is clean; *deduplication* of helpers is
+the gap.
+
+== 6. ODS Hotspot Inventory
+
+`ods/odf_parser.py` = 1147 LOC, the largest module in the tree. Function groups:
+
+[cols="3,2,1,3", options="header"]
+|===
+| Group (functions) | Concern | LOC (approx) | Cohesion
+
+| `_column_index`, `_column_letters`, `_cell_text`, `_cell_value`
+| Coordinate + ODF cell-value primitives
+| ~50
+| Cohesive (carrier-specific)
+
+| `_ods_length_to_cm`, `_ods_cm_to_excel_chars`, `_ods_rotation_to_xlsx`
+| Unit/vocabulary conversion ODS→*XLSX-shaped canonical*
+| ~30
+| Cohesive; note canonical-is-XLSX coupling
+
+| `_build_column_style_map` + `_extract_ods_column_widths` + `_build_ods_column_default_cell_style_map`
+| Column-width extraction (+ shared default-style fallback builder)
+| ~100
+| Cohesive
+
+| `_build_cell_horizontal_alignment_map` + `_extract_ods_horizontal_alignments`
+| H-alignment extraction
+| ~130
+| Cohesive internally
+
+| `_build_cell_vertical_alignment_map` + `_extract_ods_vertical_alignments`
+| V-alignment extraction
+| ~130
+| Cohesive internally
+
+| `_build_cell_rotation_map` + `_extract_ods_text_orientations`
+| Rotation extraction
+| ~130
+| Cohesive internally
+
+| `_parse_table_grid`
+| *Repeated-cell safety core* (number-rows/columns-repeated handling, ParserLimits)
+| ~140
+| Cohesive; *fragile*; well-commented
+
+| `_parse_hidden_style_names`, `_table_is_hidden`, `_parse_hidden_sheet`, `_read_meta_payload`, `_store_workbook_meta`
+| Hidden-sheet + workbook-meta blob
+| ~70
+| Cohesive
+
+| `_legend_table_hints`, `_apply_legend_table_hints`
+| Legend classification (byte-identical to XLSX)
+| ~50
+| Cohesive; duplicated cross-backend
+
+| `_unquote_sheet_name`, `_parse_cell_ref`, `_parse_range_address`
+| ODS address parsing
+| ~40
+| Cohesive (ODS-specific syntax)
+
+| `_parse_validation_formula`, `_extract_validations`, `_extract_named_ranges`, `_extract_autofilter_ref`
+| Validations / named ranges / autofilter
+| ~90
+| Cohesive (ODS-specific)
+
+| `parse_workbook`
+| Orchestrator
+| ~130
+| Cohesive
+|===
+
+*Where is the concentration, and is it accidental?*
+
+* *Presentation extraction is ~48% (≈555 LOC, lines 106-661) of the file.* This
+  is a real concentration.
+* *The three cell-addressed extractors* (`_extract_ods_horizontal_alignments`,
+  `_extract_ods_vertical_alignments`, `_extract_ods_text_orientations`) are
+  *~250 LOC of near-duplicated cell-walk*: identical row/col iteration,
+  identical repeated-structure clipping (`effective_row_repeat`/
+  `effective_col_repeat`), identical `ParserLimits` enforcement, identical
+  per-column `default-cell-style-name` fallback. They differ only in (a) which
+  map they consult, (b) the value key (`horizontal`/`vertical`/`rotation`), and
+  (c) text-orientation's extra `_ods_rotation_to_xlsx` + `>0` filter. *This is
+  the one piece of genuinely accidental growth* and the prime consolidation
+  target.
+* *The size delta vs XLSX is mostly intrinsic, not accidental.* ODF conveys
+  presentation through *named styles*: the parser must build `{style_name →
+  value}` maps from `<style:style>` elements (`_build_*_map(doc)`), resolve a
+  cell's `table:style-name`, *and* fall back to the column's
+  `table:default-cell-style-name`. `openpyxl` resolves all of this into per-cell
+  `cell.alignment` objects, so the XLSX extractors read a value directly. The
+  `_build_*_map` + default-style-fallback machinery has no XLSX analogue *by
+  carrier necessity*. Leave it.
+
+*Which ODS areas are fragile but contained -- leave alone?* `_parse_table_grid`.
+It is the fix for `BUG-ODS-REIMPORT-REPEATED-CELL-MEMORY-EXPLOSION`, is densely
+commented about why it must *not* materialize repeated fillers, and is pinned by
+a thorough characterization suite (§10). Touching it for cosmetic reasons is
+pure downside.
+
+*Suggested ODS module split (do not implement) -- see the Appendix for the
+full map.* Summary classification:
+
+[cols="3,2", options="header"]
+|===
+| Candidate extraction | Class
+
+| Shared cell-walk behind the 3 cell-addressed extractors (within ODS)
+| extract only after characterization (characterization already largely exists)
+
+| Presentation extraction → `ods/presentation.py` submodule
+| requires characterization tests first (then safe)
+
+| Legend hints + `_store_workbook_meta` → shared carrier-neutral module
+| safe extraction (byte-identical, carrier-neutral)
+
+| Blob decode → shared helper
+| safe extraction
+
+| `_parse_table_grid` (repeated-cell core)
+| do not touch yet
+
+| Address parsing / validations / named ranges
+| leave alone (cohesive, ODS-specific, low churn)
+|===
+
+== 7. XLSX vs ODS Comparison
+
+*Is XLSX structurally cleaner, or merely smaller?* Both -- and the "smaller" is
+mostly intrinsic. `openpyxl` provides a *live, resolved object model*:
+presentation values arrive per-cell, so the parser needs no style-map
+resolution; and the renderer mutates cells directly via `_execute_render_op`,
+so it needs no buffered intermediate. ODF requires the opposite on both sides
+(resolve named styles on read; buffer-then-emit a whole XML document on write,
+with a style cache).
+
+[cols="3,2,2", options="header"]
+|===
+| Responsibility | XLSX | ODS
+
+| Hidden-sheet meta
+| `sheet_state="hidden"`
+| table style `display:false` / name `_meta`
+
+| Presentation extraction (4 families)
+| Direct from `cell.alignment` / `column_dimensions`
+| Resolve named styles + column default-style fallback (heavier *by carrier*)
+
+| Legend classification
+| `_legend_table_hints` / `_apply_legend_table_hints`
+| *byte-identical* copies
+
+| Workbook-meta blob
+| `_store_workbook_meta`
+| *byte-identical* copy
+
+| Validations (list literal)
+| `"a,b,c"` comma form (`_parse_xlsx_list_literal_formula`)
+| `cell-content-is-in-list("a";"b")` semicolon form (`_parse_validation_formula`)
+
+| Renderer architecture
+| Live model, `_execute_render_op` dispatch (405 LOC)
+| Buffered `_collect_sheets` + `_build_table` + style cache (675 LOC)
+
+| Freeze panes
+| `ws.freeze_panes`; parsed back (`__freeze`)
+| `settings.xml` config items; *not parsed back* (documented gap)
+
+| Lookup formula
+| `=XLOOKUP(...)` A1 refs
+| `of:=XLOOKUP(...)` `[.A1]` refs
+|===
+
+*Legitimate (do not force symmetry):* the renderer architectures (live vs
+buffered), the style-resolution asymmetry, the formula/validation string
+formats, and the freeze-readback gap are all *correct* carrier differences.
+
+*Accidental (normalizable):* the byte-identical `_legend_table_hints`,
+`_apply_legend_table_hints`, `_store_workbook_meta`; the 5-copy blob decoder;
+the *within-each-parser* 3× cell-walk; and the near-duplicated
+`parser_interpretation` modules (Finding F2). Of these, the cross-backend
+*byte-identical* helpers are the safest to share; the `parser_interpretation`
+unification is higher-value but higher-risk (the cell accessors genuinely
+differ, so it needs an accessor abstraction).
+
+== 8. Rendering-Layer Boundary Assessment
+
+*Is `rendering/` truly carrier-neutral?* Yes, and it is *guard-enforced*.
+`test_adapter_alignment.test_generic_rendering_package_stays_free_of_openpyxl_and_xlsx_adapter_imports`
+walks every module under `rendering/` and asserts no `openpyxl` /
+`io_backends.xlsx` import; a fresh grep confirms zero `openpyxl`/`odf` imports
+anywhere in `rendering/`.
+
+*Are RenderOps / WorkbookIR / RenderPlan sufficiently separated from carrier
+implementation?* Yes. `plan.py` defines ~17 frozen `RenderOp` dataclasses;
+notably `SetHorizontalAlignment`/`SetVerticalAlignment` *enforce the canonical
+vocabulary at construction* (`__post_init__` raises `ValueError` on out-of-vocab
+values), so a backend cannot smuggle a carrier-specific alignment token through
+the plan. `WriteMeta`'s docstring explicitly anticipates non-hidden-sheet
+carriers ("other carriers remain possible").
+
+*Where would future carrier-visible features land first?* *Rendering before
+parsers.* The write path (compose → passes → flow → plan) is the producer of all
+carrier-visible structure; parsers only need to recognize it on readback. For
+grouped headers specifically, the path already exists (§2), so the work is
+*extending* `layout_composer._build_header_grid_and_merges` and the matching
+parser recognition -- in three places, because the header machinery is copied.
+
+*Guards protecting this boundary:* `test_adapter_contract_boundary_guards`
+(backends delegate to contract; renderers consume only `plan`; parsers stop at
+`ir` + local interpretation; contract stays neutral), `test_adapter_alignment`,
+`test_spreadsheet_parse_contract`, and the two `*_parser_modularization` guards.
+This is a *strong* fence and a real asset.
+
+== 9. Capability-Profile Recommendation
+
+*Are parity gaps explicit?* Yes, but *scattered* across two representations:
+
+* *Documented-gap tests with positive assertions* (not skips):
+  `test_freeze_parse_hint_difference_is_an_explicit_accepted_gap` (XLSX parses
+  `__freeze` back, ODS does not) and `test_protection_is_xlsx_only_ods_documented_gap`.
+* *Renderer no-op branches:* `odf_renderer` `continue  # ODS protection not
+  implemented in this slice` and `# ODS cell locking not implemented in this
+  slice`.
+
+There is *no central record*. To answer the gap question today you must read
+both the parity test and the ODS renderer.
+
+*Recommendation -- smallest useful form:* a *documentation table* (a single
+`*.adoc` listing family × {xlsx, ods} × {full, partial, none} with a one-line
+basis and a pointer to the asserting test), optionally single-sourced as a small
+Python constant that the parity test imports so the doc and the tests cannot
+drift. That is enough to make the gaps reviewable *before* grouped headers /
+nested lists -- which will add capability *unevenly* across backends and need a
+place to declare "ODS: not yet."
+
+*Do not* build a capability-profile *framework* / enforcement engine. There is
+no current pressure, and (mirroring the persistence-boundary reasoning in the
+sequencing review) two data points -- freeze and protection -- do not define a
+schema worth freezing. A doc + tiny constant is the right altitude now.
+
+== 10. Test Safety-Net Assessment
+
+*Strong where it matters most.*
+
+[cols="3,3", options="header"]
+|===
+| Concern | Protecting tests
+
+| Repeated-cell core + parser limits
+| `unit/io_backends/ods/test_ods_parser_repeated_cells.py` (empty col/row not materialized; non-empty repeats kept; `ParserLimits` raise; merge-span bounds)
+
+| ODS presentation extractors (all 4 families)
+| same file: sheet-wide-filler clipping, implausible-repeat rejection, stale-embedded-meta clear, `start/end`→`left/right` and `middle`→`center` normalization, unmapped-value drop, column-default-style fallback, per-column fallback, explicit-over-default precedence
+
+| Presentation roundtrips
+| `integration/io_backends/xlsx/test_{column_width,horizontal_alignment,vertical_alignment,text_orientation}_roundtrip.py`; `ods/test_ods_display_metadata_roundtrip.py`; `unit/io_backends/test_presentation_meta.py`
+
+| XLSX/ODS parity + accepted gaps
+| `integration/io_backends/test_ods_xlsx_parity.py` (frames + meta + parser semantics; freeze + protection documented gaps)
+
+| Workbook-meta blob carrier
+| `integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`; `roundtrip/test_metadata_convergence.py`
+
+| Table interpretation seam
+| `unit/io_backends/{ods,xlsx}/test_*_parser_interpretation_helpers.py`; `architecture/parse_contract/test_{ods,xlsx}_parser_modularization.py`
+
+| Meta/carrier boundary + persistence projection
+| `architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`; `unit/pipeline/test_persistence_boundary.py`
+
+| Adapter import-graph boundaries
+| `architecture/spreadsheet_contract/test_adapter_contract_boundary_guards.py`; `dependency_guards/test_adapter_alignment.py`
+|===
+
+*Test-gap list (what to add before the corresponding slice):*
+
+. *ODS renderer characterization.* `_collect_sheets` and `_build_table` (the two
+  largest renderer functions: op-replay into a buffered grid, then ODF emission
+  with style caching) have *support* tests (`test_odf_renderer_style_cache`,
+  `test_odf_renderer_support`) but the *interaction* edges -- merge anchor +
+  covered cells + row/col spans + a cell that simultaneously carries
+  rotation/alignment/fill -- are thinner than the parser side. *Add before any
+  renderer split.*
+. *Blob-decode unit test.* The 5 copies are each only *implicitly* covered via
+  roundtrips. A single focused unit test (JSON form, legacy `repr` form, garbage
+  → `None`) should exist *before* consolidating them, so the shared helper has a
+  home test.
+. *`legend_blocks`-only crossing guard.* No test asserts that `legend_blocks` is
+  the sole domain token in `io_backends` (§4). Add as the guard slice itself.
+. *MultiIndex `" / "` round-trip negative case.* `workbook_projection`
+  reconstructs a `MultiIndex` by splitting headers on `" / "`. No test pins what
+  happens when a *legitimate* header contains `" / "`. *Watch-only* today
+  (latent mis-split), worth a characterization test before grouped-header work
+  formalizes the header separator.
+
+*Brittle tests:* a few dense-axis / `_meta`-shape assertions exist (noted in the
+baseline); acceptable as characterization, volume not excessive. The ODS parser
+characterization file is named `test_ods_parser_repeated_cells.py` but now
+covers far more than repeated cells -- a cosmetic naming drift, not a defect.
+
+== 11. Future Feature Pressure Matrix
+
+Pressure rated -- (none) / L / M / H per layer.
+
+[cols="2,1,1,1,1,1,1,1", options="header"]
+|===
+| Feature | render | parser | hidden-meta | presentation-meta | workbook-meta | domain | pipeline
+
+| Grouped / multiline headers
+| M (extend existing `_build_header_grid_and_merges`)
+| M (extend header detect in *both* + dedup)
+| --
+| L
+| L
+| M (axis model `FTR-XREF-AXIS-MAPPINGS`)
+| L
+
+| Nested lists / JSON list integration
+| H (new cell/range semantics)
+| H (new readback, no existing path)
+| L
+| --
+| M
+| H (core flatten/unflatten)
+| M
+
+| `compact_multiaxis` richer projection
+| L
+| L
+| --
+| --
+| M (dense-axis resolution contract)
+| H
+| M
+
+| `cell_codec` visible token surfaces
+| M (token rendering)
+| M (token readback)
+| --
+| L
+| L
+| M
+| L
+
+| `workbook_view` / `sheet_mappings` / frame lifecycle
+| L (path exists in `frame_selection`)
+| --
+| --
+| --
+| M (precedence rule)
+| M
+| M
+
+| Review / diff / promotion workflow
+| L
+| L
+| --
+| --
+| M
+| M
+| H
+
+| Consumer workflow UI ("Wippe")
+| L
+| L
+| --
+| --
+| L
+| L
+| M (orchestration/API)
+|===
+
+*Which feature is safe soon?* `workbook_view / sheet_mappings / frame_lifecycle`
+completion -- it is render-path-resident, already roundtrip-tested, and adds *no*
+parser or presentation pressure (matches the sequencing review's Phase 4). Among
+modeling tracks, `cell_codec`/`compact_multiaxis` stress the *domain* layer, not
+the carrier.
+
+*Which requires adapter preparation first?* Grouped / multiline headers. The
+path exists but is duplicated across compose + two parsers; the prep is the
+`parser_interpretation` dedup (Finding F2) plus the axis model. Do the prep
+before the feature.
+
+*Which should not be attempted until ODS modularization / capability profiles
+exist?* Nested lists. It is the only feature with *no* existing path in *either*
+parser, the highest carrier risk, and it lands squarely in the least-prepared
+spot. Gate it behind both the ODS presentation submodule and the capability-gap
+doc.
+
+== 12. (See Appendix) ODS Decomposition Plan
+
+The function-level decomposition map is in the Appendix.
+
+== 13. Recommended Small Slices
+
+All slices are independently reviewable and ordered safest-first. Slices 1-5 are
+zero- or near-zero-runtime; 6-7 touch ODS internals behaviorally.
+
+[cols="1,3", options="header"]
+|===
+| # | Slice
+
+| 1
+| *Land this review (inventory only).* +
+  *Purpose:* record the decomposition map + guard recommendations. +
+  *Files:* this artifact. *Runtime code:* no. *Tests:* none. *Risk:* none. +
+  *Exit:* committed as a `*_review.adoc` artifact.
+
+| 2
+| *Architecture guard: `legend_blocks` is the only domain crossing in `io_backends`.* +
+  *Purpose:* convert the accepted-exception prose into an enforced invariant. +
+  *Files:* new `tests/architecture/...` guard (AST/token scan of `io_backends/**`). +
+  *Runtime code:* no (test only). *Tests:* the new guard. *Risk:* low (may flag nothing; that is the success case). +
+  *Exit:* guard green; a new domain-family token read in a parser fails CI.
+
+| 3
+| *Capability-gap profile (documentation + tiny constant).* +
+  *Purpose:* single-source the scattered parity gaps (§9). +
+  *Files:* new `docs/` table; optional small constant imported by `test_ods_xlsx_parity`. +
+  *Runtime code:* doc/data only. *Tests:* existing parity tests still green. *Risk:* low. +
+  *Exit:* one place lists family × backend × support level with test pointers.
+
+| 4
+| *Consolidate the blob decoder (5 copies → 1).* +
+  *Purpose:* remove `json`→`ast.literal_eval` duplication across `ods/odf_parser`, `xlsx/openpyxl_parser`, `rendering/workbook_projection`, `rendering/passes/_base`, `rendering/flow`. +
+  *Files:* a shared neutral helper (likely beside `workbook_projection`, which already owns `canonicalize_workbook_meta`); the 5 call sites. +
+  *Runtime code:* yes (behavior-preserving). *Tests:* add the focused blob-decode unit test (§10 gap 2) first; full roundtrip + parity must stay green. *Risk:* low-medium (touches both rendering and both parsers -- keep it a pure move). +
+  *Exit:* one decoder; 5 call sites delegate; suite green.
+
+| 5
+| *Hoist the byte-identical legend + store-meta helpers to a shared carrier-neutral module.* +
+  *Purpose:* remove the verbatim `_legend_table_hints` / `_apply_legend_table_hints` / `_store_workbook_meta` copies. +
+  *Files:* new shared module under `io_backends/`; both parsers delegate. +
+  *Runtime code:* yes (behavior-preserving). *Tests:* legend roundtrip + parity green; consider extending the §4 guard to permit the new shared module. *Risk:* low. +
+  *Exit:* one copy of each; parsers import it.
+
+| 6
+| *Within-ODS: extract the shared cell-addressed cell-walk.* +
+  *Purpose:* collapse the ~250 LOC near-duplication across the 3 cell-addressed extractors into one `_walk_cell_addressed_styles(table, max_row, max_col, limits, classify)` helper; the 3 families become thin `classify` callables. +
+  *Files:* `ods/odf_parser.py` only. +
+  *Runtime code:* yes. *Tests:* `test_ods_parser_repeated_cells.py` already characterizes clipping/limits/fallback/normalization for all three families -- confirm coverage, add cases only if a branch is uncovered. *Risk:* medium (touches presentation extraction) but characterization is strong. +
+  *Exit:* one cell-walk; 3 thin classifiers; characterization green unchanged.
+
+| 7
+| *(Later) Extract ODS presentation into `ods/presentation.py`.* +
+  *Purpose:* move the `_build_*_map` + extractors (~555 LOC) out of `odf_parser.py` once slice 6 has reduced them to a cohesive block; add a modularization guard mirroring the existing interpretation-seam guard. +
+  *Files:* new `ods/presentation.py`; `odf_parser.py`; new guard. +
+  *Runtime code:* yes (pure relocation). *Tests:* same characterization; new import guard. *Risk:* medium. +
+  *Exit:* `odf_parser.py` materially smaller; guard pins the new seam.
+|===
+
+*Deliberately excluded* (per the prompt's anti-patterns): large ODS rewrite,
+generic spreadsheet-adapter framework, new carrier abstraction layer, mass
+parser rewrite, the cross-backend `parser_interpretation` unification (Finding
+F2 -- defer until grouped headers create real pressure and an accessor
+abstraction is justified), and any feature implementation before this prep.
+
+== 14. Specific Questions -- Explicit Answers
+
+. *Is `io_backends` healthy, mildly hot, structurally risky, or a blocker?*
+  *Mild hotspot.* Architecture and guards are healthy; the heat is ODS internal
+  concentration + cross-backend helper duplication. Bounded and well-tested.
+. *Is ODS the main concern, or the whole carrier-boundary layer?* *ODS* -- and
+  within it, specifically the presentation-extraction cell-walk. The broader
+  carrier boundary (contract, rendering neutrality, guards) is a strength.
+. *Does `legend_blocks` in parser code represent acceptable classification or
+  leakage?* *Acceptable carrier classification.* A visible legend must be
+  recognized so it is not treated as payload. *Recommendation:* add a guard
+  locking it as the *sole* permitted domain crossing (§13 slice 2).
+. *Is `presentation_meta.py` a good extraction pattern to imitate?* *Yes* -- with
+  the nuance that it consolidated the *replace-or-clear policy*, not the
+  *extraction walk*. Imitate it for the next move: a carrier-neutral policy/
+  helper plus carrier-specific thin callers (slice 6 follows the same shape).
+. *Should `spreadsheet_contract.py` become more central?* It already *is* the
+  central seam, and it is correctly *thin* (two functions). Keep new carriers
+  routing through it; do *not* grow it into a god-facade. "More central" only in
+  the sense of remaining the single entry -- which it is.
+. *Is a backend capability profile useful now or premature?* A *small doc/data*
+  profile is useful *now* (before grouped headers/nested lists). A *framework*
+  is premature.
+. *Which ODS split first?* The safest first behavioral move is the *within-ODS
+  cell-walk extraction* (slice 6), because its characterization already exists.
+  But the *overall* safest first steps are the *cross-cutting hygiene* (slices
+  2, 4, 5) which carry even lower risk and shrink the blast radius of slice 6/7.
+. *Which tests before any ODS modularization?* Mostly already present
+  (`test_ods_parser_repeated_cells.py` covers the extractors). *Add* before
+  touching code: an ODS *renderer* characterization for `_collect_sheets` /
+  `_build_table` (before slice 7 or any renderer work) and a *blob-decode* unit
+  test (before slice 4).
+. *What should absolutely not be touched yet?* `_parse_table_grid` (repeated-cell
+  safety core); the divergent ODS *buffered* renderer model; the ODS↔XLSX
+  vocabulary-conversion split (no codec concept is justified yet); and the three
+  dispatch mechanisms (no pressure).
+. *How does this affect the `next_program_sequencing_review` roadmap?* It
+  *confirms* Phase 5 (adapter preparation, bounded + guard-backed) and supplies
+  its concrete slice order. It *adds* that Phase 5 can *open* with zero-runtime
+  cross-cutting hygiene (guard + blob-decode + legend hoist) that is safer than,
+  and should precede, ODS modularization. It *reinforces* the "do not start
+  grouped headers / nested lists" gate, while *refining* that grouped headers
+  extend an existing (duplicated) multi-row-header path rather than building one
+  from scratch.
+
+== 15. "Do Not Do Yet" List
+
+* *Do not* modify `_parse_table_grid` -- the repeated-cell memory-safety core.
+* *Do not* unify the ODS (buffered) and XLSX (live) renderer architectures --
+  the divergence is a correct carrier difference.
+* *Do not* unify the two `parser_interpretation` modules yet (Finding F2) --
+  higher value but higher risk; wait for grouped-header pressure and design an
+  accessor abstraction first.
+* *Do not* build a capability-profile enforcement engine -- a doc + tiny
+  constant is the right altitude.
+* *Do not* centralize the ODS↔XLSX presentation vocabulary into a "codec" yet --
+  no pressure; the read/write split is contained.
+* *Do not* start nested lists -- no path in either parser; highest carrier risk;
+  gate behind ODS presentation submodule + capability doc.
+* *Do not* start grouped headers as a feature -- do the `parser_interpretation`
+  dedup + axis model first.
+* *Do not* refactor the three backend-dispatch mechanisms speculatively.
+* *Do not* extract the ODS presentation submodule (slice 7) before the within-ODS
+  cell-walk (slice 6) exists and characterization is confirmed green.
+
+== Open Questions Requiring Human Decision
+
+. *Shared-helper home.* Should the consolidated blob decoder and the hoisted
+  legend/store-meta helpers live in a new `io_backends/_carrier_shared.py`, or be
+  folded into existing neutral modules (`workbook_projection` for decode,
+  `presentation_meta`'s neighbourhood for legend/meta)? Affects the §4 guard's
+  allow-list.
+. *`parser_interpretation` dedup appetite.* Is the maintenance cost of two
+  near-identical interpretation modules acceptable until grouped headers force
+  the issue, or worth an accessor-abstraction slice sooner? (This review
+  recommends *waiting*; a maintainer who expects grouped headers imminently might
+  pull it forward.)
+. *Capability-profile single-sourcing.* Doc-only, or doc + a small constant
+  imported by the parity test? The latter prevents drift but adds one import
+  coupling between tests and a data module.
+. *Header separator formalization.* The `" / "` `MultiIndex` join/split is a
+  latent fragility (§10 gap 4). Pin it with a characterization test now, or defer
+  to grouped-header work that will have to formalize it anyway?
+
+'''
+
+== Appendix: ODS Decomposition Plan
+
+Read-only map for later small slices. *No refactor, no rewrite, no patches.*
+
+=== A.1 Function / Group Inventory
+
+[cols="2,2,2,1,2", options="header"]
+|===
+| Function / group | Current responsibility | Carrier-specific vs neutral-mixed | Risk if moved | Disposition
+
+| `_column_index`, `_column_letters`
+| A1 ↔ index (also duplicated in renderer)
+| Neutral helper, ODS-flavored
+| Low
+| safe extraction (or share with renderer)
+
+| `_cell_text`, `_cell_value`
+| Read text / typed value from ODF cell
+| Carrier-specific
+| Low
+| leave alone
+
+| `_ods_length_to_cm`, `_ods_cm_to_excel_chars`, `_ods_rotation_to_xlsx`
+| Convert ODS units → *XLSX-shaped canonical*
+| Carrier-bridging (depends on canonical-is-XLSX)
+| Low
+| leave alone (move with presentation if slice 7)
+
+| `_build_column_style_map` + `_extract_ods_column_widths` + `_build_ods_column_default_cell_style_map`
+| Column-width extraction + shared default-style builder
+| Carrier-specific; default-style builder is shared by all cell-addressed families
+| Medium
+| candidate for `ods/presentation.py` (slice 7)
+
+| `_build_cell_horizontal_alignment_map` + `_extract_ods_horizontal_alignments`
+| H-alignment; *near-dup cell-walk*
+| Map = specific; walk = neutral-mixed (shared shape)
+| Medium
+| extract shared walk after characterization (slice 6)
+
+| `_build_cell_vertical_alignment_map` + `_extract_ods_vertical_alignments`
+| V-alignment; *near-dup cell-walk*
+| as above
+| Medium
+| extract shared walk after characterization (slice 6)
+
+| `_build_cell_rotation_map` + `_extract_ods_text_orientations`
+| Rotation; *near-dup cell-walk* (+ `>0` filter)
+| as above
+| Medium
+| extract shared walk after characterization (slice 6)
+
+| `_parse_table_grid`
+| Repeated-cell safety core; merges; validation cells; bounds
+| Carrier-specific; *fragile*
+| *High*
+| *do not touch yet*
+
+| `_parse_hidden_style_names`, `_table_is_hidden`
+| Hidden-table detection via table style
+| Carrier-specific
+| Low
+| leave alone (move with presentation only if cohesive)
+
+| `_parse_hidden_sheet`, `_read_meta_payload`
+| Hidden `_meta` → dict; blob decode (legacy fallback)
+| `_read_meta_payload` shares blob-decode shape (neutral)
+| Low
+| blob decode → shared (slice 4)
+
+| `_store_workbook_meta`
+| Write `workbook_meta_blob` JSON to hidden sheet
+| *Byte-identical to XLSX* (neutral)
+| Low
+| safe extraction → shared (slice 5)
+
+| `_legend_table_hints`, `_apply_legend_table_hints`
+| Legend classification from `_meta.legend_blocks[*].resolved`
+| *Byte-identical to XLSX* (neutral)
+| Low
+| safe extraction → shared (slice 5)
+
+| `_unquote_sheet_name`, `_parse_cell_ref`, `_parse_range_address`
+| ODS address syntax parsing
+| Carrier-specific
+| Low
+| leave alone
+
+| `_parse_validation_formula`, `_extract_validations`
+| ODS `cell-content-is-in-list(...)` → `ListLiteralFormulaSpec`
+| Carrier-specific (semicolon form)
+| Low
+| leave alone
+
+| `_extract_named_ranges`, `_extract_autofilter_ref`
+| Named ranges / autofilter from ODF
+| Carrier-specific
+| Low
+| leave alone
+
+| `parse_workbook`
+| Orchestrator (hidden sheets → style maps → per-sheet extract → carrier-authority clear)
+| Carrier-specific
+| Medium (it wires everything)
+| leave as orchestrator; shrinks naturally as groups move out
+|===
+
+=== A.2 Proposed Future Module Boundaries
+
+[source,text]
+----
+io_backends/
+  _carrier_shared.py        (NEW, slices 4-5)  blob decode; legend hints; store_workbook_meta
+  ods/
+    odf_parser.py           orchestrator + ODF cell primitives + address parsing
+                            + validations/named-ranges/autofilter + _parse_table_grid
+    presentation.py         (NEW, slice 7)  _build_*_map ×4 + extractors ×4
+                            + shared cell-walk (slice 6) + unit/vocab conversions
+    parser_interpretation.py (unchanged; header/extent/merges)
+----
+
+Dependency notes: `presentation.py` would import `parser_limits`,
+`presentation_meta` (policy), and `rendering.ir`; it must *not* import
+`spreadsheet_contract`, `rendering.{composer,passes,flow,plan,workbook_projection}`,
+`domain`, or `pipeline` -- mirroring the existing
+`test_adapter_contract_boundary_guards` constraints, which the new
+modularization guard should extend to it.
+
+=== A.3 Extraction Order (lowest risk first)
+
+. *(slice 4)* Blob decode → `_carrier_shared` (cross-cutting; pure).
+. *(slice 5)* Legend hints + `_store_workbook_meta` → `_carrier_shared`
+  (byte-identical; pure).
+. *(slice 6)* Within `odf_parser`, fold the 3 cell-addressed extractors onto one
+  shared cell-walk (behavioral but characterized).
+. *(slice 7)* Relocate the now-cohesive presentation block to `ods/presentation.py`
+  and add a modularization guard.
+
+Column widths can move with slice 7; its extractor is *not* part of the
+cell-addressed-walk family (it iterates `table-column` elements, not cells), so
+it does not participate in slice 6.
+
+=== A.4 Required Characterization Before Each Extraction
+
+* Before slice 4: a focused *blob-decode* unit test (JSON / legacy `repr` /
+  garbage→`None`). Roundtrip + parity already cover the integrated behavior.
+* Before slice 5: legend roundtrip (`integration/roundtrip/test_legend_blocks.py`)
+  and parity already cover it; no new test required, but verify the §4 guard
+  permits `_carrier_shared`.
+* Before slice 6: confirm `test_ods_parser_repeated_cells.py` covers, for *all
+  three* families, the clip / limit-reject / stale-clear / column-default
+  fallback / per-column fallback / normalization / unmapped-drop branches (it
+  does today); add a case only for any branch a coverage run shows uncovered.
+* Before slice 7: an ODS *renderer* characterization is *not* strictly required
+  for the parser relocation, but is required before any *renderer* split; add it
+  in the same phase.
+
+=== A.5 "Do Not Touch" Fragile Areas
+
+* `_parse_table_grid` -- repeated-cell memory-safety core; dense comments encode
+  *why* fillers must not materialize; pinned by the regression suite. Any change
+  here must be its own slice with its own review, never a side effect of
+  modularization.
+* The ODS *renderer* buffered model (`_collect_sheets` + `_build_table` + style
+  cache) -- correct carrier-specific design; thinner characterization than the
+  parser; out of scope for the parser-side slices above.
+
+=== A.6 First Safe ODS Slice
+
+The first safe slice that is *ODS-internal* is *slice 6* (shared cell-walk),
+because its characterization already exists. However, the *globally* safest
+opening moves are the *cross-cutting* slices 4 and 5 (pure relocations of
+neutral/byte-identical code that happen to also shrink ODS), which should
+precede slice 6.
+
+=== A.7 Explicit Warning
+
+*No ODS extraction beyond the pure relocations (slices 4-5) should be attempted
+without first confirming the §A.4 characterization is green, and `_parse_table_grid`
+must not be modified as part of any of these slices.* A behavioral ODS change
+folded silently into a "modularization" commit is exactly the failure mode the
+existing parse-contract and repeated-cell guards exist to prevent.
+
+'''
+
+== Appendix B -- Evidence & Validation Commands
+
+Run from the git root (`spreadsheet-handling/core`) with the project venv.
+
+[source,bash]
+----
+# Domain coupling: legend_blocks is the only domain token in io_backends
+grep -rnoE "fk_helpers|legend_blocks|xref_crosstable|cell_codecs?|compact_multiaxis|sparse_defaults|split_by_discriminator|enrich_lookup|join_views|tabular_views|frame_lifecycle|workbook_view" \
+  src/spreadsheet_handling/io_backends src/spreadsheet_handling/rendering
+
+# No domain/ imports in carrier or rendering layers (expect: none)
+grep -rnE "from spreadsheet_handling\.domain|import spreadsheet_handling\.domain" \
+  src/spreadsheet_handling/io_backends src/spreadsheet_handling/rendering
+
+# Blob decode duplication (expect: 5 modules)
+grep -rln "ast.literal_eval" src/spreadsheet_handling/io_backends src/spreadsheet_handling/rendering
+
+# Verbatim-named functions shared across the two parsers
+comm -12 \
+  <(grep -oE "^def [a-z_]+" src/spreadsheet_handling/io_backends/ods/odf_parser.py | sed 's/^def //' | sort -u) \
+  <(grep -oE "^def [a-z_]+" src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py | sed 's/^def //' | sort -u)
+
+# Carrier-boundary + presentation safety nets
+.venv/bin/python -m pytest \
+  tests/architecture/spreadsheet_contract \
+  tests/architecture/parse_contract \
+  tests/architecture/dependency_guards/test_adapter_alignment.py \
+  tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py \
+  tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py \
+  tests/integration/io_backends/test_ods_xlsx_parity.py
+----
+
+[NOTE]
+====
+The full suite was *not* executed end-to-end for this review. Evidence is drawn
+from reading the carrier-boundary and rendering sources, the architecture
+guards, the meta registry, the persistence boundary, and the ODS/XLSX
+parser/renderer characterization tests, plus the greps above. A full `make test`
+run is the recommended gate before acting on any slice in §13.
+====
+
+== Appendix C -- Scope and Evidence Boundaries
+
+* Reviewed read-only at `main` / `d2e8394`; working tree clean apart from the two
+  untracked baseline review artifacts.
+* In scope: `io_backends/` (esp. `base.py`, `router.py`, `spreadsheet_contract.py`,
+  `presentation_meta.py`, `parser_limits.py`, `ods/`, `xlsx/`), `rendering/`
+  (ir/plan/flow/composer/frame_selection/passes/workbook_projection),
+  `pipeline/persistence_boundary.py`, `registries/meta_registry.yaml`, and the
+  carrier-relevant `tests/architecture`, `tests/integration`, `tests/roundtrip`,
+  `tests/unit/io_backends`.
+* Uncertain / not gathered: full-suite green status (only targeted reasoning, no
+  run); exact line-coverage of the ODS *renderer* buffered model;
+  performance under very large real workbooks; the demo/consumer repository.
+* The prompt named `io_backends/backend.py` and `io_backends/options.py`; these
+  files do not exist. Their concerns live in `io_backends/base.py`
+  (`BackendBase`, `BackendOptions`). The review maps the layer as built.
