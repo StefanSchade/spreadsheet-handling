@@ -42,9 +42,14 @@ def expand_xref(
     column_key: str = "column_key",
     value: str = "value",
     drop_empty: bool = False,
+    base_relation: str | None = None,
     name: str | None = None,
 ) -> Frames:
-    """Expand a matrix/cross-table frame into explicit long-form rows."""
+    """Expand a matrix/cross-table frame into explicit long-form rows.
+
+    When base_relation is supplied, out-of-scope rows from that frame are
+    appended after the recomposed in-scope rows (scoped recomposition).
+    """
     config_id = name or output
     source = _require_frame(frames, matrix)
     row_key_cols = _as_list(row_keys, "row_keys")
@@ -61,9 +66,12 @@ def expand_xref(
     _ensure_columns(source, value_cols, frame_name=matrix, field_name="value_columns")
 
     records: list[dict[Any, Any]] = []
+    in_scope_addresses: set[tuple[tuple[Any, ...], Any]] = set()
     for _, source_row in source.iterrows():
         row_identity = {row_key: source_row[row_key] for row_key in row_key_cols}
+        row_id = tuple(source_row[row_key] for row_key in row_key_cols)
         for matrix_col in value_cols:
+            in_scope_addresses.add((row_id, matrix_col))
             cell_value = source_row[matrix_col]
             if drop_empty and _is_empty_cell(cell_value):
                 continue
@@ -72,6 +80,26 @@ def expand_xref(
                 column_key: matrix_col,
                 value: cell_value,
             })
+
+    if base_relation is not None:
+        base_frame = _require_frame(frames, base_relation)
+        _ensure_columns(
+            base_frame,
+            [*row_key_cols, column_key, value],
+            frame_name=base_relation,
+            field_name="row_keys/column_key/value",
+        )
+        for _, base_row in base_frame.iterrows():
+            base_addr = (
+                tuple(base_row[row_key] for row_key in row_key_cols),
+                base_row[column_key],
+            )
+            if base_addr not in in_scope_addresses:
+                records.append({
+                    **{row_key: base_row[row_key] for row_key in row_key_cols},
+                    column_key: base_row[column_key],
+                    value: base_row[value],
+                })
 
     relation = pd.DataFrame(records, columns=[*row_key_cols, column_key, value])
     out: dict[str, Any] = dict(frames)

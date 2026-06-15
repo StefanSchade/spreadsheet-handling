@@ -674,6 +674,188 @@ class TestColumnKeysAndDenseColumnFromInteraction:
             )
 
 
+# ---------------------------------------------------------------------------
+# FTR-XREF-CROSSTABLE Slice D -- scoped recomposition via base_relation
+# ---------------------------------------------------------------------------
+
+
+class TestExpandXrefScopedRecomposition:
+    """Test expand_xref scoped recomposition via the base_relation parameter.
+
+    When base_relation is supplied, expand_xref performs scoped recomposition:
+    in-scope matrix cells update the relation; out-of-scope base rows are
+    preserved and appended after.  In-scope = all (row_identity × value_col)
+    addresses present in the matrix frame, regardless of blank/nonblank.
+    """
+
+    def test_without_base_relation_behavior_unchanged(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["new"]}),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"],
+        )
+        assert out["rel"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": "new"},
+        ]
+
+    def test_nonblank_cell_replaces_matching_base_row(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["updated"]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "original"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"], base_relation="base",
+        )
+        assert out["rel"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": "updated"},
+        ]
+
+    def test_blank_cell_with_drop_empty_true_removes_matching_base_row(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": [""]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "original"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"],
+            base_relation="base", drop_empty=True,
+        )
+        assert out["rel"].to_dict(orient="records") == []
+
+    def test_blank_cell_with_drop_empty_false_emits_empty_row(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": [""]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "original"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"],
+            base_relation="base", drop_empty=False,
+        )
+        assert out["rel"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": ""},
+        ]
+
+    def test_in_scope_address_with_no_base_counterpart_is_added(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1", "r2"], "col_A": ["new", "also_new"]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "existing"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"], base_relation="base",
+        )
+        records = out["rel"].to_dict(orient="records")
+        assert {"row_key": "r2", "column_key": "col_A", "value": "also_new"} in records
+
+    def test_out_of_scope_base_row_preserved(self) -> None:
+        """Base row at col_B is not in value_cols scope, so it is carried through."""
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["updated"]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "old"},
+                {"row_key": "r1", "column_key": "col_B", "value": "preserved"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"], base_relation="base",
+        )
+        records = out["rel"].to_dict(orient="records")
+        assert {"row_key": "r1", "column_key": "col_B", "value": "preserved"} in records
+
+    def test_blank_cell_address_is_in_scope_so_base_row_not_preserved(self) -> None:
+        """A blank matrix cell is still in-scope; base row at that address is not kept."""
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": [""]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "old"},
+                {"row_key": "r1", "column_key": "col_B", "value": "out_of_scope"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"],
+            base_relation="base", drop_empty=True,
+        )
+        records = out["rel"].to_dict(orient="records")
+        assert {"row_key": "r1", "column_key": "col_A", "value": "old"} not in records
+        assert {"row_key": "r1", "column_key": "col_B", "value": "out_of_scope"} in records
+
+    def test_out_of_scope_base_rows_appended_after_in_scope_rows(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1", "r2"], "col_A": ["a1", "a2"]}),
+            "base": pd.DataFrame([
+                {"row_key": "r3", "column_key": "col_A", "value": "out1"},
+                {"row_key": "r4", "column_key": "col_A", "value": "out2"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"], base_relation="base",
+        )
+        assert out["rel"].to_dict(orient="records") == [
+            {"row_key": "r1", "column_key": "col_A", "value": "a1"},
+            {"row_key": "r2", "column_key": "col_A", "value": "a2"},
+            {"row_key": "r3", "column_key": "col_A", "value": "out1"},
+            {"row_key": "r4", "column_key": "col_A", "value": "out2"},
+        ]
+
+    def test_multiple_out_of_scope_rows_preserved_in_base_order(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["a1"]}),
+            "base": pd.DataFrame([
+                {"row_key": "r1", "column_key": "col_A", "value": "in_scope"},
+                {"row_key": "r1", "column_key": "col_B", "value": "b1"},
+                {"row_key": "r2", "column_key": "col_B", "value": "b2"},
+                {"row_key": "r3", "column_key": "col_B", "value": "b3"},
+            ]),
+        }
+        out = expand_xref(
+            frames, matrix="matrix", output="rel",
+            row_keys=["row_key"], value_columns=["col_A"], base_relation="base",
+        )
+        records = out["rel"].to_dict(orient="records")
+        assert records[0] == {"row_key": "r1", "column_key": "col_A", "value": "a1"}
+        assert records[1] == {"row_key": "r1", "column_key": "col_B", "value": "b1"}
+        assert records[2] == {"row_key": "r2", "column_key": "col_B", "value": "b2"}
+        assert records[3] == {"row_key": "r3", "column_key": "col_B", "value": "b3"}
+
+    def test_missing_base_frame_fails_fast(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["a"]}),
+        }
+        with pytest.raises(KeyError):
+            expand_xref(
+                frames, matrix="matrix", output="rel",
+                row_keys=["row_key"], value_columns=["col_A"],
+                base_relation="nonexistent",
+            )
+
+    def test_base_frame_missing_required_column_fails_fast(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame({"row_key": ["r1"], "col_A": ["a"]}),
+            "base": pd.DataFrame([{"row_key": "r1", "wrong_col": "something"}]),
+        }
+        with pytest.raises(KeyError):
+            expand_xref(
+                frames, matrix="matrix", output="rel",
+                row_keys=["row_key"], value_columns=["col_A"],
+                base_relation="base",
+            )
+
+
 @DENSE_FTR
 def test_contract_xref_dense_multicolumn_row_keys() -> None:
     frames = {
