@@ -24,6 +24,13 @@ PYTHON       := $(VENV)/bin/python
 PYTEST       := $(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
+SHEETS_RUN   := $(VENV)/bin/sheets-run
+
+META_DIR           := $(ROOT)project_meta
+META_CANONICAL_DIR := $(META_DIR)/canonical
+META_DERIVED_DIR   := $(META_DIR)/derived
+META_STAGING_DIR   := $(META_DIR)/staging
+META_PIPELINE_DIR  := $(META_DIR)/pipelines/meta
 
 STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
@@ -241,6 +248,61 @@ check-asciidoctor-pdf: check-asciidoctor ## Check asciidoctor-pdf is available
 clean-docs: ## Remove doc build output
 	@rm -rf "$(DOC_BUILD_DIR)" "$(DOC_PAGES_DIR)" "$(DOC_PAGES_ROOT_DIR)"
 
+# =========================
+# Project meta
+# =========================
+.PHONY: meta-setup meta-export meta-query meta-context meta-extract meta-import meta-check meta-promote
+.PHONY: meta-export-ods meta-import-ods meta-diff-reimport meta-check-reimport meta-promote-reimport meta-promote-reimport-checked
+.PHONY: check-meta-sheets-run
+
+meta-setup: deps-dev ## Install the current core checkout for project_meta ODS roundtrips
+
+check-meta-sheets-run: venv ## Ensure the local sheets-run binary exists for project_meta targets
+	@test -x "$(SHEETS_RUN)" || { \
+		echo "sheets-run not found in $(VENV). Run 'make meta-setup' first."; \
+		exit 127; \
+	}
+
+meta-export: check-meta-sheets-run ## Render project_meta canonical JSON into project_meta.ods
+	$(SHEETS_RUN) --config "$(META_PIPELINE_DIR)/json_to_ods.yaml"
+
+meta-query: check-meta-sheets-run ## Render derived project_meta query views into project_meta/derived
+	@mkdir -p "$(META_DERIVED_DIR)"
+	@find "$(META_DERIVED_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(META_PIPELINE_DIR)/json_to_derived_queries.yaml"
+
+meta-context: meta-query ## Render the generated project_meta context report
+	@mkdir -p "$(ROOT)docs_generated/project_meta"
+	@find "$(ROOT)docs_generated/project_meta" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_meta.plugins.render_context
+	@echo "$(ROOT)docs_generated/project_meta/current_context.adoc"
+
+meta-extract: check-meta-sheets-run ## Extract conservative project_meta candidates from ADOC artifacts
+	@mkdir -p "$(META_DIR)/extracted"
+	@find "$(META_DIR)/extracted" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_meta.plugins.extract_candidates
+	@echo "$(META_DIR)/extracted/"
+
+meta-import: check-meta-sheets-run ## Reimport project_meta.ods into project_meta/staging
+	@mkdir -p "$(META_STAGING_DIR)"
+	@find "$(META_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	$(SHEETS_RUN) --config "$(META_PIPELINE_DIR)/ods_to_json.yaml"
+
+meta-check: meta-import meta-diff-reimport ## Reimport the ODS spreadsheet and compare it with canonical JSON
+
+meta-diff-reimport: ## Compare canonical project_meta JSON with the current staging review area
+	diff -ru --exclude='.gitignore' "$(META_CANONICAL_DIR)" "$(META_STAGING_DIR)"
+
+meta-promote: ## Promote the current staging snapshot into canonical project_meta JSON
+	@test -d "$(META_STAGING_DIR)" || (echo "Missing $(META_STAGING_DIR). Run meta-import or meta-check first." >&2; exit 1)
+	cp -f "$(META_STAGING_DIR)"/*.json "$(META_CANONICAL_DIR)/"
+	@test -f "$(META_STAGING_DIR)/_meta.yaml" && cp -f "$(META_STAGING_DIR)/_meta.yaml" "$(META_CANONICAL_DIR)/"
+
+meta-check-reimport: meta-check
+meta-promote-reimport: meta-promote
+meta-promote-reimport-checked: meta-check meta-promote ## Reimport, compare, then promote the verified snapshot
+
+# Backward-compatible aliases for the common typo in the target name.
 # =========================
 # Snapshot
 # =========================
