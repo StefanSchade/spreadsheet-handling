@@ -12,7 +12,7 @@ FTR_SOURCE_GLOBS = [
 ]
 REVIEW_SOURCE_GLOBS = [
     "docs/cold_storage/reviews/**/*.adoc",
-    "audit/*.adoc",
+    "docs/warm_storage/global_reviews/*.adoc",
 ]
 OUTPUT_DIR = ROOT / "project_meta" / "extracted"
 
@@ -146,6 +146,32 @@ def _extract_section_paragraph(lines: list[str], section_names: set[str]) -> str
     return re.sub(r"\s+", " ", " ".join(collected)).strip()
 
 
+def _review_scope_area(path: Path) -> tuple[str, str]:
+    rel = path.relative_to(ROOT).as_posix()
+    review_scope = "unknown"
+    review_area = "unknown"
+    if rel.startswith("docs/warm_storage/global_reviews/"):
+        review_scope = "warm_global"
+        review_area = "global"
+        return review_scope, review_area
+    if rel.startswith("docs/cold_storage/reviews/"):
+        review_scope = "global" if "global_reviews" in rel else "topic"
+        review_area = "global"
+        if "topic_reviews" in rel:
+            if "domain_reviews" in rel:
+                review_area = "domain"
+            elif "package_reviews" in rel:
+                review_area = "package"
+            elif "fk_helper_reviews" in rel:
+                review_area = "fk_helper"
+            elif "meta_reviews" in rel:
+                review_area = "meta"
+            else:
+                review_area = "topic"
+        return review_scope, review_area
+    return review_scope, review_area
+
+
 def _is_primary_ftr_file(path: Path) -> bool:
     rel = path.relative_to(ROOT).as_posix()
     if rel.startswith("docs/backlog/") and path.name.startswith(("FTR-", "BUG-")) and path.suffix == ".adoc" and "_" not in path.stem:
@@ -184,7 +210,7 @@ def _extract_review_candidates(path: Path, lines: list[str]) -> list[dict[str, s
     heading, heading_line = _find_heading(lines)
     content = "\n".join(lines[:40])
     rel = path.relative_to(ROOT).as_posix()
-    if not (rel.startswith("docs/cold_storage/reviews/") or rel.startswith("audit/")):
+    if not (rel.startswith("docs/cold_storage/reviews/") or rel.startswith("docs/warm_storage/global_reviews/")):
         return []
     name = _strip_suffixes(path.stem).lower()
     stem = path.stem.lower()
@@ -194,11 +220,14 @@ def _extract_review_candidates(path: Path, lines: list[str]) -> list[dict[str, s
         return []
     rid = _first_id(_strip_suffixes(path.stem)) or _first_id(path.name) or _first_id(heading) or _candidate_id("REV", path, heading or "review")
     labels = _parse_labels(lines[:80])
+    review_scope, review_area = _review_scope_area(path)
     return [{
         "id": rid,
         "title": heading or labels.get("title", "") or path.stem,
         "status": labels.get("status", "") or _extract_status(content),
         "purpose": labels.get("purpose", "") or labels.get("summary", ""),
+        "review_scope": review_scope,
+        "review_area": review_area,
         "source_path": str(path.relative_to(ROOT)),
         "line_start": str(heading_line or 1),
     }]
@@ -207,8 +236,9 @@ def _extract_review_candidates(path: Path, lines: list[str]) -> list[dict[str, s
 def _extract_finding_candidates(path: Path, lines: list[str]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     rel = path.relative_to(ROOT).as_posix()
-    if not (rel.startswith("docs/cold_storage/reviews/") or rel.startswith("audit/")):
+    if not (rel.startswith("docs/cold_storage/reviews/") or rel.startswith("docs/warm_storage/global_reviews/")):
         return out
+    review_scope, review_area = _review_scope_area(path)
     current_heading = ""
     current_line = 0
     for idx, line in enumerate(lines, start=1):
@@ -232,6 +262,8 @@ def _extract_finding_candidates(path: Path, lines: list[str]) -> list[dict[str, 
                 "severity": labels.get("severity", "") or ("blocker" if "blocker" in lowered else ""),
                 "status": labels.get("status", "") or _extract_status(text),
                 "summary": labels.get("summary", "") or "",
+                "review_scope": review_scope,
+                "review_area": review_area,
                 "source_path": str(path.relative_to(ROOT)),
                 "line_start": str(current_line),
             }
