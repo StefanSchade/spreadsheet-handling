@@ -1,0 +1,419 @@
+= Project Memory Data Model Assessment
+
+== Strengths of Current Model
+
+The current canonical model starts with the right top-level nouns for a
+project-history source of truth:
+
+* `reviews.json` records review events.
+* `findings.json` records review-derived concerns separately from reviews.
+* `ftrs.json` records planned or completed work items.
+* `ftr_dependencies.json` gives dependencies a first-class flat table instead
+  of encoding list-valued references in FTR rows.
+* `decisions.json` and `releases.json` provide places for stable project choices
+  and release/package context.
+
+That split is a good foundation for ODS roundtrips because it keeps most rows
+flat and queryable. In particular, the model already avoids embedding findings
+inside reviews or dependencies inside FTRs, which is the right direction for a
+spreadsheet-friendly canonical source.
+
+The existing `findings.json` also contains two important lifecycle signals:
+`status` and `current_relevance`. This is useful because historical findings
+should remain queryable without polluting current-risk reports. The sample
+`FIN-PROJECT-MEMORY-001` demonstrates this pattern: it can remain in history while
+being marked historical and superseded.
+
+The review records already support more than one target shape through
+`review_type`, `target_type`, and `target_id`. That is directionally correct:
+the archive contains global review waves, FTR reviews, package reviews, release
+readiness reviews, topic assessments, and planning reviews. A single review table
+can represent these if the target fields are used consistently.
+
+The generated context report proves the basic workflow can work:
+canonical project memory can be queried into current findings, blocker views,
+and handoff material. The model is therefore already good enough for a first
+dogfooding slice and for validating JSON/ODS mechanics.
+
+== Missing Concepts
+
+The main missing concept is the review wave.
+
+REVIEW-001, REVIEW-002, and REVIEW-003 are not single review rows in practice.
+They are review programs made of prompts, passes, findings documents,
+consolidations, reassessments, summaries, and completion notices. The current
+`reviews.json` row shape can represent one document or one event, but it cannot
+cleanly express:
+
+* a parent review wave such as `REVIEW-002`;
+* child passes such as architecture follow-up, hotspot analysis, spreadsheet
+  boundary, reassessment, or release-readiness steps;
+* prompts versus review outputs versus summaries;
+* the baseline of a later review, for example REVIEW-002 reassessing
+  REVIEW-001, or REVIEW-003 using REVIEW-002 and the Phase 3.5 reassessment as
+  baseline;
+* the archival status of the wave versus the current relevance of specific
+  carry-over findings.
+
+The second missing concept is finding identity across waves.
+
+The archived material distinguishes local finding labels such as `D-001`,
+`IR-006`, `F-RR-B-1`, and `W-RR-1` from larger project risks that persist across
+reviews. The current finding row has one `id` and one `review_id`, so it can
+record where a finding was observed, but it does not separate:
+
+* the local label assigned inside a review document;
+* a durable project-wide finding or risk identity;
+* repeated observations of the same issue in later reviews;
+* reassessments that change the interpretation without creating a wholly new
+  concern.
+
+The third missing concept is finding disposition history.
+
+The current row has a single `status`, a single `resolved_by_ftr_id`, a single
+`resolved_by_commit`, and a single `superseded_by`. That is adequate for a
+snapshot, but the archive records multi-step history:
+
+* REVIEW-001 findings were consolidated into clusters and converted into FTRs.
+* REVIEW-002 reassessed REVIEW-001 findings as resolved, mitigated, unchanged,
+  worsened, or newly introduced.
+* The Phase 3.5 reassessment reframed some REVIEW-002 findings rather than
+  simply closing them.
+* REVIEW-003 carried findings forward into release-blocking, before-low-touch,
+  after-release, and watch-only buckets.
+
+Those transitions are facts worth preserving. A single mutable `status` loses
+the evidence trail unless every reassessment is duplicated into prose.
+
+The fourth missing concept is finding-to-FTR linkage as a many-to-many
+relationship.
+
+The current finding row supports one `target_id` and one `resolved_by_ftr_id`.
+The real history is richer:
+
+* one finding can produce several FTRs;
+* several findings can be bundled into one FTR;
+* a finding can be mitigated by one FTR and finally closed by another;
+* a review can propose follow-up FTRs without creating them immediately;
+* a review can decide that no FTR should be created.
+
+REVIEW-001's derivation prompt and the warm backlog triage review both show that
+FTR generation is an explicit workflow step, not just a field on a finding.
+
+The fifth missing concept is evidence and artifact provenance.
+
+The current model uses `source_path`, but the review archive often depends on
+more precise provenance:
+
+* source path and line or section;
+* reviewed branch, commit, and dirty-state notes;
+* commands run and validation results;
+* reviewer/model identity;
+* whether the artifact is a prompt, findings report, summary, plan,
+  reassessment, shell output, or notice.
+
+That information matters for agent handoff. A future agent needs to know whether
+a row describes a verified current risk, a historical prompt instruction, or a
+summary that was superseded by a later reassessment.
+
+The sixth missing concept is review outcome taxonomy.
+
+`verdict` exists, but the archive uses several different outcome dimensions:
+
+* green/yellow/red architecture health;
+* release blocker versus must-fix versus low-touch versus after-release;
+* resolved, mitigated, unchanged, worsened, obsolete, reframed;
+* no-FTR-created assessments;
+* watch-only items and non-findings.
+
+These are not all the same as review status. Some are review verdicts, some are
+finding dispositions, and some are planning buckets.
+
+== Modeling Risks
+
+The largest risk is collapsing review-local observations into project-wide
+finding identity.
+
+If every local label becomes a canonical finding, the model will accumulate
+duplicate rows for the same project risk. REVIEW-001 already shows duplicated
+or clustered labels: `D-001 + IR-002`, `IR-008 + A-004`, and several cluster
+groups. REVIEW-002 then reassesses those clusters. Without a durable
+project-wide finding identity plus per-review observations, query results will
+either double count risks or hide useful historical evidence.
+
+The second risk is treating `status` as both lifecycle and current reporting
+state.
+
+`open`, `accepted`, `resolved`, `superseded`, `wontfix`, and `historical` mix
+different concepts. For example, a finding can be accepted as real, currently
+mitigated, still relevant, and not yet closed. Another can be resolved but still
+important historical context. REVIEW-002's "mitigated / replaced by a better
+pattern" bucket is not the same as closed, and REVIEW-003's "watch only" is not
+the same as open.
+
+The third risk is overloading `review_id` on findings.
+
+One finding can be created in REVIEW-001, reassessed in REVIEW-002, reframed in
+Phase 3.5, and carried into REVIEW-003. A single `review_id` only captures one
+point in that history. If the row is updated to the latest review, origin is
+lost. If it stays at the origin review, current reassessment is hard to query.
+
+The fourth risk is making `target_type` / `target_id` too generic without
+relation semantics.
+
+Generic target fields are useful for ODS shape, but they do not say whether the
+target is the reviewed object, the affected area, the source artifact, the FTR
+that resolves it, or the FTR proposed by the review. The model already has
+`affected_area`, `target_type`, `target_id`, and `resolved_by_ftr_id`; without
+clear relationship tables this will become ambiguous as soon as real review
+history is promoted.
+
+The fifth risk is losing negative and deferred decisions.
+
+Several reviews explicitly say "do not do this yet", "no FTR created", "watch
+only", or "not a finding". Those are important governance facts. If the model
+only tracks active findings and FTRs, future agents may regenerate rejected work
+or promote watch-only concerns into implementation tasks.
+
+The sixth risk is letting extracted candidates shape the canonical model.
+
+The extracted files are useful discovery artifacts, but their coarse fields
+cannot represent the review history. They flatten headings into candidate
+reviews/findings and cannot distinguish a findings section, a prompt, a
+reassessment, a release-blocking bucket, or a non-finding. They should not drive
+canonical schema decisions except as evidence that the source documents contain
+heterogeneous artifact types.
+
+The seventh risk is assuming review documents and canonical truth are the same
+granularity.
+
+The archive has documents that are not themselves review conclusions: prompts,
+shell outputs, indexes, plans, and completion notices. Those should be modeled
+as artifacts or evidence attached to review waves, not as findings or canonical
+project risks.
+
+== Suggested Canonical Entities
+
+The next canonical entities should be added around review history and
+relationships, not around extraction.
+
+Suggested entities:
+
+* `review_waves`: parent records for `REVIEW-001`, `REVIEW-002`, `REVIEW-003`,
+  and later named review programs.
+* `review_artifacts`: individual documents or captured outputs that belong to a
+  review wave, with artifact kind such as prompt, review, findings, summary,
+  reassessment, plan, shell_output, notice, or index.
+* `review_passes`: optional child records for ordered review steps when the wave
+  has meaningful passes, for example REVIEW-002 pass 1/2/3 or REVIEW-003
+  step 1/2/3.
+* `finding_threads`: durable project-wide finding or risk identities that can be
+  observed, reassessed, mitigated, or closed over time.
+* `finding_observations`: review-local observations of a finding thread,
+  preserving local ID, source artifact, section, reviewed commit, severity,
+  category, and local recommendation.
+* `finding_events`: lifecycle transitions such as opened, confirmed, mitigated,
+  resolved, closed, superseded, reframed, accepted-risk, wontfix, or watch-only.
+* `finding_relations`: relationships between findings, for example duplicates,
+  clusters, supersedes, refines, carry-over, root-cause, symptom, or reframe.
+* `finding_ftr_links`: many-to-many links between findings and FTRs with a
+  relation such as generated, proposed, resolves, mitigates, verifies, blocks,
+  supersedes, or no_ftr_needed.
+* `review_ftr_links`: links where a review wave or artifact proposes, derives,
+  validates, closes, or rejects FTRs independent of a single finding.
+* `review_decisions`: explicit review outcomes that are not findings, including
+  do-not-do-yet guidance, no-FTR-created conclusions, release cutline decisions,
+  and non-finding classifications.
+
+Some of these could be combined initially if the project wants fewer files, but
+the conceptual separation matters:
+
+* review wave is not the same as review artifact;
+* finding thread is not the same as review-local observation;
+* lifecycle event is not the same as current status;
+* FTR link is not the same as FTR dependency.
+
+The current `reviews.json` can remain as a compact summary view only if richer
+review-wave/artifact/pass structure exists elsewhere. Otherwise it will be
+forced to carry too many meanings.
+
+The current `findings.json` can remain as a current snapshot only if durable
+finding threads and observation/event history exist elsewhere. Otherwise it will
+not support cross-wave tracking.
+
+== Review / Finding Lifecycle Assessment
+
+The current reviews model is sufficient for simple FTR review records, but it
+is not sufficient for REVIEW-001, REVIEW-002, or REVIEW-003 as they exist in the
+archive.
+
+REVIEW-001 can be represented only partially. A single review row can point at
+the consolidation document, but the wave had multiple area reviews, prompts, a
+consolidated findings table, clusters, a completion notice, and a later FTR
+derivation workflow. The current row shape has no parent wave, no child
+artifacts, no cluster relation, and no way to state that `D-001 + IR-002` are
+the same root issue or that `IR-008 + A-004` are duplicates from different
+review perspectives.
+
+REVIEW-002 can be represented only partially. It explicitly reassesses
+REVIEW-001 findings into resolved, mitigated, unchanged, and new architectural
+risks. Later, the Phase 3.5 reassessment marks findings as resolved, partially
+resolved, reframed, still open, or obsolete. A single review row plus finding
+rows can store the latest summaries, but it cannot preserve the transition
+history or the distinction between a finding being resolved and a finding being
+reframed.
+
+REVIEW-003 can be represented only partially. It is a release-readiness program
+with steps, release blockers, must-fix-before-tagging items, should-fix-before-
+low-touch items, after-release items, watch-only items, and non-findings. These
+categories are not merely severities. They encode release timing and planning
+semantics. The current model lacks a field for release gate, disposition bucket,
+or planning horizon.
+
+Findings cannot yet be tracked cleanly across review waves. The existing fields
+can record origin review and current status, but not multiple observations,
+carry-over links, reassessment evidence, or history of status changes.
+
+A finding can move from active to mitigated to closed only by mutating one row.
+That supports a current snapshot, but not an auditable lifecycle. The archive's
+value is precisely that it records why an issue moved, which review established
+the transition, and what evidence was used. That requires event history or
+observation rows.
+
+Review-local findings and project-wide findings are not distinguished properly
+yet. The model has one `id` field. It needs separate identities for:
+
+* project-wide durable finding thread;
+* review-local label or source heading;
+* observation instance;
+* cluster or duplicate relation.
+
+Without that distinction, canonical data will either become too verbose
+because every local label becomes a finding, or too lossy because local review
+evidence is collapsed into broad summaries.
+
+Fields likely missing from review records:
+
+* `wave_id`;
+* `artifact_kind`;
+* `pass_id` or `step_id`;
+* `parent_review_id`;
+* `baseline_review_id`;
+* `reviewed_commit`;
+* `reviewed_branch`;
+* `scope`;
+* `status` distinct from `verdict`;
+* `artifact_role` such as prompt, evidence, findings, summary, reassessment, or
+  handoff;
+* `archival_state`;
+* `line_start` or section anchor for source provenance.
+
+Fields likely missing from finding records:
+
+* durable `finding_thread_id`;
+* review-local `local_id`;
+* `observation_id`;
+* `origin_review_id`;
+* `latest_review_id`;
+* `lifecycle_state` separate from current reporting relevance;
+* `disposition`;
+* `planning_bucket` or `release_gate`;
+* `confidence` or verification state;
+* `evidence_path` and optional section/line;
+* `introduced_in_review_id`;
+* `reassessed_in_review_id`;
+* `closed_in_review_id`;
+* `mitigated_by_ftr_id` distinct from `resolved_by_ftr_id`;
+* `closed_by_ftr_id`;
+* `closed_by_review_id`;
+* relation to duplicate, cluster, root-cause, symptom, or reframe.
+
+Potentially redundant or risky fields:
+
+* `ftr_id` on reviews overlaps with generic `target_type=ftr` and `target_id`;
+  it is convenient for simple FTR reviews but redundant once reviews can target
+  multiple entities.
+* `target_type` / `target_id` on findings overlaps with `affected_area` and
+  `resolved_by_ftr_id`; without typed relationship tables it may become
+  ambiguous.
+* `status` and `current_relevance` are both useful, but they should not carry
+  all lifecycle and reporting semantics alone.
+* `superseded_by` as a scalar cannot represent clusters, duplicate findings, or
+  many-step reframing.
+
+== FTR Integration Assessment
+
+Findings can be linked to FTRs in the current model only in a narrow case: one
+finding points to one resolving FTR through `resolved_by_ftr_id`, or targets one
+FTR through `target_id`.
+
+That is not enough for the real review history.
+
+REVIEW-001 explicitly used a derivation workflow where consolidated findings and
+clusters became FTR candidates. The prompt required FTRs to preserve review
+source, finding IDs, cluster IDs, dependencies, scope, non-goals, and
+acceptance criteria. That implies a generated-from or derived-from relation
+between review findings and FTRs, not just a resolved-by relation.
+
+REVIEW-002 reassessed whether earlier FTR work resolved, mitigated, or left
+open REVIEW-001 issues. That needs relation types such as validates, mitigates,
+partially_resolves, leaves_open, supersedes, or reframes.
+
+REVIEW-003 tied findings to release cutline FTRs and backlog reconciliation. It
+also identified pre-tag mechanical actions, low-touch governance tasks,
+after-release items, and watch-only concerns. Some of these should generate
+FTRs; some should update existing FTRs; some should remain review decisions
+without FTRs.
+
+The warm backlog triage review goes further: it proposes new ticket candidates
+from reviews while explicitly stating that no files were created. That requires
+a canonical way to represent proposed FTRs or candidate FTRs separately from
+accepted canonical FTRs, or at least a review-to-FTR link whose target may be
+pending.
+
+Additional structure is required:
+
+* FTR dependencies should remain separate in `ftr_dependencies.json`.
+* Finding-to-FTR links should be separate from FTR dependencies.
+* Review-to-FTR links should be separate from finding-to-FTR links.
+* Proposed FTR candidates should have a lifecycle state distinct from canonical
+  active FTRs.
+* The relation should state whether the FTR was generated by, proposed by,
+  resolves, mitigates, verifies, blocks, supersedes, or was rejected by a review.
+
+This separation avoids confusing planning lineage with execution dependencies.
+For example, "FTR A depends on FTR B" is different from "Finding X generated
+FTR A" or "Review Y validated that FTR A closed Finding X".
+
+== Recommended Next Step
+
+Do not improve extraction heuristics next.
+
+The next canonical modeling step should be a small manual representation of one
+complete review wave, preferably REVIEW-002, because it exercises the hardest
+modeling cases:
+
+* a baseline against REVIEW-001;
+* multiple artifacts and passes;
+* resolved, mitigated, unchanged, new, reframed, obsolete, and still-open
+  finding states;
+* carry-over findings;
+* explicit links to FTR and backlog cleanup;
+* reassessment after later semantic work.
+
+The output should be a deliberately small canonical slice that proves the
+entities and relationships, not a broad migration of the archive. A good target
+would be:
+
+* one `review_wave` for REVIEW-002;
+* a handful of `review_artifacts` from the REVIEW-002 index;
+* two or three durable `finding_threads`, including one REVIEW-001 carry-over
+  and one REVIEW-002 new risk;
+* their `finding_observations` and lifecycle events;
+* at least one finding-to-FTR link and one review-generated FTR candidate link;
+* one explicit no-FTR or watch-only decision.
+
+Only after that manual canonical slice is coherent should extraction be revisited.
+The question to answer first is not "can headings be parsed", but "does the
+canonical model preserve the review and finding history without collapsing
+meaningful distinctions".

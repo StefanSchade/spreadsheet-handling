@@ -14,7 +14,7 @@ REVIEW_SOURCE_GLOBS = [
     "docs/cold_storage/reviews/**/*.adoc",
     "docs/warm_storage/global_reviews/*.adoc",
 ]
-OUTPUT_DIR = ROOT / "project_meta" / "extracted"
+OUTPUT_DIR = ROOT / "project_memory" / "extracted"
 
 ID_RE = re.compile(r"\b(?:FTR|BUG|REV|FIN|DEC|REL)-[A-Z0-9][A-Z0-9_-]*\b")
 LABEL_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 _/-]{1,40}):\s*(.+?)\s*$")
