@@ -255,11 +255,11 @@ clean-docs: ## Remove doc build output
 .PHONY: memory-export-ods memory-import-ods memory-diff-reimport memory-check-reimport memory-promote-reimport memory-promote-reimport-checked
 .PHONY: check-memory-sheets-run
 
-memory-setup: deps-dev ## Install the current core checkout for project_memory ODS roundtrips
+memory-setup: setup ## Alias for setup; project_memory uses the shared local dev venv
 
-check-memory-sheets-run: venv ## Ensure the local sheets-run binary exists for project_memory targets
+check-memory-sheets-run: deps-dev ## Ensure the local sheets-run binary exists for project_memory targets
 	@test -x "$(SHEETS_RUN)" || { \
-		echo "sheets-run not found in $(VENV). Run 'make memory-setup' first."; \
+		echo "sheets-run not found in $(VENV). Run 'make setup' or 'make memory-setup' first."; \
 		exit 127; \
 	}
 
