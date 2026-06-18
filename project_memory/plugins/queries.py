@@ -124,3 +124,31 @@ def derived_views_only(
         if isinstance(frame, pd.DataFrame):
             out[name] = frame.copy()
     return out
+
+
+def drop_projection_frames(
+    frames: Mapping[str, Any],
+    *,
+    names: tuple[str, ...] = ("concern_signal_matrix",),
+    xref_names: tuple[str, ...] = ("concern_signal_threads",),
+) -> dict[str, Any]:
+    """Drop workbook-only projection frames before canonical JSON staging."""
+    out: dict[str, Any] = dict(frames)
+    for name in names:
+        out.pop(name, None)
+
+    meta = out.get("_meta")
+    if isinstance(meta, dict):
+        meta = dict(meta)
+        xref = meta.get("xref_crosstable")
+        if isinstance(xref, dict):
+            xref = dict(xref)
+            for name in xref_names:
+                xref.pop(name, None)
+            if xref:
+                meta["xref_crosstable"] = xref
+            else:
+                meta.pop("xref_crosstable", None)
+        out["_meta"] = meta
+
+    return out
