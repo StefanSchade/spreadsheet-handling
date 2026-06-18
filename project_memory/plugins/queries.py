@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -152,3 +153,88 @@ def drop_projection_frames(
         out["_meta"] = meta
 
     return out
+
+
+def copy_frame(frames: Mapping[str, Any], *, source: str, output: str) -> dict[str, Any]:
+    """Copy a frame so later recomposition can use it as a stable base."""
+    out: dict[str, Any] = dict(frames)
+    frame = frames.get(source)
+    if isinstance(frame, pd.DataFrame):
+        out[output] = frame.copy()
+    return out
+
+
+def finalize_concern_signal_xrefs(
+    frames: Mapping[str, Any],
+    *,
+    frame: str = "concern_signal_xrefs",
+    base_frame: str = "__base_concern_signal_xrefs",
+    projection_frames: tuple[str, ...] = (
+        "concern_signal_matrix",
+        "__base_concern_signal_xrefs",
+    ),
+    xref_names: tuple[str, ...] = ("concern_signal_xrefs",),
+) -> dict[str, Any]:
+    """Restore deterministic xref IDs/notes and remove workbook-only frames."""
+    out: dict[str, Any] = dict(frames)
+    current = _frame_or_empty(out, frame)
+    base = _frame_or_empty(out, base_frame)
+
+    if not current.empty:
+        base_notes = _xref_notes_by_tuple(base)
+        rows: list[dict[str, Any]] = []
+        for record in current.where(pd.notnull(current), "").to_dict(orient="records"):
+            signal_id = str(record.get("signal_id", ""))
+            concern_thread_id = str(record.get("concern_thread_id", ""))
+            rows.append({
+                "id": _concern_signal_xref_id(signal_id, concern_thread_id),
+                "signal_id": signal_id,
+                "concern_thread_id": concern_thread_id,
+                "signal_role": str(record.get("signal_role", "")),
+                "notes": base_notes.get((signal_id, concern_thread_id), ""),
+            })
+        out[frame] = pd.DataFrame(
+            rows,
+            columns=["id", "signal_id", "concern_thread_id", "signal_role", "notes"],
+        )
+
+    for name in projection_frames:
+        out.pop(name, None)
+    _drop_xref_meta(out, xref_names)
+    return out
+
+
+def _xref_notes_by_tuple(frame: pd.DataFrame) -> dict[tuple[str, str], str]:
+    if frame.empty:
+        return {}
+    notes: dict[tuple[str, str], str] = {}
+    clean = frame.where(pd.notnull(frame), "")
+    for record in clean.to_dict(orient="records"):
+        key = (str(record.get("signal_id", "")), str(record.get("concern_thread_id", "")))
+        notes[key] = str(record.get("notes", ""))
+    return notes
+
+
+def _concern_signal_xref_id(signal_id: str, concern_thread_id: str) -> str:
+    return f"CTSX-{_safe_id_part(signal_id)}--{_safe_id_part(concern_thread_id)}"
+
+
+def _safe_id_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
+
+
+def _drop_xref_meta(out: dict[str, Any], xref_names: tuple[str, ...]) -> None:
+    meta = out.get("_meta")
+    if not isinstance(meta, dict):
+        return
+    meta = dict(meta)
+    xref = meta.get("xref_crosstable")
+    if isinstance(xref, dict):
+        xref = dict(xref)
+        for name in xref_names:
+            xref.pop(name, None)
+        if xref:
+            meta["xref_crosstable"] = xref
+        else:
+            meta.pop("xref_crosstable", None)
+    out["_meta"] = meta
