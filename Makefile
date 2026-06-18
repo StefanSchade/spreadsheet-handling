@@ -264,7 +264,7 @@ check-memory-sheets-run: deps-dev ## Ensure the local sheets-run binary exists f
 	}
 
 memory-export: check-memory-sheets-run ## Render project_memory canonical JSON into project_memory.ods
-	$(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/json_to_ods.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/json_to_ods.yaml"
 
 memory-query: check-memory-sheets-run ## Render derived project_memory query views into project_memory/derived
 	@mkdir -p "$(MEMORY_DERIVED_DIR)"

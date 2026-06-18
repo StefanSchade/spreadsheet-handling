@@ -164,6 +164,50 @@ def copy_frame(frames: Mapping[str, Any], *, source: str, output: str) -> dict[s
     return out
 
 
+def enrich_concern_signal_matrix(
+    frames: Mapping[str, Any],
+    *,
+    matrix: str = "concern_signal_matrix",
+    signals: str = "concern_signals",
+    context_columns: tuple[str, ...] = ("signal_date", "source_type", "summary"),
+) -> dict[str, Any]:
+    """Add display-only signal context to the concern-signal matrix."""
+    out: dict[str, Any] = dict(frames)
+    matrix_frame = _frame_or_empty(frames, matrix)
+    signals_frame = _frame_or_empty(frames, signals)
+    if matrix_frame.empty or signals_frame.empty or "signal_id" not in matrix_frame.columns:
+        return out
+
+    context = _stable_columns(signals_frame.rename(columns={"id": "signal_id"}), [
+        "signal_id",
+        *context_columns,
+    ])
+    enriched = matrix_frame.merge(context, on="signal_id", how="left")
+    ordered_columns = [
+        "signal_id",
+        *context_columns,
+        *[col for col in matrix_frame.columns if col != "signal_id"],
+    ]
+    out[matrix] = _json_safe_frame(_stable_columns(enriched, ordered_columns))
+    return out
+
+
+def strip_concern_signal_matrix_context(
+    frames: Mapping[str, Any],
+    *,
+    matrix: str = "concern_signal_matrix",
+    context_columns: tuple[str, ...] = ("signal_date", "source_type", "summary"),
+) -> dict[str, Any]:
+    """Remove display-only matrix context columns before xref expansion."""
+    out: dict[str, Any] = dict(frames)
+    matrix_frame = _frame_or_empty(frames, matrix)
+    if matrix_frame.empty:
+        return out
+    drop_columns = [col for col in context_columns if col in matrix_frame.columns]
+    out[matrix] = matrix_frame.drop(columns=drop_columns)
+    return out
+
+
 def finalize_concern_signal_xrefs(
     frames: Mapping[str, Any],
     *,
