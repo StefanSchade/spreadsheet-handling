@@ -87,10 +87,20 @@ def test_concern_signal_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path
     ] = "low"
 
     matrix = workbook_frames["concern_signal_matrix"]
+    assert matrix.columns.tolist()[:4] == [
+        "signal_id",
+        "signal_date",
+        "source_type",
+        "summary",
+    ]
+    matrix.loc[
+        matrix["signal_id"] == "SIG-CONC-TEST",
+        "summary",
+    ] = "Edited matrix summary that must be ignored"
     matrix.loc[
         matrix["signal_id"] == "SIG-CONC-TEST",
         "CONC-ADAPTER-SPREADSHEET-BOUNDARY",
-    ] = "test_role_roundtrip"
+    ] = "matrix_helper_context_roundtrip"
 
     staging_frames = run_pipeline(
         workbook_frames,
@@ -105,13 +115,17 @@ def test_concern_signal_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path
         staging["concern_threads"]["id"] == "CONC-DOMAIN-META-SEMANTICS",
         "priority",
     ].item() == "low"
+    assert staging["concern_signals"].loc[
+        staging["concern_signals"]["id"] == "SIG-CONC-TEST",
+        "summary",
+    ].item() == "Test signal."
 
     xrefs = staging["concern_signal_xrefs"].to_dict(orient="records")
     assert {
         "id": "CTSX-SIG-CONC-TEST--CONC-ADAPTER-SPREADSHEET-BOUNDARY",
         "signal_id": "SIG-CONC-TEST",
         "concern_thread_id": "CONC-ADAPTER-SPREADSHEET-BOUNDARY",
-        "signal_role": "test_role_roundtrip",
+        "signal_role": "matrix_helper_context_roundtrip",
         "notes": "",
     } in xrefs
     assert {
