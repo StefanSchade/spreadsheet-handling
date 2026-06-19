@@ -12,6 +12,7 @@ TEMPLATE_DIR = ROOT / "project_memory" / "templates"
 OUTPUT_PATH = ROOT / "docs_generated" / "project_memory" / "current_context.adoc"
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+_HISTORIC_RELEVANCE = frozenset({"historic", "historical"})
 CONCERN_STATUS_ORDER = {
     ("active", "doing_now"): 0,
     ("active", ""): 1,
@@ -73,7 +74,10 @@ def _current_reviews(reviews: list[dict[str, str]]) -> list[dict[str, str]]:
         row
         for row in reviews
         if row.get("current_relevance", "") in {"current", "partial"}
-        or row.get("takeaway_confidence", "") == "high"
+        or (
+            row.get("takeaway_confidence", "") == "high"
+            and row.get("current_relevance", "") not in _HISTORIC_RELEVANCE
+        )
     ]
     return sorted(rows, key=lambda row: (row.get("date", ""), row.get("id", "")), reverse=True)
 
