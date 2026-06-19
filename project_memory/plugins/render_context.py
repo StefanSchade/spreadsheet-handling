@@ -164,6 +164,7 @@ def build_render_context() -> dict[str, Any]:
     current_findings = _read_rows(DERIVED_DIR / "current_findings.json")
     blockers = _read_rows(DERIVED_DIR / "ftr_blockers.json")
     edges = _read_rows(DERIVED_DIR / "ftr_dependency_edges.json")
+    event_ftr_links = _read_rows(DERIVED_DIR / "event_ftr_links.json")
     concerns = _read_rows(CANONICAL_DIR / "concerns.json")
     concern_events = _read_rows(CANONICAL_DIR / "concern_events.json")
     concern_event_xrefs = _read_rows(CANONICAL_DIR / "concern_event_xrefs.json")
@@ -191,6 +192,7 @@ def build_render_context() -> dict[str, Any]:
         "ftr_blockers": blockers,
         "ftr_dependency_edges": edges,
         "reviews": _current_reviews(reviews),
+        "event_ftr_links": event_ftr_links,
         "diagnostics": diagnostics,
     }
 

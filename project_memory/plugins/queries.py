@@ -178,11 +178,79 @@ def release_note_candidates(
     return {**dict(frames), "release_note_candidates": result}
 
 
+def _parse_commit_refs(value: str) -> list[str]:
+    """Split a comma-or-semicolon-separated commit ref string; normalise each hash to 7 chars."""
+    if not value.strip():
+        return []
+    parts = [h.strip() for h in value.replace(";", ",").split(",") if h.strip()]
+    return [p[:7] for p in parts if len(p) >= 6]
+
+
+def event_ftr_links(
+    frames: Mapping[str, Any],
+    *,
+    events: str = "concern_events",
+    xrefs: str = "concern_event_xrefs",
+    ftrs: str = "ftrs",
+) -> dict[str, Any]:
+    """Link concern events to FTRs via shared commit references."""
+    events_df = _frame_or_empty(frames, events)
+    xrefs_df = _frame_or_empty(frames, xrefs)
+    ftrs_df = _frame_or_empty(frames, ftrs)
+
+    output_columns = [
+        "event_id", "concern_ids", "ftr_id", "match_field",
+        "matched_commit", "ftr_summary", "event_summary",
+    ]
+
+    if events_df.empty or ftrs_df.empty:
+        return {**dict(frames), "event_ftr_links": _json_safe_frame(pd.DataFrame(columns=output_columns))}
+
+    # event_id → comma-separated concern_ids
+    concern_map: dict[str, str] = {}
+    if not xrefs_df.empty and "event_id" in xrefs_df.columns and "concern_id" in xrefs_df.columns:
+        clean = xrefs_df.where(xrefs_df.notna(), "")
+        for eid, grp in clean.groupby("event_id"):
+            ids = sorted(grp["concern_id"].astype(str).unique().tolist())
+            concern_map[str(eid)] = ", ".join(i for i in ids if i)
+
+    # normalised_commit → [(ftr_id, match_field, ftr_summary)]
+    commit_to_ftrs: dict[str, list[tuple[str, str, str]]] = {}
+    for ftr_row in ftrs_df.where(ftrs_df.notna(), "").to_dict(orient="records"):
+        ftr_id = str(ftr_row.get("id", ""))
+        ftr_summary = str(ftr_row.get("summary", ""))
+        for field in ("created_commit", "implementation_commits", "review_commits"):
+            for h in _parse_commit_refs(str(ftr_row.get(field, ""))):
+                commit_to_ftrs.setdefault(h, []).append((ftr_id, field, ftr_summary))
+
+    rows: list[dict[str, str]] = []
+    for event_row in events_df.where(events_df.notna(), "").to_dict(orient="records"):
+        event_id = str(event_row.get("id", ""))
+        event_summary = str(event_row.get("summary", ""))
+        concern_ids = concern_map.get(event_id, "")
+        for h in _parse_commit_refs(str(event_row.get("commit_refs", ""))):
+            for ftr_id, match_field, ftr_summary in commit_to_ftrs.get(h, []):
+                rows.append({
+                    "event_id": event_id,
+                    "concern_ids": concern_ids,
+                    "ftr_id": ftr_id,
+                    "match_field": match_field,
+                    "matched_commit": h,
+                    "ftr_summary": ftr_summary,
+                    "event_summary": event_summary,
+                })
+
+    result = pd.DataFrame(rows, columns=output_columns) if rows else pd.DataFrame(columns=output_columns)
+    result = result.drop_duplicates().sort_values(["event_id", "ftr_id"], ignore_index=True)
+    return {**dict(frames), "event_ftr_links": _json_safe_frame(result)}
+
+
 def derived_views_only(
     frames: Mapping[str, Any],
     *,
     names: tuple[str, ...] = (
-        "current_findings", "ftr_dependency_edges", "ftr_blockers", "release_note_candidates",
+        "current_findings", "ftr_dependency_edges", "ftr_blockers",
+        "release_note_candidates", "event_ftr_links",
     ),
 ) -> dict[str, pd.DataFrame]:
     """Keep only the derived query frames for downstream json_dir export."""
