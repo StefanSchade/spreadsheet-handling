@@ -1,0 +1,227 @@
+== Project Memory: Vocabulary Rename Runbook
+
+Use this runbook when renaming a project-memory entity: a table name, a field
+name, or both. The vocabulary is not centralised; it is woven through eight
+layers that must be updated in concert.
+
+This runbook covers *table and field renames only*. Business record IDs
+(`CONC-*`, `SIG-*`, `SIG-ACT-*`, `SIG-REL-*`, `CTSX-*`) are stable keys and
+must not be renamed under any circumstances.
+
+=== Before You Start
+
+Run the baseline checks and confirm they all pass before touching any file.
+If a check fails before your changes, stop and report — do not proceed.
+
+[source,shell]
+----
+make memory-context
+make test-file FILE=tests/integration/project_memory/test_concern_event_matrix_roundtrip.py
+make test-file FILE=tests/integration/project_memory/test_render_context.py
+.venv/bin/pytest -q tests/architecture/dependency_guards/test_project_memory_dependency_boundary.py
+git diff --check
+----
+
+=== Find Everything First
+
+Before changing anything, grep for all occurrences of the old name and build a
+mental map of what needs to change.
+
+[source,shell]
+----
+grep -rn "OLD_NAME" \
+  project_memory/canonical/ \
+  project_memory/contracts/ \
+  project_memory/pipelines/ \
+  project_memory/plugins/ \
+  project_memory/templates/ \
+  project_memory/README.adoc \
+  tests/integration/project_memory/ \
+  docs/backlog/
+----
+
+Historical review artifacts under `docs/backlog/*_review.adoc` are frozen
+prose; update them only if they contain executable configuration, not merely
+descriptive text.
+
+=== What Must Not Change
+
+* `findings.json` and `reviews.json` — independent tables, separate vocabulary
+* Business record IDs: `CONC-*`, `SIG-*`, `SIG-ACT-*`, `SIG-REL-*`, `CTSX-*`
+* The CTSX-* xref ID pattern is derived from SIG-* and CONC-* values;
+  renaming those source values would silently corrupt existing xref IDs
+
+=== Layers in Order
+
+Work through the layers in the order below. Each layer depends on the
+previous; changing them out of order makes verification harder.
+
+==== 1. Canonical JSON — file renames
+
+[source,shell]
+----
+git mv project_memory/canonical/OLD_TABLE.json project_memory/canonical/NEW_TABLE.json
+----
+
+==== 2. Canonical JSON — field renames within data
+
+Use a small Python snippet so the transformation is reproducible and safe:
+
+[source,python]
+----
+import json
+from pathlib import Path
+
+field_map = {"old_field": "new_field", ...}
+p = Path("project_memory/canonical/NEW_TABLE.json")
+data = json.loads(p.read_text())
+renamed = [
+    {field_map.get(k, k): v for k, v in row.items()}
+    for row in data
+]
+p.write_text(json.dumps(renamed, indent=2, ensure_ascii=False) + "\n")
+----
+
+Run this via `python3 - <<'EOF' ... EOF` inline in the shell so nothing extra
+is committed.
+
+==== 3. Pipeline YAML files
+
+Files to update:
+
+* `project_memory/pipelines/memory/json_to_ods.yaml`
+* `project_memory/pipelines/memory/ods_to_json.yaml`
+* `project_memory/pipelines/memory/json_to_derived_queries.yaml`
+
+Things to rename in YAML:
+
+* `relation:` and `output:` values (table names and matrix names)
+* `row_keys:` entries (field names used as row identifiers)
+* `column_key:` value (the field used as column selector)
+* `value:` field (the field used as cell value)
+* `dotted:` function references (if functions are renamed)
+* `args:` keys and values that reference table or field names
+* `base_relation:` values
+
+==== 4. Python code — `queries.py`
+
+* Function names (`enrich_*`, `strip_*`, `finalize_*`, private helpers)
+* Default argument values for `signals=`, `xrefs=`, `matrix=` parameters
+* `context_columns=` tuple entries (field names)
+* Internal column references used in `.merge()`, `.groupby()`, subscript access
+* `output_columns` list (field names in derived output frames)
+* Sort key field names in `.sort_values()`
+* Frame key names in `{**dict(frames), "NAME": ...}` return expressions
+* `_drop_xref_meta` / `_drop_xref_meta` xref name lists
+
+==== 5. Python code — `render_context.py`
+
+* File path strings in `_read_rows(CANONICAL_DIR / "OLD.json")`
+* Private function names (`_concern_threads_with_signals` → `_concerns_with_events`)
+* Internal field references in dict literals built from xref and event rows
+* Accumulated list keys on concern rows (`row["signals"]` → `row["events"]`)
+* Sort key lambdas that reference field names by string
+* `_diagnostics()` parameter names and return dict keys
+  (`"missing_concern_signal_refs"` etc.)
+* `build_render_context()` return dict keys (`"concern_threads"` → `"concerns"`)
+* Sort key in `_group_by_section()` if a date field is renamed
+
+==== 6. Jinja2 templates
+
+Files to check:
+
+* `project_memory/templates/_concerns.adoc.j2` (or the concerns partial)
+* `project_memory/templates/_diagnostics.adoc.j2`
+* `project_memory/templates/current_context.adoc.j2`
+* `project_memory/templates/release_note_candidates.adoc.j2`
+
+Things to rename:
+
+* Template file names (use `git mv`)
+* `{% include "OLD.adoc.j2" %}` references in `current_context.adoc.j2`
+* Context variable names (`concern_threads` → `concerns`, etc.)
+* Attribute access on loop variables (`signal.signal_id` → `event.event_id`)
+* Section heading text if it reflects the entity name
+
+==== 7. Contracts
+
+Files to rename with `git mv`:
+
+* `project_memory/contracts/OLD_TABLE.adoc` → `NEW_TABLE.adoc`
+
+Content to update in each contract file:
+
+* `= Table Contract: OLD_NAME` heading
+* `Purpose` section prose
+* `Fields` table: field names and their descriptions
+* `id` pattern description (if it references old field names)
+* Example JSON blocks
+
+Update `project_memory/contracts/index.adoc`:
+
+* `xref:OLD_TABLE.adoc[]` references
+* Granularity Policy prose that names the entities
+
+==== 8. Tests
+
+* Rename test files if the file name reflects the old entity (`git mv`)
+* Update `_frames()` fixture: dict keys, DataFrame column names, data values
+* Update all assertions: frame key names, column names, expected values in
+  `.to_dict()` records, `.item()` comparisons
+* Update string literals in `assert "..." in text` that reflect template output
+
+[source,shell]
+----
+git mv tests/integration/project_memory/test_OLD_roundtrip.py \
+       tests/integration/project_memory/test_NEW_roundtrip.py
+----
+
+==== 9. Documentation
+
+* `project_memory/README.adoc`: all prose mentions of table and field names,
+  section headings that name the entities
+* `docs/backlog/FTR-*.adoc`: current-model FTRs (not historical review
+  artifacts) — update table/field names in Problem, Goal, Source, and Scope
+  sections
+
+=== Validation After All Changes
+
+Run the full baseline sequence again and confirm all checks pass.
+
+[source,shell]
+----
+make memory-context
+make test-file FILE=tests/integration/project_memory/test_concern_event_matrix_roundtrip.py
+make test-file FILE=tests/integration/project_memory/test_render_context.py
+.venv/bin/pytest -q tests/architecture/dependency_guards/test_project_memory_dependency_boundary.py
+git diff --check
+----
+
+Then confirm no old vocabulary remains (adjust the grep for what you renamed):
+
+[source,shell]
+----
+grep -rn "OLD_NAME" \
+  project_memory/canonical/ project_memory/contracts/ \
+  project_memory/pipelines/ project_memory/plugins/ \
+  project_memory/templates/ project_memory/README.adoc \
+  tests/integration/project_memory/ docs/backlog/
+----
+
+=== Commit
+
+Single chore commit for the entire rename. Commit message pattern:
+
+----
+chore(project-memory): rename OLD to NEW
+
+ONE-LINE summary of what was renamed and why.
+
+* OLD_TABLE.json -> NEW_TABLE.json
+* old_field -> new_field (in NEW_TABLE.json)
+* old_field -> new_field (in NEW_XREFS.json)
+* All pipeline YAMLs, queries.py, render_context.py, templates,
+  contracts, tests, README updated consistently.
+* Business record IDs (CONC-*, SIG-*, CTSX-*) unchanged.
+* findings.json and reviews.json unchanged.
+----
