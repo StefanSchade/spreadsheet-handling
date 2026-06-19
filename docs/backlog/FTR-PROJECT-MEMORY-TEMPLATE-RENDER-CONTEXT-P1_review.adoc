@@ -1,0 +1,410 @@
+= Review: FTR-PROJECT-MEMORY-TEMPLATE-RENDER-CONTEXT-P1
+:toc:
+:toclevels: 2
+
+Review date:: 2026-06-19
+Reviewer:: Claude Sonnet 4.6
+Review type:: Focused implementation review; project_memory / dev-tooling scope only. Architecture not reopened.
+Verdict:: Yellow
+
+== Verdict
+
+Yellow.
+
+The template-based render-context refactor is structurally sound.
+The Jinja2 dependency boundary is correctly enforced via the optional
+`project-memory` extra and the AST guard test.
+The Makefile stamp target is correct.
+`build_render_context()` is cleanly usable without Jinja2.
+`StrictUndefined` prevents silent missing-variable renders.
+AsciiDoc table syntax in templates is valid.
+
+One semantic issue requires a fix before the generated context is trusted
+for LLM or review handoff: `_current_reviews` includes all
+`takeaway_confidence='high'` reviews with no relevance guard, causing 14 of 28
+reviews (all marked `current_relevance='historic'`) to surface in a section
+titled "current or highly relevant".
+One test assertion is fragile and will break on the next active concern addition.
+Remaining findings are maintenance risks without current impact.
+
+== Executive Summary
+
+The refactor achieves its stated goals: Python builds a structured context dict,
+Jinja2 templates own AsciiDoc layout, concern threads and linked signals appear
+before raw finding and FTR lists, and unresolved references are surfaced as
+diagnostics.
+
+The dependency boundary is clean.
+`build_render_context()` reads from both `canonical/` and `derived/`
+as intended.
+Diagnostics correctly flag missing signal xref targets, missing concern-thread
+xref targets, and missing FTR dependency endpoints.
+`make memory-context` correctly chains the stamp and the query run.
+
+The two issues requiring follow-up are:
+
+* The `_current_reviews` filter (review-takeaways semantics)
+* The hardcoded `[0]` index in the integration test
+
+== Findings
+
+=== Before-release: _current_reviews OR clause includes all historic high-confidence reviews
+
+*Observation:*
+`_current_reviews()` includes a review if
+`current_relevance in {'current', 'partial'}` *or*
+`takeaway_confidence == 'high'`.
+There is no relevance guard on the high-confidence branch.
+
+*Evidence:*
+`reviews.json` uses exactly two `current_relevance` values: `'current'` and
+`'historic'`.
+All 14 reviews marked `current_relevance='historic'` also carry
+`takeaway_confidence='high'`, so all 14 pass the OR condition.
+Of 28 total reviews, 14 are historic; the rendered "Review Takeaways" section
+is currently 50 % stale data.
+
+*Risk if ignored:*
+An LLM consuming the handoff context sees steering takeaways from superseded
+or historically-closed reviews as live context.
+The section header "Maintainer steering interpretation from current or highly
+relevant review records" sets an expectation the filter does not honour when
+`current_relevance='historic'` is the explicit maintainer signal.
+
+*Recommended action:*
+Add a relevance guard to the high-confidence branch:
+
+[source,python]
+----
+or (
+    row.get("takeaway_confidence", "") == "high"
+    and row.get("current_relevance", "") not in {"historic", "historical"}
+)
+----
+
+Alternatively, document in the FTR that high-confidence historic reviews are
+intentionally surfaced and rename the section accordingly.
+
+*Disposition:* Before-release fix or explicit design decision.
+
+=== Before-release: test [0] index hardcoded to specific concern ID
+
+*Observation:*
+`test_build_render_context_includes_concern_steering` asserts
+`context["concern_threads"][0]["id"] == "CONC-DOMAIN-META-SEMANTICS"`.
+
+*Evidence:*
+`_concern_rank` produces `(status_rank, priority_rank, id)`.
+Both `CONC-DOMAIN-META-SEMANTICS` and `CONC-PROJECT-MEMORY-GOVERNANCE` are
+`active / doing_now / high`, yielding identical numeric ranks `(0, 0)`.
+`CONC-DOMAIN-META-SEMANTICS` wins index `[0]` only because `'D' < 'P'`
+lexicographically.
+Adding any new `active/doing_now/high` concern whose ID begins with `A`, `B`,
+or `C` pushes `CONC-DOMAIN-META-SEMANTICS` to index `[1]` and the assertion
+fails.
+
+*Risk if ignored:*
+The test breaks on the next concern addition with no relation to the feature
+under test.
+The CI failure appears to be a regression in concern ordering rather than a
+data-quality problem.
+
+*Recommended action:*
+Replace the index lookup with an ID search:
+
+[source,python]
+----
+ct = next(c for c in context["concern_threads"] if c["id"] == "CONC-DOMAIN-META-SEMANTICS")
+assert ct["signals"]
+----
+
+*Disposition:* Fix before the next commit that touches `concern_threads.json`.
+
+=== Maintenance: 'historic' / 'historical' vocabulary mismatch across filters
+
+*Observation:*
+`_active_ftrs()` guards against `current_relevance != 'historical'` (with the
+`-al` suffix).
+`reviews.json` uses `'historic'` (no suffix) as the non-current relevance
+value.
+The two filters in the same file spell the exclusion value differently.
+
+*Evidence:*
+`reviews.json` `current_relevance` values: `['current', 'historic']`.
+`ftrs.json` `current_relevance` values: `['current']` (no historic FTRs exist
+yet).
+The `_active_ftrs` guard is therefore currently a no-op, but would silently
+miss `current_relevance='historic'` FTRs if the canonical data ever adopts that
+spelling.
+
+*Risk if ignored:*
+A historic FTR added with `current_relevance='historic'` (matching the review
+vocabulary) bypasses the exclusion and appears in the Active FTRs table with no
+diagnostic.
+
+*Recommended action:*
+Either unify the exclusion string across both filters, or define a module-level
+constant:
+
+[source,python]
+----
+_HISTORIC_RELEVANCE = frozenset({"historic", "historical"})
+----
+
+and use it in both `_active_ftrs` and the `_current_reviews` fix above.
+
+*Disposition:* Maintenance fix; no current data impact.
+
+=== Maintenance: xref notes or-fallback swallows intentionally empty notes
+
+*Observation:*
+Signal notes selection uses:
+`xref.get("notes", "") or signal.get("notes", "")`.
+`_read_rows` converts JSON `null` to `""`.
+An xref with an explicit `null` notes field (converted to `""`) is falsy and
+falls through to the signal's notes.
+
+*Evidence:*
+All 17 current xref rows carry non-empty notes strings, so the fallback is
+never triggered in live data.
+The semantic contract "xref notes override signal notes" is broken for any
+future xref that intentionally clears the notes field.
+
+*Risk if ignored:*
+A future xref whose notes field is set to `null` to signal "no annotation"
+silently inherits the signal's notes, producing misleading output in the
+concern-thread table with no diagnostic.
+
+*Recommended action:*
+Use an explicit `None`-aware check at JSON load time or at the merge point:
+
+[source,python]
+----
+"notes": xref.get("notes") or signal.get("notes", ""),
+----
+
+where `_read_rows` preserves `None` rather than coercing to `""`, or check the
+raw JSON value before coercion.
+Alternatively, document that empty-string and null xref notes both defer to the
+signal note, as an explicit design choice.
+
+*Disposition:* Maintenance fix; no current impact.
+
+=== Maintenance: enrich_concern_signal_matrix rename is silent on missing 'id' column
+
+*Observation:*
+`enrich_concern_signal_matrix()` calls
+`signals_frame.rename(columns={"id": "signal_id"})`.
+`DataFrame.rename` is a no-op when the source column name is absent.
+
+*Evidence:*
+If the canonical signals schema ever renames `id` to another key,
+`_stable_columns` adds an empty `signal_id` column, the merge on `signal_id`
+yields zero matches, and the function returns the unenriched matrix with no
+error or warning.
+
+*Risk if ignored:*
+Enrichment silently disappears after a schema column rename.
+The ODS export and the derived query views show no signal context, and no
+diagnostic flags the problem.
+
+*Recommended action:*
+Add an early guard:
+
+[source,python]
+----
+if "id" not in signals_frame.columns:
+    return out  # or raise ValueError with a descriptive message
+----
+
+*Disposition:* Maintenance fix; no current schema impact.
+
+=== Watch: _concern_rank falls back silently for unknown postures
+
+*Observation:*
+`CONCERN_STATUS_ORDER` maps only `("active", "doing_now")`, `("active", "")`,
+and `("watching", "")`.
+Any `(status, posture)` pair not in the table falls through to the
+`(status, "")` entry.
+
+*Evidence:*
+Live `concern_threads.json` contains four distinct active postures none of
+which are in `CONCERN_STATUS_ORDER`:
+`after_domain_meta_slice`, `after_0_3_0`, `review_after_refactor`,
+`no_current_pressure`.
+All four silently resolve to rank 1 alongside concerns with no posture.
+Adding a new semantically urgent posture value such as `blocked_external`
+also resolves to rank 1 with no indication the table needs updating.
+
+*Risk if ignored:*
+Concern ordering for non-`doing_now` postures is determined solely by priority
+and ID tiebreakers, not by any posture-urgency signal.
+The silent fallback makes it impossible to distinguish urgency by posture
+without inspecting `CONCERN_STATUS_ORDER` and the raw data together.
+
+*Recommended action:*
+Add a diagnostic warning for `(status, posture)` pairs that fall through to the
+`(status, "")` fallback.
+Or enumerate the known posture values in `CONCERN_STATUS_ORDER` and raise a
+diagnostic for unrecognised ones.
+
+*Disposition:* Watch; acceptable during active model dogfooding per FTR
+Residual Risks statement.
+
+=== Watch: _active_ftrs.adoc.j2 owns two unrelated top-level sections
+
+*Observation:*
+`_active_ftrs.adoc.j2` contains both `== Active FTRs` and
+`== FTR Dependency Context` (which nests `=== FTR Blockers` and
+`=== Active Dependency Edges`).
+The file name implies only the FTR listing.
+
+*Evidence:*
+Lines 1–16: Active FTRs table.
+Lines 18–55: FTR Dependency Context parent section with two subsections.
+
+*Risk if ignored:*
+Moving or reordering the FTR Dependency Context section requires editing a file
+whose name does not reflect its scope.
+The include order in `current_context.adoc.j2` must also change, and the
+mismatch between file name and content grows harder to scan.
+
+*Recommended action:*
+Split into `_active_ftrs.adoc.j2` (FTR table only) and
+`_ftr_dependency_context.adoc.j2` (Dependency Context, Blockers, Edges).
+Update the two corresponding `{% include %}` lines in
+`current_context.adoc.j2`.
+
+*Disposition:* After-release cleanup; no correctness impact.
+
+=== Watch: _active_ftrs inactive-status set is not shared with the query pipeline
+
+*Observation:*
+`_active_ftrs()` defines inline:
+`inactive = {"done", "closed", "resolved", "superseded", "historical", "wontfix"}`.
+The query pipeline (`queries.py`, `json_to_derived_queries.yaml`) applies its
+own status filters when building derived frames such as `current_findings` and
+`ftr_blockers`.
+
+*Evidence:*
+`queries.py` `current_findings()` (line 61) excludes
+`{'resolved', 'superseded', 'historical'}` — a subset of the render-context
+set.
+Live FTR data only contains `'draft'` and `'open'`, so no divergence is
+observable today.
+
+*Risk if ignored:*
+A new status value (e.g. `'abandoned'`) added to the pipeline exclusion list is
+silently missed in `_active_ftrs`, causing abandoned FTRs to appear active in
+the rendered context while the derived pipeline views exclude them.
+
+*Recommended action:*
+Add a derived query `ftr_active` to `json_to_derived_queries.yaml` (mirroring
+`current_findings`) and read from it in `build_render_context()`.
+Or define a shared constant in `queries.py` and import it in `render_context.py`.
+
+*Disposition:* Watch; acceptable while the FTR data set is small and manually
+curated.
+
+== Non-findings
+
+=== Makefile stamp semantics
+
+`$(PROJECT_MEMORY_STAMP): $(PROJECT_MEMORY_INPUTS) | $(DEV_STAMP)` is correct.
+The order-only `| $(DEV_STAMP)` ensures the venv exists before installing but
+does not force re-installation when the dev venv is rebuilt for unrelated
+reasons.
+`PROJECT_MEMORY_INPUTS := pyproject.toml` correctly invalidates the stamp when
+the `project-memory` extra version changes.
+Repeated `make memory-context` calls are idempotent once the stamp file exists.
+
+=== Jinja2 dependency boundary
+
+`jinja2` is confined to the `[project-memory]` optional extra in
+`pyproject.toml`.
+The AST guard in
+`tests/architecture/dependency_guards/test_project_memory_dependency_boundary.py`
+correctly scans `src/spreadsheet_handling/` and does not scan
+`project_memory/` (where the allowed usage lives).
+The guard is sufficient for its stated scope.
+
+=== build_render_context() without Jinja2
+
+`build_render_context()` performs no Jinja2 import.
+The lazy import is confined to `_template_environment()`, which is called only
+by `render_current_context()`.
+The integration test correctly uses `pytest.importorskip("jinja2")` before
+calling `render_current_context`.
+
+=== AsciiDoc table syntax
+
+`trim_blocks=True` and `lstrip_blocks=True` produce one-cell-per-line output
+that is valid for AsciiDoc multi-column tables.
+Column-width proportions (`[cols="1,1,2,1,4,2",...]`) are intentional
+improvements over the removed equal-weight `_table()` helper.
+Heading-level demotions (`== FTR Blockers` → `=== FTR Blockers`) are a
+deliberate structural improvement to group dependency context under a parent
+section.
+
+=== __main__ guard
+
+`render_context.py` contains an `if __name__ == "__main__":` block that calls
+`render_current_context()`.
+`make memory-context` runs `python -m project_memory.plugins.render_context`
+and triggers this block correctly.
+
+== Lifecycle Cleanup Check
+
+This review declares a Yellow verdict; lifecycle migration is not yet due.
+
+When a follow-up review declares Green:
+
+* FTR status should change from `Implemented` to `Done`.
+* This review artifact and the FTR should move to
+  `docs/cold_storage/backlog/ftrs_done/`.
+* The include entry in `docs/backlog/_ftrs_open.adoc` for this FTR should be
+  removed.
+* No follow-up FTR is needed for residual scope; the open maintenance items
+  above are small enough for inline follow-up commits.
+
+== Validation Commands
+
+Commands executed or re-runnable to validate this slice:
+
+[source,shell]
+----
+# Primary render validation
+make memory-context
+# repeat to verify stamp idempotence
+make memory-context
+
+# Unit and integration tests
+make test-file FILE=tests/integration/project_memory/test_render_context.py
+.venv/bin/pytest -q tests/architecture/dependency_guards/test_project_memory_dependency_boundary.py
+
+# Dependency boundary spot-check
+rg -n "jinja2|Jinja2" src/spreadsheet_handling/
+
+# Vocabulary audit (confirms 'historic' vs 'historical' gap)
+.venv/bin/python -c "
+import json
+rs = json.load(open('project_memory/canonical/reviews.json'))
+fs = json.load(open('project_memory/canonical/ftrs.json'))
+print('review current_relevance values:', sorted({r.get('current_relevance') for r in rs}))
+print('ftr    current_relevance values:', sorted({f.get('current_relevance') for f in fs}))
+"
+
+# Filter breadth audit (confirms historic review count)
+.venv/bin/python -c "
+import json
+rs = json.load(open('project_memory/canonical/reviews.json'))
+stale_high = [r['id'] for r in rs
+              if r.get('takeaway_confidence') == 'high'
+              and r.get('current_relevance') not in {'current', 'partial'}]
+print(len(stale_high), 'historic+high-confidence reviews would surface:', stale_high)
+"
+
+# JSON integrity
+find project_memory/canonical -maxdepth 1 -type f -name '*.json' -print \
+  | sort | xargs -n1 .venv/bin/python -m json.tool > /dev/null
+----
