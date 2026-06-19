@@ -19,3 +19,15 @@ def test_json_roundtrip(tmp_path: Path):
     assert set(back.keys()) == {"products","branches"}
     assert list(back["products"].columns) == ["id","name"]
     assert back["products"].iloc[0]["name"] == "Alpha"
+
+
+def test_json_read_preserves_iso_date_strings(tmp_path: Path):
+    frames = {
+        "reviews": pd.DataFrame([{"id": "REV-1", "date": "2026-06-18"}]),
+    }
+    out = tmp_path / "data"
+    write_json_dir(frames, str(out))
+
+    back = read_json_dir(str(out))
+
+    assert back["reviews"].iloc[0]["date"] == "2026-06-18"

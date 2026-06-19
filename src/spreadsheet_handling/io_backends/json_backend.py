@@ -89,7 +89,7 @@ class JSONBackend(BackendBase):
         in_dir = Path(path)
         out: Frames = {}
         for p in sorted(in_dir.glob("*.json")):
-            df = pd.read_json(p, dtype=str)
+            df = pd.read_json(p, dtype=str, convert_dates=False)
             df = df.where(pd.notnull(df), "")  # normalize empties as ""
             out[p.stem] = df
 
