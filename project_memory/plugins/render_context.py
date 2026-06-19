@@ -83,6 +83,27 @@ def _current_reviews(reviews: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(rows, key=lambda row: (row.get("date", ""), row.get("id", "")), reverse=True)
 
 
+def _review_sets_grouped(
+    review_sets: list[dict[str, str]],
+    reviews: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    reviews_by_set: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for review in reviews:
+        rs_id = review.get("review_set_id", "")
+        if rs_id:
+            reviews_by_set[rs_id].append(review)
+
+    enriched: list[dict[str, Any]] = []
+    for rs in sorted(review_sets, key=lambda r: (r.get("category", ""), r.get("id", ""))):
+        row: dict[str, Any] = dict(rs)
+        row["reviews"] = sorted(
+            reviews_by_set.get(rs.get("id", ""), []),
+            key=lambda r: (r.get("date", ""), r.get("id", "")),
+        )
+        enriched.append(row)
+    return enriched
+
+
 def _concerns_with_events(
     concerns: list[dict[str, str]],
     events: list[dict[str, str]],
@@ -170,6 +191,7 @@ def build_render_context() -> dict[str, Any]:
     concern_event_xrefs = _read_rows(CANONICAL_DIR / "concern_event_xrefs.json")
     ftrs = _read_rows(CANONICAL_DIR / "ftrs.json")
     ftr_dependencies = _read_rows(CANONICAL_DIR / "ftr_dependencies.json")
+    review_sets = _read_rows(CANONICAL_DIR / "review_sets.json")
     reviews = _read_rows(CANONICAL_DIR / "reviews.json")
 
     diagnostics = _diagnostics(
@@ -191,7 +213,7 @@ def build_render_context() -> dict[str, Any]:
         "active_ftrs": _active_ftrs(ftrs),
         "ftr_blockers": blockers,
         "ftr_dependency_edges": edges,
-        "reviews": _current_reviews(reviews),
+        "review_sets": _review_sets_grouped(review_sets, reviews),
         "event_ftr_links": event_ftr_links,
         "diagnostics": diagnostics,
     }
