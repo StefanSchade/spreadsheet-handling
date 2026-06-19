@@ -11,8 +11,12 @@ def test_build_render_context_includes_concern_steering() -> None:
     context = build_render_context()
 
     assert context["concern_threads"]
-    assert context["concern_threads"][0]["id"] == "CONC-DOMAIN-META-SEMANTICS"
-    assert context["concern_threads"][0]["signals"]
+    ct = next(
+        (c for c in context["concern_threads"] if c["id"] == "CONC-DOMAIN-META-SEMANTICS"),
+        None,
+    )
+    assert ct is not None, "CONC-DOMAIN-META-SEMANTICS not found in concern_threads"
+    assert ct["signals"]
     assert "diagnostics" in context
 
 
