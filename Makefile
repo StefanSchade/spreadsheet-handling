@@ -305,7 +305,7 @@ memory-refresh-workbook: ## Refresh project_memory.ods with current extracted ca
 memory-import: check-memory-sheets-run ## Reimport project_memory.ods into project_memory/staging
 	@mkdir -p "$(MEMORY_STAGING_DIR)"
 	@find "$(MEMORY_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
-	$(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/ods_to_json.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/ods_to_json.yaml"
 
 memory-check: memory-import memory-diff-reimport ## Reimport the ODS spreadsheet and compare it with canonical JSON
 
