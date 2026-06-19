@@ -83,40 +83,40 @@ def _current_reviews(reviews: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(rows, key=lambda row: (row.get("date", ""), row.get("id", "")), reverse=True)
 
 
-def _concern_threads_with_signals(
+def _concerns_with_events(
     concerns: list[dict[str, str]],
-    signals: list[dict[str, str]],
+    events: list[dict[str, str]],
     xrefs: list[dict[str, str]],
 ) -> list[dict[str, Any]]:
-    signals_by_id = {row.get("id", ""): row for row in signals}
-    signals_by_concern: dict[str, list[dict[str, str]]] = defaultdict(list)
+    events_by_id = {row.get("id", ""): row for row in events}
+    events_by_concern: dict[str, list[dict[str, str]]] = defaultdict(list)
     for xref in xrefs:
-        signal = signals_by_id.get(xref.get("signal_id", ""))
-        if signal is None:
+        event = events_by_id.get(xref.get("event_id", ""))
+        if event is None:
             continue
-        signals_by_concern[xref.get("concern_thread_id", "")].append(
+        events_by_concern[xref.get("concern_id", "")].append(
             {
-                "signal_id": xref.get("signal_id", ""),
-                "signal_role": xref.get("signal_role", ""),
-                "signal_date": signal.get("signal_date", ""),
-                "source_type": signal.get("source_type", ""),
-                "source_id": signal.get("source_id", ""),
-                "weight": signal.get("weight", ""),
-                "summary": signal.get("summary", ""),
-                "notes": xref.get("notes", "") or signal.get("notes", ""),
+                "event_id": xref.get("event_id", ""),
+                "event_role": xref.get("event_role", ""),
+                "event_date": event.get("event_date", ""),
+                "source_type": event.get("source_type", ""),
+                "source_id": event.get("source_id", ""),
+                "weight": event.get("weight", ""),
+                "summary": event.get("summary", ""),
+                "notes": xref.get("notes", "") or event.get("notes", ""),
             }
         )
 
     enriched: list[dict[str, Any]] = []
     for concern in concerns:
         row: dict[str, Any] = dict(concern)
-        linked = signals_by_concern.get(concern.get("id", ""), [])
-        row["signals"] = sorted(
+        linked = events_by_concern.get(concern.get("id", ""), [])
+        row["events"] = sorted(
             linked,
-            key=lambda signal: (
-                _reverse_date_rank(signal.get("signal_date", "")),
-                _priority_rank(signal.get("weight", "")),
-                signal.get("signal_id", ""),
+            key=lambda event: (
+                _reverse_date_rank(event.get("event_date", "")),
+                _priority_rank(event.get("weight", "")),
+                event.get("event_id", ""),
             ),
         )
         enriched.append(row)
@@ -128,18 +128,18 @@ def _diagnostics(
     ftrs: list[dict[str, str]],
     ftr_dependencies: list[dict[str, str]],
     concerns: list[dict[str, str]],
-    signals: list[dict[str, str]],
-    concern_signal_xrefs: list[dict[str, str]],
+    events: list[dict[str, str]],
+    concern_event_xrefs: list[dict[str, str]],
 ) -> dict[str, Any]:
     ftr_ids = {row.get("id", "") for row in ftrs}
     concern_ids = {row.get("id", "") for row in concerns}
-    signal_ids = {row.get("id", "") for row in signals}
+    event_ids = {row.get("id", "") for row in events}
 
-    missing_signals = [
-        row for row in concern_signal_xrefs if row.get("signal_id", "") not in signal_ids
+    missing_events = [
+        row for row in concern_event_xrefs if row.get("event_id", "") not in event_ids
     ]
     missing_concerns = [
-        row for row in concern_signal_xrefs if row.get("concern_thread_id", "") not in concern_ids
+        row for row in concern_event_xrefs if row.get("concern_id", "") not in concern_ids
     ]
     missing_ftr_refs = [
         {
@@ -153,10 +153,10 @@ def _diagnostics(
     ]
 
     return {
-        "missing_concern_signal_refs": missing_signals,
-        "missing_concern_thread_refs": missing_concerns,
+        "missing_concern_event_refs": missing_events,
+        "missing_concern_refs": missing_concerns,
         "missing_ftr_dependency_refs": missing_ftr_refs,
-        "has_warnings": bool(missing_signals or missing_concerns or missing_ftr_refs),
+        "has_warnings": bool(missing_events or missing_concerns or missing_ftr_refs),
     }
 
 
@@ -164,9 +164,9 @@ def build_render_context() -> dict[str, Any]:
     current_findings = _read_rows(DERIVED_DIR / "current_findings.json")
     blockers = _read_rows(DERIVED_DIR / "ftr_blockers.json")
     edges = _read_rows(DERIVED_DIR / "ftr_dependency_edges.json")
-    concerns = _read_rows(CANONICAL_DIR / "concern_threads.json")
-    concern_signals = _read_rows(CANONICAL_DIR / "concern_signals.json")
-    concern_signal_xrefs = _read_rows(CANONICAL_DIR / "concern_signal_xrefs.json")
+    concerns = _read_rows(CANONICAL_DIR / "concerns.json")
+    concern_events = _read_rows(CANONICAL_DIR / "concern_events.json")
+    concern_event_xrefs = _read_rows(CANONICAL_DIR / "concern_event_xrefs.json")
     ftrs = _read_rows(CANONICAL_DIR / "ftrs.json")
     ftr_dependencies = _read_rows(CANONICAL_DIR / "ftr_dependencies.json")
     reviews = _read_rows(CANONICAL_DIR / "reviews.json")
@@ -175,16 +175,16 @@ def build_render_context() -> dict[str, Any]:
         ftrs=ftrs,
         ftr_dependencies=ftr_dependencies,
         concerns=concerns,
-        signals=concern_signals,
-        concern_signal_xrefs=concern_signal_xrefs,
+        events=concern_events,
+        concern_event_xrefs=concern_event_xrefs,
     )
     return {
         "title": "Current Project Memory Context",
         "generated_from": "project_memory/canonical",
-        "concern_threads": _concern_threads_with_signals(
+        "concerns": _concerns_with_events(
             concerns,
-            concern_signals,
-            concern_signal_xrefs,
+            concern_events,
+            concern_event_xrefs,
         ),
         "current_findings": current_findings,
         "active_ftrs": _active_ftrs(ftrs),
@@ -223,7 +223,7 @@ def _group_by_section(
     for row in candidates:
         sections.setdefault(row.get("section", ""), []).append(row)
     return [
-        (section, sorted(rows, key=lambda r: r.get("signal_date", ""), reverse=True))
+        (section, sorted(rows, key=lambda r: r.get("event_date", ""), reverse=True))
         for section, rows in sorted(sections.items())
     ]
 

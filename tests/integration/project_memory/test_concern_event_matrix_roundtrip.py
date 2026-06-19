@@ -23,7 +23,7 @@ def _pipeline(path: Path) -> list[dict[str, Any]]:
 
 def _frames() -> dict[str, Any]:
     return {
-        "concern_threads": pd.DataFrame([
+        "concerns": pd.DataFrame([
             {
                 "id": "CONC-DOMAIN-META-SEMANTICS",
                 "title": "Domain and Metadata Semantics",
@@ -51,10 +51,10 @@ def _frames() -> dict[str, Any]:
                 "notes": "",
             },
         ]),
-        "concern_signals": pd.DataFrame([
+        "concern_events": pd.DataFrame([
             {
                 "id": "SIG-CONC-TEST",
-                "signal_date": "2026-06-18",
+                "event_date": "2026-06-18",
                 "source_type": "activity",
                 "source_id": "ACT-TEST",
                 "commit_refs": "abc1234, def5678",
@@ -63,43 +63,43 @@ def _frames() -> dict[str, Any]:
                 "notes": "",
             }
         ]),
-        "concern_signal_xrefs": pd.DataFrame([
+        "concern_event_xrefs": pd.DataFrame([
             {
                 "id": "CTSX-SIG-CONC-TEST--CONC-DOMAIN-META-SEMANTICS",
-                "signal_id": "SIG-CONC-TEST",
-                "concern_thread_id": "CONC-DOMAIN-META-SEMANTICS",
-                "signal_role": "driver",
+                "event_id": "SIG-CONC-TEST",
+                "concern_id": "CONC-DOMAIN-META-SEMANTICS",
+                "event_role": "driver",
                 "notes": "existing note",
             }
         ]),
     }
 
 
-def test_concern_signal_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path) -> None:
+def test_concern_event_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path) -> None:
     forward = run_pipeline(_frames(), build_steps_from_config(_pipeline(FORWARD_CONFIG)))
     ods_path = tmp_path / "project_memory.ods"
     OdsBackend().write_multi(forward, str(ods_path))
 
     workbook_frames = OdsBackend().read_multi(str(ods_path), header_levels=1)
-    threads = workbook_frames["concern_threads"]
+    threads = workbook_frames["concerns"]
     threads.loc[
         threads["id"] == "CONC-DOMAIN-META-SEMANTICS",
         "priority",
     ] = "low"
 
-    matrix = workbook_frames["concern_signal_matrix"]
+    matrix = workbook_frames["concern_event_matrix"]
     assert matrix.columns.tolist()[:4] == [
-        "signal_id",
-        "signal_date",
+        "event_id",
+        "event_date",
         "source_type",
         "summary",
     ]
     matrix.loc[
-        matrix["signal_id"] == "SIG-CONC-TEST",
+        matrix["event_id"] == "SIG-CONC-TEST",
         "summary",
     ] = "Edited matrix summary that must be ignored"
     matrix.loc[
-        matrix["signal_id"] == "SIG-CONC-TEST",
+        matrix["event_id"] == "SIG-CONC-TEST",
         "CONC-ADAPTER-SPREADSHEET-BOUNDARY",
     ] = "matrix_helper_context_roundtrip"
 
@@ -111,32 +111,32 @@ def test_concern_signal_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path
     write_json_dir(staging_frames, staging_dir)
     staging = read_json_dir(str(staging_dir))
 
-    assert "concern_signal_matrix" not in staging
-    assert staging["concern_threads"].loc[
-        staging["concern_threads"]["id"] == "CONC-DOMAIN-META-SEMANTICS",
+    assert "concern_event_matrix" not in staging
+    assert staging["concerns"].loc[
+        staging["concerns"]["id"] == "CONC-DOMAIN-META-SEMANTICS",
         "priority",
     ].item() == "low"
-    assert staging["concern_signals"].loc[
-        staging["concern_signals"]["id"] == "SIG-CONC-TEST",
+    assert staging["concern_events"].loc[
+        staging["concern_events"]["id"] == "SIG-CONC-TEST",
         "summary",
     ].item() == "Test signal."
-    assert staging["concern_signals"].loc[
-        staging["concern_signals"]["id"] == "SIG-CONC-TEST",
+    assert staging["concern_events"].loc[
+        staging["concern_events"]["id"] == "SIG-CONC-TEST",
         "commit_refs",
     ].item() == "abc1234, def5678"
 
-    xrefs = staging["concern_signal_xrefs"].to_dict(orient="records")
+    xrefs = staging["concern_event_xrefs"].to_dict(orient="records")
     assert {
         "id": "CTSX-SIG-CONC-TEST--CONC-ADAPTER-SPREADSHEET-BOUNDARY",
-        "signal_id": "SIG-CONC-TEST",
-        "concern_thread_id": "CONC-ADAPTER-SPREADSHEET-BOUNDARY",
-        "signal_role": "matrix_helper_context_roundtrip",
+        "event_id": "SIG-CONC-TEST",
+        "concern_id": "CONC-ADAPTER-SPREADSHEET-BOUNDARY",
+        "event_role": "matrix_helper_context_roundtrip",
         "notes": "",
     } in xrefs
     assert {
         "id": "CTSX-SIG-CONC-TEST--CONC-DOMAIN-META-SEMANTICS",
-        "signal_id": "SIG-CONC-TEST",
-        "concern_thread_id": "CONC-DOMAIN-META-SEMANTICS",
-        "signal_role": "driver",
+        "event_id": "SIG-CONC-TEST",
+        "concern_id": "CONC-DOMAIN-META-SEMANTICS",
+        "event_role": "driver",
         "notes": "existing note",
     } in xrefs

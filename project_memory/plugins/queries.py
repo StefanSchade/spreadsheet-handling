@@ -116,8 +116,8 @@ def ftr_blockers(frames: Mapping[str, Any], *, ftrs: str = "ftrs", ftr_dependenc
 def release_note_candidates(
     frames: Mapping[str, Any],
     *,
-    signals: str = "concern_signals",
-    xrefs: str = "concern_signal_xrefs",
+    signals: str = "concern_events",
+    xrefs: str = "concern_event_xrefs",
     default_section: str = "Internal architecture and project memory",
     default_audience: str = "maintainer",
     default_status: str = "candidate",
@@ -127,9 +127,9 @@ def release_note_candidates(
     xrefs_df = _frame_or_empty(frames, xrefs)
 
     output_columns = [
-        "id", "signal_id", "signal_date", "source_type", "source_id",
+        "id", "event_id", "event_date", "source_type", "source_id",
         "commit_refs", "weight", "section", "audience", "status",
-        "summary", "notes", "linked_concern_thread_ids",
+        "summary", "notes", "linked_concern_ids",
     ]
 
     if sigs.empty:
@@ -144,15 +144,15 @@ def release_note_candidates(
 
     orig_ids = _as_string_series(activity, "id")
 
-    # Resolve linked concern thread IDs from xrefs via a dict lookup (avoids merge column collisions)
-    if not xrefs_df.empty and "signal_id" in xrefs_df.columns and "concern_thread_id" in xrefs_df.columns:
+    # Resolve linked concern IDs from xrefs via a dict lookup (avoids merge column collisions)
+    if not xrefs_df.empty and "event_id" in xrefs_df.columns and "concern_id" in xrefs_df.columns:
         grouped = (
-            xrefs_df.groupby("signal_id", sort=False)["concern_thread_id"]
+            xrefs_df.groupby("event_id", sort=False)["concern_id"]
             .apply(lambda s: ", ".join(sorted(s.dropna().astype(str).tolist())))
         )
-        activity["linked_concern_thread_ids"] = orig_ids.map(grouped).fillna("")
+        activity["linked_concern_ids"] = orig_ids.map(grouped).fillna("")
     else:
-        activity["linked_concern_thread_ids"] = ""
+        activity["linked_concern_ids"] = ""
 
     def _default(col: str, default: str) -> pd.Series:
         if col in activity.columns:
@@ -170,11 +170,11 @@ def release_note_candidates(
     else:
         activity["summary"] = _as_string_series(activity, "summary")
 
-    activity["signal_id"] = orig_ids
+    activity["event_id"] = orig_ids
     activity["id"] = "RNC-" + orig_ids
 
     result = _json_safe_frame(_stable_columns(activity, output_columns))
-    result = result.sort_values(["signal_date", "signal_id"], ascending=[False, True]).reset_index(drop=True)
+    result = result.sort_values(["event_date", "event_id"], ascending=[False, True]).reset_index(drop=True)
     return {**dict(frames), "release_note_candidates": result}
 
 
@@ -197,8 +197,8 @@ def derived_views_only(
 def drop_projection_frames(
     frames: Mapping[str, Any],
     *,
-    names: tuple[str, ...] = ("concern_signal_matrix",),
-    xref_names: tuple[str, ...] = ("concern_signal_threads",),
+    names: tuple[str, ...] = ("concern_event_matrix",),
+    xref_names: tuple[str, ...] = ("concern_event_threads",),
 ) -> dict[str, Any]:
     """Drop workbook-only projection frames before canonical JSON staging."""
     out: dict[str, Any] = dict(frames)
@@ -231,39 +231,39 @@ def copy_frame(frames: Mapping[str, Any], *, source: str, output: str) -> dict[s
     return out
 
 
-def enrich_concern_signal_matrix(
+def enrich_concern_event_matrix(
     frames: Mapping[str, Any],
     *,
-    matrix: str = "concern_signal_matrix",
-    signals: str = "concern_signals",
-    context_columns: tuple[str, ...] = ("signal_date", "source_type", "summary"),
+    matrix: str = "concern_event_matrix",
+    signals: str = "concern_events",
+    context_columns: tuple[str, ...] = ("event_date", "source_type", "summary"),
 ) -> dict[str, Any]:
-    """Add display-only signal context to the concern-signal matrix."""
+    """Add display-only event context to the concern-event matrix."""
     out: dict[str, Any] = dict(frames)
     matrix_frame = _frame_or_empty(frames, matrix)
     signals_frame = _frame_or_empty(frames, signals)
-    if matrix_frame.empty or signals_frame.empty or "signal_id" not in matrix_frame.columns:
+    if matrix_frame.empty or signals_frame.empty or "event_id" not in matrix_frame.columns:
         return out
 
-    context = _stable_columns(signals_frame.rename(columns={"id": "signal_id"}), [
-        "signal_id",
+    context = _stable_columns(signals_frame.rename(columns={"id": "event_id"}), [
+        "event_id",
         *context_columns,
     ])
-    enriched = matrix_frame.merge(context, on="signal_id", how="left")
+    enriched = matrix_frame.merge(context, on="event_id", how="left")
     ordered_columns = [
-        "signal_id",
+        "event_id",
         *context_columns,
-        *[col for col in matrix_frame.columns if col != "signal_id"],
+        *[col for col in matrix_frame.columns if col != "event_id"],
     ]
     out[matrix] = _json_safe_frame(_stable_columns(enriched, ordered_columns))
     return out
 
 
-def strip_concern_signal_matrix_context(
+def strip_concern_event_matrix_context(
     frames: Mapping[str, Any],
     *,
-    matrix: str = "concern_signal_matrix",
-    context_columns: tuple[str, ...] = ("signal_date", "source_type", "summary"),
+    matrix: str = "concern_event_matrix",
+    context_columns: tuple[str, ...] = ("event_date", "source_type", "summary"),
 ) -> dict[str, Any]:
     """Remove display-only matrix context columns before xref expansion."""
     out: dict[str, Any] = dict(frames)
@@ -275,16 +275,16 @@ def strip_concern_signal_matrix_context(
     return out
 
 
-def finalize_concern_signal_xrefs(
+def finalize_concern_event_xrefs(
     frames: Mapping[str, Any],
     *,
-    frame: str = "concern_signal_xrefs",
-    base_frame: str = "__base_concern_signal_xrefs",
+    frame: str = "concern_event_xrefs",
+    base_frame: str = "__base_concern_event_xrefs",
     projection_frames: tuple[str, ...] = (
-        "concern_signal_matrix",
-        "__base_concern_signal_xrefs",
+        "concern_event_matrix",
+        "__base_concern_event_xrefs",
     ),
-    xref_names: tuple[str, ...] = ("concern_signal_xrefs",),
+    xref_names: tuple[str, ...] = ("concern_event_xrefs",),
 ) -> dict[str, Any]:
     """Restore deterministic xref IDs/notes and remove workbook-only frames."""
     out: dict[str, Any] = dict(frames)
@@ -295,18 +295,18 @@ def finalize_concern_signal_xrefs(
         base_notes = _xref_notes_by_tuple(base)
         rows: list[dict[str, Any]] = []
         for record in current.where(pd.notnull(current), "").to_dict(orient="records"):
-            signal_id = str(record.get("signal_id", ""))
-            concern_thread_id = str(record.get("concern_thread_id", ""))
+            event_id = str(record.get("event_id", ""))
+            concern_id = str(record.get("concern_id", ""))
             rows.append({
-                "id": _concern_signal_xref_id(signal_id, concern_thread_id),
-                "signal_id": signal_id,
-                "concern_thread_id": concern_thread_id,
-                "signal_role": str(record.get("signal_role", "")),
-                "notes": base_notes.get((signal_id, concern_thread_id), ""),
+                "id": _concern_event_xref_id(event_id, concern_id),
+                "event_id": event_id,
+                "concern_id": concern_id,
+                "event_role": str(record.get("event_role", "")),
+                "notes": base_notes.get((event_id, concern_id), ""),
             })
         out[frame] = pd.DataFrame(
             rows,
-            columns=["id", "signal_id", "concern_thread_id", "signal_role", "notes"],
+            columns=["id", "event_id", "concern_id", "event_role", "notes"],
         )
 
     for name in projection_frames:
@@ -321,13 +321,13 @@ def _xref_notes_by_tuple(frame: pd.DataFrame) -> dict[tuple[str, str], str]:
     notes: dict[tuple[str, str], str] = {}
     clean = frame.where(pd.notnull(frame), "")
     for record in clean.to_dict(orient="records"):
-        key = (str(record.get("signal_id", "")), str(record.get("concern_thread_id", "")))
+        key = (str(record.get("event_id", "")), str(record.get("concern_id", "")))
         notes[key] = str(record.get("notes", ""))
     return notes
 
 
-def _concern_signal_xref_id(signal_id: str, concern_thread_id: str) -> str:
-    return f"CTSX-{_safe_id_part(signal_id)}--{_safe_id_part(concern_thread_id)}"
+def _concern_event_xref_id(event_id: str, concern_id: str) -> str:
+    return f"CTSX-{_safe_id_part(event_id)}--{_safe_id_part(concern_id)}"
 
 
 def _safe_id_part(value: str) -> str:
