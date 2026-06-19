@@ -251,7 +251,7 @@ clean-docs: ## Remove doc build output
 # =========================
 # Project memory
 # =========================
-.PHONY: memory-setup memory-export memory-query memory-context memory-extract memory-import memory-check memory-promote
+.PHONY: memory-setup memory-export memory-query memory-context memory-extract memory-stage-extracted memory-refresh-workbook memory-import memory-check memory-promote
 .PHONY: memory-export-ods memory-import-ods memory-diff-reimport memory-check-reimport memory-promote-reimport memory-promote-reimport-checked
 .PHONY: check-memory-sheets-run
 
@@ -282,6 +282,25 @@ memory-extract: check-memory-sheets-run ## Extract conservative project_memory c
 	@find "$(MEMORY_DIR)/extracted" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.extract_candidates
 	@echo "$(MEMORY_DIR)/extracted/"
+
+memory-stage-extracted: ## Stage extracted candidates as generated ext_* canonical tables
+	@set -euo pipefail; \
+	src_dir="$(MEMORY_DIR)/extracted"; \
+	dst_dir="$(MEMORY_CANONICAL_DIR)"; \
+	test -d "$$src_dir" || { echo "Missing $$src_dir. Run 'make memory-extract' first." >&2; exit 1; }; \
+	for name in finding_candidates.json ftr_candidates.json review_candidates.json; do \
+		test -f "$$src_dir/$$name" || { echo "Missing extracted candidate file: $$src_dir/$$name. Run 'make memory-extract' first." >&2; exit 1; }; \
+	done; \
+	find "$$dst_dir" -maxdepth 1 -type f -name 'ext_*.json' -exec rm -f {} +; \
+	for name in finding_candidates.json ftr_candidates.json review_candidates.json; do \
+		cp -f "$$src_dir/$$name" "$$dst_dir/ext_$$name"; \
+	done; \
+	printf '%s\n' "$$dst_dir"/ext_finding_candidates.json "$$dst_dir"/ext_ftr_candidates.json "$$dst_dir"/ext_review_candidates.json
+
+memory-refresh-workbook: ## Refresh project_memory.ods with current extracted candidate sheets
+	$(MAKE) memory-extract
+	$(MAKE) memory-stage-extracted
+	$(MAKE) memory-export
 
 memory-import: check-memory-sheets-run ## Reimport project_memory.ods into project_memory/staging
 	@mkdir -p "$(MEMORY_STAGING_DIR)"
