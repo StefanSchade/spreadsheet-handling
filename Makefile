@@ -35,9 +35,11 @@ MEMORY_PIPELINE_DIR  := $(MEMORY_DIR)/pipelines/memory
 STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
+PROJECT_MEMORY_STAMP := $(STAMP_DIR)/project-memory.ok
 
 DEPS_INPUTS  := pyproject.toml
 DEV_INPUTS   := pyproject.toml
+PROJECT_MEMORY_INPUTS := pyproject.toml
 
 VERBOSE      ?= TRUE
 LOG_OPTS     ?= -o log_cli=true -o log_cli_level=DEBUG
@@ -255,7 +257,14 @@ clean-docs: ## Remove doc build output
 .PHONY: memory-export-ods memory-import-ods memory-diff-reimport memory-check-reimport memory-promote-reimport memory-promote-reimport-checked
 .PHONY: check-memory-sheets-run
 
-memory-setup: setup ## Alias for setup; project_memory uses the shared local dev venv
+$(PROJECT_MEMORY_STAMP): $(PROJECT_MEMORY_INPUTS) | $(DEV_STAMP)
+	@mkdir -p "$(STAMP_DIR)"
+	@echo "Installing project_memory tooling deps..."
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s '.[project-memory]' -E $(PIP_VERBOSE_FLAG)
+	@$(PYTHON) -c "import jinja2"
+	@touch "$(PROJECT_MEMORY_STAMP)"
+
+memory-setup: $(PROJECT_MEMORY_STAMP) ## Install optional project_memory tooling in the shared local dev venv
 
 check-memory-sheets-run: deps-dev ## Ensure the local sheets-run binary exists for project_memory targets
 	@test -x "$(SHEETS_RUN)" || { \
@@ -271,7 +280,7 @@ memory-query: check-memory-sheets-run ## Render derived project_memory query vie
 	@find "$(MEMORY_DERIVED_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/json_to_derived_queries.yaml"
 
-memory-context: memory-query ## Render the generated project_memory context report
+memory-context: $(PROJECT_MEMORY_STAMP) memory-query ## Render the generated project_memory context report
 	@mkdir -p "$(ROOT)docs_generated/project_memory"
 	@find "$(ROOT)docs_generated/project_memory" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.render_context
