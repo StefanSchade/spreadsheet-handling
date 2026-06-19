@@ -5,8 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DERIVED_DIR = ROOT / "project_meta" / "derived"
-OUTPUT_PATH = ROOT / "docs_generated" / "project_meta" / "current_context.adoc"
+DERIVED_DIR = ROOT / "project_memory" / "derived"
+OUTPUT_PATH = ROOT / "docs_generated" / "project_memory" / "current_context.adoc"
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -57,9 +57,9 @@ def render_current_context(output_path: Path | str = OUTPUT_PATH) -> Path:
     edges = _read_rows(DERIVED_DIR / "ftr_dependency_edges.json")
 
     lines: list[str] = [
-        "= Current Project Meta Context",
+        "= Current Project Memory Context",
         "",
-        "Generated from `project_meta/canonical` via `make meta-query`.",
+        "Generated from `project_memory/canonical` via `make memory-query`.",
         "",
         "[NOTE]",
         "====",

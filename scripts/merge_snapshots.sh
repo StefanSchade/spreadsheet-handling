@@ -71,7 +71,7 @@ merge_two() {
 }
 
 while true; do
-    mapfile -d '' files < <(find "$TARGET_DIR" -maxdepth 1 -name '*.txt' ! -name 'project_meta.txt' -print0)
+    mapfile -d '' files < <(find "$TARGET_DIR" -maxdepth 1 -name '*.txt' ! -name 'project_memory.txt' -print0)
     count="${#files[@]}"
 
     if (( count <= MAX_FILES )); then

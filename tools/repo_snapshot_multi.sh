@@ -72,7 +72,7 @@ INFRA_INCL=(
     --include-ext adoc --include-ext txt
 )
 
-PROJECT_META_INCL=(
+PROJECT_MEMORY_INCL=(
     --include-ext adoc --include-ext json --include-ext yaml
     --include-ext yml  --include-ext py   --include-ext txt
 )
@@ -134,11 +134,11 @@ done
 # ---- tree.txt ------------------------------------------------------------
 if command -v tree >/dev/null 2>&1; then
     tree -L 3 "$REPO_ROOT" > "$TARGET_DIR/tree.txt"
-    if [ -d "${REPO_ROOT}project_meta" ]; then
+    if [ -d "${REPO_ROOT}project_memory" ]; then
         {
             printf '\n'
-            printf '=== project_meta subtree ===\n'
-            tree -L 3 "${REPO_ROOT}project_meta"
+            printf '=== project_memory subtree ===\n'
+            tree -L 3 "${REPO_ROOT}project_memory"
         } >> "$TARGET_DIR/tree.txt"
     fi
     echo "  tree.txt"
@@ -168,23 +168,23 @@ for sub in scripts tools .github; do
 done
 echo "  repo_infrastructure.txt"
 
-# ---- project_meta.txt ----------------------------------------------------
-PROJECT_META_ROOT="${REPO_ROOT}project_meta/"
-if [ -d "$PROJECT_META_ROOT" ]; then
-    out="$TARGET_DIR/project_meta.txt"
-    run_core "$PROJECT_META_ROOT" "$out" \
+# ---- project_memory.txt --------------------------------------------------
+PROJECT_MEMORY_ROOT="${REPO_ROOT}project_memory/"
+if [ -d "$PROJECT_MEMORY_ROOT" ]; then
+    out="$TARGET_DIR/project_memory.txt"
+    run_core "$PROJECT_MEMORY_ROOT" "$out" \
         "${EXCL[@]}" \
         --exclude-dir staging \
         --exclude-dir tmp \
-        --exclude-path "${PROJECT_META_ROOT}staging" \
-        --exclude-path "${PROJECT_META_ROOT}staging/*" \
-        --exclude-path "${PROJECT_META_ROOT}tmp" \
-        --exclude-path "${PROJECT_META_ROOT}tmp/*" \
-        --exclude-path "${PROJECT_META_ROOT}canonical/_meta.yaml" \
-        --exclude-path "${PROJECT_META_ROOT}*/_meta.yaml" \
-        --exclude-path "${REPO_ROOT}project_meta.ods" \
-        "${PROJECT_META_INCL[@]}"
-    if [ -s "$out" ]; then echo "  project_meta.txt"; else rm -f "$out"; fi
+        --exclude-path "${PROJECT_MEMORY_ROOT}staging" \
+        --exclude-path "${PROJECT_MEMORY_ROOT}staging/*" \
+        --exclude-path "${PROJECT_MEMORY_ROOT}tmp" \
+        --exclude-path "${PROJECT_MEMORY_ROOT}tmp/*" \
+        --exclude-path "${PROJECT_MEMORY_ROOT}canonical/_meta.yaml" \
+        --exclude-path "${PROJECT_MEMORY_ROOT}*/_meta.yaml" \
+        --exclude-path "${REPO_ROOT}project_memory.ods" \
+        "${PROJECT_MEMORY_INCL[@]}"
+    if [ -s "$out" ]; then echo "  project_memory.txt"; else rm -f "$out"; fi
 fi
 
 # ---- loc.txt -------------------------------------------------------------
