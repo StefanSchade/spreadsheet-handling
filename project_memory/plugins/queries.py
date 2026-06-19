@@ -113,10 +113,77 @@ def ftr_blockers(frames: Mapping[str, Any], *, ftrs: str = "ftrs", ftr_dependenc
     return {**dict(frames), "ftr_blockers": _json_safe_frame(_stable_columns(merged, columns))}
 
 
+def release_note_candidates(
+    frames: Mapping[str, Any],
+    *,
+    signals: str = "concern_signals",
+    xrefs: str = "concern_signal_xrefs",
+    default_section: str = "Internal architecture and project memory",
+    default_audience: str = "maintainer",
+    default_status: str = "candidate",
+) -> dict[str, Any]:
+    """Derive release-note candidates from curated activity signals (source_type='activity' or SIG-ACT-* id)."""
+    sigs = _frame_or_empty(frames, signals)
+    xrefs_df = _frame_or_empty(frames, xrefs)
+
+    output_columns = [
+        "id", "signal_id", "signal_date", "source_type", "source_id",
+        "commit_refs", "weight", "section", "audience", "status",
+        "summary", "notes", "linked_concern_thread_ids",
+    ]
+
+    if sigs.empty:
+        return {**dict(frames), "release_note_candidates": _json_safe_frame(pd.DataFrame(columns=output_columns))}
+
+    source_type_col = _as_string_series(sigs, "source_type")
+    id_col = _as_string_series(sigs, "id")
+    activity = sigs.loc[source_type_col.eq("activity") | id_col.str.startswith("SIG-ACT-")].copy()
+
+    if activity.empty:
+        return {**dict(frames), "release_note_candidates": _json_safe_frame(pd.DataFrame(columns=output_columns))}
+
+    orig_ids = _as_string_series(activity, "id")
+
+    # Resolve linked concern thread IDs from xrefs via a dict lookup (avoids merge column collisions)
+    if not xrefs_df.empty and "signal_id" in xrefs_df.columns and "concern_thread_id" in xrefs_df.columns:
+        grouped = (
+            xrefs_df.groupby("signal_id", sort=False)["concern_thread_id"]
+            .apply(lambda s: ", ".join(sorted(s.dropna().astype(str).tolist())))
+        )
+        activity["linked_concern_thread_ids"] = orig_ids.map(grouped).fillna("")
+    else:
+        activity["linked_concern_thread_ids"] = ""
+
+    def _default(col: str, default: str) -> pd.Series:
+        if col in activity.columns:
+            s = activity[col].fillna("").astype(str)
+            return s.where(s != "", default)
+        return pd.Series([default] * len(activity), index=activity.index, dtype="object")
+
+    activity["section"] = _default("release_note_section", default_section)
+    activity["audience"] = _default("release_note_audience", default_audience)
+    activity["status"] = _default("release_note_status", default_status)
+
+    if "release_note_summary" in activity.columns:
+        rn = activity["release_note_summary"].fillna("").astype(str)
+        activity["summary"] = rn.where(rn != "", _as_string_series(activity, "summary"))
+    else:
+        activity["summary"] = _as_string_series(activity, "summary")
+
+    activity["signal_id"] = orig_ids
+    activity["id"] = "RNC-" + orig_ids
+
+    result = _json_safe_frame(_stable_columns(activity, output_columns))
+    result = result.sort_values(["signal_date", "signal_id"], ascending=[False, True]).reset_index(drop=True)
+    return {**dict(frames), "release_note_candidates": result}
+
+
 def derived_views_only(
     frames: Mapping[str, Any],
     *,
-    names: tuple[str, ...] = ("current_findings", "ftr_dependency_edges", "ftr_blockers"),
+    names: tuple[str, ...] = (
+        "current_findings", "ftr_dependency_edges", "ftr_blockers", "release_note_candidates",
+    ),
 ) -> dict[str, pd.DataFrame]:
     """Keep only the derived query frames for downstream json_dir export."""
     out: dict[str, pd.DataFrame] = {}

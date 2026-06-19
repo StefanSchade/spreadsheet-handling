@@ -10,6 +10,7 @@ CANONICAL_DIR = ROOT / "project_memory" / "canonical"
 DERIVED_DIR = ROOT / "project_memory" / "derived"
 TEMPLATE_DIR = ROOT / "project_memory" / "templates"
 OUTPUT_PATH = ROOT / "docs_generated" / "project_memory" / "current_context.adoc"
+RELEASE_NOTE_CANDIDATES_PATH = ROOT / "docs_generated" / "project_memory" / "release_note_candidates.adoc"
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 _HISTORIC_RELEVANCE = frozenset({"historic", "historical"})
@@ -215,6 +216,40 @@ def _template_environment() -> Any:
     return env
 
 
+def _group_by_section(
+    candidates: list[dict[str, str]],
+) -> list[tuple[str, list[dict[str, str]]]]:
+    sections: dict[str, list[dict[str, str]]] = {}
+    for row in candidates:
+        sections.setdefault(row.get("section", ""), []).append(row)
+    return [
+        (section, sorted(rows, key=lambda r: r.get("signal_date", ""), reverse=True))
+        for section, rows in sorted(sections.items())
+    ]
+
+
+def build_release_note_context() -> dict[str, Any]:
+    candidates = _read_rows(DERIVED_DIR / "release_note_candidates.json")
+    return {
+        "title": "Release Note Candidates",
+        "candidates_by_section": _group_by_section(candidates),
+        "candidates": candidates,
+    }
+
+
+def render_release_note_candidates(
+    output_path: Path | str = RELEASE_NOTE_CANDIDATES_PATH,
+) -> Path:
+    output = Path(output_path)
+    context = build_release_note_context()
+    template = _template_environment().get_template("release_note_candidates.adoc.j2")
+    rendered = template.render(**context)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(rendered.rstrip() + "\n")
+    return output
+
+
 def render_current_context(output_path: Path | str = OUTPUT_PATH) -> Path:
     output = Path(output_path)
     context = build_render_context()
@@ -229,3 +264,4 @@ def render_current_context(output_path: Path | str = OUTPUT_PATH) -> Path:
 
 if __name__ == "__main__":
     render_current_context()
+    render_release_note_candidates()
