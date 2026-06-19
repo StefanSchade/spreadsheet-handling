@@ -55,8 +55,9 @@ def _frames() -> dict[str, Any]:
             {
                 "id": "SIG-CONC-TEST",
                 "signal_date": "2026-06-18",
-                "source_type": "manual_note",
-                "source_id": "test-signal",
+                "source_type": "activity",
+                "source_id": "ACT-TEST",
+                "commit_refs": "abc1234, def5678",
                 "weight": "high",
                 "summary": "Test signal.",
                 "notes": "",
@@ -119,6 +120,10 @@ def test_concern_signal_matrix_edit_reimports_to_normalized_xrefs(tmp_path: Path
         staging["concern_signals"]["id"] == "SIG-CONC-TEST",
         "summary",
     ].item() == "Test signal."
+    assert staging["concern_signals"].loc[
+        staging["concern_signals"]["id"] == "SIG-CONC-TEST",
+        "commit_refs",
+    ].item() == "abc1234, def5678"
 
     xrefs = staging["concern_signal_xrefs"].to_dict(orient="records")
     assert {
