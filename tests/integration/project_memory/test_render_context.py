@@ -30,5 +30,7 @@ def test_render_current_context_uses_asciidoc_templates(tmp_path: Path) -> None:
     assert "CONC-DOMAIN-META-SEMANTICS" in text
     assert "== Current Findings" in text
     assert "== Active FTRs" in text
-    assert "== Review Takeaways" in text
+    assert "== Review Sets" in text
+    assert "REVSET-GLOBAL-REVIEW-001" in text
+    assert "REVSET-TOPIC-FK-HELPER-REVIEWS" in text
     assert "== Diagnostics" in text
