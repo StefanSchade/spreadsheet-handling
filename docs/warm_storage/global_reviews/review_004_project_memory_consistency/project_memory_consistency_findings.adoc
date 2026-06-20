@@ -1,0 +1,144 @@
+= Review 004 -- Project-Memory Consistency Findings
+:toc: left
+:toclevels: 2
+
+[NOTE]
+====
+Severity uses the project's existing heat-map `impact_0_5` scale
+(`none`=0 .. `critical`=5), not a new vocabulary. These findings concern the
+*project_memory steering model itself* (does it reliably represent project
+state?), not the product code. Evidence is captured in the sibling
+`_evidence_*.txt` files in this folder and is reproducible from canonical JSON.
+Urgency is not assessed.
+
+Read-only review: no canonical JSON edited.
+====
+
+== What is consistent (non-findings, recorded for confidence)
+
+* *Identity integrity is clean.* No duplicate `id` in any canonical table
+  (findings 195, ftrs 251, reviews 32, concerns 7, concern_events 50,
+  concern_event_xrefs 98, decisions 3, review_sets 8).
+* *The concern/event/xref/review-set layer is clean.* 0 dangling
+  `event_id`, 0 dangling `concern_id`, 0 orphan events, 0 dangling
+  `review_set_id`, 0 unresolved `concern_events.source_id`. The context-report
+  Diagnostics section and the FTR-dependency check report no missing references.
+* *The assessment-scale mapping is a true derived view, not pseudo-truth.* No
+  canonical finding stores a numeric `impact_0_5`; the normalization lives in
+  `assessment_scale_mappings.json` (config) and is joined only in the derived
+  `finding_assessment_heatmap.json` (195 rows). All 8 finding severity labels
+  map. The mapping layer *reduces* ambiguity; it does not add a competing truth.
+* *Findings, FTRs, Decisions, Concerns, Events, Signals are separated
+  coherently* at the table level; the boundary problems below are within-table
+  field hygiene, not cross-entity confusion.
+
+== Findings
+
+[cols="2,1,4,3,3,3", options="header"]
+|===
+| finding_id | severity | finding | evidence | impact | proposed_correction
+
+| PMC-001
+| medium
+| `findings.status` uses two undocumented values: `done` (92 rows) and `in_arbeit` (15 rows, German "in progress"). Documented vocabulary is `open, accepted, resolved, superseded, wontfix, historical`.
+| `_evidence_*`; README "Current Status Vocabulary"; status distribution
+| `in_arbeit` findings are real current work hidden behind a non-vocabulary, non-English label; `done` overlaps `resolved`. Derived filters and any reader must guess intent.
+| Map `in_arbeit`->`open`/`accepted` and `done`->`resolved`, or extend and document the vocabulary deliberately. Do not leave it implicit.
+
+| PMC-002
+| high
+| `ftrs.status` is free text, not a controlled vocabulary: 24 distinct values including full sentences ("dropped after review. the concern is already addressed by commit e413386...", "narrow e2 + e6 slice implemented (intent-vs-resolution)") and 58 empty strings.
+| status distribution (24 buckets); BUG/FTR records
+| The model's core question -- "what is open / done?" -- cannot be answered by query. `ftr_blockers`, health "no commit evidence", and any next-slice decision inherit unreliable status. This is the largest threat to the steering model's purpose.
+| Introduce a small closed status enum for FTR/BUG (e.g. new/open/in_progress/implemented/done/superseded/dropped) and move prose into `implementation_notes`/`summary`. Backfill incrementally.
+
+| PMC-003
+| medium
+| `findings.superseded_by` is list-valued and type-mixed. 11 findings hold semicolon-joined values; FIN-REVIEW-002-P2-006 points to *FTRs* (FTR-FK-HELPER-POLICY-LIFECYCLE-P4A; FTR-META-LIFECYCLE-INVENTORY-P5), not findings.
+| `_evidence_integrity_check.txt`; superseded_by offender list
+| Violates the README rule "do not add list-valued fields... use flat relation tables." The supersession graph is not queryable and mixes finding-supersession with FTR-tracking semantics. Automated diagnostics cannot validate it.
+| Make `superseded_by` a single finding id, or add a flat `finding_supersedes` xref table. Move FTR linkage to `tracking_ftr_ids`.
+
+| PMC-004
+| low
+| `findings.resolved_by_ftr_id` (singular field) holds two semicolon-joined ids in FIN-REVIEW-001-D-002 and D-003.
+| integrity check (resolved_by multi-valued)
+| A singular-named field carrying plural content breaks the flat-reference contract and any join on it.
+| Split to one id, or rename/duplicate into a plural flat field with a documented separator.
+
+| PMC-005
+| low
+| `findings.tracking_ftr_ids` contains the prose token "FK Helper Consolidation Closure" (4 findings: D-002, D-003, D-009, P1-007) alongside real FTR ids.
+| integrity check flagged it as the only dangling tracking "FTR id"
+| A free-text phrase masquerading as an id pollutes the only place an automated check inspects, and breaks finding->FTR navigation.
+| Remove the prose token (the closure is already a review-set/event); keep only resolvable FTR ids.
+
+| PMC-006
+| medium
+| `reviews.json` carries duplicate competing columns: `Verdict` (25 populated) vs `verdict` (29 populated), and `set` (28) vs `review_set_id` (32). The pairs are not in sync.
+| `_evidence_*`; reviews key dump + population counts
+| Two truths for the same datum. A reader/renderer cannot tell which verdict is authoritative; 4 rows have a lowercase verdict but no capitalized one (and vice-versa).
+| Collapse to one column each (`verdict`, `review_set_id` are the fuller/normalized ones); drop or alias `Verdict`/`set`.
+
+| PMC-007
+| medium
+| BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A reads as implemented while being an unresolved contract: status=`new` but `implementation_commits=88e4b78`, `implementation_date=2026-06-03`, `implementation_notes="Implemented in a single commit."` Commit 88e4b78 introduced the roundtrip *invariant/xfail layer*, not a fix.
+| BUG record; commit subject "introduce roundtrip invariant layer"; live `1 xfailed`
+| The single most decision-relevant BUG looks done at header level. A reader trusting the header would wrongly conclude the helper-value contract is resolved. Status/implementation semantics are conflated.
+| Separate "test/sentinel landed" from "contract resolved." Keep status open/unresolved; record the commit as `sentinel_commit` (or note), not implementation. See goal-4 representation gap.
+
+| PMC-008
+| medium
+| Diagnostic coverage gap: the health report and context-report Diagnostics validate concern/event/xref/ftr-dependency references (all clean) but do *not* validate `findings.tracking_ftr_ids`, `resolved_by_ftr_id`, or `superseded_by`. The dirtiest fields (PMC-003/004/005) are invisible to automated self-checks.
+| health report sections; context Diagnostics (only concern/ftr-dep checks)
+| The model cannot detect its own reference rot in findings. Drift accumulates silently exactly where it already exists.
+| Extend the health report with a findings cross-reference check (tracking/resolved/superseded targets resolve and are well-typed).
+
+| PMC-009
+| cosmetic
+| 5 findings have `current_relevance=current` but `status=superseded` (FIN-REVIEW-003-S1-F-A02-1/2/4, S3-F-RR-A02-1/3). status and relevance disagree.
+| integrity / relevance-status query; derived `current_findings` drops them (canonical current=45 vs derived current=40)
+| Canonical vs derived current counts diverge with no explanation visible in canonical data; a reader of canonical alone overcounts current work.
+| Align relevance to the superseded status (set `historical`) or re-open if genuinely live. Low impact (all `nice_to_have`).
+|===
+
+== Semantic-separation assessment (goal 2 summary)
+
+[cols="2,4", options="header"]
+|===
+| Dimension | Verdict
+
+| status vs current_relevance vs accepted/rejected vs action
+| *Mostly separated, with leaks.* `status` and `current_relevance` are distinct
+  fields but disagree in PMC-009; there is no explicit `accepted/rejected`
+  decision disposition for findings (accepted is folded into `status`);
+  "action" is implied by `tracking_ftr_ids` rather than an action field.
+
+| severity vs status vs relevance
+| *Cleanly separated and complete* (all severities map; relevance factors are a
+  separate derived weighting). This part of the model is sound.
+
+| derived views vs pseudo-truth
+| *Sound.* Derived outputs (current_findings, heatmaps, mapping gaps,
+  release-note candidates, context report) are all rebuildable and gitignored;
+  none are promoted into canonical. The assessment-scale layer is config + a
+  derived join. No pseudo-truth detected.
+
+| dangling refs / orphans / duplicate ids / competing truths
+| *Clean on the concern/event side; localized problems in findings fields*
+  (PMC-003/004/005) and one duplicate-column case in reviews (PMC-006).
+
+| assessment-scale mapping: clarity vs indirection
+| *Reduces ambiguity.* It is a thin, complete, derived normalization, not an
+  extra unclear layer. Keep it.
+|===
+
+== Goal-4 note carried here (sentinel representation)
+
+The xfail executable sentinel is represented *only narratively*: one
+`manual_note` event `SIG-ACT-FK-HELPER-NAN-XFAIL-CONTRACT-SENTINEL` whose
+`source_id=XF-SENTINEL-FK-HELPER-NAN-CONTRACT` resolves to no canonical table,
+plus prose in the context report. There is no structured state distinguishing
+*test-green* / *known-xfail* / *unresolved-semantic-contract*, and the BUG
+header record contradicts the sentinel (PMC-007). Detail and recommendation are
+in `next_slice_recommendation.adoc`.
