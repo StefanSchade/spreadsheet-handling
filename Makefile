@@ -253,7 +253,7 @@ clean-docs: ## Remove doc build output
 # =========================
 # Project memory
 # =========================
-.PHONY: memory-setup memory-export memory-query memory-context memory-extract memory-stage-extracted memory-refresh-workbook memory-import memory-check memory-promote
+.PHONY: memory-setup memory-export memory-query memory-context memory-extract memory-stage-extracted memory-refresh-workbook memory-import memory-check memory-promote memory-health-report
 .PHONY: memory-export-ods memory-import-ods memory-diff-reimport memory-check-reimport memory-promote-reimport memory-promote-reimport-checked
 .PHONY: check-memory-sheets-run
 
@@ -284,7 +284,14 @@ memory-context: $(PROJECT_MEMORY_STAMP) memory-query ## Render the generated pro
 	@mkdir -p "$(ROOT)docs_generated/project_memory"
 	@find "$(ROOT)docs_generated/project_memory" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.render_context
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.health_report
 	@echo "$(ROOT)docs_generated/project_memory/current_context.adoc"
+
+memory-health-report: ## Generate project_memory health report (derived diagnostic; requires memory-extract to have run)
+	@mkdir -p "$(MEMORY_DERIVED_DIR)"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.health_report
+	@echo "$(MEMORY_DERIVED_DIR)/memory_health_report.json"
+	@echo "$(MEMORY_DERIVED_DIR)/memory_health_report.adoc"
 
 memory-extract: check-memory-sheets-run ## Extract conservative project_memory candidates from ADOC artifacts
 	@mkdir -p "$(MEMORY_DIR)/extracted"
