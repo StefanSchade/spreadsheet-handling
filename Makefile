@@ -290,6 +290,7 @@ memory-extract: check-memory-sheets-run ## Extract conservative project_memory c
 	@mkdir -p "$(MEMORY_DIR)/extracted"
 	@find "$(MEMORY_DIR)/extracted" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.extract_candidates
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m project_memory.plugins.extract_commit_signals
 	@echo "$(MEMORY_DIR)/extracted/"
 
 memory-stage-extracted: ## Stage extracted candidates as generated ext_* canonical tables
