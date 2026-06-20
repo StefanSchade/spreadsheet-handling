@@ -245,12 +245,76 @@ def event_ftr_links(
     return {**dict(frames), "event_ftr_links": _json_safe_frame(result)}
 
 
+def finding_assessment_heatmap(
+    frames: Mapping[str, Any],
+    *,
+    findings_source: str = "findings",
+    mappings_source: str = "assessment_scale_mappings",
+    normalized_scale: str = "impact_0_5",
+) -> dict[str, Any]:
+    """Join finding severity to normalized impact values via assessment_scale_mappings."""
+    from project_memory.plugins.assessment_scale import build_lookup_index
+
+    findings = _frame_or_empty(frames, findings_source)
+    mappings_frame = _frame_or_empty(frames, mappings_source)
+
+    output_columns = [
+        "id", "severity", "topic", "status", "current_relevance",
+        "normalized_scale", "normalized_value", "normalized_label", "mapping_status",
+    ]
+
+    if findings.empty:
+        return {**dict(frames), "finding_assessment_heatmap": _json_safe_frame(pd.DataFrame(columns=output_columns))}
+
+    mappings_list: list[Any] = (
+        mappings_frame.where(mappings_frame.notna(), None).to_dict(orient="records")
+        if not mappings_frame.empty
+        else []
+    )
+    index = build_lookup_index(mappings_list)
+
+    rows: list[dict[str, Any]] = []
+    for record in findings.where(findings.notna(), "").to_dict(orient="records"):
+        finding_id = str(record.get("id", ""))
+        severity = str(record.get("severity", ""))
+        mapping = index.get(("finding", "severity", severity, normalized_scale))
+        if mapping is not None:
+            rows.append({
+                "id": finding_id,
+                "severity": severity,
+                "topic": str(record.get("topic", "")),
+                "status": str(record.get("status", "")),
+                "current_relevance": str(record.get("current_relevance", "")),
+                "normalized_scale": normalized_scale,
+                "normalized_value": mapping.get("normalized_value", ""),
+                "normalized_label": str(mapping.get("normalized_label", "")),
+                "mapping_status": "mapped",
+            })
+        else:
+            rows.append({
+                "id": finding_id,
+                "severity": severity,
+                "topic": str(record.get("topic", "")),
+                "status": str(record.get("status", "")),
+                "current_relevance": str(record.get("current_relevance", "")),
+                "normalized_scale": normalized_scale,
+                "normalized_value": "",
+                "normalized_label": "",
+                "mapping_status": "unmapped",
+            })
+
+    result = pd.DataFrame(rows, columns=output_columns) if rows else pd.DataFrame(columns=output_columns)
+    sort_key = pd.to_numeric(result["normalized_value"], errors="coerce").fillna(-1)
+    result = result.iloc[sort_key.sort_values(ascending=False).index].reset_index(drop=True)
+    return {**dict(frames), "finding_assessment_heatmap": _json_safe_frame(result)}
+
+
 def derived_views_only(
     frames: Mapping[str, Any],
     *,
     names: tuple[str, ...] = (
         "current_findings", "ftr_dependency_edges", "ftr_blockers",
-        "release_note_candidates", "event_ftr_links",
+        "release_note_candidates", "event_ftr_links", "finding_assessment_heatmap",
     ),
 ) -> dict[str, pd.DataFrame]:
     """Keep only the derived query frames for downstream json_dir export."""
