@@ -6,7 +6,9 @@ as foreign keys, indexes, and hierarchies. It is built around small composable
 pipeline steps configured in YAML so that complex spreadsheet models stay
 easier to validate, transform, and reimport.
 
-The project is in beta.
+The project is pre-1.0 software. Public behavior is useful for careful
+adoption, but API and YAML compatibility are still intentionally allowed to
+change while the domain and metadata model settle.
 
 ---
 
@@ -36,22 +38,13 @@ Requires Python 3.10 or newer.
 
 ## Features
 
-- Convert JSON ↔ CSV/Excel (XLSX) with round-tripping support
+- Convert JSON ↔ CSV/Excel (XLSX) and ODS workbooks with round-tripping support
 - Detect and enforce foreign key relationships
 - Validate spreadsheet structures (naming rules, uniqueness, etc.)
 - Orchestrate multi-sheet pipelines via YAML configs
 - Extensible: plug in new backends and transformation steps
 
 ---
-
-### AI Usage & Position Statement
-
-- AI tools are used at all levels of this project: requirement analysis, solution design, coding.
-- Human oversight, testing, and review remain essential. AI augments reasoning and speed but does not replace engineering judgment.
-- Quality and maintainability are goals treated with priority; AI contributes to these.
-
-*Industry trends support this approach:*
-according to the [JetBrains Developer Ecosystem 2025 survey published by *Golem.de*](https://www.golem.de/news/umfrage-unter-24-000-entwicklern-gesamtes-berufsfeld-befindet-sich-im-wandel-2510-188855.html), AI adoption is already pervasive and considered a core competency.
 
 ### License
 
