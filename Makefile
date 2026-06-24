@@ -386,7 +386,7 @@ release-status: ## One-shot cross-repo release state (core/demo/pages). CORE_DIR
 # =========================
 # Domain reformation helpers
 # =========================
-.PHONY: reformation-slice reformation-check
+.PHONY: reformation-slice reformation-check reformation-driver
 
 reformation-slice: ## Scaffold a domain reformation slice. Usage: make reformation-slice NAME=fk-helper-unresolved-values
 	@test -n "$(NAME)" || { echo "NAME is required, e.g. make reformation-slice NAME=fk-helper-unresolved-values" >&2; exit 2; }
@@ -395,6 +395,12 @@ reformation-slice: ## Scaffold a domain reformation slice. Usage: make reformati
 reformation-check: ## Check a domain reformation slice. Usage: make reformation-check SLICE=fk-helper-unresolved-values
 	@test -n "$(SLICE)" || { echo "SLICE is required, e.g. make reformation-check SLICE=fk-helper-unresolved-values" >&2; exit 2; }
 	@bash "$(ROOT)scripts/reformation_slice.sh" check "$(SLICE)"
+
+reformation-driver: ## Print a reusable agent driver prompt. Usage: make reformation-driver SLICE=fk-helper-unresolved-values
+	@test -n "$(SLICE)" || { echo "SLICE is required, e.g. make reformation-driver SLICE=fk-helper-unresolved-values" >&2; exit 2; }
+	@bash "$(ROOT)scripts/reformation_slice.sh" driver "$(SLICE)" \
+	  $(foreach source,$(SOURCES),--source "$(source)") \
+	  $(foreach hint,$(TEST_HINTS),--test-hint "$(hint)")
 
 # =========================
 # Coverage
