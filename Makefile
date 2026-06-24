@@ -384,6 +384,19 @@ release-status: ## One-shot cross-repo release state (core/demo/pages). CORE_DIR
 	  $(if $(PAGES_DIR),--pages "$(PAGES_DIR)")
 
 # =========================
+# Domain reformation helpers
+# =========================
+.PHONY: reformation-slice reformation-check
+
+reformation-slice: ## Scaffold a domain reformation slice. Usage: make reformation-slice NAME=fk-helper-unresolved-values
+	@test -n "$(NAME)" || { echo "NAME is required, e.g. make reformation-slice NAME=fk-helper-unresolved-values" >&2; exit 2; }
+	@bash "$(ROOT)scripts/reformation_slice.sh" create "$(NAME)"
+
+reformation-check: ## Check a domain reformation slice. Usage: make reformation-check SLICE=fk-helper-unresolved-values
+	@test -n "$(SLICE)" || { echo "SLICE is required, e.g. make reformation-check SLICE=fk-helper-unresolved-values" >&2; exit 2; }
+	@bash "$(ROOT)scripts/reformation_slice.sh" check "$(SLICE)"
+
+# =========================
 # Coverage
 # =========================
 .PHONY: coverage coverage-html
