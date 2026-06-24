@@ -28,7 +28,7 @@ Requires Python 3.10 or newer.
   from a normalized JSON model, edit it, reimport it, and verify the
   canonical JSON stays clean.
 - **Read the user guide (latest release)** &mdash;
-  <https://stefanschade.github.io/spreadsheet-handling-pages/versions/v0.2.1/core/user-guide/>.
+  <https://stefanschade.github.io/spreadsheet-handling-pages/latest/core/user-guide/>.
 - **Browse documentation by version** &mdash;
   <https://stefanschade.github.io/spreadsheet-handling-pages/>
   is the per-release archive portal; it carries the latest-release banner
