@@ -4,324 +4,157 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.transformations.cell_codec import (
-    ParsedCellValue,
     decode_cell_values,
     encode_cell_values,
-    parse_cell_value,
-    serialize_cell_value,
-)
-from spreadsheet_handling.domain.transformations.xref_crosstable import (
-    contract_xref,
-    expand_xref,
 )
 
 
 pytestmark = pytest.mark.ftr("FTR-CELL-CODEC")
 
 
-def test_whole_cell_code_keeps_delimited_looking_code_intact() -> None:
-    parsed = parse_cell_value(
-        "E-R-K",
-        mode="whole_cell_code",
-        allowed_codes=["S", "E-R-K"],
-    )
-
-    assert parsed == ParsedCellValue(mode="whole_cell_code", values=("E-R-K",))
-    assert serialize_cell_value(parsed, mode="whole_cell_code", allowed_codes=["S", "E-R-K"]) == "E-R-K"
-
-
-def test_split_tokens_requires_explicit_mode_and_serializes_in_canonical_order() -> None:
-    parsed = parse_cell_value(
-        "K-E-R",
-        mode="split_tokens",
-        delimiter="-",
-        allowed_tokens=["E", "R", "K"],
-    )
-
-    assert parsed.values == ("K", "E", "R")
-    assert (
-        serialize_cell_value(
-            parsed,
-            mode="split_tokens",
-            delimiter="-",
-            allowed_tokens=["E", "R", "K"],
-            canonical_order=["E", "R", "K"],
-        )
-        == "E-R-K"
-    )
-
-
-def test_serialize_split_tokens_expects_structured_values_not_compact_cell_text() -> None:
-    assert (
-        serialize_cell_value(
-            ["K", "E"],
-            mode="split_tokens",
-            delimiter="-",
-            allowed_tokens=["K", "E"],
-        )
-        == "K-E"
-    )
-
-    with pytest.raises(ValueError, match="Invalid cell token"):
-        serialize_cell_value(
-            "K-E",
-            mode="split_tokens",
-            delimiter="-",
-            allowed_tokens=["K", "E"],
-        )
-
-
-def test_invalid_whole_cell_code_is_rejected_when_allowed_codes_are_configured() -> None:
-    with pytest.raises(ValueError, match="Invalid cell code"):
-        parse_cell_value("X", mode="whole_cell_code", allowed_codes=["E", "S"])
-
-
-@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
-def test_invalid_codec_mode_error_names_explicit_modes() -> None:
-    with pytest.raises(ValueError, match="whole_cell_code.*split_tokens"):
-        parse_cell_value("E-R-K", mode="tokens")
-
-
-@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
-def test_split_tokens_requires_configured_delimiter() -> None:
-    with pytest.raises(ValueError, match="non-empty delimiter"):
-        parse_cell_value("E-R-K", mode="split_tokens", delimiter="")
-
-
-def test_codec_can_source_allowed_values_from_legend_block() -> None:
-    meta = {
-        "legend_blocks": {
-            "status_codes": {
-                "entries": [
-                    {"token": "E", "label": "Editable"},
-                    {"token": "E-R-K", "label": "Capital-path recalculation"},
-                ],
-            }
-        }
+def _position_codec_intent() -> dict[str, object]:
+    return {
+        "participating_columns": ["a", "b", "c"],
+        "compact_column": "abc",
+        "separator": " / ",
+        "absent_value": "-",
     }
 
-    assert (
-        parse_cell_value(
-            "E-R-K",
-            mode="whole_cell_code",
-            allowed_from_legend="status_codes",
-            meta=meta,
-        ).values
-        == ("E-R-K",)
-    )
 
-    with pytest.raises(ValueError, match="Invalid cell code"):
-        parse_cell_value(
-            "X",
-            mode="whole_cell_code",
-            allowed_from_legend="status_codes",
-            meta=meta,
-        )
-
-
-@pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
-def test_missing_legend_block_error_points_to_allowed_from_legend() -> None:
-    with pytest.raises(KeyError, match="allowed_from_legend.*status_codes"):
-        parse_cell_value(
-            "E",
-            mode="whole_cell_code",
-            allowed_from_legend="status_codes",
-            meta={},
-        )
-
-
-def test_duplicate_explicit_and_legend_allowed_values_are_config_error() -> None:
-    meta = {
-        "legend_blocks": {
-            "status_codes": {
-                "entries": [
-                    {"token": "E", "label": "Editable"},
-                ],
-            }
-        }
-    }
-
-    with pytest.raises(ValueError, match="Allowed value set contains duplicate"):
-        parse_cell_value(
-            "E",
-            mode="whole_cell_code",
-            allowed_codes=["E"],
-            allowed_from_legend="status_codes",
-            meta=meta,
-        )
-
-
-def test_decode_cell_values_emits_one_code_row_for_whole_cell_codes() -> None:
+def test_position_based_contracts_configured_columns_into_compact_column() -> None:
+    """Given expanded columns, when contracted, then they become one compact column."""
+    # Given
     frames = {
-        "long": pd.DataFrame([
-            {"feature_id": "f1", "column_key": "P-001", "value": "E-R-K"},
-            {"feature_id": "f2", "column_key": "P-001", "value": ""},
+        "expanded": pd.DataFrame([
+            {"id": "row-1", "a": "A", "b": "B", "c": "C"},
+            {"id": "row-2", "a": "A", "b": "", "c": "C"},
         ])
     }
 
-    out = decode_cell_values(
-        frames,
-        source="long",
-        output="decoded",
-        passthrough_columns=["feature_id", "column_key"],
-        allowed_codes=["E-R-K"],
-    )
-
-    assert out["decoded"].to_dict(orient="records") == [
-        {"feature_id": "f1", "column_key": "P-001", "code": "E-R-K"},
-    ]
-    assert out["_meta"]["cell_codecs"]["decoded"]["mode"] == "whole_cell_code"
-
-
-def test_decode_cell_values_can_split_tokens_and_preserve_empty_rows_when_requested() -> None:
-    frames = {
-        "long": pd.DataFrame([
-            {"feature_id": "f1", "column_key": "P-001", "value": "K-E"},
-            {"feature_id": "f2", "column_key": "P-001", "value": ""},
-        ])
-    }
-
-    out = decode_cell_values(
-        frames,
-        source="long",
-        output="decoded",
-        passthrough_columns=["feature_id", "column_key"],
-        drop_empty=False,
-        mode="split_tokens",
-        delimiter="-",
-        allowed_tokens=["E", "K"],
-    )
-
-    assert out["decoded"].to_dict(orient="records") == [
-        {"feature_id": "f1", "column_key": "P-001", "code": "K"},
-        {"feature_id": "f1", "column_key": "P-001", "code": "E"},
-        {"feature_id": "f2", "column_key": "P-001", "code": ""},
-    ]
-
-
-def test_encode_cell_values_groups_tokens_into_canonical_cell_values() -> None:
-    frames = {
-        "decoded": pd.DataFrame([
-            {"feature_id": "f1", "column_key": "P-001", "code": "K"},
-            {"feature_id": "f1", "column_key": "P-001", "code": "E"},
-            {"feature_id": "f2", "column_key": "P-001", "code": ""},
-        ])
-    }
-
+    # When
     out = encode_cell_values(
         frames,
-        source="decoded",
-        output="encoded",
-        group_by=["feature_id", "column_key"],
-        mode="split_tokens",
-        delimiter="-",
-        allowed_tokens=["E", "K"],
-        canonical_order=["E", "K"],
+        source="expanded",
+        output="compact",
+        codec_intent=_position_codec_intent(),
     )
 
-    assert out["encoded"].to_dict(orient="records") == [
-        {"feature_id": "f1", "column_key": "P-001", "value": "E-K"},
-        {"feature_id": "f2", "column_key": "P-001", "value": ""},
+    # Then
+    assert out["compact"].to_dict(orient="records") == [
+        {"id": "row-1", "abc": "A / B / C"},
+        {"id": "row-2", "abc": "A / - / C"},
     ]
 
 
-def test_sparse_decode_default_can_drop_empty_only_xref_groups() -> None:
+def test_position_based_contract_preserves_non_participating_columns() -> None:
+    """Given passthrough columns, when contracted, then they remain unchanged."""
+    # Given
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", ""],
-        })
-    }
-    expanded = expand_xref(
-        frames,
-        matrix="matrix",
-        output="long",
-        row_keys=["feature_id"],
-        value_columns=["P-001"],
-    )
-    decoded = decode_cell_values(
-        expanded,
-        source="long",
-        output="decoded",
-        passthrough_columns=["feature_id", "column_key"],
-        allowed_codes=["E"],
-    )
-    encoded = encode_cell_values(
-        decoded,
-        source="decoded",
-        output="encoded",
-        group_by=["feature_id", "column_key"],
-        allowed_codes=["E"],
-    )
-    roundtrip = contract_xref(
-        encoded,
-        relation="encoded",
-        output="roundtrip",
-        row_keys=["feature_id"],
-        column_keys=["P-001"],
-    )
-
-    assert roundtrip["roundtrip"].to_dict(orient="records") == [
-        {"feature_id": "f1", "P-001": "E"},
-    ]
-
-
-def test_drop_empty_false_preserves_empty_xref_groups_for_lossless_roundtrip() -> None:
-    frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", ""],
-        })
-    }
-    expanded = expand_xref(
-        frames,
-        matrix="matrix",
-        output="long",
-        row_keys=["feature_id"],
-        value_columns=["P-001"],
-    )
-    decoded = decode_cell_values(
-        expanded,
-        source="long",
-        output="decoded",
-        passthrough_columns=["feature_id", "column_key"],
-        drop_empty=False,
-        allowed_codes=["E"],
-    )
-    encoded = encode_cell_values(
-        decoded,
-        source="decoded",
-        output="encoded",
-        group_by=["feature_id", "column_key"],
-        allowed_codes=["E"],
-    )
-    roundtrip = contract_xref(
-        encoded,
-        relation="encoded",
-        output="roundtrip",
-        row_keys=["feature_id"],
-        column_keys=["P-001"],
-    )
-
-    assert roundtrip["roundtrip"].to_dict(orient="records") == [
-        {"feature_id": "f1", "P-001": "E"},
-        {"feature_id": "f2", "P-001": ""},
-    ]
-
-
-def test_encode_cell_values_rejects_multiple_whole_codes_per_group() -> None:
-    frames = {
-        "decoded": pd.DataFrame([
-            {"feature_id": "f1", "column_key": "P-001", "code": "E"},
-            {"feature_id": "f1", "column_key": "P-001", "code": "S"},
+        "expanded": pd.DataFrame([
+            {"id": "row-1", "note": "keep", "a": "A", "b": "B", "c": "C"},
         ])
     }
 
-    with pytest.raises(ValueError, match="exactly one code"):
+    # When
+    out = encode_cell_values(
+        frames,
+        source="expanded",
+        output="compact",
+        codec_intent=_position_codec_intent(),
+    )
+
+    # Then
+    assert out["compact"].to_dict(orient="records") == [
+        {"id": "row-1", "note": "keep", "abc": "A / B / C"},
+    ]
+
+
+def test_position_based_contract_expands_compact_column_to_configured_columns() -> None:
+    """Given a compact column, when decoded, then configured columns are restored."""
+    # Given
+    frames = {
+        "compact": pd.DataFrame([
+            {"id": "row-1", "abc": "A / B / C"},
+            {"id": "row-2", "abc": "A / - / C"},
+        ])
+    }
+
+    # When
+    out = decode_cell_values(
+        frames,
+        source="compact",
+        output="expanded",
+        codec_intent=_position_codec_intent(),
+    )
+
+    # Then
+    assert out["expanded"].to_dict(orient="records") == [
+        {"id": "row-1", "a": "A", "b": "B", "c": "C"},
+        {"id": "row-2", "a": "A", "b": "", "c": "C"},
+    ]
+
+
+def test_position_based_contract_requires_codec_intent_for_decoding() -> None:
+    """Given no codec intent, when compact text contains separators, then no decode occurs."""
+    # Given
+    frames = {
+        "compact": pd.DataFrame([
+            {"id": "row-1", "abc": "A / B / C"},
+        ])
+    }
+
+    # When / Then
+    with pytest.raises(ValueError, match="codec intent"):
+        decode_cell_values(
+            frames,
+            source="compact",
+            output="expanded",
+            value="abc",
+        )
+
+
+def test_position_based_contract_rejects_wrong_token_count() -> None:
+    """Given too few tokens, when decoded, then the failure is hard."""
+    # Given
+    frames = {
+        "compact": pd.DataFrame([
+            {"id": "row-1", "abc": "A / B"},
+        ])
+    }
+
+    # When / Then
+    with pytest.raises(ValueError, match="token count"):
+        decode_cell_values(
+            frames,
+            source="compact",
+            output="expanded",
+            codec_intent=_position_codec_intent(),
+        )
+
+
+def test_position_based_contract_rejects_helper_or_derived_participating_columns() -> None:
+    """Given a helper column is selected, when contracted, then the failure is hard."""
+    # Given
+    frames = {
+        "expanded": pd.DataFrame([
+            {"id": "row-1", "a": "A", "b": "B", "c": "C"},
+        ]),
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "expanded": {
+                        "helper_columns": ["b"],
+                    },
+                },
+            },
+        },
+    }
+
+    # When / Then
+    with pytest.raises(ValueError, match="helper|derived"):
         encode_cell_values(
             frames,
-            source="decoded",
-            output="encoded",
-            group_by=["feature_id", "column_key"],
-            allowed_codes=["E", "S"],
+            source="expanded",
+            output="compact",
+            codec_intent=_position_codec_intent(),
         )
