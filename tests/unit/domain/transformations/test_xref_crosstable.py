@@ -13,6 +13,259 @@ pytestmark = pytest.mark.ftr("FTR-XREF-CROSSTABLE")
 DENSE_FTR = pytest.mark.ftr("FTR-XREF-DENSE-AXES-P4A2")
 
 
+class TestXRefFramesMetaBridgeContract:
+    """Approved XRef contract: tuple/matrix addressing without value semantics."""
+
+    def test_relation_rows_contract_into_matrix_cells(self) -> None:
+        """Given relation rows, When contracted, Then values land at addresses."""
+        # Given
+        frames = {
+            "relations": pd.DataFrame([
+                {
+                    "product": "home_automation",
+                    "market": "JP",
+                    "relation": "SaaS / JP / OIDC",
+                },
+                {
+                    "product": "home_automation",
+                    "market": "DE",
+                    "relation": "OnPrem / DE / SAML",
+                },
+            ])
+        }
+
+        # When
+        out = contract_xref(
+            frames,
+            relation="relations",
+            output="matrix",
+            row_keys=["product"],
+            column_key="market",
+            value="relation",
+            column_keys=["JP", "DE", "US"],
+        )
+
+        # Then
+        assert out["matrix"].to_dict(orient="records") == [
+            {
+                "product": "home_automation",
+                "JP": "SaaS / JP / OIDC",
+                "DE": "OnPrem / DE / SAML",
+                "US": "",
+            }
+        ]
+
+    def test_matrix_cells_expand_back_into_relation_rows(self) -> None:
+        """Given non-empty matrix cells, When expanded, Then each becomes one row."""
+        # Given
+        frames = {
+            "matrix": pd.DataFrame([
+                {
+                    "product": "home_automation",
+                    "JP": "SaaS / JP / OIDC",
+                    "DE": "OnPrem / DE / SAML",
+                }
+            ])
+        }
+
+        # When
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relations",
+            row_keys=["product"],
+            value_columns=["JP", "DE"],
+            column_key="market",
+            value="relation",
+        )
+
+        # Then
+        assert out["relations"].to_dict(orient="records") == [
+            {
+                "product": "home_automation",
+                "market": "JP",
+                "relation": "SaaS / JP / OIDC",
+            },
+            {
+                "product": "home_automation",
+                "market": "DE",
+                "relation": "OnPrem / DE / SAML",
+            },
+        ]
+
+    def test_drop_empty_true_means_empty_matrix_cell_has_no_relation_row(self) -> None:
+        """Given drop_empty=True, When expanded, Then empty cells are omitted."""
+        # Given
+        frames = {
+            "matrix": pd.DataFrame([
+                {
+                    "product": "home_automation",
+                    "JP": "SaaS / JP / OIDC",
+                    "DE": "",
+                }
+            ])
+        }
+
+        # When
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relations",
+            row_keys=["product"],
+            value_columns=["JP", "DE"],
+            column_key="market",
+            value="relation",
+            drop_empty=True,
+        )
+
+        # Then
+        assert out["relations"].to_dict(orient="records") == [
+            {
+                "product": "home_automation",
+                "market": "JP",
+                "relation": "SaaS / JP / OIDC",
+            }
+        ]
+
+    def test_drop_empty_false_preserves_empty_matrix_cell_as_empty_relation_row(self) -> None:
+        """Given drop_empty=False, When expanded, Then empty cells are preserved."""
+        # Given
+        frames = {
+            "matrix": pd.DataFrame([
+                {
+                    "product": "home_automation",
+                    "JP": "SaaS / JP / OIDC",
+                    "DE": "",
+                }
+            ])
+        }
+
+        # When
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="relations",
+            row_keys=["product"],
+            value_columns=["JP", "DE"],
+            column_key="market",
+            value="relation",
+            drop_empty=False,
+        )
+
+        # Then
+        assert out["relations"].to_dict(orient="records") == [
+            {
+                "product": "home_automation",
+                "market": "JP",
+                "relation": "SaaS / JP / OIDC",
+            },
+            {"product": "home_automation", "market": "DE", "relation": ""},
+        ]
+
+    def test_duplicate_tuple_coordinates_hard_fail(self) -> None:
+        """Given duplicate coordinates, When contracted, Then XRef fails fast."""
+        # Given
+        frames = {
+            "relations": pd.DataFrame([
+                {"product": "home_automation", "market": "JP", "relation": "first"},
+                {"product": "home_automation", "market": "JP", "relation": "second"},
+            ])
+        }
+
+        # When / Then
+        with pytest.raises(ValueError, match=r"(?i)duplicate.*row/column pair"):
+            contract_xref(
+                frames,
+                relation="relations",
+                output="matrix",
+                row_keys=["product"],
+                column_key="market",
+                value="relation",
+            )
+
+    def test_axis_domains_survive_independently_of_filled_relation_cells(self) -> None:
+        """Given dynamic axis domains, When contracted, Then empty addresses render."""
+        # Given
+        frames = {
+            "products": pd.DataFrame({"product": ["home_automation", "security"]}),
+            "markets": pd.DataFrame({"market": ["JP", "DE", "US"]}),
+            "relations": pd.DataFrame([
+                {
+                    "product": "home_automation",
+                    "market": "JP",
+                    "relation": "SaaS / JP / OIDC",
+                }
+            ]),
+        }
+
+        # When
+        out = contract_xref(
+            frames,
+            relation="relations",
+            output="matrix",
+            row_keys=["product"],
+            column_key="market",
+            value="relation",
+            dense_axes={
+                "rows_from": {"frame": "products", "key": "product"},
+                "columns_from": {"frame": "markets", "key": "market"},
+            },
+        )
+
+        # Then
+        assert out["matrix"].to_dict(orient="records") == [
+            {
+                "product": "home_automation",
+                "JP": "SaaS / JP / OIDC",
+                "DE": "",
+                "US": "",
+            },
+            {"product": "security", "JP": "", "DE": "", "US": ""},
+        ]
+
+    def test_relation_values_are_transport_not_xref_semantics(self) -> None:
+        """Given parseable-looking strings, When roundtripped, Then text is unchanged."""
+        # Given
+        rows = [
+            {"product": "home_automation", "market": "JP", "relation": "TRUE"},
+            {
+                "product": "home_automation",
+                "market": "DE",
+                "relation": "SaaS / JP / OIDC",
+            },
+            {"product": "security", "market": "JP", "relation": "A-B-C"},
+            {
+                "product": "security",
+                "market": "DE",
+                "relation": "please check with customer",
+            },
+        ]
+        frames = {"relations": pd.DataFrame(rows)}
+
+        # When
+        contracted = contract_xref(
+            frames,
+            relation="relations",
+            output="matrix",
+            row_keys=["product"],
+            column_key="market",
+            value="relation",
+            column_keys=["JP", "DE"],
+        )
+        out = expand_xref(
+            contracted,
+            matrix="matrix",
+            output="roundtrip",
+            row_keys=["product"],
+            value_columns=["JP", "DE"],
+            column_key="market",
+            value="relation",
+        )
+
+        # Then
+        assert out["roundtrip"].to_dict(orient="records") == rows
+
+
 def test_expand_xref_turns_matrix_columns_into_long_rows() -> None:
     frames = {
         "product_matrix": pd.DataFrame({
