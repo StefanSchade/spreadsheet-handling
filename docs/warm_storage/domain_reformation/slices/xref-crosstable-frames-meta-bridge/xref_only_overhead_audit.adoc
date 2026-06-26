@@ -1,0 +1,302 @@
+= XRef-Only Overhead and Meta-Lifecycle Audit
+:revdate: 2026-06-26
+
+This note audits current XRef implementation and metadata behavior against
+`slice.adoc`. It is evidence for the slice, not a new contract authority.
+
+== Summary Verdict
+
+The XRef implementation is mostly aligned with the approved core contract:
+relation rows and matrix cells are converted by explicit row/column addressing,
+relation values are transported without interpretation, duplicate coordinates
+fail, and `drop_empty` is the explicit empty-cell policy.
+
+The main overhead is not value semantics. It is meta lifecycle: runtime
+`_meta.xref_crosstable` entries currently mix projection intent, runtime
+resolution, and possible projection/writeback scope support. These fields are
+not durable canonical truth, but they may be needed to know what matrix rows
+and columns the user actually saw and could edit during a workbook roundtrip.
+The persistence boundary already recognizes part of this split by preserving
+intent and pruning `column_keys` plus `dense_axes.resolved` from sidecar
+persistence.
+
+== Target XRef Core
+
+Current behavior that belongs directly to XRef:
+
+* `contract_xref`: relation-shaped rows -> matrix projection.
+* `expand_xref`: matrix projection -> relation-shaped rows.
+* `row_keys`, `column_key`, and `value` configure tuple/matrix addressing.
+* `drop_empty=True` omits empty cells from relation rows.
+* `drop_empty=False` preserves empty cells as relation rows with empty values.
+* Duplicate row/column pairs fail before matrix projection.
+* `dense_axes.rows_from` and `dense_axes.columns_from` can render row/column
+  members that have no filled relation cells.
+* Relation values are copied through; XRef does not parse, split, validate, or
+  interpret their internal meaning.
+
+== Axis-Domain Intent
+
+Current axis-domain intent surfaces:
+
+* `row_keys`: configured row-axis address column(s).
+* `column_key`: configured relation column that addresses matrix columns.
+* `column_keys`: explicit ordered column-axis member list at the step surface.
+* `dense_axes.rows_from`: configured row-axis source frame and key field(s).
+* `dense_axes.columns_from`: configured column-axis source frame and key field.
+* `name`: transform id used to find prior runtime/meta configuration.
+
+`dense_axes.rows_from` and `dense_axes.columns_from` are the cleanest current
+shape for source-frame/source-field axis-domain intent. `column_keys` is useful
+as an explicit member list at the step surface, but the same field name is also
+used as a runtime snapshot in `_meta.xref_crosstable`; that ambiguity is the
+largest carrier-shape concern.
+
+== Runtime Resolution / Meta-Lifecycle Concerns
+
+Current runtime resolution and projection-scope candidate surfaces:
+
+* `_meta.xref_crosstable[*].column_keys`: materialized matrix columns for a
+  run; also a possible projection/writeback scope snapshot.
+* `_meta.xref_crosstable[*].dense_axes.resolved.column_keys`: materialized
+  column-axis members; also a possible projection/writeback scope snapshot.
+* `_meta.xref_crosstable[*].dense_axes.resolved.row_identities`: materialized
+  row-axis identities; also a possible projection/writeback scope snapshot.
+* relation-derived matrix column order when neither `column_keys` nor
+  `dense_axes.columns_from` is supplied.
+* stored resolved dense axes used as fallback when source frames are absent.
+
+The persistence boundary already treats `column_keys` and `dense_axes.resolved`
+as Resolution: they are pruned from sidecar persistence while intent fields
+survive. The workbook/carrier path may retain resolution as reconstruction
+support. Human review adds a missing distinction: these fields may also be
+projection/writeback scope support. They must not be dismissed as mere
+historical sediment before that use case is specified, and they must not be
+promoted to durable truth.
+
+The audit uses `projection_scope_candidate` locally for values that may be
+needed to decide writeback scope but whose final lifecycle role is not approved.
+
+== Projection Scope and Entity Lifecycle Finding
+
+Empty matrix cells are already controlled by `drop_empty`. Missing matrix rows
+or columns are a different problem.
+
+On reimport, a missing row or column may mean any of the following:
+
+* it was outside the original projection scope;
+* the user deleted it intentionally;
+* the workbook projection structure was damaged;
+* the corresponding entity was deleted or renamed in a source/entity frame;
+* the relation exists but the axis entity no longer exists.
+
+Without a projection/writeback scope snapshot, recomposition cannot always
+distinguish these cases. XRef, FK-helper, workbook-view, and future projection
+integrity logic need an explicit policy for at least:
+
+* preserving outside-scope relations;
+* deleting in-scope relations;
+* warning or failing on dangling relation references;
+* optionally supporting explicit cascade/prune behavior later.
+
+This audit does not choose that behavior. It records that `column_keys` and
+`dense_axes.resolved` may be legitimate projection/writeback scope support in
+addition to runtime resolution. That role must be specified before any cleanup
+removes, renames, or persists those fields differently.
+
+== External Behavior Obligations Table
+
+[cols="2,2,2,3", options="header"]
+|===
+| Surface | Observed behavior | Classification | Audit note
+
+| `expand_xref` / `contract_xref` registered step names
+| YAML/pipeline registry binds these names to public transform callables.
+| public_surface_contract
+| Rename or removal is gated.
+
+| Step parameters: `matrix`, `relation`, `output`, `row_keys`, `column_key`,
+`value`, `value_columns`, `column_keys`, `drop_empty`, `fill_value`, `dense_axes`,
+`name`
+| Existing tests and integrations configure XRef through these fields.
+| public_surface_contract
+| Shape changes require approval.
+
+| `drop_empty=False`
+| Preserves empty-valued relation rows and is the current default.
+| compatibility_bridge
+| Keep unless a public-surface migration is approved.
+
+| `drop_empty=True`
+| Omits empty cells from relation recomposition.
+| public_surface_contract
+| Now approved as explicit no-relation policy.
+
+| `base_relation`
+| Scoped recomposition carries out-of-scope relation rows through.
+| public_surface_contract
+| Belongs to XRef scoped update semantics; depends on knowing which addresses
+are in projection/writeback scope.
+
+| `_meta.xref_crosstable`
+| Runtime transform entries include both intent and resolution.
+| needs_human_decision
+| Carrier shape must stay explicit before any reshape.
+
+| `_meta.xref_crosstable[*].column_keys`
+| Runtime snapshot used for matrix column order fallback and possible
+projection/writeback scope.
+| compatibility_bridge / projection_scope_candidate / needs_human_decision
+| Do not remove as mere resolution until projection-scope semantics are
+specified.
+
+| `_meta.xref_crosstable[*].dense_axes.rows_from` / `columns_from`
+| Source-frame/source-field axis-domain intent.
+| public_surface_contract
+| Clean current intent shape.
+
+| `_meta.xref_crosstable[*].dense_axes.resolved`
+| Current-run resolved axis members and possible projection/writeback scope.
+| compatibility_bridge / projection_scope_candidate / needs_human_decision
+| Runtime/carrier reconstruction support; pruned from sidecar persistence but
+possibly still needed during workbook writeback.
+
+| Persistence boundary pruning
+| Drops `column_keys` and `dense_axes.resolved`; keeps intent fields.
+| public_surface_contract
+| Existing tests guard this behavior.
+
+| Relation-order fallback
+| Derives matrix columns from current relation rows when no explicit axis list
+or dense axis source exists.
+| compatibility_bridge / needs_human_decision
+| Useful current behavior, but weak as projection/writeback scope because it
+depends on current relation content.
+
+| Meta registry `meta_canonical` / `canonical_meta` wording
+| Current registry labels XRef meta as canonical while describing runtime
+resolution facets.
+| historical_sediment
+| Do not promote this vocabulary in the reformation slice.
+
+| Sparse crosstable integration
+| Composes XRef with sparse defaults.
+| composition_contract_owned_elsewhere
+| XRef should not absorb sparse-default semantics.
+
+| Workbook-view reimport and localized-resource integration
+| Compose XRef with workbook view, discriminator split, helpers, and IO.
+| composition_contract_owned_elsewhere
+| Useful regression coverage, not XRef-only contract.
+
+| Project-by-role migration parity
+| Uses `expand_xref(drop_empty=True)` after projection.
+| composition_contract_owned_elsewhere
+| Confirms XRef empty-cell policy in a composed migration path.
+
+| Unit characterization of old blank defaults
+| Tests `drop_empty=False` and default behavior.
+| test_characterization_only
+| Keep as compatibility signal unless default behavior is intentionally changed.
+|===
+
+== Composition Leakage Candidates
+
+No direct imports from XRef to Cell Codec, Legend Blocks, validation, Sparse
+Defaults, or Compact Multiaxis were found in the XRef package.
+
+Possible leakage candidates are low risk:
+
+* The `operation.py` module docstring mentions a "compact-transform slice";
+  this appears historical, not behavioral coupling.
+* `fill_value` controls blank matrix cell materialization during projection; it
+  is not Sparse Defaults semantics by itself.
+* Integration tests compose XRef with Sparse Defaults, workbook views,
+  discriminator split, helpers, and project-by-role. These are external
+  obligations, not evidence that XRef owns those concepts.
+
+== Shared Primitive Suspicion
+
+[cols="2,2,3", options="header"]
+|===
+| Use | Classification | Rationale
+
+| `_is_empty_cell` in `expand_xref`
+| addressing equality / empty-value normalization needed by XRef
+| Implements `drop_empty` cell-presence policy.
+
+| `_is_empty_cell` in dense-axis identity checks
+| addressing equality / empty-value normalization needed by XRef
+| Empty axis identities cannot address matrix rows or columns.
+
+| `_values_equal` in `_ordered_unique`
+| addressing equality / empty-value normalization needed by XRef
+| Deduplicates relation-derived column-axis members.
+
+| `_values_equal` / `_ordered_values_equal` in dense-axis comparisons
+| addressing equality / empty-value normalization needed by XRef
+| Compares configured and resolved axis members across pandas/numpy scalar
+representations.
+
+| `_values_equal` in relation-within-axis checks
+| addressing equality / empty-value normalization needed by XRef
+| Validates relation tuple addresses against configured axis domains.
+|===
+
+No current shared-primitive use appears to interpret relation payload values.
+
+== Concrete Simplification Candidates
+
+* Do not delete runtime resolution fields merely because they are not durable
+  intent. First specify whether they are required as writeback/projection-scope
+  snapshots. Then rename, isolate, or prune them according to that role.
+* Separate intent, runtime resolution, projection/writeback scope, and durable
+  truth more clearly inside runtime `_meta.xref_crosstable`, or document current
+  mixed runtime shape as deliberate. This requires public/meta-surface approval.
+* Resolve the `column_keys` ambiguity: explicit axis-domain member list at the
+  step surface, runtime resolution snapshot in `_meta`, and possible
+  projection/writeback scope snapshot.
+* Keep `dense_axes.rows_from` / `columns_from` as the preferred source-frame
+  axis-domain intent shape unless a clearer approved carrier shape replaces it.
+* Narrow or explicitly document fallback from relation data order when no
+  explicit `column_keys` or dense axis source is supplied. This is compatibility
+  sensitive and may be insufficient for writeback-scope decisions.
+* Keep composition tests in their owning layers; do not fold Sparse Defaults,
+  workbook view, discriminator split, or project-by-role behavior into XRef.
+* Consider small internal cleanup of dense-axis helper return dictionaries only
+  after behavior and meta-surface tests pin the current contract.
+
+== Items Not To Change
+
+* Do not remove or rename `expand_xref` / `contract_xref`.
+* Do not introduce a new empty-cell flag; keep `drop_empty`.
+* Do not add Cell Codec, Legend Block, validation, Sparse Defaults, or Compact
+  Multiaxis imports to XRef.
+* Do not change `_meta.xref_crosstable` sidecar persistence behavior without
+  explicit meta-surface approval.
+* Do not persist `column_keys` or `dense_axes.resolved` as sidecar truth.
+* Do not delete runtime `column_keys` or `dense_axes.resolved` merely because
+  they are not durable intent.
+* Do not delete old paths or characterization tests without contract-test
+  coverage and explicit approval.
+* Do not promote registry vocabulary such as `canonical_meta` into the slice
+  contract language.
+
+== Human Decisions Needed Before Code/Meta Changes
+
+* Axis-domain carrier: decide whether current `column_keys` plus
+  `dense_axes.rows_from` / `columns_from` is sufficient, or approve a narrower
+  meta/public shape.
+* Runtime resolution carrier: decide whether workbook-retained
+  `dense_axes.resolved` / `column_keys` remains acceptable reconstruction
+  support and where that boundary is documented.
+* Projection/writeback scope semantics: decide how recomposition interprets
+  missing matrix rows/columns and relations whose axis entities were deleted or
+  renamed in source/entity frames. This is probably a follow-up Functional
+  Model concept or slice, not part of the current XRef core contract.
+* Relation-order fallback: decide whether deriving matrix columns from current
+  relation row order remains a supported compatibility path.
+* Public surface: approve any step-parameter, YAML, registry, import, or
+  persistence-boundary change before implementation.
+* Old-path handling: approve any removal or rewrite of tests or code that only
+  preserves historical metadata shape.
