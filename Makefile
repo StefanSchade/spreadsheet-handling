@@ -32,14 +32,24 @@ MEMORY_DERIVED_DIR   := $(MEMORY_DIR)/derived
 MEMORY_STAGING_DIR   := $(MEMORY_DIR)/staging
 MEMORY_PIPELINE_DIR  := $(MEMORY_DIR)/pipelines/memory
 
+DOMAIN_CONTRACTS_DIR           := $(ROOT)registries/domain_contracts
+DOMAIN_CONTRACTS_CANONICAL_DIR := $(DOMAIN_CONTRACTS_DIR)/canonical
+DOMAIN_CONTRACTS_STAGING_DIR   := $(DOMAIN_CONTRACTS_DIR)/staging
+DOMAIN_CONTRACTS_PIPELINE_DIR  := $(DOMAIN_CONTRACTS_DIR)/pipelines
+DOMAIN_CONTRACTS_WORKBOOK      := $(DOMAIN_CONTRACTS_DIR)/domain_contracts.ods
+DOMAIN_CONTRACTS_GENERATED_DIR := $(ROOT)docs_generated/domain_contracts
+DOMAIN_CONTRACTS_BUILD_DIR     := $(BUILD_DIR)/domain_contracts
+
 STAMP_DIR    := $(VENV)/.stamp
 DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 PROJECT_MEMORY_STAMP := $(STAMP_DIR)/project-memory.ok
+DOMAIN_CONTRACTS_STAMP := $(STAMP_DIR)/domain-contracts.ok
 
 DEPS_INPUTS  := pyproject.toml
 DEV_INPUTS   := pyproject.toml
 PROJECT_MEMORY_INPUTS := pyproject.toml
+DOMAIN_CONTRACTS_INPUTS := pyproject.toml
 
 VERBOSE      ?= TRUE
 LOG_OPTS     ?= -o log_cli=true -o log_cli_level=DEBUG
@@ -339,6 +349,64 @@ memory-promote-reimport: memory-promote
 memory-promote-reimport-checked: memory-check memory-promote ## Reimport, compare, then promote the verified snapshot
 
 # Backward-compatible aliases for the common typo in the target name.
+
+# =========================
+# Domain contracts
+# =========================
+.PHONY: domain-contracts-setup domain-contracts-check domain-contracts-context
+.PHONY: domain-contracts-export domain-contracts-import domain-contracts-diff-reimport
+.PHONY: domain-contracts-check-reimport domain-contracts-promote domain-contracts-promote-reimport-checked
+.PHONY: check-domain-contracts-sheets-run
+
+$(DOMAIN_CONTRACTS_STAMP): $(DOMAIN_CONTRACTS_INPUTS) | $(DEV_STAMP)
+	@mkdir -p "$(STAMP_DIR)"
+	@echo "Installing domain_contracts tooling deps..."
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s . $(PIP_VERBOSE_FLAG)
+	@touch "$(DOMAIN_CONTRACTS_STAMP)"
+
+domain-contracts-setup: $(DOMAIN_CONTRACTS_STAMP) ## Install domain_contracts tooling in the shared local dev venv
+
+check-domain-contracts-sheets-run: deps-dev ## Ensure the local sheets-run binary exists for domain-contracts targets
+	@test -x "$(SHEETS_RUN)" || { \
+		echo "sheets-run not found in $(VENV). Run 'make setup' or 'make domain-contracts-setup' first."; \
+		exit 127; \
+	}
+
+domain-contracts-check: $(DOMAIN_CONTRACTS_STAMP) ## Validate canonical domain-contract JSON and write diagnostics
+	@mkdir -p "$(DOMAIN_CONTRACTS_BUILD_DIR)"
+	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.check_contracts \
+		--registry-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
+		--report "$(DOMAIN_CONTRACTS_BUILD_DIR)/domain_contract_health.json"
+
+domain-contracts-context: domain-contracts-check ## Validate and render generated domain-contract ADOC
+	@mkdir -p "$(DOMAIN_CONTRACTS_GENERATED_DIR)"
+	@find "$(DOMAIN_CONTRACTS_GENERATED_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.render_contracts \
+		--registry-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
+		--output "$(DOMAIN_CONTRACTS_GENERATED_DIR)/domain_contracts.adoc" \
+		--report "$(DOMAIN_CONTRACTS_BUILD_DIR)/domain_contract_health.json"
+	@echo "$(DOMAIN_CONTRACTS_GENERATED_DIR)/domain_contracts.adoc"
+
+domain-contracts-export: check-domain-contracts-sheets-run ## Render domain-contract canonical JSON into an ODS workbook
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/json_to_ods.yaml"
+
+domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_contracts.ods into registries/domain_contracts/staging
+	@mkdir -p "$(DOMAIN_CONTRACTS_STAGING_DIR)"
+	@find "$(DOMAIN_CONTRACTS_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
+
+domain-contracts-diff-reimport: ## Compare canonical domain-contract JSON with current staging
+	diff -ru --exclude='.gitignore' "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" "$(DOMAIN_CONTRACTS_STAGING_DIR)"
+
+domain-contracts-check-reimport: domain-contracts-import domain-contracts-diff-reimport ## Reimport ODS and compare with canonical JSON
+
+domain-contracts-promote: ## Promote current domain-contract staging snapshot into canonical JSON
+	@test -d "$(DOMAIN_CONTRACTS_STAGING_DIR)" || (echo "Missing $(DOMAIN_CONTRACTS_STAGING_DIR). Run domain-contracts-import or domain-contracts-check-reimport first." >&2; exit 1)
+	cp -f "$(DOMAIN_CONTRACTS_STAGING_DIR)"/*.json "$(DOMAIN_CONTRACTS_CANONICAL_DIR)/"
+	@test -f "$(DOMAIN_CONTRACTS_STAGING_DIR)/_meta.yaml" && cp -f "$(DOMAIN_CONTRACTS_STAGING_DIR)/_meta.yaml" "$(DOMAIN_CONTRACTS_CANONICAL_DIR)/" || true
+
+domain-contracts-promote-reimport-checked: domain-contracts-check-reimport domain-contracts-promote ## Reimport, compare, then promote verified domain-contract JSON
+
 # =========================
 # Snapshot
 # =========================
