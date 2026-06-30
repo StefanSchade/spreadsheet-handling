@@ -396,7 +396,7 @@ domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_co
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
 
 domain-contracts-diff-reimport: ## Compare canonical domain-contract JSON with current staging
-	diff -ru --exclude='.gitignore' "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" "$(DOMAIN_CONTRACTS_STAGING_DIR)"
+	diff -ru --exclude='.gitignore' --exclude='seeds' "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" "$(DOMAIN_CONTRACTS_STAGING_DIR)"
 
 domain-contracts-check-reimport: domain-contracts-import domain-contracts-diff-reimport ## Reimport ODS and compare with canonical JSON
 

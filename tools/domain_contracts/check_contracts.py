@@ -20,44 +20,27 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "source_ref",
         "notes",
     ),
-    "concepts": (
-        "id",
-        "term",
-        "status",
-        "definition",
-        "owning_capability_family",
-        "reuse_check",
-        "non_goals",
-        "notes",
-    ),
     "transformations": (
         "id",
-        "runtime_name",
-        "category",
-        "callable",
+        "name",
+        "trans_type",
+        "trans_family",
         "pipeline_exposed",
-        "status",
-        "summary",
-        "notes",
+        "details",
+        "inverse_transformation_id",
+        "configuration_input",
+        "input_meta",
+        "output_meta",
     ),
-    "rules": ("id", "status", "rule", "consequence_if_violated", "notes"),
+    "transformation_types": ("id", "name", "detail", "bidirectional"),
+    "transformation_families": ("id", "name", "details"),
+    "meta_buckets": ("id", "name", "details", "lifecycle", "carrier_scope", "persisted"),
+    "lifecycle_phase": ("id", "sequence", "name", "details"),
     "transformation_requirements": (
         "id",
         "transformation_id",
         "requirement_id",
         "relation",
-        "notes",
-    ),
-    "concept_requirements": ("id", "concept_id", "requirement_id", "relation", "notes"),
-    "rule_requirements": ("id", "rule_id", "requirement_id", "relation", "notes"),
-    "transformation_frame_io": (
-        "id",
-        "transformation_id",
-        "direction",
-        "frame_pattern",
-        "role",
-        "required",
-        "effect",
         "notes",
     ),
     "transformation_meta_io": (
@@ -71,15 +54,6 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "persistence_expectation",
         "notes",
     ),
-    "transformation_config_sources": (
-        "id",
-        "transformation_id",
-        "source_kind",
-        "source_path",
-        "precedence",
-        "required",
-        "notes",
-    ),
     "transformation_links": (
         "id",
         "source_transformation_id",
@@ -87,39 +61,23 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "relation",
         "notes",
     ),
+    "transformation_lifecycle_notes": (
+        "id",
+        "transformation_id",
+        "lifecycle_phase_id",
+        "role",
+        "details",
+        "source_refs",
+        "status",
+    ),
 }
 
 BOOLEAN_FIELDS: dict[str, tuple[str, ...]] = {
     "transformations": ("pipeline_exposed",),
-    "transformation_frame_io": ("required",),
     "transformation_meta_io": ("required",),
-    "transformation_config_sources": ("required",),
 }
 
-TRANSFORMATION_CATEGORIES = frozenset(
-    {
-        "projection",
-        "inverse_projection",
-        "extraction",
-        "validation",
-        "workflow_infra",
-        "wrapper",
-        "configuration",
-        "maintenance",
-    }
-)
-FRAME_DIRECTIONS = frozenset({"read", "write", "read_write"})
-META_DIRECTIONS = FRAME_DIRECTIONS
-CONFIG_PRECEDENCE = frozenset(
-    {
-        "yaml_over_meta",
-        "meta_over_yaml",
-        "fill_if_absent",
-        "error_on_conflict",
-        "explicit_merge",
-        "single_source",
-    }
-)
+DIRECTIONS = frozenset({"read", "write", "read_write"})
 LINK_RELATIONS = frozenset(
     {
         "inverse",
@@ -130,20 +88,31 @@ LINK_RELATIONS = frozenset(
         "prepares_config_for",
     }
 )
+LIFECYCLE_NOTE_ROLES = frozenset(
+    {"primary", "supporting", "risk", "open_question", "not_applicable"}
+)
+LIFECYCLE_NOTE_STATUSES = frozenset(
+    {"draft_inferred", "reviewed", "approved", "deprecated"}
+)
 
 XREFS: dict[str, tuple[tuple[str, str], ...]] = {
+    "transformations": (
+        ("trans_type", "transformation_types"),
+        ("trans_family", "transformation_families"),
+        ("inverse_transformation_id", "transformations"),
+    ),
     "transformation_requirements": (
         ("transformation_id", "transformations"),
         ("requirement_id", "requirements"),
     ),
-    "concept_requirements": (("concept_id", "concepts"), ("requirement_id", "requirements")),
-    "rule_requirements": (("rule_id", "rules"), ("requirement_id", "requirements")),
-    "transformation_frame_io": (("transformation_id", "transformations"),),
     "transformation_meta_io": (("transformation_id", "transformations"),),
-    "transformation_config_sources": (("transformation_id", "transformations"),),
     "transformation_links": (
         ("source_transformation_id", "transformations"),
         ("target_transformation_id", "transformations"),
+    ),
+    "transformation_lifecycle_notes": (
+        ("transformation_id", "transformations"),
+        ("lifecycle_phase_id", "lifecycle_phase"),
     ),
 }
 
@@ -230,66 +199,21 @@ def _validate_table_shape(
                 )
 
 
-def _validate_controlled_values(
-    tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
-) -> None:
-    for index, row in enumerate(tables["transformations"]):
-        if row.get("category") not in TRANSFORMATION_CATEGORIES:
-            _error(
-                errors,
-                "transformations",
-                "invalid_category",
-                "Transformation category is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("category"),
-            )
-    for table in ("transformation_frame_io", "transformation_meta_io"):
-        allowed = FRAME_DIRECTIONS if table == "transformation_frame_io" else META_DIRECTIONS
-        for index, row in enumerate(tables[table]):
-            if row.get("direction") not in allowed:
-                _error(
-                    errors,
-                    table,
-                    "invalid_direction",
-                    "Direction is not controlled",
-                    row_index=index,
-                    id=row.get("id", ""),
-                    value=row.get("direction"),
-                )
-    for index, row in enumerate(tables["transformation_config_sources"]):
-        if row.get("precedence") not in CONFIG_PRECEDENCE:
-            _error(
-                errors,
-                "transformation_config_sources",
-                "invalid_precedence",
-                "Config precedence is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("precedence"),
-            )
-    for index, row in enumerate(tables["transformation_links"]):
-        if row.get("relation") not in LINK_RELATIONS:
-            _error(
-                errors,
-                "transformation_links",
-                "invalid_relation",
-                "Transformation link relation is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("relation"),
-            )
-
-
-def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]) -> None:
-    ids = {
+def _ids_by_table(tables: dict[str, list[dict[str, Any]]]) -> dict[str, set[str]]:
+    return {
         table: {row.get("id") for row in rows if isinstance(row.get("id"), str)}
         for table, rows in tables.items()
     }
+
+
+def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]) -> None:
+    ids = _ids_by_table(tables)
     for table, refs in XREFS.items():
         for index, row in enumerate(tables[table]):
             for field, target_table in refs:
                 value = row.get(field)
+                if value == "":
+                    continue
                 if value not in ids[target_table]:
                     _error(
                         errors,
@@ -302,6 +226,97 @@ def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[s
                         value=value,
                         target_table=target_table,
                     )
+
+
+def _validate_controlled_values(
+    tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
+) -> None:
+    for index, row in enumerate(tables["transformation_meta_io"]):
+        if row.get("direction") not in DIRECTIONS:
+            _error(
+                errors,
+                "transformation_meta_io",
+                "invalid_direction",
+                "Direction is not controlled",
+                row_index=index,
+                id=row.get("id", ""),
+                value=row.get("direction"),
+            )
+    for index, row in enumerate(tables["transformation_links"]):
+        if row.get("relation") not in LINK_RELATIONS:
+            _error(
+                errors,
+                "transformation_links",
+                "invalid_relation",
+                "Transformation link relation is not controlled",
+                row_index=index,
+                id=row.get("id", ""),
+                value=row.get("relation"),
+            )
+    for index, row in enumerate(tables["transformation_lifecycle_notes"]):
+        if row.get("role") not in LIFECYCLE_NOTE_ROLES:
+            _error(
+                errors,
+                "transformation_lifecycle_notes",
+                "invalid_role",
+                "Lifecycle note role is not controlled",
+                row_index=index,
+                id=row.get("id", ""),
+                value=row.get("role"),
+            )
+        if row.get("status") not in LIFECYCLE_NOTE_STATUSES:
+            _error(
+                errors,
+                "transformation_lifecycle_notes",
+                "invalid_status",
+                "Lifecycle note status is not controlled",
+                row_index=index,
+                id=row.get("id", ""),
+                value=row.get("status"),
+            )
+
+
+def _phase_sequence(row: dict[str, Any]) -> int | None:
+    try:
+        return int(str(row.get("sequence", "")).strip())
+    except ValueError:
+        return None
+
+
+def _validate_lifecycle_phase_sequences(
+    tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
+) -> None:
+    seen: dict[int, str] = {}
+    for index, row in enumerate(tables["lifecycle_phase"]):
+        sequence = _phase_sequence(row)
+        if sequence is None:
+            _error(
+                errors,
+                "lifecycle_phase",
+                "invalid_sequence",
+                "Lifecycle phase sequence must sort numerically",
+                row_index=index,
+                id=row.get("id", ""),
+                value=row.get("sequence"),
+            )
+            continue
+        if sequence in seen:
+            _error(
+                errors,
+                "lifecycle_phase",
+                "duplicate_sequence",
+                f"Duplicate lifecycle phase sequence {sequence}",
+                row_index=index,
+                id=row.get("id", ""),
+                first_id=seen[sequence],
+                value=row.get("sequence"),
+            )
+        else:
+            seen[sequence] = str(row.get("id", ""))
+
+
+def sorted_lifecycle_phases(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=lambda row: (_phase_sequence(row) is None, _phase_sequence(row) or 0))
 
 
 def load_contract_tables(registry_dir: Path | str = DEFAULT_REGISTRY_DIR) -> dict[str, list[dict[str, Any]]]:
@@ -329,6 +344,7 @@ def check_contracts(
     for table, rows in tables.items():
         _validate_table_shape(table, rows, errors)
     _validate_controlled_values(tables, errors)
+    _validate_lifecycle_phase_sequences(tables, errors)
     _validate_xrefs(tables, errors)
 
     report = {
@@ -359,4 +375,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
