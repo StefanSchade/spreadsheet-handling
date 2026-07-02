@@ -1,0 +1,237 @@
+= Domain Contract Lifecycle Matrix vs Existing XRef Crosstable
+:toc:
+
+== Question
+
+The lifecycle authoring slice added a tooling plugin that projects
+`transformation_lifecycle_notes.json` into an editable workbook matrix and folds
+edited cells back into the normalized table.
+
+This looks close to the already implemented XRef Crosstable transformation
+family:
+
+* `contract_xref`: relation / tuple form -> matrix / crosstable form
+* `expand_xref`: matrix / crosstable form -> relation / tuple form
+
+The question is whether the lifecycle slice duplicated missing functionality, or
+whether the existing implementation was present but not directly accessible for
+this registry-authoring use case.
+
+== Current Runtime Implementation Status
+
+The generic XRef Crosstable implementation exists and is substantial.
+
+Evidence:
+
+* `src/spreadsheet_handling/domain/transformations/xref_crosstable/operation.py`
+  implements `contract_xref` and `expand_xref`.
+* `src/spreadsheet_handling/pipeline/registry.py` registers both steps:
+  `contract_xref` and `expand_xref`.
+* `registries/pipeline_step_registry.json` records both as current primitive
+  steps, with `contract_xref` classified as `relation_to_matrix` and
+  `expand_xref` as `matrix_to_relation`.
+* `registries/meta_registry.yaml` has an `xref_crosstable` metadata contract.
+* `tests/unit/domain/transformations/test_xref_crosstable.py` covers tuple /
+  matrix conversion, duplicate coordinate rejection, named metadata roundtrip,
+  sparse blank behavior, dense axes, and scoped recomposition through
+  `base_relation`.
+* `docs/cold_storage/backlog/ftrs_done/FTR-XREF-CROSSTABLE_review.adoc`
+  explicitly accepted the core as generic, domain-layer, value-opaque, and
+  pipeline-addressable.
+* `docs/cold_storage/backlog/ftrs_done/FTR-XREF-CROSSTABLE_implementation_concept.adoc`
+  records later closure of the scoped recomposition gap through
+  `expand_xref(base_relation=...)`.
+
+So the repository already had the central transformation concept implemented.
+This was not a missing runtime transformation.
+
+== What The Existing XRef Transform Solves
+
+The existing runtime transformation solves this shape well:
+
+[source,text]
+----
+relation rows:
+  row_keys..., column_key, value
+
+matrix:
+  row_keys..., one column per column_key value
+----
+
+It also provides important semantics:
+
+* cell values are opaque;
+* duplicate `(row_keys, column_key)` coordinates fail fast;
+* `drop_empty` controls whether blank matrix cells become relation rows;
+* `base_relation` preserves out-of-scope relation rows during recomposition;
+* dense axes can supply row and column domains;
+* XRef metadata records projection intent and reconstruction support.
+
+For ordinary runtime frame transformations, this is the right primitive.
+
+== Why The Lifecycle Registry Slice Did Not Use It Directly
+
+The lifecycle registry authoring view is similar, but not identical.
+
+Canonical source:
+
+[source,text]
+----
+transformation_lifecycle_notes:
+  id
+  transformation_id
+  lifecycle_phase_id
+  role
+  details
+  source_refs
+  status
+----
+
+Desired workbook authoring view:
+
+[source,text]
+----
+rows    = transformations
+columns = lifecycle phases ordered by lifecycle_phase.sequence
+cell    = details
+----
+
+That is a single-value crosstable over `details`, but the normalized table has
+additional fields that must not be lost:
+
+* `id`
+* `role`
+* `source_refs`
+* `status`
+
+The generic `contract_xref` can project the `details` column into a matrix if it
+is configured roughly as:
+
+[source,yaml]
+----
+- step: contract_xref
+  relation: transformation_lifecycle_notes
+  output: transformation_lifecycle_matrix
+  row_keys: [transformation_id]
+  column_key: lifecycle_phase_id
+  value: details
+----
+
+But the inverse is where direct reuse becomes insufficient:
+
+[source,yaml]
+----
+- step: expand_xref
+  matrix: transformation_lifecycle_matrix
+  output: transformation_lifecycle_notes
+  row_keys: [transformation_id]
+  column_key: lifecycle_phase_id
+  value: details
+  drop_empty: true
+----
+
+That output contains only:
+
+[source,text]
+----
+transformation_id
+lifecycle_phase_id
+details
+----
+
+It does not reconstruct or preserve `id`, `role`, `source_refs`, or `status`
+for in-scope edited cells. `base_relation` helps with out-of-scope rows, but it
+does not merge ancillary columns back onto in-scope updated addresses. For the
+registry workflow, those ancillary columns are part of the canonical table, not
+runtime decoration.
+
+== Accessibility Gap
+
+The main gap is therefore not that XRef Crosstable was absent. The gap is that
+the existing runtime primitive is not exposed as a ready-made
+metadata-preserving registry workbook authoring adapter.
+
+Specific accessibility mismatches:
+
+* *Dynamic column list:* lifecycle matrix columns must come from
+  `lifecycle_phase.json` sorted by numeric `sequence`. The generic pipeline
+  step accepts `column_keys` / `value_columns` as configured inputs; it does not
+  derive workbook-authoring columns from another registry table by convention.
+* *Ancillary field preservation:* lifecycle note rows carry `role`, `status`,
+  `source_refs`, and stable `id`. Generic `expand_xref` reconstructs the tuple
+  coordinate and one value field, not a multi-field row with preserved metadata.
+* *New sparse cells:* when a previously empty matrix cell becomes non-empty,
+  the registry needs a generated lifecycle note ID and default values for
+  `role`, `status`, and `source_refs`. Generic XRef has no registry-specific ID
+  policy.
+* *Workbook review ergonomics:* the lifecycle view includes
+  `transformation_name` next to `transformation_id` for authoring readability.
+  That is not part of the canonical tuple coordinate.
+* *Generated helper-sheet lifecycle:* the matrix sheet must be present in the
+  review workbook but not written as canonical staging JSON. The generic runtime
+  transform writes ordinary frames; the registry workflow needs an import/export
+  adapter boundary.
+* *Spec-first boundary:* the domain-contract registry work is intentionally
+  spec-first. Depending directly on runtime domain transformations for registry
+  authoring may be conceptually awkward, even if technically possible, because
+  the registry is meant to describe transformation contracts rather than derive
+  its own authoring mechanics from the runtime implementation.
+
+== Shortcomings Of The Current Lifecycle Plugin
+
+The current lifecycle workbook plugin works, but it has clear shortcomings.
+
+* It reimplements a narrow relation/matrix projection pattern instead of
+  visibly reusing or wrapping the existing XRef Crosstable primitive.
+* The conceptual relationship to `contract_xref` / `expand_xref` is not recorded
+  in the code or registry docs, so a later developer can reasonably read it as a
+  duplicate transformation.
+* It handles only the `details` cell as the editable matrix value. `role`,
+  `status`, and `source_refs` remain editable only in the normalized table.
+  That satisfies "do not lose them silently", but it is not a full matrix-based
+  authoring experience.
+* It contains lifecycle-specific ID generation and defaulting policy in
+  `tools/domain_contracts/workbook.py`.
+* It is a tooling adapter, not a reusable domain-contract crosstable framework.
+  A second registry matrix would likely need another adapter or a small shared
+  registry-authoring abstraction.
+* It does not use `_meta.xref_crosstable` or the pipeline step registry's
+  declared XRef contract. That keeps the registry workbook path simple, but it
+  also bypasses the existing metadata vocabulary.
+
+== Assessment
+
+The earlier implementation was real and accessible at the runtime pipeline
+level. It was not directly accessible as a lossless, spreadsheet-roundtrip
+registry authoring view for this lifecycle table.
+
+The lifecycle plugin should be understood as a thin registry-authoring adapter,
+not as a new domain transformation. Its need came from field preservation,
+dynamic phase ordering, sparse row creation, and generated-sheet promotion
+rules. Those concerns sit around the generic XRef primitive rather than inside
+the core tuple/matrix mechanics.
+
+The architectural shortcoming is mostly documentation and reuse clarity:
+
+* the current adapter does not make the dependency on the existing XRef concept
+  visible;
+* it does not explain why direct `contract_xref` / `expand_xref` use would lose
+  normalized lifecycle fields;
+* it creates a small amount of duplicate projection logic in tooling.
+
+== Future Direction Without Changing This Slice
+
+If this area is revisited, the cleanest direction is probably not to change the
+runtime XRef semantics. Better candidates are:
+
+* document the lifecycle matrix adapter as a registry-authoring specialization
+  of the XRef Crosstable pattern;
+* introduce a small tooling-level helper for "single editable value column plus
+  preserved ancillary fields";
+* optionally use `contract_xref` for the export-side `details` projection, with
+  a registry-specific import postprocessor that restores `id`, `role`,
+  `status`, and `source_refs`;
+* keep runtime domain behavior and spec-first registry authoring concerns
+  separate unless there is an explicit contract saying registry workbook views
+  should be implemented through runtime transformation steps.
+

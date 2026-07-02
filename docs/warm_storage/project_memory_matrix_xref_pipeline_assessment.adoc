@@ -1,0 +1,330 @@
+= Project Memory Concern Matrix and XRef Crosstable Reuse
+:toc:
+
+== Question
+
+Project Memory exports `concern_event_xrefs.json` as an editable workbook matrix
+using the existing XRef Crosstable runtime steps:
+
+* `contract_xref` on export
+* `expand_xref` on import
+
+It also uses Project Memory plugins around those steps. This raises the same
+question as the domain-contract lifecycle matrix review:
+
+* why was the built-in XRef functionality insufficient on its own?
+* why did Project Memory use a less drastic approach than the lifecycle matrix
+  plugin?
+* does this reveal a framework gap?
+
+== Observed Pipeline
+
+Forward export:
+
+[source,yaml]
+----
+- step: contract_xref
+  relation: concern_event_xrefs
+  output: concern_event_matrix
+  row_keys:
+    - event_id
+  column_key: concern_id
+  column_keys:
+    - CONC-DOMAIN-META-SEMANTICS
+    - CONC-ADAPTER-SPREADSHEET-BOUNDARY
+    - CONC-USER-SURFACE-ADOPTION
+    - CONC-PROJECTION-ERGONOMICS
+    - CONC-BACKEND-PORTABILITY
+    - CONC-MAINTAINABILITY-HYGIENE
+    - CONC-PROJECT-MEMORY-GOVERNANCE
+  value: event_role
+  fill_value: ""
+- step: plugin
+  dotted: project_memory.plugins.queries:enrich_concern_event_matrix
+  args:
+    matrix: concern_event_matrix
+    signals: concern_events
+----
+
+Reverse import:
+
+[source,yaml]
+----
+- step: plugin
+  dotted: project_memory.plugins.queries:copy_frame
+  args:
+    source: concern_event_xrefs
+    output: __base_concern_event_xrefs
+- step: plugin
+  dotted: project_memory.plugins.queries:strip_concern_event_matrix_context
+  args:
+    matrix: concern_event_matrix
+- step: expand_xref
+  matrix: concern_event_matrix
+  output: concern_event_xrefs
+  row_keys:
+    - event_id
+  value_columns:
+    - CONC-DOMAIN-META-SEMANTICS
+    - CONC-ADAPTER-SPREADSHEET-BOUNDARY
+    - CONC-USER-SURFACE-ADOPTION
+    - CONC-PROJECTION-ERGONOMICS
+    - CONC-BACKEND-PORTABILITY
+    - CONC-MAINTAINABILITY-HYGIENE
+    - CONC-PROJECT-MEMORY-GOVERNANCE
+  column_key: concern_id
+  value: event_role
+  drop_empty: true
+  base_relation: __base_concern_event_xrefs
+- step: plugin
+  dotted: project_memory.plugins.queries:finalize_concern_event_xrefs
+----
+
+The README documents the intended authoring semantics: `concern_event_matrix`
+is editable for concern relation cells, display-only for copied event context,
+and not canonical storage.
+
+== What The Built-In XRef Steps Provide Here
+
+For Project Memory, the core XRef implementation is used directly for the
+actual tuple/matrix transform.
+
+`contract_xref` handles:
+
+* `concern_event_xrefs` relation rows -> `concern_event_matrix`;
+* row identity via `event_id`;
+* concern columns via configured `concern_id` values;
+* cell value via `event_role`;
+* blank fill for missing event/concern pairs.
+
+`expand_xref` handles:
+
+* matrix cells -> normalized relation coordinates;
+* `drop_empty: true`, so blank cells do not create xref rows;
+* `base_relation`, so out-of-scope relation rows can survive recomposition.
+
+This is a successful reuse of the runtime feature. The plugin code is not doing
+the core pivot operation.
+
+== Why Built-In XRef Was Still Insufficient Alone
+
+The Project Memory canonical table is not just the conceptual XRef tuple.
+
+Canonical shape:
+
+[source,text]
+----
+concern_event_xrefs:
+  id
+  event_id
+  concern_id
+  event_role
+  notes
+----
+
+Conceptual XRef identity:
+
+[source,text]
+----
+(event_id, concern_id) -> event_role
+----
+
+The generic XRef transform can reconstruct:
+
+[source,text]
+----
+event_id
+concern_id
+event_role
+----
+
+It does not know how to reconstruct:
+
+* deterministic Project Memory row IDs;
+* `notes` attached to an xref row;
+* display-only context columns copied from `concern_events`;
+* the rule that edits to copied `summary`, `event_date`, or `source_type` in the
+  matrix must not update `concern_events`;
+* the rule that `concern_event_matrix` is workbook-only and must not be staged
+  as canonical JSON;
+* cleanup of `_meta.xref_crosstable` entries that are only needed for the
+  workbook projection.
+
+Those are not failures of `contract_xref` or `expand_xref`; they are
+canonical-table and workbook-authoring policies around the XRef primitive.
+
+== What The Plugins Do
+
+The Project Memory plugins are adapters around a correctly reused primitive.
+
+`enrich_concern_event_matrix`:
+
+* joins display-only context from `concern_events`;
+* moves `event_date`, `source_type`, and `summary` next to `event_id`;
+* improves human review ergonomics without changing the xref relation.
+
+`strip_concern_event_matrix_context`:
+
+* removes the display-only columns before `expand_xref`;
+* prevents context-column edits in the matrix from mutating `concern_events`.
+
+`copy_frame`:
+
+* snapshots the original canonical xref table as `__base_concern_event_xrefs`;
+* gives `expand_xref(base_relation=...)` and the finalizer a stable base.
+
+`finalize_concern_event_xrefs`:
+
+* regenerates deterministic IDs from `(event_id, concern_id)`;
+* restores existing `notes` for surviving xref tuples;
+* removes workbook-only projection frames;
+* removes projection-local XRef metadata from `_meta`.
+
+This is narrower than the lifecycle plugin because the core tuple/matrix work
+is delegated to the framework.
+
+== Comparison With The Domain-Contract Lifecycle Matrix
+
+Both cases are structurally comparable:
+
+[cols="1,1,1", options="header"]
+|===
+| Concern | Project Memory | Domain Contract Lifecycle
+
+| Canonical normalized table
+| `concern_event_xrefs`
+| `transformation_lifecycle_notes`
+
+| Matrix rows
+| `event_id`
+| `transformation_id`
+
+| Matrix columns
+| fixed concern IDs in YAML
+| lifecycle phases sorted from `lifecycle_phase.sequence`
+
+| Matrix cell value
+| `event_role`
+| `details`
+
+| Extra canonical fields
+| `id`, `notes`
+| `id`, `role`, `status`, `source_refs`
+
+| Context columns
+| `event_date`, `source_type`, `summary`
+| `transformation_name`
+
+| Core XRef use
+| yes: `contract_xref` and `expand_xref`
+| no: custom tooling projection
+
+| Postprocessing
+| restore IDs/notes, drop helper frames/meta
+| preserve role/status/source refs, generate new IDs/defaults, drop helper sheet
+|===
+
+The difference is mostly degree and access path, not kind.
+
+Project Memory already had a simple XRef-compatible relation:
+
+[source,text]
+----
+event_id + concern_id -> event_role
+----
+
+The lifecycle matrix also has an XRef-compatible core:
+
+[source,text]
+----
+transformation_id + lifecycle_phase_id -> details
+----
+
+But its columns are not hard-coded in the pipeline; they are derived from a
+registry table and sorted by numeric sequence. It also has more ancillary fields
+whose defaults and preservation policy matter during authoring.
+
+== Why The Project Memory Approach Was Less Drastic
+
+The Project Memory approach could stay closer to the framework for three
+reasons.
+
+First, its column domain is explicitly declared in YAML. The existing
+`contract_xref` / `expand_xref` interface accepts static `column_keys` and
+`value_columns` directly.
+
+Second, the edited matrix value is exactly the XRef value field:
+`event_role`. The remaining canonical fields are limited enough that a finalizer
+can rebuild them after expansion.
+
+Third, Project Memory is already an operational registry/tooling area that uses
+pipeline steps as part of its workbook workflow. Reusing runtime pipeline
+primitives there is natural.
+
+The domain-contract lifecycle work was stricter about being spec-first and did
+not start by using runtime transformation modules as authoring machinery. That
+made the adapter more self-contained, but also more duplicative.
+
+== Possible Framework Gap
+
+There is a real recurring gap, but it is not "XRef Crosstable cannot pivot".
+It can.
+
+The gap is a higher-level *editable registry crosstable authoring* pattern:
+
+* derive matrix columns from another table, not only static YAML;
+* add display-only context columns;
+* strip display-only context before import;
+* expand sparse non-empty cells only;
+* preserve or regenerate canonical row IDs;
+* preserve ancillary fields attached to existing tuple coordinates;
+* supply defaults for ancillary fields on newly-created tuple coordinates;
+* drop helper frames and projection-local metadata before staging;
+* make the canonical table remain flat and spreadsheet-roundtrip-friendly.
+
+Project Memory implements this pattern by composing existing XRef steps with
+small plugins. Domain Contract Lifecycle currently implements the whole adapter
+inside tooling code.
+
+That suggests the framework gap is not a runtime domain transformation gap. It
+is a missing reusable adapter/helper for "editable XRef projection with
+canonical row decoration".
+
+== Assessment
+
+Project Memory is the better precedent for reuse: let `contract_xref` and
+`expand_xref` do the tuple/matrix mechanics, and use plugins for authoring
+policy around the matrix.
+
+The fact that Project Memory still needs plugins is expected. The generic XRef
+transform deliberately treats cell values as opaque and knows nothing about
+Project Memory IDs, notes, display context, or canonical staging policy.
+
+The domain-contract lifecycle implementation is more drastic because it
+collapsed both layers into one tooling adapter:
+
+* core tuple/matrix mechanics;
+* registry-specific lifecycle authoring policy.
+
+That is functional, but it obscures the relationship to the existing XRef
+feature. A later cleanup could move it closer to the Project Memory pattern
+without changing runtime behavior.
+
+== Future Direction Without Code Changes Here
+
+For future slices, prefer a small tooling-level convention over changing the
+runtime XRef primitive:
+
+* use `contract_xref` / `expand_xref` for the core value projection when the
+  table shape fits;
+* add plugins only for context columns, ID regeneration, ancillary-field
+  preservation, defaults, and helper-frame cleanup;
+* consider a reusable helper for "expand matrix and reattach preserved
+  coordinate fields";
+* consider a small pre-step that resolves dynamic `column_keys` from a registry
+  table for pipeline configs that cannot hard-code the axis list;
+* keep generated authoring sheets distinct from canonical JSON tables.
+
+This would make Project Memory and Domain Contract registry authoring follow the
+same pattern while preserving the current runtime XRef semantics.
+
