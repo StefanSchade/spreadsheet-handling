@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
+import yaml
 
+from spreadsheet_handling.application.orchestrator import orchestrate
+from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
+from spreadsheet_handling.pipeline.build import build_steps_from_config
 from tools.domain_contracts.check_contracts import (
     DEFAULT_REGISTRY_DIR,
     check_contracts,
@@ -19,6 +24,63 @@ from tools.domain_contracts.workbook import (
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+_REIMPORT_PLUGIN = "tools.domain_contracts.workbook:normalize_reimported_contract_frames"
+
+
+def test_normalize_reimported_contract_frames_preserves_meta() -> None:
+    # Regression: the reimport normalizer must not drop the ``_meta`` frame the
+    # ODS read path produced; only the derived lifecycle matrix sheet is folded
+    # back into notes and removed.
+    meta = {"sheets": {"transformations": {"column_widths": {"A": {"width": 42.0}}}}}
+    frames = {
+        "transformations": pd.DataFrame({"id": ["TRANS-X"], "name": ["x"]}),
+        LIFECYCLE_MATRIX_FRAME: pd.DataFrame({"transformation_id": ["TRANS-X"]}),
+        "_meta": meta,
+    }
+
+    out = normalize_reimported_contract_frames(frames)
+
+    assert out.get("_meta") == meta
+    assert LIFECYCLE_MATRIX_FRAME not in out
+
+
+def test_domain_contracts_import_preserves_presentation_meta_sidecar(tmp_path: Path) -> None:
+    # Regression for the domain-contracts ODS reimport dropping presentation
+    # meta: a workbook with a non-default column width, imported through the
+    # same orchestrator path as ``make domain-contracts-import`` (ods input,
+    # json_dir output, ``normalize_reimported_contract_frames`` plugin), must
+    # write ``_meta.yaml`` carrying that column width.
+    ods_path = tmp_path / "domain_contracts.ods"
+    staging = tmp_path / "staging"
+
+    # Author an ODS carrying an explicit column width; it round-trips through
+    # the same ODS parser a LibreOffice-authored width would.
+    OdsBackend().write_multi(
+        {
+            "transformations": pd.DataFrame({"id": ["TRANS-X"], "name": ["x"]}),
+            "_meta": {
+                "sheets": {
+                    "transformations": {
+                        "column_widths": {"A": {"width": 42.0, "source": "workbook"}}
+                    }
+                }
+            },
+        },
+        str(ods_path),
+    )
+
+    orchestrate(
+        input={"kind": "ods", "path": str(ods_path)},
+        output={"kind": "json_dir", "path": str(staging)},
+        steps=build_steps_from_config([{"step": "plugin", "dotted": _REIMPORT_PLUGIN}]),
+    )
+
+    sidecar = staging / "_meta.yaml"
+    assert sidecar.exists(), "domain-contracts reimport must write _meta.yaml with presentation meta"
+    persisted = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    width = persisted["sheets"]["transformations"]["column_widths"]["A"]["width"]
+    assert width == pytest.approx(42.0, abs=0.5)
 
 
 def _table_frames() -> dict[str, pd.DataFrame]:

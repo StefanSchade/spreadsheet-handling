@@ -162,11 +162,19 @@ def _build_lifecycle_notes_from_matrix(frames: Mapping[str, Any]) -> pd.DataFram
 
 
 def normalize_reimported_contract_frames(frames: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize spreadsheet carrier values before writing staging JSON."""
+    """Normalize spreadsheet carrier values before writing staging JSON.
+
+    ``_meta`` is preserved: it carries the ODS read path's presentation
+    metadata (e.g. column widths observed in LibreOffice Calc), which the
+    orchestrator persistence boundary projects to its persistable contract
+    and the JSON writer emits as ``_meta.yaml``. Only the derived lifecycle
+    matrix sheet is dropped, since it is folded back into
+    ``transformation_lifecycle_notes`` below and must not become a JSON file.
+    """
     out: dict[str, Any] = {
         name: frame.copy() if isinstance(frame, pd.DataFrame) else frame
         for name, frame in frames.items()
-        if name not in {"_meta", LIFECYCLE_MATRIX_FRAME}
+        if name != LIFECYCLE_MATRIX_FRAME
     }
     lifecycle_notes = _build_lifecycle_notes_from_matrix(frames)
     if lifecycle_notes is not None:
