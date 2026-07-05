@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,6 +11,13 @@ from tools.domain_contracts.check_contracts import BOOLEAN_FIELDS, sorted_lifecy
 LIFECYCLE_MATRIX_FRAME = "transformation_lifecycle_matrix"
 LIFECYCLE_NOTE_DEFAULT_ROLE = "open_question"
 LIFECYCLE_NOTE_DEFAULT_STATUS = "draft_inferred"
+
+IMPLEMENTATION_DRIFT_FRAME = "transformation_implementation_drift"
+# Link relations that count a unit as an implementation of a requirement
+# (as opposed to merely 'supporting' it).
+_IMPL_RELATIONS = frozenset(
+    {"implements", "partially_implements", "alternative_implementation"}
+)
 
 
 def _coerce_bool(value: Any) -> bool | Any:
@@ -82,6 +90,100 @@ def add_lifecycle_matrix_frame(frames: Mapping[str, Any]) -> dict[str, Any]:
     out[LIFECYCLE_MATRIX_FRAME] = pd.DataFrame(
         rows,
         columns=["transformation_id", "transformation_name", *lifecycle_phase_ids],
+    )
+    return out
+
+
+def add_implementation_drift_frame(frames: Mapping[str, Any]) -> dict[str, Any]:
+    """Add a derived, review-only sheet classifying requirement/implementation drift.
+
+    Drift is *derived* from ``transformation_implementation_links`` (it is not
+    stored on any row), so it cannot be filtered directly in the exported
+    workbook. This plugin materialises one unified, filterable sheet with a
+    ``quadrant`` column so a reviewer can filter for any quadrant in Calc:
+
+    * ``forward_drift`` -- requirement with no implementation link,
+    * ``aligned`` / ``partial`` -- requirement with exactly one implementation
+      link (``partial`` when that link is ``partially_implements``),
+    * ``multiple_implementations`` -- requirement with >= 2 implementation links,
+    * ``reverse_drift`` -- implementation unit with no requirement link,
+    * ``linked_impl`` -- implementation unit that maps to a requirement.
+
+    The sheet is regenerated on every export and dropped on reimport (see
+    ``normalize_reimported_contract_frames``); it is never persisted to JSON.
+    """
+    out: dict[str, Any] = {
+        name: frame.copy() if isinstance(frame, pd.DataFrame) else frame
+        for name, frame in frames.items()
+    }
+    units = _records(out.get("implementation_units"))
+    links = _records(out.get("transformation_implementation_links"))
+    if not units and not links:
+        return out  # nothing to derive; leave frames untouched
+
+    by_transformation: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    by_unit: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for link in links:
+        tid = _cell_text(link.get("transformation_id"))
+        uid = _cell_text(link.get("implementation_id"))
+        rel = _cell_text(link.get("relation"))
+        if tid:
+            by_transformation[tid].append((uid, rel))
+        if uid:
+            by_unit[uid].append((tid, rel))
+
+    rows: list[dict[str, Any]] = []
+    for transformation in _transformation_rows(out):
+        tid = _cell_text(transformation.get("id"))
+        if not tid:
+            continue
+        linked = by_transformation.get(tid, [])
+        impl_links = [pair for pair in linked if pair[1] in _IMPL_RELATIONS]
+        if not impl_links:
+            quadrant = "forward_drift"
+        elif len(impl_links) >= 2:
+            quadrant = "multiple_implementations"
+        elif impl_links[0][1] == "partially_implements":
+            quadrant = "partial"
+        else:
+            quadrant = "aligned"
+        rows.append(
+            {
+                "subject_kind": "requirement",
+                "subject_id": tid,
+                "subject_name": _cell_text(transformation.get("name")),
+                "quadrant": quadrant,
+                "counterpart_ids": "; ".join(uid for uid, _ in linked),
+                "relations": "; ".join(rel for _, rel in linked),
+            }
+        )
+
+    for unit in units:
+        uid = _cell_text(unit.get("id"))
+        if not uid:
+            continue
+        linked = by_unit.get(uid, [])
+        rows.append(
+            {
+                "subject_kind": "implementation",
+                "subject_id": uid,
+                "subject_name": _cell_text(unit.get("name")),
+                "quadrant": "reverse_drift" if not linked else "linked_impl",
+                "counterpart_ids": "; ".join(tid for tid, _ in linked),
+                "relations": "; ".join(rel for _, rel in linked),
+            }
+        )
+
+    out[IMPLEMENTATION_DRIFT_FRAME] = pd.DataFrame(
+        rows,
+        columns=[
+            "subject_kind",
+            "subject_id",
+            "subject_name",
+            "quadrant",
+            "counterpart_ids",
+            "relations",
+        ],
     )
     return out
 
@@ -167,14 +269,16 @@ def normalize_reimported_contract_frames(frames: Mapping[str, Any]) -> dict[str,
     ``_meta`` is preserved: it carries the ODS read path's presentation
     metadata (e.g. column widths observed in LibreOffice Calc), which the
     orchestrator persistence boundary projects to its persistable contract
-    and the JSON writer emits as ``_meta.yaml``. Only the derived lifecycle
-    matrix sheet is dropped, since it is folded back into
-    ``transformation_lifecycle_notes`` below and must not become a JSON file.
+    and the JSON writer emits as ``_meta.yaml``. The derived review sheets are
+    dropped: the lifecycle matrix is folded back into
+    ``transformation_lifecycle_notes`` below, and the implementation-drift sheet
+    is regenerated on each export -- neither must become a JSON file.
     """
+    derived_frames = {LIFECYCLE_MATRIX_FRAME, IMPLEMENTATION_DRIFT_FRAME}
     out: dict[str, Any] = {
         name: frame.copy() if isinstance(frame, pd.DataFrame) else frame
         for name, frame in frames.items()
-        if name != LIFECYCLE_MATRIX_FRAME
+        if name not in derived_frames
     }
     lifecycle_notes = _build_lifecycle_notes_from_matrix(frames)
     if lifecycle_notes is not None:
