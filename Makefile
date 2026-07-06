@@ -37,6 +37,8 @@ DOMAIN_CONTRACTS_CANONICAL_DIR := $(DOMAIN_CONTRACTS_DIR)/canonical
 DOMAIN_CONTRACTS_STAGING_DIR   := $(DOMAIN_CONTRACTS_DIR)/staging
 DOMAIN_CONTRACTS_PIPELINE_DIR  := $(DOMAIN_CONTRACTS_DIR)/pipelines
 DOMAIN_CONTRACTS_WORKBOOK      := $(DOMAIN_CONTRACTS_DIR)/domain_contracts.ods
+DOMAIN_CONTRACTS_ODS_STAMP     := $(DOMAIN_CONTRACTS_DIR)/domain_contracts.ods.stamp.json
+DOMAIN_CONTRACTS_STAGING_STAMP := $(DOMAIN_CONTRACTS_DIR)/staging/.export_stamp.json
 DOMAIN_CONTRACTS_GENERATED_DIR := $(ROOT)docs_generated/domain_contracts
 DOMAIN_CONTRACTS_BUILD_DIR     := $(BUILD_DIR)/domain_contracts
 
@@ -389,19 +391,35 @@ domain-contracts-context: domain-contracts-check ## Validate and render generate
 
 domain-contracts-export: check-domain-contracts-sheets-run ## Render domain-contract canonical JSON into an ODS workbook
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/json_to_ods.yaml"
+	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.promote_guard stamp \
+		--canonical-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
+		--out "$(DOMAIN_CONTRACTS_ODS_STAMP)"
 
 domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_contracts.ods into registries/domain_contracts/staging
+	@test -f "$(DOMAIN_CONTRACTS_ODS_STAMP)" || { \
+		echo "Missing $(DOMAIN_CONTRACTS_ODS_STAMP)."; \
+		echo "The workbook was not produced by 'make domain-contracts-export'; re-export before importing."; \
+		exit 1; \
+	}
 	@mkdir -p "$(DOMAIN_CONTRACTS_STAGING_DIR)"
 	@find "$(DOMAIN_CONTRACTS_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
+	@cp -f "$(DOMAIN_CONTRACTS_ODS_STAMP)" "$(DOMAIN_CONTRACTS_STAGING_STAMP)"
 
 domain-contracts-diff-reimport: ## Compare canonical domain-contract JSON with current staging
-	diff -ru --exclude='.gitignore' --exclude='seeds' "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" "$(DOMAIN_CONTRACTS_STAGING_DIR)"
+	diff -ru --exclude='.gitignore' --exclude='seeds' --exclude='.export_stamp.json' --exclude='_meta.yaml' "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" "$(DOMAIN_CONTRACTS_STAGING_DIR)"
 
 domain-contracts-check-reimport: domain-contracts-import domain-contracts-diff-reimport ## Reimport ODS and compare with canonical JSON
 
-domain-contracts-promote: ## Promote current domain-contract staging snapshot into canonical JSON
+domain-contracts-promote: $(DOMAIN_CONTRACTS_STAMP) ## Promote current domain-contract staging snapshot into canonical JSON (gated: fresh + checker-valid staging only)
 	@test -d "$(DOMAIN_CONTRACTS_STAGING_DIR)" || (echo "Missing $(DOMAIN_CONTRACTS_STAGING_DIR). Run domain-contracts-import or domain-contracts-check-reimport first." >&2; exit 1)
+	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.promote_guard verify \
+		--canonical-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
+		--stamp "$(DOMAIN_CONTRACTS_STAGING_STAMP)"
+	@mkdir -p "$(DOMAIN_CONTRACTS_BUILD_DIR)"
+	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.check_contracts \
+		--registry-dir "$(DOMAIN_CONTRACTS_STAGING_DIR)" \
+		--report "$(DOMAIN_CONTRACTS_BUILD_DIR)/staging_domain_contract_health.json"
 	cp -f "$(DOMAIN_CONTRACTS_STAGING_DIR)"/*.json "$(DOMAIN_CONTRACTS_CANONICAL_DIR)/"
 	@test -f "$(DOMAIN_CONTRACTS_STAGING_DIR)/_meta.yaml" && cp -f "$(DOMAIN_CONTRACTS_STAGING_DIR)/_meta.yaml" "$(DOMAIN_CONTRACTS_CANONICAL_DIR)/" || true
 

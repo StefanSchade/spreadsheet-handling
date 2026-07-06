@@ -13,7 +13,7 @@ LIFECYCLE_NOTE_DEFAULT_ROLE = "open_question"
 LIFECYCLE_NOTE_DEFAULT_STATUS = "draft_inferred"
 
 IMPLEMENTATION_DRIFT_FRAME = "transformation_implementation_drift"
-# Link relations that count a unit as an implementation of a requirement
+# Link relations that count a unit as an implementation of a transformation
 # (as opposed to merely 'supporting' it).
 _IMPL_RELATIONS = frozenset(
     {"implements", "partially_implements", "alternative_implementation"}
@@ -102,12 +102,12 @@ def add_implementation_drift_frame(frames: Mapping[str, Any]) -> dict[str, Any]:
     workbook. This plugin materialises one unified, filterable sheet with a
     ``quadrant`` column so a reviewer can filter for any quadrant in Calc:
 
-    * ``forward_drift`` -- requirement with no implementation link,
-    * ``aligned`` / ``partial`` -- requirement with exactly one implementation
+    * ``forward_drift`` -- transformation with no implementation link,
+    * ``aligned`` / ``partial`` -- transformation with exactly one implementation
       link (``partial`` when that link is ``partially_implements``),
-    * ``multiple_implementations`` -- requirement with >= 2 implementation links,
-    * ``reverse_drift`` -- implementation unit with no requirement link,
-    * ``linked_impl`` -- implementation unit that maps to a requirement.
+    * ``multiple_implementations`` -- transformation with >= 2 implementation links,
+    * ``reverse_drift`` -- implementation unit with no transformation link,
+    * ``linked_impl`` -- implementation unit that maps to a transformation.
 
     The sheet is regenerated on every export and dropped on reimport (see
     ``normalize_reimported_contract_frames``); it is never persisted to JSON.
@@ -149,7 +149,7 @@ def add_implementation_drift_frame(frames: Mapping[str, Any]) -> dict[str, Any]:
             quadrant = "aligned"
         rows.append(
             {
-                "subject_kind": "requirement",
+                "subject_kind": "transformation",
                 "subject_id": tid,
                 "subject_name": _cell_text(transformation.get("name")),
                 "quadrant": quadrant,

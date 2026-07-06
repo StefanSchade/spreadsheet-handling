@@ -15,9 +15,12 @@ from tools.domain_contracts.check_contracts import (
     check_contracts,
     load_contract_tables,
 )
+from tools.domain_contracts.promote_guard import verify_stamp, write_stamp
 from tools.domain_contracts.render_contracts import render_contracts
 from tools.domain_contracts.workbook import (
+    IMPLEMENTATION_DRIFT_FRAME,
     LIFECYCLE_MATRIX_FRAME,
+    add_implementation_drift_frame,
     add_lifecycle_matrix_frame,
     normalize_reimported_contract_frames,
 )
@@ -241,3 +244,178 @@ def test_lifecycle_matrix_reimport_keeps_empty_cells_sparse() -> None:
     assert row["role"] == "open_question"
     assert row["status"] == "draft_inferred"
     assert row["source_refs"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Checker coverage for the newest tables and reference formats (Review 005
+# Slice 0: FIN-REVIEW-005-P1-1).
+# ---------------------------------------------------------------------------
+
+def _copy_registry(tmp_path: Path) -> Path:
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    for source in Path(DEFAULT_REGISTRY_DIR).glob("*.json"):
+        (registry / source.name).write_text(
+            source.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    return registry
+
+
+def _edit_table(registry: Path, table: str, mutate) -> None:
+    path = registry / f"{table}.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    mutate(rows)
+    path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _check(registry: Path, tmp_path: Path) -> dict:
+    return check_contracts(registry, tmp_path / "report.json")
+
+
+def _error_codes(report: dict) -> set[tuple[str, str]]:
+    return {(error["table"], error["code"]) for error in report["errors"]}
+
+
+def test_checker_rejects_broken_implementation_link_references(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+
+    def mutate(rows: list) -> None:
+        rows[0]["implementation_id"] = "IMPL-DOES-NOT-EXIST"
+
+    _edit_table(registry, "transformation_implementation_links", mutate)
+
+    report = _check(registry, tmp_path)
+
+    assert report["status"] == "error"
+    assert ("transformation_implementation_links", "missing_reference") in _error_codes(report)
+
+
+def test_checker_rejects_uncontrolled_implementation_vocabulary(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "implementation_units",
+        lambda rows: rows[0].__setitem__("kind", "made_up_kind"),
+    )
+    _edit_table(
+        registry,
+        "transformation_implementation_links",
+        lambda rows: rows[0].__setitem__("relation", "made_up_relation"),
+    )
+
+    report = _check(registry, tmp_path)
+
+    codes = _error_codes(report)
+    assert ("implementation_units", "invalid_kind") in codes
+    assert ("transformation_implementation_links", "invalid_relation") in codes
+
+
+def test_checker_rejects_duplicate_implementation_unit_ids(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(registry, "implementation_units", lambda rows: rows.append(dict(rows[0])))
+
+    report = _check(registry, tmp_path)
+
+    assert ("implementation_units", "duplicate_id") in _error_codes(report)
+
+
+def test_checker_rejects_unexpected_transformation_fields(tmp_path: Path) -> None:
+    # A canonical schema change must land together with a checker update;
+    # an unknown field is how the 2026-07 checker/data drift would have
+    # surfaced immediately.
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "transformations",
+        lambda rows: rows[0].__setitem__("brand_new_field", "value"),
+    )
+
+    report = _check(registry, tmp_path)
+
+    assert ("transformations", "unexpected_field") in _error_codes(report)
+
+
+def test_checker_resolves_comma_separated_meta_bucket_references(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "transformations",
+        lambda rows: rows[0].__setitem__(
+            "meta_in_buckets", "META-BUCKET-FRAME-SCHEMA, META-BUCKET-DOES-NOT-EXIST"
+        ),
+    )
+
+    report = _check(registry, tmp_path)
+
+    errors = [
+        error
+        for error in report["errors"]
+        if error["code"] == "missing_reference" and error.get("value") == "META-BUCKET-DOES-NOT-EXIST"
+    ]
+    assert errors, "unknown bucket token in a comma-separated list must fail"
+
+
+def test_checker_reports_known_semantic_defects_as_warnings_only(tmp_path: Path) -> None:
+    # Duplicate names and asymmetric inverse pairs are flagged registry
+    # content (Review 005 P2-7/P3-10); they must be visible but non-fatal
+    # until the semantic cleanup slice runs.
+    report = check_contracts(DEFAULT_REGISTRY_DIR, tmp_path / "report.json")
+
+    assert report["status"] == "ok"
+    warning_codes = {warning["code"] for warning in report["warnings"]}
+    assert warning_codes <= {"duplicate_name", "asymmetric_inverse"}
+
+
+# ---------------------------------------------------------------------------
+# Drift-sheet labeling (Review 005 Slice 0: FIN-REVIEW-005-P1-3, label only).
+# ---------------------------------------------------------------------------
+
+def test_drift_sheet_labels_transformation_rows_as_transformation() -> None:
+    out = add_implementation_drift_frame(_table_frames())
+
+    drift = out[IMPLEMENTATION_DRIFT_FRAME]
+    kinds = set(drift["subject_kind"])
+    assert "requirement" not in kinds
+    assert kinds == {"transformation", "implementation"}
+
+
+def test_drift_sheet_is_dropped_on_reimport() -> None:
+    frames = add_implementation_drift_frame(add_lifecycle_matrix_frame(_table_frames()))
+
+    out = normalize_reimported_contract_frames(frames)
+
+    assert IMPLEMENTATION_DRIFT_FRAME not in out
+    assert LIFECYCLE_MATRIX_FRAME not in out
+
+
+# ---------------------------------------------------------------------------
+# Promote freshness guard (Review 005 Slice 0: FIN-REVIEW-005-P1-2).
+# ---------------------------------------------------------------------------
+
+def test_promote_guard_accepts_fresh_stamp(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json")
+
+    ok, message = verify_stamp(registry, stamp)
+
+    assert ok, message
+
+
+def test_promote_guard_rejects_stamp_after_canonical_change(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json")
+    _edit_table(registry, "glossary", lambda rows: rows[0].__setitem__("area", "edited"))
+
+    ok, message = verify_stamp(registry, stamp)
+
+    assert not ok
+    assert "Stale staging" in message
+
+
+def test_promote_guard_rejects_missing_stamp(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+
+    ok, message = verify_stamp(registry, tmp_path / "staging" / ".export_stamp.json")
+
+    assert not ok
+    assert "Missing export stamp" in message

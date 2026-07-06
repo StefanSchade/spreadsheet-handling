@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY_DIR = ROOT / "registries" / "domain_contracts" / "canonical"
 DEFAULT_REPORT_PATH = ROOT / "build" / "domain_contracts" / "domain_contract_health.json"
 
+# Required fields per table. Rows must carry exactly these fields (see
+# _validate_table_shape): a canonical schema change therefore fails the
+# checker until this module is updated in the same change.
 TABLE_FIELDS: dict[str, tuple[str, ...]] = {
     "requirements": (
         "id",
@@ -25,6 +28,7 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "name",
         "trans_type",
         "trans_family",
+        "operation_locus",
         "pipeline_exposed",
         "details",
         "inverse_transformation_id",
@@ -38,6 +42,11 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "meta_output_content",
         "meta_output_consumer",
         "meta_output_loss_risks",
+        "source_refs",
+        "source_kind",
+        "source_status",
+        "human_reviewed",
+        "notes",
     ),
     "transformation_types": ("id", "name", "detail", "bidirectional"),
     "transformation_families": ("id", "name", "details"),
@@ -77,11 +86,54 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "source_refs",
         "status",
     ),
+    "implementation_units": (
+        "id",
+        "name",
+        "kind",
+        "registered_step_id",
+        "code_refs",
+        "observed",
+        "snapshot_date",
+        "notes",
+    ),
+    "transformation_implementation_links": (
+        "id",
+        "transformation_id",
+        "implementation_id",
+        "relation",
+        "notes",
+    ),
+    "glossary": ("term", "area", "explanation", "related to"),
+    "principles": ("statements",),
 }
 
-BOOLEAN_FIELDS: dict[str, tuple[str, ...]] = {
+# Identity field per table; None disables the identity/uniqueness checks.
+TABLE_ID_FIELDS: dict[str, str | None] = {
+    table: "id" for table in TABLE_FIELDS
+}
+TABLE_ID_FIELDS["glossary"] = "term"
+TABLE_ID_FIELDS["principles"] = None
+
+# Fields that must be strict booleans when present.
+STRICT_BOOLEAN_FIELDS: dict[str, tuple[str, ...]] = {
     "transformations": ("pipeline_exposed",),
     "transformation_meta_io": ("required",),
+}
+
+# Fields that must be a boolean or the empty string (unset).
+OPTIONAL_BOOLEAN_FIELDS: dict[str, tuple[str, ...]] = {
+    "transformations": ("human_reviewed",),
+}
+
+# All boolean-carrying fields; the ODS reimport normalizer coerces these
+# back from spreadsheet carrier strings (see tools/domain_contracts/workbook.py).
+BOOLEAN_FIELDS: dict[str, tuple[str, ...]] = {
+    table: tuple(
+        dict.fromkeys(
+            STRICT_BOOLEAN_FIELDS.get(table, ()) + OPTIONAL_BOOLEAN_FIELDS.get(table, ())
+        )
+    )
+    for table in set(STRICT_BOOLEAN_FIELDS) | set(OPTIONAL_BOOLEAN_FIELDS)
 }
 
 DIRECTIONS = frozenset({"read", "write", "read_write"})
@@ -101,6 +153,25 @@ LIFECYCLE_NOTE_ROLES = frozenset(
 LIFECYCLE_NOTE_STATUSES = frozenset(
     {"draft_inferred", "reviewed", "approved", "deprecated"}
 )
+IMPLEMENTATION_UNIT_KINDS = frozenset(
+    {"registered_step", "config_meta", "domain_function"}
+)
+IMPLEMENTATION_LINK_RELATIONS = frozenset(
+    {"implements", "partially_implements", "alternative_implementation", "supporting"}
+)
+
+# Controlled single-value vocabularies: (table, field) -> (allowed values, error code).
+CONTROLLED_VALUES: dict[tuple[str, str], tuple[frozenset[str], str]] = {
+    ("transformation_meta_io", "direction"): (DIRECTIONS, "invalid_direction"),
+    ("transformation_links", "relation"): (LINK_RELATIONS, "invalid_relation"),
+    ("transformation_lifecycle_notes", "role"): (LIFECYCLE_NOTE_ROLES, "invalid_role"),
+    ("transformation_lifecycle_notes", "status"): (LIFECYCLE_NOTE_STATUSES, "invalid_status"),
+    ("implementation_units", "kind"): (IMPLEMENTATION_UNIT_KINDS, "invalid_kind"),
+    ("transformation_implementation_links", "relation"): (
+        IMPLEMENTATION_LINK_RELATIONS,
+        "invalid_relation",
+    ),
+}
 
 XREFS: dict[str, tuple[tuple[str, str], ...]] = {
     "transformations": (
@@ -120,6 +191,18 @@ XREFS: dict[str, tuple[tuple[str, str], ...]] = {
     "transformation_lifecycle_notes": (
         ("transformation_id", "transformations"),
         ("lifecycle_phase_id", "lifecycle_phase"),
+    ),
+    "transformation_implementation_links": (
+        ("transformation_id", "transformations"),
+        ("implementation_id", "implementation_units"),
+    ),
+}
+
+# Comma-separated reference lists: every non-empty token must resolve.
+MULTI_VALUE_XREFS: dict[str, tuple[tuple[str, str], ...]] = {
+    "transformations": (
+        ("meta_in_buckets", "meta_buckets"),
+        ("meta_out_buckets", "meta_buckets"),
     ),
 }
 
@@ -155,10 +238,20 @@ def _load_table(path: Path, table: str, errors: list[dict[str, Any]]) -> list[di
     return rows
 
 
+def _row_id(table: str, row: dict[str, Any]) -> str:
+    id_field = TABLE_ID_FIELDS[table]
+    if id_field is None:
+        return ""
+    value = row.get(id_field)
+    return value if isinstance(value, str) else ""
+
+
 def _validate_table_shape(
     table: str, rows: list[dict[str, Any]], errors: list[dict[str, Any]]
 ) -> None:
     required = TABLE_FIELDS[table]
+    allowed = set(required)
+    id_field = TABLE_ID_FIELDS[table]
     seen_ids: dict[str, int] = {}
     for index, row in enumerate(rows):
         for field in required:
@@ -171,29 +264,41 @@ def _validate_table_shape(
                     row_index=index,
                     field=field,
                 )
-        row_id = row.get("id")
-        if not isinstance(row_id, str) or not row_id:
-            _error(
-                errors,
-                table,
-                "invalid_id",
-                f"Row {index} has a missing or non-string id",
-                row_index=index,
-            )
-        elif row_id in seen_ids:
-            _error(
-                errors,
-                table,
-                "duplicate_id",
-                f"Duplicate id {row_id!r}",
-                row_index=index,
-                first_row_index=seen_ids[row_id],
-                id=row_id,
-            )
-        else:
-            seen_ids[row_id] = index
+        for field in row:
+            if field not in allowed:
+                _error(
+                    errors,
+                    table,
+                    "unexpected_field",
+                    f"Row {index} has unexpected field {field!r}; "
+                    "schema changes must update tools/domain_contracts/check_contracts.py",
+                    row_index=index,
+                    field=field,
+                )
+        if id_field is not None:
+            row_id = row.get(id_field)
+            if not isinstance(row_id, str) or not row_id:
+                _error(
+                    errors,
+                    table,
+                    "invalid_id",
+                    f"Row {index} has a missing or non-string {id_field}",
+                    row_index=index,
+                )
+            elif row_id in seen_ids:
+                _error(
+                    errors,
+                    table,
+                    "duplicate_id",
+                    f"Duplicate {id_field} {row_id!r}",
+                    row_index=index,
+                    first_row_index=seen_ids[row_id],
+                    id=row_id,
+                )
+            else:
+                seen_ids[row_id] = index
 
-        for field in BOOLEAN_FIELDS.get(table, ()):
+        for field in STRICT_BOOLEAN_FIELDS.get(table, ()):
             if field in row and not isinstance(row[field], bool):
                 _error(
                     errors,
@@ -202,13 +307,28 @@ def _validate_table_shape(
                     f"Field {field!r} must be boolean",
                     row_index=index,
                     field=field,
-                    id=row.get("id", ""),
+                    id=_row_id(table, row),
+                )
+        for field in OPTIONAL_BOOLEAN_FIELDS.get(table, ()):
+            if field in row and not isinstance(row[field], bool) and row[field] != "":
+                _error(
+                    errors,
+                    table,
+                    "invalid_boolean",
+                    f"Field {field!r} must be boolean or empty",
+                    row_index=index,
+                    field=field,
+                    id=_row_id(table, row),
                 )
 
 
 def _ids_by_table(tables: dict[str, list[dict[str, Any]]]) -> dict[str, set[str]]:
     return {
-        table: {row.get("id") for row in rows if isinstance(row.get("id"), str)}
+        table: {
+            _row_id(table, row)
+            for row in rows
+            if _row_id(table, row)
+        }
         for table, rows in tables.items()
     }
 
@@ -219,7 +339,7 @@ def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[s
         for index, row in enumerate(tables[table]):
             for field, target_table in refs:
                 value = row.get(field)
-                if value == "":
+                if value == "" or value is None:
                     continue
                 if value not in ids[target_table]:
                     _error(
@@ -228,59 +348,99 @@ def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[s
                         "missing_reference",
                         f"{field!r} points to missing {target_table} id {value!r}",
                         row_index=index,
-                        id=row.get("id", ""),
+                        id=_row_id(table, row),
                         field=field,
                         value=value,
                         target_table=target_table,
                     )
+    for table, refs in MULTI_VALUE_XREFS.items():
+        for index, row in enumerate(tables[table]):
+            for field, target_table in refs:
+                raw = row.get(field)
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                for token in (part.strip() for part in raw.split(",")):
+                    if token and token not in ids[target_table]:
+                        _error(
+                            errors,
+                            table,
+                            "missing_reference",
+                            f"{field!r} contains missing {target_table} id {token!r}",
+                            row_index=index,
+                            id=_row_id(table, row),
+                            field=field,
+                            value=token,
+                            target_table=target_table,
+                        )
 
 
 def _validate_controlled_values(
     tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
 ) -> None:
-    for index, row in enumerate(tables["transformation_meta_io"]):
-        if row.get("direction") not in DIRECTIONS:
-            _error(
-                errors,
-                "transformation_meta_io",
-                "invalid_direction",
-                "Direction is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("direction"),
+    for (table, field), (allowed, code) in CONTROLLED_VALUES.items():
+        for index, row in enumerate(tables[table]):
+            if row.get(field) not in allowed:
+                _error(
+                    errors,
+                    table,
+                    code,
+                    f"Field {field!r} value is not controlled",
+                    row_index=index,
+                    id=_row_id(table, row),
+                    field=field,
+                    value=row.get(field),
+                )
+
+
+def _collect_warnings(tables: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Non-fatal data-quality signals recorded in the report.
+
+    These stay warnings because fixing them requires semantic registry
+    cleanup (Review 005 FIN-REVIEW-005-P2-7 / P3-10), not tooling work.
+    """
+    warnings: list[dict[str, Any]] = []
+    transformations = tables.get("transformations", [])
+    by_id = {_row_id("transformations", row): row for row in transformations}
+
+    names: dict[str, str] = {}
+    for row in transformations:
+        row_id = _row_id("transformations", row)
+        name = row.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in names:
+            warnings.append(
+                {
+                    "table": "transformations",
+                    "code": "duplicate_name",
+                    "message": f"Name {name!r} used by {names[name]!r} and {row_id!r}",
+                    "id": row_id,
+                }
             )
-    for index, row in enumerate(tables["transformation_links"]):
-        if row.get("relation") not in LINK_RELATIONS:
-            _error(
-                errors,
-                "transformation_links",
-                "invalid_relation",
-                "Transformation link relation is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("relation"),
+        else:
+            names[name] = row_id
+
+    for row in transformations:
+        row_id = _row_id("transformations", row)
+        inverse_id = row.get("inverse_transformation_id")
+        if not inverse_id:
+            continue
+        inverse = by_id.get(inverse_id)
+        if inverse is None:
+            continue  # missing target already reported as an error
+        if inverse.get("inverse_transformation_id") != row_id:
+            warnings.append(
+                {
+                    "table": "transformations",
+                    "code": "asymmetric_inverse",
+                    "message": (
+                        f"{row_id!r} names inverse {inverse_id!r}, but {inverse_id!r} "
+                        f"names {inverse.get('inverse_transformation_id')!r}"
+                    ),
+                    "id": row_id,
+                }
             )
-    for index, row in enumerate(tables["transformation_lifecycle_notes"]):
-        if row.get("role") not in LIFECYCLE_NOTE_ROLES:
-            _error(
-                errors,
-                "transformation_lifecycle_notes",
-                "invalid_role",
-                "Lifecycle note role is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("role"),
-            )
-        if row.get("status") not in LIFECYCLE_NOTE_STATUSES:
-            _error(
-                errors,
-                "transformation_lifecycle_notes",
-                "invalid_status",
-                "Lifecycle note status is not controlled",
-                row_index=index,
-                id=row.get("id", ""),
-                value=row.get("status"),
-            )
+    return warnings
 
 
 def _phase_sequence(row: dict[str, Any]) -> int | None:
@@ -353,6 +513,7 @@ def check_contracts(
     _validate_controlled_values(tables, errors)
     _validate_lifecycle_phase_sequences(tables, errors)
     _validate_xrefs(tables, errors)
+    warnings = _collect_warnings(tables)
 
     report = {
         "registry_dir": str(registry),
@@ -360,6 +521,8 @@ def check_contracts(
         "tables": {table: {"rows": len(rows)} for table, rows in tables.items()},
         "error_count": len(errors),
         "errors": errors,
+        "warning_count": len(warnings),
+        "warnings": warnings,
         "status": "error" if errors else "ok",
     }
 
