@@ -117,6 +117,10 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "id",
         "meta_root",
         "path_pattern",
+        # Bridge to registries/meta_registry.yaml entry names (Slice 1d).
+        # Local shape only here; cross-file resolution is guarded by
+        # tests/architecture/semantic_invariants/test_meta_reference_surfaces.py.
+        "meta_registry_entry",
         "target_kind",
         "maintenance_role",
         "rename_column_policy",

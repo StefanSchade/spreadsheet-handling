@@ -78,3 +78,74 @@ def test_surface_evidence_paths_exist() -> None:
             if reference.startswith(("src/", "tests/")) and not (REPO_ROOT / reference).exists():
                 missing.append(f"{row['id']}: {reference}")
     assert not missing, missing
+
+
+# ---------------------------------------------------------------------------
+# Meta Registry Bridge (Review 005 Slice 1d): surface rows join to
+# registries/meta_registry.yaml entry names. The YAML stays the source of
+# truth for meta inventory/ownership; it is parsed directly here - no JSON
+# mirror exists or may be introduced to make this cheaper.
+# ---------------------------------------------------------------------------
+
+import yaml  # noqa: E402
+
+META_REGISTRY_PATH = REPO_ROOT / "registries" / "meta_registry.yaml"
+
+PATTERN_ROOTS = {CATCH_ALL_ROOT, DUNDER_PREFIX_ROOT}
+
+# Non-pattern rows may stay unjoined only when their notes carry this marker,
+# stating that the root is intentionally not (yet) in the meta registry.
+UNINVENTORIED_MARKER = "uninventoried"
+
+
+def _meta_registry_entry_names() -> set[str]:
+    registry = yaml.safe_load(META_REGISTRY_PATH.read_text(encoding="utf-8"))
+    return {entry["name"] for entry in registry["entries"]}
+
+
+def test_bridge_entries_resolve_in_meta_registry() -> None:
+    entry_names = _meta_registry_entry_names()
+    unresolved = [
+        f"{row['id']}: {row['meta_registry_entry']!r}"
+        for row in _surfaces()
+        if row["meta_registry_entry"] and row["meta_registry_entry"] not in entry_names
+    ]
+    assert not unresolved, unresolved
+
+
+def test_non_pattern_rows_are_joined_or_explicitly_uninventoried() -> None:
+    offenders = [
+        row["id"]
+        for row in _surfaces()
+        if row["meta_root"] not in PATTERN_ROOTS
+        and not row["meta_registry_entry"]
+        and UNINVENTORIED_MARKER not in row["notes"]
+    ]
+    assert not offenders, (
+        "non-pattern surface rows must join a meta_registry.yaml entry or "
+        f"carry an explicit '{UNINVENTORIED_MARKER}' note: {offenders}"
+    )
+
+
+def test_pattern_rows_stay_unjoined() -> None:
+    # `*` and `__*` describe rule surfaces, not one inventory entry; a join
+    # there would misattribute several YAML entries to a single row.
+    for row in _surfaces():
+        if row["meta_root"] in PATTERN_ROOTS:
+            assert row["meta_registry_entry"] == "", row["id"]
+
+
+def test_report_meta_registry_roots_without_surface_row() -> None:
+    """Visibility only - never fails on coverage (Slice 1d, optional item).
+
+    Prints meta-registry entries whose name is not referenced by any surface
+    row so a reviewer can see which inventoried meta has no declared
+    schema-maintenance policy. Forced coverage is explicitly not a goal.
+    """
+    joined = {row["meta_registry_entry"] for row in _surfaces() if row["meta_registry_entry"]}
+    uncovered = sorted(_meta_registry_entry_names() - joined)
+    print(
+        f"meta_registry entries without a meta_reference_surfaces join ({len(uncovered)}): "
+        + ", ".join(uncovered)
+    )
+    assert isinstance(uncovered, list)
