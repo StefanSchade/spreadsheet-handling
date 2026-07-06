@@ -563,3 +563,128 @@ def test_report_is_still_not_added_as_frame_or_under_meta() -> None:
     assert "report" not in result.frames["_meta"]
     assert "schema_maintenance_report" not in result.frames["_meta"]
     assert "_schema_maintenance_report" not in result.frames["_meta"]
+
+
+def _lookup_meta() -> dict:
+    return {
+        "helper_policies": {
+            "lookup": {
+                "places": {
+                    "key": "id",
+                    "allowed_helpers": ["name"],
+                    "default_helpers": ["name"],
+                    "missing": "fail",
+                    "order": {"sort_by": ["name"]},
+                }
+            }
+        }
+    }
+
+
+def test_rename_updates_lookup_policy_columns_for_the_lookup_frame() -> None:
+    frames = _base_frames(_lookup_meta())
+
+    result = rename_column(frames, _rename(frame="places", source="name", target="label"))
+
+    assert not result.report.blocked
+    policy = result.frames["_meta"]["helper_policies"]["lookup"]["places"]
+    assert policy["allowed_helpers"] == ["label"]
+    assert policy["default_helpers"] == ["label"]
+    assert policy["order"]["sort_by"] == ["label"]
+    assert policy["missing"] == "fail"
+    assert {change.path for change in result.report.metadata_changes} == {
+        "helper_policies.lookup.places.allowed_helpers",
+        "helper_policies.lookup.places.default_helpers",
+        "helper_policies.lookup.places.order.sort_by",
+    }
+    assert all(
+        change.root is ReferenceRoot.HELPER_POLICIES_LOOKUP
+        and change.action is ReferenceAction.UPDATED
+        for change in result.report.metadata_changes
+    )
+
+
+def test_rename_updates_lookup_policy_scalar_key() -> None:
+    frames = _base_frames(_lookup_meta())
+
+    result = rename_column(frames, _rename(frame="places", source="id", target="place_id"))
+
+    assert not result.report.blocked
+    policy = result.frames["_meta"]["helper_policies"]["lookup"]["places"]
+    assert policy["key"] == "place_id"
+    assert result.report.metadata_changes[0].path == "helper_policies.lookup.places.key"
+
+
+def test_rename_updates_lookup_policy_composite_key_and_scalar_sort_by() -> None:
+    meta = _lookup_meta()
+    meta["helper_policies"]["lookup"]["places"]["key"] = ["id", "name"]
+    meta["helper_policies"]["lookup"]["places"]["order"] = {"sort_by": "name"}
+    frames = _base_frames(meta)
+
+    result = rename_column(frames, _rename(frame="places", source="name", target="label"))
+
+    assert not result.report.blocked
+    policy = result.frames["_meta"]["helper_policies"]["lookup"]["places"]
+    assert policy["key"] == ["id", "label"]
+    assert policy["order"]["sort_by"] == "label"
+
+
+def test_rename_leaves_lookup_policies_of_other_frames_untouched() -> None:
+    frames = _base_frames(_lookup_meta())
+
+    result = rename_column(frames, _rename(frame="characters", source="name", target="display_name"))
+
+    assert not result.report.blocked
+    assert result.frames["_meta"]["helper_policies"]["lookup"] == (
+        _lookup_meta()["helper_policies"]["lookup"]
+    )
+    assert not [
+        change
+        for change in result.report.metadata_changes
+        if change.root is ReferenceRoot.HELPER_POLICIES_LOOKUP
+    ]
+
+
+def test_lookup_drop_blocks_even_when_prune_is_requested() -> None:
+    frames = _base_frames(_lookup_meta())
+
+    result = drop_column(frames, _drop(frame="places", source="name", prune=True))
+
+    assert result.report.blocked
+    blocked = [
+        change
+        for change in result.report.metadata_changes
+        if change.action is ReferenceAction.BLOCKED
+    ]
+    assert {change.path for change in blocked} == {
+        "helper_policies.lookup.places.allowed_helpers",
+        "helper_policies.lookup.places.default_helpers",
+        "helper_policies.lookup.places.order.sort_by",
+    }
+    assert {failure.code for failure in result.report.failures} == {"blocking_metadata_reference"}
+    assert result.frames["_meta"] == frames["_meta"]
+    assert list(result.frames["places"].columns) == ["id", "name"]
+
+
+def test_lookup_policy_does_not_block_unreferenced_drop() -> None:
+    frames = _base_frames(_lookup_meta())
+
+    result = drop_column(frames, _drop(frame="characters", source="notes"))
+
+    assert not result.report.blocked
+    assert "notes" not in result.frames["characters"].columns
+    assert result.frames["_meta"]["helper_policies"]["lookup"] == (
+        _lookup_meta()["helper_policies"]["lookup"]
+    )
+
+
+def test_malformed_lookup_policy_shapes_block_safely() -> None:
+    meta = {"helper_policies": {"lookup": {"places": {"key": {"bad": "shape"}}}}}
+    frames = _base_frames(meta)
+
+    result = rename_column(frames, _rename(frame="places", source="id", target="place_id"))
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "malformed_meta"
+    assert result.report.failures[0].meta_path == "helper_policies.lookup.places.key"
+    assert result.frames["_meta"] == meta

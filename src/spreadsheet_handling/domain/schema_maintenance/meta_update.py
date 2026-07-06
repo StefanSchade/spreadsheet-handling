@@ -306,6 +306,18 @@ def _handle_helper_policies(
     if not isinstance(helper_policies, Mapping):
         failures.append(_malformed("helper_policies", "_meta.helper_policies must be a mapping", request))
         return
+    updated_helper_policies = dict(helper_policies)
+    _handle_fk_policies(updated_helper_policies, request, changes, failures)
+    _handle_lookup_policies(updated_helper_policies, request, changes, failures)
+    meta["helper_policies"] = updated_helper_policies
+
+
+def _handle_fk_policies(
+    helper_policies: dict[str, Any],
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> None:
     fk = helper_policies.get("fk")
     if fk is None:
         return
@@ -331,9 +343,200 @@ def _handle_helper_policies(
     # (FK Helper Slice 2: v1 retirement), so there is no residual v1 shape
     # to block on rename/drop here. Only the durable v2 `relations` model is
     # maintained, by `_handle_fk_relations` above.
-    updated_helper_policies = dict(helper_policies)
-    updated_helper_policies["fk"] = updated_fk
-    meta["helper_policies"] = updated_helper_policies
+    helper_policies["fk"] = updated_fk
+
+
+def _handle_lookup_policies(
+    helper_policies: dict[str, Any],
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> None:
+    lookup = helper_policies.get("lookup")
+    if lookup is None:
+        return
+    if not isinstance(lookup, Mapping):
+        failures.append(
+            _malformed("helper_policies.lookup", "_meta.helper_policies.lookup must be a mapping", request)
+        )
+        return
+
+    # A lookup policy is keyed by its lookup frame, and every column field in
+    # the entry names a column of that frame (validated by
+    # configure_lookup_helpers), so only the target frame's entry is affected.
+    entry = lookup.get(request.target_frame)
+    if entry is None:
+        return
+    path = f"helper_policies.lookup.{request.target_frame}"
+    if not isinstance(entry, Mapping):
+        failures.append(_malformed(path, f"_meta.{path} must be a mapping", request))
+        return
+
+    if request.kind == SchemaOperationKind.RENAME_COLUMN:
+        updated_entry = _rename_lookup_policy_columns(entry, path, request, changes, failures)
+        updated_lookup = dict(lookup)
+        updated_lookup[request.target_frame] = updated_entry
+        helper_policies["lookup"] = updated_lookup
+    elif request.kind == SchemaOperationKind.DROP_COLUMN:
+        _block_lookup_drop_if_referenced(entry, path, request, changes, failures)
+
+
+def _rename_lookup_policy_columns(
+    entry: Mapping[str, Any],
+    path: str,
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> dict[str, Any]:
+    affected = _affected_column(request)
+    updated = dict(entry)
+
+    key = entry.get("key")
+    if key is not None:
+        if isinstance(key, str):
+            if key == affected:
+                updated["key"] = request.target_column
+                changes.append(_lookup_updated(f"{path}.key", request, affected))
+        elif _is_sequence(key):
+            if affected in key:
+                updated["key"] = [
+                    request.target_column if column == affected else column for column in key
+                ]
+                changes.append(_lookup_updated(f"{path}.key", request, affected))
+        else:
+            failures.append(
+                _malformed(f"{path}.key", f"_meta.{path}.key must be a string or list", request)
+            )
+
+    for field in ("allowed_helpers", "default_helpers"):
+        value = entry.get(field)
+        if value is None:
+            continue
+        if not _is_sequence(value):
+            failures.append(_malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request))
+            continue
+        if affected in value:
+            updated[field] = [
+                request.target_column if column == affected else column for column in value
+            ]
+            changes.append(_lookup_updated(f"{path}.{field}", request, affected))
+
+    order = entry.get("order")
+    if order is not None:
+        if not isinstance(order, Mapping):
+            failures.append(_malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request))
+        else:
+            sort_by = order.get("sort_by")
+            if sort_by is None:
+                pass
+            elif isinstance(sort_by, str):
+                if sort_by == affected:
+                    updated_order = dict(order)
+                    updated_order["sort_by"] = request.target_column
+                    updated["order"] = updated_order
+                    changes.append(_lookup_updated(f"{path}.order.sort_by", request, affected))
+            elif _is_sequence(sort_by):
+                if affected in sort_by:
+                    updated_order = dict(order)
+                    updated_order["sort_by"] = [
+                        request.target_column if column == affected else column
+                        for column in sort_by
+                    ]
+                    updated["order"] = updated_order
+                    changes.append(_lookup_updated(f"{path}.order.sort_by", request, affected))
+            else:
+                failures.append(
+                    _malformed(
+                        f"{path}.order.sort_by",
+                        f"_meta.{path}.order.sort_by must be a string or list",
+                        request,
+                    )
+                )
+    return updated
+
+
+def _block_lookup_drop_if_referenced(
+    entry: Mapping[str, Any],
+    path: str,
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> None:
+    affected = _affected_column(request)
+    referenced: list[str] = []
+
+    key = entry.get("key")
+    if isinstance(key, str):
+        if key == affected:
+            referenced.append(f"{path}.key")
+    elif _is_sequence(key):
+        if affected in key:
+            referenced.append(f"{path}.key")
+    elif key is not None:
+        failures.append(_malformed(f"{path}.key", f"_meta.{path}.key must be a string or list", request))
+
+    for field in ("allowed_helpers", "default_helpers"):
+        value = entry.get(field)
+        if value is None:
+            continue
+        if not _is_sequence(value):
+            failures.append(_malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request))
+        elif affected in value:
+            referenced.append(f"{path}.{field}")
+
+    order = entry.get("order")
+    if isinstance(order, Mapping):
+        sort_by = order.get("sort_by")
+        if isinstance(sort_by, str):
+            if sort_by == affected:
+                referenced.append(f"{path}.order.sort_by")
+        elif _is_sequence(sort_by):
+            if affected in sort_by:
+                referenced.append(f"{path}.order.sort_by")
+        elif sort_by is not None:
+            failures.append(
+                _malformed(
+                    f"{path}.order.sort_by",
+                    f"_meta.{path}.order.sort_by must be a string or list",
+                    request,
+                )
+            )
+    elif order is not None:
+        failures.append(_malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request))
+
+    # Lookup lists carry cross-field invariants (default_helpers within
+    # allowed_helpers, sort_by within key/allowed_helpers), so pruning one
+    # member is not a safe local edit; referenced drops always block,
+    # mirroring the FK relation policy.
+    for reference_path in referenced:
+        changes.append(
+            _change(
+                ReferenceRoot.HELPER_POLICIES_LOOKUP,
+                reference_path,
+                ReferenceAction.BLOCKED,
+                request.target_frame,
+                affected,
+                "Lookup policy pruning is blocked in this slice",
+            )
+        )
+        failures.append(
+            _blocked_reference(ReferenceRoot.HELPER_POLICIES_LOOKUP, reference_path, request, affected)
+        )
+
+
+def _lookup_updated(
+    path: str,
+    request: SchemaMaintenanceRequest,
+    affected: str | None,
+) -> MetadataReferenceChange:
+    return _change(
+        ReferenceRoot.HELPER_POLICIES_LOOKUP,
+        path,
+        ReferenceAction.UPDATED,
+        request.target_frame,
+        affected,
+        f"Renamed lookup policy column to {request.target_column!r}",
+    )
 
 
 def _handle_fk_relations(

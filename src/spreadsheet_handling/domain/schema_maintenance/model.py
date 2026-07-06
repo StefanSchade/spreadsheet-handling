@@ -32,6 +32,7 @@ class ReferenceAction(Enum):
 class ReferenceRoot(Enum):
     CONSTRAINTS = "constraints"
     HELPER_POLICIES_FK = "helper_policies.fk"
+    HELPER_POLICIES_LOOKUP = "helper_policies.lookup"
     SHEETS = "sheets"
     WORKBOOK_VIEW = "workbook_view"
     FRAME_LIFECYCLE = "frame_lifecycle"
