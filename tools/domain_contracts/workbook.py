@@ -7,6 +7,11 @@ from typing import Any
 import pandas as pd
 
 from tools.domain_contracts.check_contracts import BOOLEAN_FIELDS, sorted_lifecycle_phases
+from tools.domain_contracts.promote_guard import (
+    DEFAULT_CANONICAL_DIR,
+    EMBEDDED_MARKER_KEY,
+    canonical_fingerprint,
+)
 
 LIFECYCLE_MATRIX_FRAME = "transformation_lifecycle_matrix"
 LIFECYCLE_NOTE_DEFAULT_ROLE = "open_question"
@@ -59,6 +64,28 @@ def _lifecycle_phase_ids(frames: Mapping[str, Any]) -> list[str]:
 def _transformation_rows(frames: Mapping[str, Any]) -> list[dict[str, Any]]:
     rows = _records(frames.get("transformations"))
     return sorted(rows, key=lambda row: str(row.get("id", "")))
+
+
+def embed_export_fingerprint(frames: Mapping[str, Any]) -> dict[str, Any]:
+    """Embed the canonical fingerprint into workbook ``_meta`` at export.
+
+    LibreOffice rewrites the ODS bytes on save, so the sidecar stamp's
+    ``workbook_sha256`` only proves the unedited case. The embedded
+    fingerprint survives editing in the persistent workbook-embedded meta
+    carrier and lets ``promote_guard.verify_workbook`` prove that an edited
+    workbook descends from the stamped export. The marker is consumed on
+    reimport (see ``normalize_reimported_contract_frames``).
+    """
+    out: dict[str, Any] = {
+        name: frame.copy() if isinstance(frame, pd.DataFrame) else frame
+        for name, frame in frames.items()
+    }
+    meta = dict(out.get("_meta") or {})
+    meta[EMBEDDED_MARKER_KEY] = {
+        "canonical_fingerprint": canonical_fingerprint(DEFAULT_CANONICAL_DIR)
+    }
+    out["_meta"] = meta
+    return out
 
 
 def add_lifecycle_matrix_frame(frames: Mapping[str, Any]) -> dict[str, Any]:
@@ -283,6 +310,13 @@ def normalize_reimported_contract_frames(frames: Mapping[str, Any]) -> dict[str,
     lifecycle_notes = _build_lifecycle_notes_from_matrix(frames)
     if lifecycle_notes is not None:
         out["transformation_lifecycle_notes"] = lifecycle_notes
+
+    # The embedded export fingerprint is consumed by the pre-import
+    # verification (promote_guard.verify_workbook); it must not persist
+    # into staging _meta.yaml and travel onward as stale provenance.
+    meta = out.get("_meta")
+    if isinstance(meta, dict) and EMBEDDED_MARKER_KEY in meta:
+        out["_meta"] = {key: value for key, value in meta.items() if key != EMBEDDED_MARKER_KEY}
 
     for frame_name, fields in BOOLEAN_FIELDS.items():
         frame = out.get(frame_name)

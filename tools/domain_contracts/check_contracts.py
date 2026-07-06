@@ -483,6 +483,49 @@ def _validate_controlled_values(
                 )
 
 
+def _validate_no_unexpected_tables(registry: Path, errors: list[dict[str, Any]]) -> None:
+    """Reject ungoverned top-level table files (Review 005 Slice 1b).
+
+    Promote copies every ``staging/*.json`` into canonical, so a table file
+    the checker does not govern must be an error, not a silent passenger.
+    Dotfiles (``.export_stamp.json``) and subdirectories (``seeds/``) are
+    intentionally out of scope.
+    """
+    for path in sorted(registry.glob("*.json")):
+        if path.name.startswith("."):
+            continue
+        if path.stem not in TABLE_FIELDS:
+            _error(
+                errors,
+                path.stem,
+                "unexpected_table",
+                f"Unexpected registry table file {path.name!r}; "
+                "governed tables are declared in tools/domain_contracts/check_contracts.py",
+                path=str(path),
+            )
+
+
+def _validate_surface_path_uniqueness(
+    tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
+) -> None:
+    seen: dict[tuple[str, str], str] = {}
+    for index, row in enumerate(tables["meta_reference_surfaces"]):
+        pair = (str(row.get("meta_root", "")), str(row.get("path_pattern", "")))
+        row_id = _row_id("meta_reference_surfaces", row)
+        if pair in seen:
+            _error(
+                errors,
+                "meta_reference_surfaces",
+                "duplicate_path",
+                f"Duplicate (meta_root, path_pattern) {pair!r} in {seen[pair]!r} and {row_id!r}",
+                row_index=index,
+                id=row_id,
+                first_id=seen[pair],
+            )
+        else:
+            seen[pair] = row_id
+
+
 def _collect_warnings(tables: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Non-fatal data-quality signals recorded in the report.
 
@@ -601,10 +644,12 @@ def check_contracts(
     }
     for table, rows in tables.items():
         _validate_table_shape(table, rows, errors)
+    _validate_no_unexpected_tables(registry, errors)
     _validate_controlled_values(tables, errors)
     _validate_lifecycle_phase_sequences(tables, errors)
     _validate_xrefs(tables, errors)
     _validate_gap_subjects(tables, errors)
+    _validate_surface_path_uniqueness(tables, errors)
     warnings = _collect_warnings(tables)
 
     report = {

@@ -15,13 +15,20 @@ from tools.domain_contracts.check_contracts import (
     check_contracts,
     load_contract_tables,
 )
-from tools.domain_contracts.promote_guard import verify_stamp, write_stamp
+from tools.domain_contracts.promote_guard import (
+    EMBEDDED_MARKER_KEY,
+    canonical_fingerprint,
+    verify_stamp,
+    verify_workbook,
+    write_stamp,
+)
 from tools.domain_contracts.render_contracts import render_contracts
 from tools.domain_contracts.workbook import (
     IMPLEMENTATION_DRIFT_FRAME,
     LIFECYCLE_MATRIX_FRAME,
     add_implementation_drift_frame,
     add_lifecycle_matrix_frame,
+    embed_export_fingerprint,
     normalize_reimported_contract_frames,
 )
 
@@ -392,9 +399,16 @@ def test_drift_sheet_is_dropped_on_reimport() -> None:
 # Promote freshness guard (Review 005 Slice 0: FIN-REVIEW-005-P1-2).
 # ---------------------------------------------------------------------------
 
+def _fake_workbook(tmp_path: Path, content: bytes = b"exported workbook bytes") -> Path:
+    workbook = tmp_path / "domain_contracts.ods"
+    workbook.write_bytes(content)
+    return workbook
+
+
 def test_promote_guard_accepts_fresh_stamp(tmp_path: Path) -> None:
     registry = _copy_registry(tmp_path)
-    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json")
+    workbook = _fake_workbook(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json", workbook)
 
     ok, message = verify_stamp(registry, stamp)
 
@@ -403,7 +417,8 @@ def test_promote_guard_accepts_fresh_stamp(tmp_path: Path) -> None:
 
 def test_promote_guard_rejects_stamp_after_canonical_change(tmp_path: Path) -> None:
     registry = _copy_registry(tmp_path)
-    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json")
+    workbook = _fake_workbook(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "staging" / ".export_stamp.json", workbook)
     _edit_table(registry, "glossary", lambda rows: rows[0].__setitem__("area", "edited"))
 
     ok, message = verify_stamp(registry, stamp)
@@ -490,3 +505,159 @@ def test_column_maintenance_transformation_is_linked_to_its_implementation() -> 
         if row["transformation_id"] == "TRANS-SCHEMA-COLUMN-MAINTENANCE"
     }
     assert features == {"add_column", "drop_column", "rename_column", "reorder_columns"}
+
+
+# ---------------------------------------------------------------------------
+# Slice 1b: loop hardening - unexpected tables, workbook/stamp binding,
+# duplicate surface paths (Review 005 follow-up).
+# ---------------------------------------------------------------------------
+
+def test_checker_rejects_rogue_registry_table(tmp_path: Path) -> None:
+    # Promote copies staging/*.json wholesale, so an ungoverned table file
+    # must fail the checker (which promote runs against staging).
+    registry = _copy_registry(tmp_path)
+    (registry / "rogue_table.json").write_text('[{"id": "ROGUE-1"}]', encoding="utf-8")
+
+    report = _check(registry, tmp_path)
+
+    assert report["status"] == "error"
+    assert ("rogue_table", "unexpected_table") in _error_codes(report)
+
+
+def test_checker_ignores_dotfiles_and_subdirectories(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    (registry / ".export_stamp.json").write_text("{}", encoding="utf-8")
+    seeds = registry / "seeds"
+    seeds.mkdir()
+    (seeds / "prototype.json").write_text("[]", encoding="utf-8")
+
+    report = _check(registry, tmp_path)
+
+    assert report["status"] == "ok"
+
+
+def test_checker_rejects_duplicate_surface_paths(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+
+    def duplicate_first(rows: list) -> None:
+        clone = dict(rows[0])
+        clone["id"] = "MRS-DUPLICATE-PATH-FIXTURE"
+        rows.append(clone)
+
+    _edit_table(registry, "meta_reference_surfaces", duplicate_first)
+
+    report = _check(registry, tmp_path)
+
+    assert ("meta_reference_surfaces", "duplicate_path") in _error_codes(report)
+
+
+def test_verify_workbook_accepts_unedited_export_bytes(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    workbook = _fake_workbook(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "stamp.json", workbook)
+
+    ok, message = verify_workbook(stamp, workbook)
+
+    assert ok, message
+    assert "bytes match" in message
+
+
+def test_verify_workbook_rejects_foreign_workbook_without_embedded_fingerprint(
+    tmp_path: Path,
+) -> None:
+    registry = _copy_registry(tmp_path)
+    workbook = _fake_workbook(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "stamp.json", workbook)
+
+    # A mixed-in workbook: real ODS bytes, but not the stamped export and
+    # carrying no embedded export fingerprint.
+    foreign = tmp_path / "foreign.ods"
+    OdsBackend().write_multi(
+        {"transformations": pd.DataFrame({"id": ["TRANS-X"], "name": ["x"]})},
+        str(foreign),
+    )
+
+    ok, message = verify_workbook(stamp, foreign)
+
+    assert not ok
+    assert "no embedded export fingerprint" in message
+
+
+def test_verify_workbook_accepts_edited_descendant_via_embedded_fingerprint(
+    tmp_path: Path,
+) -> None:
+    registry = _copy_registry(tmp_path)
+    exported = _fake_workbook(tmp_path)
+    stamp = write_stamp(registry, tmp_path / "stamp.json", exported)
+
+    # Simulate the LibreOffice edit: different bytes, but the workbook still
+    # carries the embedded fingerprint of the stamped canonical state.
+    edited = tmp_path / "edited.ods"
+    OdsBackend().write_multi(
+        {
+            "transformations": pd.DataFrame({"id": ["TRANS-X"], "name": ["edited"]}),
+            "_meta": {
+                EMBEDDED_MARKER_KEY: {"canonical_fingerprint": canonical_fingerprint(registry)}
+            },
+        },
+        str(edited),
+    )
+
+    ok, message = verify_workbook(stamp, edited)
+
+    assert ok, message
+    assert "embedded fingerprint" in message
+
+
+def test_verify_workbook_rejects_stale_embedded_fingerprint(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    exported = _fake_workbook(tmp_path)
+
+    stale = tmp_path / "stale.ods"
+    OdsBackend().write_multi(
+        {
+            "transformations": pd.DataFrame({"id": ["TRANS-X"], "name": ["old"]}),
+            "_meta": {
+                EMBEDDED_MARKER_KEY: {"canonical_fingerprint": canonical_fingerprint(registry)}
+            },
+        },
+        str(stale),
+    )
+    # Canonical moves on after the stale workbook's export generation.
+    _edit_table(registry, "glossary", lambda rows: rows[0].__setitem__("area", "edited"))
+    stamp = write_stamp(registry, tmp_path / "stamp.json", exported)
+
+    ok, message = verify_workbook(stamp, stale)
+
+    assert not ok
+    assert "different canonical state" in message
+
+
+def test_promote_and_import_guards_reject_old_format_stamps(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    workbook = _fake_workbook(tmp_path)
+    old_stamp = tmp_path / "stamp.json"
+    old_stamp.write_text(
+        json.dumps(
+            {"stamp_format": 1, "canonical_fingerprint": canonical_fingerprint(registry)}
+        ),
+        encoding="utf-8",
+    )
+
+    stamp_ok, stamp_message = verify_stamp(registry, old_stamp)
+    workbook_ok, workbook_message = verify_workbook(old_stamp, workbook)
+
+    assert not stamp_ok and not workbook_ok
+    assert "Re-run 'make domain-contracts-export'" in stamp_message
+    assert "Re-run 'make domain-contracts-export'" in workbook_message
+
+
+def test_embedded_fingerprint_is_added_on_export_and_consumed_on_reimport() -> None:
+    frames = embed_export_fingerprint({"transformations": pd.DataFrame({"id": ["TRANS-X"]})})
+
+    marker = frames["_meta"][EMBEDDED_MARKER_KEY]
+    assert marker["canonical_fingerprint"] == canonical_fingerprint(DEFAULT_REGISTRY_DIR)
+
+    out = normalize_reimported_contract_frames(frames)
+
+    assert EMBEDDED_MARKER_KEY not in out["_meta"]

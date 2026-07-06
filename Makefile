@@ -393,14 +393,13 @@ domain-contracts-export: check-domain-contracts-sheets-run ## Render domain-cont
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/json_to_ods.yaml"
 	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.promote_guard stamp \
 		--canonical-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
+		--workbook "$(DOMAIN_CONTRACTS_WORKBOOK)" \
 		--out "$(DOMAIN_CONTRACTS_ODS_STAMP)"
 
-domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_contracts.ods into registries/domain_contracts/staging
-	@test -f "$(DOMAIN_CONTRACTS_ODS_STAMP)" || { \
-		echo "Missing $(DOMAIN_CONTRACTS_ODS_STAMP)."; \
-		echo "The workbook was not produced by 'make domain-contracts-export'; re-export before importing."; \
-		exit 1; \
-	}
+domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_contracts.ods into registries/domain_contracts/staging (refuses a workbook that does not match its export stamp)
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(PYTHON) -m tools.domain_contracts.promote_guard verify-workbook \
+		--stamp "$(DOMAIN_CONTRACTS_ODS_STAMP)" \
+		--workbook "$(DOMAIN_CONTRACTS_WORKBOOK)"
 	@mkdir -p "$(DOMAIN_CONTRACTS_STAGING_DIR)"
 	@find "$(DOMAIN_CONTRACTS_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
 	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
