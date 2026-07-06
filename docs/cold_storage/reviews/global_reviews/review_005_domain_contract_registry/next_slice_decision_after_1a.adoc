@@ -1,0 +1,276 @@
+= Review 005: Next-Slice Decision After Slice 1a
+:revdate: 2026-07-06
+:review-status: decided
+:review-type: decision note
+
+Scope: decide the smallest safe slice after `664297e` (Slice 0), `31aab46`
+(Slice 1), `690ec69` (Slice 1a), and the Codex follow-up
+(`followup_slices_0_1_1a.adoc`). Review-only: no code or registry JSON was
+changed in this pass.
+
+Concern separation used throughout:
+
+* *loop safety* - export/import/promote integrity (Makefile, checker, stamps);
+* *metadata-reference behavior* - what schema maintenance does to `_meta`
+  references (`meta_refs.py`, `meta_update.py`, `meta_reference_surfaces.json`);
+* *meta inventory / ownership* - what each meta entry means and who
+  produces/consumes it (`meta_registry.yaml`);
+* *transformation meta IO* - per-transformation read/write declarations
+  (`transformation_meta_io.json`, currently 3 FK rows, frozen);
+* *gap findings* - cross-cutting, checker-validated defect records
+  (`implementation_gap_findings.json`).
+
+== 1. Executive Recommendation
+
+Take Codex's ordering. Close the two remaining loop loopholes first
+(Slice 1b), then land one narrow supported-root convention-escape fixture
+(Slice 1c), then the Meta Registry Bridge as a single join column plus guard,
+not a mirror (Slice 1d). All three verified claims hold on the current tree:
+
+* the checker reports `ok` with a rogue `rogue_table.json` present in the
+  registry directory (re-verified by execution during this pass);
+* `domain_contracts.ods.stamp.json` contains only
+  `{stamp_format, canonical_fingerprint}` - nothing binds it to the workbook
+  bytes actually imported;
+* `domain-contracts-promote` still bulk-copies `staging/*.json` into
+  canonical, so an ungoverned table would be promoted silently.
+
+`meta_reference_surfaces.json` is *not* a duplicate of `meta_registry.yaml`;
+it models a different concern (see section 6) and should be joined to it, not
+merged with it and not mirrored from it.
+
+== 2. Recommended Next Slice
+
+*Slice 1b - loop hardening.* Two mechanical closures plus one cheap checker
+addition, no semantics:
+
+. Checker rejects unexpected registry tables: any top-level, non-dotfile
+  `*.json` in the registry directory that is not in `TABLE_FIELDS` is an
+  `unexpected_table` error. Because promote already runs the checker against
+  staging, this closes the rogue-table promote path with one check applied to
+  both canonical and staging.
+. Bind the export stamp to the workbook: `domain-contracts-export` adds a
+  `workbook_sha256` of the written ODS to the stamp;
+  `domain-contracts-import` refuses to import when the workbook on disk does
+  not match the stamp. (Promote keeps verifying the canonical fingerprint as
+  today; the workbook binding is enforced at the only point where the workbook
+  is read.)
+. While in the checker: reject duplicate `(meta_root, path_pattern)` pairs in
+  `meta_reference_surfaces` - Codex correctly notes duplicates are currently
+  uncaught.
+
+Estimated size: small (checker + Makefile/promote_guard + focused tests).
+
+== 3. Recommended Order of the Next Slices
+
+. *Slice 1b* - loop hardening (above). Loop safety only.
+. *Slice 1c* - one convention-escape fixture with the matching narrow code
+  change: route *unhandled `helper_policies` subtrees* through the existing
+  structured-reference scan, so a conventional frame+column reference in
+  e.g. `helper_policies.<future_subtree>` blocks instead of silently passing.
+  One fixture test proves the class; `GAP-META-REF-CONVENTION-ESCAPE` gets
+  *narrowed* (helper_policies closed; other supported roots still open), not
+  resolved. Metadata-reference behavior only.
+. *Slice 1d* - Meta Registry Bridge: one optional `meta_registry_entry` column
+  on `meta_reference_surfaces` rows joining to `meta_registry.yaml` entry
+  names, plus a resolution guard. Meta inventory/ownership linkage only.
+
+Nothing beyond 1d should be scheduled from this note; re-decide after 1d.
+
+== 4. Loop Hardening Before More Modeling?
+
+Yes. Codex is right, and the reasoning is structural, not cautionary: every
+modeling slice adds or changes canonical tables, which means every modeling
+slice *rides the loop it would be weakening*. Slice 1d in particular adds a
+column (schema change) that must round-trip through export/import/promote.
+Adding model mass while promote can smuggle ungoverned tables and import can
+read an unstamped workbook would grow exactly the unreviewable surface the
+registry exists to prevent. The two closures are small; there is no schedule
+argument against doing them first.
+
+== 5. Convention-Escape Fixture Before the Bridge?
+
+Yes. The fixture (1c) is behavioral and touches the code path that Slice 1a
+just proved out - the knowledge is fresh, the blast radius is one handler
+(`_handle_lookup_policies`' sibling scan in `_handle_plugin_roots` /
+`_handle_helper_policies`), and it converts the largest open gap from prose
+to one executable regression. The bridge (1d) is declarative and can wait;
+doing it before 1c would add rows/columns describing behavior that still has
+a known silent-escape class inside its most important root. Prove the
+behavior, then link the inventory.
+
+Deliberate narrowing for 1c: only `helper_policies` unhandled subtrees. The
+other supported roots do not currently present the same risk profile:
+`constraints` is handled whole, `sheets` entries carry no frame keys (the
+convention scan cannot match them), `workbook_view` carries frame-only
+references, `frame_lifecycle` is shape-checked. Extending the remainder-scan
+to those roots is a later decision, recorded in the gap finding, not in code.
+
+== 6. Is `meta_reference_surfaces.json` Duplicating `meta_registry.yaml`?
+
+No - distinct concerns with a missing join, which is the actual drift risk.
+
+* `meta_registry.yaml` answers: *what is this meta entry, who produces and
+  consumes it, how does it persist and round-trip?* It is capability-neutral
+  inventory and ownership.
+* `meta_reference_surfaces.json` answers: *what does one specific capability
+  (column schema maintenance) do to frame/column references under this root
+  or path?* It is the behavioral contract of one transformation family, with
+  per-path rename/drop policies that would be noise in the inventory.
+
+The overlap is nominal, not semantic: both name meta roots, and the surfaces
+table carries a free-text `owner` column that paraphrases producer/consumer
+facts the YAML owns. That column is the duplication to contain (the bridge
+makes it derivable), not the table.
+
+Verified feasibility: 26 of the 27 current surface rows join 1:1 by name to
+existing `meta_registry.yaml` entries (including fine-grained entries such as
+`helper_columns`, `protection`, `workbook_view.sheet_mappings`); only the
+pattern rows (`*`, `__*`) have no single entry, and the YAML's dunder entries
+(`__style`, `__helper_cols`, ...) are individually present should finer rows
+ever be needed.
+
+== 7. Should `meta_registry.yaml` Remain the Source of Truth for Meta Paths?
+
+Yes, unchanged. It has the strongest existing guards
+(`tests/architecture/semantic_invariants/test_meta_registry*.py`, including
+code-reference resolution), an explicit maintenance contract
+(`runtime_binding: forbidden`), and Review 005 (FIN-REVIEW-005-P2-5) already
+designated it the owner of meta paths. Nothing learned in Slices 0-1a argues
+otherwise. Domain-contract tables reference its entry names; they do not
+redefine entries.
+
+== 8. JSON Mirror or Join Tables?
+
+Join/link/declaration tables only. No JSON mirror of `meta_registry.yaml`
+under `domain_contracts/canonical/`, for four reasons:
+
+* a mirror is the fourth-parallel-vocabulary failure (FIN-REVIEW-005-P2-6)
+  reconstituted inside the very registry built to prevent it;
+* the YAML's guards (producer/consumer shape, code-reference resolution) do
+  not transfer to a copy, so the copy would be the *less* validated twin;
+* the ODS loop would become a second editor of meta-inventory semantics,
+  with promote able to overwrite meaning that the YAML review flow owns;
+* nothing needs the mirror: the bridge requires only entry-name resolution,
+  which a test can do against the YAML directly.
+
+== 9. Exact Relation Between the Four Artifacts
+
+[cols="1,1,2", options="header"]
+|===
+|Artifact |Concern |Relation
+
+|`meta_registry.yaml`
+|meta inventory / ownership
+|Source of truth for meta entries: name, meaning, layer, classification,
+ producers, consumers, persistence. Referenced by name; never mirrored.
+
+|`meta_reference_surfaces.json`
+|metadata-reference behavior (schema maintenance)
+|Behavioral policy over meta entries. After Slice 1d each non-pattern row
+ carries `meta_registry_entry` (the most specific YAML entry name; empty for
+ `*` and `__*` pattern rows). The `owner` column becomes commentary; the
+ join is authoritative.
+
+|`transformation_meta_io.json`
+|transformation meta IO
+|Per-transformation read/write declarations. Stays frozen at its 3 FK rows
+ until the bridge pattern is proven on surfaces; the planned P2-5 migration
+ (join `meta_path` to YAML entry names) then reuses the same mechanism. Do
+ not expand it in 1b-1d.
+
+|`implementation_gap_findings.json`
+|gap findings
+|Cross-cutting defect records; already polymorphically xrefs surfaces,
+ transformations, and units via the checker. Role unchanged; 1c narrows
+ `GAP-META-REF-CONVENTION-ESCAPE` here.
+|===
+
+== 10. Checker / Architecture-Test Invariants Against Drift
+
+Slice 1b (checker/tooling):
+
+* `unexpected_table` error for unlisted top-level `*.json` files (canonical
+  and, via promote, staging);
+* import fails on `workbook_sha256` mismatch between stamp and ODS;
+* `duplicate_id`-style error for duplicate `(meta_root, path_pattern)` in
+  `meta_reference_surfaces`.
+
+Slice 1c (behavior guard):
+
+* one fixture: conventional frame+column reference in an unhandled
+  `helper_policies` subtree blocks with a report entry (and original frames
+  returned unchanged).
+
+Slice 1d (bridge guards):
+
+* architecture test: every non-empty `meta_registry_entry` in
+  `meta_reference_surfaces.json` resolves to an entry name in
+  `meta_registry.yaml` (parse the YAML directly; no copy);
+* architecture test: non-pattern surface rows must have a non-empty
+  `meta_registry_entry` *or* an explicit note marker for
+  intentionally-uninventoried roots, so new rows cannot skip the join
+  silently;
+* optional, warning-level only: report (not fail) `meta_registry.yaml`
+  entries of layer `meta_canonical` whose root has no surface row - drift
+  *visibility* without forcing rows.
+
+Existing guards stay as they are (root-set equality vs `meta_refs.py`
+frozensets, evidence-path existence, checker vocabularies/xrefs).
+
+== 11. Risks of Duplicating the Meta Registry (Why the Mirror Is Rejected)
+
+* Two editable representations of one inventory guarantee a divergence the
+  project has already catalogued once (four "canonical" meanings,
+  FIN-REVIEW-005-P2-6).
+* The mirror would sit in the ODS loop, so a stale promote could rewrite
+  meta-inventory semantics wholesale - precisely the loaded-gun class Slice 0
+  closed for contract tables.
+* Duplicated producer/consumer facts rot fastest; the YAML's resolution test
+  keeps them honest, a JSON copy has no equivalent without duplicating the
+  test too.
+* Every future meta entry would need double bookkeeping, raising the cost of
+  the inventory the project most needs to stay cheap.
+
+== Sibling Observation (Out of Scope)
+
+`project_memory` uses the same unguarded promote pattern
+(`cp -f "$(MEMORY_STAGING_DIR)"/*.json "$(MEMORY_CANONICAL_DIR)/"`, Makefile).
+Not part of this decision; recorded so the 1b pattern can be reused there
+later if wanted.
+
+== Concrete Implementation Prompt for Slice 1b
+
+----
+Implement Review 005 Slice 1b: close the remaining domain-contract loop
+loopholes identified in followup_slices_0_1_1a.adoc and confirmed in
+next_slice_decision_after_1a.adoc.
+
+Repository: ~/repos/spreadsheet-handling/core
+
+Tasks:
+1. check_contracts.py: report an "unexpected_table" error for any top-level,
+   non-dotfile *.json file in the registry directory that is not a
+   TABLE_FIELDS table. Apply to both canonical and staging runs (promote
+   already checks staging). Do not scan subdirectories (seeds/ stays
+   ungoverned for now) or dotfiles (.export_stamp.json).
+2. promote_guard.py + Makefile: extend the export stamp with a
+   workbook_sha256 of the written domain_contracts.ods;
+   domain-contracts-import must fail with a clear message when the workbook
+   on disk does not match the stamp. Keep the existing canonical-fingerprint
+   verification at promote unchanged. Bump stamp_format and treat old-format
+   stamps as invalid (refuse with "re-run export").
+3. check_contracts.py: reject duplicate (meta_root, path_pattern) pairs in
+   meta_reference_surfaces as an error.
+4. Tests: rogue staging table cannot be promoted (checker error);
+   rogue canonical table fails domain-contracts-check; import refuses a
+   workbook whose bytes differ from the stamp; old-format stamp refused;
+   duplicate surface path pair rejected; existing Slice 0/1/1a tests stay
+   green.
+5. Regenerate the ODS/staging loop; make domain-contracts-check and the full
+   active suite must be green.
+
+Non-goals: no registry semantics, no meta_reference_surfaces content changes,
+no convention-escape code change (that is Slice 1c), no project_memory
+changes, no requirements/status-axis work.
+----
