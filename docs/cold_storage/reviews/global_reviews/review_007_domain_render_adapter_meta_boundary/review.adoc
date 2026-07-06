@@ -1,0 +1,660 @@
+= Review 007: Domain Intent vs Render / Adapter Boundary and Meta Simplification
+:toc:
+:toclevels: 2
+
+Status: complete (read-only architecture review)
+
+Date: 2026-07-07
+
+Baseline: Review 005 (closed, not reopened here), Review 006 (complete; used
+only as posture guidance: prefer small boundary clarification over broad
+redesign).
+
+Scope: the boundary between domain/pipeline logic, the rendering/IR layer,
+spreadsheet adapters/parsers, and persisted vs derived meta. Read-only; no
+runtime code, registry, or backlog edits were made.
+
+== 1. Executive assessment
+
+*Is there action needed in the spreadsheet adapter / render stack before or
+during meta simplification?*
+
+*No implementation action is needed in the adapters or renderers before meta
+simplification. The recommended posture is: document/guard the boundary
+first.* The write chain (frames + canonical meta -> compose -> IR passes ->
+RenderPlan -> adapter) and the read chain (carrier -> format parser ->
+WorkbookIR -> generic frame projection) are implemented as documented, and are
+already protected by architecture guard tests
+(`tests/architecture/spreadsheet_contract`, `tests/architecture/parse_contract`,
+`tests/architecture/semantic_invariants` -- all green at review time).
+
+*Is the current boundary mostly clean, partially leaky, or structurally
+confused?*
+
+Mostly clean, with three localized soft spots, none of which is an adapter
+problem:
+
+. *Canonical meta travels inside the render flow as the carrier blob.* IR
+  passes read canonical workbook meta by deserializing
+  `hidden_sheets["_meta"].meta["workbook_meta_blob"]`
+  (`rendering/passes/_base.py::_workbook_meta`). The canonical channel and the
+  persistence carrier share one representation inside the IR. This works and
+  is registry-documented (`workbook_meta_blob` = `carrier_artifact`), but it is
+  the main structural wart: five near-identical JSON-then-`ast.literal_eval`
+  decoders exist across rendering and both parsers (already backlogged as
+  `FTR-CARRIER-BLOB-DECODER-CONSOLIDATION-P4A`).
+. *Helper-column identification in `StylePass` falls back to a naming
+  convention.* Explicit intent (`helper_columns`, `derived.sheets.*` provenance)
+  is consulted first, but `helper_prefix` (default `"_"`) prefix matching
+  remains a structure-derived fallback in the render layer
+  (`rendering/passes/style_pass.py`, `_base.py::_helper_column_indices`).
+. *The canonical->operational-view key list is triplicated.* Which canonical
+  roots become per-sheet `options` is encoded three times:
+  `layout_composer._WORKBOOK_OPTION_KEYS` (5 keys) and `OPTION_HINT_KEYS` in
+  both `xlsx/parser_interpretation.py` and `ods/parser_interpretation.py`
+  (7 keys each). The lists already differ in content and are a drift risk.
+
+*Where is the highest-risk leak?*
+
+Not in the adapters. The highest risk for the meta simplification effort is a
+*misclassification* risk in canonical meta itself: the four presentation
+families (`column_widths`, `text_orientations`, `horizontal_alignments`,
+`vertical_alignments`) look like "derived rendering meta" but are in fact
+persistent roundtrip payload under an explicit carrier-authority contract
+(`FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5`). Simplification that reclassifies
+them as derived-only would break presentation continuity across roundtrips, and
+the pressure to compensate would move heuristics into the parsers -- exactly the
+failure mode this review was asked to test (risk pattern E).
+
+== 2. Current intended architecture
+
+The intended chain, confirmed in code:
+
+[source,text]
+----
+Domain / Pipeline steps
+  -> Frames + runtime _meta (dict; domain writes intent roots)
+  -> persistence boundary (orchestrator-owned; Intent kept, Resolution dropped)
+     [pipeline/persistence_boundary.py]
+  -> spreadsheet write path:
+       select_render_frames (workbook_view selection)          [rendering/frame_selection.py]
+       compose_workbook     (geometry, options merge, legends) [rendering/composer/layout_composer.py]
+       apply_all IR passes  (meta_canonical -> meta_rendering) [rendering/passes/*]
+       build_render_plan    (IR -> backend-neutral RenderPlan) [rendering/flow.py]
+  -> adapter renderer executes RenderPlan                      [io_backends/{xlsx,ods}/*_renderer.py]
+       (WriteMeta persists canonical meta as hidden `_meta` carrier)
+
+Carrier file
+  -> format-specific parser -> WorkbookIR                      [io_backends/{xlsx,ods}/*_parser.py]
+       (+ parser-local interpretation modules; heuristic table discovery,
+        embedded-meta hints, presentation-family extraction)
+  -> generic projection WorkbookIR -> Frames + _meta           [rendering/workbook_projection.py]
+----
+
+Semantic meaning is owned by the *domain layer plus canonical `_meta`*. The IR
+layer owns derivation rules (inheritance workbook -> sheet, defaults, conflict
+resolution). The `RenderPlan` is the executable, non-semantic projection.
+Adapters own only carrier mechanics plus per-backend translation of
+backend-neutral specs (`FormulaSpec`, alignment/rotation vocabulary
+conversion). The facade `io_backends/spreadsheet_contract.py` is the single
+narrow seam both backends use, and guard tests enforce that backends do not
+reach past it.
+
+The one sanctioned reverse write: parsers project observed presentation state
+for the four presentation families into the embedded canonical meta
+(`io_backends/presentation_meta.py::apply_cell_addressed_presentation_meta`,
+replace-or-clear, carrier authoritative, `source: workbook` markers, bounded by
+`ParserLimits`).
+
+== 3. Boundary rule matrix
+
+Legend: "read canonical" = may read domain/canonical meta; "write persist" =
+may write persistent `_meta`; "write derived" = may write derived render
+intent (`options`, `+__*+` keys, IR fields); "infer semantic" = may infer
+semantic meaning; "observe carrier" = may observe carrier artifacts; "modify
+data" = may modify domain payload data.
+
+[cols="14,8,8,8,8,8,8,24,14",options="header"]
+|===
+| Layer / actor | read canonical | write persist | write derived | infer semantic | observe carrier | modify data | Current evidence | Boundary risk
+
+| Domain transformation
+| yes
+| yes (intent roots)
+| no
+| yes (owns it)
+| no
+| yes
+| `fk_helpers`, `xref_crosstable`, `cell_codec`, `compact_multiaxis`,
+  `helper_policies` write only intent/provenance roots; no colors, widths,
+  positions, or freeze found in `domain/transformations/*`
+| low
+
+| Meta bootstrap
+| yes
+| yes (merge)
+| no
+| no
+| no
+| no
+| `domain/meta_bootstrap.py` is a pure precedence merge
+  (profile < persisted < CLI)
+| low
+
+| Workbook view mapping
+| yes
+| yes (`workbook_view`, `sheets.*.options`, `frame_lifecycle`)
+| no
+| no
+| no
+| no (re-keys frames only)
+| `domain/workbook_views.py`; rejects transformation keys; readback via
+  authoritative `sheet_mappings`, fail-loud, no name inference
+| low
+
+| Render composer
+| yes (via `canonicalize_workbook_meta`)
+| yes -- writes the `_meta` hidden-sheet blob and `legend_blocks[*].resolved`
+| yes (`options`, `+__header_grid+`, `+__header_merges+`)
+| no
+| no
+| no
+| `layout_composer.py`; `resolved` is a Resolution facet, stripped again at the
+  structured persistence boundary, kept in the workbook carrier as a parse hint
+| low/medium: composer writes into a canonical root (`legend_blocks`), by
+  documented design
+
+| Render pass
+| yes -- but by deserializing the carrier blob (`_workbook_meta`)
+| no
+| yes (`+__style+`, `+__helper_cols+`, `+__freeze+`, `+__autofilter+`,
+  `+__protection+`, promotes presentation families to `+__*+`)
+| partially: helper-prefix fallback in `StylePass`
+| no
+| no
+| `rendering/passes/*`; defaults centralized here (header fill, helper fill,
+  `auto_filter` default true)
+| medium: blob-decode coupling + naming-convention fallback
+
+| XLSX renderer
+| no
+| no (executes `WriteMeta` mechanically)
+| no
+| no
+| yes (writes carrier)
+| no
+| `openpyxl_renderer.py` is a pure op executor; only per-backend `FormulaSpec`
+  translation
+| low
+
+| ODS renderer
+| no
+| no (executes `WriteMeta` mechanically)
+| no
+| no
+| yes (writes carrier)
+| no
+| `odf_renderer.py` buffers plan ops, emits ODF; protection ops skipped
+  (documented gap); freeze via config settings (documented best-effort)
+| low
+
+| XLSX parser
+| yes (embedded `_meta` as hints)
+| yes -- *only* the four presentation families via the shared helper
+| yes (IR meta: `+__freeze+`, `+__autofilter_ref+`, `+__column_widths+`, ...)
+| bounded heuristics: header depth from merges, table extents
+| yes
+| no
+| `openpyxl_parser.py` + `parser_interpretation.py`; stops at `WorkbookIR`
+| low/medium: sanctioned canonical write is contract-backed but not
+  allowlist-guarded
+
+| ODS parser
+| yes (embedded `_meta` as hints)
+| yes -- *only* the four presentation families via the shared helper
+| yes (same IR hint keys)
+| bounded heuristics, `ParserLimits`-clipped repeated-carrier handling
+| yes
+| no
+| `odf_parser.py` + `parser_interpretation.py`; stops at `WorkbookIR`
+| low/medium: same as XLSX
+
+| JSON backend
+| no (passes `_meta` through as sidecar)
+| yes (sidecar `_meta.yaml` verbatim)
+| no
+| one exception: MultiIndex writer drops `_`-prefixed top-level header
+  segments (`_records_nested_from_multiindex`)
+| n/a
+| no
+| `json_backend.py`; flat-column path writes everything it receives
+| low, but the `_`-prefix drop is a naming-convention semantic decision inside
+  a writer (tension with ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB)
+
+| Schema maintenance
+| yes
+| yes (supported roots only; blocks unmaintained roots)
+| no
+| no
+| no
+| yes (column ops)
+| `schema_maintenance/meta_refs.py` explicitly declares presentation roots
+  out-of-scope and blocks plugin roots
+| low
+|===
+
+== 4. Meta-root classification
+
+Classification vocabulary: *P-intent* = persistent domain/projection intent;
+*P-roundtrip* = persistent roundtrip contract; *D-render* = derived render
+intent (never persisted); *C-obs* = carrier artifact / adapter readback
+observation; *mixed* = intentionally faceted.
+
+[cols="20,16,64",options="header"]
+|===
+| Root / key | Class | Evidence and notes
+
+| `workbook_view` (incl. `sheet_mappings`)
+| P-intent + P-roundtrip
+| Written by `configure_workbook_view`; consumed by `select_render_frames`
+  (forward) and `apply_workbook_view_sheet_mappings` (readback identity).
+  `sheet_mappings` is the *only* mechanism recovering frame identity from
+  visible sheet names -- must remain persistent.
+
+| `frame_lifecycle`
+| P-intent
+| Role/canonical/editable/render declarations; drives frame selection.
+
+| `constraints`
+| P-intent
+| Structured validation rules; `ValidationPass` derives
+  `DataValidationSpec` from them. Canonical rule meaning stays here per
+  `spreadsheet_meta_semantics.adoc`.
+
+| `validations` (as IR/`AddValidation`)
+| D-render / C-obs
+| No free canonical root. Write side derived from `constraints`; read side
+  reconstructed into `SheetIR.validations` but *dropped* at
+  `workbookir_to_frames` -- carrier validations never become domain truth.
+
+| `helper_policies`, `fk_relations` (v2 relations)
+| P-intent
+| Durable declarations needed for reimport helper cleanup
+  (ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB); persistence boundary
+  deliberately preserves them.
+
+| `derived` (`derived.sheets.*.helper_columns`, `.enrich_lookup`)
+| D-render (runtime provenance)
+| Domain-written, render/cleanup-consumed, stripped at the persistence
+  boundary (`RUNTIME_ONLY_TOP_LEVEL_META_KEYS`). Registry classifies it as
+  `meta_rendering` although domain produces it -- a naming ambiguity worth one
+  line in the lifecycle inventory, not a code problem.
+
+| `xref_crosstable`
+| mixed (P-intent + Resolution facets)
+| Intent (`column_key`, `row_keys`, `dense_axes.columns_from`, ...) persists;
+  `column_keys` / `dense_axes.resolved` snapshots are stripped at the
+  persistence boundary. Already the model case for Intent-vs-Resolution.
+
+| `legend_blocks`
+| mixed (P-intent + Resolution facet)
+| Entries/placement/title persist; `resolved` (coordinates) is written by the
+  composer, stripped at the structured boundary, retained in the workbook
+  carrier where parsers use it as a table-discovery hint. Asymmetric by
+  design; registry documents it.
+
+| `cell_codec`(`s`), `compact_multiaxis`, `sparse_defaults`,
+  `split_by_discriminator`
+| P-intent
+| Domain transformation configuration; no render/adapter coupling. Any
+  simplification is Functional-Model/contract work
+  (ADR-CONTRACT-FIRST-DOMAIN-META-REWRITE), not adapter work.
+
+| `column_widths`, `text_orientations`, `horizontal_alignments`,
+  `vertical_alignments` (under `sheets.<sheet>.*`)
+| P-roundtrip (carrier-authoritative observation, persisted by contract)
+| The four presentation families. Parser observation replaces or clears the
+  persisted entry (`presentation_meta.py`); next forward run re-renders them
+  via passes. *Must remain persistent* or presentation continuity
+  (`05_workbook_presentation_meta_roundtrip.adoc`) breaks. Their `+__*+`
+  IR twins are D-render.
+
+| `freeze_header`, `auto_filter`, `header_fill_rgb`, `helper_fill_rgb`,
+  `helper_prefix`
+| P-intent (presentation intent, workbook/sheet defaults)
+| Caller/profile-supplied declaratives; passes derive `+__freeze+`,
+  `+__autofilter+`, `+__style+`, `+__helper_cols+`. Read path treats recovered
+  freeze/filter as hints only (`+__freeze+`, `+__autofilter_ref+`) -- never
+  promoted to these roots. Could in principle become bootstrap-only
+  (derived from profile) rather than persisted, but they are cheap, explicit,
+  and roundtrip-read from the blob today: no simplification urgency.
+
+| `editable_columns` / `protection` (under `sheets.*.options`)
+| P-intent
+| Editability is domain semantics (which columns a user may edit);
+  `ProtectionPass` derives `+__protection+`; adapters execute lock ops.
+  XLSX-only execution (ODS skips) is a documented capability gap, not a leak.
+
+| `named_ranges`
+| D-render + C-obs
+| No canonical root. `NamedRangePass` derives them from table structure each
+  render; parsers reconstruct them into IR, where they are dropped at frame
+  projection. Already "derived-only" -- nothing to simplify.
+
+| `_meta` hidden sheet / `workbook_meta_blob`
+| C-obs (carrier artifact)
+| The persistence carrier for canonical meta. `canonicalize_workbook_meta`
+  defensively unwraps nested blobs and strips MetaPass marker defaults
+  (`version`/`author`/`exported_at` when empty). Must never be treated as a
+  canonical root itself.
+
+| `options`, `+__style+`, `+__helper_cols+`, `+__freeze+`, `+__autofilter+`,
+  `+__autofilter_ref+`, `+__header_grid+`, `+__header_merges+`,
+  `+__protection+`, `+__column_widths+` (IR sheet meta)
+| D-render / C-obs (read-path hints)
+| IR-internal operational views; persistence boundary strips all top-level
+  `+__*+` keys; registry classifies them as `meta_rendering`.
+|===
+
+== 5. Forward-boundary findings: Domain -> Render
+
+*Acceptable projection intent (clean):* `workbook_view` sheet selection,
+naming, ordering, roles; `frame_lifecycle`; `helper_columns`;
+`editable_columns`; `constraints`; legend entries. Domain transformations
+were checked (`fk_helpers`, `xref_crosstable`, `cell_codec`,
+`compact_multiaxis`, `project_by_role`, `schema_maintenance`): none writes
+colors, widths, coordinates, styles, or freeze state.
+
+*Acceptable presentation intent:* `freeze_header`, `auto_filter`,
+`header_fill_rgb`, `helper_fill_rgb`, presentation families. These enter
+canonical meta from caller configuration, bootstrap profiles, or parser
+readback -- not from fachliche transformations. This matches the workbook view
+boundary concept ("render-near options available to the renderer").
+
+*Questionable backend/layout detail (accepted, should stay visible):*
+
+. The canonical vocabulary of presentation meta is XLSX-shaped by explicit
+  decision: widths in Excel character units, rotation in the XLSX
+  `textRotation` 0-180 convention, alignments restricted to the XLSX-shaped
+  canonical triple (`plan.py` docstrings say "project canonical encoding
+  (XLSX-shaped)"). The ODS adapter converts both ways. This is a documented
+  portability baseline, not a leak -- but meta simplification should not
+  mistake the XLSX flavor for "carrier artifact, delete".
+. `legend_blocks[*].placement` accepts raw `top`/`left` coordinates in
+  addition to anchors (`right_of_table`, `below_table`). Raw coordinates are
+  layout detail inside a canonical root; the anchor form is the cleaner
+  intent. Minor; no action proposed.
+
+*Actual boundary violations:* none found on the forward path.
+
+== 6. Reverse-boundary findings: Render/Adapter/Parser -> Domain
+
+*Safe value readback:* table discovery uses bounded heuristics (header depth
+from merge regions, extent scans with lookahead) plus embedded-meta hints
+(legend `resolved` anchors). Formatting is used only to find *structure*, not
+to synthesize business meaning, and the parse contract documents the
+heuristics as such.
+
+*Safe persisted `_meta` readback:* hidden-sheet blob, JSON-first with legacy
+`ast.literal_eval` fallback, defensive unwrapping. Canonical meta is
+reconstructed from the payload, not inferred from formatting.
+
+*Presentation-meta readback (sanctioned semantic write):* the four families,
+via one shared backend-neutral helper with replace-or-clear semantics.
+Quarantine quality is good: `source: workbook` markers, canonical-vocabulary
+filtering on read (out-of-vocabulary alignment values dropped rather than
+mapped), extent clipping and `ParserLimits` against ODS repeated-carrier
+expansion. This is the *only* place a parser writes canonical meta -- verified
+by reading both parsers; nothing else mutates `embedded_meta`/`meta_payload`.
+
+*Dangerous semantic inference:* none found. Specifically:
+
+* carrier validations and named ranges are parsed into IR and *dropped* at
+  frame projection -- a user adding a dropdown in Excel does not create a
+  canonical constraint;
+* recovered freeze/autofilter stay as `+__freeze+` / `+__autofilter_ref+`
+  hints and never write `freeze_header` / `auto_filter`;
+* styles are not reconstructed into canonical policy (per capability
+  profile: "no style-to-canonical reconstruction claim");
+* sheet identity on readback comes only from persisted
+  `workbook_view.sheet_mappings`, fail-loud on missing/unknown/duplicate --
+  no name-similarity inference.
+
+*Missing reconciliation/error handling (watch-only):* a user renaming a
+visible sheet produces a hard failure ("not declared in sheet_mappings"),
+which is correct but not yet a guided reconciliation diagnostic. Header
+renames surface only later through domain validations. Acceptable for now;
+any automatic rename reconciliation is a non-goal (section 12).
+
+== 7. Adapter-specific assessment
+
+*XLSX:* renderer is a pure `RenderPlan` executor
+(`_execute_render_op` dispatch); the only intelligence is per-backend
+translation of `FormulaSpec` (list literals, `XLOOKUP` synthesis from plan
+context), which is the intended adapter-translator role. Parser ends at
+`WorkbookIR`; interpretation is parser-local.
+
+*ODS:* renderer buffers plan ops into `_BufferedSheet` structures and emits
+ODF carriers (named styles, content validations, database ranges, config-item
+freeze). Capability differences are isolated and documented: protection ops
+skipped, freeze best-effort write / hint-only read. Parser mirrors the XLSX
+seam and adds the repeated-carrier safety model (`ParserLimits`, content-extent
+clipping) required by the review instructions' adapter read-path safety
+checks.
+
+*Symmetry:* parse and render are symmetric for the supported profile (tables,
+headers/merges, hidden `_meta`, list validations, named ranges, the four
+presentation families, autofilter/freeze as hints). Asymmetries are the
+documented capability gaps, not silent drift.
+
+*Where adapters still know too much:* nothing semantic. The residual issue is
+*duplication*, not knowledge: `_legend_table_hints`,
+`_apply_legend_table_hints`, `_store_workbook_meta`, and the blob decoder are
+byte-identical or near-identical across both parsers, and `OPTION_HINT_KEYS`
+exists twice (plus the diverging `_WORKBOOK_OPTION_KEYS` in the composer).
+Both duplication clusters are already backlogged
+(`FTR-CARRIER-BLOB-DECODER-CONSOLIDATION-P4A`,
+`FTR-CARRIER-LEGEND-META-HELPERS-CONSOLIDATION-P4A`); the option-key list
+should be folded into that consolidation.
+
+*Unavoidable carrier responsibilities:* unit conversion (cm <-> Excel chars),
+rotation-convention conversion, ODF named-style materialization, XLSX
+live-object styling, freeze via ODS view settings. All correctly adapter-local.
+
+== 8. Render-layer assessment
+
+* Passes derive from explicit intent (`options` merged workbook->sheet in the
+  composer; constraints and legend tokens from workbook meta). The single
+  structure-derived fallback is the `helper_prefix` match in `StylePass` /
+  `ProtectionPass` helpers; explicit helper metadata takes precedence when
+  present.
+* Passes are cohesive: one concern per module, deterministic order in
+  `default_passes()`.
+* Presentation defaults are centralized in the passes (header/legend/helper
+  fills in `StylePass`, `auto_filter` default true in `FilterPass`), not in
+  adapters.
+* No duplicated semantic logic between passes and adapters; formula/vocabulary
+  translation is deliberately per-adapter.
+* The `meta_canonical -> meta_rendering` transition has a clear home: composer
+  (options merge, geometry) plus passes (`+__*+` derivations). The blemish is
+  *how* passes reach canonical meta: through the serialized hidden-sheet blob
+  rather than a typed side channel. Consolidating the decoder (already
+  backlogged) is sufficient for now; a typed channel is bridge-DSL work under
+  ADR-CONTRACT-FIRST-DOMAIN-META-REWRITE, not a pre-simplification blocker.
+
+== 9. Parser/readback assessment
+
+* *Read as value data:* visible table blocks (headers, header grids/merges,
+  cell values as strings).
+* *Read as persisted meta:* hidden `_meta` blob -> canonical workbook meta;
+  ordinary hidden sheets preserved as hidden sheets.
+* *Read as presentation observation:* the four presentation families
+  (promoted to persisted meta by contract); freeze and autofilter as
+  quarantined hints.
+* *Ignored:* arbitrary styling, fills, borders, formulas outside the supported
+  specs, carrier validations/named ranges at the frames level (parsed into IR,
+  dropped at projection), out-of-vocabulary alignment/rotation values.
+* *Should be diagnosed rather than silently accepted (watch-only):*
+  out-of-vocabulary presentation values are silently dropped (documented
+  design to avoid metadata bloat, but a debug-level diagnostic would help
+  users wondering why `justify` did not survive); sheet-rename failures could
+  carry reconciliation guidance.
+* *User-authored presentation changes:* intentionally preserved for the four
+  families (carrier-authoritative, including deletion via the clear branch);
+  intentionally ignored outside them. The line is explicit, not ambiguous.
+
+== 10. Meta simplification recommendations
+
+* *Must remain persistent:* `workbook_view` (+`sheet_mappings`),
+  `frame_lifecycle`, `constraints`, `helper_policies`/v2 relations,
+  `legend_blocks` intent facets, transform-config roots (`xref_crosstable`,
+  `cell_codecs`, `compact_multiaxis`, `sparse_defaults`,
+  `split_by_discriminator`) pending Functional-Model contract work, and the
+  four presentation families (roundtrip contract -- do not demote).
+* *Already derived-only (keep that way):* `options`, all `+__*+` IR keys,
+  named ranges, IR validations, `derived` provenance.
+* *Adapter-local only:* carrier encodings (blob serialization, ODF styles,
+  config-item freeze, unit/rotation conversions). Nothing currently
+  adapter-local should be promoted to canonical meta.
+* *Require explicit reconciliation policy (later, if ever):* visible-sheet
+  renames; presentation values outside the canonical vocabulary.
+* *Do not simplify yet:* `freeze_header`/`auto_filter`/fill-color roots
+  (cheap, explicit, roundtrip-read today); the carrier-blob channel into
+  passes (consolidate the decoder first, re-shape only under a bridge-DSL
+  slice); the `helper_prefix` fallback (retire only when explicit helper
+  metadata is guaranteed present by contract, e.g. after the FK-helper bridge
+  slice).
+
+== 11. First follow-up slice (proposed, not implemented)
+
+*Problem statement:* the single sanctioned parser->canonical write (the four
+presentation families) is enforced today only by code review and by each
+parser calling the shared helper. Meta simplification will touch the parsers'
+surroundings; nothing executable currently fails if a future change starts
+writing additional canonical roots from a parser, silently widening the
+reverse boundary.
+
+*Slice:* add a guard test that codifies the parser canonical-write allowlist,
+plus a short normative note in the parse contract doc.
+
+* Exact files:
+** new: `tests/architecture/parse_contract/test_parser_canonical_write_allowlist.py`
+** edit: `docs/technical_model/ch08_architecture_details/spreadsheet_parse_contract.adoc`
+   (one subsection naming the allowlist: parsers may update persisted canonical
+   meta only for `sheets.<sheet>.{column_widths,text_orientations,horizontal_alignments,vertical_alignments}`)
+* Test approach: for each backend, render a workbook from frames + rich
+  canonical meta (workbook_view, constraints, legend_blocks, helper roots,
+  presentation values), reparse it, extract the embedded canonical meta from
+  the reparsed IR, and assert that any difference from the written canonical
+  meta is confined to the four family keys under `sheets.*` (plus the
+  documented `legend_blocks[*].resolved` carrier facet). A second, static
+  assertion checks that `apply_cell_addressed_presentation_meta` is the only
+  call site in `io_backends/**` that mutates the embedded meta mapping.
+* Acceptance criteria: test fails if a parser writes any new canonical root or
+  family key; passes on current XLSX and ODS parsers; doc subsection merged;
+  no runtime behavior change; existing architecture guards stay green.
+* Non-goals: no parser refactor, no new meta roots, no change to the
+  presentation-meta contract, no ODS/XLSX behavior change, no diagnostics work.
+
+== 12. Non-goals
+
+Explicitly rejected by this review:
+
+* broad meta rewrite or `_meta` redesign (owned by
+  ADR-CONTRACT-FIRST-DOMAIN-META-REWRITE slices);
+* new meta registry work beyond what `FTR-META-LIFECYCLE-INVENTORY-P5` /
+  `FTR-META-FACET-CLASSIFICATION-P5` already scope;
+* a new DSL;
+* adapter or renderer rewrites (both are assets per the ADR);
+* inference of domain meaning from formatting, colors, protection, or
+  validation UI state;
+* automatic sheet/header rename reconciliation;
+* reopening Review 005.
+
+== 13. Ready-to-use implementation prompt
+
+----
+Implement the Review 007 follow-up slice: guard the parser canonical-write
+allowlist.
+
+Repo: ~/repos/spreadsheet-handling/core. Read
+docs/ai_info/review_instructions.adoc and
+docs/cold_storage/reviews/global_reviews/review_007_domain_render_adapter_meta_boundary/review.adoc
+(section 11) first.
+
+Task:
+1. Add tests/architecture/parse_contract/test_parser_canonical_write_allowlist.py.
+   For each spreadsheet backend (XLSX via io_backends.xlsx, ODS via
+   io_backends.ods):
+   - build frames plus canonical meta containing workbook_view (with
+     sheet_mappings), constraints, legend_blocks, sheets.<sheet> options
+     (helper_columns, protection.editable_columns, freeze_header,
+     header_fill_rgb), and one presentation value per family;
+   - write the workbook via the backend's write path, reparse it via the
+     backend's parse_workbook, and read the embedded canonical meta from the
+     reparsed WorkbookIR hidden `_meta` sheet;
+   - assert the reparsed canonical meta equals the written canonical meta
+     except for: (a) values under
+     sheets.<sheet>.{column_widths,text_orientations,horizontal_alignments,
+     vertical_alignments} and (b) legend_blocks[*].resolved.
+   Add a static check asserting that within src/spreadsheet_handling/io_backends
+   only presentation_meta.apply_cell_addressed_presentation_meta mutates the
+   parsed embedded canonical meta mapping (AST-based, mirroring the style of
+   tests/architecture/spreadsheet_contract/test_adapter_contract_boundary_guards.py).
+2. Add a subsection "Parser canonical-write allowlist" to
+   docs/technical_model/ch08_architecture_details/spreadsheet_parse_contract.adoc
+   stating the rule in one paragraph and referencing
+   FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5 and Review 007.
+3. Run: .venv/bin/python -m pytest tests/architecture -q  (must be green).
+4. No runtime code changes. No new meta roots. Do not modify parsers,
+   renderers, or presentation_meta.py.
+5. Follow the repo review/commit conventions; commit the guard separately
+   from any unrelated work; check the release-notes checkpoint (expected
+   outcome: no release note needed -- test/doc only; state that in the commit
+   or FTR note).
+----
+
+== Validation commands
+
+Run at review time (2026-07-07), all green:
+
+[source,bash]
+----
+.venv/bin/python -m pytest tests/architecture/semantic_invariants \
+  tests/architecture/spreadsheet_contract tests/architecture/parse_contract -q
+# 57 passed
+
+.venv/bin/python -m pytest tests/integration/roundtrip \
+  tests/integration/spreadsheet_contract -q
+# 42 passed
+----
+
+== Release-notes checkpoint
+
+Read-only review artifact; no user-facing behavior, public surface, or
+limitation changes. No release note needed.
+
+== Lifecycle cleanup check
+
+This is a global review, not an FTR workstream. No backlog includes need
+removal. The proposed follow-up slice (section 11) is small enough to run as a
+direct backlog note or micro-FTR at the maintainer's discretion; this review
+does not create one. Reviews 005 and 006 remain in their recorded states
+(closed / complete); nothing here reopens them. Residual scope beyond the
+guard slice is already tracked by existing FTRs
+(`FTR-META-LIFECYCLE-INVENTORY-P5`, `FTR-META-FACET-CLASSIFICATION-P5`,
+`FTR-CARRIER-BLOB-DECODER-CONSOLIDATION-P4A`,
+`FTR-CARRIER-LEGEND-META-HELPERS-CONSOLIDATION-P4A`); the only addition this
+review suggests to an existing item is folding the `OPTION_HINT_KEYS` /
+`_WORKBOOK_OPTION_KEYS` triplication into the legend/meta-helpers
+consolidation FTR.
+
+== Final recommendation
+
+*Document/guard first.* No adapter or render implementation action is needed
+before meta simplification. Implement the small parser canonical-write
+allowlist guard (section 11) as the first slice, then proceed with the already
+planned meta lifecycle inventory / facet classification. Meta simplification
+must keep the four presentation families and `workbook_view.sheet_mappings`
+persistent; everything else on the render/adapter side is already derived-only
+or carrier-local.
