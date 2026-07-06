@@ -309,6 +309,7 @@ def _handle_helper_policies(
     updated_helper_policies = dict(helper_policies)
     _handle_fk_policies(updated_helper_policies, request, changes, failures)
     _handle_lookup_policies(updated_helper_policies, request, changes, failures)
+    _scan_unhandled_helper_policy_subtrees(helper_policies, request, changes, failures)
     meta["helper_policies"] = updated_helper_policies
 
 
@@ -379,6 +380,49 @@ def _handle_lookup_policies(
         helper_policies["lookup"] = updated_lookup
     elif request.kind == SchemaOperationKind.DROP_COLUMN:
         _block_lookup_drop_if_referenced(entry, path, request, changes, failures)
+
+
+_HANDLED_HELPER_POLICY_SUBTREES = frozenset({"fk", "lookup"})
+
+
+def _scan_unhandled_helper_policy_subtrees(
+    helper_policies: Mapping[str, Any],
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> None:
+    """Block on conventional references in helper_policies subtrees we do not maintain.
+
+    ``helper_policies`` is a supported root and therefore exempt from the
+    unknown-root scan, which previously exempted *every* subtree - the
+    escape class behind GAP-META-REF-CONVENTION-ESCAPE (Review 005 Slice 1c).
+    Subtrees other than the explicitly maintained ``fk`` and ``lookup`` get
+    the same convention scan as unknown plugin roots: a structured
+    frame+column reference to the affected column blocks the operation
+    instead of silently dangling.
+    """
+    affected = _affected_column(request)
+    if affected is None:
+        return
+    for name, value in helper_policies.items():
+        if name in _HANDLED_HELPER_POLICY_SUBTREES:
+            continue
+        if contains_structured_reference(value, request.target_frame, affected):
+            path = f"helper_policies.{name}"
+            changes.append(
+                _change(
+                    ReferenceRoot.UNKNOWN_PLUGIN,
+                    path,
+                    ReferenceAction.BLOCKED,
+                    request.target_frame,
+                    affected,
+                    "Unmaintained helper_policies subtree references the affected column "
+                    "and is not rewritten",
+                )
+            )
+            failures.append(
+                _blocked_reference(ReferenceRoot.UNKNOWN_PLUGIN, path, request, affected)
+            )
 
 
 def _rename_lookup_policy_columns(

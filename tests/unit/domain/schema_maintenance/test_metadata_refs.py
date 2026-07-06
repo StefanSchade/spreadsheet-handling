@@ -688,3 +688,83 @@ def test_malformed_lookup_policy_shapes_block_safely() -> None:
     assert result.report.failures[0].code == "malformed_meta"
     assert result.report.failures[0].meta_path == "helper_policies.lookup.places.key"
     assert result.frames["_meta"] == meta
+
+
+def _future_plugin_meta(frame: str = "characters", column: str = "name") -> dict:
+    return {
+        "helper_policies": {
+            "future_plugin": {
+                "targets": [{"frame": frame, "column": column}],
+            }
+        }
+    }
+
+
+def test_rename_blocks_unhandled_helper_policy_subtree_with_conventional_reference() -> None:
+    frames = _base_frames(_future_plugin_meta())
+
+    result = rename_column(frames, _rename())
+
+    assert result.report.blocked
+    blocked = result.report.metadata_changes[-1]
+    assert blocked.action is ReferenceAction.BLOCKED
+    assert blocked.root is ReferenceRoot.UNKNOWN_PLUGIN
+    assert blocked.path == "helper_policies.future_plugin"
+    assert result.report.failures[0].code == "blocking_metadata_reference"
+    assert result.frames["_meta"] == frames["_meta"]
+    assert list(result.frames["characters"].columns) == ["id", "name", "home_place_id", "notes"]
+
+
+def test_drop_blocks_unhandled_helper_policy_subtree_with_conventional_reference() -> None:
+    frames = _base_frames(_future_plugin_meta())
+
+    result = drop_column(frames, _drop(source="name", prune=True))
+
+    assert result.report.blocked
+    assert result.report.failures[0].code == "blocking_metadata_reference"
+    assert result.report.failures[0].meta_path == "helper_policies.future_plugin"
+    assert result.frames["_meta"] == frames["_meta"]
+    assert "name" in result.frames["characters"].columns
+
+
+def test_unhandled_helper_policy_subtree_without_matching_reference_does_not_block() -> None:
+    # References another frame's column and an unrelated column of the target
+    # frame: neither matches (frame, affected column), so the operation stays
+    # non-invasive for the unmaintained subtree.
+    meta = {
+        "helper_policies": {
+            "future_plugin": {
+                "targets": [
+                    {"frame": "places", "column": "name"},
+                    {"frame": "characters", "column": "notes"},
+                ],
+            }
+        }
+    }
+    frames = _base_frames(meta)
+
+    result = rename_column(frames, _rename())
+
+    assert not result.report.blocked
+    assert result.frames["_meta"]["helper_policies"] == meta["helper_policies"]
+    assert "display_name" in result.frames["characters"].columns
+
+
+def test_handled_fk_and_lookup_subtrees_stay_maintained_next_to_unhandled_ones() -> None:
+    meta = _fk_meta()
+    meta["helper_policies"]["lookup"] = _lookup_meta()["helper_policies"]["lookup"]
+    meta["helper_policies"]["future_plugin"] = {
+        "targets": [{"frame": "places", "column": "id"}]
+    }
+    frames = _base_frames(meta)
+
+    result = rename_column(frames, _rename(frame="places", source="name", target="label"))
+
+    assert not result.report.blocked
+    relation = result.frames["_meta"]["helper_policies"]["fk"]["relations"][0]
+    assert relation["helper_columns"][0]["target_field"] == "label"
+    policy = result.frames["_meta"]["helper_policies"]["lookup"]["places"]
+    assert policy["allowed_helpers"] == ["label"]
+    assert result.frames["_meta"]["helper_policies"]["future_plugin"] == (
+        meta["helper_policies"]["future_plugin"]
+    )
