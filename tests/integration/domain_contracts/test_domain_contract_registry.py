@@ -419,3 +419,74 @@ def test_promote_guard_rejects_missing_stamp(tmp_path: Path) -> None:
 
     assert not ok
     assert "Missing export stamp" in message
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 tables: features, meta reference surfaces, gap findings
+# (Review 005 Slice 1: rename_column metadata reference propagation).
+# ---------------------------------------------------------------------------
+
+def test_checker_rejects_feature_without_existing_transformation(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "transformation_features",
+        lambda rows: rows[0].__setitem__("transformation_id", "TRANS-DOES-NOT-EXIST"),
+    )
+
+    report = _check(registry, tmp_path)
+
+    assert ("transformation_features", "missing_reference") in _error_codes(report)
+
+
+def test_checker_rejects_uncontrolled_surface_policies(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "meta_reference_surfaces",
+        lambda rows: rows[0].__setitem__("rename_column_policy", "maybe"),
+    )
+    _edit_table(
+        registry,
+        "meta_reference_surfaces",
+        lambda rows: rows[1].__setitem__("maintenance_role", "sometimes"),
+    )
+
+    report = _check(registry, tmp_path)
+
+    codes = _error_codes(report)
+    assert ("meta_reference_surfaces", "invalid_rename_policy") in codes
+    assert ("meta_reference_surfaces", "invalid_maintenance_role") in codes
+
+
+def test_checker_rejects_gap_finding_with_missing_subject(tmp_path: Path) -> None:
+    registry = _copy_registry(tmp_path)
+    _edit_table(
+        registry,
+        "implementation_gap_findings",
+        lambda rows: rows[0].__setitem__("subject_id", "IMPL-DOES-NOT-EXIST"),
+    )
+
+    report = _check(registry, tmp_path)
+
+    assert ("implementation_gap_findings", "missing_reference") in _error_codes(report)
+
+
+def test_column_maintenance_transformation_is_linked_to_its_implementation() -> None:
+    tables = load_contract_tables(DEFAULT_REGISTRY_DIR)
+
+    links = [
+        row
+        for row in tables["transformation_implementation_links"]
+        if row["transformation_id"] == "TRANS-SCHEMA-COLUMN-MAINTENANCE"
+    ]
+    assert [(link["implementation_id"], link["relation"]) for link in links] == [
+        ("IMPL-DOMAIN-SCHEMA-COLUMNS", "implements")
+    ]
+
+    features = {
+        row["name"]
+        for row in tables["transformation_features"]
+        if row["transformation_id"] == "TRANS-SCHEMA-COLUMN-MAINTENANCE"
+    }
+    assert features == {"add_column", "drop_column", "rename_column", "reorder_columns"}

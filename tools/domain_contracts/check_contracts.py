@@ -103,6 +103,38 @@ TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "relation",
         "notes",
     ),
+    "transformation_features": (
+        "id",
+        "transformation_id",
+        "name",
+        "feature_kind",
+        "details",
+        "source_status",
+        "evidence",
+        "notes",
+    ),
+    "meta_reference_surfaces": (
+        "id",
+        "meta_root",
+        "path_pattern",
+        "target_kind",
+        "maintenance_role",
+        "rename_column_policy",
+        "drop_column_policy",
+        "owner",
+        "evidence",
+        "source_status",
+        "notes",
+    ),
+    "implementation_gap_findings": (
+        "id",
+        "subject_kind",
+        "subject_id",
+        "finding",
+        "disposition",
+        "source_refs",
+        "notes",
+    ),
     "glossary": ("term", "area", "explanation", "related to"),
     "principles": ("statements",),
 }
@@ -159,6 +191,25 @@ IMPLEMENTATION_UNIT_KINDS = frozenset(
 IMPLEMENTATION_LINK_RELATIONS = frozenset(
     {"implements", "partially_implements", "alternative_implementation", "supporting"}
 )
+FEATURE_KINDS = frozenset({"suboperation"})
+SURFACE_TARGET_KINDS = frozenset({"frame", "column", "column_list", "unknown"})
+SURFACE_MAINTENANCE_ROLES = frozenset({"supported", "blocked", "ignored", "reported", "unknown"})
+SURFACE_RENAME_POLICIES = frozenset({"update", "ignore", "block", "report", "unknown"})
+SURFACE_DROP_POLICIES = frozenset(
+    {"block", "block_unless_prune", "ignore", "report", "unknown"}
+)
+GAP_SUBJECT_KINDS = frozenset(
+    {"transformation", "implementation_unit", "meta_reference_surface", "process"}
+)
+GAP_DISPOSITIONS = frozenset({"open", "accepted", "resolved"})
+
+# Which table a gap finding's subject_id must resolve against, per subject_kind.
+# "process" findings have no id table; their subject_id is free text.
+GAP_SUBJECT_TABLES = {
+    "transformation": "transformations",
+    "implementation_unit": "implementation_units",
+    "meta_reference_surface": "meta_reference_surfaces",
+}
 
 # Controlled single-value vocabularies: (table, field) -> (allowed values, error code).
 CONTROLLED_VALUES: dict[tuple[str, str], tuple[frozenset[str], str]] = {
@@ -171,6 +222,22 @@ CONTROLLED_VALUES: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         IMPLEMENTATION_LINK_RELATIONS,
         "invalid_relation",
     ),
+    ("transformation_features", "feature_kind"): (FEATURE_KINDS, "invalid_feature_kind"),
+    ("meta_reference_surfaces", "target_kind"): (SURFACE_TARGET_KINDS, "invalid_target_kind"),
+    ("meta_reference_surfaces", "maintenance_role"): (
+        SURFACE_MAINTENANCE_ROLES,
+        "invalid_maintenance_role",
+    ),
+    ("meta_reference_surfaces", "rename_column_policy"): (
+        SURFACE_RENAME_POLICIES,
+        "invalid_rename_policy",
+    ),
+    ("meta_reference_surfaces", "drop_column_policy"): (
+        SURFACE_DROP_POLICIES,
+        "invalid_drop_policy",
+    ),
+    ("implementation_gap_findings", "subject_kind"): (GAP_SUBJECT_KINDS, "invalid_subject_kind"),
+    ("implementation_gap_findings", "disposition"): (GAP_DISPOSITIONS, "invalid_disposition"),
 }
 
 XREFS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -196,6 +263,7 @@ XREFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("transformation_id", "transformations"),
         ("implementation_id", "implementation_units"),
     ),
+    "transformation_features": (("transformation_id", "transformations"),),
 }
 
 # Comma-separated reference lists: every non-empty token must resolve.
@@ -374,6 +442,29 @@ def _validate_xrefs(tables: dict[str, list[dict[str, Any]]], errors: list[dict[s
                         )
 
 
+def _validate_gap_subjects(
+    tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
+) -> None:
+    ids = _ids_by_table(tables)
+    for index, row in enumerate(tables["implementation_gap_findings"]):
+        target_table = GAP_SUBJECT_TABLES.get(row.get("subject_kind"))
+        if target_table is None:
+            continue  # process findings, or an invalid kind already reported
+        subject_id = row.get("subject_id")
+        if subject_id not in ids[target_table]:
+            _error(
+                errors,
+                "implementation_gap_findings",
+                "missing_reference",
+                f"'subject_id' points to missing {target_table} id {subject_id!r}",
+                row_index=index,
+                id=_row_id("implementation_gap_findings", row),
+                field="subject_id",
+                value=subject_id,
+                target_table=target_table,
+            )
+
+
 def _validate_controlled_values(
     tables: dict[str, list[dict[str, Any]]], errors: list[dict[str, Any]]
 ) -> None:
@@ -513,6 +604,7 @@ def check_contracts(
     _validate_controlled_values(tables, errors)
     _validate_lifecycle_phase_sequences(tables, errors)
     _validate_xrefs(tables, errors)
+    _validate_gap_subjects(tables, errors)
     warnings = _collect_warnings(tables)
 
     report = {
