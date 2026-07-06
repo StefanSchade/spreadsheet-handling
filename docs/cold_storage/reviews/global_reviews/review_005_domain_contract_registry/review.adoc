@@ -1,0 +1,1091 @@
+= Review 005: Domain Contract Registry and Metadata Complexity
+:revdate: 2026-07-06
+:review-status: draft
+:review-type: adversarial architecture/model review
+:toc:
+:toclevels: 2
+
+== Purpose
+
+This review tests whether the domain-contract registry under
+`registries/domain_contracts/` can actually constrain transformation
+semantics, implementation drift, and metadata complexity - or whether it is
+on track to become another layer of vague documentation on top of the three
+metadata-describing artifacts the project already maintains
+(`registries/meta_registry.yaml`, `registries/pipeline_step_registry.json`,
+`docs/semantic_model/`).
+
+The review also tests the working hypothesis supplied with the review prompt:
+that parts of the early metadata model were AI-designed around generic
+categories ("canonical data", "meta authority") that were not directly derived
+from user requirements, and that documentation later preserved or amplified
+those assumptions. The hypothesis is treated as a claim to be verified against
+the repository, not as an accepted premise.
+
+== Scope
+
+Inspected areas:
+
+* `registries/domain_contracts/` (canonical, staging, seeds, pipelines, README)
+* `tools/domain_contracts/` (`check_contracts.py`, `render_contracts.py`, `workbook.py`)
+* `registries/meta_registry.yaml`, `registries/pipeline_step_registry.json`
+* Domain implementation: `src/spreadsheet_handling/pipeline/registry.py`,
+  `src/spreadsheet_handling/domain/meta_bootstrap.py`,
+  `src/spreadsheet_handling/domain/schema_maintenance/` (`operations.py`,
+  `meta_refs.py`, `meta_update.py`), transformation step modules referenced by
+  `implementation_units.json`
+* `docs/functional_model/` (esp. `ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`)
+* `docs/semantic_model/` (esp. `07_overlapping_semantic_sets.adoc`)
+* `docs/cold_storage/working_context/functional_model_inquiry/`
+  (esp. `metadata_foundations/app_boundary_meta_authority.adoc`,
+  `domain_reformation_strategy_inquiry.adoc`,
+  `adr_reviews/ADR-CONTRACT-FIRST-DOMAIN-META-REWRITE_review.adoc`)
+* `docs/cold_storage/reviews/global_reviews/review_002/` (final summary)
+* `docs/developer_guide/ch10_project_evolution/01_project_evolution.adoc`
+* `project_memory/README.adoc` (structure only)
+* Tests: `tests/integration/domain_contracts/`,
+  `tests/architecture/semantic_invariants/`
+* Makefile domain-contracts targets; git history of `registries/domain_contracts/`
+
+Explicit non-goals:
+
+* no code changes;
+* no registry patching (defects found in registry JSON are recorded as
+  findings, even trivial ones);
+* no broad ontology design;
+* no attempt to resolve every transformation or complete registry coverage.
+
+Release-notes checkpoint: not applicable - this is a review-only artifact with
+no user-facing change.
+
+== Executive Summary
+
+The registry's *direction* is sound and better grounded than its predecessors:
+`implementation_units.json` records dated, code-referenced observations;
+`transformation_implementation_links.json` makes drift queryable; the row
+notes honestly flag their own defects ("flagged, not changed"). This is the
+first artifact in the repository that puts intended transformations and
+observed implementation in the same joinable structure.
+
+However, the registry is *currently failing at exactly the thing it exists
+for*, and the failure is mechanical, not conceptual:
+
+1. **The canonical data no longer passes its own checker.** The
+   `transformations` table was reshaped on 2026-07-02/03 (commits `8c13476`,
+   `b29f9cf`) to a richer column set, but `tools/domain_contracts/check_contracts.py`
+   still validates the old columns. `make domain-contracts-check` reports 90
+   errors, and `tests/integration/domain_contracts/test_domain_contract_registry.py::test_domain_contract_seed_json_is_structurally_valid`
+   has been red in the active suite since then. The invariant loop exists and
+   was allowed to break.
+
+2. **The spreadsheet review loop is a loaded gun.** `staging/` still holds the
+   pre-reshape schema. `make domain-contracts-promote` bulk-copies
+   `staging/*.json` over `canonical/`. Running it today would silently destroy
+   every enriched field on all 30 transformation rows (`source_refs`,
+   `human_reviewed`, `notes`, all `meta_*` fields) - and the stale result
+   would then *pass* the stale checker.
+
+3. **The "requirement" concept is currently vacuous.** `requirements.json`
+   holds two rows, both of which are requirements *about the registry itself*
+   ("... should be reviewable as registry rows"). No user requirement is
+   recorded. Meanwhile the drift tooling labels transformations
+   `subject_kind: "requirement"`, conflating the two concepts in the one place
+   built to keep them apart.
+
+4. **Most transformation-row content is free prose** (`frames_in`,
+   `meta_workflow_prerequisites`, `meta_or_config_input`, ...) and
+   comma-separated ID lists that the checker cannot and does not validate.
+   These fields document; they cannot constrain.
+
+On the hypothesis: **partially confirmed, with an important correction.** The
+generic-category pattern is real - `canonical_meta` covers 26 of 35
+`meta_registry.yaml` entries (too broad to discriminate), the semantic model
+defines ~18 overlapping sets that remain "descriptive, not enforced", and the
+word "canonical" now has at least four distinct meanings in the repository.
+The documentation-amplification pattern is also real (see the unfalsifiable
+"meta loss is never data loss" axiom, FIN-REVIEW-005-P2-9). But the *core*
+lifecycle distinctions (projection scope, runtime resolution, boundary
+distrust) trace to concrete, observed failure modes and to human-authored
+inquiry documents - they are not ungrounded inventions. The dominant
+complexity driver documented in the repository is implementation sediment from
+fast feature delivery (FK/helper logic across ~20 modules, 8 of 39 registered
+steps), not the metadata ontology itself. The risk today is not that the old
+ontology was wrong, but that the project keeps adding parallel vocabularies
+instead of retiring any.
+
+== Method
+
+The review compared four layers pairwise:
+
+* *Intended model*: transformation rows, types, families, meta buckets,
+  lifecycle phases in `registries/domain_contracts/canonical/`.
+* *Observed implementation*: `pipeline/registry.py` step registrations, the
+  domain modules referenced from `implementation_units.json`, and
+  `schema_maintenance/` internals.
+* *Registry tooling*: `check_contracts.py`, `workbook.py`,
+  `render_contracts.py`, the Makefile export/import/promote loop, and the
+  tests that bind them.
+* *Documentation lineage*: functional model ch05, semantic model sets,
+  metadata-foundations inquiries, REVIEW-002 summary, ADR review, and the
+  project-evolution narrative.
+
+Cross-checks were executed, not read: the contract checker was run against
+canonical (90 errors), the domain-contracts integration test was run (red),
+canonical/staging schemas and row sets were diffed programmatically, code-step
+IDs were set-compared against `implementation_units.json` and
+`transformation_implementation_links.json`, and `_meta` root usage in `src/`
+was grepped against `meta_registry.yaml` entries.
+
+Evidence strength:
+
+* *Strong* (executed or directly read): checker failure, red test, staging
+  schema divergence, promote semantics, link coverage counts, drift-sheet
+  labeling, hardcoded reference-key frozensets in `meta_refs.py`.
+* *Medium* (single-source documentation reading): the intent behind
+  free-prose fields; the intended authority of each vocabulary.
+* *Inferred* (marked as such where used): authorship attribution
+  (AI-designed vs human-designed) is inferred from style, breadth, and the
+  evolution narrative; the repository does not record authorship per artifact.
+
+=== Validation commands
+
+[source,shell]
+----
+python3 tools/domain_contracts/check_contracts.py
+# -> build/domain_contracts/domain_contract_health.json, status=error, 90 errors,
+#    all (transformations, missing_field)
+
+.venv/bin/python -m pytest tests/integration/domain_contracts/ -x -q
+# -> FAILED ...::test_domain_contract_seed_json_is_structurally_valid
+
+diff -rq registries/domain_contracts/staging registries/domain_contracts/canonical
+# -> staging lacks implementation_units.json, transformation_implementation_links.json,
+#    glossary.json, principles.json, seeds/; transformations.json differs (old schema)
+----
+
+== Main Findings
+
+=== FIN-REVIEW-005-P1-1: Registry fails its own checker; active suite red since 2026-07-03
+
+Severity:: high
+Confidence:: high
+Primary area:: tests
+Finding type:: code/model drift
+
+Evidence::
+* `tools/domain_contracts/check_contracts.py` `TABLE_FIELDS["transformations"]`
+  requires `configuration_input`, `input_meta`, `output_meta`.
+* `registries/domain_contracts/canonical/transformations.json` uses
+  `meta_or_config_input`, `meta_in_buckets`, `meta_out_buckets`,
+  `meta_workflow_prerequisites`, `frames_in/out/consumed`, `source_*`,
+  `human_reviewed`, `notes`, `operation_locus`.
+* Executed: checker exits 1 with 90 `missing_field` errors;
+  `tests/integration/domain_contracts/test_domain_contract_registry.py::test_domain_contract_seed_json_is_structurally_valid`
+  fails; that test is inside the active suite (`make test` runs
+  `tests/integration`).
+* Git: canonical reshaped `2026-07-02/03` (`8c13476`, `b29f9cf`); checker last
+  touched `2026-06-30`.
+
+Problem::
+The data model was evolved by editing canonical JSON without evolving the
+checker, the export/import tooling, or the tests - and the resulting red suite
+was tolerated for several days of further commits. The checker additionally
+knows nothing about four canonical tables that exist on disk
+(`implementation_units`, `transformation_implementation_links`, `glossary`,
+`principles`) or any `seeds/` table, so the newest and most valuable tables
+have *no* structural validation at all.
+
+Practical risk::
+This is the registry's core failure mode happening in real time: the moment
+schema evolution outruns the checker, the checker stops being an invariant and
+becomes noise, red tests get normalized, and every subsequent edit is
+unvalidated. Six months of this and the registry is exactly the "vague
+documentation layer" the effort was meant to prevent.
+
+Recommendation::
+Treat "checker green on canonical" as a hard gate: update `TABLE_FIELDS` to
+the current schema, add the missing tables (including
+`implementation_units` and `transformation_implementation_links` with
+controlled `kind` and `relation` vocabularies), and adopt a working rule that
+canonical schema changes land in the same commit as the checker/test change.
+
+Follow-up target::
+test/check (plus a small implementation change in `check_contracts.py`)
+
+=== FIN-REVIEW-005-P1-2: `domain-contracts-promote` would silently destroy the enriched canonical data
+
+Severity:: high
+Confidence:: high
+Primary area:: process
+Finding type:: missing invariant
+
+Evidence::
+* `Makefile` `domain-contracts-promote`:
+  `cp -f "$(DOMAIN_CONTRACTS_STAGING_DIR)"/*.json "$(DOMAIN_CONTRACTS_CANONICAL_DIR)/"`
+  with no freshness or checker gate (only a directory-exists test).
+* Executed diff: `staging/transformations.json` still carries the old columns
+  (`configuration_input`, `input_meta`, `output_meta`); canonical carries 16
+  additional fields including `source_refs`, `human_reviewed`, `notes`.
+* `staging/` lacks `implementation_units.json`,
+  `transformation_implementation_links.json`, `glossary.json`,
+  `principles.json` - it is a stale snapshot from before those tables existed.
+* The committed `domain_contracts.ods` predates the canonical reshape as well.
+
+Problem::
+The ODS review loop (export -> human edit -> import -> promote) has no
+guarantee that staging derives from the *current* canonical state. Promote is
+a blind bulk copy. Today it would revert 30 transformation rows to the
+pre-review schema, erasing the human-review provenance - and the result would
+pass the (stale) checker, so nothing would catch it.
+
+Practical risk::
+One habitual `make domain-contracts-promote-reimport-checked` invoked from
+muscle memory destroys weeks of review work in a way that looks green. Note
+that `domain-contracts-check-reimport` diffs staging against canonical, but
+its output is advisory; `promote` does not depend on the diff being empty or
+even inspected, and `promote` alone has no dependency on `import` at all.
+
+Recommendation::
+Make promote refuse to run unless (a) staging was regenerated from the current
+canonical export in the same session (e.g. compare a content hash of the
+export snapshot), and (b) the checker passes on staging. Until then, either
+delete the stale `staging/` content and `domain_contracts.ods` or mark them
+unusable. Also decide whether the binary ODS belongs in git at all; a stale
+committed workbook is itself a drift source.
+
+Follow-up target::
+implementation change (Makefile/tooling guard)
+
+=== FIN-REVIEW-005-P1-3: "Requirement" is self-referential and conflated with "transformation"
+
+Severity:: high
+Confidence:: high
+Primary area:: registry
+Finding type:: conflation
+
+Evidence::
+* `registries/domain_contracts/canonical/requirements.json`: two rows, both of
+  the form "X should be reviewable as transformation-centric registry rows" -
+  requirements about the registry, not about user-visible system behavior.
+* `tools/domain_contracts/workbook.py` `add_implementation_drift_frame`:
+  transformation rows are emitted with `"subject_kind": "requirement"` and the
+  docstring describes the forward-drift quadrant as "requirement with no
+  implementation link" while iterating *transformations*.
+* `implementation_units.json`: 12 rows carry the note "no requirement row";
+  the drift model treats a transformation link as discharging that gap.
+* Demand-side evidence from
+  `adr_reviews/ADR-CONTRACT-FIRST-DOMAIN-META-REWRITE_review.adoc`: two of
+  three real consumers use only 3-4 registered steps; requirement pressure is
+  measurable but unrecorded.
+
+Problem::
+The registry's central promise is to distinguish "what users need" from "what
+we built" from "what we intend to build". Right now the requirements table
+cannot support that distinction (it is empty of user requirements), and the
+tooling actively substitutes transformations for requirements. A
+transformation row like `TRANS-PRUNE` is an *intent*, not a requirement; a
+requirement would be "diagnostic meta must not accumulate across git
+boundaries because users gitignore `_meta.yaml`" - which exists in the inquiry
+docs but not in the table.
+
+Practical risk::
+Forward drift becomes unmeasurable: every invented transformation
+self-justifies by appearing in the "requirement" column of the drift sheet.
+This is precisely how the FK-helper family grew to 8 steps without a single
+user-facing model deciding ownership (per the ADR review).
+
+Recommendation::
+Either populate `requirements.json` with a small number of real,
+consumer-anchored requirements (the three consumers - worldbuilding,
+personal_data, project_memory - give a concrete demand-side inventory), or
+rename the current rows to what they are (registry meta-goals) and mark the
+table explicitly as unpopulated. Fix `subject_kind` in the drift sheet to
+`transformation`.
+
+Follow-up target::
+registry change (plus a small tooling correction)
+
+=== FIN-REVIEW-005-P1-4: The transformations table is dominated by unenforceable prose fields
+
+Severity:: high
+Confidence:: high
+Primary area:: registry
+Finding type:: missing boundary
+
+Evidence::
+* `canonical/transformations.json`: `frames_in`, `frames_out`,
+  `frames_consumed`, `meta_workflow_prerequisites`, `meta_or_config_input`,
+  `meta_output_content`, `meta_output_consumer`, `meta_output_loss_risks` are
+  free German/English prose ("the remvoal of the helper columns applies to the
+  whole workbook, so there is no real input required").
+* `meta_in_buckets` / `meta_out_buckets` are comma-separated ID strings; the
+  checker's xref machinery only validates scalar fields, so these references
+  are never checked (and cannot be, in current form).
+* The field name `meta_or_config_input` itself concedes that the meta/config
+  boundary is not drawn; `principles.json` codifies the blur ("transformations
+  receive their input either from config ... or from meta ... or a
+  combination").
+* Contrast: `transformation_meta_io.json` shows the enforceable alternative
+  (path, direction, role, required, persistence_expectation) but has only 3
+  rows.
+
+Problem::
+Nine of the ~16 columns on the registry's anchor table can only be read by a
+human, cannot be validated, diffed semantically, or consumed by a checker, and
+duplicate content that belongs in the functional model chapters they cite.
+The one boundary the registry most needs to draw - config-supplied intent vs
+meta-carried intent - is explicitly merged into a single column.
+
+Practical risk::
+Prose columns rot fastest: they are expensive to review in an ODS grid, nobody
+updates them when behavior changes, and in six months they will disagree with
+both code and docs while still looking authoritative. The table's size (46 KB
+for 30 rows) already makes whole-table review impractical.
+
+Recommendation::
+Narrow the anchor table to identity, classification, status, and links (id,
+name, type, family, exposure, inverse, one-line details, source_*,
+human_reviewed, notes). Move meta IO to `transformation_meta_io` rows (see
+P2-6), move frame IO to the seed `transformation_frame_io` shape
+(pattern/direction/role/required), and split `meta_or_config_input` into
+config-source rows (`transformation_config_sources` seed shape) vs meta-read
+rows. Loss-risk prose belongs in lifecycle notes or the functional model, once,
+not per-row.
+
+Follow-up target::
+registry change
+
+=== FIN-REVIEW-005-P2-5: Meta IO is modeled at three competing granularities across two registries
+
+Severity:: medium
+Confidence:: high
+Primary area:: metadata
+Finding type:: conflation
+
+Evidence::
+* Granularity 1: `meta_in_buckets`/`meta_out_buckets` per transformation row
+  (all 30 rows).
+* Granularity 2: `transformation_meta_io.json` with concrete `meta_path`
+  (`_meta.helper_policies.fk`, `_meta.derived.sheets.*.helper_columns`) - 3
+  rows, FK family only.
+* Granularity 3: `registries/meta_registry.yaml` - 35 entries with
+  producer/consumer lists naming the same steps
+  (`domain.meta_bootstrap.bootstrap_meta`, etc.), maintained under its own
+  contract (`runtime_binding: forbidden`) and guarded by
+  `tests/architecture/semantic_invariants/test_meta_registry*.py`.
+
+Problem::
+The same fact - "step X reads/writes meta path Y" - now has three homes with
+no join between them. `transformation_meta_io.meta_path` strings are not
+validated against `meta_registry.yaml` entry names, and bucket tags are not
+validated against anything. Three partially-populated inventories of one
+relation is worse than one, because each gives the reader false confidence
+that it is the complete one.
+
+Practical risk::
+The registries answer the same question differently within a release or two.
+Reviewers stop trusting all three. Metadata growth becomes *less* visible
+because each new meta path can be recorded in whichever inventory is cheapest
+(or none) while appearing accounted-for.
+
+Recommendation::
+Declare `meta_registry.yaml` the sole owner of meta *paths* (it already has
+the strongest guards) and make `transformation_meta_io` a thin join table:
+`transformation_id` x `meta_registry_entry_name` x direction/required. Keep
+buckets only as an attribute *of meta_registry entries* (or of meta_io rows),
+not as free-text tags on transformation rows. Do not attempt this migration
+before P1-1/P1-2 are fixed.
+
+Follow-up target::
+registry change
+
+=== FIN-REVIEW-005-P2-6: Fourth parallel metadata vocabulary; "canonical" has four meanings
+
+Severity:: medium
+Confidence:: high (existence of the parallel vocabularies); medium (authorship attribution)
+Primary area:: documentation
+Finding type:: conflation
+
+Evidence::
+* Vocabulary 1: `meta_registry.yaml` classifications (`canonical_meta`,
+  `derived_operational_view`, `carrier_artifact`, `read_path_hint`) -
+  distribution measured: 26/35 entries are `canonical_meta`.
+* Vocabulary 2: `docs/semantic_model/07_overlapping_semantic_sets.adoc` - ~18
+  overlapping sets (Canonical, Derived, Persistent, Transient,
+  RoundtripRelevant, ..., TransitionBridge), explicitly "descriptive and
+  rule-ready, not yet enforced by code".
+* Vocabulary 3: functional model ch05/03 lifecycle attributes
+  (`drop_at_persistence`, `drop_if_stale`, `carrier_takes_precedence`,
+  `required`, `render_consumed`) - "conceptual names, not yet formal".
+* Vocabulary 4 (new): `meta_buckets.json` lifecycle labels (`durable_intent`,
+  `workflow_intent`, `until_inverse_projection`, `runtime_or_until_consumed`,
+  `user_carried_intent`, `render_only`).
+* "Canonical" meanings: (a) `canonical_meta` classification; (b) semantic-set
+  *Canonical* ("authoritative for reconstructed domain output"); (c)
+  functional model's "meta is not canonical payload"; (d)
+  `registries/*/canonical/` directory = curated registry data (vs staging).
+
+Problem::
+This is where the review hypothesis partially holds. A classification that
+covers 74% of entries (`canonical_meta`) discriminates almost nothing; the
+18-set taxonomy has produced careful membership statements for exactly one
+family (FK helpers) in over a month; and each new modeling wave (semantic
+model May 2026, functional model recut June 2026, meta buckets July 2026)
+added a vocabulary without retiring or mapping the previous one. REVIEW-002
+explicitly warned against a "universal meta engine"; the taxonomies avoided
+the engine but kept the universality. Uncertainty note: attribution of the
+early categories to AI design is *inferred* from breadth/style and the
+evolution narrative ("AI-designed" is not recorded anywhere); what is
+verifiable is that the categories are broader than their demonstrated use.
+
+Practical risk::
+Every future contract discussion pays a translation tax across four
+vocabularies. New contributors (and agents) cannot tell which vocabulary is
+load-bearing, so they cite whichever they read last - documentation then
+amplifies whichever taxonomy was cited, exactly the amplification pattern the
+hypothesis describes.
+
+Recommendation::
+Do not design a fifth, unifying ontology. Instead publish one small mapping
+table (bucket -> meta_registry classification -> the 3-4 semantic sets that
+are actually consulted in reviews) and explicitly mark the rest of the
+semantic-set catalogue as historical/reference. Split the `canonical_meta`
+classification only when a concrete check needs the distinction.
+
+Follow-up target::
+documentation correction
+
+=== FIN-REVIEW-005-P2-7: The inverse relation is encoded in three places and already disagrees
+
+Severity:: medium
+Confidence:: high
+Primary area:: registry
+Finding type:: unmaintainable model
+
+Evidence::
+* Encoding 1: `transformations.inverse_transformation_id` (populated on most
+  projection rows).
+* Encoding 2: `trans_type` = `TRANS-TYPE-PROJECTION` vs
+  `TRANS-TYPE-PROJECTION-INVERSE` (directionality as a type).
+* Encoding 3: `transformation_links.json` with relations
+  `inverse`/`cleanup_inverse` - populated for exactly one pair (FK
+  enrich/drop), i.e. ~5% coverage.
+* Already inconsistent: `TRANS-FLATTEN_OBJECT_TO_COLUMN.inverse_transformation_id`
+  -> `TRANS-SPLIT-XREF-TO-SEPARATED` and
+  `TRANS-UNFLATTEN_COLUMN_TO_OBJECT` -> `TRANS-SEPARATED-TO-XREF` (both wrong,
+  and to the row's credit, flagged in `notes`); the checker validates that the
+  target *exists*, not that inverse pairs are symmetric.
+
+Problem::
+Three representations of one relation guarantee divergence. The links table
+adds nothing today that `inverse_transformation_id` does not already provide,
+and the type-level PROJECTION/PROJECTION-INVERSE split double-encodes
+direction that the pair relation already implies.
+
+Practical risk::
+Queries and rendered views computed from different encodings will give
+different answers about which transformations are roundtrip-capable - the
+single most important property the registry is supposed to make reviewable.
+
+Recommendation::
+Keep `inverse_transformation_id` as the single source; add a symmetry check
+(A.inverse = B implies B.inverse = A) to the checker; drop or freeze
+`transformation_links` until a relation appears that is genuinely not
+expressible on the row (`wraps` for the multiaxis wrapper would be the first
+real case). Reconsider whether PROJECTION-INVERSE needs to be a *type* rather
+than a derived property.
+
+Follow-up target::
+registry change + test/check
+
+=== FIN-REVIEW-005-P2-8: Intended and observed rows share one table with a single soft status
+
+Severity:: medium
+Confidence:: high
+Primary area:: registry
+Finding type:: missing boundary
+
+Evidence::
+* All 30 transformation rows carry `source_status: "candidate"`; there is no
+  `accepted`/`implemented` status vocabulary and no checker enforcement of
+  `source_status`/`source_kind` values (fields are not even in
+  `TABLE_FIELDS`).
+* Unimplemented, future-concept rows (`TRANS-MERGE-LIST-TO-SEPARATED`,
+  `TRANS-PRUNE`, nested family) carry `pipeline_exposed: true` - a claim about
+  runtime surface that is false today (`pipeline/registry.py` has no such
+  steps). `TRANS-PRUNE.notes` flags the conflict but the value stands.
+* 16 transformations have no implementation link; 16 implementation units
+  have no transformation link; the gap-findings artifact
+  (`implementation_gap_findings.json`) does not exist yet, so "known gap" and
+  "unreviewed gap" are indistinguishable.
+
+Problem::
+The table mixes three assertion kinds - "users need this", "we intend this",
+"the code does this" - distinguished only by free-text notes and a
+non-validated status field. `pipeline_exposed` silently shifts meaning between
+"is exposed" (observed rows) and "should be exposed" (candidate rows).
+
+Practical risk::
+A reader (or agent) doing pipeline work trusts `pipeline_exposed: true` and
+references a step that does not exist; conversely, drift metrics
+over-count because concept rows and observed rows are weighted identically.
+
+Recommendation::
+Add a controlled status axis to the checker (`candidate` /
+`accepted_unimplemented` / `implemented` / `deprecated`, or reuse the
+lifecycle-note status vocabulary), define `pipeline_exposed` as *observed
+runtime truth only* (must be empty/false on unimplemented rows), and create
+`implementation_gap_findings.json` so the 32 unlinked rows each become either
+a link or an explicit gap finding.
+
+Follow-up target::
+registry change + gap finding
+
+=== FIN-REVIEW-005-P2-9: Documentation preserves an unfalsifiable meta axiom that the registry itself contradicts
+
+Severity:: medium
+Confidence:: high
+Primary area:: documentation
+Finding type:: documentation drift
+
+Evidence::
+* `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`:
+  "Loss of meta is at most an inconvenience, never a data loss." followed by:
+  "If a current or future feature stores essential long-term information only
+  in `_meta`, that is a design gap / technical debt, not a counterexample to
+  the rule."
+* Same document: "Meta does not enter from outside; no external import of
+  meta." - while the workbook-embedded `_meta` carrier is persistent, *not*
+  gitignored (stated in the same document's carrier table), and is read back
+  by the parser; the app-boundary inquiry explicitly warns that meta "may be
+  imported back and forth across the application boundary - so it might be
+  corrupted".
+* Registry rows document concrete data-loss consequences of meta loss:
+  `TRANS-COMPACT-CODEC` ("the expansion may become impossible"),
+  `TRANS-ENRICH-FK-HELPERS` (helper columns "written as structured data
+  creating redundancy and conflicts"), `TRANS-SPLIT-BY-DISCRIMINATOR` ("losing
+  the split mapping prevents restoring the discriminator").
+
+Problem::
+The axiom is stated as a property of the system but defended as a design
+*goal*: any observed counterexample is reclassified as a gap, so the sentence
+can never be false. This is the clearest instance of the
+documentation-amplification pattern named in the review hypothesis: a clean
+early principle survives by redefinition while the registry and the inquiry
+docs accumulate the exceptions. `META-BUCKET-PROJECTION-SCOPE`
+(`until_inverse_projection`, persisted) is precisely meta whose loss *is* a
+data-integrity event, and the registry says so.
+
+Practical risk::
+Engineers make persistence-boundary and prune decisions ("it's only meta, meta
+loss is harmless") that the loss-risk rows explicitly warn against. The two
+statements cannot both guide a prune implementation.
+
+Recommendation::
+Reword the axiom as the design rule it is, with its enforcement surface: "meta
+loss must never cause payload data loss; buckets PROJECTION-SCOPE and
+RUNTIME-RESOLUTION are the current exceptions, tolerated only inside an
+unbroken projection->inverse window; the prune/persistence contract is where
+this rule is enforced." Fix or scope the "meta does not enter from outside"
+claim to `_meta.yaml` sidecars.
+
+Follow-up target::
+documentation correction
+
+=== FIN-REVIEW-005-P3-10: Load-bearing ID typos, duplicate names, and prototype leftovers
+
+Severity:: low
+Confidence:: high
+Primary area:: registry
+Finding type:: unmaintainable model
+
+Evidence::
+* `TRANS-FAMIILY-SCHEMA-MAINTENANCE` (double I) exists in *both*
+  `transformation_families.json` and six transformation rows - the typo is
+  referentially consistent, so the xref check protects it forever.
+* Three rows share the `name` values `merge_list_to_separated` /
+  `split_list_to_separated` (`TRANS-SEPARATED-TO-XREF` and
+  `TRANS-SPLIT-XREF-TO-SEPARATED` carry copy-paste names); row notes flag
+  this but no checker enforces name uniqueness.
+* `seeds/` contains parallel prototype duplicates: `t_frame_io.json` ==
+  `transformation_frame_io.json` (same fields), `t_links.json`,
+  `t_requirements.json` beside the canonical tables of the same meaning; plus
+  an embryonic second ontology (`concepts.json`, `rules.json`,
+  `concept_requirements.json`, `rule_requirements.json`) with 2 rows each.
+* `principles.json` is one row of untyped prose with multiple typos.
+* `TRANS-TYPE-CARRIER` and `TRANS-TYPE-EXTRACTION` are defined but unused by
+  any row; `TRANS-FAMILY-TYPED-CELLS` / `-DYNAMIC-PROJECTIONS` likewise.
+
+Problem::
+Individually trivial; collectively they signal that table hygiene has no
+owner and no gate. The typo case is instructive: because IDs are referenced,
+cleanup requires a coordinated rename the tooling does not support -
+ironically the exact `rename_*`/reference-propagation problem the registry
+models for payload data.
+
+Practical risk::
+IDs become permanent embarrassments; duplicate names break the workbook
+review loop's usability (a reviewer filtering by name gets wrong rows); the
+seeds duplicates get divergent edits.
+
+Recommendation::
+One small cleanup pass after P1-1: name-uniqueness check, delete the `t_*`
+duplicates, decide keep/postpone for `concepts`/`rules` (recommendation:
+postpone - see table assessment), fold `principles.json` into the README or
+delete it, and either use or remove unused type/family rows.
+
+Follow-up target::
+registry change
+
+=== FIN-REVIEW-005-P3-11: Lifecycle-matrix reimport silently deletes and default-stamps notes
+
+Severity:: low
+Confidence:: high
+Primary area:: registry
+Finding type:: missing invariant
+
+Evidence::
+* `tools/domain_contracts/workbook.py` `_build_lifecycle_notes_from_matrix`:
+  a note whose matrix cell is blank after editing is dropped (delete-on-blank,
+  undocumented); a new cell creates a note with `role=open_question`,
+  `status=draft_inferred`, `source_refs=""`.
+* `role`, `status`, and `source_refs` are not present in the matrix sheet at
+  all, so the ODS loop cannot edit them - only preserve or default them.
+* All 25 current lifecycle notes are `status=draft_inferred`; none has ever
+  been promoted to `reviewed`/`approved`.
+
+Problem::
+The spreadsheet loop's write-back semantics for lifecycle notes are lossy and
+partially hidden: a reviewer clearing a cell to "tidy up" deletes a note, and
+the status field that is supposed to record review progress is unreachable
+from the review surface. Meanwhile the status vocabulary exists but the whole
+table sits at its weakest value, so "draft" conveys no information.
+
+Practical risk::
+Review effort leaks: notes vanish without trace in a promote, and the
+draft->reviewed ratchet that would show model consolidation never moves.
+
+Recommendation::
+Document delete-on-blank in the README (or require an explicit `DELETE`
+token); add `role`/`status` columns to the matrix or accept that the matrix
+edits details only; add a checker warning when `human_reviewed=true` rows cite
+only `draft_inferred` lifecycle notes.
+
+Follow-up target::
+implementation change (tooling) + test/check
+
+== Boundary Review
+
+Where the concepts are currently too easy to conflate:
+
+transformation vs implementation unit::
+The best-drawn boundary in the registry - separate tables, dated
+observations, explicit link relations. Weakness: `relation` values
+(`implements`, `partially_implements`, `alternative_implementation`,
+`supporting`) are uncontrolled by the checker, and "alternative_implementation"
+already absorbs what may be genuinely different transformations
+(`add_lookup_helpers` vs `add_fk_helpers` - the ADR review treats
+lookup-vs-FK as an open modeling question, the link table quietly answers it).
+
+transformation vs requirement::
+Currently collapsed (P1-3). The drift tooling literally labels
+transformations "requirement". Until `requirements.json` holds real user
+requirements, every forward-drift statistic is a statement about intent
+coverage, not need coverage.
+
+transformation vs feature/option::
+No representation for options exists except prose in `meta_or_config_input`
+("Shorthand options should be available..."). Risk: options get promoted to
+transformation rows to become visible (the existence-attribute pair
+`TRANS-EXTEND/DROP-XREF-EXISTENCE-ATTRIBUTE` is arguably an option of the
+xref family modeled as two transformations). Decide the rule: an option
+changes behavior of one transformation; a transformation changes frames/meta.
+
+transformation vs config generation::
+`TRANS-TYPE-CONFIGURATION` rows (`helper_config`,
+`adjust_presentation_names`) do not transform payload; they produce intent.
+They sit in the same table with `frames_in/out` columns that do not apply
+(left empty or prose-apologized). Tolerable now, but the type deserves a note
+that frame IO columns are undefined for it.
+
+meta attribute vs meta reference surface::
+Sharp in code, absent in the registry: `schema_maintenance/meta_refs.py`
+hardcodes which meta keys are frame/column *references*
+(`FRAME_KEYS`, `COLUMN_KEYS`, `COLUMN_LIST_KEYS`, `SUPPORTED_ROOT_NAMES`,
+`BLOCKED_ROOTS_BY_NAME`). Neither `meta_registry.yaml` nor the domain
+contracts declare "this attribute references a column name and must follow
+renames". This is the single most valuable missing declaration (see next
+slice).
+
+config vs runtime resolution::
+Well-separated conceptually (buckets TRANSFORMATION-INTENT vs
+RUNTIME-RESOLUTION) but merged in the anchor table's `meta_or_config_input`
+column and in `principles.json`.
+
+presentation intent vs readback support surface::
+The presentation-meta roundtrip (carrier-observed widths merged into meta with
+carrier precedence) is documented in ch05/03 and implemented; but
+`TRANS-PRESENTATION-ADJUST-NAMES` models presentation naming as a
+transformation while the functional model treats workbook presentation as a
+lifecycle attribute - the row's own notes flag the tension. Keep it flagged;
+do not resolve in the registry.
+
+readback support surface vs schema maintenance::
+`drop_legend`'s notes correctly separate "render composition" from "read-path
+classification" from "persistence-time prune". That three-way split (who keeps
+a derived surface out of payload: the reader, the pruner, or the inverse step)
+is the pattern to reuse; the cold-storage lifecycle notes that blur it are
+flagged but not yet reconciled.
+
+schema maintenance::
+Reverse-drift showcase: registry rows are table/key-level
+(`add_table`, `rename_key`), code is column-level only
+(`schema_maintenance/operations.py`), and both sides say so in notes. The
+boundary at risk is not table-vs-column but "schema maintenance updates
+references deterministically" vs "query_replace edits payload with user-owned
+integrity" - currently held apart only by row notes.
+
+== Registry Table Assessment
+
+[cols="1,1,2,3"]
+|===
+|Table / concept |Decision |Reason |Risk if mishandled
+
+|`transformations`
+|keep but narrow
+|Anchor table; identity/classification/links are sound, prose columns are not (P1-4)
+|46 KB of prose rots into a second, wrong functional model
+
+|`transformation_types`
+|keep but narrow
+|Small controlled vocabulary, but 2 of 10 types unused; PROJECTION-INVERSE double-encodes direction (P2-7)
+|Types multiply to describe rows instead of constraining them
+
+|`transformation_families`
+|keep now
+|Cheap grouping, matches code package structure; fix typo ID
+|Low
+
+|`requirements`
+|keep but narrow
+|Concept is essential; current content vacuous (P1-3)
+|Registry certifies intent as need; forward drift unmeasurable
+
+|`transformation_requirements`
+|keep now
+|Thin join; worthless until requirements are real, harmless meanwhile
+|Low
+
+|`implementation_units`
+|keep now
+|Best table in the registry: dated, code-referenced, observed-only
+|Snapshot dates rot silently without a re-verification cadence
+
+|`transformation_implementation_links`
+|keep now
+|The drift detector; add controlled `relation` vocab to checker
+|"alternative_implementation" quietly resolves open modeling questions
+
+|`meta_buckets`
+|keep but narrow
+|Grounded in the human-authored inquiry taxonomy; must be mapped to `meta_registry` classifications, not grow beside them (P2-6)
+|Fifth metadata vocabulary consolidates
+
+|`transformation_meta_io`
+|keep but narrow
+|Right shape (path/direction/role/required/persistence); should join to `meta_registry.yaml` entries instead of free-string paths (P2-5)
+|Three competing meta-IO inventories, none complete
+
+|`lifecycle_phase`
+|keep now
+|Eight rows, stable, matches the functional model's Type-2 event narrative
+|Low
+
+|`transformation_lifecycle_notes`
+|keep but narrow
+|Valuable content, but 25/25 `draft_inferred` and lossy ODS write-back (P3-11); cap growth until a promotion ratchet exists
+|Grows as unreviewed prose; deletions silent
+
+|`transformation_links`
+|postpone
+|~5% coverage; redundant with `inverse_transformation_id` (P2-7); revive only for `wraps`
+|Divergent inverse answers
+
+|`glossary`
+|keep now
+|Three genuinely project-specific terms (xref, false xref, crosstable); cheap
+|Low
+
+|`principles`
+|reject
+|One untyped prose row; belongs in README/functional model
+|Pseudo-authority for an unowned sentence
+
+|`seeds/t_frame_io`, `t_links`, `t_requirements`
+|reject
+|Prototype duplicates of canonical/seed tables of the same meaning
+|Divergent edits to twins
+
+|`seeds/transformation_frame_io`
+|postpone
+|Right shape for the P1-4 narrowing, but do not populate before the anchor table is narrowed
+|Another half-filled inventory
+
+|`seeds/transformation_config_sources`
+|postpone
+|The config/meta boundary needs it eventually (P1-4), after meta_io is settled
+|Same
+
+|`seeds/concepts`, `rules`, `concept_requirements`, `rule_requirements`
+|postpone
+|A second ontology (concept/rule) with 2 rows each; exactly the "broad ontology" the effort forswears
+|Ontology-building displaces drift-tracking
+
+|`staging/` + `domain_contracts.ods`
+|unclear
+|The review-loop mechanism is legitimate but currently stale and dangerous (P1-2); keep the mechanism, never keep stale snapshots in git
+|Silent canonical clobber
+|===
+
+== Metadata Complexity Assessment
+
+Is the registry likely to constrain `_meta`, or merely document it?::
+As built: document only. Nothing in the runtime reads the domain-contracts
+registry (correctly so), and the only enforcement path - checker + tests - is
+currently red and covers neither the meta tables' reference fields nor the
+newest tables. The realistic constraint path is indirect: checker-enforced
+join integrity (meta_io -> meta_registry entries -> code refs that must
+resolve, which `test_meta_registry_code_references_resolve_or_are_explicitly_narrative`
+already proves is possible). Constraint is achievable, but only through the
+meta_registry join, not through prose columns.
+
+What would make metadata growth visible?::
+(a) A failing diff between `_meta` roots observed in `src/` (grep-derived,
+as this review did) and `meta_registry.yaml` entries - today the entries
+cover the observed roots, so the check is cheap to add while it is green.
+(b) Row counts per bucket/persistence class trended in
+`domain_contract_health.json` (the report already counts rows; add per-bucket
+counts). (c) A rule that every new `meta_out_buckets` value on an implemented
+transformation requires a matching `transformation_meta_io` row.
+
+What would keep metadata ownership explicit?::
+`meta_registry.yaml` already requires producer/consumer per entry - that is
+the ownership record. The gap is durability policy: `persisted:
+"conditional"` (RUNTIME-RESOLUTION bucket) names no condition and no owner of
+the condition. Each conditional entry should name the consuming inverse step
+or the prune policy that discharges it.
+
+Which metadata concepts are still too vague?::
+"canonical" (four meanings, P2-6); `persisted: conditional` (no condition);
+`carrier_scope: meta_payload_or_pipeline_config` on
+META-BUCKET-TRANSFORMATION-INTENT (the or is the config/meta boundary,
+undrawn); "meta authority" as used in inquiry docs (a direction, not a rule -
+acceptable in cold storage, not citable as contract).
+
+Which metadata paths or roots appear risky or under-owned?::
+`_meta.derived.*` (broad transient namespace whose cleanup depends on
+provenance surviving exactly long enough - the FK contract matrix covers the
+FK slice, the namespace has more tenants);
+`_meta.split_by_discriminator` (projection-scope evidence with
+`until_inverse_projection` durability and no prune owner);
+`workbook_meta_blob` and `options` (registry entries whose names promise
+little and can absorb anything); the `sheets.*` presentation subtree
+(carrier-precedence merge on every read path - correct per ch05/03, but it
+makes every read a meta *writer*, which no transformation row models).
+
+== Minimum Viable Registry Model
+
+Required now (must be green and gated):
+
+* `transformations` narrowed to identity/classification/status/links
+  (P1-4 field set), with a controlled implementation-status axis (P2-8);
+* `transformation_types`, `transformation_families`, `lifecycle_phase`
+  (small vocabularies, checker-controlled);
+* `implementation_units` + `transformation_implementation_links` with
+  controlled `kind`/`relation` values;
+* `implementation_gap_findings.json` (new, small: id, subject id,
+  finding, disposition) so unlinked rows are either linked or acknowledged;
+* the checker validating *all* of the above, wired so `make ci`/the active
+  suite cannot be green while the registry is invalid (already true via the
+  integration test - keep it, fix it).
+
+Useful soon:
+
+* `requirements` + `transformation_requirements` populated from the three
+  real consumers' demand side (start with <=10 rows);
+* `transformation_meta_io` as a join to `meta_registry.yaml` entry names,
+  populated only for implemented transformations, FK family first;
+* `glossary` growth as terms actually recur in reviews.
+
+Postpone:
+
+* lifecycle-note expansion beyond the current 25 (and any status promotion
+  machinery) until the ODS loop is safe (P1-2, P3-11);
+* `transformation_links`, `transformation_config_sources`,
+  `transformation_frame_io` population;
+* `concepts`/`rules` seed ontology;
+* any bucket/classification/set unification beyond the one mapping table
+  (P2-6).
+
+== Proposed Invariants and Checks
+
+Concrete, implementable later, roughly in order of value:
+
+. *Checker green is a suite invariant* - already structurally true via
+  `test_domain_contract_seed_json_is_structurally_valid`; the invariant to add
+  is procedural: canonical schema changes and checker changes land together
+  (enforceable as a paired-path guard in CI if wanted).
+. *No promote of stale staging* - `domain-contracts-promote` fails unless
+  staging was produced from the current canonical export (hash stamp) and
+  passes the checker.
+. *No accepted transformation without implementation status* - controlled
+  `source_status`; `pipeline_exposed=true` permitted only when an
+  `implements`-relation link exists to a `registered_step` unit whose
+  `registered_step_id` resolves against `pipeline/registry.py` (the
+  set-comparison this review ran, automated).
+. *No implementation unit without transformation link or explicit gap
+  finding* - link table union gap-findings table must cover
+  `implementation_units` (16 rows currently fail this).
+. *Inverse symmetry* - `A.inverse_transformation_id == B` implies the
+  converse; inverse pairs may not share a `name`.
+. *Name uniqueness* across transformations (three violations today).
+. *Bucket references validate* - split `meta_in_buckets`/`meta_out_buckets`
+  on commas and xref each token, or move to list-valued fields.
+. *No new `_meta` root without a registry entry* - diff `_meta` root usage in
+  `src/` against `meta_registry.yaml` entry names (green today; cheapest time
+  to add).
+. *No meta write without declared producer* - every `transformation_meta_io`
+  `write` row's path must match a `meta_registry.yaml` entry that lists the
+  linked implementation unit among its producers.
+. *No derived review sheet persisted back to JSON* - already implemented in
+  `normalize_reimported_contract_frames` for the two derived sheets; add the
+  missing test asserting the drift sheet (not only the matrix) is dropped.
+. *No schema-maintenance reference handling for undeclared meta paths* -
+  longer term: `meta_refs.py` frozensets generated from, or checked against,
+  registry declarations (see next slice).
+
+== Failure Modes
+
+What would make this effort fail after six months:
+
+* *Tolerated red.* The checker/test stays red (or gets skipped to "unblock"
+  work), edits continue, and by month six the registry is unvalidated prose
+  with JSON syntax. This is not hypothetical - it is the current state, three
+  days in.
+* *One bad promote.* The stale-staging clobber (P1-2) fires once, review
+  provenance is lost or force-recovered from git, and contributors stop
+  trusting the ODS loop - after which the registry is edited ad hoc or not at
+  all.
+* *Prose accretion.* Rows keep growing free-text columns because prose is
+  easier to write than to model; whole-table review becomes a multi-hour task
+  nobody schedules; rows silently diverge from code that keeps moving
+  (snapshot dates already need a re-verification cadence).
+* *Vocabulary N+1.* The bucket taxonomy drifts from meta_registry
+  classifications and semantic sets; each review cites a different vocabulary;
+  the registry becomes the fourth thing to reconcile instead of the thing that
+  reconciles.
+* *Everything stays "candidate".* No promotion ratchet ever moves
+  `source_status`/lifecycle-note `status`, so the registry never acquires
+  authority over anything, and the first contributor to notice stops
+  consulting it.
+* *Ontology displacement.* Energy flows into completing concepts/rules/
+  frame-IO/config-source tables (satisfying, unbounded) instead of the drift
+  loop (uncomfortable, bounded). The prompt's own instinct - "not another
+  broad ontology" - is the right one; the seeds directory shows the pull
+  exists.
+* *Single-maintainer coupling.* The whole loop (export, Calc review, import,
+  promote, checker) currently assumes one person who knows which snapshot is
+  fresh. Any second contributor - human or agent - lacks the implicit state.
+
+== Recommended Next Slice
+
+Two-part recommendation; the parts are ordered, not alternatives.
+
+*Slice 0 (days, blocking): repair the loop.* Fix the checker schema to match
+canonical (P1-1), extend it to the untracked tables, regenerate
+`domain_contracts.ods` and `staging/` from current canonical, and gate
+`promote` on freshness + checker (P1-2). Nothing else in this review is safe
+to act on while writing to the registry can silently destroy it. This slice is
+small, mechanical, and immediately turns the registry's main risk into its
+main proof: the drift the registry is supposed to catch was caught (by this
+review) using the registry's own tooling.
+
+*Slice 1 (the white-box slice): column schema maintenance / `rename_column`
+metadata reference propagation - confirmed, with a sharpened target.* The
+prompt's expected candidate survives challenge, and the code says why:
+`schema_maintenance/meta_refs.py` hardcodes which meta keys denote frame and
+column references (`FRAME_KEYS`, `COLUMN_KEYS`, `COLUMN_LIST_KEYS`,
+`SUPPORTED_ROOT_NAMES`, `BLOCKED_ROOTS_BY_NAME`) as name-convention
+frozensets. Any new meta attribute holding a column name that does not match
+these conventions silently escapes rename propagation - the exact
+"metadata growth invisible to its consumers" failure the registry exists to
+prevent, and unlike most candidates it has an implemented, tested code
+surface on both sides. The slice: declare reference-role per meta attribute
+(in `meta_registry.yaml`, joined from `transformation_meta_io`), then check -
+not generate, in the first pass - `meta_refs.py`'s frozensets against those
+declarations, and record every mismatch as a gap finding. That is a real
+constrain-vs-document experiment with a falsifiable outcome.
+
+Alternatives considered and rejected as first white-box slice: FK-helper
+contract completion (biggest surface, but already has the contract-matrix
+pilot; marginal learning lower), prune/persistence-boundary contract (higher
+concept risk, no implemented step to anchor against - it would test intent
+against intent).
+
+== Open Questions
+
+Not to be decided in this review:
+
+* What is the demand-side requirement inventory of the three real consumers,
+  and who curates it into `requirements.json`?
+* Should `transformation_meta_io` reference `meta_registry.yaml` entries by
+  name, or should the two registries merge in the long run? (P2-5 recommends
+  the join now; merger is a separate decision.)
+* Is the ODS review loop worth its safety cost for tables this small, or is
+  direct JSON editing with the checker the better review surface until row
+  counts justify the workbook?
+* Which of the ~18 semantic sets are actually consulted in reviews, and can
+  the rest be formally marked historical? (Requires input from whoever runs
+  contract reviews, not this document.)
+* Is `add_lookup_helpers` an alternative implementation of the FK-helper
+  transformation or a distinct transformation? The link table currently
+  answers "alternative"; the ADR review treats it as open.
+* Does transformation granularity equal registered-step granularity, or
+  contract granularity (`helper_config` currently absorbs three differently
+  shaped steps)?
+* Should `pipeline_exposed` survive at all on intent rows, or move to the
+  implementation unit where it is observable?
+
+== Appendix: Candidate Follow-Up Artifacts
+
+`implementation_gap_findings.json` (new)::
+* 16 unlinked implementation units (P2-8), starting with the "no requirement
+  row" cluster (`extract_frame`, `pivot_frame`, `join_frames`,
+  `sparse_collapse/expand`, writers, workbook views);
+* the schema-maintenance reverse-drift entry (column-level code vs
+  table/key-level rows);
+* `meta_refs.py` frozenset-vs-declaration mismatches once Slice 1 runs.
+
+Registry schema changes::
+* P1-4 anchor-table narrowing; P2-8 status axis; P2-7 drop/freeze
+  `transformation_links`; P3-10 hygiene pass (typo IDs, duplicate names,
+  seeds duplicates, `principles.json`).
+
+Checker/fitness-function changes::
+* P1-1 schema sync + new tables; the invariant list above (inverse symmetry,
+  name uniqueness, bucket-token xrefs, exposure-vs-link consistency,
+  unit-coverage rule, `_meta`-root-vs-registry diff);
+* Makefile promote gate (P1-2); drift-sheet drop test (P3-11 companion).
+
+Focused code review tasks::
+* `schema_maintenance/meta_update.py` (672 lines) reference-propagation
+  behavior against the declared reference model, as part of Slice 1;
+* `tools/domain_contracts/workbook.py` reimport semantics (delete-on-blank,
+  default stamping) once the loop is repaired.
+
+Future review documents::
+* a follow-up review after Slice 0 + Slice 1 verifying that the checker
+  gate held (were any canonical edits made with a red checker since?);
+* a requirements-inventory review of the three consumers feeding P1-3;
+* the deferred vocabulary-mapping note (P2-6) reviewed against actual
+  citation practice in the next two contract reviews.
