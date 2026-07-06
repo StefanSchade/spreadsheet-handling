@@ -1,0 +1,847 @@
+== Review 006 -- Consumer Pipeline Operability and Maintainer Autonomy
+
+*Status:* Complete (read-only review; no code changes)
+
+*Date:* 2026-07-06
+
+*Baseline:* core `22ed328` (post Review-005 closure `69c4cbc` line). Review 005
+is closed and paused; this review deliberately does not continue the
+domain-contract/meta-registry work.
+
+*Core question:* How hard is it for a human maintainer or power user to
+understand, adjust, and safely operate consumer pipelines without reading
+custom plugin code or asking AI?
+
+*Method:* Read-only inspection of pipeline YAML, consumer plugin code,
+Makefiles, dependency state, and the framework step surface
+(`pipeline/build.py`, `pipeline/registry.py`, `registries/pipeline_step_registry.json`).
+No import/export/promote commands were run; no data was read beyond
+pipeline/config/plugin files. In `personal_data` only pipeline and plugin
+files were inspected; domain data files were not opened, and schema facts
+cited here come from pipeline YAML only.
+
+*Prior art honored:* `docs/cold_storage/reviews/topic_reviews/CONFIGURATION-SIMPLIFICATION-FTR-ASSESSMENT.adoc`
+(single-consumer-era assessment of the same friction),
+`FTR-MODEL-DEFAULT-CONFIGURATION-P5` (open, broad),
+`FTR-YAML-SURFACE-NORMALIZATION-P5` (open),
+`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-*` (done),
+`FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` (project_by_role line).
+
+=== 1. Executive assessment
+
+*Yes, with one significant exception and one dogfood caveat: the real consumer
+fleet is currently maintainable by a human without AI.*
+
+The dominant real-consumer shape is a 2-3 step forward pipeline
+(`validate_references` -> `configure_workbook_view` -> `add_validations`) and a
+2-step reverse pipeline (`apply_workbook_view_sheet_mappings` ->
+`validate_references`), using only built-in registered steps and zero plugins.
+`personal_data` (7 datasets + project workspaces) and `home-lab` (6 datasets)
+follow this shape uniformly. A maintainer can read any of these files top to
+bottom and know exactly what happens. This is a genuinely good result and
+should be recognized as the project's healthy baseline.
+
+The friction is concentrated, not diffuse:
+
+1. *The single largest friction is repeated schema knowledge, not plugin
+   opacity.* Every consumer duplicates its primary-key/foreign-key/uniqueness
+   rule block verbatim between the forward and reverse pipeline (and
+   worldbuilding repeats it a third time mid-reverse). The schema of each
+   dataset lives in two or three places that must be synchronized by hand.
+   This is the highest-value, lowest-risk fix, and it is the exact narrow
+   slice the CONFIGURATION-SIMPLIFICATION assessment said should wait for a
+   second real consumer. That second (and third, and fourth) consumer now
+   exists.
+
+2. *worldbuilding/dino_insel is the one severe real-consumer pipeline* (39 +
+   25 steps, 360 + 210 lines). Its bulk is a 4x copy-pasted facet motif
+   (extract -> join -> contract_xref -> join -> project_by_role, mirrored on
+   reimport). It is legible but exhausting to audit, and its four plugin calls
+   are all generic table operations, not domain logic.
+
+3. *The in-repo dogfood consumers, not the real consumers, are the
+   AI-interpreter hotspots.* `registries/domain_contracts` pipelines are 100%
+   plugin steps; `project_memory`'s roundtrip pipelines are 3-of-4 and
+   1-of-2 plugin steps with reserved `__base_*` frame conventions. Their YAML
+   communicates nothing beyond function names; safe operation requires reading
+   328-750-line Python modules.
+
+4. *Workflow safety is good.* The export/check/diff/promote Makefile
+   convention is uniform across consumers, tmp-staged, and hard to misuse.
+   Version drift is a documentation problem (demo's stale pin), not a runtime
+   problem: every consumer venv runs the local core checkout editable.
+
+Main friction ranking: (1) duplicated model facts in YAML, (2) one severe
+pipeline's copy-paste volume, (3) dogfood plugin opacity, (4) stale demo
+surface, (5) missing tiny generic steps (drop columns / select frames) that
+three codebases have independently reimplemented as plugins.
+
+=== 2. Repository / version inventory
+
+[cols="2,1,1,3,1,1",options="header"]
+|===
+| Repo path | HEAD | State | spreadsheet-handling dependency | Assessment | Evidence role
+
+| `~/repos/spreadsheet-handling/core`
+| `22ed328` (main)
+| clean
+| n/a (is the library)
+| current
+| framework + dogfood (secondary)
+
+| `~/repos/spreadsheet-handling/demo`
+| `fc8ba73` (2026-05-25)
+| clean
+| `pyproject.toml` pins `spreadsheet-handling==0.1.0b6`; venv actually has
+  editable local core (metadata `0.1.0b7.dev56`, install from 2026-05-25).
+  Makefile offers both `setup-lib-local` (editable core) and PyPI pin.
+| *stale* (~6 weeks; uses legacy `validate` step; pin contradicts venv)
+| secondary (teaching surface, version-drift evidence only)
+
+| `~/repos/spreadsheet-handling/worldbuilding`
+| `f580c14` (2026-06-11)
+| clean
+| editable local core (`pip install -e ../core`, metadata `0.2.1.dev76`)
+| current enough (post role-based matrix validations commit)
+| *primary*
+
+| `~/repos/spreadsheet-handling/personal_data`
+| `5078595` (2026-06-22)
+| clean
+| editable local core (metadata `0.2.1.dev70`)
+| current (most recent consumer commit)
+| *primary* (pipeline/config/plugin files only; no domain data read)
+
+| `~/repos/spreadsheet-handling/home-lab`
+| `270a452` (2026-05-10)
+| *dirty*: `Makefile`, `AGENT.md`, `.gitignore` modified; entire
+  `pipelines/`, `data/`, `scripts/compare_reimport.py`, `templates/`,
+  `STRUCTURED_DATA.adoc` *untracked*
+| editable local core (metadata `0.2.1.dev70`)
+| working tree current, *git state unknown/uncommitted*
+| *primary* (with caveat: all inspected pipeline files are untracked)
+|===
+
+Editable installs mean all consumers execute the *current* core checkout at
+runtime regardless of the frozen pip version metadata; only demo's declared
+pin is misleading.
+
+Out-of-scope note: sibling directories `ssdp/` and `msg_ssdp_rollout/` also
+contain spreadsheet-handling pipelines (not in this review's accessible list).
+A filename-level grep shows they carry a consumer plugin
+`structured.plugins.frame_cleanup:drop_helper_like_columns`; this is cited
+below only as a third independent instance of a generic-cleanup plugin, and
+those repos were not otherwise inspected.
+
+=== 3. Pipeline inventory
+
+Step counts are `- step:` occurrences; "plugin" counts `step: plugin` dotted
+calls; the remainder are built-in registered steps.
+
+[cols="1,3,3,1,1,1,1,1",options="header"]
+|===
+| Repo | Pipeline | Purpose | Steps | Plugin | Built-in | ~Lines | Complexity / maintainability risk
+
+| worldbuilding | `pipelines/dino_insel/json_to_spreadsheet.yaml`
+| canonical JSON -> authoring workbook with FK helpers + 5 matrix views
+| 39 | 2 | 37 | 360 | *severe* / high (copy-paste fan-out, 3-way sync with reverse + overrides)
+
+| worldbuilding | `pipelines/dino_insel/spreadsheet_to_json.yaml`
+| workbook -> canonical JSON, matrix recomposition
+| 25 | 2 | 23 | 210 | *high* / high (mirrors forward; validate block twice)
+
+| personal_data | `pipelines/<7 datasets>/json_to_spreadsheet.yaml` (7 files)
+| dataset -> workbook (validate, view, in-list validations)
+| 3 | 0 | 3 | 42-83 | small / low
+
+| personal_data | `pipelines/<7 datasets>/spreadsheet_to_json.yaml` (7 files)
+| workbook -> staging JSON
+| 2 | 0 | 2 | 16-29 | small / low (duplicates forward rule block)
+
+| personal_data | `projekte/{_template,ssdp}/pipelines/*.yaml` (4 files)
+| project workspace roundtrip
+| 3 / 2 | 0 | all | 36-92 | small / low-medium (template copies will drift; currently byte-identical)
+
+| home-lab | `pipelines/<6 datasets>/*.yaml` (12 files)
+| homelab structured data roundtrip
+| 3 / 2 | 0 | all | 15-57 | small / low (but files are untracked in git)
+
+| demo | `pipelines/*.yaml` (14 files)
+| teaching pipelines
+| 0-7 | 0-1 | rest | 3-59 | small / low (content partially stale: legacy `validate` step)
+
+| core (dogfood) | `project_memory/pipelines/memory/json_to_ods.yaml`
+| canonical -> review ODS with concern-event matrix
+| 2 | 1 | 1 | 30 | moderate / medium (concern-ID list duplicated with reverse)
+
+| core (dogfood) | `project_memory/pipelines/memory/ods_to_json.yaml`
+| review ODS -> staging JSON, matrix recomposition
+| 4 | 3 | 1 | 45 | *high opacity* / high (copy_frame/strip/finalize + `__base_*` convention unreadable from YAML)
+
+| core (dogfood) | `project_memory/pipelines/memory/json_to_derived_queries.yaml`
+| canonical -> derived report frames
+| 8 | 8 | 0 | 55 | moderate / medium (pure plugin, but linear and report-only)
+
+| core (dogfood) | `registries/domain_contracts/pipelines/json_to_ods.yaml`
+| contract registry -> review ODS
+| 3 | 3 | 0 | 15 | *high opacity* / medium (100% plugin; YAML says nothing)
+
+| core (dogfood) | `registries/domain_contracts/pipelines/ods_to_json.yaml`
+| review ODS -> staging
+| 1 | 1 | 0 | 11 | *high opacity* / medium
+|===
+
+Fleet summary: 30 real-consumer roundtrip pipelines follow the healthy 2-3
+step pattern; exactly one real pipeline pair (dino_insel) is severe; all
+high-opacity pipelines are in-repo dogfood.
+
+=== 4. Plugin inventory
+
+[cols="1,2,2,1,3,1,2",options="header"]
+|===
+| Repo | Plugin | Called from | Generic vs domain | What it does | Understandable from YAML alone? | Candidate replacement
+
+| worldbuilding | `plugins.character_views:drop_columns` (14 LOC)
+| dino forward
+| *generic*
+| drops named columns from one frame
+| name is honest, semantics trivial
+| tiny new declarative step (`drop_columns`/extend `extract_frame` in-place), or keep
+
+| worldbuilding | `plugins.character_views:strip_trailing_header_separator` (27 LOC)
+| dino reverse
+| *generic* (header-roundtrip cleanup)
+| normalizes `x.` / `x.x` headers after flatten(join) roundtrip
+| no -- why it is needed requires knowing the flatten/unflatten quirk
+| candidate framework fix: `flatten_headers mode: join` should not emit
+  trailing separators for single-level headers; until then keep as plugin
+
+| worldbuilding | `plugins.matrix_meta:ensure_frame_columns` (22 LOC)
+| dino forward
+| *generic*
+| creates empty frame with fixed columns if absent; adds missing columns
+| mostly (args say frame + columns; the "why": empty-relation export)
+| small declarative step (`ensure_frame`/`ensure_columns`) or keep
+
+| worldbuilding | `plugins.frame_sets:keep_frames` (10 LOC)
+| dino reverse (last step)
+| *generic*
+| whitelist output frames (+ `_meta`)
+| yes
+| small declarative step (`select_frames`); third occurrence of this op fleet-wide
+
+| worldbuilding | `plugins.matrix_meta:add_from_legend_constraints_for_matrix`
+| *no longer called* (superseded by role-targeted `add_validations`, commit `f580c14`)
+| was generic
+| wrote per-column legend constraints into `_meta`
+| n/a
+| *delete* -- dead code; framework absorbed it (positive precedent)
+
+| worldbuilding | `plugins.story_cast_views:*` (70 LOC)
+| *no longer called* (superseded by `project_by_role`)
+| was generic
+| matrix view column ordering
+| n/a
+| *delete after retention window* (file says retained one release cycle per FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5)
+
+| personal_data | (none -- `plugins/__init__.py` is an empty package)
+| -- | -- | -- | -- | best-practice consumer; no action
+
+| home-lab | (none; `scripts/compare_reimport.py` + `render_adoc.py` are CLI tools, not pipeline plugins)
+| -- | -- | -- | -- | `render_adoc.py` is a legitimate external-report adapter outside the pipeline
+
+| demo | `plugins.extractions:{branch_manager_summary,product_overview}` (200 LOC)
+| 4 demo pipelines
+| domain-specific *by design*
+| teaching examples for the custom-extraction extension point
+| the demos exist to show exactly this
+| keep as plugins (that is their point)
+
+| core dogfood | `project_memory.plugins.queries:copy_frame` (7 LOC)
+| memory reverse
+| *generic*
+| copies a frame under a new name
+| yes
+| tiny declarative step (`copy_frame`) or fold into expand_xref `base_relation` handling
+
+| core dogfood | `queries:strip_concern_event_matrix_context` (14 LOC)
+| memory reverse
+| *generic* (drop columns)
+| drops display-only context columns before expansion
+| no -- context-column list lives in the Python default
+| same gap as worldbuilding `drop_columns`
+
+| core dogfood | `queries:enrich_concern_event_matrix` (26 LOC)
+| memory forward
+| *generic-ish* (left join + column order)
+| joins event context columns onto matrix
+| no -- column set is a Python default
+| expressible today as built-in `join_frames`
+
+| core dogfood | `queries:finalize_concern_event_xrefs` (~40 LOC)
+| memory reverse
+| *domain/roundtrip glue*
+| synthesizes xref ids, preserves notes, drops projection frames + xref meta
+| no
+| keep as plugin (roundtrip identity policy is genuinely local), but document in pipeline comments
+
+| core dogfood | `queries:derived_views_only` (16 LOC)
+| derived-queries
+| *generic* (select frames)
+| whitelist derived frames for export
+| partially (frame list is a Python default, not in YAML)
+| same gap as `keep_frames`
+
+| core dogfood | `queries:{current_findings, ftr_dependency_edges, ftr_blockers, release_note_candidates, event_ftr_links, finding_assessment_heatmap, concern_heatmap}` (~500 LOC)
+| derived-queries
+| *domain-specific*
+| project-memory report/query views (filters, joins, scoring, interpretation bands)
+| no, but the pipeline is report-only and linear
+| keep as plugins (legitimate report generation); simplest ones (`current_findings`, `ftr_dependency_edges`) are optionally expressible as `extract_frame` if it grew `not_in` filtering -- not worth forcing
+
+| core dogfood | `tools.domain_contracts.workbook:*` (328 LOC, 4 functions)
+| domain_contracts fwd+rev (100% of steps)
+| domain-specific (registry lifecycle/fingerprint/drift frames)
+| export fingerprint, lifecycle matrix, drift frame, reimport normalization
+| *no -- nothing is understandable from YAML*
+| keep as plugins (Review 005 scope; paused), but see finding F5 for a
+  zero-code YAML-comment mitigation
+
+| (out of scope) ssdp / msg_ssdp_rollout | `structured.plugins.frame_cleanup:drop_helper_like_columns`
+| their reverse pipelines (2 calls each)
+| *generic*
+| drops helper-like columns
+| unknown (not inspected)
+| third independent reimplementation of drop-columns cleanup
+|===
+
+=== 5. Main findings
+
+==== F1 -- The standard consumer pattern is healthy and human-operable (positive finding)
+
+*Evidence:* 30 of 32 real-consumer roundtrip pipelines are 2-3 built-in steps,
+plugin-free, with a uniform Makefile lifecycle (`export` / `import` / `diff` /
+`check` / `promote`) in worldbuilding, personal_data, and home-lab. The
+personal_data plugin package is empty.
+
+*Consumer impact:* A maintainer can open any of these YAML files and read the
+whole operation. The `promote` step only copies from a tmp reimport dir that
+`check` has diffed, which is a safe-by-construction loop.
+
+*Cause:* current framework surface (validate_references /
+configure_workbook_view / add_validations / apply_workbook_view_sheet_mappings
+cover the whole standard need).
+
+*Direction:* none -- protect this baseline; measure any new feature against
+"does it keep the 3-step pipeline a 3-step pipeline".
+
+*Confidence:* high.
+
+==== F2 -- Schema facts are duplicated 2-3x per dataset across pipeline pairs (primary friction)
+
+*Evidence:* The `validate_references` rule block is repeated verbatim between
+forward and reverse pipelines in *every* dataset:
+`personal_data/pipelines/beruf_meta/json_to_spreadsheet.yaml:11-30` equals
+`spreadsheet_to_json.yaml:9-28` (18 rules); same pattern in all 7
+personal_data datasets, both project workspaces, all 6 home-lab datasets, and
+worldbuilding (which carries the block *three* times:
+`json_to_spreadsheet.yaml:20-42`, `spreadsheet_to_json.yaml:19-35` (subset),
+and `spreadsheet_to_json.yaml:183-205` (superset)). Fleet-wide this is roughly
+16 duplicated rule blocks, several hundred lines whose divergence would be
+silent.
+
+*Consumer impact:* Adding a frame or FK means editing 2-3 rule sites per
+dataset by hand; a missed site silently weakens reimport validation (the
+dangerous direction: canonical data gets promoted after a check that no longer
+tests the new constraint). This is precisely the "maintainer must synchronize
+several files mentally" failure the review is hunting.
+
+*Stale or current?* Current framework surface: `validate_references` accepts
+only an inline `rules:` list (`reference_validations.py:72-79`); there is no
+way to name a ruleset once and reference it, although the sibling
+`apply_overrides` step already has the `overrides_path` precedent.
+
+*Direction:* the Section 9 slice (shared ruleset file via `rules_path`).
+
+*Confidence:* high (proven in three real consumers).
+
+==== F3 -- dino_insel's faceted-matrix fan-out is the one severe real pipeline
+
+*Evidence:* forward `json_to_spreadsheet.yaml:100-262`: the 5-step motif
+extract_frame -> join_frames(name) -> contract_xref -> join_frames(title) ->
+project_by_role is copy-pasted 4x (facets `role`, `notes`,
+`character_development`, `crystal`), differing in one string; the reverse
+mirrors it with 4x project_by_role -> expand_xref -> join_frames and a single
+`merge_by_discriminator` (`spreadsheet_to_json.yaml:177`). ~200 of 360 forward
+lines are this repetition.
+
+*Consumer impact:* auditing means diffing near-identical blocks by eye; adding
+facet #5 means writing ~35 lines in two files that must mirror each other.
+However -- as the CONFIGURATION-SIMPLIFICATION assessment already concluded --
+the sequence is architecturally legible: every stage (split, label join, dense
+axes, title join, projection) is visible and diagnosable from YAML.
+
+*Stale or current?* Current framework surface; not version drift. One concrete
+oddity: the *reverse* uses the built-in `merge_by_discriminator`, while the
+*forward* hand-rolls the inverse as 4x `extract_frame` even though
+`split_by_discriminator` (its registered bijective inverse,
+FTR-SPLIT-BY-DISCRIMINATOR-P4A) exists. A consumer-side rewrite could replace
+the four extract_frame steps with one split_by_discriminator step today, with
+zero framework change (4 steps -> 1; column projection to
+`[story_id, character_id, value]` still needed per facet or via value_map
+semantics -- to be verified against the step's parameter contract before
+migrating).
+
+*Direction:* (a) consumer-side: try split_by_discriminator in the forward
+pipeline; (b) framework-side: continue to *withhold* the faceted-matrix macro
+(one consumer, one relation -- unchanged since the prior assessment); (c) F2's
+ruleset slice removes ~60 of the 570 lines on its own.
+
+*Confidence:* high on the evidence; medium on the split_by_discriminator
+substitution (parameter fit not executed, read-only review).
+
+==== F4 -- Three codebases independently reimplement the same two generic frame ops as plugins
+
+*Evidence:* drop-columns exists as `character_views:drop_columns`
+(worldbuilding), `queries:strip_concern_event_matrix_context`
+(project_memory), and `frame_cleanup:drop_helper_like_columns` (ssdp repos,
+filename-level evidence). Select-frames-for-output exists as
+`frame_sets:keep_frames` (worldbuilding) and `queries:derived_views_only`
+(project_memory). Plus trivial `copy_frame` and `ensure_frame_columns`.
+
+*Consumer impact:* each occurrence forces the reader out of YAML into Python
+for an operation whose whole semantics is one line; each consumer must also
+re-learn the `dict(frames)` copy discipline and `_meta` preservation rule
+(frame_sets:keep_frames explicitly hand-carries `_meta` -- a correctness trap
+each plugin author must rediscover).
+
+*Stale or current?* Current framework surface: the registry has no
+column-drop or frame-set-selection primitive (extract_frame projects columns
+but always writes a new output frame and cannot say "all columns except X";
+configure_workbook_view selects sheets for rendering but not frames for
+json_dir export).
+
+*Direction:* after the F2 slice lands, a follow-up micro-FTR for `drop_columns`
++ `select_frames` steps is justified by the rule of three. Deliberately *not*
+the first slice: it reduces plugin count (a non-goal by itself) more than it
+reduces synchronization risk.
+
+*Confidence:* high for the duplication; medium for priority.
+
+==== F5 -- Dogfood pipelines are the actual "AI required as interpreter" cases
+
+*Evidence:* `registries/domain_contracts/pipelines/*.yaml` are 100% plugin
+steps (4 dotted calls into 328-line `workbook.py`, zero parameters in YAML).
+`project_memory/pipelines/memory/ods_to_json.yaml` is 3-of-4 plugin steps
+around one expand_xref, with a reserved `__base_concern_event_xrefs` frame
+created by `copy_frame`, consumed via `base_relation`, and cleaned up inside
+`finalize_concern_event_xrefs` together with `_meta.xref_crosstable` pruning
+-- none of which is visible in the YAML. The concern-ID list is additionally
+duplicated between forward `contract_xref.column_keys`
+(`json_to_ods.yaml:16-23`) and reverse `expand_xref.value_columns`
+(`ods_to_json.yaml:24-31`), and both must track the `concerns` frame content.
+
+*Consumer impact:* these are the pipelines where the maintainer demonstrably
+cannot answer "what does my own pipeline do" from config. They are also the
+complexity proxy for what real consumers would look like if plugin-first
+authoring became the norm.
+
+*Stale or current?* Current, but deliberately so: domain_contracts is Review
+005 territory (paused), and project_memory's finalize logic is genuine
+roundtrip identity policy. The *generic* fraction (copy_frame, strip context
+columns, enrich = join_frames) is the same F4 gap.
+
+*Direction:* no registry/framework work now. Two cheap mitigations when these
+files are next touched anyway: (a) replace `enrich_concern_event_matrix` with
+the built-in `join_frames` it re-implements, (b) one comment line per plugin
+step in the YAML stating its contract ("copies X so expand_xref can diff
+against a pre-edit base"). Do not resume Review 005 for this.
+
+*Confidence:* high.
+
+==== F6 -- Forward/reverse pairs require mental synchronization beyond validation rules
+
+*Evidence:* per dataset the maintainer must keep aligned: (a) frame lists --
+`configure_workbook_view.sheets` vs
+`apply_workbook_view_sheet_mappings.logical_frames` (e.g. home-lab network
+6-frame list in both files); (b) xref parameters -- contract_xref vs
+expand_xref (relation/matrix names, row_keys, column_key, value, legend names)
+in worldbuilding and project_memory; (c) personal_data `projekte/_template` vs
+per-project copies (currently byte-identical, guaranteed to drift silently
+after the first project-specific edit); (d) Makefile `DATASETS` lists vs
+`pipelines/` directories; (e) demo `pyproject.toml` pin vs Makefile-installed
+editable core.
+
+*Consumer impact:* every model change fans out to 2-6 hand-edited locations.
+Today the fan-out is manageable because datasets are small; it is the growth
+axis to watch.
+
+*Stale or current?* Structural consequence of the (sound) explicit two-file
+pipeline design; only (c) and (e) are consumer-side hygiene issues.
+
+*Direction:* F2's slice removes the largest single synchronization (rules).
+The frame-list pairing (a) is *acceptable* explicitness: the two lists answer
+different questions (render vs readback boundary) and inference was already
+rejected in the FTR record. Leave (b) explicit per prior assessment. For (c),
+a one-line README note in `projekte/_template` ("template is copied, not
+referenced; diff against _template after edits") is enough for now.
+
+*Confidence:* high.
+
+==== F7 -- home-lab's entire pipeline surface is untracked in git
+
+*Evidence:* `git status` shows `pipelines/`, `data/`, `scripts/compare_reimport.py`,
+`templates/`, `STRUCTURED_DATA.adoc` untracked; Makefile/AGENT.md modified;
+last commit 2026-05-10 predates all of it.
+
+*Consumer impact:* the most operations-relevant consumer (homelab inventory /
+network / power) has no versioned or recoverable pipeline definitions; a
+stray `git clean` or disk issue loses them. This is a pure operability risk
+independent of the framework.
+
+*Stale or current?* Consumer-side workflow state, not framework.
+
+*Direction:* commit (or consciously .gitignore data/ while committing
+pipelines/). Recommend but do not perform (read-only review).
+
+*Confidence:* high.
+
+==== F8 -- demo is drifting from the current step surface
+
+*Evidence:* demo pins `spreadsheet-handling==0.1.0b6` in `pyproject.toml`
+while its venv runs editable core; `demo_product_business_slice.yaml` uses the
+`validate` step (registry status: *transitional*, superseded in practice by
+`validate_references`) with convention flags (`detect_fk: true`,
+`helper_prefix`) that current consumers no longer use; last commit 2026-05-25.
+
+*Consumer impact:* demo is the public teaching surface; a new user copying
+demo patterns learns the transitional API instead of the pattern all real
+consumers use. Not a runtime failure -- a message failure.
+
+*Stale or current?* Stale consumer state (recorded as such per the review's
+caveat rule; not evidence of framework failure).
+
+*Direction:* demo realignment pass after the F2 slice (so demo can teach the
+ruleset pattern too). Out of scope here.
+
+*Confidence:* high on facts; medium on urgency.
+
+==== F9 -- Failure-mode diagnosability is decent for built-ins, absent for plugins
+
+Which failures can be diagnosed from YAML alone (spot-check of error paths in
+`build.py` and step purposes in the step registry):
+
+* unknown step name -> error lists all registry keys (`build.py:32`);
+* non-string YAML key (the `on:` boolean trap) -> targeted hint (`build.py:55-69`);
+* validate_references in `mode: fail` -> failure message carries rule facts
+  that map 1:1 to YAML lines;
+* missing FK helper policy -> error names `configure_fk_helpers` /
+  `infer_fk_relations` (per registry purpose entries);
+* wrong/renamed frame in extract/join/xref steps -> "Expected DataFrame 'x'"
+  traces to a YAML parameter.
+
+Which require opening Python: *any* plugin step failure (raw traceback into
+consumer code); *why* `strip_trailing_header_separator` must exist
+(flatten/unflatten join-mode artifact); everything in the dogfood pipelines
+(F5); `merge_by_discriminator` source_pattern mismatches (the pattern
+`story_cast_{value}_cells` is in YAML, but knowing which frames matched
+requires runtime knowledge).
+
+*Direction:* no action beyond F2/F4; the built-in error surface is already
+maintainer-friendly.
+
+*Confidence:* medium (static reading, not fault injection -- read-only review).
+
+=== 6. What is acceptable plugin usage?
+
+Plugins are the *right* tool, and should remain plugins, when the logic is:
+
+* *external-system adapters* -- e.g. home-lab's `render_adoc.py` style report
+  rendering (kept outside the pipeline entirely, even better), a future
+  CMDB/API push;
+* *domain-specific report generation* -- project_memory's heatmaps, blocker
+  joins with scoring bands and interpretation thresholds; the value *is* the
+  domain judgment encoded in Python;
+* *roundtrip identity policy that is genuinely local* --
+  `finalize_concern_event_xrefs` (id synthesis scheme, note preservation);
+* *one-off extraction / teaching examples* -- demo's extraction plugins exist
+  to demonstrate the extension point;
+* *temporary experiments* -- anything expected to be deleted or promoted
+  within a release cycle (the `story_cast_views` retirement shows the promote
+  path works: plugin -> FTR -> registered step -> plugin deleted).
+
+Operational bar for an acceptable plugin: the YAML step's `dotted:` name plus
+`args:` should state *what* it does and *which frames/columns it owns*, even
+if the *how* lives in Python; frame-set changes should be visible in args, not
+in Python defaults (negative examples: `derived_views_only` and
+`strip_concern_event_matrix_context`, whose frame/column lists are Python
+default arguments invisible to a YAML reader).
+
+=== 7. What is overgrown configuration?
+
+Patterns observed in this fleet that make YAML hard to maintain:
+
+* *repeated model facts* -- the same PK/FK/unique rules in 2-3 files per
+  dataset (F2); the same concern-ID list in forward and reverse xref steps
+  (F5);
+* *copy-paste step motifs varying in one token* -- the 4-facet fan-out (F3);
+  the reader must diff blocks to discover they are identical;
+* *implicit lifecycle coupling* -- reserved frames (`__base_*`) created by one
+  plugin, consumed by a step three lines later via `base_relation`, and
+  destroyed inside a third plugin, with the contract nowhere in the file (F5);
+* *hidden joins and hidden column sets* -- joins and drop-lists living as
+  Python defaults instead of YAML args (`enrich_concern_event_matrix`,
+  `strip_concern_event_matrix_context`);
+* *duplicated view definitions across the forward/reverse boundary* --
+  contract_xref/expand_xref parameter mirroring without a shared name;
+* *plugin step names that hide a generic operation* --
+  `strip_concern_event_matrix_context` is drop-columns;
+  `derived_views_only` is select-frames; the name suggests domain logic where
+  none exists, which *raises* the reading cost;
+* *pipelines where safe operation requires reading Python* -- both
+  domain_contracts pipelines (100% plugin) are the limit case.
+
+Deliberately *not* overgrown (verbose but correct): the explicit
+`helper_columns`/`key_columns` on every project_by_role call (rationale
+recorded in FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5); the paired frame lists in
+configure_workbook_view / apply_workbook_view_sheet_mappings (different
+boundaries); per-sheet in-list validations in add_validations (domain
+vocabulary belongs in the dataset's own file); dense_axes declarations on
+contract_xref (they encode a real modelling decision -- dense vs sparse axes).
+
+=== 8. Transferability assessment
+
+*Proven in real consumer repos (strongest):*
+
+* F1 healthy baseline (worldbuilding + personal_data + home-lab);
+* F2 duplicated validation facts (all three, ~16 blocks);
+* F3 faceted fan-out (worldbuilding only -- one consumer, so the *macro*
+  abstraction remains unjustified, exactly as the prior assessment ruled);
+* F4 generic-op plugins (worldbuilding real; +2 non-inspected sibling repos at
+  filename level);
+* F6 fwd/rev synchronization; F7 git hygiene.
+
+*Inferred from in-repo dogfood (indicative, not proof of consumer need):*
+
+* F5 plugin opacity at scale -- dogfood, by definition maintained by the
+  framework author; its pain predicts, but does not prove, consumer pain;
+* the `copy_frame`/`enrich`/`strip` generic fraction strengthens F4 but
+  shouldn't be counted as an independent consumer.
+
+*Possibly stale-version artifacts (excluded from framework findings):*
+
+* everything demo-specific (F8): legacy `validate` usage, pin mismatch;
+* home-lab's uncommitted state (F7) is workflow, not framework;
+* worldbuilding's two dead plugin files (already superseded by shipped
+  framework features -- evidence the promote path works, not of current pain).
+
+=== 9. Candidate first implementation slice
+
+*Slice: named shared rulesets for `validate_references` via `rules_path`
+(one dataset schema file, referenced by both pipeline directions).*
+
+*Problem statement:* Every consumer duplicates its dataset's structural facts
+(primary keys, uniqueness, foreign keys) as identical `validate_references`
+rule blocks in forward and reverse pipelines (worldbuilding: three sites).
+Model changes require synchronized hand edits; a missed reverse-side edit
+silently weakens the reimport check that gates `promote`. The framework
+already has the file-reference idiom (`apply_overrides.overrides_path`), so
+this adds no new concept -- only the missing symmetry.
+
+*Proposed surface (exact, minimal):*
+
+[source,yaml]
+----
+# pipelines/beruf_meta/reference_rules.yaml  (one file per dataset)
+rules:
+  - { type: primary_key, frame: phases, columns: [id] }
+  - { type: foreign_key, frame: situations, columns: [phase_id],
+      target: phases, target_columns: [id], allow_empty: false }
+  # ... unchanged rule schema, plain list ...
+----
+
+[source,yaml]
+----
+# both json_to_spreadsheet.yaml and spreadsheet_to_json.yaml
+- step: validate_references
+  mode: fail
+  rules_path: ./pipelines/beruf_meta/reference_rules.yaml
+----
+
+Semantics: `rules_path` loads the YAML file's top-level `rules` list and
+validates it with the identical code path as inline `rules`. When both
+`rules` and `rules_path` are given, concatenate file rules first, then inline
+rules (supports worldbuilding's reverse-pipeline superset case: shared base
+from file + post-recomposition additions inline). Paths resolve relative to
+the pipeline YAML's directory (same convention as other consumer-relative
+paths). No includes-of-includes, no templating, no rule generation.
+
+*Exact affected files:*
+
+* `core/src/spreadsheet_handling/domain/validations/reference_validations.py`
+  -- add optional `rules_path: str | None` to `validate_references`
+  (signature at line 72), plus a small loader with clear errors (missing
+  file, missing/empty `rules` key, non-list);
+* `core/src/spreadsheet_handling/pipeline/build.py` -- likely no change
+  (kwargs pass through); verify base-path resolution: if step factories do not
+  receive the config file's directory, thread it or resolve relative to CWD
+  and document that the Makefile convention (`--config` run from repo root)
+  makes CWD-relative paths stable -- decide during implementation and record
+  the decision in the FTR;
+* `core/registries/pipeline_step_registry.json` -- `validate_references`
+  entry: add the `rules_path` parameter (`source_kind` matching the
+  registry's file-reference convention as used by
+  `apply_overrides.overrides_path`);
+* `core/docs/user_guide/ch03_transformation_catalog/` -- document the shared
+  ruleset pattern (supporting-steps chapter);
+* `core/docs/release_notes/release_notes.adoc` -- bullet under the active
+  unreleased section (public YAML surface change);
+* backlog: record as the narrow refinement slice of
+  `FTR-MODEL-DEFAULT-CONFIGURATION-P5` (per the CONFIGURATION-SIMPLIFICATION
+  assessment's recommendation to narrow, not compete).
+
+*Likely tests:*
+
+* `core/tests/unit/domain/validations/test_reference_validations.py` --
+  extend: rules_path-only; rules_path+inline concatenation (order and
+  duplicate tolerance); missing file -> actionable error naming the path and
+  the step; file without `rules` key / empty list -> clear error; relative
+  path resolution;
+* one integration-level test running a two-step pipeline YAML from a tmp dir
+  proving both directions can share one ruleset file (mirrors the consumer
+  layout).
+
+*Acceptance criteria:*
+
+* a personal_data-shaped consumer can delete both inline rule blocks, add one
+  `reference_rules.yaml`, and `export`/`check` behave identically (same
+  failures for same violations, same findings frame in warn mode);
+* inline `rules` behavior is byte-for-byte unchanged when `rules_path` is
+  absent (zero migration pressure);
+* worldbuilding's reverse superset case is expressible as file + inline
+  without duplicating the base block;
+* error text for a bad path/file names the pipeline step and the resolved
+  absolute path;
+* expanded rule provenance is inspectable: in warn mode findings (or verbose
+  logging) it is possible to see that rules came from a file (satisfies the
+  prior assessment's inspectability requirement).
+
+*Risks:*
+
+* path-resolution ambiguity (config-relative vs CWD-relative) -- the one real
+  design decision; must be documented and tested either way;
+* scope creep toward a model-fact DSL ("since we have a schema file, let's
+  also generate helpers/views from it") -- explicitly out of scope; the file
+  contains literal `validate_references` rules and nothing else;
+* a second place to look when reading a pipeline -- mitigated by the file
+  being plain rules in the same schema, named in the step that uses it;
+* silent divergence if consumers only migrate one direction -- migration note
+  should recommend deleting inline blocks in the same change.
+
+*Explicit non-goals:*
+
+* no rule generation or inference from frames/columns/names;
+* no shared-ruleset *registry* (a plain consumer-owned file, no core registry
+  additions);
+* no cross-step reuse (helpers, workbook views, projections stay untouched);
+* no changes to `add_validations` (cell-level in-list rules stay inline: they
+  are per-sheet domain vocabulary, not duplicated schema facts);
+* no include mechanism inside ruleset files;
+* no deprecation of inline `rules`.
+
+*Why this slice and not the alternatives:* it is the only candidate that (a)
+appears in *all three* real consumers, (b) reduces silent-divergence risk
+rather than just line count, (c) has an in-repo surface precedent
+(`overrides_path`), (d) was already identified as the safest direction by the
+prior topic assessment -- which explicitly waited for the multi-consumer
+evidence this review now supplies, and (e) is implementable in one small,
+independently shippable change. The runner-up (generic `drop_columns` /
+`select_frames` steps, F4) reduces plugin count but not synchronization risk,
+and "fewer plugins" is a non-goal by itself.
+
+=== 10. Implementation prompt for the first slice (ready to use; do not run now)
+
+----
+Implement FTR slice: shared reference-validation rulesets via `rules_path`.
+
+Repo: ~/repos/spreadsheet-handling/core (work on a feature branch off main).
+Read first: docs/ai_info/_ai_info.adoc, docs/ai_info/git_and_workflow.adoc,
+docs/cold_storage/reviews/global_reviews/review_006_consumer_pipeline_operability_maintainer_autonomy/review.adoc
+(section 9 is the authoritative spec for this slice), and
+docs/cold_storage/reviews/topic_reviews/CONFIGURATION-SIMPLIFICATION-FTR-ASSESSMENT.adoc.
+
+Task:
+1. Add an optional `rules_path: str | None = None` parameter to
+   `validate_references` in
+   src/spreadsheet_handling/domain/validations/reference_validations.py.
+   - It loads a YAML file whose top level is `rules: [ ... ]` (identical rule
+     schema as the inline list; yaml.safe_load only).
+   - Precedence: file rules first, then inline `rules` appended. Providing
+     neither is an error; providing either alone works; both = concatenation.
+   - Errors must be actionable: missing file, unreadable YAML, missing/empty
+     `rules` key, non-list -> ValueError naming the step (`name` param if
+     given) and the resolved absolute path.
+2. Decide and document path resolution (config-file-relative preferred; if the
+   step factory cannot see the config path, CWD-relative is acceptable but
+   must be stated in the docs and tested). Record the decision and rationale
+   in the FTR note.
+3. Update the `validate_references` entry in
+   registries/pipeline_step_registry.json (add `rules_path`, mirror the
+   `apply_overrides.overrides_path` parameter conventions; keep the manual
+   review-artifact character of that registry).
+4. Tests in tests/unit/domain/validations/test_reference_validations.py:
+   rules_path only; rules_path + inline concatenation; missing file; file
+   without `rules`; empty list; relative resolution. Add one integration test
+   that runs a small pipeline from YAML in tmp where forward and reverse
+   configs reference the same ruleset file.
+5. Docs: user_guide ch03 transformation catalog (supporting steps chapter):
+   show the shared-ruleset pattern with a forward/reverse pair; release_notes
+   bullet under the active unreleased section (public YAML surface change).
+6. Backlog hygiene: add the FTR note as the narrow first slice refining
+   FTR-MODEL-DEFAULT-CONFIGURATION-P5 (do not implement anything else from
+   that FTR; do not create a competing umbrella FTR).
+
+Hard non-goals (reject scope creep): no rule generation/inference, no core
+registry of rulesets, no includes inside ruleset files, no changes to
+add_validations or any other step, no deprecation of inline rules, no
+consumer-repo edits in this change.
+
+Definition of done: full test suite green; inline-rules behavior unchanged;
+a consumer can share one ruleset file between both pipeline directions; FTR
+review artifact per docs/ai_info/review_instructions.adoc; release-notes
+checkpoint satisfied.
+----
+
+=== Lifecycle cleanup check
+
+This review is a standalone global review, not an FTR workstream completion;
+no FTR status changes, backlog include removals, or cold-storage moves are
+triggered by it. Residual scope identified (not performed, read-only):
+
+* the Section 9 slice -> new FTR note refining
+  `FTR-MODEL-DEFAULT-CONFIGURATION-P5` (follow-up, owner: implementer of the
+  slice);
+* worldbuilding dead plugin cleanup (`matrix_meta:add_from_legend_constraints_for_matrix`
+  now uncalled; `story_cast_views` past its stated retention window when the
+  next release ships) -- consumer-repo follow-up;
+* home-lab: commit untracked pipeline surface (consumer-repo follow-up, F7);
+* demo realignment (F8) -- candidate follow-up after the slice, so demo can
+  teach the ruleset pattern;
+* no release-notes entry is needed for this review itself (documentation-only,
+  no behavior change).
+
+=== Recommendation
+
+*Implement the slice now.* The prior topic assessment explicitly gated this
+exact slice on a second real consumer; personal_data and home-lab now provide
+the second and third, with ~16 duplicated rule blocks fleet-wide and the
+duplication sitting directly on the promote-safety path. The slice is small,
+has an in-repo surface precedent, requires no DSL and no registry, and leaves
+every existing pipeline byte-identical in behavior.
+
+Secondary, in order: (1) consumer-side experiment replacing dino_insel's 4x
+`extract_frame` with the existing `split_by_discriminator` (no framework
+change; verify parameter fit first); (2) micro-FTR for `drop_columns` /
+`select_frames` once the ruleset slice ships (rule-of-three evidence recorded
+in F4); (3) demo realignment. Continue to *reject* the faceted-matrix macro
+and any broad model-declaration layer on current evidence.
