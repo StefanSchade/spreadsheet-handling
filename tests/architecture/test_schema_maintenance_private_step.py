@@ -8,6 +8,7 @@ import tomllib
 
 import pytest
 
+from spreadsheet_handling.application import schema_maintenance as schema_maintenance_app
 from spreadsheet_handling.cli.apps import schema_maintain
 from spreadsheet_handling.domain.schema_maintenance import SchemaOperationKind
 from spreadsheet_handling.pipeline.build import build_steps_from_config
@@ -17,7 +18,7 @@ pytestmark = pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS")
 
 
 def test_private_schema_maintenance_step_is_not_in_pipeline_registry() -> None:
-    assert schema_maintain.PRIVATE_STEP_NAME not in REGISTRY
+    assert schema_maintenance_app.PRIVATE_STEP_NAME not in REGISTRY
 
 
 def test_private_schema_maintenance_step_is_not_in_descriptive_registry() -> None:
@@ -26,21 +27,29 @@ def test_private_schema_maintenance_step_is_not_in_descriptive_registry() -> Non
 
     names = {entry["name"] for entry in registry["entries"]}
     runtime_names = {entry["runtime_name"] for entry in registry["entries"]}
-    assert schema_maintain.PRIVATE_STEP_NAME not in names
-    assert schema_maintain.PRIVATE_STEP_NAME not in runtime_names
+    assert schema_maintenance_app.PRIVATE_STEP_NAME not in names
+    assert schema_maintenance_app.PRIVATE_STEP_NAME not in runtime_names
 
 
 def test_private_schema_maintenance_step_is_not_buildable_from_yaml_config() -> None:
-    with pytest.raises(KeyError, match=schema_maintain.PRIVATE_STEP_NAME):
-        build_steps_from_config([{"step": schema_maintain.PRIVATE_STEP_NAME}])
+    with pytest.raises(KeyError, match=schema_maintenance_app.PRIVATE_STEP_NAME):
+        build_steps_from_config([{"step": schema_maintenance_app.PRIVATE_STEP_NAME}])
 
 
-def test_cli_uses_bound_step_directly_without_config_builder() -> None:
-    source = inspect.getsource(schema_maintain)
+def test_application_owns_private_bound_step_without_config_builder() -> None:
+    source = inspect.getsource(schema_maintenance_app)
 
     assert "BoundStep(" in source
     assert "build_steps_from_config" not in source
     assert "build_steps_from_yaml" not in source
+
+
+def test_cli_delegates_schema_maintenance_to_application() -> None:
+    source = inspect.getsource(schema_maintain)
+
+    assert "run_schema_maintenance(" in source
+    assert "BoundStep(" not in source
+    assert "orchestrate(" not in source
 
 
 def test_domain_schema_maintenance_does_not_import_forbidden_layers() -> None:

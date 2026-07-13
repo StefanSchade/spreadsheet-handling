@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping, TypeAlias
 
 import logging
 
@@ -11,6 +11,8 @@ from ..pipeline.persistence_boundary import project_meta_to_persistable_contract
 from ..pipeline.types import BoundStep, Frames
 
 log = logging.getLogger("sheets.orchestrator")
+
+IODescriptorLike: TypeAlias = Mapping[str, Any]
 
 
 # ---------------------------
@@ -64,8 +66,8 @@ def _save_frames(out: IODesc, frames: Frames) -> None:
 
 def orchestrate(
     *,
-    input: Mapping[str, Any],
-    output: Mapping[str, Any],
+    input: IODescriptorLike,
+    output: IODescriptorLike,
     steps: Iterable[BoundStep] | None = None,
     header_levels: int = 1,
 ) -> Frames:

@@ -7,49 +7,31 @@ import json
 from pathlib import Path
 from typing import Any
 
-from spreadsheet_handling.application.orchestrator import orchestrate
+from spreadsheet_handling.application.schema_maintenance import run_schema_maintenance
 from spreadsheet_handling.cli.runtime import run_cli
 from spreadsheet_handling.domain.schema_maintenance import (
     ColumnPlacement,
     ReorderSpec,
     SchemaMaintenanceReport,
     SchemaMaintenanceRequest,
-    SchemaMaintenanceResult,
     SchemaOperationKind,
     WriteIntent,
-    apply_schema_maintenance,
 )
-from spreadsheet_handling.pipeline.types import BoundStep, Frames
 
-PRIVATE_STEP_NAME = "_schema_maintenance_private"
 DISCARD_PATH = "__discard__"
-
-
-class SchemaMaintenanceBlocked(RuntimeError):
-    def __init__(self, report: SchemaMaintenanceReport) -> None:
-        super().__init__("Schema maintenance operation blocked")
-        self.report = report
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     request = _request_from_args(args)
-    collector: list[SchemaMaintenanceReport] = []
-    step = _build_private_step(request, collector)
-
-    try:
-        orchestrate(
-            input={"kind": args.in_kind, "path": args.in_path},
-            output=_output_from_args(args),
-            steps=[step],
-        )
-    except SchemaMaintenanceBlocked:
-        _emit_report(_require_report(collector), args.report)
-        return 1
-
-    _emit_report(_require_report(collector), args.report)
-    return 0
+    report = run_schema_maintenance(
+        input={"kind": args.in_kind, "path": args.in_path},
+        output=_output_from_args(args),
+        request=request,
+    )
+    _emit_report(report, args.report)
+    return 1 if report.blocked else 0
 
 
 def cli_entry() -> None:
@@ -99,25 +81,30 @@ def _request_from_args(args: argparse.Namespace) -> SchemaMaintenanceRequest:
         source_column=args.source_column,
         target_column=args.target_column,
         default_value=args.default,
-        placement=_placement_from_args(args),
-        reorder=_reorder_from_args(args),
+        placement=_placement_from_args(args, kind),
+        reorder=_reorder_from_args(args, kind),
         prune=args.prune,
         write_intent=WriteIntent.WRITE if args.write else WriteIntent.DRY_RUN,
     )
 
 
-def _placement_from_args(args: argparse.Namespace) -> ColumnPlacement | None:
+def _placement_from_args(
+    args: argparse.Namespace,
+    kind: SchemaOperationKind,
+) -> ColumnPlacement | None:
     if args.insert_before:
         return ColumnPlacement(mode="before", column=args.insert_before)
     if args.insert_after:
         return ColumnPlacement(mode="after", column=args.insert_after)
-    if args.op == SchemaOperationKind.ADD_COLUMN.value:
+    if kind is SchemaOperationKind.ADD_COLUMN:
         return ColumnPlacement()
     return None
 
-
-def _reorder_from_args(args: argparse.Namespace) -> ReorderSpec | None:
-    if args.op != SchemaOperationKind.REORDER_COLUMNS.value:
+def _reorder_from_args(
+    args: argparse.Namespace,
+    kind: SchemaOperationKind,
+) -> ReorderSpec | None:
+    if kind is not SchemaOperationKind.REORDER_COLUMNS:
         return None
     return ReorderSpec(mode=args.reorder_mode, columns=tuple(args.column))
 
@@ -130,30 +117,6 @@ def _output_from_args(args: argparse.Namespace) -> dict[str, str]:
         rendered = ", ".join("--" + name.replace("_", "-") for name in missing)
         raise SystemExit(f"Write mode requires {rendered}")
     return {"kind": args.out_kind, "path": args.out_path}
-
-
-def _build_private_step(
-    request: SchemaMaintenanceRequest,
-    collector: list[SchemaMaintenanceReport],
-) -> BoundStep:
-    def run(frames: Frames) -> Frames:
-        result: SchemaMaintenanceResult = apply_schema_maintenance(frames, request)
-        collector.append(result.report)
-        if result.report.blocked:
-            raise SchemaMaintenanceBlocked(result.report)
-        return result.frames
-
-    return BoundStep(
-        name=PRIVATE_STEP_NAME,
-        config={"operation": request.kind.value, "target_frame": request.target_frame},
-        fn=run,
-    )
-
-
-def _require_report(collector: list[SchemaMaintenanceReport]) -> SchemaMaintenanceReport:
-    if not collector:
-        raise RuntimeError("Schema maintenance did not produce a report")
-    return collector[-1]
 
 
 def _emit_report(report: SchemaMaintenanceReport, path: str | None) -> None:

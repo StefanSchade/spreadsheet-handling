@@ -3,26 +3,29 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 from spreadsheet_handling.cli.apps import schema_maintain
-from spreadsheet_handling.pipeline.types import BoundStep
+from spreadsheet_handling.domain.schema_maintenance import (
+    FrameChange,
+    SchemaMaintenanceFailure,
+    SchemaMaintenanceReport,
+    SchemaMaintenanceRequest,
+    SchemaOperationKind,
+    WriteIntent,
+)
 
 pytestmark = pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS")
 
 
-def test_cli_builds_private_bound_step_and_calls_orchestrate(monkeypatch, capsys) -> None:
+def test_cli_delegates_to_schema_maintenance_application(monkeypatch, capsys) -> None:
     called = {}
 
-    def fake_orchestrate(**kwargs):
+    def fake_run_schema_maintenance(**kwargs):
         called.update(kwargs)
-        step = kwargs["steps"][0]
-        assert isinstance(step, BoundStep)
-        assert step.name == schema_maintain.PRIVATE_STEP_NAME
-        return step({"items": pd.DataFrame({"name": ["Item"]})})
+        return _report()
 
-    monkeypatch.setattr(schema_maintain, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(schema_maintain, "run_schema_maintenance", fake_run_schema_maintenance)
 
     rc = schema_maintain.main(
         [
@@ -40,17 +43,19 @@ def test_cli_builds_private_bound_step_and_calls_orchestrate(monkeypatch, capsys
     )
 
     assert rc == 0
+    assert called["input"] == {"kind": "json_dir", "path": "in"}
     assert called["output"] == {"kind": "discard", "path": "__discard__"}
+    assert called["request"].kind is SchemaOperationKind.ADD_COLUMN
     report = json.loads(capsys.readouterr().out)
     assert report["operation"]["kind"] == "add_column"
     assert report["frame_changes"][0]["target_column"] == "slug"
 
 
 def test_write_mode_requires_output_path(monkeypatch) -> None:
-    def fail_orchestrate(**kwargs):
-        raise AssertionError("orchestrate should not run without write output")
+    def fail_run_schema_maintenance(**kwargs):
+        raise AssertionError("run_schema_maintenance should not run without write output")
 
-    monkeypatch.setattr(schema_maintain, "orchestrate", fail_orchestrate)
+    monkeypatch.setattr(schema_maintain, "run_schema_maintenance", fail_run_schema_maintenance)
 
     with pytest.raises(SystemExit, match="Write mode requires --out-path"):
         schema_maintain.main(
@@ -75,11 +80,11 @@ def test_write_mode_requires_output_path(monkeypatch) -> None:
 def test_write_mode_uses_user_output_and_not_discard(monkeypatch, tmp_path: Path) -> None:
     called = {}
 
-    def fake_orchestrate(**kwargs):
+    def fake_run_schema_maintenance(**kwargs):
         called.update(kwargs)
-        return kwargs["steps"][0]({"items": pd.DataFrame({"name": ["Item"]})})
+        return _report(write_intent=WriteIntent.WRITE)
 
-    monkeypatch.setattr(schema_maintain, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(schema_maintain, "run_schema_maintenance", fake_run_schema_maintenance)
     out_path = tmp_path / "out"
 
     rc = schema_maintain.main(
@@ -107,10 +112,10 @@ def test_write_mode_uses_user_output_and_not_discard(monkeypatch, tmp_path: Path
 
 
 def test_report_is_written_to_path_when_requested(monkeypatch, tmp_path: Path, capsys) -> None:
-    def fake_orchestrate(**kwargs):
-        return kwargs["steps"][0]({"items": pd.DataFrame({"name": ["Item"]})})
+    def fake_run_schema_maintenance(**kwargs):
+        return _report()
 
-    monkeypatch.setattr(schema_maintain, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(schema_maintain, "run_schema_maintenance", fake_run_schema_maintenance)
     report_path = tmp_path / "reports" / "schema.json"
 
     rc = schema_maintain.main(
@@ -137,10 +142,21 @@ def test_report_is_written_to_path_when_requested(monkeypatch, tmp_path: Path, c
 
 
 def test_blocked_operation_still_emits_report(monkeypatch, capsys) -> None:
-    def fake_orchestrate(**kwargs):
-        return kwargs["steps"][0]({"items": pd.DataFrame({"name": ["Item"]})})
+    def fake_run_schema_maintenance(**kwargs):
+        return _report(
+            target_column="name",
+            failures=(
+                SchemaMaintenanceFailure(
+                    code="target_column_exists",
+                    message="Target column already exists",
+                    frame="items",
+                    column="name",
+                ),
+            ),
+            write_intent=WriteIntent.WRITE,
+        )
 
-    monkeypatch.setattr(schema_maintain, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(schema_maintain, "run_schema_maintenance", fake_run_schema_maintenance)
 
     rc = schema_maintain.main(
         [
@@ -165,3 +181,33 @@ def test_blocked_operation_still_emits_report(monkeypatch, capsys) -> None:
     assert rc == 1
     report = json.loads(capsys.readouterr().out)
     assert report["failures"][0]["code"] == "target_column_exists"
+
+
+def _report(
+    *,
+    target_column: str = "slug",
+    failures: tuple[SchemaMaintenanceFailure, ...] = (),
+    write_intent: WriteIntent = WriteIntent.DRY_RUN,
+) -> SchemaMaintenanceReport:
+    request = SchemaMaintenanceRequest(
+        kind=SchemaOperationKind.ADD_COLUMN,
+        target_frame="items",
+        target_column=target_column,
+        write_intent=write_intent,
+    )
+    frame_changes = ()
+    if not failures:
+        frame_changes = (
+            FrameChange(
+                frame="items",
+                kind=SchemaOperationKind.ADD_COLUMN,
+                source_column=None,
+                target_column=target_column,
+                detail=f"Added column '{target_column}'",
+            ),
+        )
+    return SchemaMaintenanceReport(
+        operation=request,
+        frame_changes=frame_changes,
+        failures=failures,
+    )
