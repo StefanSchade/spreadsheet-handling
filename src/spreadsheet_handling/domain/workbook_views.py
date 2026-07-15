@@ -75,12 +75,16 @@ def configure_workbook_view(
     name: str | None = None,
 ) -> Frames:
     """Write workbook view selection, ordering, sheet names, and lifecycle metadata."""
-    normalized = _normalize_sheet_specs(sheets, frames)
 
+    normalized_sheet_specs = _normalize_sheet_specs(sheets, frames)
+
+    # Create a new outer frames mapping and a shallow copy of the top-level
+    # metadata mapping, while reusing the unchanged DataFrames.
     out: dict[str, Any] = dict(frames)
     out["_meta"] = dict(frames.get("_meta") or {})
-    for sheet in normalized:
-        _write_sheet_lifecycle(out, sheet)
+
+    for sheet_spec in normalized_sheet_specs:
+        _write_sheet_lifecycle(out, sheet_spec)
 
     meta = dict(out.get("_meta") or {})
     view: dict[str, Any] = {
@@ -89,13 +93,13 @@ def configure_workbook_view(
         "unknown_frame_policy": _non_empty_string(unknown_frame_policy, "unknown_frame_policy"),
         "sheets": [
             {
-                "frame": sheet.frame,
-                "sheet": sheet.sheet,
+                "frame": sheet_spec.frame,
+                "sheet": sheet_spec.sheet,
                 "order": index,
             }
-            for index, sheet in enumerate(normalized)
+            for index, sheet_spec in enumerate(normalized_sheet_specs)
         ],
-        WORKBOOK_VIEW_SHEET_MAPPINGS_KEY: _sheet_mappings(out, normalized),
+        WORKBOOK_VIEW_SHEET_MAPPINGS_KEY: _sheet_mappings(out, normalized_sheet_specs),
     }
     if include_debug_frames:
         view["include_debug_frames"] = True
@@ -109,7 +113,7 @@ def configure_workbook_view(
         view["name"] = _non_empty_string(name, "name")
 
     meta["workbook_view"] = view
-    _merge_sheet_options(meta, normalized)
+    _merge_sheet_options(meta, normalized_sheet_specs)
     out["_meta"] = meta
     return out
 
@@ -118,6 +122,11 @@ def _normalize_sheet_specs(
     sheets: Iterable[Mapping[str, Any]] | Mapping[str, Any],
     frames: Mapping[str, Any],
 ) -> list[_SheetSpec]:
+    """Validate sheet configuration and convert it to normalized sheet specifications.
+
+    Ensures that referenced frames exist, frame and sheet names are unambiguous,
+    and optional sheet settings use the expected types.
+    """
     raw_specs = _raw_sheet_specs(sheets)
     if not raw_specs:
         raise ValueError("sheets must not be empty")
@@ -222,9 +231,17 @@ def _lifecycle_mapping(raw: Mapping[str, Any], *, index: int) -> Mapping[str, An
     return lifecycle_map
 
 
-def _write_sheet_lifecycle(out: dict[str, Any], sheet: _SheetSpec) -> None:
-    existing = dict(frame_lifecycle(out.get("_meta")).get(sheet.frame) or {})
-    lifecycle = dict(sheet.lifecycle)
+def _write_sheet_lifecycle(
+    out: dict[str, Any],
+    sheet_spec: _SheetSpec,
+) -> None:
+    """Write or update lifecycle metadata for one configured workbook sheet.
+
+    Uses the sheet specification's lifecycle settings while preserving an
+    existing canonical frame classification where required.
+    """
+    existing = dict(frame_lifecycle(out.get("_meta")).get(sheet_spec.frame) or {})
+    lifecycle = dict(sheet_spec.lifecycle)
     role = str(lifecycle.get("role", existing.get("role", "readonly_projection")))
     canonical = bool(lifecycle.get("canonical", existing.get("canonical", False)))
     editable = lifecycle.get("editable", existing.get("editable", False))
@@ -235,7 +252,7 @@ def _write_sheet_lifecycle(out: dict[str, Any], sheet: _SheetSpec) -> None:
 
     write_frame_lifecycle(
         out,
-        sheet.frame,
+        sheet_spec.frame,
         role=role,
         canonical=canonical,
         editable=editable,
