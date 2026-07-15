@@ -1,3 +1,9 @@
+"""CLI adapter for schema-maintenance commands.
+
+Schema maintenance is intentionally exposed separately from
+user-configurable pipelines. This module parses CLI arguments, maps them to
+an application request, invokes the use case, and serializes its report.
+"""
 from __future__ import annotations
 
 import argparse
@@ -25,11 +31,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     request = _request_from_args(args)
+
     report = run_schema_maintenance(
         input={"kind": args.in_kind, "path": args.in_path},
         output=_output_from_args(args),
         request=request,
     )
+
     _emit_report(report, args.report)
     return 1 if report.blocked else 0
 
