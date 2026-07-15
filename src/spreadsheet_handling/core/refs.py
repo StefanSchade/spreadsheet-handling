@@ -1,7 +1,7 @@
 # core/refs.py
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 
 def add_helper_columns(records: list[dict[str, Any]], ref_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -20,4 +20,3 @@ def add_helper_columns(records: list[dict[str, Any]], ref_specs: list[dict[str, 
                 except Exception:
                     r[hp] = ""
     return records
-

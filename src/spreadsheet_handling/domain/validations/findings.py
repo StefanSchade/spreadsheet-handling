@@ -6,8 +6,8 @@ This keeps validation logic pure and decoupled from control flow.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Literal
 
 log = logging.getLogger("sheets.validation")
 
