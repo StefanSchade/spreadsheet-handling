@@ -25,6 +25,8 @@ PYTEST       := $(VENV)/bin/pytest
 RUFF         := $(VENV)/bin/ruff
 BLACK        := $(VENV)/bin/black
 SHEETS_RUN   := $(VENV)/bin/sheets-run
+# Extra existing sheets-run CLI arguments, for example SHEETS_RUN_ARGS=-vv.
+SHEETS_RUN_ARGS ?=
 
 MEMORY_DIR           := $(ROOT)project_memory
 MEMORY_CANONICAL_DIR := $(MEMORY_DIR)/canonical
@@ -285,12 +287,12 @@ check-memory-sheets-run: deps-dev ## Ensure the local sheets-run binary exists f
 	}
 
 memory-export: check-memory-sheets-run ## Render project_memory canonical JSON into project_memory.ods
-	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/json_to_ods.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) $(SHEETS_RUN_ARGS) --config "$(MEMORY_PIPELINE_DIR)/json_to_ods.yaml"
 
 memory-query: check-memory-sheets-run ## Render derived project_memory query views into project_memory/derived
 	@mkdir -p "$(MEMORY_DERIVED_DIR)"
 	@find "$(MEMORY_DERIVED_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
-	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/json_to_derived_queries.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) $(SHEETS_RUN_ARGS) --config "$(MEMORY_PIPELINE_DIR)/json_to_derived_queries.yaml"
 
 memory-context: $(PROJECT_MEMORY_STAMP) memory-query ## Render the generated project_memory context report
 	@mkdir -p "$(ROOT)docs_generated/project_memory"
@@ -334,7 +336,7 @@ memory-refresh-workbook: ## Refresh project_memory.ods with current extracted ca
 memory-import: check-memory-sheets-run ## Reimport project_memory.ods into project_memory/staging
 	@mkdir -p "$(MEMORY_STAGING_DIR)"
 	@find "$(MEMORY_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
-	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(MEMORY_PIPELINE_DIR)/ods_to_json.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) $(SHEETS_RUN_ARGS) --config "$(MEMORY_PIPELINE_DIR)/ods_to_json.yaml"
 
 memory-check: memory-import memory-diff-reimport ## Reimport the ODS spreadsheet and compare it with canonical JSON
 
@@ -390,7 +392,7 @@ domain-contracts-context: domain-contracts-check ## Validate and render generate
 	@echo "$(DOMAIN_CONTRACTS_GENERATED_DIR)/domain_contracts.adoc"
 
 domain-contracts-export: check-domain-contracts-sheets-run ## Render domain-contract canonical JSON into an ODS workbook
-	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/json_to_ods.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) $(SHEETS_RUN_ARGS) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/json_to_ods.yaml"
 	PYTHONPATH="$(ROOT)" $(PYTHON) -m tools.domain_contracts.promote_guard stamp \
 		--canonical-dir "$(DOMAIN_CONTRACTS_CANONICAL_DIR)" \
 		--workbook "$(DOMAIN_CONTRACTS_WORKBOOK)" \
@@ -402,7 +404,7 @@ domain-contracts-import: check-domain-contracts-sheets-run ## Reimport domain_co
 		--workbook "$(DOMAIN_CONTRACTS_WORKBOOK)"
 	@mkdir -p "$(DOMAIN_CONTRACTS_STAGING_DIR)"
 	@find "$(DOMAIN_CONTRACTS_STAGING_DIR)" -mindepth 1 ! -name '.gitignore' -exec rm -rf {} +
-	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
+	PYTHONPATH="$(ROOT):$(ROOT)src" $(SHEETS_RUN) $(SHEETS_RUN_ARGS) --config "$(DOMAIN_CONTRACTS_PIPELINE_DIR)/ods_to_json.yaml"
 	@cp -f "$(DOMAIN_CONTRACTS_ODS_STAMP)" "$(DOMAIN_CONTRACTS_STAGING_STAMP)"
 
 domain-contracts-diff-reimport: ## Compare canonical domain-contract JSON with current staging
