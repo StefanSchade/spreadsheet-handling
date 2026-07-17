@@ -1,0 +1,370 @@
+= FTR-PIPELINE-META-CHANGE-TRACE-P5 -- Trace structural runtime metadata changes per pipeline step
+
+*Status:* New
+
+*Priority:* P5
+
+*Area:* Pipeline execution / maintainer diagnostics
+
+*Kind:* Internal diagnostic slice
+
+== Purpose
+
+Make the otherwise implicit construction and evolution of runtime `_meta`
+easier for maintainers to follow while a pipeline executes.
+
+When DEBUG logging is enabled, the central pipeline execution boundary should
+report a compact, deterministically ordered summary of the runtime metadata
+paths that each successfully completed step added, changed, or removed.
+
+This is a human-comprehension aid for development and review. It is not a
+general pipeline-observability feature, an audit log, or a canonical semantic
+record.
+
+== Context and current code alignment
+
+Pipeline steps may introduce a metadata root, update an entry inside a nested
+contract, remove transient metadata, or preserve `_meta` unchanged. These
+effects are less visible than changes to DataFrames and currently require
+maintainers to correlate implementation code, tests, registries, and persisted
+output manually.
+
+The current central execution loop is
+`src/spreadsheet_handling/pipeline/execution.py:run_pipeline`. It iterates bound
+steps linearly, emits the existing per-step configuration DEBUG message, and
+then invokes each step. This is the appropriate observation boundary for a
+before/after runtime `_meta` diagnostic.
+
+`src/spreadsheet_handling/cli/logging_utils.py` maps CLI verbosity to the
+standard WARNING, INFO, and DEBUG levels. This slice uses the existing DEBUG
+level and does not introduce a new logging mode or public option.
+
+Logging complete `_meta` values after every step would create repetition and
+could expose payload-related or personal data. The diagnostic therefore
+reports structural paths only and remains best-effort.
+
+== Bounded scope
+
+This FTR covers only structural changes to runtime `_meta`:
+
+* observation before and after each successfully completed step at the central
+  pipeline execution boundary;
+* a small diagnostic structural snapshot of `_meta`, created only when the
+  relevant logger is enabled for DEBUG;
+* classification of paths as added, changed, or removed, plus a compact
+  unchanged outcome;
+* recursive comparison of ordinary mappings;
+* atomic reporting for sequences and other non-mapping values;
+* deterministic subtree collapsing and path sorting;
+* a small pure helper for snapshot, comparison, and formatting concerns;
+* focused unit tests that primarily assert the structured diff result;
+* focused pipeline-level logging tests for consecutive steps with distinct
+  metadata effects; and
+* short developer documentation describing intended use and limitations.
+
+Frame names, frame-set changes, DataFrame shapes, and other frame summaries are
+outside this first slice.
+
+== Desired behavior
+
+A step that changes metadata may produce a compact DEBUG summary resembling:
+
+[source,text]
+----
+<- step: configure_workbook_view
+meta:
+  added:
+    - workbook_view
+  changed:
+    - frame_lifecycle.characters
+    - frame_lifecycle.places
+  removed: []
+----
+
+A step that does not change runtime metadata may produce:
+
+[source,text]
+----
+<- step: identity
+meta: unchanged
+----
+
+Exact punctuation, indentation, and line wrapping are implementation details.
+The public contract is not a stable machine-readable log format. Tests should
+assert the structured diff model and use emitted-log assertions only for the
+focused pipeline integration points.
+
+== Structural diff semantics
+
+Paths are relative to the runtime `_meta` mapping. The diagnostic follows these
+rules:
+
+* ordinary mappings are compared recursively by key;
+* when a mapping key exists on both sides, comparison descends until it reaches
+  another mapping or an atomic reporting boundary;
+* lists and tuples are snapshotted deeply enough to detect nested or in-place
+  mutation, but any difference is reported atomically at the path containing
+  that sequence;
+* no index-based paths are emitted for list or tuple members;
+* sets, scalar values, DataFrames, and unsupported objects are treated as
+  atomic or opaque values rather than recursively reported structures;
+* an entirely added or removed subtree may be collapsed to the highest useful
+  path instead of listing descendants;
+* subtree collapsing is deterministic: when a key is absent on one side, that
+  key's path is reported once and comparison does not descend into that
+  added or removed subtree; and
+* each added, changed, and removed path list is deterministically sorted by its
+  rendered dotted path.
+
+For example, a nested mutation inside a relation list is reported as:
+
+[source,text]
+----
+changed:
+  - helper_policies.fk.relations
+----
+
+It is not reported with sequence indexes such as:
+
+[source,text]
+----
+changed:
+  - helper_policies.fk.relations.2.source_column
+  - helper_policies.fk.relations.3.target_frame
+----
+
+Snapshot semantics and reporting semantics are deliberately different. A list
+or tuple needs enough structural snapshot depth to detect mutation of a nested
+member, even though the diff reports only the sequence's containing path.
+
+If an ordinary mapping contains an unsupported key or value that cannot be
+handled safely, the diagnostic may collapse to the nearest safe containing
+path or emit a concise diagnostic-limitation message. It must not derive a path
+or message from arbitrary object `repr()` output.
+
+== Diagnostic snapshot strategy
+
+The implementation must use a small diagnostic structural snapshot rather than
+unrestricted `copy.deepcopy(_meta)` as a general solution.
+
+The snapshot must:
+
+* snapshot runtime `_meta` only, never the complete `Frames` mapping;
+* recursively capture ordinary mappings, lists, and tuples sufficiently for
+  later comparison and in-place-mutation detection;
+* never deep-copy a DataFrame;
+* never log or depend on arbitrary object `repr()` output;
+* treat sets, scalars, DataFrames, and unsupported complex values atomically or
+  as opaque values;
+* remain an internal diagnostic representation rather than a serializer or
+  canonical metadata form; and
+* be best-effort so snapshot failure cannot make a valid pipeline fail.
+
+The exact small implementation is an implementation decision. This FTR does
+not prescribe a generic serializer, content hashing or fingerprint
+infrastructure, registry-driven normalization, or an observability framework.
+
+== Data minimisation and logging boundary
+
+The new metadata-change summary must not emit:
+
+* DataFrame cell values;
+* complete metadata payloads;
+* before-and-after values;
+* copied lists or mappings;
+* arbitrary object representations; or
+* values derived from user-authored cells.
+
+Structural paths may nevertheless contain user-selected frame, sheet, column,
+contract, or plugin-defined names. The diagnostic minimizes exposure by
+logging structure instead of values, but DEBUG logs must still be treated as
+potentially sensitive operational output.
+
+Redaction, path allowlisting, and formal privacy classification are outside
+this slice. The implementation and documentation must not claim that the
+complete application debug log is payload-safe.
+
+The runner's existing per-step configuration logging is explicitly outside
+this FTR. The data-minimisation rules above apply only to the new metadata-
+change summary. This slice does not redesign, suppress, or sanitize existing
+step-configuration logging. A separate follow-up may be proposed only if
+concrete evidence demonstrates a problem.
+
+== DEBUG fast path and failure isolation
+
+When the relevant logger is not enabled for DEBUG:
+
+* no metadata snapshot is created;
+* no recursive metadata traversal occurs;
+* no metadata diff is calculated; and
+* normal pipeline results and exception behavior remain unchanged.
+
+When DEBUG is enabled, the executor captures `_meta` before a step and compares
+it with `_meta` returned by that successfully completed step. A failing step
+does not require an after-step diff in this slice; its existing exception
+propagation remains authoritative.
+
+Snapshotting, comparison, path extraction, and formatting are diagnostic only.
+If any of them fails:
+
+* the successfully computed step result remains authoritative;
+* the diagnostic should fall back to a coarser path-level indication where
+  safe;
+* otherwise it may emit a concise limitation message without object values or
+  arbitrary representations; and
+* it must not replace, mask, or modify the pipeline step's result or exception
+  semantics.
+
+== Architectural placement
+
+The implementation must preserve this separation:
+
+[source,text]
+----
+domain transformation
+    produces Frames + Meta
+
+pipeline execution boundary
+    observes before/after metadata effects
+
+small diagnostic helper
+    snapshots, compares, and formats structural changes
+----
+
+Generic trace logic must not be added to individual domain transformations.
+A small pipeline-internal helper module is acceptable when it keeps structural
+snapshot, diff, and formatting logic out of the execution loop. It must not
+grow into a generic observability subsystem.
+
+== Test strategy
+
+Pure helper tests should assert a structured diff result containing the added,
+changed, and removed path collections or an unchanged outcome. They should not
+couple the contract to incidental log whitespace or punctuation.
+
+Focused pipeline-level tests should assert only the integration behavior that
+the pure helper cannot prove:
+
+* no helper work occurs when DEBUG is disabled;
+* each successfully completed step is compared when DEBUG is enabled;
+* two consecutive steps with distinct metadata effects emit distinct summaries;
+* diagnostic failure does not alter a valid step result; and
+* step exceptions retain existing propagation semantics.
+
+New or modified test files must carry:
+
+[source,python]
+----
+pytestmark = pytest.mark.ftr("FTR-PIPELINE-META-CHANGE-TRACE-P5")
+----
+
+== Acceptance criteria
+
+. With DEBUG disabled, no snapshot, recursive traversal, or diff calculation
+  occurs.
+. With DEBUG enabled, runtime `_meta` is compared before and after each
+  successfully completed pipeline step.
+. The structured result represents added, changed, removed, and unchanged
+  outcomes.
+. Ordinary mappings are compared recursively.
+. Nested in-place mapping mutation is detected without aliasing the before
+  state to the after state.
+. Nested in-place list or tuple mutation is detected by the structural
+  snapshot.
+. A changed list or tuple is reported only at its containing path; no
+  index-based member paths are emitted.
+. Added and removed subtrees collapse deterministically to the highest useful
+  path.
+. All reported path collections are deterministically sorted.
+. Sets, scalars, DataFrames, and unsupported complex values are handled
+  atomically or opaquely without arbitrary `repr()` output.
+. No DataFrame is deep-copied for the diagnostic.
+. The new summary contains no complete metadata values, before-and-after
+  values, copied mappings or sequences, DataFrame cell values, or arbitrary
+  object representations.
+. Snapshot, comparison, extraction, or formatting failure cannot make an
+  otherwise valid pipeline fail.
+. Pipeline step results and exception semantics remain unchanged.
+. Pipeline-level evidence covers two consecutive successful steps with
+  distinct runtime metadata effects.
+. Focused logging assertions prove that the structured summary is emitted at
+  the pipeline boundary without defining incidental whitespace or punctuation
+  as a contract.
+. Developer documentation describes the trace as a best-effort human-
+  comprehension aid, not an audit log or canonical semantic record, and notes
+  the DEBUG-output sensitivity limitation.
+. No frame-set or DataFrame-shape tracing is introduced.
+. The FTR review resolves the release-note checkpoint. The expected outcome is
+  no release-note entry because this is an internal DEBUG diagnostic without a
+  new public CLI, YAML, or stable logging contract.
+
+== Non-goals
+
+This FTR does not include:
+
+* added or removed frame-name reporting;
+* DataFrame shape-change reporting or another compact frame summary;
+* a public pipeline step;
+* a CLI or YAML option;
+* a custom `TRACE` level;
+* registry validation or registry-driven normalization;
+* a stable machine-readable logging contract;
+* complete metadata dumps, before-and-after values, or value-bearing trace
+  records;
+* telemetry, metrics, tracing spans, or external observability integration;
+* a general pipeline-observability framework;
+* semantic judgment about whether a metadata change is correct;
+* modification, redesign, suppression, or sanitization of existing per-step
+  configuration logging;
+* a generic serializer, hashing, or fingerprint infrastructure;
+* new `_meta` fields, metadata semantics, or persistence behavior;
+* changes to domain transformation contracts; or
+* redaction, path allowlisting, or formal privacy classification.
+
+== Suggested implementation sequence
+
+. Reconfirm the central execution loop, logger hierarchy, and current step-
+  configuration message without changing the existing message.
+. Add pure tests for the structural snapshot and diff semantics.
+. Implement the small diagnostic snapshot and structured diff helper.
+. Add deterministic path sorting and subtree collapsing.
+. Guard all snapshot, traversal, and comparison work with the DEBUG-enabled
+  check.
+. Integrate before/after observation around successful steps in the central
+  execution loop.
+. Add focused pipeline-level tests for two consecutive metadata effects,
+  logging, diagnostic isolation, and exception preservation.
+. Add the bounded developer documentation and its privacy/operational
+  limitations.
+. Run focused tests, the normal unit and architecture targets, and the FTR
+  review/lifecycle workflow.
+
+== Approval status
+
+Planning and active-backlog registration are approved.
+
+Runtime, test, and developer-documentation implementation is *not* approved by
+this planning task. Separate human approval is required before implementation
+begins.
+
+If implementation evidence suggests a public option, a logging redesign,
+registry-driven normalization, a frame summary, or broader observability work,
+stop and propose a separately approved slice rather than expanding this FTR.
+
+== Expected outcome
+
+A maintainer can enable DEBUG logging for an existing pipeline and follow which
+step added, changed, or removed structural runtime metadata paths without
+dumping metadata values.
+
+The diagnostic should help answer questions such as:
+
+* Which step first introduced `workbook_view`?
+* Which step changed a frame-lifecycle entry?
+* Which step changed a helper-policy relation list?
+* Which step removed transient metadata?
+* Did a supposedly data-only step also modify runtime metadata?
+
+The diagnostic remains deliberately incomplete and potentially sensitive. It
+reveals structural metadata movement for human comprehension; it does not prove
+semantic correctness or provide an audit record.
