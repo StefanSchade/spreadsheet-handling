@@ -1,0 +1,337 @@
+= FTR-PIPELINE-META-CHANGE-TRACE-P5 -- Implementation review
+
+*Reviewed FTR:*
+`docs/cold_storage/backlog/ftrs_done/FTR-PIPELINE-META-CHANGE-TRACE-P5.adoc`
+
+*Planning commit:* `8f0983266e19b1685654755ed6d555c46c031f5a`
+
+*Implementation commit:* `0628245e6f735fec32e44dbbc063f400db8636c0`
+
+*Review type:* Implementation self-review and lifecycle closure
+
+*Verdict:* GREEN
+
+== Delivered change
+
+The pipeline now takes a private structural snapshot of runtime `_meta` before
+and after each successfully completed step when `sheets.pipeline` is enabled
+for DEBUG. The resulting immutable `MetaDiff` reports sorted tuple paths in
+`added`, `changed`, and `removed`, with an easy-to-test `unchanged` property and
+a bounded `limited` marker.
+
+The helper recursively snapshots ordinary mappings, lists, and tuples without
+using unrestricted deep copy. Sequence members provide mutation detection, but
+the diff reports a changed sequence only at its containing path. Safe scalar
+sets are snapshotted atomically. DataFrames and arbitrary unsupported values
+are identity-only opaque nodes. Unsupported mapping keys are retained only for
+identity matching and never rendered or compared by value; a change collapses
+to the nearest safe parent and carries the limitation marker.
+
+`run_pipeline` remains a small linear loop. Its existing configuration DEBUG
+message is unchanged in purpose and text. The new work is gated immediately
+before the pre-step snapshot, surrounds the unchanged `out = step(out)` call,
+and emits a summary only after successful return.
+
+== Acceptance-criteria trace
+
+[cols="3,4,1"]
+|===
+|Criterion |Evidence |Status
+
+|No snapshot, traversal, or diff work with DEBUG disabled
+|`execution.py` checks `log.isEnabledFor(logging.DEBUG)` immediately before
+`_snapshot_before_step`; `test_disabled_debug_path_performs_no_snapshot_or_diff_work`
+monkeypatches every helper to fail if called.
+|Met
+
+|Compare `_meta` around every successful step with DEBUG enabled
+|`run_pipeline` snapshots before `out = step(out)` and calls `_log_meta_change`
+after return. `test_enabled_debug_snapshots_before_and_after_every_successful_step`
+observes four snapshots for two steps.
+|Met
+
+|Structured added, changed, removed, and unchanged outcomes
+|Frozen `MetaDiff` exposes tuple collections plus `unchanged`; focused helper
+tests assert every outcome directly.
+|Met
+
+|Recursive ordinary-mapping comparison
+|`_snapshot_mapping` and `_diff_mappings` recurse by safe string key;
+added-nested and changed-nested tests exercise the behavior.
+|Met
+
+|Nested in-place mapping mutation detected without aliasing
+|Snapshot nodes copy mapping structure and safe scalar state;
+`test_snapshot_detects_nested_in_place_dictionary_mutation` mutates the same
+object graph after the before snapshot.
+|Met
+
+|Nested in-place list and tuple-member mutation detected
+|`_SequenceSnapshot` recursively snapshots members. Dedicated list and
+tuple-member mutation tests pass.
+|Met
+
+|Changed sequences reported only at their container, without indexes
+|Non-mapping node differences call `_record_changed` at the incoming path. The
+list and tuple tests assert the container path and absence of index segments.
+|Met
+
+|Added and removed subtrees collapse deterministically
+|`_diff_mappings` records an absent key once and does not descend. Root and
+nested added-subtree plus removed-subtree tests pass.
+|Met
+
+|Deterministically sorted path collections
+|`_sorted_paths` sorts deduplicated tuple paths by dotted rendering; the mixed
+ordering test asserts all three collections.
+|Met
+
+|Sets, scalars, DataFrames, and unsupported values are atomic or opaque without
+arbitrary representation
+|Exact built-in scalars and safe scalar sets use bounded comparison;
+DataFrames and unsupported objects use identity. Tests cover NaN, sets,
+DataFrames, objects whose equality and representation raise, and unsupported
+keys whose representation raises.
+|Met
+
+|No DataFrame deep copy
+|No copy facility is imported. `test_dataframe_is_opaque_and_never_deep_copied`
+monkeypatches `DataFrame.__deepcopy__` to raise and still passes.
+|Met
+
+|Summary emits no metadata values or copied payloads
+|`format_meta_diff` accepts only a step name and structural `MetaDiff`; the
+formatter test proves sentinel before/after values are absent. Manual evidence
+below contains paths only.
+|Met
+
+|Snapshot, comparison, extraction, or formatting failure cannot fail a valid
+pipeline
+|Before-snapshot and parameterized after-snapshot/diff/format tests inject
+failures and assert result identity and the concise limitation fallback.
+|Met
+
+|Step results and exception semantics unchanged
+|The step call remains `out = step(out)`. Valid-result tests assert identity;
+`test_step_exception_propagates_unchanged_without_after_summary` asserts the
+same exception object escapes and no after summary is logged.
+|Met
+
+|Two consecutive successful steps have distinct metadata effects
+|The enabled integration test runs add-policy, change-policy, and identity
+steps and asserts three ordered, distinct summaries. Manual core-step evidence
+also shows two different added roots.
+|Met
+
+|Focused boundary logging without stable whitespace contract
+|Pipeline tests inspect record messages for step names, paths, summary count,
+and compact unchanged content. Pure tests own the structured diff contract.
+|Met
+
+|Developer documentation covers purpose, limitations, and sensitivity
+|Developer Guide `Getting Started / Following Runtime Metadata Changes`
+documents `-vv`, structural movement, human comprehension, best-effort and
+non-canonical status, semantic non-judgment, no values, sensitive names, the
+existing configuration-line exception, and no stable machine format.
+|Met
+
+|No frame-set or DataFrame-shape trace
+|The helper reads only `frames["_meta"]`; no frame iteration, frame-name
+reporting, shape access, or DataFrame traversal exists.
+|Met
+
+|Release-note checkpoint resolved
+|The release-note decision below confirms that no entry is warranted for this
+internal DEBUG-only diagnostic.
+|Met
+|===
+
+== Implementation decisions
+
+=== Diagnostic snapshot representation
+
+The private helper uses frozen, representation-disabled node dataclasses and a
+frozen public-to-the-module `MetaSnapshot`. Mappings copy safe keys and child
+nodes; lists and tuples copy child nodes recursively. This is an ephemeral
+diagnostic tree, not a serializer, hash, persistent carrier, or metadata model.
+
+=== Opaque-value behavior
+
+DataFrames and unsupported values are stored as identity-only opaque nodes.
+Replacement is observable; arbitrary internal in-place mutation is deliberately
+best-effort and may remain invisible. No arbitrary equality or representation
+is invoked.
+
+=== Safe mapping-key behavior
+
+Only non-empty printable built-in strings become path segments. Unsupported
+keys are never converted, rendered, or value-compared. Identity matching allows
+the helper to notice a safely snapshotted child change and collapse it to the
+nearest supported parent; otherwise the result records only a limitation.
+
+=== Subtree collapsing
+
+An absent mapping key is added or removed once. Comparison never enters its
+subtree. Final path tuples are deduplicated and sorted by dotted rendering.
+
+=== Disabled DEBUG fast path
+
+The exact guard is in the central loop after the existing pre-step
+configuration `log.debug(...)` call and before `_snapshot_before_step(out)`.
+When false, `before` is `None`, the normal step call is unchanged, and the
+after-step diagnostic branch is skipped.
+
+=== Failure isolation
+
+The before-snapshot wrapper converts diagnostic exceptions to an internal
+unavailable marker without touching the step. The after wrapper contains
+snapshot, diff, formatting, and new summary logging, then attempts one fixed,
+value-free limitation message if any stage fails. Failure of that fallback is
+also swallowed. `Exception` is caught, not `BaseException`; step exceptions are
+outside the wrapper and propagate unchanged.
+
+=== Log formatting
+
+The formatter emits one multiline DEBUG record per successful step. It renders
+only safe dotted paths, empty category lists, `meta: unchanged`, or a bounded
+unsupported-structure limitation. The format is intentionally human-readable
+and unstable as a machine contract.
+
+=== Developer-documentation placement
+
+The small operational section lives in
+`docs/developer_guide/ch03_getting_started/01_getting_started.adoc`, near setup
+and verification guidance. It links to existing architectural material rather
+than duplicating the pipeline or metadata models.
+
+=== Release-note checkpoint
+
+No release-note entry was added. Repository conventions reserve release notes
+for public or release-relevant behavior. This change is an internal DEBUG
+diagnostic with no new CLI argument, YAML option, public Python export, plugin
+contract, metadata schema, stable log format, migration behavior, known-
+limitation change, or release-positioning change.
+
+== Manual comprehension evidence
+
+A small in-memory pipeline used existing `configure_workbook_view`,
+`add_validations`, and `identity` steps with DEBUG enabled. Sanitized output
+from only the new summaries was:
+
+[source,text]
+----
+<- step: configure_workbook_view
+meta:
+  added:
+    - frame_lifecycle
+    - workbook_view
+  changed: []
+  removed: []
+<- step: add_validations
+meta:
+  added:
+    - constraints
+  changed: []
+  removed: []
+<- step: identity
+meta: unchanged
+----
+
+This follows metadata construction across distinct core steps without showing
+metadata values. Existing configuration messages were intentionally excluded
+from the sanitized excerpt because they remain outside this FTR's minimisation
+guarantee.
+
+== Validation
+
+[cols="4,1,4"]
+|===
+|Command |Result |Notes
+
+|`.venv/bin/python -m pytest tests/unit/pipeline/test_meta_change_trace.py tests/unit/pipeline/test_pipeline_meta_change_trace.py -q`
+|Passed
+|26 focused tests passed.
+
+|`.venv/bin/ruff check src/spreadsheet_handling/pipeline/_meta_change_trace.py src/spreadsheet_handling/pipeline/execution.py tests/unit/pipeline/test_meta_change_trace.py tests/unit/pipeline/test_pipeline_meta_change_trace.py`
+|Passed
+|All changed Python files are clean.
+
+|`.venv/bin/ruff check src/spreadsheet_handling tests`
+|Baseline failure
+|Reported 26 existing errors in unrelated test files. None is in the five-file
+implementation diff; the exact requested command was executed and unrelated
+user-owned lint debt was not changed.
+
+|`make source-style-guards`
+|Passed
+|Zero errors; 78 repository-wide warnings and two allowlisted findings. The
+setup prerequisite logged sandboxed-network retries but completed with the
+existing environment.
+
+|`make test-unit`
+|Passed
+|Complete active unit slice passed.
+
+|`make test-arch`
+|Passed
+|Complete active architecture slice passed.
+
+|`make test`
+|Passed
+|1,455 passed and one expected xfail.
+
+|`asciidoctor --failure-level=ERROR -o /tmp/getting_started_pipeline_meta_trace.html docs/developer_guide/ch03_getting_started/01_getting_started.adoc`
+|Passed
+|Changed standalone Developer Guide source rendered strictly.
+
+|Strict assembled Developer Guide render from a temporary docs mirror with
+`docs/warm_storage/attributes.adoc` copied to its expected `docs/attributes.adoc`
+include location
+|Passed
+|The repository currently lacks the expected `docs/attributes.adoc`; supplying
+the existing canonical attributes in temporary space avoids a source-tree
+mutation. Existing section-level warnings remain below ERROR.
+
+|`asciidoctor --failure-level=ERROR -o /tmp/FTR-PIPELINE-META-CHANGE-TRACE-P5.html docs/backlog/FTR-PIPELINE-META-CHANGE-TRACE-P5.adoc`
+|Passed
+|Active FTR rendered strictly before archival.
+
+|`asciidoctor --failure-level=ERROR -o /tmp/ftrs_open_pipeline_meta_trace.html docs/backlog/_ftrs_open.adoc`
+|Passed
+|Active include surface rendered strictly before closure.
+
+|`asciidoctor --safe-mode=unsafe --failure-level=ERROR -o /tmp/backlog_pipeline_meta_trace.html docs/backlog/backlog.adoc`
+|Passed
+|Assembled backlog rendered strictly before closure.
+
+|Manual in-memory core-step pipeline with `PYTHONPATH=src` and DEBUG logging
+|Passed
+|Produced distinct structural summaries for two metadata-producing steps and
+a compact unchanged summary without metadata values.
+
+|`git diff --check`
+|Passed
+|No whitespace errors before the implementation commit.
+|===
+
+== Findings and residual scope
+
+No implementation findings and no residual FTR scope. The full-tree Ruff debt
+and the Developer Guide's missing top-level attributes include predate this
+change, do not affect the new diagnostic, and were not broadened into this FTR.
+No follow-up is required for the delivered feature.
+
+Opaque custom-object mutation remains intentionally best-effort, structural
+names remain potentially sensitive, and the output format remains unstable;
+these are explicit bounded properties rather than unmet criteria.
+
+== Lifecycle cleanup check
+
+* The FTR status changes to `Done` and its Delivery section records the
+  implementation commit and delivered surfaces.
+* Its include and completed current-focus action are removed from
+  `docs/backlog/_ftrs_open.adoc`.
+* The FTR and this review move together to
+  `docs/cold_storage/backlog/ftrs_done/`; no other companion artifacts exist.
+* No residual scope exists and no follow-up FTR is required.
+* Cleanup is performed in the review and lifecycle closure commit.
