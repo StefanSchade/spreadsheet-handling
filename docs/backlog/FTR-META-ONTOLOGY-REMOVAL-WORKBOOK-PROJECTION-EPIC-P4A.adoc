@@ -1,0 +1,983 @@
+= FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A
+:revdate: 2026-07-18
+:status: Draft for architecture review
+:type: Epic / Architecture Reformation
+:review-first: true
+
+== Status
+
+Draft for Fable review.
+
+This document is intentionally broader than a normal implementation FTR.
+It defines an architecture direction, records the reasoning behind it, and
+splits the intended change into reviewable implementation slices.
+
+No implementation should start before the architecture-impact review has
+tested the target model against the current code, tests, examples, plugins,
+documentation, and carrier behavior.
+
+== Purpose
+
+Remove ontology-driven frame-selection behavior from the spreadsheet rendering
+path and replace it with explicit, mechanically composable contracts.
+
+The current implementation mixes two different concerns:
+
+. carrier-neutral domain cleanup of frames that a functional transformation has
+  made redundant; and
+. spreadsheet-specific projection of remaining logical frames onto workbook
+  structures.
+
+Both concerns are currently influenced by broad `frame_lifecycle` concepts such
+as `canonical`, `intermediate`, `redundant`, `system`,
+`visible_by_default`, and `omit_by_default`.
+
+The implementation ultimately reduces much of this vocabulary to a binary
+decision:
+
+[source,text]
+----
+materialize this frame
+or
+do not materialize this frame
+----
+
+This epic shall remove that implicit ontology-to-command translation in this
+specific context.
+
+Functional transformations shall own the decision whether a frame remains part
+of the logical domain state. Workbook View shall own only the explicit
+spreadsheet projection of the logical state that remains. Rendering shall
+execute a validated projection plan without inferring behavior from broad
+lifecycle roles.
+
+This is expected to be the first of several similar reformation epics. Other
+transformations and metadata areas may contain comparable ontology-driven
+behavior and require separate FTRs.
+
+== Problem Statement
+
+=== Requirements-language drift
+
+Terms such as `canonical`, `derived`, `intermediate`, `editable_projection`,
+`redundant`, and `system` were introduced to summarize groups of properties.
+
+Over time those terms began to act as executable categories.
+
+For example, the rendering layer currently contains logic equivalent to:
+
+[source,python]
+----
+DEFAULT_OMIT_ROLES = {"intermediate", "redundant", "system"}
+----
+
+The renderer therefore interprets a semantic classification as a spreadsheet
+materialization decision.
+
+This creates several problems:
+
+* A broad category may bundle several unrelated properties.
+* The original use case behind the category becomes difficult to recover.
+* New consistency requirements are derived from the category itself.
+* Different consumers may attach different meanings to the same term.
+* Documentation must explain an ontology that the runtime only consumes as a
+  binary include/omit switch.
+* The renderer becomes responsible for decisions that belong either to a
+  functional transformation or to a concrete workbook projection.
+
+=== Two kinds of omission were merged
+
+The current design does not sufficiently distinguish:
+
+Domain cleanup::
+A frame is no longer part of the intended logical result because a functional
+transformation has replaced it and does not require it as shadow or merge
+state. The frame should be removed before any persistence adapter runs.
+
+Workbook projection::
+A frame remains part of the logical result but is not materialized in a
+particular spreadsheet artifact.
+
+These operations have different semantics.
+
+A domain cleanup affects JSON, YAML, XML, XLSX, ODS, and any later pipeline
+step. A workbook projection affects only the workbook artifact.
+
+Treating both as render-layer omission causes carrier asymmetry. A frame may
+disappear in a spreadsheet but remain in JSON or XML, even when the functional
+transformation considers it fully redundant.
+
+=== Workbook View is optional
+
+A spreadsheet writer must remain usable without an explicit Workbook View
+configuration.
+
+Without Workbook View, the default spreadsheet projection shall remain simple
+and predictable:
+
+[source,text]
+----
+each remaining logical frame
+-> one same-named worksheet
+----
+
+The logical frame name is the default worksheet name, subject to existing
+spreadsheet naming validation and normalization rules.
+
+Workbook View is an optional explicit projection contract. It is not a
+mandatory prerequisite for spreadsheet export.
+
+=== Sheets are not frames
+
+The current implementation is largely one-frame-to-one-sheet, but the
+architecture must not freeze that assumption.
+
+Future valid projections may include:
+
+* one frame rendered to multiple sheets;
+* multiple frames composed into one sheet;
+* one frame rendered into a named range on another sheet;
+* one frame rendered into several named ranges;
+* a legend frame rendered as a secondary structure rather than as its own
+  worksheet;
+* projections that select or reshape only part of a frame.
+
+Workbook View therefore belongs at the logical-frame to physical-workbook
+boundary. The rendering layer remains responsible for executing that physical
+projection.
+
+The required reform is not to remove workbook projection from rendering. It is
+to stop rendering from deriving workbook projection from broad lifecycle
+ontology.
+
+== Architecture Decision Under Review
+
+=== Responsibility 1: Functional transformations
+
+Each functional transformation owns the semantics of the frames that it
+creates, replaces, preserves, or later reconstructs.
+
+A transformation must decide, based on its own contract and parameters, whether
+a source or intermediate frame:
+
+. must remain available as shadow or merge state;
+. is fully reconstructable from the editable projection and may be removed; or
+. may be absent in an initial state and created during inverse transformation.
+
+This decision is feature-local.
+
+The framework shall not attempt to infer reconstructability from generic frame
+roles.
+
+If a transformation determines that a frame is no longer part of the intended
+logical output, it shall record a simple deferred-cleanup directive.
+
+The first target contract is intentionally binary:
+
+[source,yaml]
+----
+pipeline_cleanup:
+  frames:
+    relation_source:
+      drop: true
+----
+
+The exact final path and shape remain subject to review. The semantic intent
+must remain narrow:
+
+[source,text]
+----
+drop: true
+-> remove this frame from the logical Frames state during final domain cleanup
+
+drop: false or no drop directive
+-> do not remove this frame through this cleanup contract
+----
+
+The directive does not encode:
+
+* why the frame is redundant;
+* how it can be reconstructed;
+* whether the projection is filtered;
+* which inverse algorithm is used;
+* whether the frame is canonical;
+* whether the frame is editable;
+* whether the frame belongs to a report or roundtrip workbook.
+
+Those questions remain in the transformation's local contract, implementation,
+tests, and documentation.
+
+=== Responsibility 2: Final domain cleanup
+
+A dedicated final domain transformation shall execute deferred frame cleanup.
+
+Conceptually:
+
+[source,text]
+----
+functional transformations
+-> deferred cleanup directives
+-> final domain cleanup transformation
+-> carrier-neutral logical Frames result
+-> persistence and artifact projection
+----
+
+The cleanup transformation shall:
+
+* remove every frame explicitly marked for domain cleanup;
+* act before any persistence adapter that is expected to receive the final
+  logical state;
+* apply the same logical cleanup regardless of target carrier;
+* update or validate metadata references affected by removed frames;
+* fail deterministically on contradictory retained references where silent
+  cleanup would hide an invalid pipeline;
+* leave unmarked frames unchanged;
+* never infer cleanup from `role`, `canonical`, `derived`, `intermediate`,
+  `redundant`, `system`, or similar broad categories.
+
+The pipeline builder remains responsible for placing the final cleanup step at
+the correct point.
+
+This framework is a programming toolkit. It provides deterministic building
+blocks and local guards, but it does not prove that an arbitrary pipeline is
+semantically reversible.
+
+=== Responsibility 3: Workbook View
+
+Workbook View defines an optional spreadsheet artifact projection over the
+remaining logical Frames state.
+
+Without an explicit Workbook View:
+
+[source,text]
+----
+every remaining frame
+-> one default worksheet
+-> default worksheet name derived from the logical frame name
+----
+
+With an explicit Workbook View:
+
+[source,text]
+----
+only explicitly declared normal workbook projections are materialized
+----
+
+A missing mapping means that the frame is not part of that explicit workbook
+view. It does not mean that the frame is removed from the logical Frames state.
+
+Workbook View may later support M:N projection from logical frames to physical
+workbook structures.
+
+The target model must therefore be described in terms of projection mappings,
+not permanent one-frame-to-one-sheet identity.
+
+Workbook View may define:
+
+* source frame;
+* worksheet target;
+* visible worksheet name;
+* order;
+* named-range or anchored-range target in future slices;
+* protection and editability presentation;
+* helper/display columns;
+* other spreadsheet-specific presentation directives.
+
+Workbook View shall not derive projection from broad lifecycle roles.
+
+=== Responsibility 4: Rendering
+
+The rendering layer shall build and execute a validated workbook projection
+plan.
+
+It may:
+
+* apply the implicit one-frame-to-one-sheet default when Workbook View is
+  absent;
+* apply explicit Workbook View mappings when present;
+* compose future feature-local workbook projection directives;
+* validate target names, target existence, uniqueness, and non-overlap;
+* reject contradictory directives;
+* create WorkbookIR and pass it to concrete spreadsheet backends.
+
+It shall not:
+
+* infer redundancy from lifecycle role;
+* decide whether data is reconstructable;
+* decide whether a source frame is needed as shadow state;
+* interpret `canonical`, `intermediate`, `redundant`, or `system` as projection
+  commands;
+* silently resolve contradictions by precedence heuristics.
+
+=== Responsibility 5: Persistence adapters
+
+JSON, YAML, XML, XLSX, ODS, and future adapters shall receive the logical frame
+state produced by the domain pipeline at the point they are invoked.
+
+Carrier-neutral cleanup must therefore happen before the adapter call when the
+cleaned logical result is intended for all carriers.
+
+Spreadsheet-specific projection remains a workbook concern and does not imply
+that non-spreadsheet adapters should drop unmapped frames.
+
+== Default and Explicit Workbook Behavior
+
+=== No Workbook View
+
+When no Workbook View is present:
+
+. each remaining DataFrame is projected once;
+. each projection targets a same-named worksheet;
+. `_meta` remains metadata and is not treated as a normal frame;
+. existing worksheet-name validation and carrier constraints apply;
+. future feature-local special projections may add workbook structures;
+. feature-local special projections must not require an explicit Workbook View.
+
+Example:
+
+[source,text]
+----
+Frames:
+  stories
+  characters
+  places
+
+Workbook:
+  stories
+  characters
+  places
+----
+
+=== Explicit Workbook View
+
+When Workbook View is present:
+
+. its declared normal projections are authoritative;
+. a logical frame without an explicit normal projection is not materialized as
+  a default worksheet;
+. independent feature-local special projections may still be composed if the
+  final contract allows them;
+. all composed directives must be validated for conflicts.
+
+Example:
+
+[source,yaml]
+----
+workbook_view:
+  mappings:
+    - frame: stories
+      target:
+        sheet: Story Overview
+    - frame: characters
+      target:
+        sheet: Cast
+----
+
+`places` remains in the logical Frames state but is not materialized in this
+workbook.
+
+=== Future M:N projection
+
+The target model must not assume that `sheet` and `frame` are synonymous.
+
+A future contract may support:
+
+[source,yaml]
+----
+workbook_view:
+  mappings:
+    - frame: legend
+      target:
+        sheet: Overview
+        named_range: StatusLegend
+
+    - frame: legend
+      target:
+        sheet: Details
+        named_range: StatusLegendDetails
+----
+
+This epic does not require named-range implementation. It requires that the
+refactor not make future M:N projection harder.
+
+== Conflict Semantics
+
+Conflicts shall fail explicitly.
+
+No silent precedence rule shall decide between domain cleanup and workbook
+projection.
+
+=== Cleanup versus Workbook View
+
+If a frame is marked for carrier-neutral cleanup and Workbook View explicitly
+maps that frame, the pipeline or projection-plan validation must fail.
+
+Example:
+
+[source,text]
+----
+Frame 'relation_source' is scheduled for domain cleanup
+but is explicitly referenced by workbook_view.
+----
+
+The preferred validation point is subject to review. It must occur before
+artifact creation and must identify both conflicting declarations.
+
+=== Cleanup versus feature-local special projection
+
+If a special workbook projection uses a frame marked for domain cleanup, that is
+also a conflict unless the special projection has already materialized an
+independent replacement before cleanup.
+
+The contract must avoid hidden ordering dependencies.
+
+=== Multiple workbook targets
+
+Future projection planning must reject:
+
+* duplicate exclusive named-range definitions;
+* overlapping exclusive target ranges;
+* incompatible mappings to the same target;
+* references to target sheets that cannot be created or resolved;
+* contradictory explicit inclusion and exclusion directives.
+
+=== Missing frames
+
+Explicit mappings to missing frames shall fail.
+
+The system shall not infer a substitute from frame names, order, role, shape,
+or lifecycle relationships.
+
+== Transformation and Roundtrip Responsibility
+
+A functional transformation may expose different valid states.
+
+For example, a transformation that creates an editable projection may define:
+
+Preserved-source mode::
+The source frame remains because the inverse step must merge edited projection
+data into shadow or out-of-scope data.
+
+Reconstructable-source mode::
+The source frame is fully reconstructable from the projection and is marked for
+final domain cleanup.
+
+Initial-create mode::
+The source frame may not exist in the initial state and the inverse step creates
+it from the projection.
+
+These are examples, not a global metadata ontology.
+
+Each transformation must document and test only the states that its own contract
+supports.
+
+If a transformation can receive both present and absent source frames, its
+inverse implementation must handle that distinction.
+
+If a transformation contract guarantees one state only, no general framework
+branch is required.
+
+The final cleanup contract needs only the binary decision whether the logical
+frame is removed. It does not need to encode the transformation's complete
+reasoning.
+
+== Metadata Direction
+
+=== Remove executable ontology from this path
+
+This epic shall review and likely remove or decouple render behavior based on:
+
+* `frame_lifecycle.role`;
+* `frame_lifecycle.render`;
+* `canonical`;
+* `intermediate`;
+* `redundant`;
+* `system`;
+* `visible_by_default`;
+* `omit_by_default`;
+* `DEFAULT_INCLUDE_ROLES`;
+* `DEFAULT_OMIT_ROLES`;
+* `mode` where it acts as an implicit projection preset;
+* `drop_redundant_data`;
+* `include_roles`;
+* `omit_roles`;
+* `include_omit_by_default`;
+* `unknown_frame_policy` where it exists only to support implicit lifecycle
+  selection.
+
+This list is a review target, not an instruction to delete every field without
+evidence.
+
+A field may remain if a concrete consumer uses it for a distinct, justified
+decision. It must not remain merely because the existing ontology contains it.
+
+=== Metadata as narrow command carrier
+
+Metadata may transport narrow declarative commands that a concrete consumer
+can execute deterministically.
+
+Examples:
+
+[source,text]
+----
+drop this logical frame during final domain cleanup
+map this logical frame to this workbook target
+apply these spreadsheet protection options
+----
+
+Metadata should not attempt to become a complete ontology of:
+
+* canonicality;
+* reconstruction safety;
+* business authority;
+* editability;
+* persistence universality;
+* projection type;
+* redundancy reason.
+
+Feature semantics remain owned by feature-local contracts.
+
+== Documentation Requirements
+
+The documentation work is part of this epic, not a follow-up convenience task.
+
+=== Semantic Model
+
+The Semantic Model shall explain:
+
+* logical Frames state versus workbook artifact projection;
+* carrier-neutral domain cleanup versus spreadsheet-specific omission;
+* the exact meaning and full paths of cleanup directives;
+* the exact meaning and full paths of Workbook View projection directives;
+* the absence of ontology-based render inference;
+* the optional nature of Workbook View;
+* the default one-frame-to-one-sheet projection;
+* conflict semantics;
+* the responsibility retained by the pipeline builder;
+* how feature-local transformation contracts relate to generic cleanup and
+  workbook projection.
+
+The Semantic Model shall show full metadata paths, not only leaf names.
+
+It shall include an explicit mapping from Workbook View DSL fields to canonical
+metadata paths and projection-plan behavior.
+
+=== Technical Model
+
+The Technical Model shall explain:
+
+* which functions produce cleanup directives;
+* which final domain step executes them;
+* when metadata references are validated or removed;
+* how the workbook projection plan is constructed;
+* how implicit default projection differs from explicit Workbook View;
+* how future M:N mappings fit the architecture;
+* how conflicts are detected;
+* which old lifecycle-based branches were removed or retained;
+* why rendering no longer interprets lifecycle ontology.
+
+=== Functional Model
+
+Feature-local functional documentation shall explain for each affected
+transformation:
+
+* whether it preserves source frames;
+* whether it may mark them for cleanup;
+* under which explicit parameters or preconditions;
+* how inverse behavior handles present or absent source state;
+* which behavior is guaranteed and which remains pipeline-builder
+  responsibility.
+
+=== User Guide
+
+The User Guide shall include practical examples for:
+
+* spreadsheet export without Workbook View;
+* explicit Workbook View projection;
+* a frame retained for JSON/XML but omitted only from a workbook view;
+* a frame removed carrier-neutrally by final domain cleanup;
+* a transformation that keeps shadow state for merge;
+* a transformation that marks a fully reconstructable source for cleanup;
+* conflict errors between cleanup and Workbook View;
+* the limits of framework guarantees.
+
+=== Registry and structured model artifacts
+
+The metadata registry, transformation registry, requirements registry, and
+related structured artifacts shall be updated only after the target contract is
+settled.
+
+They must record concrete paths and consumers rather than reintroduce broad
+categories as executable abstractions.
+
+== Fable Review Mandate
+
+Fable shall review this epic before implementation.
+
+The purpose is not to redesign the proposal from first principles. The purpose
+is to search for blockers, counterexamples, hidden dependencies, and migration
+risks.
+
+Fable shall attempt to falsify the target architecture.
+
+=== Review Questions
+
+Fable shall determine:
+
+. Which current code paths derive workbook selection from lifecycle roles or
+  lifecycle render values?
+. Which real pipelines, examples, plugins, or consumers depend on that behavior?
+. Which tests demonstrate an actual user requirement, and which merely preserve
+  speculative or historical implementation?
+. Does any non-spreadsheet carrier currently depend on Workbook View or render
+  selection semantics?
+. Where are frames currently dropped, pruned, renamed, or retained?
+. Is there already a generic drop/prune transformation that can implement the
+  final cleanup step?
+. Which metadata paths reference frame names and must be updated or validated
+  when a frame is removed?
+. Can cleanup be deferred safely through later transformations?
+. Which later transformations depend on frames that earlier transformations may
+  mark for cleanup?
+. How should multiple transformations contribute cleanup directives?
+. Can one transformation revoke or override an earlier cleanup directive, or
+  must that be a conflict?
+. At what pipeline point can final cleanup be inserted without hidden behavior?
+. Should the cleanup step be explicit in the pipeline, automatically appended,
+  or provided as an explicit standard end-stage invoked by orchestration?
+. What are the effects on JSON, YAML, XML, XLSX, ODS, CLI, plugins, examples,
+  and roundtrip tests?
+. Which existing fields become dead after explicit projection replaces
+  lifecycle inference?
+. Which fields still have independent justified consumers?
+. Does current Workbook View behavior already provide an authoritative explicit
+  mapping branch that can be retained?
+. Where does the current implementation assume one frame equals one sheet?
+. Would the proposed refactor hinder future named-range or M:N workbook
+  projection?
+. Which backward-compatibility promises exist for current YAML or Python APIs?
+. What is the smallest safe migration path?
+
+=== Required Review Output
+
+Fable shall return:
+
+* confirmed supporting evidence;
+* counterexamples;
+* semantic blockers;
+* implementation risks;
+* documentation risks;
+* compatibility risks;
+* dead or speculative complexity;
+* affected files and symbols;
+* existing tests that should be retained, rewritten, or removed;
+* proposed additional characterization tests;
+* recommended slice ordering;
+* a conclusion using one of:
+  ** target model supported;
+  ** target model supported with amendments;
+  ** target model blocked by identified evidence.
+
+Fable shall distinguish architectural evidence from mere implementation
+convenience.
+
+== Epic Slices
+
+The slices below are provisional. Fable may recommend reordering or splitting
+them.
+
+=== Slice 0 -- Characterization and impact review
+
+Goal::
+Establish the real behavior and dependencies before changing contracts.
+
+Work::
+
+* inventory all producers and consumers of frame lifecycle and workbook-view
+  selection fields;
+* identify real consumer pipelines;
+* characterize no-Workbook-View behavior;
+* characterize explicit Workbook View behavior;
+* characterize current carrier asymmetry;
+* identify metadata references affected by frame deletion;
+* record compatibility constraints.
+
+Acceptance::
+
+* every current selection branch is mapped to tests and consumers;
+* speculative behavior is distinguished from required behavior;
+* the implementation slices are confirmed or amended.
+
+=== Slice 1 -- Narrow domain-cleanup contract
+
+Goal::
+Introduce a feature-neutral, carrier-neutral deferred frame-drop contract.
+
+Work::
+
+* define the exact metadata path and schema;
+* allow functional transformations to contribute explicit frame-drop
+  directives;
+* reject invalid frame names and reserved `_meta`;
+* define duplicate and contradictory directive behavior;
+* add local contract tests.
+
+Acceptance::
+
+* a transformation can mark a logical frame for final cleanup;
+* the contract contains no lifecycle-role inference;
+* no adapter behavior changes yet.
+
+=== Slice 2 -- Final domain cleanup transformation
+
+Goal::
+Execute deferred cleanup deterministically before persistence.
+
+Work::
+
+* add a final domain cleanup step;
+* remove marked frames;
+* update or validate metadata references;
+* define behavior for missing already-removed frames;
+* define idempotence;
+* produce useful diagnostics;
+* test JSON/YAML/XML and spreadsheet-preparation inputs.
+
+Acceptance::
+
+* marked frames are absent from the resulting logical Frames state;
+* unmarked frames are unchanged;
+* all carriers observe the same cleaned state when invoked afterward;
+* contradictory retained references fail.
+
+=== Slice 3 -- Explicit Workbook View projection contract
+
+Goal::
+Clarify Workbook View as optional artifact projection.
+
+Work::
+
+* define no-Workbook-View default behavior;
+* define explicit-view authoritative behavior;
+* document that unmapped frames remain in logical state;
+* preserve physical sheet naming and ordering;
+* prepare the mapping model for future M:N targets without implementing them;
+* add conflict checks against domain cleanup directives.
+
+Acceptance::
+
+* no Workbook View produces one same-named sheet per remaining frame;
+* explicit Workbook View produces only declared normal projections;
+* omitted workbook frames remain available outside the workbook artifact;
+* cleanup conflicts fail before rendering.
+
+=== Slice 4 -- Remove lifecycle-based render inference
+
+Goal::
+Stop deriving workbook selection from broad frame ontology.
+
+Work::
+
+* remove or isolate `DEFAULT_INCLUDE_ROLES`;
+* remove or isolate `DEFAULT_OMIT_ROLES`;
+* remove role-based frame omission;
+* review `mode`, `drop_redundant_data`, `include_roles`, `omit_roles`,
+  `include_omit_by_default`, `unknown_frame_policy`, and
+  `frame_lifecycle.render`;
+* retain fields only where an independent concrete consumer remains;
+* migrate or deprecate affected public configuration.
+
+Acceptance::
+
+* rendering does not infer inclusion or omission from broad lifecycle roles;
+* equivalent explicit projection behavior is covered by tests;
+* deprecated configuration has a documented migration path.
+
+=== Slice 5 -- Projection-plan conflict validation
+
+Goal::
+Make independent directives compose mechanically and fail on contradiction.
+
+Work::
+
+* validate cleanup versus explicit mapping;
+* validate cleanup versus special projection;
+* validate duplicate and incompatible workbook targets;
+* validate missing source frames;
+* expose deterministic diagnostics;
+* ensure no ordering accident silently resolves conflict.
+
+Acceptance::
+
+* every known contradiction fails with a precise message;
+* compatible independent directives compose;
+* validation occurs before concrete backend materialization.
+
+=== Slice 6 -- Documentation and registry realignment
+
+Goal::
+Make the architecture understandable without reverse-engineering code.
+
+Work::
+
+* update Semantic Model;
+* update Technical Model;
+* update Functional Model sections for affected transformations;
+* update User Guide;
+* update metadata and transformation registries;
+* add full-path tables;
+* document pipeline-builder responsibility and framework limits;
+* record the architecture decision in Project Memory.
+
+Acceptance::
+
+* a reader can distinguish domain cleanup from workbook projection;
+* a reader can understand behavior with and without Workbook View;
+* all relevant metadata paths are shown explicitly;
+* no documentation claims that lifecycle roles imply render behavior.
+
+=== Slice 7 -- Future M:N projection preparation
+
+Goal::
+Ensure the refactor does not entrench one-frame-to-one-sheet assumptions.
+
+This slice may remain documentation/design-only.
+
+Work::
+
+* identify current 1:1 assumptions;
+* define projection-target vocabulary;
+* reserve extension points for named ranges and multiple targets;
+* avoid implementing unused generic machinery.
+
+Acceptance::
+
+* the current contract remains simple;
+* future M:N projection is not blocked by the revised responsibilities;
+* no speculative named-range engine is introduced.
+
+== Compatibility and Migration
+
+The review must determine whether current configuration is public and stable.
+
+Potentially affected fields include:
+
+[source,text]
+----
+mode
+drop_redundant_data
+include_roles
+omit_roles
+include_debug_frames
+include_omit_by_default
+unknown_frame_policy
+frame_lifecycle.*.role
+frame_lifecycle.*.render
+visible_by_default
+omit_by_default
+----
+
+Possible migration strategies include:
+
+* immediate removal before stable release;
+* deprecation with warnings;
+* compatibility translation into explicit Workbook View mappings;
+* retention only for a documented debug/export profile;
+* removal of fields that have no real consumer.
+
+No compatibility mechanism shall preserve ontology-driven behavior indefinitely
+without a real use case.
+
+== Non-Goals
+
+This epic does not:
+
+* prove semantic reversibility of arbitrary pipelines;
+* infer whether a frame is reconstructable;
+* encode transformation-specific reconstruction strategies in generic metadata;
+* require every transformation to support both merge and create inverse modes;
+* implement named-range or general M:N workbook projection;
+* make Workbook View mandatory;
+* remove all frame lifecycle metadata without individual evidence;
+* redesign every metadata family in the repository;
+* hide pipeline-builder errors through automatic precedence;
+* guarantee that an incorrectly composed pipeline cannot lose data.
+
+== Framework Responsibility
+
+The framework shall provide:
+
+* deterministic transformations;
+* explicit contracts;
+* local validation;
+* stable metadata transport;
+* precise failure diagnostics;
+* roundtrip building blocks;
+* documentation of intended composition.
+
+The pipeline builder shall remain responsible for:
+
+* choosing compatible transformations;
+* placing cleanup at the correct point;
+* preserving shadow state when a feature contract requires it;
+* testing concrete roundtrip behavior;
+* deciding which artifacts are authoritative;
+* ensuring that selected projections contain the intended information.
+
+This responsibility split is deliberate.
+
+== Epic Acceptance
+
+The epic is complete when:
+
+* functional transformations can explicitly mark frames for carrier-neutral
+  cleanup;
+* a final domain transformation executes that cleanup;
+* all adapters receive the same cleaned logical state when invoked afterward;
+* Workbook View is optional;
+* default spreadsheet export maps every remaining frame to a same-named sheet;
+* explicit Workbook View controls only workbook artifact projection;
+* unmapped workbook frames remain part of logical state;
+* rendering no longer derives omission from broad lifecycle ontology;
+* cleanup and workbook projection conflicts fail deterministically;
+* current behavior has a documented compatibility path;
+* Semantic Model, Technical Model, Functional Model, User Guide, registries, and
+  Project Memory explain the new responsibilities;
+* Fable's identified blockers and amendments have been resolved or explicitly
+  deferred.
+
+== Open Decisions for Review
+
+The following decisions remain intentionally open pending Fable review:
+
+* final metadata path for deferred cleanup;
+* whether `drop: false` is stored explicitly or represented by absence;
+* whether multiple transformations may revoke earlier cleanup directives;
+* whether final cleanup is an explicit pipeline step or an orchestrated standard
+  end-stage that remains visible in execution traces;
+* exact metadata-reference cleanup policy;
+* backward-compatibility treatment of current lifecycle render fields;
+* whether any debug-only lifecycle selection remains justified;
+* exact representation of future general workbook projection mappings;
+* validation phase for cleanup-versus-view conflicts.
+
+== Review Instruction Summary
+
+Review the repository against this target model.
+
+Do not assume that current lifecycle categories are requirements merely because
+they are implemented or tested.
+
+Search for real use cases, hidden contracts, and counterexamples.
+
+Prefer the smallest model that preserves demonstrated behavior:
+
+[source,text]
+----
+functional transformation decides logical retention
+final domain cleanup executes logical removal
+Workbook View defines optional workbook projection
+renderer executes explicit projection
+adapters persist the state they receive
+----
+
