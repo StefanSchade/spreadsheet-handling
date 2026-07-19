@@ -12,11 +12,6 @@ from spreadsheet_handling.domain._where_predicates import (
     _duplicate_column_names,
     _ensure_columns,
 )
-from spreadsheet_handling.domain.frame_lifecycle import (
-    mark_source_if_unclassified,
-    write_frame_lifecycle,
-)
-
 Frames = dict[str, Any]
 
 
@@ -30,10 +25,10 @@ def extract_frame(
     rename: Mapping[str, str] | None = None,
     constants: Mapping[str, Any] | None = None,
     sort_by: str | Iterable[str] | None = None,
-    lifecycle: Mapping[str, Any] | None = None,
     name: str | None = None,
 ) -> Frames:
     """Extract a filtered, ordered projection from one source frame."""
+    del name
     source_df = _require_frame(frames, source)
     projection = _project_columns(
         _apply_where(source_df, where, frame_name=source),
@@ -56,13 +51,6 @@ def extract_frame(
 
     out: dict[str, Any] = dict(frames)
     out[output] = result
-    _write_lifecycle(
-        out,
-        source=source,
-        output=output,
-        lifecycle=lifecycle,
-        step_name=name or "extract_frame",
-    )
     return out
 
 
@@ -136,40 +124,6 @@ def _add_constants(
             raise TypeError(f"constant column {column!r} must use a scalar value")
         result[column] = value
     return result
-
-
-def _write_lifecycle(
-    out: dict[str, Any],
-    *,
-    source: str,
-    output: str,
-    lifecycle: Mapping[str, Any] | None,
-    step_name: str,
-) -> None:
-    if source != output:
-        mark_source_if_unclassified(out, source)
-
-    lifecycle_cfg = dict(lifecycle or {})
-    role = str(lifecycle_cfg.get("role", "readonly_projection"))
-    render = str(lifecycle_cfg.get("render", "visible_by_default"))
-    canonical = bool(lifecycle_cfg.get("canonical", False))
-    editable = lifecycle_cfg.get("editable", False)
-    consistency_policy = lifecycle_cfg.get("consistency_policy")
-    if consistency_policy is not None and not isinstance(consistency_policy, Mapping):
-        raise TypeError("lifecycle.consistency_policy must be a mapping")
-
-    write_frame_lifecycle(
-        out,
-        output,
-        role=role,
-        canonical=canonical,
-        editable=editable,
-        render=render,
-        derived_from=[source],
-        produced_by={"step": "extract_frame", "name": step_name},
-        consistency_policy=consistency_policy,
-        preserve_existing_canonical=False,
-    )
 
 
 def _string_list(value: str | Iterable[str], field_name: str) -> list[str]:

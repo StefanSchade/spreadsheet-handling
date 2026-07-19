@@ -5,7 +5,6 @@ import pytest
 from pandas.testing import assert_frame_equal
 
 from spreadsheet_handling.domain.extractions.frame_extract import extract_frame
-from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 
 
 @pytest.mark.ftr("FTR-GENERIC-FRAME-EXTRACTIONS-P4A")
@@ -153,34 +152,9 @@ def test_extract_frame_fails_clearly_for_missing_columns_and_unknown_predicates(
 
 
 @pytest.mark.ftr("FTR-GENERIC-FRAME-EXTRACTIONS-P4A")
-def test_extract_frame_marks_output_as_readonly_projection_by_default() -> None:
+def test_extract_frame_does_not_write_generic_lifecycle_metadata() -> None:
     frames = {"variables": pd.DataFrame({"ID": ["v1"]})}
 
     out = extract_frame(frames, source="variables", output="view")
 
-    lifecycle = frame_lifecycle(out["_meta"])
-    assert lifecycle["view"] == {
-        "role": "readonly_projection",
-        "canonical": False,
-        "editable": False,
-        "render": "visible_by_default",
-        "derived_from": ["variables"],
-        "produced_by": {"step": "extract_frame", "name": "extract_frame"},
-    }
-    assert lifecycle["variables"]["role"] == "canonical_source"
-
-
-@pytest.mark.ftr("FTR-GENERIC-FRAME-EXTRACTIONS-P4A")
-def test_extract_frame_allows_explicit_lifecycle_override() -> None:
-    frames = {"variables": pd.DataFrame({"ID": ["v1"]})}
-
-    out = extract_frame(
-        frames,
-        source="variables",
-        output="editable_view",
-        lifecycle={"role": "editable_projection", "editable": True},
-    )
-
-    lifecycle = frame_lifecycle(out["_meta"])
-    assert lifecycle["editable_view"]["role"] == "editable_projection"
-    assert lifecycle["editable_view"]["editable"] is True
+    assert "_meta" not in out

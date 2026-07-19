@@ -45,24 +45,7 @@ def _canonical_frames() -> dict[str, Any]:
                 {"resource_key": "r2", "context_id": "product_a", "text": "Beta A"},
             ]
         ),
-        "_meta": {
-            "frame_lifecycle": {
-                _CANONICAL_FRAME: {
-                    "role": "canonical_source",
-                    "canonical": True,
-                    "editable": False,
-                    "render": "omit_by_default",
-                    "derived_from": [],
-                },
-                _MATRIX_FRAME: {
-                    "role": "editable_projection",
-                    "canonical": False,
-                    "editable": True,
-                    "render": "visible_by_default",
-                    "derived_from": [_CANONICAL_FRAME],
-                },
-            }
-        },
+        "_meta": {},
     }
 
 

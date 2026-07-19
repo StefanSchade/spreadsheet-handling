@@ -9,11 +9,6 @@ import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain._where_predicates import _duplicate_column_names
-from spreadsheet_handling.domain.frame_lifecycle import (
-    mark_source_if_unclassified,
-    write_frame_lifecycle,
-)
-
 Frames = dict[str, Any]
 
 _DUPLICATE_POLICIES = {"fail", "aggregate"}
@@ -33,10 +28,10 @@ def pivot_frame(
     duplicates: str = "fail",
     aggregation: str = "join",
     separator: str = " | ",
-    lifecycle: Mapping[str, Any] | None = None,
     name: str | None = None,
 ) -> Frames:
     """Pivot a long-form frame into a bounded display view."""
+    del name
     source_df = _require_frame(frames, source)
     index_cols = _string_list(index_columns, "index_columns")
     _ensure_string(column_key, "column_key")
@@ -97,13 +92,6 @@ def pivot_frame(
 
     out: dict[str, Any] = dict(frames)
     out[output] = result
-    _write_lifecycle(
-        out,
-        source=source,
-        output=output,
-        lifecycle=lifecycle,
-        step_name=name or "pivot_frame",
-    )
     return out
 
 
@@ -362,40 +350,3 @@ def _hashable_token(value: Any, *, field_name: str) -> Any:
     except TypeError as exc:
         raise TypeError(f"{field_name} contains unhashable value {plain!r}") from exc
     return plain
-
-
-
-
-
-def _write_lifecycle(
-    out: dict[str, Any],
-    *,
-    source: str,
-    output: str,
-    lifecycle: Mapping[str, Any] | None,
-    step_name: str,
-) -> None:
-    if source != output:
-        mark_source_if_unclassified(out, source)
-
-    lifecycle_cfg = dict(lifecycle or {})
-    role = str(lifecycle_cfg.get("role", "readonly_projection"))
-    render = str(lifecycle_cfg.get("render", "visible_by_default"))
-    canonical = bool(lifecycle_cfg.get("canonical", False))
-    editable = lifecycle_cfg.get("editable", False)
-    consistency_policy = lifecycle_cfg.get("consistency_policy")
-    if consistency_policy is not None and not isinstance(consistency_policy, Mapping):
-        raise TypeError("lifecycle.consistency_policy must be a mapping")
-
-    write_frame_lifecycle(
-        out,
-        output,
-        role=role,
-        canonical=canonical,
-        editable=editable,
-        render=render,
-        derived_from=[source],
-        produced_by={"step": "pivot_frame", "name": step_name},
-        consistency_policy=consistency_policy,
-        preserve_existing_canonical=False,
-    )

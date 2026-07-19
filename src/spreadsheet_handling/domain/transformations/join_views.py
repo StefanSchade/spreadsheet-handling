@@ -14,11 +14,6 @@ from spreadsheet_handling.domain._where_predicates import (
     _duplicate_column_names,
     _ensure_columns,
 )
-from spreadsheet_handling.domain.frame_lifecycle import (
-    mark_source_if_unclassified,
-    write_frame_lifecycle,
-)
-
 Frames = dict[str, Any]
 
 _HOW_VALUES = {"left", "inner", "semi"}
@@ -47,10 +42,10 @@ def join_frames(
     right_where: Mapping[str, Any] | None = None,
     where: Mapping[str, Any] | None = None,
     right_unique: bool | None = None,
-    lifecycle: Mapping[str, Any] | None = None,
     name: str | None = None,
 ) -> Frames:
     """Join two frames into an explicit materialized view frame."""
+    del name
     if how not in _HOW_VALUES:
         raise ValueError(f"how must be one of {sorted(_HOW_VALUES)!r}; got {how!r}")
     if collisions not in _COLLISION_POLICIES:
@@ -140,14 +135,6 @@ def join_frames(
     result = result.where(pd.notnull(result), "")
     out: dict[str, Any] = dict(frames)
     out[output] = result
-    _write_lifecycle(
-        out,
-        left=left,
-        right=right,
-        output=output,
-        lifecycle=lifecycle,
-        step_name=name or "join_frames",
-    )
     return out
 
 
@@ -440,40 +427,3 @@ def _join_token(value: Any) -> Any:
     except TypeError as exc:
         raise TypeError(f"Join key contains unhashable value {value!r}") from exc
     return value
-
-
-def _write_lifecycle(
-    out: dict[str, Any],
-    *,
-    left: str,
-    right: str,
-    output: str,
-    lifecycle: Mapping[str, Any] | None,
-    step_name: str,
-) -> None:
-    if left != output:
-        mark_source_if_unclassified(out, left)
-    if right != output:
-        mark_source_if_unclassified(out, right)
-
-    lifecycle_cfg = dict(lifecycle or {})
-    role = str(lifecycle_cfg.get("role", "readonly_projection"))
-    render = str(lifecycle_cfg.get("render", "visible_by_default"))
-    canonical = bool(lifecycle_cfg.get("canonical", False))
-    editable = lifecycle_cfg.get("editable", False)
-    consistency_policy = lifecycle_cfg.get("consistency_policy")
-    if consistency_policy is not None and not isinstance(consistency_policy, Mapping):
-        raise TypeError("lifecycle.consistency_policy must be a mapping")
-
-    write_frame_lifecycle(
-        out,
-        output,
-        role=role,
-        canonical=canonical,
-        editable=editable,
-        render=render,
-        derived_from=[left, right],
-        produced_by={"step": "join_frames", "name": step_name},
-        consistency_policy=consistency_policy,
-        preserve_existing_canonical=False,
-    )

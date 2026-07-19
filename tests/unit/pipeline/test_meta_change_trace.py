@@ -70,13 +70,13 @@ def test_formatter_emits_structural_paths_without_metadata_values() -> None:
 
 
 def test_snapshot_detects_nested_in_place_dictionary_mutation() -> None:
-    metadata = {"frame_lifecycle": {"places": {"kind": "source"}}}
+    metadata = {"policy": {"places": {"kind": "source"}}}
     before = snapshot_meta({"_meta": metadata})
-    metadata["frame_lifecycle"]["places"]["kind"] = "derived"
+    metadata["policy"]["places"]["kind"] = "derived"
 
     result = diff_meta(before, snapshot_meta({"_meta": metadata}))
 
-    assert result.changed == (("frame_lifecycle", "places", "kind"),)
+    assert result.changed == (("policy", "places", "kind"),)
 
 
 def test_nested_in_place_list_mutation_reports_only_sequence_container() -> None:

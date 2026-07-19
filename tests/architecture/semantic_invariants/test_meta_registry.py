@@ -75,7 +75,6 @@ def test_meta_registry_seeds_current_known_entries():
         "helper_fill_rgb",
         "helper_prefix",
         "helper_columns",
-        "frame_lifecycle",
         "workbook_view",
         "workbook_view.sheet_mappings",
         "sheets",
@@ -88,6 +87,7 @@ def test_meta_registry_seeds_current_known_entries():
         "__autofilter_ref",
         "_hidden",
         "derived",
+        "pipeline_cleanup",
     } <= names
 
 

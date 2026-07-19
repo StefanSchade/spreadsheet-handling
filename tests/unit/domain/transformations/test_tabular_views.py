@@ -3,7 +3,6 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.transformations.tabular_views import pivot_frame
 from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
@@ -148,16 +147,7 @@ def test_pivot_frame_marks_output_as_readonly_projection_by_default() -> None:
         name="request_mapping_view",
     )
 
-    lifecycle = frame_lifecycle(out["_meta"])
-    assert lifecycle["mapping_view"] == {
-        "role": "readonly_projection",
-        "canonical": False,
-        "editable": False,
-        "render": "visible_by_default",
-        "derived_from": ["mapping_rows"],
-        "produced_by": {"step": "pivot_frame", "name": "request_mapping_view"},
-    }
-    assert lifecycle["mapping_rows"]["role"] == "canonical_source"
+    assert "_meta" not in out
 
 
 def test_extract_frame_composes_with_pivot_frame_through_pipeline_registry() -> None:

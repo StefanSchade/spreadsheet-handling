@@ -382,9 +382,8 @@ class TestIntentVsResolutionSlice:
         assert out["cell_codecs"] == fixture["cell_codecs"]
         assert out["compact_multiaxis"] == fixture["compact_multiaxis"]
         assert out["split_by_discriminator"] == fixture["split_by_discriminator"]
-        # frame_lifecycle and source: workbook are intentionally not pruned
-        # in this slice; verify they pass through unchanged.
-        assert out["frame_lifecycle"] == fixture["frame_lifecycle"]
+        assert "frame_lifecycle" not in out
+        # Carrier-authoritative source envelopes remain unchanged.
         sheets = out["sheets"]
         any_sheet = next(iter(sheets.values()))
         any_width = next(iter(any_sheet["column_widths"].values()))

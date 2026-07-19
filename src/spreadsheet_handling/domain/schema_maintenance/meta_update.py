@@ -77,7 +77,6 @@ def apply_metadata_rules(
     _handle_constraints(updated_meta, resolver, request, metadata_changes, failures)
     _handle_sheets(updated_meta, resolver, request, metadata_changes, failures)
     _handle_helper_policies(updated_meta, request, metadata_changes, failures)
-    _handle_frame_lifecycle(updated_meta, request, failures)
     _handle_workbook_view(updated_meta, failures)
     _handle_blocked_roots(meta, request, metadata_changes, failures)
     _handle_plugin_roots(meta, request, metadata_changes, failures)
@@ -704,16 +703,6 @@ def _block_fk_drop_if_referenced(
         )
     )
     failures.append(_blocked_reference(ReferenceRoot.HELPER_POLICIES_FK, path, request, affected))
-
-
-def _handle_frame_lifecycle(
-    meta: dict[str, Any],
-    request: SchemaMaintenanceRequest,
-    failures: list[SchemaMaintenanceFailure],
-) -> None:
-    value = meta.get("frame_lifecycle")
-    if value is not None and not isinstance(value, Mapping):
-        failures.append(_malformed("frame_lifecycle", "_meta.frame_lifecycle must be a mapping", request))
 
 
 def _handle_workbook_view(meta: dict[str, Any], failures: list[SchemaMaintenanceFailure]) -> None:

@@ -275,7 +275,7 @@ def test_extracted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) ->
         frames["VisibleVariables"],
         check_dtype=False,
     )
-    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+    assert xlsx_back["_meta"] == ods_back["_meta"] == {}
 
 
 @pytest.mark.ftr("FTR-DECLARATIVE-TABULAR-VIEW-OPS-P4A")
@@ -313,7 +313,7 @@ def test_pivoted_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> N
         frames["MappingView"],
         check_dtype=False,
     )
-    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+    assert xlsx_back["_meta"] == ods_back["_meta"] == {}
 
 
 @pytest.mark.ftr("FTR-SIMPLE-JOIN-VIEWS-P4A")
@@ -354,7 +354,7 @@ def test_joined_frame_renders_portably_across_xlsx_and_ods(tmp_path: Path) -> No
         frames["VariableView"],
         check_dtype=False,
     )
-    assert xlsx_back["_meta"] == ods_back["_meta"] == frames["_meta"]
+    assert xlsx_back["_meta"] == ods_back["_meta"] == {}
 
 
 @pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
@@ -423,24 +423,7 @@ def test_workbook_view_reverse_mapping_roundtrips_portably_across_xlsx_and_ods(
                     {"variable_id": "v1", "label": "Rate"},
                 ]
             ),
-            "_meta": {
-                "frame_lifecycle": {
-                    "variables": {
-                        "role": "canonical_source",
-                        "canonical": True,
-                        "editable": False,
-                        "render": "visible_by_default",
-                        "derived_from": [],
-                    },
-                    "variables_view": {
-                        "role": "editable_projection",
-                        "canonical": False,
-                        "editable": True,
-                        "render": "visible_by_default",
-                        "derived_from": ["variables"],
-                    },
-                }
-            },
+            "_meta": {},
         },
         sheets=[{"frame": "variables_view", "sheet": "Editable Variables"}],
     )

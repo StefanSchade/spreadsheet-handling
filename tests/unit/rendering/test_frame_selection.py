@@ -21,102 +21,44 @@ def _frames_with_meta(meta: dict) -> dict:
     }
 
 
-def test_render_plan_omits_only_explicit_lifecycle_frames_when_view_policy_requests_it() -> None:
+def test_render_plan_selects_every_remaining_frame_without_workbook_view() -> None:
     meta = {
-        "workbook_view": {"mode": "editable", "drop_redundant_data": True},
         "frame_lifecycle": {
             "orders_raw": {
-                "role": "intermediate",
-                "canonical": False,
-                "editable": False,
-                "render": "omit_by_default",
-                "derived_from": [],
-                "superseded_by": ["orders_view"],
-            },
-            "orders_view": {
-                "role": "editable_projection",
-                "canonical": False,
-                "editable": True,
-                "render": "visible_by_default",
-                "derived_from": ["orders_raw"],
+                "role": "system",
+                "render": "never",
             },
         },
     }
 
     plan = build_spreadsheet_render_plan(_frames_with_meta(meta), meta)
 
-    assert "orders_raw" not in plan.sheet_order
-    assert "orders_view" in plan.sheet_order
+    assert plan.sheet_order == ["orders_raw", "orders_view"]
 
 
-def test_render_plan_preserves_current_visibility_without_workbook_view_policy() -> None:
-    meta = {
-        "frame_lifecycle": {
-            "orders_raw": {
-                "role": "intermediate",
-                "canonical": False,
-                "editable": False,
-                "render": "omit_by_default",
-            }
-        }
-    }
-
-    plan = build_spreadsheet_render_plan(_frames_with_meta(meta), meta)
-
-    assert "orders_raw" in plan.sheet_order
-    assert "orders_view" in plan.sheet_order
-
-
-def test_render_selection_does_not_infer_lifecycle_from_raw_suffix() -> None:
-    meta = {
-        "workbook_view": {"mode": "editable", "drop_redundant_data": True},
-        "frame_lifecycle": {
-            "orders_view": {
-                "role": "editable_projection",
-                "canonical": False,
-                "editable": True,
-                "render": "visible_by_default",
-            }
-        },
-    }
-
-    selected = select_render_frames(_frames_with_meta(meta), meta)
-
-    assert "orders_raw" in selected
-    assert "orders_view" in selected
-
-
-def test_render_selection_does_not_omit_derived_frames_without_omit_policy() -> None:
-    meta = {
-        "workbook_view": {"mode": "editable", "drop_redundant_data": True},
-        "frame_lifecycle": {
-            "orders_view": {
-                "role": "editable_projection",
-                "canonical": False,
-                "editable": True,
-                "render": "visible_by_default",
-                "derived_from": ["orders_raw"],
-            }
-        },
-    }
-
-    selected = select_render_frames(_frames_with_meta(meta), meta)
-
-    assert "orders_view" in selected
-
-
-def test_unknown_frame_policy_can_fail_unclassified_frames() -> None:
+def test_legacy_ontology_and_view_knobs_do_not_infer_selection() -> None:
     meta = {
         "workbook_view": {
             "mode": "editable",
             "drop_redundant_data": True,
             "unknown_frame_policy": "fail",
+            "omit_roles": ["system"],
         },
-        "frame_lifecycle": {},
+        "frame_lifecycle": {
+            "orders_raw": {
+                "canonical": False,
+                "role": "system",
+                "render": "never",
+                "derived_from": ["orders_view"],
+                "superseded_by": ["orders_view"],
+            },
+            "orders_view": {"role": "redundant", "render": "omit_by_default"},
+        }
     }
 
-    with pytest.raises(ValueError, match="orders_raw"):
-        select_render_frames(_frames_with_meta(meta), meta)
+    selected = select_render_frames(_frames_with_meta(meta), meta)
+
+    assert list(selected) == ["orders_raw", "orders_view", "_meta"]
 
 
 @pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")

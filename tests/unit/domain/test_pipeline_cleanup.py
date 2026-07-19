@@ -302,23 +302,6 @@ def test_canonical_frame_reference_to_dropped_frame_is_not_a_conflict() -> None:
     )
 
 
-def test_frame_lifecycle_entry_of_dropped_frame_is_removed_others_kept() -> None:
-    frames = _frames(
-        _meta={
-            "frame_lifecycle": {
-                "relation_source": {"role": "anything"},
-                "stories": {"role": "anything_else"},
-            }
-        }
-    )
-    frames = configure_pipeline_cleanup(frames, drop_frames=["relation_source"])
-
-    cleaned = execute_final_domain_cleanup(frames)
-
-    assert "relation_source" not in cleaned["_meta"]["frame_lifecycle"]
-    assert "stories" in cleaned["_meta"]["frame_lifecycle"]
-
-
 def test_transformation_intent_referencing_dropped_frame_is_preserved() -> None:
     # Inverse transformations need intent metadata to recreate absent frames;
     # references to a dropped frame are required intent, not contradictions.

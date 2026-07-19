@@ -35,7 +35,6 @@ class ReferenceRoot(Enum):
     HELPER_POLICIES_LOOKUP = "helper_policies.lookup"
     SHEETS = "sheets"
     WORKBOOK_VIEW = "workbook_view"
-    FRAME_LIFECYCLE = "frame_lifecycle"
     XREF_CROSSTABLE = "xref_crosstable"
     SPLIT_BY_DISCRIMINATOR = "split_by_discriminator"
     COMPACT_MULTIAXIS = "compact_multiaxis"

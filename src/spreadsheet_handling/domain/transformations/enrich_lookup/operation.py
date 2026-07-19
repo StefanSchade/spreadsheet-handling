@@ -10,10 +10,6 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.core.formulas import lookup_formula
-from spreadsheet_handling.domain.frame_lifecycle import (
-    mark_source_if_unclassified,
-    write_frame_lifecycle,
-)
 
 from .policy import (
     _FORMULA_MODES,
@@ -173,7 +169,6 @@ def enrich_lookup(
     out = dict(frames)
     out[output] = enriched
     _write_provenance(out, output, lookup, join_keys, fields)
-    _write_lookup_lifecycle(out, source=source, lookup=lookup, output=output)
     return out
 
 
@@ -364,35 +359,3 @@ def _write_provenance(
         "helper_columns": list(fields),
     }
     out["_meta"] = meta
-
-
-def _write_lookup_lifecycle(
-    out: Frames,
-    *,
-    source: str,
-    lookup: str,
-    output: str,
-) -> None:
-    if source != output:
-        write_frame_lifecycle(
-            out,
-            source,
-            role="intermediate",
-            canonical=False,
-            editable=False,
-            render="omit_by_default",
-            superseded_by=[output],
-            preserve_existing_canonical=True,
-        )
-    mark_source_if_unclassified(out, lookup)
-    write_frame_lifecycle(
-        out,
-        output,
-        role="editable_projection",
-        canonical=False,
-        editable=True,
-        render="visible_by_default",
-        derived_from=[source, lookup],
-        produced_by={"step": "add_lookup_helpers"},
-        consistency_policy={"on_conflict": "fail"},
-    )

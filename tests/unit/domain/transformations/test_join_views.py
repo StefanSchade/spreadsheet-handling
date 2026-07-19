@@ -3,7 +3,6 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.transformations.join_views import join_frames
 from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
@@ -288,7 +287,7 @@ def test_join_frames_applies_post_join_where_to_output_columns() -> None:
     ]
 
 
-def test_join_frames_marks_output_as_readonly_projection_by_default() -> None:
+def test_join_frames_does_not_write_generic_lifecycle_metadata() -> None:
     frames = {
         "variables": pd.DataFrame([{"variable_id": "v1"}]),
         "metadata": pd.DataFrame([{"variable_id": "v1", "component": "cashflow"}]),
@@ -303,17 +302,7 @@ def test_join_frames_marks_output_as_readonly_projection_by_default() -> None:
         name="variable_metadata_view",
     )
 
-    lifecycle = frame_lifecycle(out["_meta"])
-    assert lifecycle["variable_view"] == {
-        "role": "readonly_projection",
-        "canonical": False,
-        "editable": False,
-        "render": "visible_by_default",
-        "derived_from": ["variables", "metadata"],
-        "produced_by": {"step": "join_frames", "name": "variable_metadata_view"},
-    }
-    assert lifecycle["variables"]["role"] == "canonical_source"
-    assert lifecycle["metadata"]["role"] == "canonical_source"
+    assert "_meta" not in out
 
 
 def test_join_frames_is_config_addressable_in_a_pipeline() -> None:

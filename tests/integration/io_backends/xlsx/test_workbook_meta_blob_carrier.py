@@ -58,9 +58,6 @@ pytestmark = pytest.mark.ftr("BUG-XLSX-WORKBOOK-VIEW-BLOB-READBACK-P4A")
 
 def _canonical_workbook_view() -> dict:
     return {
-        "mode": "editable",
-        "drop_redundant_data": True,
-        "unknown_frame_policy": "fail",
         "sheets": [{"frame": "items", "sheet": "items", "order": 0}],
         "sheet_mappings": [{"frame": "items", "sheet": "items"}],
     }
@@ -397,9 +394,6 @@ def test_reduced_ods_produced_sidecar_meta_survives_xlsx_carrier_smoke(
     # ``auto_filter``, ``freeze_header``) still flows through the carrier.
     persistable_meta = dict(persistable_meta)
     persistable_meta["workbook_view"] = {
-        "mode": "editable",
-        "drop_redundant_data": True,
-        "unknown_frame_policy": "ignore",
         "sheets": [{"frame": "items", "sheet": "items", "order": 0}],
         "sheet_mappings": [{"frame": "items", "sheet": "items"}],
     }
@@ -411,7 +405,6 @@ def test_reduced_ods_produced_sidecar_meta_survives_xlsx_carrier_smoke(
         "compact_multiaxis",
         "split_by_discriminator",
         "sheets",
-        "frame_lifecycle",
     ):
         persistable_meta.pop(worldbuilding_root, None)
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from spreadsheet_handling.domain.frame_lifecycle import frame_lifecycle
 from spreadsheet_handling.domain.workbook_views import (
     WorkbookViewSheetMapping,
     apply_workbook_view_sheet_mappings,
@@ -15,7 +14,7 @@ from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 pytestmark = pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
 
 
-def test_configure_workbook_view_writes_sheet_order_names_and_lifecycle() -> None:
+def test_configure_workbook_view_writes_explicit_sheet_projection() -> None:
     frames = {
         "variables_view": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
         "product_matrix": pd.DataFrame([{"variable_id": "v1", "P-001": "output"}]),
@@ -28,7 +27,6 @@ def test_configure_workbook_view_writes_sheet_order_names_and_lifecycle() -> Non
             {
                 "frame": "variables_view",
                 "sheet": "Variables",
-                "lifecycle": {"role": "editable_projection", "editable": True},
                 "options": {"freeze_header": True},
             },
             {"frame": "product_matrix", "sheet": "Variable Matrix"},
@@ -39,9 +37,6 @@ def test_configure_workbook_view_writes_sheet_order_names_and_lifecycle() -> Non
     assert out["variables_view"] is frames["variables_view"]
     assert out["product_matrix"] is frames["product_matrix"]
     assert out["_meta"]["workbook_view"] == {
-        "mode": "editable",
-        "drop_redundant_data": True,
-        "unknown_frame_policy": "fail",
         "sheets": [
             {"frame": "variables_view", "sheet": "Variables", "order": 0},
             {"frame": "product_matrix", "sheet": "Variable Matrix", "order": 1},
@@ -50,19 +45,12 @@ def test_configure_workbook_view_writes_sheet_order_names_and_lifecycle() -> Non
             {"sheet": "Variables", "frame": "variables_view"},
             {"sheet": "Variable Matrix", "frame": "product_matrix"},
         ],
-        "name": "consumer_editable_view",
     }
     assert out["_meta"]["sheets"]["Variables"] == {"freeze_header": True}
-
-    lifecycle = frame_lifecycle(out["_meta"])
-    assert lifecycle["variables_view"]["role"] == "editable_projection"
-    assert lifecycle["variables_view"]["editable"] is True
-    assert lifecycle["variables_view"]["render"] == "visible_by_default"
-    assert lifecycle["product_matrix"]["role"] == "readonly_projection"
-    assert "raw_variables" not in lifecycle
+    assert "frame_lifecycle" not in out["_meta"]
 
 
-def test_configure_workbook_view_preserves_existing_canonical_lifecycle() -> None:
+def test_configure_workbook_view_does_not_interpret_or_mutate_legacy_lifecycle() -> None:
     frames = {
         "products": pd.DataFrame([{"product_id": "P-001"}]),
         "_meta": {
@@ -83,8 +71,7 @@ def test_configure_workbook_view_preserves_existing_canonical_lifecycle() -> Non
         sheets=[{"frame": "products", "sheet": "Products"}],
     )
 
-    assert frame_lifecycle(out["_meta"])["products"]["role"] == "canonical_source"
-    assert frame_lifecycle(out["_meta"])["products"]["canonical"] is True
+    assert out["_meta"]["frame_lifecycle"] is frames["_meta"]["frame_lifecycle"]
     assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
         {"sheet": "Products", "frame": "products"}
     ]
@@ -179,6 +166,25 @@ def test_configure_workbook_view_rejects_missing_duplicate_and_transform_specs()
                     "options": {"helper_columns": ["data_type"]},
                 }
             ],
+        )
+
+    with pytest.raises(ValueError, match="unsupported key"):
+        configure_workbook_view(
+            frames,
+            sheets=[
+                {
+                    "frame": "variables_view",
+                    "sheet": "Variables",
+                    "lifecycle": {"render": "omit_by_default"},
+                }
+            ],
+        )
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'mode'"):
+        configure_workbook_view(
+            frames,
+            sheets=[{"frame": "variables_view", "sheet": "Variables"}],
+            mode="editable",  # type: ignore[call-arg]
         )
 
 
@@ -333,31 +339,7 @@ def test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves()
         "variables": pd.DataFrame([{"variable_id": "v1"}]),
         "variables_view": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
         "variables_audit": pd.DataFrame([{"variable_id": "v1", "checked": True}]),
-        "_meta": {
-            "frame_lifecycle": {
-                "variables": {
-                    "role": "canonical_source",
-                    "canonical": True,
-                    "editable": False,
-                    "render": "visible_by_default",
-                    "derived_from": [],
-                },
-                "variables_view": {
-                    "role": "editable_projection",
-                    "canonical": False,
-                    "editable": True,
-                    "render": "visible_by_default",
-                    "derived_from": ["variables"],
-                },
-                "variables_audit": {
-                    "role": "intermediate",
-                    "canonical": False,
-                    "editable": False,
-                    "render": "omit_by_default",
-                    "derived_from": ["variables"],
-                },
-            }
-        },
+        "_meta": {},
     }
 
     out = configure_workbook_view(
@@ -440,16 +422,14 @@ def test_apply_workbook_view_sheet_mappings_preserves_meta_unchanged() -> None:
     meta = {
         "workbook_view": {
             "sheet_mappings": [{"sheet": "S", "frame": "f"}],
-            "mode": "editable",
         },
-        "frame_lifecycle": {"f": {"role": "editable_projection"}},
+        "plugin_state": {"roundtrip": True},
     }
     expected_meta = {
         "workbook_view": {
             "sheet_mappings": [{"sheet": "S", "frame": "f"}],
-            "mode": "editable",
         },
-        "frame_lifecycle": {"f": {"role": "editable_projection"}},
+        "plugin_state": {"roundtrip": True},
     }
     frames = {"S": pd.DataFrame([{"a": 1}]), "_meta": meta}
 

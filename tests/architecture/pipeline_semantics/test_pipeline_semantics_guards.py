@@ -38,14 +38,6 @@ ALLOWED_COMPOSITE_METADATA_POLICIES = {
     "current_state_unknown",
 }
 
-ALLOWED_PLUGIN_LIFECYCLE_MODES = {
-    "plugin_or_caller_owned",
-    "declared_lifecycle",
-    "caller_owned_lifecycle",
-    "declared_lifecycle_or_caller_owned",
-}
-
-
 def _load_step_registry() -> dict[str, Any]:
     with STEP_REGISTRY_PATH.open("r", encoding="utf-8") as handle:
         loaded = json.load(handle)
@@ -164,7 +156,6 @@ def test_plugin_contract_preserves_extension_and_frame_set_responsibility() -> N
 
     assert plugin_entry["factory_shape"] == "plugin_factory"
     assert contract["may_change_frame_set"] is True
-    assert contract["lifecycle_responsibility"] in ALLOWED_PLUGIN_LIFECYCLE_MODES
     assert "dynamic_plugin_owned" in plugin_entry["frame_contract"]["reads"]
     assert "dynamic_plugin_owned" in plugin_entry["frame_contract"]["writes"]
 

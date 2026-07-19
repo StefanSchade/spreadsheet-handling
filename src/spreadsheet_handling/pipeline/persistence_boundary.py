@@ -38,6 +38,8 @@ Scope of this fix (minimal, release-near)
 Pruned:
 
 * top-level ``derived`` -- transient runtime helper-column provenance,
+* top-level ``frame_lifecycle`` -- obsolete generic frame ontology retained
+  only as ignored legacy input,
 * top-level ``__*``-prefixed keys -- carrier / derived view markers that the
   IR rendering passes own,
 * Resolution facets under canonical roots (added by
@@ -68,8 +70,6 @@ Out of scope (explicit non-goals):
 * read-side sanitisation of sidecars already on disk,
 * pruning ``sheets[*].helper_columns`` -- the declared-vs-resolved
   question lives with FTR-FK-HELPER-POLICY-LIFECYCLE-P4A,
-* pruning ``frame_lifecycle.{derived_from, produced_by}`` -- flagged as
-  Resolution but deferred pending a consumer audit,
 * pruning the ``source: workbook`` envelope on the four presentation
   families (carrier-authoritative by policy under
   FTR-PRESENTATION-META-CARRIER-AUTHORITY-P5).
@@ -110,11 +110,12 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 RUNTIME_ONLY_TOP_LEVEL_META_KEYS: frozenset[str] = frozenset(
-    {"derived", "pipeline_cleanup"}
+    {"derived", "frame_lifecycle", "pipeline_cleanup"}
 )
 """Top-level ``_meta`` keys that must never survive into persistence.
 
-Conservative initial set. The full classification belongs to
+This set also includes obsolete generic metadata that may arrive in a legacy
+payload but must not be written again. The full classification belongs to
 ``FTR-META-LIFECYCLE-INVENTORY-P5``; until then, new producers that emit
 runtime-only meta on a new top-level key should extend this set.
 

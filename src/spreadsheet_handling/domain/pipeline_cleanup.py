@@ -38,8 +38,8 @@ Transformation-produced drop commands compose with either builder mode:
 * duplicate identical drop commands -> compatible, idempotent.
 
 There is no override precedence and no ontology-derived default. The executor
-never infers cleanup from ``frame_lifecycle`` roles, ``canonical``,
-``render``, or any other broad classification.
+never infers cleanup from generic roles, canonicality, rendering labels, or
+any other broad classification.
 
 Consumer
 ~~~~~~~~
@@ -64,7 +64,6 @@ that bypass the orchestrator.
 
 Metadata references to removed frames follow narrow per-family policies:
 
-* ``frame_lifecycle`` entries keyed by a removed frame are removed;
 * explicit ``workbook_view`` mappings (``sheets[*].frame`` and
   ``sheet_mappings[*].frame``) that reference a *drop-commanded* frame are a
   conflict and fail: two targeted declarations contradict each other.
@@ -205,12 +204,11 @@ def execute_final_domain_cleanup(frames: Frames) -> Frames:
     """Execute pending cleanup commands and consume them.
 
     Pure function. Returns the input object unchanged when no commands are
-    pending; otherwise returns a new frames dict with the resolved removal
-    set dropped, per-family metadata references cleaned, and
-    ``_meta.pipeline_cleanup`` removed.
+    pending; otherwise returns a new frames dict with the resolved removal set
+    dropped and ``_meta.pipeline_cleanup`` removed.
 
-    Executes only explicit commands. Never infers cleanup from lifecycle
-    roles or any other frame classification.
+    Executes only explicit commands. Never infers cleanup from generic frame
+    classifications.
     """
     meta = frames.get("_meta")
     if not isinstance(meta, Mapping) or PIPELINE_CLEANUP_KEY not in meta:
@@ -241,7 +239,6 @@ def execute_final_domain_cleanup(frames: Frames) -> Frames:
 
     out: Frames = {key: value for key, value in frames.items() if key not in removal}
     new_meta = dict(meta)
-    _prune_frame_lifecycle_entries(new_meta, removal)
     del new_meta[PIPELINE_CLEANUP_KEY]
     out["_meta"] = new_meta
 
@@ -326,21 +323,6 @@ def _fail_on_workbook_view_conflicts(meta: Mapping[str, Any], dropped: set[str])
             "_meta.workbook_view; remove either the cleanup command or the "
             "workbook mapping"
         )
-
-
-def _prune_frame_lifecycle_entries(meta: dict[str, Any], removal: set[str]) -> None:
-    """Remove ``frame_lifecycle`` entries keyed by removed frames.
-
-    Entries for retained frames are left untouched, including any provenance
-    references they may hold; broader provenance cleanup belongs to the
-    later ontology-removal slice.
-    """
-    lifecycle = meta.get("frame_lifecycle")
-    if not isinstance(lifecycle, Mapping) or not removal:
-        return
-    pruned = {key: value for key, value in lifecycle.items() if str(key) not in removal}
-    if len(pruned) != len(lifecycle):
-        meta["frame_lifecycle"] = pruned
 
 
 # ---------------------------------------------------------------------------

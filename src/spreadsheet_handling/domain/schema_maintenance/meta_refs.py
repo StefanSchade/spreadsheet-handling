@@ -8,7 +8,6 @@ from .model import ReferenceRoot
 
 FRAME_KEYS = frozenset(
     {
-        "canonical_frame",
         "frame",
         "logical_frame",
         "output_frame",
@@ -48,7 +47,6 @@ COLUMN_LIST_KEYS = frozenset(
 SUPPORTED_ROOT_NAMES = frozenset(
     {
         "constraints",
-        "frame_lifecycle",
         "helper_policies",
         "sheets",
         "workbook_view",

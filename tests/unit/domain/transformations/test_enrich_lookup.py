@@ -457,7 +457,7 @@ def test_enrich_lookup_rejects_missing_sort_by_column() -> None:
 # Finding 6: Provenance
 # ---------------------------------------------------------------------------
 
-def test_enrich_lookup_writes_provenance() -> None:
+def test_enrich_lookup_writes_only_consumed_helper_provenance() -> None:
     frames = _frames()
     out = enrich_lookup(
         frames,
@@ -472,16 +472,7 @@ def test_enrich_lookup_writes_provenance() -> None:
     assert prov["lookup"] == "variables"
     assert prov["on"] == ["ID"]
     assert prov["helper_columns"] == ["sort_key", "value_label_de"]
-    lifecycle = out["_meta"]["frame_lifecycle"]
-    assert lifecycle["variable_usage_matrix_raw"]["role"] == "intermediate"
-    assert lifecycle["variable_usage_matrix_raw"]["render"] == "omit_by_default"
-    assert lifecycle["variable_usage_matrix_raw"]["superseded_by"] == ["variable_usage_matrix"]
-    assert lifecycle["variables"]["role"] == "canonical_source"
-    assert lifecycle["variable_usage_matrix"]["role"] == "editable_projection"
-    assert lifecycle["variable_usage_matrix"]["derived_from"] == [
-        "variable_usage_matrix_raw",
-        "variables",
-    ]
+    assert "frame_lifecycle" not in out["_meta"]
 
 
 def test_enrich_lookup_no_provenance_without_helpers() -> None:

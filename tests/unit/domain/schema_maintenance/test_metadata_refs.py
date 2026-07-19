@@ -161,6 +161,25 @@ def test_rename_of_other_frame_leaves_sheet_scoped_references_of_mapped_frame() 
     assert result.frames["_meta"]["constraints"][0]["column"] == "name"
 
 
+def test_legacy_canonical_frame_key_is_not_a_generic_structured_reference() -> None:
+    frames = _base_frames(
+        {
+            "plugin_state": {
+                "canonical_frame": "characters",
+                "column": "name",
+            }
+        }
+    )
+
+    result = rename_column(frames, _rename(frame="characters"))
+
+    assert not result.report.blocked
+    assert result.frames["_meta"]["plugin_state"] == {
+        "canonical_frame": "characters",
+        "column": "name",
+    }
+
+
 def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_target_frame() -> None:
     frames = _base_frames(
         {

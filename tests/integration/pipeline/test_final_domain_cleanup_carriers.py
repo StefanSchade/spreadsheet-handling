@@ -213,3 +213,61 @@ def test_builder_keep_mode_replaces_consumer_keep_frames_plugin(
 
     assert _json_frame_names(out_dir) == {"stories", "story_settings"}
     assert "pipeline_cleanup" not in _meta_sidecar(out_dir)
+
+
+def test_stale_view_mapping_after_keep_mode_fails_before_spreadsheet_creation(
+    tmp_path: Path,
+) -> None:
+    in_dir = tmp_path / "in"
+    _write_json_dir(
+        in_dir,
+        {
+            "stories": SAMPLE_DATA["stories"],
+            "editable_story_view": SAMPLE_DATA["stories"],
+        },
+    )
+    (in_dir / "_meta.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workbook_view": {
+                    "sheets": [
+                        {"frame": "editable_story_view", "sheet": "Stories", "order": 0}
+                    ],
+                    "sheet_mappings": [
+                        {"frame": "editable_story_view", "sheet": "Stories"}
+                    ],
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    structured_out = tmp_path / "structured"
+
+    orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "json_dir", "path": str(structured_out)},
+        steps=build_steps_from_config(
+            [
+                {
+                    "step": "configure_pipeline_cleanup",
+                    "keep_frames": ["stories"],
+                }
+            ]
+        ),
+    )
+
+    persisted_meta = _meta_sidecar(structured_out)
+    assert persisted_meta["workbook_view"]["sheet_mappings"] == [
+        {"frame": "editable_story_view", "sheet": "Stories"}
+    ]
+    assert "pipeline_cleanup" not in persisted_meta
+
+    spreadsheet_out = tmp_path / "stale-view.xlsx"
+    with pytest.raises(KeyError, match="missing frame 'editable_story_view'"):
+        orchestrate(
+            input={"kind": "json_dir", "path": str(structured_out)},
+            output={"kind": "xlsx", "path": str(spreadsheet_out)},
+        )
+
+    assert not spreadsheet_out.exists()
