@@ -421,7 +421,7 @@ def test_fk_drop_blocks_even_when_prune_is_requested() -> None:
     assert list(result.frames["characters"].columns) == ["id", "name", "home_place_id", "notes"]
 
 
-@pytest.mark.parametrize("root", ["compact_multiaxis", "xref_crosstable"])
+@pytest.mark.parametrize("root", ["compact_multiaxis"])
 def test_detected_transformation_structured_reference_blocks(root: str) -> None:
     frames = _base_frames(
         {
@@ -439,6 +439,114 @@ def test_detected_transformation_structured_reference_blocks(root: str) -> None:
     assert result.report.blocked
     assert result.report.metadata_changes[0].action is ReferenceAction.BLOCKED
     assert result.report.failures[0].code == "blocking_metadata_reference"
+
+
+class TestXrefCrosstableReferences:
+    """XRef intent is handled by a dedicated, feature-aware checker.
+
+    Only the real reference shapes block: row_keys on the relation/matrix
+    frames, run-local column_keys on the matrix frame, and dense-axis
+    key(s) on the configured axis frame. Fabricated convention-style
+    shapes and legacy descriptive fields are not references.
+    """
+
+    @staticmethod
+    def _xref_meta(**overrides: object) -> dict:
+        entry: dict = {
+            "relation": "characters",
+            "matrix": "characters_matrix",
+            "row_keys": ["name"],
+        }
+        entry.update(overrides)
+        return {"xref_crosstable": {"characters_view": entry}}
+
+    def test_row_key_rename_on_relation_frame_blocks(self) -> None:
+        result = rename_column(_base_frames(self._xref_meta()), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+        assert result.report.failures[0].meta_path == "xref_crosstable.characters_view"
+
+    def test_row_key_drop_on_relation_frame_blocks(self) -> None:
+        result = drop_column(_base_frames(self._xref_meta()), _drop(prune=True))
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_dense_axis_key_rename_on_axis_frame_blocks(self) -> None:
+        meta = self._xref_meta(
+            row_keys=["id"],
+            dense_axes={"rows_from": {"frame": "characters", "key": "name"}},
+        )
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_matrix_column_key_rename_blocks_only_on_matrix_frame(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "places",
+                    "matrix": "characters",
+                    "row_keys": ["id"],
+                    "column_keys": ["name"],
+                }
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_unreferenced_column_rename_passes_through(self) -> None:
+        # Same column name on a frame the intent does not reference.
+        meta = self._xref_meta(relation="places", matrix="places_matrix")
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert not result.report.blocked
+        assert result.frames["_meta"] == _base_frames(meta)["_meta"]
+
+    def test_fabricated_convention_shape_is_not_a_reference(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "story_matrix": {
+                    "frame": "characters",
+                    "value_column": "name",
+                }
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert not result.report.blocked
+
+    def test_legacy_descriptive_fields_are_not_references(self) -> None:
+        # Legacy payloads may still carry value/column_key descriptive
+        # fields; they are ignored, not treated as column references.
+        meta = self._xref_meta(
+            relation="places",
+            matrix="places_matrix",
+            row_keys=["id"],
+            value="name",
+            column_key="name",
+            operation="contract_xref",
+        )
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert not result.report.blocked
+
+    def test_malformed_xref_root_fails(self) -> None:
+        result = rename_column(
+            _base_frames({"xref_crosstable": ["not-a-mapping"]}), _rename()
+        )
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "malformed_meta"
 
 
 def test_derived_does_not_enable_rename_and_is_not_rewritten_as_canonical_metadata() -> None:

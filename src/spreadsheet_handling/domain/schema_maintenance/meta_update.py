@@ -77,6 +77,7 @@ def apply_metadata_rules(
     _handle_constraints(updated_meta, resolver, request, metadata_changes, failures)
     _handle_sheets(updated_meta, resolver, request, metadata_changes, failures)
     _handle_helper_policies(updated_meta, request, metadata_changes, failures)
+    _handle_xref_crosstable(updated_meta, request, metadata_changes, failures)
     _handle_workbook_view(updated_meta, failures)
     _handle_blocked_roots(meta, request, metadata_changes, failures)
     _handle_plugin_roots(meta, request, metadata_changes, failures)
@@ -705,6 +706,81 @@ def _block_fk_drop_if_referenced(
     failures.append(_blocked_reference(ReferenceRoot.HELPER_POLICIES_FK, path, request, affected))
 
 
+def _handle_xref_crosstable(
+    meta: dict[str, Any],
+    request: SchemaMaintenanceRequest,
+    changes: list[MetadataReferenceChange],
+    failures: list[SchemaMaintenanceFailure],
+) -> None:
+    """Block schema changes that touch *real* XRef intent references.
+
+    The XRef intent contract references columns in exactly three places:
+
+    * ``row_keys`` — shared row-identity vocabulary of the ``relation`` and
+      ``matrix`` frames (one intent list serves both sides, so a one-sided
+      rename cannot be rewritten safely);
+    * ``column_keys`` — run-local matrix value-column labels (present only
+      in-run or in hand-authored meta);
+    * ``dense_axes.rows_from`` / ``columns_from`` ``key``/``keys`` on the
+      configured axis frame.
+
+    Anything else inside the root — including legacy descriptive fields —
+    is not a reference and is ignored. The generic key-name convention scan
+    does not run on this root.
+    """
+    configs = meta.get("xref_crosstable")
+    if configs is None:
+        return
+    if not isinstance(configs, Mapping):
+        failures.append(
+            _malformed("xref_crosstable", "_meta.xref_crosstable must be a mapping", request)
+        )
+        return
+    affected = _affected_column(request)
+    if affected is None:
+        return
+
+    for config_id, entry in configs.items():
+        if not isinstance(entry, Mapping):
+            continue
+        path = f"xref_crosstable.{config_id}"
+        if _xref_entry_references(entry, request.target_frame, affected):
+            changes.append(
+                _change(
+                    ReferenceRoot.XREF_CROSSTABLE,
+                    path,
+                    ReferenceAction.BLOCKED,
+                    request.target_frame,
+                    affected,
+                    "XRef intent references the affected column and is not rewritten",
+                )
+            )
+            failures.append(
+                _blocked_reference(ReferenceRoot.XREF_CROSSTABLE, path, request, affected)
+            )
+
+
+def _xref_entry_references(entry: Mapping[str, Any], frame: str, column: str) -> bool:
+    def _in_list(value: Any) -> bool:
+        return _is_sequence(value) and any(item == column for item in value)
+
+    if entry.get("matrix") == frame or entry.get("relation") == frame:
+        if _in_list(entry.get("row_keys")):
+            return True
+    if entry.get("matrix") == frame and _in_list(entry.get("column_keys")):
+        return True
+
+    dense = entry.get("dense_axes")
+    if isinstance(dense, Mapping):
+        for axis_key in ("rows_from", "columns_from"):
+            axis = dense.get(axis_key)
+            if not isinstance(axis, Mapping) or axis.get("frame") != frame:
+                continue
+            if axis.get("key") == column or _in_list(axis.get("keys")):
+                return True
+    return False
+
+
 def _handle_workbook_view(meta: dict[str, Any], failures: list[SchemaMaintenanceFailure]) -> None:
     value = meta.get("workbook_view")
     if value is None:
@@ -753,7 +829,6 @@ def _handle_blocked_roots(
         "legend_blocks",
         "sparse_defaults",
         "split_by_discriminator",
-        "xref_crosstable",
     ):
         value = meta.get(root_name)
         if value is None:

@@ -50,6 +50,9 @@ SUPPORTED_ROOT_NAMES = frozenset(
         "helper_policies",
         "sheets",
         "workbook_view",
+        # Dedicated feature-aware handler; not scanned by the generic
+        # key-name convention (real XRef references only).
+        "xref_crosstable",
     }
 )
 BLOCKED_ROOTS_BY_NAME = {
@@ -58,7 +61,6 @@ BLOCKED_ROOTS_BY_NAME = {
     "legend_blocks": ReferenceRoot.LEGEND_BLOCKS,
     "sparse_defaults": ReferenceRoot.SPARSE_DEFAULTS,
     "split_by_discriminator": ReferenceRoot.SPLIT_BY_DISCRIMINATOR,
-    "xref_crosstable": ReferenceRoot.XREF_CROSSTABLE,
 }
 OUT_OF_SCOPE_ROOT_NAMES = frozenset(
     {
