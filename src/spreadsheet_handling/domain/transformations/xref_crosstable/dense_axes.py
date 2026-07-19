@@ -364,6 +364,16 @@ def _dense_axes_meta_payload(
     row_keys: list[Any],
     column_keys: list[Any],
 ) -> dict[str, Any] | None:
+    """Build the dense-axis payload: durable intent plus run-local Resolution.
+
+    ``rows_from`` / ``columns_from`` are durable inverse intent. The
+    ``resolved`` snapshot is a run-local Resolution facet with a concrete
+    consumer: a later ``contract_xref`` in the same run (or on hand-authored
+    meta) may operate on a frame subset that no longer contains the axis
+    frames and then falls back to the snapshot
+    (see ``_resolve_dense_axes``). The persistence boundary strips
+    ``resolved`` from every persisted carrier.
+    """
     if dense_config is None and not dense_resolved:
         return None
 

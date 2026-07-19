@@ -84,6 +84,13 @@ def _xref_config(
     relation: str | None = None,
     matrix: str | None = None,
 ) -> Mapping[str, Any] | None:
+    """Find the intent entry for a transform id or a relation/matrix frame.
+
+    Exact config-id match wins. The fallback matches the persisted
+    ``relation`` / ``matrix`` frame-identity fields; more than one matching
+    entry is ambiguous intent and fails explicitly rather than silently
+    picking the first entry.
+    """
     meta = frames.get("_meta")
     if not isinstance(meta, Mapping):
         return None
@@ -95,11 +102,23 @@ def _xref_config(
         config = configs.get(config_id)
         if isinstance(config, Mapping):
             return config
-    for config in configs.values():
+
+    matches: list[tuple[Any, Mapping[str, Any]]] = []
+    for key, config in configs.items():
         if not isinstance(config, Mapping):
             continue
-        if relation is not None and config.get("relation") == relation:
-            return config
-        if matrix is not None and config.get("matrix") == matrix:
-            return config
+        if (relation is not None and config.get("relation") == relation) or (
+            matrix is not None and config.get("matrix") == matrix
+        ):
+            matches.append((key, config))
+    if len(matches) > 1:
+        match_names = [key for key, _ in matches]
+        raise ValueError(
+            f"Ambiguous xref_crosstable metadata for "
+            f"relation={relation!r} / matrix={matrix!r}: entries "
+            f"{match_names!r} both match. Name the intended transform "
+            "explicitly (name=...) to disambiguate."
+        )
+    if matches:
+        return matches[0][1]
     return None

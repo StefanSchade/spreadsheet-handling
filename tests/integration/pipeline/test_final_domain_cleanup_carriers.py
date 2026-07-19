@@ -271,3 +271,71 @@ def test_stale_view_mapping_after_keep_mode_fails_before_spreadsheet_creation(
         )
 
     assert not spreadsheet_out.exists()
+
+
+def test_xref_intent_parity_and_recreation_across_xlsx_and_ods(
+    tmp_path: Path,
+) -> None:
+    """Both spreadsheet carriers persist the same minimal XRef inverse intent.
+
+    The relation is dropped after a lossless contraction; each carrier's
+    persisted intent references the absent relation frame (required inverse
+    intent, not a contradiction) without run-local Resolution facets, and
+    the inverse expansion recreates identical relations from either carrier.
+    """
+    in_dir = tmp_path / "in"
+    _write_json_dir(in_dir, SAMPLE_DATA)
+    artifacts = {
+        "xlsx": tmp_path / "out.xlsx",
+        "ods": tmp_path / "out.ods",
+    }
+
+    for kind, path in artifacts.items():
+        orchestrate(
+            input={"kind": "json_dir", "path": str(in_dir)},
+            output={"kind": kind, "path": str(path)},
+            steps=build_steps_from_config([_XREF_STEP]),
+        )
+
+    recreated: dict[str, list[dict]] = {}
+    for kind, path in artifacts.items():
+        loaded = orchestrate(
+            input={"kind": kind, "path": str(path)},
+            output={"kind": "discard", "path": "-"},
+        )
+        assert "story_places" not in loaded
+        intent = (loaded.get("_meta") or {}).get("xref_crosstable") or {}
+        assert intent["story_places"] == {
+            "relation": "story_places",
+            "matrix": "story_place_matrix",
+            "row_keys": ["story_id"],
+        }
+
+        reimport_out = tmp_path / f"reimported_{kind}"
+        orchestrate(
+            input={"kind": kind, "path": str(path)},
+            output={"kind": "json_dir", "path": str(reimport_out)},
+            steps=build_steps_from_config(
+                [
+                    {
+                        "step": "expand_xref",
+                        "matrix": "story_place_matrix",
+                        "output": "story_places",
+                        "row_keys": "story_id",
+                        "column_key": "place",
+                        "value": "relation",
+                        "drop_empty": True,
+                    }
+                ]
+            ),
+        )
+        rows = json.loads(
+            (reimport_out / "story_places.json").read_text(encoding="utf-8")
+        )
+        recreated[kind] = sorted(rows, key=lambda row: (row["story_id"], row["place"]))
+
+    assert recreated["xlsx"] == recreated["ods"]
+    assert {(r["story_id"], r["place"], r["relation"]) for r in recreated["xlsx"]} == {
+        ("s1", "cave", "setting"),
+        ("s2", "camp", "journey"),
+    }

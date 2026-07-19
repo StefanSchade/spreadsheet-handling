@@ -130,7 +130,7 @@ def test_pivot_frame_fails_clearly_for_missing_and_unexpected_columns() -> None:
         )
 
 
-def test_pivot_frame_marks_output_as_readonly_projection_by_default() -> None:
+def test_pivot_frame_writes_no_metadata() -> None:
     frames = {
         "mapping_rows": pd.DataFrame(
             [{"variable_id": "v1", "mapping_name": "request", "display": "amount"}]

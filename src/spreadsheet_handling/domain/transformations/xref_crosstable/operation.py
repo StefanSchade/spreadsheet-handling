@@ -55,8 +55,11 @@ def expand_xref(
     With ``drop_source=True`` the caller asserts that the expanded relation
     fully supersedes the matrix frame; the matrix is then marked for final
     domain cleanup via an explicit ``_meta.pipeline_cleanup`` drop command.
-    The transformation records only the command -- whether the projection is
-    actually lossless is the caller's feature-local judgement.
+    The checkable value-loss condition is enforced: an explicit
+    ``value_columns`` subset that would leave unexpanded matrix columns
+    behind rejects ``drop_source``. Shape recovery for empty-only columns
+    under ``drop_empty=True`` remains the caller's feature-local judgement
+    (dense column intent or a retained matrix provides it).
     """
     config_id = name or output
     if drop_source and matrix == output:
@@ -74,6 +77,18 @@ def expand_xref(
     )
     _ensure_flat_axis_labels(value_cols, "value_columns")
     _ensure_columns(source, value_cols, frame_name=matrix, field_name="value_columns")
+    if drop_source:
+        unexpanded = [
+            col
+            for col in source.columns
+            if col not in row_key_cols and col not in value_cols
+        ]
+        if unexpanded:
+            raise ValueError(
+                f"drop_source would lose matrix column(s) {unexpanded!r} that "
+                "value_columns does not expand; expand every value column or "
+                "keep the matrix frame"
+            )
 
     records: list[dict[Any, Any]] = []
     in_scope_addresses: set[tuple[tuple[Any, ...], Any]] = set()
@@ -123,15 +138,16 @@ def expand_xref(
         )
         else None
     )
+    # Minimal feature-local inverse intent: frame identity (legitimately
+    # referencing frames that final cleanup may later remove), row-identity
+    # vocabulary, and dense-axis intent riding along for a later contract.
+    # ``column_keys`` is a run-local Resolution facet (same-run contract
+    # reuse and sparse_defaults); the persistence boundary strips it.
     payload = {
-        "operation": "expand_xref",
         "matrix": matrix,
         "relation": output,
         "row_keys": list(row_key_cols),
         "column_keys": list(value_cols),
-        "column_key": column_key,
-        "value": value,
-        "drop_empty": bool(drop_empty),
     }
     if dense_axes is not None:
         payload["dense_axes"] = dense_axes
@@ -164,8 +180,10 @@ def contract_xref(
     With ``drop_source=True`` the caller asserts that the contracted matrix
     fully supersedes the relation frame; the relation is then marked for
     final domain cleanup via an explicit ``_meta.pipeline_cleanup`` drop
-    command. The transformation records only the command -- whether the
-    projection is actually lossless is the caller's feature-local judgement.
+    command. The checkable value-loss condition is enforced: every relation
+    column key must be covered by the matrix columns, otherwise
+    ``drop_source`` is rejected (a matrix that silently drops relation
+    pairs cannot supersede the relation).
     """
     config_id = name or relation
     if drop_source and relation == output:
@@ -214,6 +232,13 @@ def contract_xref(
         column_key=column_key,
         dense_resolved=dense_resolved,
     )
+    if drop_source:
+        _ensure_matrix_covers_relation_columns(
+            source,
+            column_key=column_key,
+            matrix_cols=matrix_cols,
+            normalize="column_keys" in dense_resolved,
+        )
 
     values_by_pair = {
         (
@@ -243,14 +268,13 @@ def contract_xref(
     matrix_frame = pd.DataFrame(rows, columns=[*row_key_cols, *matrix_cols])
     out: dict[str, Any] = dict(frames)
     out[output] = matrix_frame
+    # Minimal feature-local inverse intent; see the expand_xref payload
+    # comment for the retained fields and their concrete consumers.
     payload = {
-        "operation": "contract_xref",
         "relation": relation,
         "matrix": output,
         "row_keys": list(row_key_cols),
         "column_keys": list(matrix_cols),
-        "column_key": column_key,
-        "value": value,
     }
     dense_payload = _dense_axes_meta_payload(
         dense_config=dense_config,
@@ -282,6 +306,28 @@ def _ensure_output_names_do_not_collide(
         raise ValueError(f"row_keys collide with output column names: {collisions!r}")
     if column_key == value:
         raise ValueError("column_key and value output names must differ")
+
+
+def _ensure_matrix_covers_relation_columns(
+    relation: pd.DataFrame,
+    *,
+    column_key: str,
+    matrix_cols: list[Any],
+    normalize: bool,
+) -> None:
+    uncovered: list[Any] = []
+    for raw_value in relation[column_key].tolist():
+        value = _relation_column_identity(raw_value, normalize=normalize)
+        if any(_values_equal(value, matrix_col) for matrix_col in matrix_cols):
+            continue
+        if not any(_values_equal(value, existing) for existing in uncovered):
+            uncovered.append(value)
+    if uncovered:
+        raise ValueError(
+            f"drop_source would lose relation column key(s) {uncovered!r} that "
+            "the matrix columns do not cover; widen column_keys/dense axes or "
+            "keep the relation frame"
+        )
 
 
 def _ensure_unique_pairs(

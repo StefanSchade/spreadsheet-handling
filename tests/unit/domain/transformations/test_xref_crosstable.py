@@ -1237,3 +1237,243 @@ class TestDropSourceCleanupCommands:
                 value="value",
                 drop_source=True,
             )
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestMinimalInverseIntent:
+    """The persisted XRef contract is the minimal feature-local inverse intent.
+
+    Retained fields all have concrete decision consumers: relation/matrix
+    (intent discovery, column-role resolution, sparse defaults), row_keys
+    (row-identity resolution), dense_axes intent (axis re-resolution), and
+    the run-local column_keys / dense resolved Resolution facets (same-run
+    contract reuse; stripped at the persistence boundary). Descriptive
+    fields without a consumer (operation, column_key, value, drop_empty)
+    are no longer written.
+    """
+
+    @staticmethod
+    def _relation_frames() -> dict:
+        return {
+            "relations": pd.DataFrame(
+                [
+                    {"product": "p1", "market": "DE", "code": "x"},
+                    {"product": "p2", "market": "JP", "code": "y"},
+                ]
+            )
+        }
+
+    def test_contract_writes_minimal_intent_payload(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+
+        assert out["_meta"]["xref_crosstable"]["relations"] == {
+            "relation": "relations",
+            "matrix": "matrix",
+            "row_keys": ["product"],
+            "column_keys": ["DE", "JP"],
+        }
+        assert list(out["_meta"]) == ["xref_crosstable"]
+
+    def test_expand_writes_minimal_intent_payload(self) -> None:
+        contracted = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+        out = expand_xref(
+            {"matrix": contracted["matrix"]},
+            matrix="matrix",
+            output="relations_again",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            drop_empty=True,
+        )
+
+        assert out["_meta"]["xref_crosstable"]["relations_again"] == {
+            "matrix": "matrix",
+            "relation": "relations_again",
+            "row_keys": ["product"],
+            "column_keys": ["DE", "JP"],
+        }
+
+    def test_persisted_intent_survives_boundary_without_resolution_facets(self) -> None:
+        from spreadsheet_handling.pipeline.persistence_boundary import (
+            project_meta_to_persistable_contract,
+        )
+
+        frames = {
+            "resources": pd.DataFrame({"resource_key": ["r1"]}),
+            "contexts": pd.DataFrame({"context_id": ["default"]}),
+            "values": pd.DataFrame(
+                [{"resource_key": "r1", "context_id": "default", "text": "Hello"}]
+            ),
+        }
+        out = contract_xref(
+            frames,
+            relation="values",
+            output="matrix",
+            row_keys=["resource_key"],
+            column_key="context_id",
+            value="text",
+            dense_axes={
+                "rows_from": {"frame": "resources", "key": "resource_key"},
+                "columns_from": {"frame": "contexts", "key": "context_id"},
+            },
+            name="resource_contexts",
+        )
+
+        persisted = project_meta_to_persistable_contract(out["_meta"])
+
+        assert persisted["xref_crosstable"]["resource_contexts"] == {
+            "relation": "values",
+            "matrix": "matrix",
+            "row_keys": ["resource_key"],
+            "dense_axes": {
+                "rows_from": {"frame": "resources", "key": "resource_key"},
+                "columns_from": {"frame": "contexts", "key": "context_id"},
+            },
+        }
+
+    def test_ambiguous_intent_fallback_fails_explicitly(self) -> None:
+        frames = dict(self._relation_frames())
+        frames["_meta"] = {
+            "xref_crosstable": {
+                "first": {"relation": "relations", "matrix": "matrix_a"},
+                "second": {"relation": "relations", "matrix": "matrix_b"},
+            }
+        }
+
+        with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+            contract_xref(
+                frames,
+                relation="relations",
+                output="matrix",
+                row_keys="product",
+                column_key="market",
+                value="code",
+                name="third",
+            )
+
+    def test_exact_config_id_wins_over_frame_fallback(self) -> None:
+        frames = dict(self._relation_frames())
+        frames["_meta"] = {
+            "xref_crosstable": {
+                "first": {"relation": "relations", "matrix": "matrix_a"},
+                "second": {"relation": "relations", "matrix": "matrix_b"},
+            }
+        }
+
+        out = contract_xref(
+            frames,
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            name="first",
+        )
+
+        assert "matrix" in out
+
+    def test_no_generic_lifecycle_or_provenance_metadata_is_written(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            drop_source=True,
+        )
+
+        assert set(out["_meta"]) == {"xref_crosstable", "pipeline_cleanup"}
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestDropSourceLosslessGuards:
+    """drop_source is rejected when the projection checkably loses values."""
+
+    @staticmethod
+    def _relation_frames() -> dict:
+        return {
+            "relations": pd.DataFrame(
+                [
+                    {"product": "p1", "market": "DE", "code": "x"},
+                    {"product": "p1", "market": "JP", "code": "y"},
+                ]
+            )
+        }
+
+    def test_contract_drop_source_rejects_uncovered_relation_columns(self) -> None:
+        with pytest.raises(ValueError, match="drop_source would lose relation column"):
+            contract_xref(
+                self._relation_frames(),
+                relation="relations",
+                output="matrix",
+                row_keys="product",
+                column_key="market",
+                value="code",
+                column_keys=["DE"],
+                drop_source=True,
+            )
+
+    def test_contract_without_drop_source_allows_scoped_column_keys(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            column_keys=["DE"],
+        )
+
+        assert list(out["matrix"].columns) == ["product", "DE"]
+        assert "relations" in out
+
+    def test_contract_drop_source_allows_full_coverage(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            column_keys=["DE", "JP"],
+            drop_source=True,
+        )
+
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["relations"]
+
+    def test_expand_drop_source_rejects_unexpanded_value_columns(self) -> None:
+        contracted = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+
+        with pytest.raises(ValueError, match="drop_source would lose matrix column"):
+            expand_xref(
+                {"matrix": contracted["matrix"]},
+                matrix="matrix",
+                output="relations_again",
+                row_keys="product",
+                value_columns=["DE"],
+                column_key="market",
+                value="code",
+                drop_source=True,
+            )
