@@ -1156,3 +1156,84 @@ def test_contract_xref_dense_multicolumn_row_keys() -> None:
             "column_keys": ["default", "product_a"],
         },
     }
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestDropSourceCleanupCommands:
+    """Explicit drop_source contributes a final-domain-cleanup drop command.
+
+    The transformation records only the command; it keeps the source frame in
+    the returned frames so later pipeline steps can still use it. Removal
+    happens at the orchestrator-owned final cleanup boundary.
+    """
+
+    @staticmethod
+    def _relation_frames() -> dict:
+        return {
+            "relations": pd.DataFrame(
+                [
+                    {"product": "p1", "market": "DE", "value": "x"},
+                    {"product": "p1", "market": "JP", "value": "y"},
+                ]
+            )
+        }
+
+    def test_contract_xref_drop_source_marks_relation_for_cleanup(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="value",
+            drop_source=True,
+        )
+
+        assert "relations" in out  # deferred: still available to later steps
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["relations"]
+
+    def test_expand_xref_drop_source_marks_matrix_for_cleanup(self) -> None:
+        contracted = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="value",
+        )
+        out = expand_xref(
+            contracted,
+            matrix="matrix",
+            output="relations_again",
+            row_keys="product",
+            column_key="market",
+            value="value",
+            drop_source=True,
+        )
+
+        assert "matrix" in out
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["matrix"]
+
+    def test_default_contributes_no_cleanup_command(self) -> None:
+        out = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="value",
+        )
+
+        assert "pipeline_cleanup" not in out["_meta"]
+
+    def test_drop_source_requires_distinct_output(self) -> None:
+        with pytest.raises(ValueError, match="distinct output"):
+            contract_xref(
+                self._relation_frames(),
+                relation="relations",
+                output="relations",
+                row_keys="product",
+                column_key="market",
+                value="value",
+                drop_source=True,
+            )

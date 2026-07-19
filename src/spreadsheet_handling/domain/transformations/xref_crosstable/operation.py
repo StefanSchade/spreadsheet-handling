@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values_equal
+from spreadsheet_handling.domain.pipeline_cleanup import mark_frames_for_cleanup
 
 from .dense_axes import (
     _dense_axes_from_config_or_meta,
@@ -43,14 +44,23 @@ def expand_xref(
     value: str = "value",
     drop_empty: bool = False,
     base_relation: str | None = None,
+    drop_source: bool = False,
     name: str | None = None,
 ) -> Frames:
     """Expand a matrix/cross-table frame into explicit long-form rows.
 
     When base_relation is supplied, out-of-scope rows from that frame are
     appended after the recomposed in-scope rows (scoped recomposition).
+
+    With ``drop_source=True`` the caller asserts that the expanded relation
+    fully supersedes the matrix frame; the matrix is then marked for final
+    domain cleanup via an explicit ``_meta.pipeline_cleanup`` drop command.
+    The transformation records only the command -- whether the projection is
+    actually lossless is the caller's feature-local judgement.
     """
     config_id = name or output
+    if drop_source and matrix == output:
+        raise ValueError("drop_source requires a distinct output frame")
     source = _require_frame(frames, matrix)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
@@ -130,6 +140,8 @@ def expand_xref(
         config_id=config_id,
         payload=payload,
     )
+    if drop_source:
+        mark_frames_for_cleanup(out, [matrix])
     return out
 
 
@@ -144,10 +156,20 @@ def contract_xref(
     column_keys: Iterable[Any] | None = None,
     fill_value: Any = "",
     dense_axes: Mapping[str, Any] | None = None,
+    drop_source: bool = False,
     name: str | None = None,
 ) -> Frames:
-    """Contract explicit long-form rows into a matrix/cross-table frame."""
+    """Contract explicit long-form rows into a matrix/cross-table frame.
+
+    With ``drop_source=True`` the caller asserts that the contracted matrix
+    fully supersedes the relation frame; the relation is then marked for
+    final domain cleanup via an explicit ``_meta.pipeline_cleanup`` drop
+    command. The transformation records only the command -- whether the
+    projection is actually lossless is the caller's feature-local judgement.
+    """
     config_id = name or relation
+    if drop_source and relation == output:
+        raise ValueError("drop_source requires a distinct output frame")
     source = _require_frame(frames, relation)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
@@ -243,6 +265,8 @@ def contract_xref(
         config_id=config_id,
         payload=payload,
     )
+    if drop_source:
+        mark_frames_for_cleanup(out, [relation])
     return out
 
 

@@ -103,6 +103,7 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "__autofilter_ref": ("meta_rendering", "read_path_hint"),
         "_hidden": ("meta_rendering", "carrier_artifact"),
         "derived": ("meta_rendering", "derived_operational_view"),
+        "pipeline_cleanup": ("meta_rendering", "derived_operational_view"),
     }
 
     actual_profiles = {

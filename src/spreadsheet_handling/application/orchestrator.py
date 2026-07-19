@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, Mapping, TypeAlias
 
 import logging
 
+from ..domain.pipeline_cleanup import execute_final_domain_cleanup
 from ..io_backends.router import get_loader, get_saver
 from ..pipeline.execution import run_pipeline
 from ..pipeline.persistence_boundary import project_meta_to_persistable_contract
@@ -104,6 +105,16 @@ def orchestrate(
         step_list = list(steps)
         log.info("orchestrate: running %d step(s)", len(step_list))
         frames = run_pipeline(frames, step_list)
+
+    # Final domain cleanup: execute pending explicit cleanup commands
+    # (_meta.pipeline_cleanup) and consume them. Carrier-neutral; runs for
+    # every output kind, immediately before the persistence boundary. Like
+    # the persistence boundary below, this is part of the orchestrator's
+    # macro flow, not a configurable pipeline step. It executes only
+    # explicit drop/keep declarations and never infers cleanup from
+    # lifecycle roles. See
+    # src/spreadsheet_handling/domain/pipeline_cleanup.py.
+    frames = execute_final_domain_cleanup(frames)
 
     # Persistence boundary: project runtime _meta onto its persistable
     # contract before any backend writes anything. Carrier-neutral; runs for

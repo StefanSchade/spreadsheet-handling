@@ -63,6 +63,21 @@ def test_drops_top_level_derived() -> None:
     assert out["version"] == "1.0"
 
 
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+def test_drops_top_level_pipeline_cleanup_commands() -> None:
+    # Defense in depth: cleanup commands are consumed by the orchestrator's
+    # implicit final domain cleanup before this projection runs, but callers
+    # that persist frames without the orchestrator must not leak executable
+    # commands into persistable _meta either.
+    meta = {
+        "version": "1.0",
+        "pipeline_cleanup": {"drop_frames": ["relation_source"]},
+    }
+    out = project_meta_to_persistable_contract(meta)
+    assert "pipeline_cleanup" not in out
+    assert out["version"] == "1.0"
+
+
 def test_drops_top_level_dunder_keys() -> None:
     meta = {
         "freeze_header": True,

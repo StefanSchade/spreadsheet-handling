@@ -109,12 +109,20 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-RUNTIME_ONLY_TOP_LEVEL_META_KEYS: frozenset[str] = frozenset({"derived"})
+RUNTIME_ONLY_TOP_LEVEL_META_KEYS: frozenset[str] = frozenset(
+    {"derived", "pipeline_cleanup"}
+)
 """Top-level ``_meta`` keys that must never survive into persistence.
 
 Conservative initial set. The full classification belongs to
 ``FTR-META-LIFECYCLE-INVENTORY-P5``; until then, new producers that emit
 runtime-only meta on a new top-level key should extend this set.
+
+``pipeline_cleanup`` is a command family consumed by the orchestrator's
+implicit final domain cleanup (``domain/pipeline_cleanup.py``) before this
+projection runs; stripping it here is defense in depth for callers that
+persist frames without going through the orchestrator, so cleanup commands
+can never roundtrip through a carrier and re-execute.
 """
 
 
