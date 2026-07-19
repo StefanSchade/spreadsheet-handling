@@ -53,6 +53,50 @@ def _ensure_flat_axis_labels(values: Iterable[Any], field_name: str) -> None:
         )
 
 
+def _ensure_column_identity_values(values: Iterable[Any], source_label: str) -> None:
+    """Enforce the carrier-stable XRef column-identity contract on values.
+
+    XRef matrix column identities that participate in the persisted
+    matrix/relation roundtrip must be non-empty strings: spreadsheet
+    carriers realize matrix headers as strings, so numeric, missing
+    (``None``/``NaN``/``NA``), mixed-type, or unhashable identities would
+    silently change type, collide, or produce non-scalar cells on the way
+    back. Duplicates are allowed here (relation rows repeat identities);
+    use :func:`_ensure_column_identity_list` for identity lists.
+    """
+    invalid_reprs: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            continue
+        value_repr = repr(value)
+        if value_repr not in invalid_reprs:
+            invalid_reprs.append(value_repr)
+    if invalid_reprs:
+        raise ValueError(
+            f"{source_label} must contain non-empty string column "
+            f"identities; invalid value(s): [{', '.join(invalid_reprs)}]. "
+            "Numeric, missing, or mixed-type identities are not stable "
+            "across spreadsheet headers."
+        )
+
+
+def _ensure_column_identity_list(values: Iterable[Any], source_label: str) -> None:
+    """Enforce the identity contract plus uniqueness on an identity list."""
+    materialized = list(values)
+    _ensure_column_identity_values(materialized, source_label)
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for value in materialized:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    if duplicates:
+        raise ValueError(
+            f"{source_label} contains duplicate column identit(y/ies): "
+            f"{duplicates!r}; matrix column identities must be unique"
+        )
+
+
 def _ensure_columns(
     df: pd.DataFrame,
     columns: Iterable[Any],

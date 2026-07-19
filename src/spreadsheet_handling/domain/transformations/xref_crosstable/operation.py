@@ -23,6 +23,8 @@ from .dense_axes import (
 from .primitives import (
     _META_KEY,
     _as_list,
+    _ensure_column_identity_list,
+    _ensure_column_identity_values,
     _ensure_columns,
     _ensure_flat_axis_labels,
     _ordered_values_equal,
@@ -60,11 +62,22 @@ def expand_xref(
     behind rejects ``drop_source``. Shape recovery for empty-only columns
     under ``drop_empty=True`` remains the caller's feature-local judgement
     (dense column intent or a retained matrix provides it).
+
+    Column identities follow the carrier-stable contract: duplicate
+    physical matrix labels are rejected before expansion, and the expanded
+    labels must be unique, non-empty strings.
     """
     config_id = name or output
     if drop_source and matrix == output:
         raise ValueError("drop_source requires a distinct output frame")
     source = _require_frame(frames, matrix)
+    duplicated_labels = source.columns[source.columns.duplicated()].tolist()
+    if duplicated_labels:
+        raise ValueError(
+            f"Frame {matrix!r} has duplicate column label(s) "
+            f"{duplicated_labels!r}; duplicate physical matrix columns "
+            "cannot be expanded (cell addressing would be non-scalar)"
+        )
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
@@ -75,7 +88,10 @@ def expand_xref(
         if value_columns is not None
         else [col for col in source.columns if col not in row_key_cols]
     )
-    _ensure_flat_axis_labels(value_cols, "value_columns")
+    # Expanded labels become relation column-identity values: enforce the
+    # carrier-stable contract (unique, non-empty strings) on the physical
+    # matrix labels selected for expansion.
+    _ensure_column_identity_list(value_cols, f"Frame {matrix!r} value_columns")
     _ensure_columns(source, value_cols, frame_name=matrix, field_name="value_columns")
     if drop_source:
         unexpanded = [
@@ -180,10 +196,17 @@ def contract_xref(
     With ``drop_source=True`` the caller asserts that the contracted matrix
     fully supersedes the relation frame; the relation is then marked for
     final domain cleanup via an explicit ``_meta.pipeline_cleanup`` drop
-    command. The checkable value-loss condition is enforced: every relation
-    column key must be covered by the matrix columns, otherwise
-    ``drop_source`` is rejected (a matrix that silently drops relation
+    command. The checkable value-loss conditions are enforced: the relation
+    must contain no fields beyond ``row_keys + column_key + value`` (the
+    matrix represents nothing else), and every relation column key must be
+    covered by the matrix columns (a matrix that silently drops relation
     pairs cannot supersede the relation).
+
+    Matrix column identities that participate in the roundtrip must be
+    unique, non-empty strings (carrier-stable contract): relation
+    ``column_key`` values and every column-identity source (explicit,
+    metadata-derived, dense-derived) are validated before the matrix is
+    built.
     """
     config_id = name or relation
     if drop_source and relation == output:
@@ -198,7 +221,24 @@ def contract_xref(
         field_name="row_keys/column_key/value",
     )
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
+    # Identity contract first: unhashable/missing values must get the
+    # deterministic contract diagnostic, not a pandas hashtable error from
+    # the duplicate-pair check below.
+    _ensure_column_identity_values(
+        source[column_key].tolist(),
+        f"Frame {relation!r} column_key {column_key!r} values",
+    )
     _ensure_unique_pairs(source, row_key_cols, column_key)
+    if drop_source:
+        represented = {*row_key_cols, column_key, value}
+        unrepresented = [col for col in source.columns if col not in represented]
+        if unrepresented:
+            raise ValueError(
+                f"drop_source would lose relation field(s) {unrepresented!r} "
+                "that the matrix does not represent (only row_keys, "
+                "column_key, and value are projected); project them "
+                "separately or keep the relation frame"
+            )
 
     dense_config = _dense_axes_from_config_or_meta(
         frames,
@@ -220,7 +260,10 @@ def contract_xref(
         explicit_column_keys=column_keys,
         dense_resolved=dense_resolved,
     )
-    _ensure_flat_axis_labels(matrix_cols, "column_keys")
+    # One identity contract for every column-identity source: explicit
+    # column_keys, metadata-derived reuse, and dense-axis-derived lists all
+    # arrive here as matrix_cols.
+    _ensure_column_identity_list(matrix_cols, "column_keys")
     row_identities = (
         dense_resolved["row_identities"]
         if "row_identities" in dense_resolved

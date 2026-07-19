@@ -188,9 +188,12 @@ def _project_xref_crosstable(xref_crosstable: Any) -> Any:
     * ``dense_axes.resolved`` -- the same snapshot mirrored under
       ``dense_axes``.
 
-    Intent fields (``column_key``, ``row_keys``, ``value``, ``relation``,
-    ``matrix``, ``operation``, ``drop_empty``, ``dense_axes.columns_from``,
-    ``dense_axes.rows_from``) are preserved.
+    The current minimal intent (``relation``, ``matrix``, ``row_keys``,
+    ``dense_axes.rows_from``, ``dense_axes.columns_from``) is preserved.
+    Unknown and legacy descriptive fields (for example ``operation``,
+    ``column_key``, ``value``, ``drop_empty`` from older payloads) pass
+    through unchanged for tolerant compatibility; producers no longer
+    write them.
     """
     if not isinstance(xref_crosstable, Mapping):
         return xref_crosstable

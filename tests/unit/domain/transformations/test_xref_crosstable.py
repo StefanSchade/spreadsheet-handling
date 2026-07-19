@@ -500,7 +500,9 @@ def test_contract_xref_rejects_tuple_column_keys_in_first_slice() -> None:
         ])
     }
 
-    with pytest.raises(ValueError, match="tuple labels"):
+    # Tuples now fail the carrier-stable column-identity contract (before
+    # the flat-label check is even reached).
+    with pytest.raises(ValueError, match="non-empty string column"):
         contract_xref(
             frames,
             relation="long",
@@ -1365,12 +1367,22 @@ class TestMinimalInverseIntent:
                 name="third",
             )
 
-    def test_exact_config_id_wins_over_frame_fallback(self) -> None:
+    def test_exact_config_id_wins_and_its_payload_is_consumed(self) -> None:
+        # The two candidate entries carry observably different column_keys;
+        # the produced matrix proves which entry the exact id selected.
         frames = dict(self._relation_frames())
         frames["_meta"] = {
             "xref_crosstable": {
-                "first": {"relation": "relations", "matrix": "matrix_a"},
-                "second": {"relation": "relations", "matrix": "matrix_b"},
+                "first": {
+                    "relation": "relations",
+                    "matrix": "matrix_a",
+                    "column_keys": ["DE", "JP", "US"],
+                },
+                "second": {
+                    "relation": "relations",
+                    "matrix": "matrix_b",
+                    "column_keys": ["DE"],
+                },
             }
         }
 
@@ -1384,7 +1396,33 @@ class TestMinimalInverseIntent:
             name="first",
         )
 
-        assert "matrix" in out
+        assert list(out["matrix"].columns) == ["product", "DE", "JP", "US"]
+
+    def test_matrix_side_frame_fallback_ambiguity_fails(self) -> None:
+        contracted = contract_xref(
+            self._relation_frames(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+        meta = dict(contracted["_meta"])
+        meta["xref_crosstable"] = {
+            "first": {"relation": "rel_a", "matrix": "matrix"},
+            "second": {"relation": "rel_b", "matrix": "matrix"},
+        }
+
+        with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+            expand_xref(
+                {"matrix": contracted["matrix"], "_meta": meta},
+                matrix="matrix",
+                output="relations_again",
+                row_keys="product",
+                column_key="market",
+                value="code",
+                name="third",
+            )
 
     def test_no_generic_lifecycle_or_provenance_metadata_is_written(self) -> None:
         out = contract_xref(
@@ -1477,3 +1515,201 @@ class TestDropSourceLosslessGuards:
                 value="code",
                 drop_source=True,
             )
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestCarrierStableColumnIdentityContract:
+    """XRef roundtrip column identities must be unique, non-empty strings.
+
+    Spreadsheet carriers stringify headers, so numeric, missing,
+    mixed-type, duplicate, or unhashable identities would silently change
+    type, collide, or produce non-scalar cells on readback. Every identity
+    source fails explicitly before any cleanup command is recorded.
+    """
+
+    @staticmethod
+    def _relation(column_values: list) -> dict:
+        return {
+            "relations": pd.DataFrame(
+                {
+                    "product": [f"p{i}" for i in range(len(column_values))],
+                    "market": column_values,
+                    "code": ["x"] * len(column_values),
+                }
+            )
+        }
+
+    @staticmethod
+    def _contract(frames: dict, **overrides):
+        params = dict(
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+        params.update(overrides)
+        return contract_xref(frames, **params)
+
+    def test_none_column_identity_fails(self) -> None:
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation(["DE", None]))
+
+    def test_nan_column_identity_fails(self) -> None:
+        import numpy as np
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation(["DE", np.nan]))
+
+    def test_pd_na_column_identity_fails(self) -> None:
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation(["DE", pd.NA]))
+
+    def test_numeric_column_identity_fails(self) -> None:
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation([1, 2]))
+
+    def test_numpy_numeric_scalar_identity_fails(self) -> None:
+        import numpy as np
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation([np.int64(1), np.int64(2)]))
+
+    def test_mixed_numeric_and_string_identities_fail(self) -> None:
+        # 1 and "1" are distinct in memory but collide as spreadsheet
+        # headers; the numeric identity fails the contract outright.
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation([1, "1"]))
+
+    def test_unhashable_column_identity_fails(self) -> None:
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation([["list"], "DE"]))
+
+    def test_empty_string_column_identity_fails(self) -> None:
+        with pytest.raises(ValueError, match="non-empty string column"):
+            self._contract(self._relation(["DE", "  "]))
+
+    def test_duplicate_explicit_column_keys_fail(self) -> None:
+        with pytest.raises(ValueError, match="duplicate column identit"):
+            self._contract(self._relation(["DE", "JP"]), column_keys=["DE", "DE", "JP"])
+
+    def test_duplicate_metadata_derived_column_keys_fail(self) -> None:
+        frames = self._relation(["DE", "JP"])
+        frames["_meta"] = {
+            "xref_crosstable": {
+                "relations": {
+                    "relation": "relations",
+                    "matrix": "matrix",
+                    "column_keys": ["DE", "DE", "JP"],
+                }
+            }
+        }
+
+        with pytest.raises(ValueError, match="duplicate column identit"):
+            self._contract(frames)
+
+    def test_duplicate_dense_derived_column_keys_fail(self) -> None:
+        # Hand-authored stored snapshot with duplicates (the live axis-frame
+        # path already rejects duplicates at the source frame).
+        frames = self._relation(["DE", "JP"])
+
+        with pytest.raises(ValueError, match="duplicate"):
+            self._contract(
+                frames,
+                dense_axes={
+                    "columns_from": {"frame": "absent_axis", "key": "id"},
+                    "resolved": {"column_keys": ["DE", "DE", "JP"]},
+                },
+            )
+
+    def test_duplicate_physical_matrix_labels_fail_expansion(self) -> None:
+        matrix = pd.DataFrame(
+            [["p1", "x", "y"]], columns=["product", "A", "A"]
+        )
+
+        with pytest.raises(ValueError, match="duplicate column label"):
+            expand_xref(
+                {"matrix": matrix},
+                matrix="matrix",
+                output="relations",
+                row_keys="product",
+                column_key="market",
+                value="code",
+            )
+
+    def test_non_string_physical_matrix_labels_fail_expansion(self) -> None:
+        matrix = pd.DataFrame([["p1", "x", "y"]], columns=["product", 1, 2])
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            expand_xref(
+                {"matrix": matrix},
+                matrix="matrix",
+                output="relations",
+                row_keys="product",
+                column_key="market",
+                value="code",
+            )
+
+    def test_valid_unique_string_identities_pass_with_drop_source(self) -> None:
+        out = self._contract(self._relation(["DE", "JP"]), drop_source=True)
+
+        assert list(out["matrix"].columns) == ["product", "DE", "JP"]
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["relations"]
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestDropSourceUnrepresentedFields:
+    """drop_source rejects relation fields the matrix does not represent."""
+
+    @staticmethod
+    def _frames_with_note() -> dict:
+        return {
+            "relations": pd.DataFrame(
+                [{"product": "p1", "market": "DE", "code": "x", "note": "keep me"}]
+            )
+        }
+
+    def test_additional_relation_field_with_drop_source_fails(self) -> None:
+        with pytest.raises(ValueError, match="does not represent"):
+            contract_xref(
+                self._frames_with_note(),
+                relation="relations",
+                output="matrix",
+                row_keys="product",
+                column_key="market",
+                value="code",
+                drop_source=True,
+            )
+
+    def test_additional_relation_field_without_drop_source_is_allowed(self) -> None:
+        out = contract_xref(
+            self._frames_with_note(),
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+        )
+
+        assert list(out["matrix"].columns) == ["product", "DE"]
+        assert "relations" in out
+        assert "pipeline_cleanup" not in out["_meta"]
+
+    def test_exactly_represented_relation_still_supports_drop_source(self) -> None:
+        frames = {
+            "relations": pd.DataFrame(
+                [{"product": "p1", "market": "DE", "code": "x"}]
+            )
+        }
+
+        out = contract_xref(
+            frames,
+            relation="relations",
+            output="matrix",
+            row_keys="product",
+            column_key="market",
+            value="code",
+            drop_source=True,
+        )
+
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["relations"]

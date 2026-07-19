@@ -203,12 +203,20 @@ def _row_keys_from_xref_meta(meta: Any, *, frame: str) -> list[str]:
     configs = meta.get("xref_crosstable")
     if not isinstance(configs, Mapping):
         return []
-    for config in configs.values():
-        if not isinstance(config, Mapping):
-            continue
-        if config.get("matrix") != frame:
-            continue
-        row_keys = config.get("row_keys")
+    matches = [
+        (key, config)
+        for key, config in configs.items()
+        if isinstance(config, Mapping) and config.get("matrix") == frame
+    ]
+    if len(matches) > 1:
+        match_names = [key for key, _ in matches]
+        raise ValueError(
+            f"Ambiguous xref_crosstable metadata for matrix frame {frame!r}: "
+            f"entries {match_names!r} both match. Provide key_columns "
+            "explicitly or keep a single matching transform entry."
+        )
+    if matches:
+        row_keys = matches[0][1].get("row_keys")
         if isinstance(row_keys, list):
             return [str(key) for key in row_keys]
     return []

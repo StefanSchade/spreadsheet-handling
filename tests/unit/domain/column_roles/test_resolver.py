@@ -393,3 +393,54 @@ class TestXrefMetaRowIdentityPath:
         assert roles.row_identity == ["story_id"]
         assert roles.display_helper == ["story_title"]
         assert roles.matrix_value == ["Galli", "Donzo"]
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+def test_ambiguous_xref_matrix_entries_fail_row_identity_resolution() -> None:
+    # Consistent family policy: multiple XRef entries claiming the same
+    # matrix frame must not be resolved by insertion order.
+    frames = {
+        "story_group_matrix_view": _matrix_view_frame(),
+        "_meta": {
+            "xref_crosstable": {
+                "first": {
+                    "matrix": "story_group_matrix_view",
+                    "row_keys": ["story_id"],
+                },
+                "second": {
+                    "matrix": "story_group_matrix_view",
+                    "row_keys": ["title"],
+                },
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+        resolve_column_roles(frames, frame="story_group_matrix_view")
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+def test_explicit_key_columns_override_bypasses_ambiguous_xref_entries() -> None:
+    frames = {
+        "story_group_matrix_view": _matrix_view_frame(),
+        "_meta": {
+            "xref_crosstable": {
+                "first": {
+                    "matrix": "story_group_matrix_view",
+                    "row_keys": ["story_id"],
+                },
+                "second": {
+                    "matrix": "story_group_matrix_view",
+                    "row_keys": ["title"],
+                },
+            },
+        },
+    }
+
+    roles = resolve_column_roles(
+        frames,
+        frame="story_group_matrix_view",
+        key_columns=["story_id"],
+    )
+
+    assert roles.row_identity == ["story_id"]
