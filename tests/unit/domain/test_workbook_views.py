@@ -86,7 +86,7 @@ def test_configure_workbook_view_preserves_existing_canonical_lifecycle() -> Non
     assert frame_lifecycle(out["_meta"])["products"]["role"] == "canonical_source"
     assert frame_lifecycle(out["_meta"])["products"]["canonical"] is True
     assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
-        {"sheet": "Products", "frame": "products", "canonical_frame": "products"}
+        {"sheet": "Products", "frame": "products"}
     ]
 
 
@@ -203,6 +203,8 @@ def test_configure_workbook_view_is_config_addressable_in_pipeline() -> None:
 
 
 def test_resolve_workbook_view_sheet_mappings_reads_hand_built_payload() -> None:
+    # The first entry carries a legacy derived "canonical_frame" key; it is
+    # ignored on read. Mapping identity is visible sheet -> logical frame only.
     meta = {
         "workbook_view": {
             "sheet_mappings": [
@@ -219,19 +221,17 @@ def test_resolve_workbook_view_sheet_mappings_reads_hand_built_payload() -> None
     mapping = resolve_workbook_view_sheet_mappings(
         meta,
         visible_sheets=["Product Matrix", "Variables"],
-        logical_frames=["variables", "variables_view", "product_matrix"],
+        logical_frames=["variables_view", "product_matrix"],
     )
 
     assert mapping == {
         "Variables": WorkbookViewSheetMapping(
             visible_sheet="Variables",
             logical_frame="variables_view",
-            canonical_frame="variables",
         ),
         "Product Matrix": WorkbookViewSheetMapping(
             visible_sheet="Product Matrix",
             logical_frame="product_matrix",
-            canonical_frame=None,
         ),
     }
 
@@ -289,7 +289,11 @@ def test_resolve_workbook_view_sheet_mappings_fails_loudly_for_missing_and_malfo
         )
 
 
-def test_configure_workbook_view_persists_reverse_mapping_from_explicit_lifecycle() -> None:
+def test_configure_workbook_view_persists_frame_only_reverse_mapping() -> None:
+    # The persisted mapping records visible sheet -> logical frame identity
+    # only. No canonical_frame is derived from lifecycle metadata: the
+    # projection/source relationship is feature-local transformation
+    # knowledge, not generic mapping identity.
     frames = {
         "variables": pd.DataFrame([{"variable_id": "v1"}]),
         "variables_view": pd.DataFrame([{"variable_id": "v1", "label": "Rate"}]),
@@ -319,11 +323,7 @@ def test_configure_workbook_view_persists_reverse_mapping_from_explicit_lifecycl
     )
 
     assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
-        {
-            "sheet": "Variables",
-            "frame": "variables_view",
-            "canonical_frame": "variables",
-        }
+        {"sheet": "Variables", "frame": "variables_view"}
     ]
 
 
@@ -368,11 +368,7 @@ def test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves()
     sheet_mappings = out["_meta"]["workbook_view"]["sheet_mappings"]
     assert "variables_audit" not in {entry["frame"] for entry in sheet_mappings}
     assert sheet_mappings == [
-        {
-            "sheet": "Variables",
-            "frame": "variables_view",
-            "canonical_frame": "variables",
-        }
+        {"sheet": "Variables", "frame": "variables_view"}
     ]
 
     mapping = resolve_workbook_view_sheet_mappings(
@@ -385,7 +381,6 @@ def test_omitted_intermediate_frame_is_absent_from_sheet_mappings_and_resolves()
         "Variables": WorkbookViewSheetMapping(
             visible_sheet="Variables",
             logical_frame="variables_view",
-            canonical_frame="variables",
         )
     }
 

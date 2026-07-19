@@ -151,7 +151,6 @@ def test_configured_reimport_roundtrip_across_xlsx_and_ods(tmp_path: Path) -> No
         {
             "sheet": _VISIBLE_SHEET,
             "frame": _MATRIX_FRAME,
-            "canonical_frame": _CANONICAL_FRAME,
         }
     ]
 

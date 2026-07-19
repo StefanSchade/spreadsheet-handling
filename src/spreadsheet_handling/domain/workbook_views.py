@@ -58,7 +58,6 @@ class _SheetSpec:
 class WorkbookViewSheetMapping:
     visible_sheet: str
     logical_frame: str
-    canonical_frame: str | None = None
 
 
 def configure_workbook_view(
@@ -99,7 +98,7 @@ def configure_workbook_view(
             }
             for index, sheet_spec in enumerate(normalized_sheet_specs)
         ],
-        WORKBOOK_VIEW_SHEET_MAPPINGS_KEY: _sheet_mappings(out, normalized_sheet_specs),
+        WORKBOOK_VIEW_SHEET_MAPPINGS_KEY: _sheet_mappings(normalized_sheet_specs),
     }
     if include_debug_frames:
         view["include_debug_frames"] = True
@@ -300,10 +299,9 @@ def resolve_workbook_view_sheet_mappings(
             raw_entry.get("frame"),
             f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}].frame",
         )
-        canonical_frame = _optional_non_empty_string(
-            raw_entry.get("canonical_frame"),
-            f"_meta.workbook_view.{WORKBOOK_VIEW_SHEET_MAPPINGS_KEY}[{index}].canonical_frame",
-        )
+        # Legacy payloads may still carry a derived "canonical_frame" key; it
+        # is ignored on read. The projection/source relationship is
+        # feature-local transformation knowledge, not mapping identity.
         if visible_sheet in mappings:
             raise ValueError(
                 f"Duplicate visible sheet mapping for {visible_sheet!r} in "
@@ -318,7 +316,6 @@ def resolve_workbook_view_sheet_mappings(
         mappings[visible_sheet] = WorkbookViewSheetMapping(
             visible_sheet=visible_sheet,
             logical_frame=logical_frame,
-            canonical_frame=canonical_frame,
         )
 
     visible_sheet_names = _normalize_visible_sheet_names(visible_sheets)
@@ -343,14 +340,6 @@ def resolve_workbook_view_sheet_mappings(
                 raise ValueError(
                     f"Workbook view mapping references unknown logical frame "
                     f"{mapping.logical_frame!r}"
-                )
-            if (
-                mapping.canonical_frame is not None
-                and mapping.canonical_frame not in logical_frame_names
-            ):
-                raise ValueError(
-                    f"Workbook view mapping references unknown canonical frame "
-                    f"{mapping.canonical_frame!r}"
                 )
 
     return mappings
@@ -390,43 +379,15 @@ def apply_workbook_view_sheet_mappings(
     return out
 
 
-def _sheet_mappings(
-    frames: Mapping[str, Any],
-    sheets: list[_SheetSpec],
-) -> list[dict[str, str]]:
-    lifecycle = frame_lifecycle(frames.get("_meta"))
-    mappings: list[dict[str, str]] = []
-    for sheet in sheets:
-        mapping = {
-            "sheet": sheet.sheet,
-            "frame": sheet.frame,
-        }
-        canonical_frame = _explicit_canonical_frame(sheet.frame, lifecycle)
-        if canonical_frame is not None:
-            mapping["canonical_frame"] = canonical_frame
-        mappings.append(mapping)
-    return mappings
+def _sheet_mappings(sheets: list[_SheetSpec]) -> list[dict[str, str]]:
+    """Persist visible-sheet -> logical-frame identity, nothing more.
 
-
-def _explicit_canonical_frame(
-    frame: str,
-    lifecycle: Mapping[str, Any],
-) -> str | None:
-    entry = lifecycle.get(frame)
-    if not isinstance(entry, Mapping):
-        return None
-    if entry.get("canonical") is True:
-        return frame
-
-    derived_from = entry.get("derived_from")
-    if not isinstance(derived_from, list) or len(derived_from) != 1:
-        return None
-
-    canonical_frame = derived_from[0]
-    source_entry = lifecycle.get(canonical_frame)
-    if isinstance(source_entry, Mapping) and source_entry.get("canonical") is True:
-        return str(canonical_frame)
-    return None
+    The mapping deliberately carries no derived ``canonical_frame``: the
+    relationship between a projection and its source frame is feature-local
+    knowledge owned by the transformation family that created the projection,
+    not a generic identity recorded in workbook metadata.
+    """
+    return [{"sheet": sheet.sheet, "frame": sheet.frame} for sheet in sheets]
 
 
 def _workbook_view_mapping(meta: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -491,12 +452,6 @@ def _non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
-
-
-def _optional_non_empty_string(value: Any, field_name: str) -> str | None:
-    if value is None:
-        return None
-    return _non_empty_string(value, field_name)
 
 
 def _string_list(values: Iterable[str], field_name: str) -> list[str]:

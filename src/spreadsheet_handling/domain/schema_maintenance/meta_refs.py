@@ -97,6 +97,13 @@ def is_known_schema_maintenance_root(root_name: str) -> bool:
 
 
 def build_sheet_resolver(meta: Mapping[str, Any], target_frame: str) -> dict[str, SheetResolution]:
+    """Resolve visible sheet names to logical frames for reference maintenance.
+
+    Frame-only resolution: a sheet denotes exactly the frame mapped to it via
+    the ``frame`` key. Legacy derived keys such as ``canonical_frame`` are not
+    resolution candidates; sheet-scoped column references belong to the frame
+    actually rendered on that sheet.
+    """
     resolver: dict[str, SheetResolution] = {target_frame: SheetResolution(frame=target_frame)}
     workbook_view = meta.get("workbook_view")
     if not isinstance(workbook_view, Mapping):
@@ -107,13 +114,13 @@ def build_sheet_resolver(meta: Mapping[str, Any], target_frame: str) -> dict[str
         collected,
         workbook_view.get("sheets"),
         ("sheet",),
-        ("canonical_frame", "frame", "logical_frame"),
+        ("frame",),
     )
     _collect_sheet_candidates(
         collected,
         workbook_view.get("sheet_mappings"),
         ("sheet", "visible_sheet"),
-        ("canonical_frame", "frame", "logical_frame"),
+        ("frame",),
     )
 
     for sheet, frames in collected.items():

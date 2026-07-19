@@ -110,6 +110,34 @@ def test_rename_updates_constraints_column_when_sheet_matches_target_frame() -> 
 
 
 def test_rename_updates_constraints_column_when_sheet_mapping_resolves_target_frame() -> None:
+    # Frame-only routing: a sheet denotes exactly the frame mapped to it via
+    # the "frame" key; sheet-scoped column references belong to the frame
+    # actually rendered on that sheet.
+    frames = _base_frames(
+        {
+            "workbook_view": {
+                "sheet_mappings": [
+                    {"sheet": "Characters", "frame": "characters"}
+                ]
+            },
+            "constraints": [
+                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
+            ],
+        }
+    )
+
+    result = rename_column(frames, _rename())
+
+    assert not result.report.blocked
+    assert result.frames["_meta"]["constraints"][0]["column"] == "display_name"
+
+
+def test_rename_of_other_frame_leaves_sheet_scoped_references_of_mapped_frame() -> None:
+    # Characterization of frame-only routing after canonical_frame removal:
+    # the sheet resolves to the mapped view frame, so renaming a column of a
+    # different frame (the former "canonical" source) neither updates nor
+    # blocks the sheet-scoped reference. A legacy canonical_frame key on the
+    # mapping is ignored and is not a resolution candidate.
     frames = _base_frames(
         {
             "workbook_view": {
@@ -127,10 +155,10 @@ def test_rename_updates_constraints_column_when_sheet_mapping_resolves_target_fr
         }
     )
 
-    result = rename_column(frames, _rename())
+    result = rename_column(frames, _rename(frame="characters"))
 
     assert not result.report.blocked
-    assert result.frames["_meta"]["constraints"][0]["column"] == "display_name"
+    assert result.frames["_meta"]["constraints"][0]["column"] == "name"
 
 
 def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_target_frame() -> None:
@@ -157,6 +185,8 @@ def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_ta
 
 
 def test_rename_blocks_conflicting_workbook_view_sheet_resolution() -> None:
+    # Two explicit frame declarations disagree about which frame the sheet
+    # denotes; resolution is ambiguous and the rename blocks.
     frames = _base_frames(
         {
             "workbook_view": {
@@ -169,7 +199,7 @@ def test_rename_blocks_conflicting_workbook_view_sheet_resolution() -> None:
                 "sheet_mappings": [
                     {
                         "sheet": "Characters",
-                        "canonical_frame": "places",
+                        "frame": "places",
                     }
                 ],
             },
@@ -245,7 +275,7 @@ def test_rename_updates_supported_sheet_helper_and_editable_columns() -> None:
         {
             "workbook_view": {
                 "sheet_mappings": [
-                    {"sheet": "Characters", "canonical_frame": "characters"}
+                    {"sheet": "Characters", "frame": "characters"}
                 ]
             },
             "sheets": {

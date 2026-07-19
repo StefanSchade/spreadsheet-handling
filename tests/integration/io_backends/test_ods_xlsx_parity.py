@@ -465,7 +465,6 @@ def test_workbook_view_reverse_mapping_roundtrips_portably_across_xlsx_and_ods(
         "Editable Variables": WorkbookViewSheetMapping(
             visible_sheet="Editable Variables",
             logical_frame="variables_view",
-            canonical_frame="variables",
         )
     }
 
