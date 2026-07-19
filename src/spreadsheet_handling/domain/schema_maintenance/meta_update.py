@@ -722,7 +722,11 @@ def _handle_xref_crosstable(
     * ``column_keys`` — run-local matrix value-column labels (present only
       in-run or in hand-authored meta);
     * ``dense_axes.rows_from`` / ``columns_from`` ``key``/``keys`` on the
-      configured axis frame.
+      configured axis frame;
+    * ``dense_axes.resolved.column_keys`` — matrix value-column labels from
+      a stored axis snapshot; ``_resolve_dense_axes`` consumes a
+      resolved-only hand-authored configuration as a fallback, so these are
+      real references on the ``matrix`` frame.
 
     Anything else inside the root — including legacy descriptive fields —
     is not a reference and is ignored. The generic key-name convention scan
@@ -767,10 +771,16 @@ def _xref_entry_references(entry: Mapping[str, Any], frame: str, column: str) ->
     if entry.get("matrix") == frame or entry.get("relation") == frame:
         if _in_list(entry.get("row_keys")):
             return True
-    if entry.get("matrix") == frame and _in_list(entry.get("column_keys")):
-        return True
 
     dense = entry.get("dense_axes")
+    if entry.get("matrix") == frame:
+        if _in_list(entry.get("column_keys")):
+            return True
+        if isinstance(dense, Mapping):
+            resolved = dense.get("resolved")
+            if isinstance(resolved, Mapping) and _in_list(resolved.get("column_keys")):
+                return True
+
     if isinstance(dense, Mapping):
         for axis_key in ("rows_from", "columns_from"):
             axis = dense.get(axis_key)

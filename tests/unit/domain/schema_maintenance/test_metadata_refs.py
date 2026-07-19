@@ -540,6 +540,94 @@ class TestXrefCrosstableReferences:
 
         assert not result.report.blocked
 
+    def test_row_key_rename_on_matrix_frame_blocks(self) -> None:
+        # The same row_keys list serves both sides; the matrix side blocks
+        # exactly like the relation side.
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "places",
+                    "matrix": "characters",
+                    "row_keys": ["name"],
+                }
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_dense_axis_keys_plural_rename_on_axis_frame_blocks(self) -> None:
+        meta = self._xref_meta(
+            row_keys=["id"],
+            dense_axes={"rows_from": {"frame": "characters", "keys": ["id", "name"]}},
+        )
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_resolved_column_keys_rename_blocks_on_matrix_frame(self) -> None:
+        # A resolved-only hand-authored snapshot is a consumed fallback
+        # (_resolve_dense_axes), so its column identities are real matrix
+        # references.
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "places",
+                    "matrix": "characters",
+                    "row_keys": ["id"],
+                    "dense_axes": {
+                        "resolved": {"column_keys": ["name"]},
+                    },
+                }
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_resolved_column_keys_drop_blocks_on_matrix_frame(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "places",
+                    "matrix": "characters",
+                    "row_keys": ["id"],
+                    "dense_axes": {
+                        "resolved": {"column_keys": ["name"]},
+                    },
+                }
+            }
+        }
+
+        result = drop_column(_base_frames(meta), _drop(prune=True))
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_resolved_column_keys_on_other_frame_do_not_block(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "characters",
+                    "matrix": "places_matrix",
+                    "row_keys": ["id"],
+                    "dense_axes": {
+                        "resolved": {"column_keys": ["name"]},
+                    },
+                }
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert not result.report.blocked
+
     def test_malformed_xref_root_fails(self) -> None:
         result = rename_column(
             _base_frames({"xref_crosstable": ["not-a-mapping"]}), _rename()
@@ -547,6 +635,25 @@ class TestXrefCrosstableReferences:
 
         assert result.report.blocked
         assert result.report.failures[0].code == "malformed_meta"
+
+    def test_non_mapping_individual_entry_is_tolerated(self) -> None:
+        # Characterization: a non-mapping entry has no valid XRef reference
+        # shape; runtime consumers skip it, and schema maintenance does the
+        # same (tolerant-reader posture) instead of failing the whole root.
+        meta = {
+            "xref_crosstable": {
+                "broken": "not-a-mapping",
+                "valid": {
+                    "relation": "places",
+                    "matrix": "places_matrix",
+                    "row_keys": ["id"],
+                },
+            }
+        }
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert not result.report.blocked
 
 
 def test_derived_does_not_enable_rename_and_is_not_rewritten_as_canonical_metadata() -> None:
