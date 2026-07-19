@@ -1,0 +1,510 @@
+= Implementation Review: XRef Projection-Family Slice
+:revdate: 2026-07-19
+:status: Review complete -- corrections required
+:type: Independent implementation review (Codex)
+:reviewed-commits: 28decf3bcbd71ece8c0930711889c2eece69a6de, f4d8f823c7ad70866b3d33e75eab1752688ee668, 8359698169439b9d291d9b4ddfcf15bbf2175009
+
+== 1. Verdict
+
+[source,text]
+----
+CHANGES REQUIRED
+TWO BLOCKING DEFECT CLASSES FOUND
+----
+
+The metadata reduction is sound: the removed descriptive fields have no live
+reader, the retained fields have concrete feature-local consumers, runtime
+Resolution is stripped at the persistence boundary, producer replacement is
+correct, and Workbook View remains free of XRef semantics. Exact-id lookup and
+the new ambiguity failure also work for the XRef transformation helper's
+current call patterns.
+
+The slice is not complete, however, because `drop_source=True` can still mark a
+source for carrier-neutral deletion when the produced representation is
+mechanically known not to preserve it. The failures are not speculative:
+
+* contraction ignores additional relation columns and nevertheless schedules
+  the relation for deletion;
+* missing and duplicate column identities can pass the guard while producing
+  missing values or non-scalar relation cells; and
+* numeric and string-distinct column identities are not stable across XLSX/ODS
+  headers, so an absent relation is recreated with changed or collided
+  identities.
+
+There are also two important completeness gaps: ambiguity is still silently
+resolved by first-match order in the column-role consumer, and the dedicated
+schema-maintenance handler misses a consumer-supported
+`dense_axes.resolved.column_keys`-only reference.
+
+These findings do not reopen generic lifecycle or Workbook View architecture.
+They are local XRef contract defects.
+
+== 2. Review basis
+
+The following artifacts were read in full before implementation inspection:
+
+* `FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A.adoc`;
+* `FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A_implementation_review.adoc`;
+* `FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A_xref_projection_slice.adoc`.
+
+The complete diffs and surrounding source were inspected for all three exact
+commits. Core and Worldbuilding were clean before review; Core HEAD was exactly
+`8359698`.
+
+== 3. Findings by severity
+
+=== 3.1 Blocking -- contraction can delete unrepresented relation fields
+
+`contract_xref` validates that the configured `row_keys`, `column_key`, and
+`value` exist, but it permits any additional source columns
+(`operation.py:191-201`). The matrix construction represents only row identity,
+column identity, and the selected value (`operation.py:243-268`). The new guard
+checks only whether every *value in the `column_key` field* appears in
+`matrix_cols` (`operation.py:311-330`). It never checks whether every source
+field is represented.
+
+An empirical probe used this valid input:
+
+[source,python]
+----
+pd.DataFrame([
+    {"r": "r1", "c": "A", "v": "x", "note": "keep me"},
+])
+----
+
+Calling `contract_xref(..., row_keys="r", column_key="c", value="v",
+drop_source=True)` succeeded, produced only `['r', 'A']`, and wrote
+`pipeline_cleanup.drop_frames: ['rel']`. The value `note="keep me"` is absent
+from the matrix and the relation is then deleted at final cleanup.
+
+This is the same class of mechanically visible exclusion that the new
+explicit-`column_keys` subset guard rejects. Treating one exclusion as a hard
+conflict and the other as caller judgement is incoherent. Either
+`drop_source=True` must reject relation columns outside
+`row_keys + column_key + value`, or the public contract must gain an equally
+explicit, narrow way to prove/reconstruct them. No generic metadata is needed.
+
+Required regression tests:
+
+* additional relation field + `drop_source=True` fails;
+* the same scoped projection without `drop_source` remains allowed;
+* a minimal relation containing exactly the represented fields still succeeds.
+
+=== 3.2 Blocking -- axis identities are not validated against actual matrix and carrier identity
+
+The guard compares relation values with the pre-construction `matrix_cols` list
+using `_values_equal`, while the actual matrix uses pandas column construction
+and spreadsheet carriers normalize headers. Those identity systems are not
+equivalent.
+
+Confirmed counterexamples:
+
+[cols="2,4", options="header"]
+|===
+| Input | Observed behavior
+
+| Relation `column_key=None`, value `"x"`, `drop_source=True`
+| Guard passes and cleanup is scheduled, but pandas materializes the column as
+  `NaN` and the matrix cell contains `NaN`, not `"x"`. This is in-memory value
+  loss before any carrier runs.
+
+| Relation `column_key=np.nan` or `pd.NA`
+| The guard rejects even when the same missing value appears in `column_keys`,
+  because `_values_equal` cannot equate missing scalars. This is fail-safe but
+  inconsistent with the otherwise accepted flat-label surface and has no
+  targeted diagnostic.
+
+| Explicit `column_keys=['A', 'A']`
+| Contraction succeeds, creates duplicate matrix columns, and schedules source
+  cleanup. A later expansion indexes the duplicate label and emits pandas
+  `Series` objects instead of scalar cell values.
+
+| Matrix input with duplicate `A` columns
+| `expand_xref(drop_source=True)` treats both as covered, emits two rows whose
+  values are the same two-element `Series`, and schedules the matrix for
+  deletion.
+
+| Relation identities `1` and `'1'`
+| In-memory columns are distinct, but both XLSX and ODS reread them as duplicate
+  string headers `'1'`. Expansion then emits duplicate addresses with `Series`
+  values. Numeric-only identities also reread as strings, changing relation
+  identity type.
+|===
+
+A dense-axis probe showed the same carrier problem: persisted
+`dense_axes.columns_from` survived both XLSX and ODS, but relation identities
+`1` and `2` were recreated as strings `'1'` and `'2'`. The retained intent does
+not currently map physical headers back to typed dense-axis identities.
+
+Consequently the new string-only carrier test proves parity for its fixture,
+not the general claim that feature-local intent recreates an absent relation.
+The implementation needs one coherent XRef column-identity contract shared by:
+
+* relation-value normalization;
+* explicit, metadata-derived, and dense-derived `column_keys`;
+* duplicate detection;
+* matrix lookup; and
+* persisted spreadsheet header realization/readback.
+
+At minimum, missing/unhashable/duplicate identities must fail before cleanup is
+recorded. For persisted spreadsheet roundtrip, either restrict the supported
+identity vocabulary to a carrier-stable subset (most simply unique non-empty
+strings), or add a narrow XRef axis-identity mapping that restores typed
+identities. This choice is the one genuine human decision identified by the
+review (Section 12).
+
+Required regression tests:
+
+* `None`, `NaN`, and `pd.NA` column identities;
+* duplicate explicit, metadata-derived, dense-derived, and physical matrix
+  labels;
+* Python and NumPy scalar equality;
+* distinct numeric/string identities (`1` versus `'1'`);
+* numeric-only identities across XLSX and ODS;
+* unusual/unhashable flat values with a deterministic validation error;
+* proof that a valid, unique carrier-stable full projection is still accepted.
+
+=== 3.3 Important -- frame-identity ambiguity still has a first-match consumer
+
+`xref_crosstable.primitives._xref_config` correctly gives exact config id
+precedence and raises when its frame-identity fallback finds multiple entries.
+`sparse_defaults._xref_column_keys_for_frame` independently has the same
+ambiguity guard.
+
+`domain.column_roles.resolver::_row_keys_from_xref_meta`, however, iterates
+entries and returns the first whose `matrix` matches. Two entries for the same
+matrix with different `row_keys` therefore select row identity by insertion
+order. That decision drives `project_by_role` and role-targeted validation, so
+it is a concrete operational consumer, not inert sediment.
+
+The release note and registry wording broadly state that frame-name intent
+lookup fails on ambiguity. That statement is currently too broad. Make the
+column-role consumer fail on multiple matching entries (unless an explicit
+role override is provided), or narrow the documented claim explicitly to
+XRef transformation lookup. The safer family-local behavior is consistent
+ambiguity failure.
+
+The new exact-id test is also weak: it only asserts that an output frame exists,
+while both candidate entries contain no field that changes the output. Strengthen
+it with distinct `column_keys` or dense intent and assert that the exact entry's
+payload was actually used. Add matrix-side ambiguity and malformed/partial
+entry cases. No live caller passes both `relation` and `matrix` to
+`_xref_config`; its OR-union behavior for that unused combination fails safely
+as ambiguity and is not a current defect.
+
+=== 3.4 Important -- schema maintenance misses a consumed Resolution reference
+
+The dedicated XRef handler correctly blocks:
+
+* `row_keys` on both `relation` and `matrix` frames;
+* top-level `column_keys` on the matrix; and
+* `dense_axes.rows_from` / `columns_from` `key` and `keys` on the named axis
+  frame.
+
+It correctly avoids the generic convention scanner, so fabricated
+`frame + value_column` shapes and removed descriptive fields do not create
+false positives.
+
+The handler does not inspect `dense_axes.resolved.column_keys`
+(`meta_update.py:763-781`). `_resolve_dense_axes` accepts that list as a
+same-run fallback when no `columns_from` frame is available, including the
+explicitly documented hand-authored-meta path. A probe with a
+`resolved.column_keys=['name']`-only entry allowed `characters.name` to be
+renamed without blocking. A later contract can still consume the stale
+`'name'` identity. Producer-generated entries normally mirror the values at
+top-level `column_keys`, which masks the gap in current tests, but the consumer
+supports the narrower shape and therefore makes it a real reference.
+
+Either block matrix rename/drop on `dense_axes.resolved.column_keys`, or reject
+resolved-only hand-authored configurations so there is no consumer contract to
+maintain. The first is the smaller compatibility-preserving fix.
+
+Non-mapping individual XRef entries are currently ignored while a non-mapping
+root fails `malformed_meta`. This is safe under the tolerant-reader posture:
+such an entry has no valid XRef reference shape and all runtime consumers also
+ignore it. Add a characterization test so the choice is explicit. Mapping
+entries with real partial references are already detected.
+
+=== 3.5 Minor -- one live boundary docstring still calls removed fields Intent
+
+`pipeline.persistence_boundary::_project_xref_crosstable` correctly strips
+`column_keys` and `dense_axes.resolved` and intentionally passes legacy fields
+through. Its docstring still lists `operation`, `column_key`, `value`, and
+`drop_empty` as "Intent fields" (`persistence_boundary.py:191-193`). That
+contradicts the new registry and slice record. Rewrite the docstring to say
+that current minimal intent is preserved and unknown/legacy fields pass through
+unchanged for tolerant compatibility.
+
+== 4. Field-by-field consumer validation
+
+[cols="2,2,5", options="header"]
+|===
+| Field | Verdict | Evidence
+
+| `operation`
+| safe to stop producing
+| No live XRef reader. It was descriptive only. Other feature families have
+  unrelated fields with the same leaf name.
+
+| `column_key`
+| safe to stop producing
+| No metadata reader. Forward/inverse field names come from explicit step
+  configuration; the corrected User Guide now says so.
+
+| `value`
+| safe to stop producing
+| Same as `column_key`; no hidden renderer, Workbook View, compact, or inverse
+  consumer was found.
+
+| `drop_empty`
+| safe to stop producing
+| No metadata reader. Empty-cell policy is explicit on `expand_xref` and on
+  composed feature-local steps.
+
+| `relation`, `matrix`
+| retain
+| XRef frame-identity discovery; matrix identity in column-role and sparse
+  default consumers; schema reference ownership. They may legitimately name
+  a cleanup-removed side.
+
+| `row_keys`
+| retain
+| Column-role row-identity resolution and schema-maintenance blocking. The
+  ambiguity gap in Finding 3.3 must be fixed.
+
+| `dense_axes.rows_from` / `columns_from`
+| retain and persist
+| `_dense_axes_from_config_or_meta` and `_resolve_dense_axes` re-resolve axes
+  from concrete source frames; schema maintenance handles `key` and `keys`.
+
+| top-level `column_keys`
+| retain run-locally, strip at boundary
+| Same-run contraction reuses it and `sparse_collapse` uses it to select matrix
+  value columns. Boundary unit/architecture tests prove it is stripped without
+  mutating the input.
+
+| `dense_axes.resolved`
+| retain run-locally, strip at boundary
+| `_resolve_dense_axes` consumes stored row/column snapshots when axis frames
+  are absent. The existing stored-axis test is behaviorally meaningful. Schema
+  handling is incomplete for resolved-only column identities (Finding 3.4).
+|===
+
+The producer replacement rule is correct. `_write_xref_meta` replaces the
+entire entry at the same config id, so legacy fields disappear when that id is
+rewritten. A probe confirmed that the input was not mutated, the rewritten
+entry contained only the new payload, and a differently keyed untouched legacy
+entry retained its old fields through persistence. The latter is accepted
+legacy sediment, assigned to the already deferred metadata-pileup work.
+
+== 5. Forward and inverse assessment
+
+For unique, non-empty string column identities and the declared three-field
+relation shape, forward and inverse behavior remains correct. Both directions
+write symmetrical minimal runtime intent; the boundary reduces it to
+`relation`, `matrix`, `row_keys`, and durable dense-axis source intent.
+
+Exact transform id precedence works before fallback and malformed non-mapping
+entries are skipped. Multiple relation-side matches fail. Multiple matrix-side
+matches follow the same implementation branch, although a direct
+characterization test is missing. Partial exact mappings are authoritative and
+may suppress fallback; current consumers then fall back locally to relation
+data when the expected facet is absent. That is deterministic and compatible
+with exact-id precedence.
+
+The forward/inverse claim is not carrier-general until Finding 3.2 is resolved.
+
+== 6. Losslessness-guard assessment
+
+=== Contraction
+
+The new subset check correctly rejects a relation column-axis value omitted by
+explicit or stale metadata-derived `column_keys`. Dense-axis out-of-domain
+values were already rejected. Valid full string projections continue to pass.
+
+It is insufficient for additional relation fields, missing identities,
+duplicate identities, unhashable identities, and carrier-normalized identity
+collisions (Findings 3.1 and 3.2).
+
+=== Expansion
+
+An explicit `value_columns` subset plus `drop_source=True` correctly fails if
+another non-row-key matrix column remains. With no explicit subset, every
+non-row-key column is, by the primitive's current contract, a value column.
+Workbook helper/technical columns must therefore be removed by their owning
+projection step (as Worldbuilding does with inbound `project_by_role`) or made
+explicit; XRef must not infer helper semantics from Workbook View. This is
+coherent and does not introduce a layering violation.
+
+Duplicate physical matrix labels are not scalar value columns in practice and
+must be rejected. The current iteration returns a Series for each duplicate
+label (Finding 3.2).
+
+`drop_empty=True` deliberately means "empty cell means no relation." Empty-only
+columns can therefore disappear after Resolution is stripped unless durable
+dense column intent is present. This limitation is explicit in the User Guide
+and the sparse/dense-axis model. It is accepted as feature-local caller
+judgement, not a reason to persist `drop_empty` or Resolution. A strict
+shape-preserving caller uses `drop_empty=False` or durable dense axes.
+
+== 7. Schema-maintenance assessment
+
+Frame-only routing is unaffected. The XRef root is now supported by a dedicated
+handler and no longer receives generic key-name inference. The change is a
+material improvement: real persisted and normal runtime references block,
+while fabricated convention shapes and legacy descriptive fields do not.
+
+`row_keys` should block on both relation and matrix because the same list names
+columns present on both representations and a one-sided metadata rewrite would
+be false. Top-level `column_keys` correctly belongs to the matrix. Dense source
+`key` and `keys` are handled for both axes. Root malformation fails; individual
+non-mapping entry tolerance is safe but untested. Finding 3.4 is the remaining
+real-reference gap.
+
+== 8. Carrier and persistence assessment
+
+The persistence boundary is carrier-neutral and executes before JSON/YAML/XML
+and spreadsheet backends. It strips both Resolution facets for every carrier.
+The new XLSX/ODS integration test proves identical minimal intent and successful
+absent-relation recreation for the shipped string-key fixture. Worldbuilding's
+two-carrier export, physical reorder, reimport, and semantic comparison also
+pass.
+
+The test does not establish typed column-axis parity. Both spreadsheet carriers
+stringify headers, producing the counterexamples in Finding 3.2. This is a
+feature-local XRef identity issue, not a reason to retain runtime Resolution in
+all persisted metadata.
+
+Workbook View contains no XRef branch, and none of the reviewed commits changes
+Workbook View or rendering. Its only adjacent role is its own frame-to-sheet
+and helper-column projection, consumed independently by column-role resolution.
+
+== 9. Compatibility assessment
+
+* Removed producer fields: compatible with all live consumers; legacy fields
+  remain tolerated and pass through untouched entries.
+* Entry replacement: a rewritten id loses obsolete legacy fields as intended;
+  untouched ids remain accepted sediment.
+* Ambiguity: XRef transformation fallback and sparse-default targeting now fail
+  instead of selecting the first entry. Column-role lookup still needs the same
+  policy (Finding 3.3).
+* `drop_source`: newly rejects explicit column-axis/value-column subsets, but
+  still accepts other mechanically lossy cases (Findings 3.1/3.2).
+* Schema maintenance: blocks real row-key, matrix-column, and dense-source-key
+  changes that previously dangled; fabricated convention shapes no longer
+  block. Resolution-only matrix columns remain uncovered.
+* Consumer YAML: Core registry configuration and Worldbuilding pass explicit
+  `column_key`, `value`, and `drop_empty`; none depended on those values being
+  recovered from metadata. No consumer YAML reads removed fields.
+* Worldbuilding: XLSX and ODS behavior is unchanged and green. Its inbound
+  `project_by_role` removes helper columns before XRef expansion.
+
+== 10. Test assessment and commands
+
+Existing positive coverage is substantial but concentrated on unique string
+identities and producer-normal forms.
+
+[source,text]
+----
+.venv/bin/pytest <13 focused XRef/schema/persistence/carrier/registry files>
+    194 passed
+
+.venv/bin/pytest
+    1505 passed, 1 xfailed
+
+.venv/bin/ruff check src
+    All checks passed!
+
+.venv/bin/ruff check <all Python files changed by the three commits>
+    All checks passed!
+
+make -C ../worldbuilding test-workbook-view
+    Ran 2 tests in 5.961s -- OK
+    XLSX and ODS: reimport matches canonical data after normalization
+----
+
+A repository-wide `ruff check src tests` also reported 26 pre-existing test
+lint findings in unrelated files; none is in a file changed by this slice.
+No review probe modified either worktree.
+
+Tests to add before acceptance:
+
+. extra relation fields with and without `drop_source`;
+. duplicate/missing/unhashable/NumPy/mixed numeric-string identities from all
+  three column-key sources;
+. duplicate physical matrix columns in `expand_xref`;
+. typed identity XLSX/ODS roundtrip or explicit rejection according to the
+  chosen contract;
+. exact-id selection with observably different candidate payloads;
+. matrix-side ambiguity and column-role ambiguity;
+. legacy same-id replacement and untouched-entry sediment;
+. schema matrix-side `row_keys`, both dense `keys` forms,
+  `dense_axes.resolved.column_keys`, drop as well as rename, and malformed
+  entry characterization;
+. input non-mutation for both XRef operations and schema handling.
+
+== 11. Accepted limitations and non-findings
+
+* `drop_empty=True` shape loss without durable dense-axis intent is documented
+  feature semantics (Section 6), not hidden ontology.
+* Untouched legacy XRef entries may retain removed descriptive fields; generic
+  pileup tooling remains deferred.
+* The compact-composed temporary relation name in XRef metadata remains owned
+  by the next family slice.
+* YAML `name` / transform-id ergonomics remain deferred.
+* The side-effecting-writer layering refactor, metadata-pileup framework, M:N
+  Workbook View, named ranges, and generic audit history remain out of scope.
+* No generic lifecycle, canonicality, provenance, precedence, or new metadata
+  ontology was introduced.
+
+== 12. Blockers and human decision
+
+Blockers before this XRef slice is accepted:
+
+. close the contraction/expansion mechanical-loss gaps in Findings 3.1 and
+  3.2;
+. define and enforce one matrix column-identity equality/normalization contract
+  across in-memory construction and persisted spreadsheet headers;
+. add adversarial tests proving the guards reject lossy cases without rejecting
+  valid full projections.
+
+One genuinely new human decision is required: choose whether persisted XRef
+column identities are restricted to unique non-empty carrier-stable strings,
+or whether a narrow feature-local mapping must preserve typed column identities
+across spreadsheet headers. The current API accepts arbitrary flat scalar
+labels, while actual XLSX/ODS behavior stringifies them; implementation alone
+cannot honestly select one compatibility contract.
+
+No human decision is needed for additional relation fields, duplicate physical
+columns, consistent ambiguity failure, or the missing schema reference: those
+are deterministic local corrections under the already accepted architecture.
+
+== 13. Commit-by-commit assessment
+
+`28decf3` -- *partially accepted; corrections required*::
+The minimal metadata writes, Resolution retention/stripping, same-id
+replacement, and XRef helper ambiguity behavior are correct. The losslessness
+guards and their tests are incomplete (Findings 3.1/3.2), and ambiguity
+hardening did not reach the column-role consumer (Finding 3.3).
+
+`f4d8f82` -- *accepted with one important correction*::
+Dedicated real-reference schema handling is the right design and removes false
+generic-convention behavior. Add the consumed resolved-only matrix reference
+and characterize malformed entries (Finding 3.4).
+
+`8359698` -- *mostly accurate, but overstates completion*::
+Registry and user-facing documentation correctly describe minimal intent,
+legacy sediment, explicit parameters, and standard string-key behavior.
+Broader ambiguity and cross-carrier recreation claims need qualification until
+the findings are fixed. Correct the stale persistence-boundary docstring.
+
+== 14. Readiness for `compact_multiaxis`
+
+Not ready to declare the XRef family slice complete or use it as the settled
+foundation for the `compact_multiaxis` family slice. Fix the two blocking
+defect classes and choose the typed column-identity contract first. The compact
+slice may then rely on a validated XRef primitive rather than inheriting
+duplicate/missing/header-normalization ambiguity.
+
+Do not expand that correction into generic metadata-pileup tooling, Workbook
+View changes, or the side-effecting-writer layering refactor.
