@@ -53,6 +53,48 @@ def _ensure_flat_axis_labels(values: Iterable[Any], field_name: str) -> None:
         )
 
 
+def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
+    """Reject duplicate physical column labels with a contract diagnostic.
+
+    Duplicate labels make positional indexing non-scalar (``row[label]``
+    yields a ``Series``), so any duplicated physical field would corrupt
+    cell values silently. Equality-based detection deliberately avoids
+    hashing so unusual labels still get the XRef diagnostic instead of a
+    raw pandas ``TypeError``.
+    """
+    duplicates: list[Any] = []
+    seen: list[Any] = []
+    for label in df.columns.tolist():
+        if any(_values_equal(label, existing) for existing in seen):
+            if not any(_values_equal(label, existing) for existing in duplicates):
+                duplicates.append(label)
+        else:
+            seen.append(label)
+    if duplicates:
+        raise ValueError(
+            f"Frame {frame_name!r} has duplicate physical column label(s) "
+            f"{duplicates!r}; duplicate columns cannot be addressed as "
+            "scalar fields"
+        )
+
+
+def _ensure_unique_field_list(values: Iterable[Any], field_name: str) -> None:
+    """Reject duplicate entries in a configured field list (e.g. row_keys)."""
+    duplicates: list[Any] = []
+    seen: list[Any] = []
+    for value in values:
+        if any(_values_equal(value, existing) for existing in seen):
+            if not any(_values_equal(value, existing) for existing in duplicates):
+                duplicates.append(value)
+        else:
+            seen.append(value)
+    if duplicates:
+        raise ValueError(
+            f"{field_name} contains duplicate field(s) {duplicates!r}; "
+            "configured fields must be unique"
+        )
+
+
 def _ensure_column_identity_values(values: Iterable[Any], source_label: str) -> None:
     """Enforce the carrier-stable XRef column-identity contract on values.
 

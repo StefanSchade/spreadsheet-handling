@@ -15,6 +15,7 @@ from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values
 
 from .primitives import (
     _as_list,
+    _ensure_column_identity_values,
     _ensure_columns,
     _ensure_flat_axis_labels,
     _ordered_values_equal,
@@ -197,16 +198,19 @@ def _column_keys_from_axis_source(
     key = axis_keys[0]
     _ensure_columns(source, [key], frame_name=str(config["frame"]), field_name="dense column axis")
 
+    plain_values = [_plain_axis_value(raw) for raw in source[key].tolist()]
+    # Live dense column identities become matrix headers: enforce the
+    # carrier-stable contract before any hash-based duplicate detection so
+    # unhashable/numeric/missing values get the XRef diagnostic instead of
+    # a raw set() TypeError.
+    _ensure_column_identity_values(
+        plain_values,
+        f"Dense column-axis frame {config['frame']!r} key {key!r} values",
+    )
+
     columns: list[Any] = []
     seen: set[Any] = set()
-    for row_number, raw_value in enumerate(source[key].tolist(), start=1):
-        value = _plain_axis_value(raw_value)
-        _ensure_non_empty_axis_identity(
-            (value,),
-            frame_name=str(config["frame"]),
-            field_name="dense column axis",
-            row_number=row_number,
-        )
+    for value in plain_values:
         if value in seen:
             raise ValueError(
                 f"Dense column-axis frame {config['frame']!r} contains duplicate key {value!r}"

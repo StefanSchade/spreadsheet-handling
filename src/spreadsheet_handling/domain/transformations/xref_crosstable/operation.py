@@ -27,6 +27,8 @@ from .primitives import (
     _ensure_column_identity_values,
     _ensure_columns,
     _ensure_flat_axis_labels,
+    _ensure_unique_field_list,
+    _ensure_unique_physical_labels,
     _ordered_values_equal,
     _require_frame,
     _xref_config,
@@ -71,15 +73,17 @@ def expand_xref(
     if drop_source and matrix == output:
         raise ValueError("drop_source requires a distinct output frame")
     source = _require_frame(frames, matrix)
-    duplicated_labels = source.columns[source.columns.duplicated()].tolist()
-    if duplicated_labels:
-        raise ValueError(
-            f"Frame {matrix!r} has duplicate column label(s) "
-            f"{duplicated_labels!r}; duplicate physical matrix columns "
-            "cannot be expanded (cell addressing would be non-scalar)"
-        )
+    # Every physical matrix label is a spreadsheet header of the roundtrip
+    # artifact: enforce the carrier-stable contract (unique, non-empty
+    # strings) on the whole physical header row before any pandas hashing
+    # or selection, so unhashable/numeric/missing/duplicate labels get the
+    # XRef diagnostic instead of raw pandas behavior.
+    _ensure_column_identity_list(
+        source.columns.tolist(), f"Frame {matrix!r} physical column labels"
+    )
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
+    _ensure_unique_field_list(row_key_cols, "row_keys")
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
 
@@ -88,6 +92,12 @@ def expand_xref(
         if value_columns is not None
         else [col for col in source.columns if col not in row_key_cols]
     )
+    row_key_overlap = [col for col in value_cols if col in row_key_cols]
+    if row_key_overlap:
+        raise ValueError(
+            f"value_columns must not overlap row_keys: {row_key_overlap!r}; "
+            "a row-identity field cannot also be a value column"
+        )
     # Expanded labels become relation column-identity values: enforce the
     # carrier-stable contract (unique, non-empty strings) on the physical
     # matrix labels selected for expansion.
@@ -124,11 +134,19 @@ def expand_xref(
 
     if base_relation is not None:
         base_frame = _require_frame(frames, base_relation)
+        _ensure_unique_physical_labels(base_frame, frame_name=base_relation)
         _ensure_columns(
             base_frame,
             [*row_key_cols, column_key, value],
             frame_name=base_relation,
             field_name="row_keys/column_key/value",
+        )
+        # Out-of-scope rows join the output relation: their column
+        # identities must satisfy the same carrier-stable contract as the
+        # expanded matrix labels.
+        _ensure_column_identity_values(
+            base_frame[column_key].tolist(),
+            f"Frame {base_relation!r} column_key {column_key!r} values",
         )
         for _, base_row in base_frame.iterrows():
             base_addr = (
@@ -212,8 +230,12 @@ def contract_xref(
     if drop_source and relation == output:
         raise ValueError("drop_source requires a distinct output frame")
     source = _require_frame(frames, relation)
+    # Duplicate physical relation labels make row[field] indexing
+    # non-scalar; reject before any selection, metadata, or cleanup write.
+    _ensure_unique_physical_labels(source, frame_name=relation)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
+    _ensure_unique_field_list(row_key_cols, "row_keys")
     _ensure_columns(
         source,
         [*row_key_cols, column_key, value],

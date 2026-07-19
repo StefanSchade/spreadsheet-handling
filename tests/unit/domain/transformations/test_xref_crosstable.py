@@ -1627,7 +1627,7 @@ class TestCarrierStableColumnIdentityContract:
             [["p1", "x", "y"]], columns=["product", "A", "A"]
         )
 
-        with pytest.raises(ValueError, match="duplicate column label"):
+        with pytest.raises(ValueError, match="duplicate column identit"):
             expand_xref(
                 {"matrix": matrix},
                 matrix="matrix",
@@ -1713,3 +1713,312 @@ class TestDropSourceUnrepresentedFields:
         )
 
         assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["relations"]
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestDuplicateAndOverlappingDeclarations:
+    """Duplicate/overlapping field declarations fail before any output.
+
+    Every rejection proves that no cleanup command was written and the
+    input metadata was not touched.
+    """
+
+    @staticmethod
+    def _assert_no_cleanup(frames: dict) -> None:
+        meta = frames.get("_meta") or {}
+        assert "pipeline_cleanup" not in meta
+
+    def test_duplicate_configured_row_keys_fail_contraction(self) -> None:
+        frames = {
+            "rel": pd.DataFrame([{"r": "r1", "k": "A", "v": "x"}])
+        }
+
+        with pytest.raises(ValueError, match="duplicate field"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys=["r", "r"],
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_duplicate_configured_row_keys_fail_expansion(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}])
+        }
+
+        with pytest.raises(ValueError, match="duplicate field"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys=["r", "r"],
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_duplicate_physical_relation_value_labels_fail(self) -> None:
+        frames = {
+            "rel": pd.DataFrame(
+                [["r1", "A", "x", "y"]], columns=["r", "k", "v", "v"]
+            )
+        }
+
+        with pytest.raises(ValueError, match="duplicate physical column label"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_duplicate_physical_relation_row_key_labels_fail_deterministically(
+        self,
+    ) -> None:
+        # Previously reached _ensure_unique_pairs and died with a raw
+        # pandas TypeError: unhashable type: 'Series'.
+        frames = {
+            "rel": pd.DataFrame(
+                [["r1", "r1", "A", "x"]], columns=["r", "r", "k", "v"]
+            )
+        }
+
+        with pytest.raises(ValueError, match="duplicate physical column label"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_value_columns_overlapping_row_keys_fail_expansion(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}])
+        }
+
+        with pytest.raises(ValueError, match="must not overlap row_keys"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                value_columns=["r", "A"],
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_inferred_expansion_still_treats_non_row_key_columns_as_values(
+        self,
+    ) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x", "B": "y"}])
+        }
+
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="rel",
+            row_keys="r",
+            column_key="k",
+            value="v",
+            drop_source=True,
+        )
+
+        assert sorted(out["rel"]["k"].tolist()) == ["A", "B"]
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["matrix"]
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestIdentitySourcesValidatedBeforePandas:
+    """All identity sources get XRef diagnostics before hash/pandas ops."""
+
+    @staticmethod
+    def _assert_no_cleanup(frames: dict) -> None:
+        meta = frames.get("_meta") or {}
+        assert "pipeline_cleanup" not in meta
+
+    def test_numeric_scoped_base_relation_identity_fails(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame([{"r": "r9", "k": 1, "v": "kept"}]),
+        }
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                base_relation="base",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_valid_scoped_base_relation_identities_pass(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame([{"r": "r9", "k": "B", "v": "kept"}]),
+        }
+
+        out = expand_xref(
+            frames,
+            matrix="matrix",
+            output="rel",
+            row_keys="r",
+            column_key="k",
+            value="v",
+            base_relation="base",
+            drop_source=True,
+        )
+
+        assert {"A", "B"} == set(out["rel"]["k"].tolist())
+        assert out["_meta"]["pipeline_cleanup"]["drop_frames"] == ["matrix"]
+
+    def test_duplicate_base_relation_labels_fail(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame(
+                [["r9", "B", "kept", "extra"]], columns=["r", "k", "v", "v"]
+            ),
+        }
+
+        with pytest.raises(ValueError, match="duplicate physical column label"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                base_relation="base",
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_unhashable_live_dense_identity_gets_contract_diagnostic(self) -> None:
+        frames = {
+            "contexts": pd.DataFrame({"context_id": [["list"], "default"]}),
+            "values": pd.DataFrame(
+                [{"r": "r1", "context_id": "default", "text": "Hello"}]
+            ),
+        }
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            contract_xref(
+                frames,
+                relation="values",
+                output="matrix",
+                row_keys=["r"],
+                column_key="context_id",
+                value="text",
+                dense_axes={
+                    "columns_from": {"frame": "contexts", "key": "context_id"},
+                },
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_unhashable_physical_matrix_label_gets_contract_diagnostic(self) -> None:
+        # A list label is unhashable and previously died in pandas
+        # duplicate detection with a raw TypeError. (Tuple labels are
+        # rejected even earlier by the flat-columns frame check.)
+        matrix = pd.DataFrame([["r1", "x"]], columns=pd.Index(["r", ["li", "st"]], dtype=object))
+        frames = {"matrix": matrix}
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_input_metadata_is_not_mutated_on_success(self) -> None:
+        import copy
+
+        meta = {"xref_crosstable": {"old": {"relation": "other", "matrix": "m2"}}}
+        frames = {
+            "rel": pd.DataFrame([{"r": "r1", "k": "A", "v": "x"}]),
+            "_meta": meta,
+        }
+        snapshot = copy.deepcopy(meta)
+
+        contract_xref(
+            frames,
+            relation="rel",
+            output="matrix",
+            row_keys="r",
+            column_key="k",
+            value="v",
+            name="fresh",
+        )
+
+        assert frames["_meta"] == snapshot
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestProducerReplacementAndLegacySediment:
+    """Same-id rewrites replace the whole entry; untouched ids survive."""
+
+    def test_same_id_rewrite_drops_legacy_descriptive_fields(self) -> None:
+        frames = {
+            "rel": pd.DataFrame([{"r": "r1", "k": "A", "v": "x"}]),
+            "_meta": {
+                "xref_crosstable": {
+                    "rel": {
+                        "relation": "rel",
+                        "matrix": "matrix",
+                        "operation": "contract_xref",
+                        "column_key": "k",
+                        "value": "v",
+                        "drop_empty": True,
+                    },
+                    "untouched": {
+                        "relation": "other_rel",
+                        "matrix": "other_matrix",
+                        "operation": "legacy",
+                    },
+                }
+            },
+        }
+
+        out = contract_xref(
+            frames,
+            relation="rel",
+            output="matrix",
+            row_keys="r",
+            column_key="k",
+            value="v",
+        )
+
+        rewritten = out["_meta"]["xref_crosstable"]["rel"]
+        assert "operation" not in rewritten
+        assert "column_key" not in rewritten
+        assert "value" not in rewritten
+        assert "drop_empty" not in rewritten
+        assert rewritten["row_keys"] == ["r"]
+        assert out["_meta"]["xref_crosstable"]["untouched"] == {
+            "relation": "other_rel",
+            "matrix": "other_matrix",
+            "operation": "legacy",
+        }
