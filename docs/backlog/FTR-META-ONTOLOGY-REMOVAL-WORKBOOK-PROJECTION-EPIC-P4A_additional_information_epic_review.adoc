@@ -1,0 +1,858 @@
+= Architecture Impact and Falsification Review: FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A
+:revdate: 2026-07-18
+:status: Review complete
+:type: Pre-implementation architecture review (Fable)
+:reviewed-commit: 6426a8d3d4c174e71df9161a8959c4822f3d017c
+
+== Review basis and method
+
+Reviewed documents:
+
+* `docs/backlog/FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A.adoc`
+* `docs/backlog/FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A_additional_information.adoc`
+
+Evidence sources: `core` source tree, unit/integration/roundtrip/architecture
+tests, `registries/meta_registry.yaml`, `registries/pipeline_step_registry.json`,
+technical/semantic/functional model chapters, user guide, release notes, and the
+external consumer repositories `../worldbuilding` (dino_insel pipelines and
+plugins) and `../demo` (acme and demo pipelines).
+
+Validation commands used during the review (all repository-read-only):
+
+[source,text]
+----
+grep -rn "DEFAULT_OMIT_ROLES\|DEFAULT_INCLUDE_ROLES" src tests
+grep -rln "frame_lifecycle" src tests registries docs
+grep -rln "drop_redundant_data\|include_roles\|omit_roles\|unknown_frame_policy\|include_debug_frames\|include_omit_by_default" src tests docs ../worldbuilding ../demo
+.venv/bin/pytest tests/unit/rendering/test_frame_selection.py \
+  tests/unit/domain/test_workbook_views.py \
+  tests/unit/pipeline/test_persistence_boundary.py \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py -q
+  # result: 57 passed
+----
+
+No repository files other than this review artifact were created or modified.
+
+== 1. Executive conclusion
+
+The target model is *supported with amendments*. The repository is already much
+closer to the target architecture than the epic's problem statement implies:
+
+* The explicit Workbook View branch
+  (`workbook_view.sheets` in
+  `src/spreadsheet_handling/rendering/frame_selection.py::_select_configured_sheets`)
+  already implements authoritative, ontology-free artifact projection with
+  missing-frame and duplicate-target failure. Every real consumer pipeline uses
+  this branch.
+* The no-Workbook-View default already is the epic's target: without
+  `workbook_view` in `_meta`, `select_render_frames` returns all frames and
+  `compose_workbook` maps each frame to a same-named worksheet.
+* The lifecycle-ontology selection branch (`_should_render_frame`,
+  `DEFAULT_OMIT_ROLES`, `DEFAULT_INCLUDE_ROLES`, `mode`, `drop_redundant_data`,
+  `include_roles`, `omit_roles`, `include_debug_frames`,
+  `include_omit_by_default`, `unknown_frame_policy`) is reachable only when
+  `_meta.workbook_view` exists *without* a `sheets` list. No shipped producer,
+  example, consumer pipeline, or documented user-guide surface creates that
+  state. It is exercised exclusively by hand-built meta in unit tests.
+* There is no generic carrier-neutral frame cleanup in core. The one real
+  consumer that needs it (`worldbuilding` dino_insel reverse pipeline)
+  implements it as a private plugin
+  (`worldbuilding/plugins/frame_sets.py::keep_frames`) — direct evidence that
+  the epic's Responsibility 2 fills a real, currently consumer-patched gap.
+
+The amendments (Section 12) concern four evidence-backed corrections, none of
+which invalidates the target model:
+
+. Cleanup directives must be contributable by the *pipeline builder* as well as
+  by transformations, because in the flagship pipeline most redundant
+  intermediates are produced by generic steps (`join_frames`, `extract_frame`,
+  `expand_xref`) that cannot know their outputs are intermediate.
+. "Fail on contradictory retained references" must be scoped narrowly:
+  transformation intent metadata (`xref_crosstable.*`, `compact_multiaxis.*`,
+  `split_by_discriminator.*`) legitimately references frames that are absent
+  from the persisted state and *must survive* cleanup, because inverse
+  transformations need it to re-create those frames.
+. Cleanup directives must be *consumed* (removed from `_meta`) when executed,
+  because `_meta` roundtrips through the workbook blob carrier and stale
+  directives would otherwise re-trigger drops in reverse pipelines.
+. The reverse-mapping field `sheet_mappings[*].canonical_frame` is currently
+  *derived from* lifecycle ontology (`canonical: true` + singleton
+  `derived_from`); removing lifecycle producers wholesale without an explicit
+  replacement would silently degrade reimport mapping metadata.
+
+== 2. Verdict category
+
+Target model *supported with amendments* (see Sections 5 and 12 for the
+amendments; final verdict statement in Section 16).
+
+== 3. Confirmed current architecture
+
+=== 3.1 Selection path (spreadsheet only)
+
+`select_render_frames(frames, meta)` in
+`src/spreadsheet_handling/rendering/frame_selection.py` has exactly three
+branches:
+
+. *No `workbook_view` mapping in meta* → returns `dict(frames)` unchanged
+  (line 26–28). Combined with
+  `rendering/composer/layout_composer.py::compose_workbook` ("naive
+  1-table-per-sheet IR", line 256–296), this is already the epic's target
+  default: every remaining frame becomes one same-named worksheet; `_meta` is
+  excluded via `RESERVED_FRAME_KEYS` and persisted as the hidden `_meta` sheet
+  by `MetaPass`.
+. *`workbook_view.sheets` present* → `_select_configured_sheets` is
+  authoritative: only listed frames are materialized, in declared order, under
+  declared sheet names; missing frames raise `KeyError`, duplicate sheet names
+  raise `ValueError`, reserved names are rejected, and
+  `LookupFormulaSpec.lookup_sheet` references are rewritten from frame names to
+  physical sheet names (`_resolve_formula_sheet_names`). Lifecycle metadata is
+  *entirely ignored* in this branch.
+. *`workbook_view` present without `sheets`* → the ontology branch
+  `_should_render_frame` interprets `frame_lifecycle.<frame>.render`
+  (`never`, `debug_only`, `omit_by_default`), `role` against
+  `DEFAULT_OMIT_ROLES = {"intermediate", "redundant", "system"}` and
+  `DEFAULT_INCLUDE_ROLES`, plus the view-level knobs `mode`,
+  `drop_redundant_data`, `include_roles`, `omit_roles`, `include_debug_frames`,
+  `include_omit_by_default`, and `unknown_frame_policy`.
+
+The only call site is
+`src/spreadsheet_handling/io_backends/spreadsheet_contract.py::build_spreadsheet_render_plan`,
+used exclusively by the XLSX backend
+(`io_backends/xlsx/xlsx_backend.py:39`) and ODS backend
+(`io_backends/ods/ods_backend.py:36`). *Render selection is not used outside
+spreadsheet rendering.* JSON, YAML, XML, and CSV backends persist every frame
+plus the `_meta.yaml` sidecar (e.g. `io_backends/json_backend.py:126–153`).
+
+=== 3.2 The ontology branch is dead in every produced flow
+
+`domain/workbook_views.py::configure_workbook_view` — the only shipped producer
+of `_meta.workbook_view` — *always* writes the explicit `sheets` list
+(line 90–103). Because branch 2 above short-circuits before any lifecycle
+lookup, the `mode`, `drop_redundant_data`, and `unknown_frame_policy` values
+that `configure_workbook_view` simultaneously writes are never read back by the
+renderer in the flow that produced them. Observable inconsistency:
+`configure_workbook_view` defaults `unknown_frame_policy="fail"` while
+`frame_selection._unknown_frame_decision` defaults `"visible"` — the divergence
+is invisible today precisely because the field is dead in the produced flow.
+
+The ontology branch is reachable only from hand-built `_meta` (unit tests
+`tests/unit/rendering/test_frame_selection.py` tests 1–5 and
+`tests/unit/domain/transformations/test_lookup_formula_mode.py`).
+
+Classification: *dead or obsolete behavior* (ontology branch and its knobs, in
+all shipped flows); *confirmed supporting evidence* for epic Slice 4.
+
+=== 3.3 Lifecycle producers and consumers
+
+Producers of `_meta.frame_lifecycle`
+(`domain/frame_lifecycle.py::write_frame_lifecycle`,
+`mark_source_if_unclassified`):
+
+* `domain/transformations/join_views.py:455–475`
+* `domain/transformations/enrich_lookup/operation.py:369–398` — the only
+  producer of `role: intermediate` + `render: omit_by_default` +
+  `superseded_by` (source frame after lookup enrichment)
+* `domain/transformations/tabular_views.py:369–399` (`pivot_frame`)
+* `domain/transformations/compact_multiaxis.py:399–438`
+* `domain/extractions/frame_extract.py:141–168`
+* `domain/workbook_views.py:234–265` (per configured sheet)
+
+Consumers:
+
+* `rendering/frame_selection.py` — `role`/`render` (spreadsheet ontology
+  branch only; dead per 3.2).
+* `domain/workbook_views.py::_explicit_canonical_frame` (line 411–429) —
+  consumes `canonical` and `derived_from` to compute
+  `sheet_mappings[*].canonical_frame` (see Section 8.2).
+* `domain/schema_maintenance/meta_update.py::_handle_frame_lifecycle`
+  (line 709) — shape validation only.
+* `superseded_by` is *written but consumed nowhere* in `src`. `render` values
+  `never` and `debug_only` are *consumed but produced nowhere*. Roles
+  `redundant`, `system`, `diagnostic` appear only in the selector's constant
+  sets; no producer emits them.
+
+Classification: *dead or obsolete behavior* (`superseded_by`, `render:
+never/debug_only`, roles `redundant`/`system`/`diagnostic`); *hidden
+implementation dependency* (`canonical` + `derived_from` →
+`canonical_frame`).
+
+=== 3.4 Frame drop/prune behavior today
+
+* `domain/transformations/compact_multiaxis.py:89,191` — pops its own
+  `__compact_multiaxis_*` temp frames (feature-local, correct under the target
+  model).
+* `domain/workbook_views.py::apply_workbook_view_sheet_mappings` — readback
+  direction: output contains *only* mapped frames plus `_meta` (a de-facto
+  frame selection on the reverse path).
+* `worldbuilding/plugins/frame_sets.py::keep_frames` — consumer plugin,
+  whitelist semantics, used as the final step of
+  `worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml` to strip ~10
+  intermediate frames before the JSON write.
+* There is *no generic drop/prune step* in
+  `pipeline/registry.py::REGISTRY`. The epic's Review Question 6 is answered:
+  nothing reusable exists in core; the nearest artifact is the consumer
+  plugin, with inverted (keep-list) semantics.
+
+=== 3.5 Orchestration and writers
+
+`application/orchestrator.py::orchestrate` (line 67–121): one input load →
+linear `run_pipeline` → *orchestrator-owned persistence boundary*
+(`pipeline/persistence_boundary.py::project_meta_to_persistable_contract`,
+deliberately not a YAML-visible step) → one output save. This is an existing,
+documented precedent for an implicit carrier-neutral end-stage between the last
+configured step and persistence.
+
+Writers can also appear mid-pipeline as ordinary steps
+(`write_structured_yaml`, `write_key_value_resources`,
+`write_artifact_manifest` in `pipeline/registry.py:84–164`), so one run can
+emit multiple carriers. These steps add *report frames* (e.g.
+`structured_yaml_files`) with no lifecycle marking; without a Workbook View
+they are rendered into the workbook and persisted to structured outputs —
+another concrete candidate for explicit cleanup or view exclusion.
+
+The architecture guard
+`tests/architecture/pipeline_semantics/test_pipeline_semantics_guards.py::test_pipeline_orchestration_does_not_route_on_workbook_payload_metadata`
+forbids the string literals `_meta`, `frame_lifecycle`, `workbook_view` in
+`pipeline/{__init__,build,execution,registry,runner}.py`. The persistence
+boundary module and `application/orchestrator.py` are *not* in the guarded set.
+A final cleanup implemented as a domain/boundary module invoked by the
+orchestrator (mirroring `persistence_boundary.py`) or as an explicit registry
+step does not collide with the guard; embedding meta interpretation in the
+guarded orchestration modules would.
+
+`pipeline/execution.py` traces per-step `_meta` diffs at DEBUG
+(`_meta_change_trace`). Frame-*set* changes are not traced. Deferred cleanup
+directives written to `_meta` would appear in the trace; the executed drop
+would be visible only via the directive-consumption meta change (see
+amendment A3) unless frame-set tracing is added.
+
+== 4. Real consumers and demonstrated requirements
+
+.Consumer evidence
+* `worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml` — the flagship
+  forward pipeline: ~30 steps produce ~20 frames; `configure_workbook_view`
+  maps exactly 12 frames to named, ordered sheets. All intermediates
+  (`story_group_named`, `story_cast_*_named`, `story_cast_*_cells`, matrices
+  before view join) are omitted from the workbook *by the explicit mapping*,
+  not by lifecycle ontology. No ontology knob is set.
+* `worldbuilding/pipelines/dino_insel/spreadsheet_to_json.yaml` — reverse
+  pipeline; final step `plugin plugins.frame_sets:keep_frames` whitelists the 9
+  canonical frames before the `json_dir` write. Demonstrated requirement for
+  carrier-neutral domain cleanup, currently consumer-owned.
+* `demo/pipelines/acme_03_xref_forward.yaml` / `acme_03_xref_reverse.yaml` —
+  no Workbook View at all: forward writes *both* `product_market` (relation)
+  and `product_market_matrix` to XLSX; reverse writes *both* back to
+  `json_dir`. The redundant representation persists carrier-symmetrically with
+  no cleanup — the exact problem the epic's Responsibility 1+2 addresses, in
+  shipped demo material.
+* `worldbuilding/tests/test_dino_insel_workbook_view.py` — characterizes
+  explicit-view naming/order and reimport identity across XLSX and ODS.
+
+.Field usage census (production surfaces)
+`mode`, `drop_redundant_data`, `include_roles`, `omit_roles`,
+`include_debug_frames`, `include_omit_by_default`, `unknown_frame_policy`:
+*zero* occurrences in `worldbuilding`, `demo`, `src/spreadsheet_handling/examples`,
+and the user guide. Occurrences exist only in
+`domain/workbook_views.py` (producer), `rendering/frame_selection.py`
+(consumer), three test files, and
+`docs/technical_model/ch08_architecture_details/pipeline_semantics.adoc`
+(aspirational design text, line 742–751, which itself already demands the
+"explicit classification, no guessing" constraint).
+
+The user guide
+(`docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`,
+line 140–235) documents *only* the explicit `sheets` surface and the persisted
+`sheet_mappings` readback contract. The functional model
+(`docs/functional_model/ch05_problem_space_overview/04_workbook_view_boundary.adoc`)
+already describes Workbook View as an artifact-surface boundary, matching epic
+Responsibility 3 nearly verbatim.
+
+Classification: *confirmed supporting evidence* for the target model;
+lifecycle-driven render selection has *no real consumer*.
+
+== 5. Counterexamples and semantic blockers
+
+No semantic blocker was found. Four falsification attempts produced material
+findings that require amendments rather than rejection:
+
+=== 5.1 Transformations alone cannot originate all cleanup decisions
+
+Attempted falsification of "functional transformations decide logical
+retention": in the dino reverse pipeline the frames that must be cleaned up
+(`story_cast_role_named`, `story_cast_role_matrix_view`, …) are outputs of
+*generic* steps (`join_frames`, `expand_xref`, `project_by_role`,
+`extract_frame`). A generic join cannot know whether its output is a terminal
+domain frame or a disposable intermediate; only the pipeline builder knows.
+The current `keep_frames` whitelist encodes exactly that builder knowledge.
+
+Consequence: the cleanup contract is sound, but directive *origination* must be
+open to the pipeline builder (per-step opt-in parameters such as
+`drop_source: true` / `cleanup_output: true`, or a generic
+`mark_frames_for_cleanup` step), not restricted to feature-internal decisions.
+The epic's Responsibility 1 text ("a transformation must decide, based on its
+own contract and parameters") is compatible with this if "parameters" is read
+to include explicit builder-supplied cleanup parameters on generic steps —
+the review recommends stating this explicitly.
+Classification: *semantic finding requiring amendment* (A1).
+
+=== 5.2 References to absent frames are often required intent, not contradictions
+
+Attempted falsification of Slice 2's "fail deterministically on contradictory
+retained references": in the dino forward flow, the persisted workbook meta
+contains `xref_crosstable.story_group_matrix.relation = "story_group_named"`
+and equivalent `compact_multiaxis.*` entries although `story_group_named` is
+absent from the workbook artifact. The reverse pipeline *depends* on this
+metadata to re-create the relation
+(`expand_compact_multiaxis` → `output: story_group_named`). The
+persistence boundary already codifies this distinction as Intent (preserved)
+versus Resolution (stripped) in `pipeline/persistence_boundary.py:52–59`.
+
+A cleanup validator that treats every metadata reference to a dropped frame as
+contradictory would break the flagship pipeline. The failure rule must be
+scoped to an explicit allow/deny list per metadata family (Section 8).
+Classification: *semantic finding requiring amendment* (A2); also *confirmed
+supporting evidence* for the additional-information document's initial-create
+case — the framework already lives with "reference to a frame that does not
+currently exist".
+
+=== 5.3 Directive persistence through the workbook blob carrier
+
+`_meta` roundtrips in full through the hidden workbook sheet
+(`tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+asserts `mode`/`drop_redundant_data`/`unknown_frame_policy` survive today). If
+cleanup directives are persisted like other canonical meta, a reverse pipeline
+reading the workbook would inherit forward-run drop directives against frames
+the inverse transformations are about to re-create — the epic's "cleanup
+directives surviving after the frame was dropped earlier" conflict, arising
+automatically rather than through builder error. Directives must either be
+consumed on execution or stripped at the persistence boundary.
+Classification: *implementation risk requiring amendment* (A3).
+
+=== 5.4 Binary drop contract: no counterexample found
+
+Searched for cases needing more than `drop: true` / absent: every existing
+transformation either keeps its source (join, enrich_lookup, pivot, xref,
+split_by_discriminator, extract) or removes private temp frames locally
+(compact_multiaxis). The shadow-state (preserved-source) case needs *no*
+directive. The initial-create case has no frame to mark. The only richer
+semantic found anywhere is `keep_frames`' whitelist, which is a different
+authoring ergonomic, not a different runtime semantic — it compiles to the
+same binary per-frame decision. The binary contract holds.
+Classification: *confirmed supporting evidence*.
+
+=== 5.5 Revocation (deliberately open in the epic)
+
+No current code produces competing cleanup decisions for one frame; there is no
+shared-source dual-projection example in any repository. The additional
+information document's YAGNI deferral is consistent with the evidence.
+Recommendation: duplicate *identical* directives are idempotent and legal;
+anything that would need revocation fails as a conflict until a concrete
+shared-source case exists. Classification: *speculative complexity* (correctly
+deferred).
+
+== 6. Hidden implementation dependencies
+
+. *Selection, renaming, and formula rewriting are fused.*
+  `_select_configured_sheets` re-keys frames to *sheet* names before
+  composition, so `compose_workbook`, all render passes, and per-sheet options
+  (`_meta.sheets.<sheet-name>`, written by
+  `workbook_views._merge_sheet_options`) operate on physical sheet names.
+  A projection-plan refactor must preserve or deliberately migrate this
+  rekeying point. (implementation risk)
+. *Cross-sheet formula references assume target materialization.*
+  `LookupFormulaSpec.lookup_sheet` names a *frame*; `frame_selection`
+  rewrites it only when the frame is mapped under a different sheet name. If
+  the lookup frame is omitted from the view (or later cleaned up), the
+  rendered `XLOOKUP` silently references a nonexistent sheet. No validation
+  exists today (`_resolve_formula_sheet_names` skips unmapped names).
+  Slice 5 should validate content-level sheet references, not only mapping
+  targets. (implementation risk)
+. *`sheet_mappings[*].canonical_frame` is computed from lifecycle ontology* —
+  see Section 8.2. (implementation/compatibility risk)
+. *Non-render consumers of `workbook_view.sheets` mappings*:
+  `domain/validations/validate_columns.py:205–235` (maps rule `sheet:` targets
+  to frames), `domain/column_roles/resolver.py:236–249` (`_sheet_for_frame`),
+  `rendering/passes/_base.py:55` (sheet-source candidates), and
+  `domain/schema_maintenance/meta_refs.py::build_sheet_resolver`. These consume
+  the *mapping* (compatible with the target model) but hard-code today's
+  `frame`/`sheet` mapping shape; a future M:N mapping model must version or
+  extend this shape for four additional readers. (implementation risk)
+. *Architecture guard on orchestration modules* (Section 3.5) constrains where
+  an auto-appended cleanup may be implemented. (implementation constraint,
+  benign if respected)
+. *`mark_source_if_unclassified` defaults `canonical: true`* for any
+  unclassified source, and `write_frame_lifecycle(preserve_existing_canonical=True)`
+  then locks that classification. Removal of render inference does not remove
+  this write path; the canonical-flag semantics survive into `canonical_frame`
+  computation. (implementation sediment to review in Slice 4)
+. *Vocabulary collision:* frame-lifecycle `role` versus column roles
+  (`project_by_role`, `column_roles/`) and versus `produced_by.mode` /
+  validation `mode` are unrelated namespaces. Slice 4's "review `mode`" must
+  scope strictly to `workbook_view.mode`. (documentation debt)
+
+== 7. Carrier and roundtrip risks
+
+* Confirmed asymmetry mechanism: only XLSX/ODS pass through
+  `select_render_frames`; JSON/YAML/XML/CSV persist everything. With an
+  explicit view this asymmetry is *intended artifact projection*; with the
+  (dead) ontology branch it would be the unintended "logically redundant but
+  still in JSON" state the epic describes. Today the visible asymmetry in
+  practice is the *inverse* problem: redundant frames persist in *all*
+  carriers (acme_03) unless a consumer plugin intervenes (dino). Final domain
+  cleanup resolves both directions. (confirmed supporting evidence)
+* `_meta` blob carrier roundtrip of directives — see 5.3. (implementation
+  risk)
+* Mid-pipeline writers (`write_structured_yaml` etc.) run before any
+  end-stage cleanup; their report frames feed `write_artifact_manifest`.
+  Cleanup of report frames must therefore be placeable *after* manifest
+  aggregation — natural with builder-placed cleanup, impossible with a
+  hard-wired "immediately after last step" auto-append that also targets
+  report frames produced late. Keep placement pipeline-builder-owned as the
+  epic states, or scope the orchestrated end-stage to directives only.
+  (implementation risk, low)
+* Deterministic tracing: meta-diff tracing covers directive writes; add
+  frame-set change logging to the cleanup step's diagnostics to satisfy the
+  epic's "deterministic and visible in traces" requirement. (implementation
+  note)
+
+== 8. Metadata-reference cleanup risks
+
+Metadata families that can reference a frame name, with the recommended
+cleanup policy for a dropped frame:
+
+[cols="3,2,4"]
+|===
+| Path | Recommended policy | Evidence / rationale
+
+| `frame_lifecycle.<frame>` (entry keyed by dropped frame)
+| remove
+| Entry describes a frame that no longer exists; retaining it re-creates the
+  stale-ontology problem.
+
+| `frame_lifecycle.*.derived_from` / `superseded_by` mentioning the frame
+| preserve as historical provenance (or drop with the field, see Section 10)
+| `superseded_by` has no consumer; `derived_from` feeds only
+  `canonical_frame` computation at configure time, which runs before cleanup.
+
+| `workbook_view.sheets[*].frame`
+| *fail* — this is the epic's core conflict (cleanup vs. explicit mapping)
+| Both declarations are explicit; silent precedence is excluded by the epic.
+
+| `workbook_view.sheet_mappings[*].frame` / `.canonical_frame`
+| fail if it names a dropped frame at write time; recompute on configure
+| `resolve_workbook_view_sheet_mappings` already fails on unknown logical
+  frames when given `logical_frames` (`domain/workbook_views.py:339–355`).
+
+| `sheets.<sheet-name>` (per-sheet options)
+| preserve; keyed by sheet name, orphaned entries are inert noise
+| Options are looked up only for materialized sheets
+  (`layout_composer.py:324–328`).
+
+| `xref_crosstable.<name>.*`, `compact_multiaxis.<name>.*`,
+  `split_by_discriminator.<name>.*`, `cell_codecs`
+| *preserve* — inverse-transformation Intent
+| Section 5.2; persistence boundary Intent/Resolution rule.
+
+| `helper_policies.fk.relations[*]` (source/target frames)
+| preserve; validate lazily at materialization
+| Relations are durable v2 declarations
+  (`persistence_boundary.py:81–105`); `enrich_helpers` and reverse cleanup
+  need them even when a frame is temporarily absent.
+
+| `legend_blocks[*].placement/target`
+| preserve; targets sheets/tables, validated at compose time
+| `layout_composer.py::_target_table_for_legend` already fails loudly.
+
+| `validate_references` / `add_validations` rules
+| out of scope — rules live in pipeline config, not `_meta`
+| Rule targets failing on missing frames is existing step behavior.
+
+| `derived.*` (runtime provenance)
+| no action — already pruned at the persistence boundary
+| `RUNTIME_ONLY_TOP_LEVEL_META_KEYS`.
+|===
+
+Key risk if this table is not made explicit in Slice 2: either over-aggressive
+failure (breaking dino, Section 5.2) or silent stale references
+(`frame_lifecycle` keys). Classification: *implementation risk*, resolved by
+the per-family policy above.
+
+=== 8.2 `canonical_frame` derivation
+
+`configure_workbook_view` → `_sheet_mappings` → `_explicit_canonical_frame`
+derives the persisted reverse-mapping `canonical_frame` from
+`frame_lifecycle.<frame>.canonical == true` or a singleton `derived_from`
+pointing at a canonical entry
+(`domain/workbook_views.py:393–429`; characterized by
+`tests/unit/domain/test_workbook_views.py::test_configure_workbook_view_persists_reverse_mapping_from_explicit_lifecycle`).
+This is a *justified, distinct consumer* of `canonical` and `derived_from` in
+the epic's sense — it feeds reimport identity, not render selection. Slice 4
+must either retain these two fields for this consumer or replace the
+derivation with an explicit `canonical_frame` declaration in the Workbook View
+DSL. Silent removal would degrade `sheet_mappings` without failing any
+currently-passing selection test. Classification: *hidden implementation
+dependency / compatibility risk*.
+
+== 9. Workbook View and future M:N implications
+
+The explicit branch already provides the target's authoritative behavior
+(Section 3.1). Hard 1:1 assumptions found:
+
+* `_select_configured_sheets` — one `selected[sheet] = frame` dict; duplicate
+  *frames* rejected in `configure_workbook_view`
+  (`Duplicate workbook view frame`, line 152–153), so 1 frame → N sheets is
+  blocked at the DSL today.
+* `_resolve_formula_sheet_names` — `frame_to_sheet: dict[str, str]` is
+  single-valued; 1 frame → N sheets makes formula target choice ambiguous
+  (a genuine future design question, not a refactor blocker).
+* `compose_workbook` — one `TableBlock` at A1 per sheet; but `SheetIR.tables`
+  is already a *list* and legend blocks already place secondary structures at
+  computed offsets on existing sheets
+  (`layout_composer.py::_resolve_legend_position`) — the IR is M:N-ready even
+  though composition is not.
+* `workbookir_to_frames` — reads `sh.tables[0]` only
+  (`rendering/workbook_projection.py:136`); the *read* side is the strongest
+  1:1 assumption and is untouched by the epic's slices — fine, but M:N export
+  without M:N readback would break roundtrip symmetry; note in Slice 7.
+* Per-sheet options and four non-render mapping consumers keyed by single
+  sheet name (Section 6.4).
+
+Conclusion: the proposed refactor (projection plan, explicit mappings,
+conflict validation) does not entrench 1:1 further and the IR substrate plus
+legend precedent leave a credible path to 1→N sheets, N→1 composition, and
+named-range targets. Requirement for Slice 3/7: model the plan as a list of
+`(source frame, target)` mappings rather than a frame-keyed dict, and do not
+promote the current rekey-then-compose fusion into the new contract.
+Classification: *confirmed supporting evidence*, with the read-side note as
+*documentation debt* for Slice 7.
+
+== 10. Compatibility and migration risks
+
+Stability context: the project is pre-1.0 (`0.2.1` released; release notes
+state "not a long-term compatibility promise",
+`docs/release_notes/release_notes.adoc:34–44`). The user guide documents only
+the explicit `sheets` surface. Per-field recommendation:
+
+[cols="3,2,4"]
+|===
+| Field | Recommendation | Basis
+
+| `workbook_view.sheets` (frame, sheet, order), `sheet_mappings`,
+  `helper_columns`, `editable_columns`, `protection`, `options`
+| retain with clarified semantics
+| Sole documented surface; used by all real consumers and four non-render
+  modules.
+
+| `workbook_view.mode`
+| remove before stable release
+| Written always, read only in the dead ontology branch; no consumer; also
+  collides semantically with unrelated `mode` parameters.
+
+| `workbook_view.drop_redundant_data`
+| remove before stable release
+| Same; the technical model's conditional acceptance
+  (`pipeline_semantics.adoc:742`) is superseded by the epic's cleanup
+  contract.
+
+| `include_roles`, `omit_roles`, `include_debug_frames`,
+  `include_omit_by_default`
+| remove before stable release
+| Producer-optional, undocumented, test-only reach.
+
+| `unknown_frame_policy`
+| remove; re-introduce only if a concrete strictness use case appears as an
+  explicit projection-plan validation option
+| Currently written as `fail` but never enforced in the produced flow
+  (Section 3.2) — retaining it preserves a false promise.
+
+| `DEFAULT_INCLUDE_ROLES`, `DEFAULT_OMIT_ROLES`
+| remove
+| Test-only reach; the epic's headline target.
+
+| `frame_lifecycle.*.render`, `role`
+| remove render inference; then remove the fields unless a documented
+  diagnostic consumer is declared
+| Only consumer is the dead branch; `enrich_lookup`'s
+  `intermediate/omit_by_default` marking becomes inert prose.
+
+| `frame_lifecycle.*.canonical`, `derived_from`
+| retain (or translate to explicit `canonical_frame` DSL) — Section 8.2
+| Real consumer: reimport mapping.
+
+| `frame_lifecycle.*.superseded_by`
+| remove from producers or downgrade to documented provenance
+| Never consumed.
+
+| `frame_lifecycle.*.editable`, `consistency_policy`, `produced_by`
+| out of this epic's scope; keep pending FTR-META-LIFECYCLE-INVENTORY-P5 /
+  FTR-FK-HELPER-POLICY-LIFECYCLE-P4A
+| Not part of render selection.
+|===
+
+Migration risks: low. No YAML in any consumer repository sets a removed field.
+The `_meta` blob carrier means *old workbooks* may carry the removed
+`workbook_view` knobs back into pipelines; the reader should ignore unknown
+view keys (it already effectively does — only `sheets` matters) rather than
+fail. Registry updates required: `meta_registry.yaml` `frame_lifecycle` entry
+lists `rendering.frame_selection.select_render_frames` as consumer and
+`render_relevance: direct` (line 521–547) — must be realigned in Slice 6;
+`tests/architecture/semantic_invariants/test_meta_registry*.py` pin these
+entries and will need coordinated updates. The release-notes checkpoint
+applies to the implementing slices (public YAML surface changes); this review
+itself needs no release note.
+
+== 11. Tests to retain, rewrite, remove, or add
+
+Retain (contract of the target model, already correct):
+
+* `tests/unit/rendering/test_frame_selection.py` — the three
+  `FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A`/`IR-006` tests (configured view
+  selection/order/rename, missing/duplicate failure, no-mutation) and
+  `test_render_plan_preserves_current_visibility_without_workbook_view_policy`
+  (characterizes the target default).
+* `tests/unit/domain/test_workbook_views.py` (all; note 8.2 dependency),
+  `tests/integration/io_backends/test_ods_xlsx_parity.py` workbook-view tests,
+  `tests/integration/pipeline/test_configured_workbook_view_reimport_roundtrip.py`,
+  `tests/roundtrip/*` (explicit-view fixtures),
+  `worldbuilding/tests/test_dino_insel_workbook_view.py`.
+* `test_render_selection_does_not_infer_lifecycle_from_raw_suffix` and
+  `..._does_not_omit_derived_frames_without_omit_policy` — keep as negative
+  guards (they assert *non*-inference), retargeted at the new selector.
+
+Rewrite or remove with Slice 4 (they pin the ontology branch):
+
+* `test_render_plan_omits_only_explicit_lifecycle_frames_when_view_policy_requests_it`,
+  `test_unknown_frame_policy_can_fail_unclassified_frames`
+  (`tests/unit/rendering/test_frame_selection.py:24–120`) — implementation
+  sediment of `FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4`; replace with
+  cleanup-contract and conflict tests.
+* `tests/unit/domain/transformations/test_enrich_lookup.py:475–478`
+  (asserts `render == "omit_by_default"`, `superseded_by`) and the lifecycle
+  assertions in `test_compact_multiaxis.py:56,148`,
+  `test_tabular_views.py:151`, `test_join_views.py:306` — rewrite against
+  whatever lifecycle fields survive Section 10.
+* `tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+  fixtures embedding `mode`/`drop_redundant_data`/`unknown_frame_policy` —
+  rewrite fixtures to the surviving contract.
+
+Add:
+
+* Cleanup-contract unit tests: mark → drop, absence → keep, `_meta`
+  rejection, unknown-frame directive failure, duplicate identical directive
+  idempotence, directive consumption after execution.
+* Carrier-symmetry integration test: same pipeline with cleanup written to
+  `json_dir` and `xlsx`; assert identical logical frame sets (minus artifact
+  projection).
+* Conflict tests: cleanup vs. explicit `workbook_view.sheets` mapping;
+  explicit mapping of an already-dropped frame; cleanup directive arriving via
+  workbook blob readback (Section 5.3 regression).
+* Formula-reference validation test: lookup formula targeting an
+  omitted/dropped frame must fail plan validation, not render a broken
+  formula (Section 6.2).
+* Worldbuilding migration parity: dino reverse pipeline with drop directives
+  (or core cleanup step) produces byte-identical `json_dir` output versus the
+  current `keep_frames` plugin.
+
+== 12. Recommended epic-slice changes (amendments)
+
+*A1 — Slice 1:* extend directive origination — generic transformation steps
+gain explicit opt-in cleanup parameters (e.g. `drop_source: true` on
+`expand_xref`/`contract_xref`/`join_frames`-class steps where the builder
+knows the source is fully consumed), and/or a generic
+`mark_frames_for_cleanup` step. Also specify duplicate-directive semantics
+(identical → idempotent; contradictory forms impossible while the contract is
+a bare `drop: true`).
+
+*A2 — Slice 2:* replace the blanket "fail on contradictory retained
+references" with the per-family policy table of Section 8; explicitly preserve
+transformation Intent metadata.
+
+*A3 — Slice 2:* define directive *consumption* on execution so directives
+cannot leak through the workbook blob carrier (Section 5.3); emit frame-set
+diagnostics for trace visibility.
+
+*A4 — Slice 2 placement:* implement as an explicit registry step *and/or* an
+orchestrator-invoked standard end-stage in the same pattern as
+`persistence_boundary` (outside the guarded orchestration modules), whichever
+the open decision lands on — both are compatible with the existing
+architecture guard.
+
+*A5 — Slice 3:* add the `canonical_frame` decision (retain lifecycle-derived
+computation vs. explicit DSL field, Section 8.2) and fix or remove the dead
+`unknown_frame_policy` default divergence (Section 3.2) instead of carrying it
+over.
+
+*A6 — Slice 4:* is mostly deletion (Section 10); include removal of the
+corresponding `configure_workbook_view` keyword parameters, and keep the two
+negative-inference guard tests alive against the new selector.
+
+*A7 — Slice 5:* extend conflict validation to content-level references —
+rendered lookup formulas targeting unmapped/dropped frames (Section 6.2) and
+legend targets — not only mapping-level duplicates and missing frames.
+
+*A8 — Slice 7:* record the read-side 1:1 assumption
+(`workbookir_to_frames` → `tables[0]`) as an explicit M:N constraint.
+
+*A9 — New (small) work item:* decide whether a core `keep_frames`-style
+whitelist step is offered alongside drop directives, so the worldbuilding
+plugin can be retired; otherwise document the plugin as the sanctioned
+pattern.
+
+== 13. Smallest credible implementation sequence
+
+. *Slice 0 closure* — adopt this review as the characterization inventory;
+  confirm amendments A1–A9 in the epic text.
+. *Slice 1 (amended)* — directive schema + producer opt-ins + unit tests. No
+  behavior change for existing pipelines.
+. *Slice 2 (amended)* — cleanup step + reference policy + directive
+  consumption + carrier-symmetry tests. Migrate the dino reverse pipeline from
+  `keep_frames` to the core mechanism as the acceptance proof (parity test in
+  Section 11).
+. *Slice 4* — delete the ontology branch, knobs, and dead lifecycle
+  vocabulary; rewrite pinned tests. Doing 4 before 3 is safe because the
+  branch is dead in all produced flows; nothing real regresses.
+. *Slice 3 + 5* — conflict validation (cleanup vs. view, formula references),
+  `canonical_frame` decision, `unknown_frame_policy` resolution.
+. *Slice 6* — docs and registries (Section 14).
+. *Slice 7* — design note only.
+
+== 14. Documentation changes required
+
+* `docs/technical_model/ch08_architecture_details/pipeline_semantics.adoc` —
+  the "Frame Lifecycle" and "Workbook Views, Rendering, and Pipeline
+  Boundaries" sections (line ~560–760) describe render-time lifecycle
+  consumption and conditionally bless `drop_redundant_data`; realign with the
+  cleanup/projection split. This document is the origin of the current design
+  and is the largest single piece of documentation debt.
+* `registries/meta_registry.yaml` — `frame_lifecycle` entry (consumer list,
+  `render_relevance: direct`, precedence notes) and any surviving
+  `workbook_view` knob documentation; coordinated with
+  `tests/architecture/semantic_invariants/test_meta_registry*.py`.
+* `registries/pipeline_step_registry.json` — new cleanup step entry; frame
+  contract for opt-in drop parameters.
+* `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc` —
+  add cleanup step and conflict examples; the existing Workbook View section
+  already matches the target model.
+* `docs/semantic_model/08_lifecycle_and_update_semantics.adoc` — add the
+  domain-cleanup vs. artifact-projection distinction with full metadata paths.
+* `docs/functional_model/.../04_workbook_view_boundary.adoc` — minor: state
+  the no-view default and the cleanup boundary explicitly (currently silent on
+  both).
+* Feature-local functional docs for `enrich_lookup`, `xref_crosstable`,
+  `compact_multiaxis`: the three source-frame cases from the
+  additional-information document.
+* Release notes (implementing slices): removed YAML fields, new cleanup step,
+  view-conflict semantics.
+* Project memory: record the architecture decision after the epic lands (per
+  epic Slice 6).
+
+== 15. Open questions that genuinely require a human decision
+
+. `canonical_frame`: keep deriving from `frame_lifecycle.canonical` +
+  `derived_from`, or add an explicit Workbook View DSL field and drop the
+  derivation? (Section 8.2 — affects reimport metadata contract.)
+. Fate of provenance fields `derived_from` / `superseded_by` /
+  `produced_by` once render inference is gone: historical documentation value
+  vs. removal. (Deferred consumer audit already flagged in
+  `persistence_boundary.py:71–72`.)
+. Cleanup step form: explicit YAML step, orchestrated standard end-stage, or
+  both (Amendment A4). Both are guard-compatible; this is an ergonomics/
+  visibility choice for the pipeline-builder contract.
+. Should core ship a whitelist (`keep_frames`) companion to drop directives,
+  or is the drop-directive path the only sanctioned mechanism (worldbuilding
+  plugin retirement)?
+. Should `enrich_lookup` stop writing `intermediate`/`omit_by_default`/
+  `superseded_by` for its source frame entirely, or convert that marking into
+  a cleanup directive under an explicit parameter? (Feature-contract change,
+  currently inert either way.)
+. Directive persistence policy: consume-on-execution (recommended, 5.3) vs.
+  persist-as-history — affects the blob carrier and audit expectations.
+
+== Finding classification summary
+
+[cols="4,2"]
+|===
+| Finding | Classification
+
+| Ontology selection branch + knobs unreachable from any produced flow
+| dead or obsolete behavior
+
+| Explicit `sheets` branch already implements target projection; no-view
+  default already target default
+| confirmed supporting evidence
+
+| No core generic cleanup; consumer `keep_frames` plugin fills the gap;
+  acme_03 redundancy persists in all carriers
+| confirmed supporting evidence (for the epic's purpose)
+
+| Builder-originated cleanup needed for generic-step intermediates (A1)
+| semantic finding → amendment (not a blocker)
+
+| Intent metadata legitimately references absent frames (A2)
+| semantic finding → amendment (not a blocker)
+
+| Directive survival through `_meta` blob carrier (A3)
+| implementation risk
+
+| `canonical_frame` derivation from lifecycle ontology
+| hidden implementation dependency / compatibility risk
+
+| Formula references to omitted frames unvalidated
+| implementation risk
+
+| Fused selection/renaming; sheet-name-keyed options; four extra mapping
+  consumers; `tables[0]` readback
+| implementation risk / documentation debt (M:N constraints)
+
+| `unknown_frame_policy` written `fail`, enforced never, default divergence
+| dead behavior + documentation debt
+
+| `render: never`/`debug_only`, roles `redundant`/`system`/`diagnostic`,
+  `superseded_by`
+| dead or speculative complexity
+
+| Revocation semantics
+| speculative complexity (correctly deferred)
+
+| `pipeline_semantics.adoc` lifecycle-render sections; `meta_registry.yaml`
+  `frame_lifecycle` consumer entry
+| documentation debt
+
+| Binary `drop: true` contract sufficiency
+| confirmed supporting evidence
+|===
+
+== Lifecycle cleanup check
+
+This is a pre-implementation architecture review, not a green-lighting
+implementation review; no workstream is being closed.
+
+* Epic status: recommend moving
+  `FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A` from "Draft for
+  architecture review" to "Reviewed — supported with amendments" and folding
+  the Section 12 amendments into the epic (or recording them as accepted
+  deviations) before Slice 1 starts.
+* No includes need to change in `docs/backlog/_ftrs_open.adoc` at this point;
+  no artifacts move to cold storage.
+* Residual scope: the amendments themselves (A1–A9) and the open decisions in
+  Section 15; all are within the epic's existing slice structure, no follow-up
+  FTR is required now. The optional core `keep_frames` companion (A9) may
+  become a small follow-up FTR if accepted.
+* Release notes: not required for this review artifact; required for the
+  implementing slices (public YAML surface changes, new step).
+* Cleanup performed in this change: none (read-only review; this artifact is
+  the only addition).
+
+== 16. Verdict
+
+[source,text]
+----
+TARGET MODEL SUPPORTED WITH AMENDMENTS
+----
+
+The amendments are: builder-originated cleanup directives (A1), per-family
+metadata-reference policy preserving transformation Intent (A2), directive
+consumption to prevent blob-carrier leakage (A3), the `canonical_frame`
+decision (A5), content-level reference validation in conflict checking (A7),
+and the read-side M:N constraint note (A8). None blocks the target model; all
+are implementable within the epic's existing slice structure.
