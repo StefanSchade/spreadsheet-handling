@@ -1,0 +1,182 @@
+= XRef Projection-Family Slice: FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A
+:revdate: 2026-07-19
+:status: Implemented
+:type: Projection-family slice record (xref_crosstable)
+
+== Purpose
+
+First projection-family slice after the accepted ontology removal: reduce
+`xref_crosstable` metadata to the minimal feature-local inverse contract,
+harden `drop_source` with checkable lossless conditions, make intent
+discovery fail on ambiguity, and make schema maintenance handle only real
+XRef references. No generic lifecycle, canonicality, provenance, or render
+concept was reopened. Workbook View required no change: it carries no XRef
+semantics (verified; the only XRef/View touchpoint is the generic
+frame-to-sheet mapping that the column-role resolver reads for helper
+columns, which is view-owned, not XRef-owned).
+
+== Minimal retained intent (field inventory result)
+
+Every retained field has a concrete producer, consumer, and operational
+decision; everything else was removed from the producers.
+
+[cols="2,3,4", options="header"]
+|===
+| Field | Status | Concrete consumer / decision
+
+| `relation`, `matrix`
+| retained (persisted intent)
+| Intent discovery by frame identity (`_xref_config` fallback when the
+  transform id differs across runs); column-role resolution
+  (`column_roles.resolver` reads `matrix` + `row_keys` for
+  `row_identity`); `sparse_defaults` matrix lookup. May legitimately
+  reference frames removed by final domain cleanup: a reverse pipeline
+  needs exactly this intent to recreate the absent side.
+
+| `row_keys`
+| retained (persisted intent)
+| Column-role resolution (`row_identity` for `project_by_role` and
+  role-targeted validations); schema-maintenance reference detection.
+
+| `dense_axes.rows_from` / `columns_from`
+| retained (persisted intent)
+| Dense-axis re-resolution on a later `contract_xref`
+  (`_dense_axes_from_config_or_meta`), including reimport re-export runs.
+
+| `column_keys` (entry top level)
+| retained (run-local Resolution; stripped at the persistence boundary,
+  unchanged)
+| Same-run matrix column reuse in `contract_xref`
+  (`_column_keys_from_meta_or_relation`) and `sparse_defaults` target
+  columns (`_xref_column_keys_for_frame`).
+
+| `dense_axes.resolved`
+| retained (run-local Resolution; stripped at the boundary, unchanged)
+| Axis-snapshot fallback when a later same-run `contract_xref` operates on
+  a frame subset that no longer contains the axis frames
+  (`test_contract_xref_reuses_stored_dense_axes_without_source_frames`).
+  An initial removal attempt during this slice broke that shipped
+  dense-axes capability and was reverted — the snapshot is
+  Resolution-with-a-consumer, not sediment.
+
+| `operation`
+| *removed* from producers
+| No reader anywhere; descriptive only.
+
+| `column_key`, `value`
+| *removed* from producers
+| No reader anywhere. Inverse operations are parameterized by explicit
+  step configuration, not by the intent entry; the intent entry is
+  discovery/validation state, not a parameter store. (Two user-guide
+  claims that these defaulted from meta were incorrect and are fixed.)
+
+| `drop_empty`
+| *removed* from producers
+| No reader anywhere.
+|===
+
+Legacy payloads carrying the removed fields pass through untouched until the
+producing transformation replaces the entry; schema maintenance ignores the
+legacy fields (they are not references).
+
+== Forward/inverse behavior
+
+* Forward (`contract_xref`) and inverse (`expand_xref`) now write
+  symmetrical minimal intent: `{relation, matrix, row_keys, column_keys}`
+  plus dense intent (contract resolves it; expand carries the prior entry's
+  dense intent forward for a later re-contract).
+* Intent discovery by frame identity fails explicitly when more than one
+  entry matches (`Ambiguous xref_crosstable metadata ...`); an exact
+  transform id (`name=...`) always wins and disambiguates.
+* Roundtrips are covered relation→matrix→relation and matrix→relation→matrix
+  (unit and dense variants), plus carrier-level recreation from persisted
+  intent on both XLSX and ODS.
+
+== Cleanup interaction (`drop_source`)
+
+`drop_source` remains an explicit caller assertion feeding
+`_meta.pipeline_cleanup`, now with the *checkable* value-loss conditions
+enforced:
+
+* `contract_xref(drop_source=True)` fails when the matrix columns do not
+  cover every relation column key (silent pair loss cannot supersede the
+  relation). Dense-axis validation already rejected out-of-axis tuples;
+  the guard closes the explicit/meta-derived `column_keys` subset path.
+* `expand_xref(drop_source=True)` fails when an explicit `value_columns`
+  subset would leave unexpanded matrix columns behind.
+* Shape recovery for empty-only columns under `drop_empty=True` remains
+  the caller's feature-local judgement (dense column intent or a retained
+  matrix provides it); documented in the user guide.
+
+Scoped (non-superseding) projections without `drop_source` are unchanged.
+
+== Workbook View interaction
+
+No Workbook View change was necessary: after the ontology removal it holds
+no XRef-specific behavior. Cleanup-versus-view conflict semantics are
+unchanged (explicit drop command of a view-mapped frame fails; verified by
+the existing cleanup suite).
+
+== Schema maintenance
+
+`xref_crosstable` moved from the generic convention-scanned blocked roots to
+a dedicated feature-aware handler (`meta_update._handle_xref_crosstable`)
+that blocks rename/drop only for *real* XRef references:
+
+* `row_keys` on the `relation`/`matrix` frames (one intent list serves both
+  sides, so a one-sided rename cannot be rewritten safely — blocking is the
+  correct policy, matching the established feature-family posture);
+* run-local `column_keys` on the `matrix` frame (present in-run or in
+  hand-authored meta);
+* `dense_axes.rows_from`/`columns_from` `key`/`keys` on the configured axis
+  frame.
+
+Fabricated convention-style shapes (`frame` + `value_column` keys) and
+legacy descriptive fields no longer block; previously the scanner blocked
+the fabricated shapes while real references dangled silently. A malformed
+(non-mapping) root fails as `malformed_meta`.
+
+== Tests
+
+New/rewritten (all green; full suite 1505 passed, 1 xfailed; ruff clean;
+worldbuilding XLSX + ODS reimports and workbook-view tests pass):
+
+* `TestMinimalInverseIntent` — exact minimal payloads for both directions;
+  boundary projection of dense intent without Resolution facets; ambiguity
+  failure and exact-id precedence; no generic lifecycle/provenance writes.
+* `TestDropSourceLosslessGuards` — uncovered relation columns rejected,
+  full coverage accepted, scoped contraction without `drop_source`
+  unchanged, unexpanded `value_columns` rejected.
+* `TestXrefCrosstableReferences` (schema maintenance) — real row-key /
+  dense-key / matrix-column references block (rename and drop); unrelated
+  frames, fabricated shapes, and legacy descriptive fields pass through;
+  malformed root fails.
+* `test_xref_intent_parity_and_recreation_across_xlsx_and_ods` — both
+  carriers persist the identical minimal intent referencing the absent
+  (dropped) relation; the inverse recreates identical relations from both.
+* Tiny adjacent cleanup from the implementation review:
+  `test_pivot_frame_marks_output_as_readonly_projection_by_default` renamed
+  to `test_pivot_frame_writes_no_metadata`.
+
+== Compatibility
+
+* Persisted `xref_crosstable` entries lose the descriptive
+  `operation`/`column_key`/`value`/`drop_empty` fields (pre-1.0, release-
+  noted; no consumer existed, legacy payloads are tolerated).
+* Intent discovery ambiguity now fails instead of silently picking the
+  first matching entry.
+* `drop_source` combinations that silently lost values now fail.
+* Schema maintenance blocking behavior for the xref root changed from
+  convention-shape detection to real-reference detection.
+
+== Deferred (recorded, out of this slice's scope)
+
+* `compact_multiaxis`-composed flows persist xref entries whose `relation`
+  field names the popped `+__compact_multiaxis_*+` temp frame — harmless
+  sediment with no consumer, owned by the compact_multiaxis family slice.
+* YAML `name:` binds to the pipeline step, not the transform id, so
+  YAML-configured entries are always keyed by the output/relation name;
+  the frame-identity discovery fallback covers this. A future ergonomics
+  decision may expose the transform id in YAML (any projection family).
+* Side-effecting writers, metadata pileup, M:N Workbook View, facet
+  classification: unchanged deferrals.
