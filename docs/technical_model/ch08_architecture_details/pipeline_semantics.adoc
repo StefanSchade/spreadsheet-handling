@@ -1,4 +1,4 @@
-== Pipeline Step Semantics, Configuration Contracts, and Frame Lifecycle
+== Pipeline Step Semantics, Configuration Contracts, and Workbook Projection
 
 :status: draft
 :scope: architecture
@@ -8,7 +8,7 @@
 
 This document defines the intended semantics for pipeline steps before the public YAML surface hardens further.
 
-It separates configuration, primitive execution, composition, plugins, frame lifecycle, and render/view decisions so that pipeline behavior remains explicit, inspectable, testable, and documentable.
+It separates configuration, primitive execution, composition, plugins, final domain cleanup, and workbook projection so that pipeline behavior remains explicit, inspectable, testable, and documentable.
 
 The document is an architecture artifact. It is not itself a runtime contract. Implementation should happen in small, reviewable slices.
 
@@ -31,8 +31,8 @@ This creates avoidable risks:
 * Users cannot easily tell whether a step executes a transformation, infers configuration, or does both.
 * Heuristics can become opaque runtime behavior instead of inspectable configuration.
 * Composite steps can hide primitive operations and temporary frames.
-* Plugins can materialize workbook views without a common lifecycle language.
-* Intermediate and derived frames can remain visible next to canonical frames, creating redundant editable data.
+* Plugins can materialize workbook views without a common operational contract.
+* Intermediate frames can remain beside final frames unless a feature or pipeline builder explicitly declares cleanup.
 * Inverse operations may rely on metadata that is not documented as part of a step contract.
 * User documentation and architecture tests have no single inventory from which to derive expectations.
 
@@ -49,7 +49,7 @@ primitive step
   -> reads direct parameters and/or resolved configuration
   -> builds one effective configuration
   -> executes one deterministic operation
-  -> writes provenance and lifecycle metadata where applicable
+  -> writes feature-local intent or explicit cleanup commands where required
 
 composite step
   -> wraps a documented sequence of primitive and/or configuration steps
@@ -130,7 +130,7 @@ Examples:
 * `infer_lookup_helper_policy`
 * `configure_fk_helpers`
 * `infer_fk_relations`
-* `configure_frame_lifecycle`
+* `configure_pipeline_cleanup`
 * `configure_compact_multiaxis`
 
 Rules:
@@ -239,7 +239,7 @@ Rules:
 * A composite step must declare whether primitive trace metadata is kept, suppressed, or nested under the composite namespace.
 * A composite step must not become a hidden second implementation of the primitive behavior.
 
-Composite provenance policy is mandatory when composite steps use temporary frames internally. If primitive metadata points at frames that are removed before the step returns, later lifecycle, inverse, or documentation logic can misread those frames as public artifacts.
+Composite provenance policy is mandatory when composite steps use temporary frames internally. If primitive metadata points at frames that are removed before the step returns, later inverse or documentation logic can misread those frames as public artifacts.
 
 Recommended composite fields:
 
@@ -305,8 +305,7 @@ Rules:
 
 * Plugin steps are explicit extension points, not architecture violations.
 * A plugin may create, replace, drop, or materialize frames.
-* If a plugin changes the frame set, it should either write lifecycle metadata or declare that it owns lifecycle responsibility for its output.
-* Missing lifecycle metadata from a plugin should initially produce diagnostics or review warnings, not a hard failure.
+* If a plugin changes the final frame set or spreadsheet projection, it must do so through an explicit plugin-owned contract or the shared cleanup/Workbook View contracts.
 * Genericization should be driven by recurring plugin patterns, not by theoretical purity.
 
 Recommended plugin registry fields:
@@ -317,9 +316,7 @@ Recommended plugin registry fields:
   "name": "plugin",
   "category": "plugin",
   "plugin_contract": {
-    "may_change_frame_set": true,
-    "lifecycle_responsibility": "caller_owned_or_declared",
-    "diagnostics": "warn_if_frames_change_without_lifecycle"
+    "may_change_frame_set": true
   }
 }
 ----
@@ -570,10 +567,10 @@ Every root referenced by step_registry[*].meta_contract must either:
   B) be explicitly marked as transient / trace-only in the step registry.
 ----
 
-Recommended additions to the meta registry during follow-up work:
+High-value meta-registry entries that step contracts reference include:
 
 * `helper_policies`
-* `frame_lifecycle`
+* `pipeline_cleanup`
 * `derived.sheets.*.helper_columns`
 * `derived.sheets.*.lookup_helpers` or the current equivalent lookup provenance path
 * composite trace namespaces if retained persistently
@@ -650,72 +647,24 @@ Example for compact multiaxis:
 }
 ----
 
-=== Frame Lifecycle
+=== Final Domain Cleanup
 
-Many transformations use explicit input and output frames.
+Transformations may create intermediate frames, but generic components do not
+classify those frames or infer when they are redundant. The feature
+transformation declares an explicit drop command when its own contract proves
+that a source is reconstructable. A pipeline builder may instead declare the
+final retained set when only the whole pipeline composition has that knowledge.
 
-Example:
+The orchestrator executes `_meta.pipeline_cleanup` after configured steps and
+before persistence, then consumes the command. A builder invocation chooses
+exactly one of `drop_frames` or `keep_frames`. Transformation-produced drops
+may compose with builder keep mode: a kept-and-dropped frame is a
+contradiction; an excluded-and-dropped frame is compatible redundancy. No
+precedence and no ontology-derived default exists.
 
-[source,yaml]
-----
-- step: contract_compact_multiaxis
-  relation: variable_codes
-  output: variable_usage_matrix_raw
-----
-
-Keeping both input and output frames can be useful for debugging and traceability.
-
-But it is dangerous when rendering an editable workbook, because users may see and edit multiple redundant representations of the same information.
-
-The solution should not be an obscure render flag or name-based guess.
-
-The solution should be an explicit frame lifecycle contract in `_meta`.
-
-Example:
-
-[source,yaml]
-----
-_meta:
-  frame_lifecycle:
-    variable_codes:
-      role: canonical_source
-      canonical: true
-      editable: false
-      render: omit_by_default
-      superseded_by: variable_usage_matrix_raw
-
-    variable_usage_matrix_raw:
-      role: intermediate
-      canonical: false
-      editable: false
-      render: omit_by_default
-      derived_from:
-        - variable_codes
-      superseded_by: variable_usage_matrix
-
-    variable_usage_matrix:
-      role: editable_projection
-      canonical: false
-      editable: true
-      render: visible_by_default
-      derived_from:
-        - variable_usage_matrix_raw
-        - variables
-      consistency_policy:
-        on_conflict: fail
-----
-
-Frame lifecycle should answer:
-
-* Which frames are canonical?
-* Which frames are intermediate?
-* Which frames are editable projections?
-* Which frames are redundant for the current workbook view?
-* Which frames should be omitted by default during spreadsheet rendering?
-* Which frames participate in inverse reconstruction?
-* What happens if redundant representations conflict?
-
-The initial lifecycle model assumes one workbook view per pipeline run. Multi-view scenarios such as debug view versus production view are deferred.
+Feature-local transformation metadata, such as `xref_crosstable` or
+`compact_multiaxis`, remains available to the matching inverse transformation.
+Generic provenance fields are not a substitute for that contract.
 
 === Workbook Views, Rendering, and Pipeline Boundaries
 
@@ -735,25 +684,16 @@ Preferred direction:
 [source,text]
 ----
 Pipeline executes declared steps linearly.
-Steps write explicit lifecycle and view metadata.
-Rendering consumes explicit workbook-view policy to decide visibility/editability.
+Feature steps write feature-local inverse intent and optional cleanup commands.
+Final domain cleanup executes commands carrier-neutrally.
+Workbook View explicitly projects remaining frames into sheets.
+Rendering mechanically realizes that projection.
 ----
 
-A future rendering option such as `drop_redundant_data` is acceptable only if it means:
-
-[source,text]
-----
-Do not render frames that are explicitly classified as redundant or omit-by-default in frame_lifecycle.
-----
-
-It must not mean:
-
-[source,text]
-----
-Guess which frames look redundant by name, shape, or position.
-----
-
-Workbook-view plugins that physically materialize or suppress frames are allowed, but they should either emit lifecycle metadata or declare caller-owned lifecycle responsibility.
+Without `workbook_view.sheets`, every remaining logical frame is selected.
+When `workbook_view.sheets` is present, that list is authoritative for
+selection, order, and sheet names. Rendering must not infer inclusion or
+omission from roles, provenance, frame names, shapes, or positions.
 
 === Naming Direction for Helper and Lookup Steps
 
@@ -815,7 +755,7 @@ First-wave guard candidates:
 | Composite steps have non-empty `wrapped_steps`; every wrapped step exists; public outputs and internal frames are declared.
 
 | Composite frame references
-| Composite metadata must not reference frames absent from both the final frame set and declared `internal_frames` / lifecycle metadata.
+| Composite metadata must distinguish public outputs, internal frames, and feature-local inverse intent.
 
 | Meta-registry alignment
 | Every persistent `meta_contract` root exists in `meta_registry.yaml`; otherwise the registry entry marks it as transient or trace-only.
@@ -829,11 +769,8 @@ First-wave guard candidates:
 | Inline versus policy conflicts
 | Parameters marked `inline_or_policy` require conflict behavior; silent precedence is disallowed.
 
-| Plugin diagnostics
-| Plugin steps that change frame sets without lifecycle metadata can produce diagnostics rather than hard failures.
-
 | Render non-guessing
-| Render omission features may use lifecycle/view metadata but must not infer redundancy from frame names or shapes.
+| Rendering selects all remaining frames by default or follows explicit `workbook_view.sheets`; it must not infer redundancy from metadata or frame names/shapes.
 
 | Pipeline non-routing
 | Pipeline orchestration must not use `_meta` for semantic branching or hidden step skipping.
@@ -848,7 +785,7 @@ Adoption should be incremental.
 ==== Step 1: Concept and Decision Record
 
 * Add this architecture document.
-* Add a short ADR that records the decision to classify steps, separate heuristics from primitive execution, preserve plugins, and make frame lifecycle explicit.
+* Add a short ADR that records the decision to classify steps, separate heuristics from primitive execution, preserve plugins, and keep cleanup/projection contracts explicit.
 * No production code changes are required.
 
 ==== Step 2: Step Registry Review Artifact
@@ -874,12 +811,12 @@ Adoption should be incremental.
 * Ensure primitive helper steps execute against resolved policy or direct inline config.
 * Fail on conflicts between inline config and resolved policy.
 
-==== Step 5: Frame Lifecycle and Workbook Views
+==== Step 5: Final Cleanup and Workbook Views
 
-* Add frame lifecycle metadata for source, canonical, intermediate, projection, redundant, editable, and diagnostic frames.
-* Use lifecycle metadata for workbook view/render decisions.
-* Avoid renderer-side guessing.
-* Keep plugin-created workbook views supported through lifecycle metadata or explicit caller-owned responsibility.
+* Let feature transformations emit narrow inverse intent and optional explicit cleanup commands.
+* Execute final domain cleanup at the carrier-neutral orchestrator boundary.
+* Use explicit Workbook View sheets for spreadsheet projection.
+* Keep the renderer mechanical and free of lifecycle inference.
 
 ==== Step 6: Guard Hardening
 
@@ -898,7 +835,7 @@ It should record:
 * primitive execution must be deterministic against direct config and/or resolved metadata
 * the step registry starts as a review artifact validated against runtime `REGISTRY`
 * metadata paths in step contracts must align with the meta registry
-* frame lifecycle is the explicit language for redundant/intermediate/view frames
+* explicit cleanup commands and Workbook View mappings replace generic frame classifications
 * plugins remain supported extension points and are candidates for later genericization, not architecture violations
 
 Rejected alternatives:
@@ -919,7 +856,6 @@ If a comparison point is needed, use a git tag or internal checkpoint. The next 
 * Should the step registry stay under `registries/` or move directly under `src/spreadsheet_handling/pipeline/`?
 * Should old FK/helper/lookup names be removed immediately or retained for exactly one beta with warnings?
 * Which direct YAML parameters should remain as convenience syntax once configuration steps exist?
-* Should frame lifecycle first be written by selected high-risk transformations only, such as compact multiaxis and lookup helpers?
 * How strict should readback conflict handling be when both canonical and editable projection frames are present?
 * Which plugin diagnostics should be warnings, and which should eventually become hard failures?
 
@@ -937,4 +873,7 @@ Do not let render visibility become implicit pipeline routing.
 
 Do keep plugins as first-class extension points.
 
-Make configuration, transformation, composition, plugin responsibility, inverse behavior, and frame lifecycle explicit enough that architecture tests and user documentation can be derived from the same reviewed registry.
+Make configuration, transformation, composition, plugin responsibility,
+feature-local inverse behavior, final cleanup, and Workbook View projection
+explicit enough that architecture tests and user documentation can be derived
+from the same reviewed registry.
