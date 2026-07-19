@@ -66,8 +66,13 @@ Metadata references to removed frames follow narrow per-family policies:
 
 * ``frame_lifecycle`` entries keyed by a removed frame are removed;
 * explicit ``workbook_view`` mappings (``sheets[*].frame`` and
-  ``sheet_mappings[*].frame``) that reference a removed frame are a
-  conflict and fail;
+  ``sheet_mappings[*].frame``) that reference a *drop-commanded* frame are a
+  conflict and fail: two targeted declarations contradict each other.
+  Keep-mode *implied* removals do not conflict with view mappings -- a
+  reverse pipeline legitimately reads back a workbook whose persisted
+  ``workbook_view`` still maps the view frames that keep mode discards,
+  and the spreadsheet renderer independently fails loudly if such a
+  workbook were actually written again (missing mapped frame);
 * ``sheet_mappings[*].canonical_frame`` referencing a removed frame is
   *not* a conflict -- a source frame may be legitimately removed after a
   lossless projection;
@@ -227,7 +232,12 @@ def execute_final_domain_cleanup(frames: Frames) -> Frames:
     )
 
     removal = _resolve_removal_set(frames, drop_names=drop_names, keep_names=keep_names)
-    _fail_on_workbook_view_conflicts(meta, removal)
+    # Only drop-commanded frames conflict with explicit view mappings: two
+    # targeted declarations contradicting each other. Keep-mode implied
+    # removals coexist with (possibly reimported, stale) view mappings; the
+    # spreadsheet renderer still fails loudly on missing mapped frames if
+    # such a workbook is written again.
+    _fail_on_workbook_view_conflicts(meta, set(drop_names) & removal)
 
     out: Frames = {key: value for key, value in frames.items() if key not in removal}
     new_meta = dict(meta)
@@ -283,15 +293,17 @@ def _resolve_removal_set(
     }
 
 
-def _fail_on_workbook_view_conflicts(meta: Mapping[str, Any], removal: set[str]) -> None:
-    """Fail when an explicit workbook mapping references a removed frame.
+def _fail_on_workbook_view_conflicts(meta: Mapping[str, Any], dropped: set[str]) -> None:
+    """Fail when an explicit workbook mapping references a drop-commanded frame.
 
     Checks ``workbook_view.sheets[*].frame`` and
-    ``workbook_view.sheet_mappings[*].frame``. ``canonical_frame`` references
-    are intentionally not checked: a source frame may be legitimately removed
-    after a lossless projection.
+    ``workbook_view.sheet_mappings[*].frame`` against explicitly
+    drop-commanded frames only; keep-mode implied removals are exempt (see
+    module docstring). Legacy ``canonical_frame`` references are intentionally
+    not checked: a source frame may be legitimately removed after a lossless
+    projection.
     """
-    if not removal:
+    if not dropped:
         return
     view = meta.get("workbook_view")
     if not isinstance(view, Mapping):
@@ -306,7 +318,7 @@ def _fail_on_workbook_view_conflicts(meta: Mapping[str, Any], removal: set[str])
             if isinstance(entry, Mapping) and isinstance(entry.get("frame"), str):
                 mapped.add(entry["frame"])
 
-    conflicts = sorted(removal.intersection(mapped))
+    conflicts = sorted(dropped.intersection(mapped))
     if conflicts:
         raise ValueError(
             f"Cleanup conflict: frame(s) {conflicts!r} are scheduled for "

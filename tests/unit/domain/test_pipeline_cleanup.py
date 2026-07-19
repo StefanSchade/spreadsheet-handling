@@ -241,6 +241,41 @@ def test_persisted_sheet_mapping_of_dropped_frame_fails() -> None:
         execute_final_domain_cleanup(frames)
 
 
+def test_keep_mode_implied_removal_coexists_with_reimported_view_mappings() -> None:
+    # A reverse pipeline reads back a workbook whose persisted workbook_view
+    # still maps view frames that keep mode discards. Those implied removals
+    # are not targeted contradictions and must not fail; the renderer guards
+    # any future workbook write independently.
+    frames = _frames(
+        _meta={
+            "workbook_view": {
+                "sheets": [{"frame": "relation_source", "sheet": "Relations"}],
+                "sheet_mappings": [{"sheet": "Relations", "frame": "relation_source"}],
+            }
+        }
+    )
+    frames = configure_pipeline_cleanup(frames, keep_frames=["stories", "characters"])
+
+    cleaned = execute_final_domain_cleanup(frames)
+
+    assert sorted(cleaned) == ["_meta", "characters", "stories"]
+
+
+def test_drop_command_conflicts_with_view_mapping_even_in_keep_mode() -> None:
+    frames = _frames(
+        _meta={
+            "workbook_view": {
+                "sheets": [{"frame": "relation_source", "sheet": "Relations"}],
+            }
+        }
+    )
+    mark_frames_for_cleanup(frames, ["relation_source"])
+    frames = configure_pipeline_cleanup(frames, keep_frames=["stories", "characters"])
+
+    with pytest.raises(ValueError, match="explicitly mapped"):
+        execute_final_domain_cleanup(frames)
+
+
 def test_canonical_frame_reference_to_dropped_frame_is_not_a_conflict() -> None:
     # A source frame may be legitimately removed after a lossless projection;
     # sheet_mappings[*].canonical_frame referencing it must not fail cleanup.
