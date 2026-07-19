@@ -214,3 +214,59 @@ def test_sparse_expand_supports_custom_blank_placeholder() -> None:
     assert out["matrix"].to_dict(orient="records") == [
         {"feature_id": "f1", "P-001": "nein"},
     ]
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestSparseAmbiguityCountsAllFrameMatches:
+    """Uniform family policy: every mapping entry claiming the matrix counts.
+
+    Partial entries (without a usable column_keys payload) participate in
+    ambiguity; there is no usable-payload precedence.
+    """
+
+    @staticmethod
+    def _matrix_frames(meta_entries: dict) -> dict:
+        return {
+            "matrix": pd.DataFrame({"feature_id": ["f1"], "P-001": ["nein"]}),
+            "_meta": {"xref_crosstable": meta_entries},
+        }
+
+    def test_one_complete_and_one_partial_entry_fail(self) -> None:
+        frames = self._matrix_frames(
+            {
+                "complete": {"matrix": "matrix", "column_keys": ["P-001"]},
+                "partial": {"matrix": "matrix"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+            sparse_collapse(frames, frame="matrix", default_value="nein")
+
+    def test_two_partial_entries_fail(self) -> None:
+        frames = self._matrix_frames(
+            {
+                "partial_a": {"matrix": "matrix"},
+                "partial_b": {"matrix": "matrix", "row_keys": ["feature_id"]},
+            }
+        )
+
+        with pytest.raises(ValueError, match="Ambiguous xref_crosstable metadata"):
+            sparse_collapse(frames, frame="matrix", default_value="nein")
+
+    def test_single_partial_entry_still_requires_explicit_columns(self) -> None:
+        frames = self._matrix_frames({"partial": {"matrix": "matrix"}})
+
+        with pytest.raises(ValueError, match="requires explicit columns"):
+            sparse_collapse(frames, frame="matrix", default_value="nein")
+
+    def test_preferred_exact_config_id_bypasses_frame_matching(self) -> None:
+        frames = self._matrix_frames(
+            {
+                "matrix": {"matrix": "matrix", "column_keys": ["P-001"]},
+                "other": {"matrix": "matrix", "column_keys": ["P-001"]},
+            }
+        )
+
+        out = sparse_collapse(frames, frame="matrix", default_value="nein")
+
+        assert out["matrix"]["P-001"].tolist() == [""]

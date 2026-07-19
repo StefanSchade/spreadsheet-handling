@@ -297,21 +297,23 @@ def _xref_column_keys_for_frame(
         column_keys = preferred.get("column_keys")
         return list(column_keys) if isinstance(column_keys, list) else None
 
-    matches: list[tuple[Any, list[Any]]] = []
+    # Uniform family ambiguity policy: count every mapping entry claiming
+    # the matrix identity before inspecting whether it carries a usable
+    # column_keys payload. Partial entries participate in ambiguity; no
+    # usable-payload precedence.
+    matches: list[tuple[Any, Mapping[str, Any]]] = []
     for key, config in configs.items():
-        if not isinstance(config, Mapping) or config.get("matrix") != frame:
-            continue
-        column_keys = config.get("column_keys")
-        if isinstance(column_keys, list):
-            matches.append((key, list(column_keys)))
+        if isinstance(config, Mapping) and config.get("matrix") == frame:
+            matches.append((key, config))
     if len(matches) > 1:
         match_names = [key for key, _ in matches]
         raise ValueError(
             f"Ambiguous xref_crosstable metadata for matrix frame {frame!r}: "
             f"{match_names!r}. Provide sparse columns or name a matching transform."
         )
-    if len(matches) == 1:
-        return matches[0][1]
+    if matches:
+        column_keys = matches[0][1].get("column_keys")
+        return list(column_keys) if isinstance(column_keys, list) else None
     return None
 
 

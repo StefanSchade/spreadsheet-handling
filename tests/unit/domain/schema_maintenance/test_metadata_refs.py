@@ -636,6 +636,58 @@ class TestXrefCrosstableReferences:
         assert result.report.blocked
         assert result.report.failures[0].code == "malformed_meta"
 
+    def test_matrix_column_key_drop_blocks(self) -> None:
+        meta = {
+            "xref_crosstable": {
+                "characters_view": {
+                    "relation": "places",
+                    "matrix": "characters",
+                    "row_keys": ["id"],
+                    "column_keys": ["name"],
+                }
+            }
+        }
+
+        result = drop_column(_base_frames(meta), _drop(prune=True))
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_dense_columns_from_key_rename_on_axis_frame_blocks(self) -> None:
+        meta = self._xref_meta(
+            row_keys=["id"],
+            dense_axes={"columns_from": {"frame": "characters", "key": "name"}},
+        )
+
+        result = rename_column(_base_frames(meta), _rename())
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_dense_columns_from_keys_plural_drop_on_axis_frame_blocks(self) -> None:
+        meta = self._xref_meta(
+            row_keys=["id"],
+            dense_axes={"columns_from": {"frame": "characters", "keys": ["name"]}},
+        )
+
+        result = drop_column(_base_frames(meta), _drop(prune=True))
+
+        assert result.report.blocked
+        assert result.report.failures[0].code == "blocking_metadata_reference"
+
+    def test_blocked_xref_reference_does_not_mutate_input_metadata(self) -> None:
+        import copy
+
+        meta = self._xref_meta()
+        frames = _base_frames(meta)
+        snapshot = copy.deepcopy(frames["_meta"])
+
+        result = rename_column(frames, _rename())
+
+        assert result.report.blocked
+        assert frames["_meta"] == snapshot
+        assert result.frames["_meta"] == snapshot
+
     def test_non_mapping_individual_entry_is_tolerated(self) -> None:
         # Characterization: a non-mapping entry has no valid XRef reference
         # shape; runtime consumers skip it, and schema maintenance does the

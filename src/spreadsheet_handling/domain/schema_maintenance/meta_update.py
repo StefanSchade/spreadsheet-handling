@@ -714,7 +714,7 @@ def _handle_xref_crosstable(
 ) -> None:
     """Block schema changes that touch *real* XRef intent references.
 
-    The XRef intent contract references columns in exactly three places:
+    The XRef intent contract references columns in these places:
 
     * ``row_keys`` — shared row-identity vocabulary of the ``relation`` and
       ``matrix`` frames (one intent list serves both sides, so a one-sided
