@@ -65,7 +65,6 @@ def test_meta_registry_seeds_current_known_entries():
         "constraints",
         "legend_blocks",
         "xref_crosstable",
-        "cell_codecs",
         "compact_multiaxis",
         "sparse_defaults",
         "freeze_header",

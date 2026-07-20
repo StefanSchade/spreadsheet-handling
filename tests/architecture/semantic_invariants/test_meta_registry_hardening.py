@@ -89,7 +89,6 @@ def test_meta_registry_current_seed_profiles_stay_explicit():
         "constraints": ("meta_canonical", "canonical_meta"),
         "legend_blocks": ("meta_canonical", "canonical_meta"),
         "xref_crosstable": ("meta_canonical", "canonical_meta"),
-        "cell_codecs": ("meta_canonical", "canonical_meta"),
         "compact_multiaxis": ("meta_canonical", "canonical_meta"),
         "split_by_discriminator": ("meta_canonical", "canonical_meta"),
         "sparse_defaults": ("meta_canonical", "canonical_meta"),
