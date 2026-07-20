@@ -28,10 +28,69 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values_equal
+from spreadsheet_handling.domain.tabular import (
+    ensure_unique_field_declaration,
+    ensure_unique_physical_column_labels,
+    is_scalar_addressable_label,
+)
 
 from .scalar import parse_cell_value, serialize_cell_value
 
+# Cell Codec shares the physical-frame column-label boundary with the other
+# tabular-domain families (see ``domain/tabular``): physical labels must be
+# non-missing, hashable, uniquely and deterministically comparable, and
+# scalar-addressable. This is distinct from the string-oriented contract on
+# participating *cell values*.
+_ensure_unique_physical_labels = ensure_unique_physical_column_labels
+
 Frames = dict[str, Any]
+
+
+class _Unset:
+    """Sentinel marking 'argument not explicitly supplied'.
+
+    Distinct from a real default so the public entry points can tell a caller
+    that explicitly passed a historical parameter from one that did not touch
+    it, without redesigning pipeline argument binding.
+    """
+
+    _instance: _Unset | None = None
+
+    def __new__(cls) -> _Unset:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<unset>"
+
+
+_UNSET: Any = _Unset()
+
+
+def _supplied(value: Any, default: Any) -> Any:
+    """Resolve a sentinel-defaulted argument to its real default."""
+    return default if value is _UNSET else value
+
+
+def _reject_historical_args_with_intent(supplied: Mapping[str, Any]) -> None:
+    """Enforce position/historical mutual exclusion at the public entry points.
+
+    ``codec_intent`` selects the position-based contract; supplying any
+    historical code-row parameter alongside it is a configuration conflict,
+    not silent position precedence. Only explicitly supplied arguments (not
+    untouched function defaults) count.
+    """
+    conflicting = sorted(
+        name for name, value in supplied.items() if value is not _UNSET
+    )
+    if conflicting:
+        raise ValueError(
+            "codec_intent (position-based) is mutually exclusive with the "
+            "historical code-row parameters, but was supplied together with: "
+            f"{conflicting!r}. Use either codec_intent or the historical "
+            "mode-based parameters, not both."
+        )
 
 
 def decode_cell_values(
@@ -40,25 +99,43 @@ def decode_cell_values(
     source: str,
     output: str,
     codec_intent: Mapping[str, Any] | None = None,
-    value: str = "value",
-    code: str = "code",
-    passthrough_columns: Iterable[Any] | None = None,
-    drop_empty: bool = True,
-    mode: str | None = None,
-    delimiter: str = "-",
-    allowed_codes: Iterable[Any] | None = None,
-    allowed_tokens: Iterable[Any] | None = None,
-    allowed_from_legend: str | None = None,
-    normalize_case: str | None = None,
-    strip: bool = False,
+    value: Any = _UNSET,
+    code: Any = _UNSET,
+    passthrough_columns: Any = _UNSET,
+    drop_empty: Any = _UNSET,
+    mode: Any = _UNSET,
+    delimiter: Any = _UNSET,
+    allowed_codes: Any = _UNSET,
+    allowed_tokens: Any = _UNSET,
+    allowed_from_legend: Any = _UNSET,
+    normalize_case: Any = _UNSET,
+    strip: Any = _UNSET,
     name: str | None = None,
 ) -> Frames:
     """Decode a compact column using explicit codec intent.
 
-    Historical code/token mode remains available only when ``mode`` is passed
-    explicitly by current composition callers.
+    The position-based ``codec_intent`` and the historical code-row mode-based
+    parameters are mutually exclusive: supplying both fails deterministically
+    rather than silently applying position precedence. Historical code/token
+    mode remains available only when ``mode`` is passed explicitly by current
+    composition callers.
     """
     if codec_intent is not None:
+        _reject_historical_args_with_intent(
+            {
+                "value": value,
+                "code": code,
+                "passthrough_columns": passthrough_columns,
+                "drop_empty": drop_empty,
+                "mode": mode,
+                "delimiter": delimiter,
+                "allowed_codes": allowed_codes,
+                "allowed_tokens": allowed_tokens,
+                "allowed_from_legend": allowed_from_legend,
+                "normalize_case": normalize_case,
+                "strip": strip,
+            }
+        )
         return _decode_position_based(
             frames,
             source=source,
@@ -66,23 +143,23 @@ def decode_cell_values(
             codec_intent=codec_intent,
             name=name,
         )
-    if mode is None:
+    if mode is _UNSET or mode is None:
         raise ValueError("codec intent is required for decoding compact cell values")
     return _decode_legacy_code_rows(
         frames,
         source=source,
         output=output,
-        value=value,
-        code=code,
-        passthrough_columns=passthrough_columns,
-        drop_empty=drop_empty,
+        value=_supplied(value, "value"),
+        code=_supplied(code, "code"),
+        passthrough_columns=_supplied(passthrough_columns, None),
+        drop_empty=_supplied(drop_empty, True),
         mode=mode,
-        delimiter=delimiter,
-        allowed_codes=allowed_codes,
-        allowed_tokens=allowed_tokens,
-        allowed_from_legend=allowed_from_legend,
-        normalize_case=normalize_case,
-        strip=strip,
+        delimiter=_supplied(delimiter, "-"),
+        allowed_codes=_supplied(allowed_codes, None),
+        allowed_tokens=_supplied(allowed_tokens, None),
+        allowed_from_legend=_supplied(allowed_from_legend, None),
+        normalize_case=_supplied(normalize_case, None),
+        strip=_supplied(strip, False),
         name=name,
     )
 
@@ -108,12 +185,16 @@ def _decode_legacy_code_rows(
     del name
     source_frame = _require_frame(frames, source)
     _ensure_unique_physical_labels(source_frame, frame_name=source)
+    _ensure_addressable_selector(value, field_name="value")
     _ensure_columns(source_frame, [value], frame_name=source)
     passthrough = (
         _as_list(passthrough_columns, "passthrough_columns")
         if passthrough_columns is not None
         else [column for column in source_frame.columns if column != value]
     )
+    # Reject duplicate/unaddressable passthrough declarations before output so
+    # duplicate declarations never create duplicate output columns.
+    _ensure_configured_field_labels(passthrough, field_name="passthrough_columns")
     _ensure_columns(source_frame, passthrough, frame_name=source)
     _ensure_output_name_does_not_collide(passthrough, code=code)
 
@@ -151,25 +232,43 @@ def encode_cell_values(
     source: str,
     output: str,
     codec_intent: Mapping[str, Any] | None = None,
-    group_by: str | Iterable[Any] | None = None,
-    code: str = "code",
-    value: str = "value",
-    mode: str | None = None,
-    delimiter: str = "-",
-    allowed_codes: Iterable[Any] | None = None,
-    allowed_tokens: Iterable[Any] | None = None,
-    allowed_from_legend: str | None = None,
-    canonical_order: Iterable[Any] | None = None,
-    normalize_case: str | None = None,
-    strip: bool = False,
+    group_by: Any = _UNSET,
+    code: Any = _UNSET,
+    value: Any = _UNSET,
+    mode: Any = _UNSET,
+    delimiter: Any = _UNSET,
+    allowed_codes: Any = _UNSET,
+    allowed_tokens: Any = _UNSET,
+    allowed_from_legend: Any = _UNSET,
+    canonical_order: Any = _UNSET,
+    normalize_case: Any = _UNSET,
+    strip: Any = _UNSET,
     name: str | None = None,
 ) -> Frames:
     """Encode configured slot columns into a compact column.
 
-    Historical code/token mode remains available only when ``mode`` is passed
-    explicitly by current composition callers.
+    The position-based ``codec_intent`` and the historical code-row mode-based
+    parameters are mutually exclusive: supplying both fails deterministically
+    rather than silently applying position precedence. Historical code/token
+    mode remains available only when ``mode`` is passed explicitly by current
+    composition callers, and requires ``group_by``.
     """
     if codec_intent is not None:
+        _reject_historical_args_with_intent(
+            {
+                "group_by": group_by,
+                "code": code,
+                "value": value,
+                "mode": mode,
+                "delimiter": delimiter,
+                "allowed_codes": allowed_codes,
+                "allowed_tokens": allowed_tokens,
+                "allowed_from_legend": allowed_from_legend,
+                "canonical_order": canonical_order,
+                "normalize_case": normalize_case,
+                "strip": strip,
+            }
+        )
         return _encode_position_based(
             frames,
             source=source,
@@ -177,25 +276,25 @@ def encode_cell_values(
             codec_intent=codec_intent,
             name=name,
         )
-    if mode is None:
+    if mode is _UNSET or mode is None:
         raise ValueError("codec intent is required for encoding compact cell values")
-    if group_by is None:
+    if group_by is _UNSET or group_by is None:
         raise ValueError("group_by is required for legacy code-row encoding")
     return _encode_legacy_code_rows(
         frames,
         source=source,
         output=output,
         group_by=group_by,
-        code=code,
-        value=value,
+        code=_supplied(code, "code"),
+        value=_supplied(value, "value"),
         mode=mode,
-        delimiter=delimiter,
-        allowed_codes=allowed_codes,
-        allowed_tokens=allowed_tokens,
-        allowed_from_legend=allowed_from_legend,
-        canonical_order=canonical_order,
-        normalize_case=normalize_case,
-        strip=strip,
+        delimiter=_supplied(delimiter, "-"),
+        allowed_codes=_supplied(allowed_codes, None),
+        allowed_tokens=_supplied(allowed_tokens, None),
+        allowed_from_legend=_supplied(allowed_from_legend, None),
+        canonical_order=_supplied(canonical_order, None),
+        normalize_case=_supplied(normalize_case, None),
+        strip=_supplied(strip, False),
         name=name,
     )
 
@@ -222,7 +321,8 @@ def _encode_legacy_code_rows(
     source_frame = _require_frame(frames, source)
     _ensure_unique_physical_labels(source_frame, frame_name=source)
     group_cols = _as_list(group_by, "group_by")
-    _ensure_unique_field_list(group_cols, "group_by")
+    _ensure_configured_field_labels(group_cols, field_name="group_by")
+    _ensure_addressable_selector(code, field_name="code")
     _ensure_columns(source_frame, [*group_cols, code], frame_name=source)
     _ensure_output_name_does_not_collide(group_cols, code=value)
 
@@ -326,44 +426,41 @@ def _meta_from_frames(frames: Mapping[str, Any]) -> Mapping[str, Any]:
     return meta if isinstance(meta, Mapping) else {}
 
 
-def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
-    """Reject duplicate physical column labels with a codec diagnostic.
+def _ensure_configured_field_labels(columns: Iterable[Any], *, field_name: str) -> None:
+    """Duplicate + scalar-addressability guard for a configured selector list.
 
-    Duplicate labels make ``row[label]`` indexing non-scalar (a ``Series``),
-    which would corrupt encoded/decoded cell values silently. Equality-based
-    detection avoids hashing so unusual labels still get the deterministic
-    diagnostic instead of raw pandas behavior.
+    Configured selectors (``participating_columns``, ``group_by``,
+    ``passthrough_columns``) must be unique and must be able to address a
+    scalar column before any pandas membership/selection runs, so an
+    unhashable/missing/ambiguous selector receives a deterministic codec
+    diagnostic instead of a raw pandas ``TypeError`` from
+    ``_ensure_columns`` membership. Duplicate declarations must never create
+    duplicate output columns.
     """
-    duplicates: list[Any] = []
-    seen: list[Any] = []
-    for label in df.columns.tolist():
-        if any(_values_equal(label, existing) for existing in seen):
-            if not any(_values_equal(label, existing) for existing in duplicates):
-                duplicates.append(label)
-        else:
-            seen.append(label)
-    if duplicates:
+    materialized = list(columns)
+    ensure_unique_field_declaration(materialized, field_name=field_name)
+    unaddressable = [
+        column for column in materialized if not is_scalar_addressable_label(column)
+    ]
+    if unaddressable:
         raise ValueError(
-            f"Frame {frame_name!r} has duplicate physical column label(s) "
-            f"{duplicates!r}; duplicate columns cannot be addressed as "
-            "scalar fields"
+            f"{field_name} contains label(s) that cannot address a scalar "
+            f"column: {unaddressable!r}; configured labels must be non-missing, "
+            "hashable, and deterministically comparable"
         )
 
 
-def _ensure_unique_field_list(values: list[Any], field_name: str) -> None:
-    """Reject duplicate entries in a configured field list."""
-    duplicates: list[Any] = []
-    seen: list[Any] = []
-    for value in values:
-        if any(_values_equal(value, existing) for existing in seen):
-            if not any(_values_equal(value, existing) for existing in duplicates):
-                duplicates.append(value)
-        else:
-            seen.append(value)
-    if duplicates:
+def _ensure_addressable_selector(label: Any, *, field_name: str) -> None:
+    """Scalar-addressability guard for a single configured column selector.
+
+    Ensures a configured scalar selector (``code`` / ``value``) can address a
+    column before it reaches pandas membership/selection.
+    """
+    if not is_scalar_addressable_label(label):
         raise ValueError(
-            f"{field_name} contains duplicate field(s) {duplicates!r}; "
-            "configured fields must be unique"
+            f"{field_name} label {label!r} cannot address a scalar column; "
+            "configured labels must be non-missing, hashable, and "
+            "deterministically comparable"
         )
 
 
@@ -451,7 +548,9 @@ def _position_intent(codec_intent: Mapping[str, Any]) -> dict[str, Any]:
         codec_intent.get("participating_columns"),
         "codec_intent.participating_columns",
     )
-    _ensure_unique_field_list(participating_columns, "codec_intent.participating_columns")
+    _ensure_configured_field_labels(
+        participating_columns, field_name="codec_intent.participating_columns"
+    )
     compact_column = codec_intent.get("compact_column")
     if not isinstance(compact_column, str) or compact_column == "":
         raise ValueError("codec_intent.compact_column must be a non-empty string")
@@ -466,10 +565,23 @@ def _position_intent(codec_intent: Mapping[str, Any]) -> dict[str, Any]:
     absent_value = codec_intent.get("absent_value")
     if not isinstance(absent_value, str) or absent_value == "":
         raise ValueError("codec_intent.absent_value must be a non-empty string")
-    if separator in absent_value:
+    # No-escaping grammar soundness: encode joins tokens (real values or the
+    # absent marker) with the separator; decode splits on the exact separator.
+    # If either marker contains the other, a run of marker/separator characters
+    # re-splits ambiguously (e.g. separator "--", absent "-", values
+    # ["A", "", "B"] encode to "A-----B", which decode splits into an empty
+    # token). Rejecting overlap in *either* direction guarantees that no token
+    # contains the separator and none is empty, so every accepted encode output
+    # decodes back to the same tokens under the identical intent. Real values
+    # containing the separator or equal to the absent marker are rejected per
+    # row in _encode_compact_value, so no further ordinary join/split ambiguity
+    # remains in this grammar.
+    if separator in absent_value or absent_value in separator:
         raise ValueError(
-            f"codec_intent.absent_value {absent_value!r} must not contain the "
-            f"separator {separator!r}"
+            f"codec_intent.separator {separator!r} and absent_value "
+            f"{absent_value!r} must not overlap (neither may contain the "
+            "other); an overlapping no-escaping grammar can encode values that "
+            "cannot be decoded unambiguously"
         )
     return {
         "participating_columns": participating_columns,
