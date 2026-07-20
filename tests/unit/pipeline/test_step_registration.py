@@ -475,7 +475,7 @@ def test_cell_codec_steps_are_config_addressable() -> None:
     codec_intent = {
         "participating_columns": ["a", "b", "c"],
         "compact_column": "abc",
-        "separator": " / ",
+        "separator": "/",
         "absent_value": "-",
     }
     steps = build_steps_from_config(
@@ -501,7 +501,7 @@ def test_cell_codec_steps_are_config_addressable() -> None:
     out = run_pipeline(frames, steps)
 
     assert out["compact"].to_dict(orient="records") == [
-        {"id": "row-1", "abc": "A / B / C"},
+        {"id": "row-1", "abc": "A/B/C"},
     ]
     assert out["decoded"].to_dict(orient="records") == [
         {"id": "row-1", "a": "A", "b": "B", "c": "C"},

@@ -19,7 +19,7 @@ def _position_codec_intent() -> dict[str, object]:
     return {
         "participating_columns": ["a", "b", "c"],
         "compact_column": "abc",
-        "separator": " / ",
+        "separator": "/",
         "absent_value": "-",
     }
 
@@ -44,8 +44,8 @@ def test_position_based_contracts_configured_columns_into_compact_column() -> No
 
     # Then
     assert out["compact"].to_dict(orient="records") == [
-        {"id": "row-1", "abc": "A / B / C"},
-        {"id": "row-2", "abc": "A / - / C"},
+        {"id": "row-1", "abc": "A/B/C"},
+        {"id": "row-2", "abc": "A/-/C"},
     ]
 
 
@@ -68,7 +68,7 @@ def test_position_based_contract_preserves_non_participating_columns() -> None:
 
     # Then
     assert out["compact"].to_dict(orient="records") == [
-        {"id": "row-1", "note": "keep", "abc": "A / B / C"},
+        {"id": "row-1", "note": "keep", "abc": "A/B/C"},
     ]
 
 
@@ -77,8 +77,8 @@ def test_position_based_contract_expands_compact_column_to_configured_columns() 
     # Given
     frames = {
         "compact": pd.DataFrame([
-            {"id": "row-1", "abc": "A / B / C"},
-            {"id": "row-2", "abc": "A / - / C"},
+            {"id": "row-1", "abc": "A/B/C"},
+            {"id": "row-2", "abc": "A/-/C"},
         ])
     }
 
@@ -102,11 +102,11 @@ def test_position_based_contract_requires_codec_intent_for_decoding() -> None:
     # Given
     frames = {
         "compact": pd.DataFrame([
-            {"id": "row-1", "abc": "A / B / C"},
+            {"id": "row-1", "abc": "A/B/C"},
         ])
     }
 
-    # When / Then
+    # When/Then
     with pytest.raises(ValueError, match="codec intent"):
         decode_cell_values(
             frames,
@@ -121,11 +121,11 @@ def test_position_based_contract_rejects_wrong_token_count() -> None:
     # Given
     frames = {
         "compact": pd.DataFrame([
-            {"id": "row-1", "abc": "A / B"},
+            {"id": "row-1", "abc": "A/B"},
         ])
     }
 
-    # When / Then
+    # When/Then
     with pytest.raises(ValueError, match="token count"):
         decode_cell_values(
             frames,
@@ -153,7 +153,7 @@ def test_position_based_contract_rejects_helper_or_derived_participating_columns
         },
     }
 
-    # When / Then
+    # When/Then
     with pytest.raises(ValueError, match="helper|derived"):
         encode_cell_values(
             frames,
@@ -247,13 +247,13 @@ class TestNoPersistedCodecMetadata:
         # There is no metadata lookup: legacy payloads must not resurrect
         # decoding configuration.
         frames = {
-            "compact": pd.DataFrame([{"id": "r1", "abc": "A / B / C"}]),
+            "compact": pd.DataFrame([{"id": "r1", "abc": "A/B/C"}]),
             "_meta": {
                 "cell_codecs": {
                     "compact": {
                         "participating_columns": ["a", "b", "c"],
                         "compact_column": "abc",
-                        "separator": " / ",
+                        "separator": "/",
                         "absent_value": "-",
                     }
                 }
@@ -301,8 +301,8 @@ class TestPositionIntentDeclarationGuards:
             self._encode(self._frames(), compact_column="id")
 
     def test_absent_value_containing_separator_fails(self) -> None:
-        # separator "/" is contained in absent_value "-/-": overlap rejected.
-        with pytest.raises(ValueError, match="must not overlap"):
+        # one-char separator "/" is contained in absent_value "-/-": rejected.
+        with pytest.raises(ValueError, match="must not contain the separator"):
             self._encode(self._frames(), separator="/", absent_value="-/-")
 
     def test_duplicate_physical_source_labels_fail(self) -> None:
@@ -317,7 +317,7 @@ class TestPositionIntentDeclarationGuards:
 
     def test_decode_overlap_with_existing_columns_fails(self) -> None:
         frames = {
-            "compact": pd.DataFrame([{"id": "r1", "a": "already", "abc": "A / B / C"}])
+            "compact": pd.DataFrame([{"id": "r1", "a": "already", "abc": "A/B/C"}])
         }
 
         with pytest.raises(ValueError, match="already"):
@@ -375,11 +375,11 @@ class TestStringOrientedValueContract:
             ]
         )
 
-        assert out["compact"]["abc"].tolist() == ["- / B / C", "- / B / C"]
+        assert out["compact"]["abc"].tolist() == ["-/B/C", "-/B/C"]
 
     def test_absent_decodes_to_empty_string_not_null(self) -> None:
         out = decode_cell_values(
-            {"compact": pd.DataFrame([{"id": "r1", "abc": "- / B / C"}])},
+            {"compact": pd.DataFrame([{"id": "r1", "abc": "-/B/C"}])},
             source="compact",
             output="expanded",
             codec_intent=_position_codec_intent(),
@@ -392,7 +392,7 @@ class TestStringOrientedValueContract:
     def test_separator_inside_value_fails_encoding(self) -> None:
         # No escaping or quoting exists; ambiguous encodes are rejected.
         with pytest.raises(ValueError, match="contains codec separator"):
-            self._encode([{"id": "r1", "a": "A / X", "b": "B", "c": "C"}])
+            self._encode([{"id": "r1", "a": "A/X", "b": "B", "c": "C"}])
 
 
 @pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
@@ -658,7 +658,12 @@ class TestSharedPhysicalLabelBoundary:
 
 
 class TestPositionGrammarSoundness:
-    """B2: every value accepted by encode decodes unambiguously."""
+    """R002-B2: one-character separator makes every encode decodable.
+
+    The no-escaping grammar requires `codec_intent.separator` to be exactly one
+    Unicode character, so a separator occurrence cannot be formed across a
+    token/marker boundary.
+    """
 
     @staticmethod
     def _intent(separator: str, absent_value: str) -> dict:
@@ -669,8 +674,8 @@ class TestPositionGrammarSoundness:
             "absent_value": absent_value,
         }
 
-    def test_separator_contains_absent_rejected(self) -> None:
-        with pytest.raises(ValueError, match="must not overlap"):
+    def test_multi_character_separator_rejected(self) -> None:
+        with pytest.raises(ValueError, match="exactly one character"):
             encode_cell_values(
                 {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
                 source="s",
@@ -678,19 +683,33 @@ class TestPositionGrammarSoundness:
                 codec_intent=self._intent(separator="--", absent_value="-"),
             )
 
-    def test_absent_contains_separator_rejected(self) -> None:
-        with pytest.raises(ValueError, match="must not overlap"):
+    def test_review_002_cross_boundary_counterexample_rejected(self) -> None:
+        # separator="--", absent_value="~", values ["A-","B","C"] previously
+        # encoded to "A---B--C" and decoded to ["A","-B","C"]. The token "A-"
+        # ends in a separator prefix; the multi-character separator is now
+        # rejected at declaration validation.
+        with pytest.raises(ValueError, match="exactly one character"):
             encode_cell_values(
-                {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
+                {"s": pd.DataFrame([{"a": "A-", "b": "B", "c": "C"}])},
                 source="s",
                 output="out",
-                codec_intent=self._intent(separator="/", absent_value="-/-"),
+                codec_intent=self._intent(separator="--", absent_value="~"),
             )
 
-    def test_review_001_counterexample_now_rejected(self) -> None:
-        # separator="--", absent_value="-", values ["A","","B"] previously
-        # encoded to "A-----B" which then failed to decode.
-        with pytest.raises(ValueError, match="must not overlap"):
+    def test_multi_character_absent_prefix_counterexample_rejected(self) -> None:
+        # separator="--", absent_value="x-" also formed a cross-boundary
+        # separator; rejected because the separator is multi-character.
+        with pytest.raises(ValueError, match="exactly one character"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "", "c": "B"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="--", absent_value="x-"),
+            )
+
+    def test_review_001_counterexample_rejected_as_multi_char(self) -> None:
+        # separator="--", absent_value="-", values ["A","","B"].
+        with pytest.raises(ValueError, match="exactly one character"):
             encode_cell_values(
                 {"s": pd.DataFrame([{"a": "A", "b": "", "c": "B"}])},
                 source="s",
@@ -698,10 +717,49 @@ class TestPositionGrammarSoundness:
                 codec_intent=self._intent(separator="--", absent_value="-"),
             )
 
-    def test_valid_non_overlapping_declaration_roundtrips(self) -> None:
+    def test_absent_marker_containing_one_char_separator_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not contain the separator"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="/", absent_value="-/-"),
+            )
+
+    def test_separator_equal_absent_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must differ"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="|", absent_value="|"),
+            )
+
+    @pytest.mark.parametrize("separator", ["|", "/", ";"])
+    def test_valid_one_character_separators_roundtrip(self, separator: str) -> None:
+        intent = self._intent(separator=separator, absent_value="-")
+        frames = {
+            "s": pd.DataFrame(
+                [
+                    {"a": "A", "b": "", "c": "B"},
+                    {"a": "003", "b": "x", "c": None},
+                    {"a": "pre-post", "b": "1", "c": "2"},
+                ]
+            )
+        }
+        encoded = encode_cell_values(frames, source="s", output="packed_f", codec_intent=intent)
+        decoded = decode_cell_values(encoded, source="packed_f", output="round", codec_intent=intent)
+        assert decoded["round"][["a", "b", "c"]].to_dict(orient="records") == [
+            {"a": "A", "b": "", "c": "B"},
+            {"a": "003", "b": "x", "c": ""},
+            {"a": "pre-post", "b": "1", "c": "2"},
+        ]
+
+    def test_valid_encode_followed_by_identical_decode(self) -> None:
         intent = self._intent(separator="|", absent_value="-")
         frames = {"s": pd.DataFrame([{"a": "A", "b": "", "c": "B"}])}
         encoded = encode_cell_values(frames, source="s", output="packed_f", codec_intent=intent)
+        assert encoded["packed_f"]["packed"].tolist() == ["A|-|B"]
         decoded = decode_cell_values(encoded, source="packed_f", output="round", codec_intent=intent)
         assert decoded["round"][["a", "b", "c"]].to_dict(orient="records") == [
             {"a": "A", "b": "", "c": "B"}
@@ -795,6 +853,83 @@ class TestHistoricalDeclarationValidation:
             },
         )
         assert out["out"]["p"].tolist() == ["A|B"]
+
+
+class TestEffectiveValueMutualExclusion:
+    """R002-I3: effective-value mutual exclusion + typed public signatures."""
+
+    @staticmethod
+    def _pos() -> dict:
+        return {
+            "participating_columns": ["a", "b"],
+            "compact_column": "p",
+            "separator": "|",
+            "absent_value": "-",
+        }
+
+    def _frames(self) -> dict:
+        return {"s": pd.DataFrame([{"a": "A", "b": "B"}])}
+
+    def test_historical_defaults_alongside_codec_intent_allowed(self) -> None:
+        # Explicit historical values equal to their public defaults carry no
+        # distinct historical intent: the position path runs.
+        out = encode_cell_values(
+            self._frames(),
+            source="s",
+            output="out",
+            codec_intent=self._pos(),
+            delimiter="-",
+            strip=False,
+            code="code",
+            value="value",
+        )
+        assert out["out"]["p"].tolist() == ["A|B"]
+
+    def test_decode_historical_defaults_alongside_codec_intent_allowed(self) -> None:
+        frames = {"s": pd.DataFrame([{"p": "A|B"}])}
+        out = decode_cell_values(
+            frames,
+            source="s",
+            output="out",
+            codec_intent=self._pos(),
+            delimiter="-",
+            drop_empty=True,
+            strip=False,
+        )
+        assert out["out"][["a", "b"]].to_dict(orient="records") == [{"a": "A", "b": "B"}]
+
+    def test_nondefault_delimiter_alongside_codec_intent_rejected(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            encode_cell_values(
+                self._frames(), source="s", output="out",
+                codec_intent=self._pos(), delimiter=";",
+            )
+
+    def test_strip_true_alongside_codec_intent_rejected(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            encode_cell_values(
+                self._frames(), source="s", output="out",
+                codec_intent=self._pos(), strip=True,
+            )
+
+    def test_allowed_tokens_alongside_codec_intent_rejected(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            encode_cell_values(
+                self._frames(), source="s", output="out",
+                codec_intent=self._pos(), allowed_tokens=["A"],
+            )
+
+    def test_public_signatures_expose_typed_defaults_not_sentinel(self) -> None:
+        import inspect
+
+        for fn in (encode_cell_values, decode_cell_values):
+            rendered = str(inspect.signature(fn))
+            assert "unset" not in rendered.lower(), rendered
+            params = inspect.signature(fn).parameters
+            assert params["delimiter"].default == "-"
+            assert params["strip"].default is False
+            assert params["mode"].default is None
+            assert params["code"].default == "code"
 
 
 class TestGeneratedOutputLabelBoundary:

@@ -24,7 +24,7 @@ pytestmark = pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC
 CODEC_INTENT = {
     "participating_columns": ["delivery", "language", "auth"],
     "compact_column": "profile",
-    "separator": " / ",
+    "separator": "/",
     "absent_value": "-",
 }
 
@@ -76,9 +76,9 @@ def test_compact_cells_roundtrip_structured_attributes(
     )
     assert "cell_codecs" not in (loaded.get("_meta") or {})
     assert loaded["profiles_compact"]["profile"].tolist() == [
-        "SaaS / JP / OIDC",
-        "AppStore / - / LDAP",
-        "1 / EN / 2",
+        "SaaS/JP/OIDC",
+        "AppStore/-/LDAP",
+        "1/EN/2",
     ]
 
     reimport_out = tmp_path / f"reimported_{carrier}"
