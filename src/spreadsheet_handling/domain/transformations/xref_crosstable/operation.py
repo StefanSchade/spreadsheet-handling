@@ -85,6 +85,16 @@ def expand_xref(
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
     _ensure_unique_field_list(row_key_cols, "row_keys")
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
+    # Load and physical-validate the base relation before any output-name set
+    # construction or membership: a configured physical base field
+    # (``column_key`` / ``value``) may be an unhashable label such as a list,
+    # which must receive the deterministic XRef physical-label diagnostic
+    # rather than a raw ``TypeError`` from the set built inside
+    # ``_ensure_output_names_do_not_collide``.
+    base_frame = None
+    if base_relation is not None:
+        base_frame = _require_frame(frames, base_relation)
+        _ensure_unique_physical_labels(base_frame, frame_name=base_relation)
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
 
     if value_columns is not None:
@@ -137,9 +147,10 @@ def expand_xref(
                 value: cell_value,
             })
 
-    if base_relation is not None:
-        base_frame = _require_frame(frames, base_relation)
-        _ensure_unique_physical_labels(base_frame, frame_name=base_relation)
+    if base_frame is not None:
+        # Already loaded and physical-validated above (before the output-name
+        # collision check) so an unhashable configured base field is rejected
+        # with the XRef diagnostic before any set/membership construction.
         _ensure_columns(
             base_frame,
             [*row_key_cols, column_key, value],

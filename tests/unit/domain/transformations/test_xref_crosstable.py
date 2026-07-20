@@ -2162,6 +2162,10 @@ class TestMissingLikePhysicalLabelBoundary:
         assert list(frames["rel"].columns)[:3] == ["r", "k", "v"]
 
     def test_unhashable_base_relation_label_gets_contract_diagnostic(self) -> None:
+        # Unselected-extra case: the list label [1, 2] is an EXTRA base column,
+        # not the configured value/column_key field. This proves the whole base
+        # frame is physical-validated, independent of the selected-field case
+        # below.
         frames = {
             "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
             "base": pd.DataFrame(
@@ -2183,6 +2187,53 @@ class TestMissingLikePhysicalLabelBoundary:
         self._assert_no_cleanup(frames)
         assert "_meta" not in frames
         assert "rel" not in frames
+
+    def test_unhashable_selected_base_relation_value_field_gets_contract_diagnostic(
+        self,
+    ) -> None:
+        # Review 005 counterexample: the list label [1, 2] is the SELECTED
+        # `value` field. Previously _ensure_output_names_do_not_collide built
+        # the set {column_key, value} and raised a raw
+        # ``TypeError: unhashable type: 'list'`` before the base frame reached
+        # _ensure_unique_physical_labels. The base frame is now loaded and
+        # physical-validated before that collision check.
+        labels = np.empty(3, dtype=object)
+        labels[:] = ["r", "k", [1, 2]]
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame(
+                [["r9", "B", "kept"]],
+                columns=pd.Index(labels, dtype=object),
+            ),
+            "_meta": {"sentinel": {"keep": ["unchanged"]}},
+        }
+
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="out",
+                row_keys="r",
+                column_key="k",
+                value=[1, 2],
+                base_relation="base",
+                drop_source=True,
+            )
+
+        # No raw TypeError (pytest.raises above already asserts ValueError);
+        # no output frame, no XRef metadata, no cleanup command.
+        assert "out" not in frames
+        assert list(frames["_meta"].keys()) == ["sentinel"]
+        assert "xref_crosstable" not in frames["_meta"]
+        assert "pipeline_cleanup" not in frames["_meta"]
+        # Input frames and sentinel metadata unchanged.
+        assert frames["_meta"]["sentinel"] == {"keep": ["unchanged"]}
+        assert [type(col).__name__ for col in frames["base"].columns] == [
+            "str",
+            "str",
+            "list",
+        ]
+        assert frames["matrix"].to_dict(orient="records") == [{"r": "r1", "A": "x"}]
 
     def test_unhashable_physical_label_is_rejected_by_boundary(self) -> None:
         frame = pd.DataFrame(
