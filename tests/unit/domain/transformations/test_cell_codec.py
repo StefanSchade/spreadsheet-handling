@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -298,7 +301,8 @@ class TestPositionIntentDeclarationGuards:
             self._encode(self._frames(), compact_column="id")
 
     def test_absent_value_containing_separator_fails(self) -> None:
-        with pytest.raises(ValueError, match="must not contain the"):
+        # separator "/" is contained in absent_value "-/-": overlap rejected.
+        with pytest.raises(ValueError, match="must not overlap"):
             self._encode(self._frames(), separator="/", absent_value="-/-")
 
     def test_duplicate_physical_source_labels_fail(self) -> None:
@@ -449,3 +453,345 @@ class TestLegacyCodeRowContract:
                 group_by="key",
                 mode="whole_cell_code",
             )
+
+
+def _object_columns(labels: list) -> pd.Index:
+    """Build an object-dtype column Index preserving exotic label objects."""
+    arr = np.empty(len(labels), dtype=object)
+    arr[:] = labels
+    return pd.Index(arr, dtype=object)
+
+
+class TestSharedPhysicalLabelBoundary:
+    """B1: all four Cell Codec paths reject unaddressable physical labels.
+
+    Physical labels must be non-missing, hashable, uniquely and
+    deterministically comparable, and scalar-addressable -- but not
+    string-only (unique numeric labels stay valid). No physical label reaches
+    pandas membership/selection/grouping/row-indexing before the shared
+    boundary runs.
+    """
+
+    @staticmethod
+    def _assert_no_output_or_metadata(frames: dict, before_meta: object) -> None:
+        assert "out" not in frames
+        assert frames.get("_meta") == before_meta
+
+    def test_position_encode_duplicate_strings_rejected(self) -> None:
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=_object_columns(["a", "a"]))}
+        with pytest.raises(ValueError, match="duplicate physical column label"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_position_encode_duplicate_nan_rejected(self) -> None:
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=_object_columns([np.nan, np.nan]))}
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_position_encode_duplicate_pd_na_rejected(self) -> None:
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=_object_columns([pd.NA, pd.NA]))}
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_position_encode_selected_list_label_rejected(self) -> None:
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=_object_columns(["a", [1, 2]]))}
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_position_encode_selected_numpy_array_label_rejected(self) -> None:
+        frames = {
+            "s": pd.DataFrame([["x", "y"]], columns=_object_columns(["a", np.array([1, 2])]))
+        }
+        with pytest.raises(ValueError, match="ambiguous equality"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_position_encode_unique_numeric_labels_supported(self) -> None:
+        # Physical labels are not string-only: a unique numeric label is
+        # scalar-addressable and remains valid.
+        frames = {"s": pd.DataFrame([["A", "B"]], columns=_object_columns(["a", 7]))}
+        out = encode_cell_values(
+            frames,
+            source="s",
+            output="out",
+            codec_intent={
+                "participating_columns": ["a"],
+                "compact_column": "p",
+                "separator": "|",
+                "absent_value": "-",
+            },
+        )
+        # numeric label 7 is a passthrough column preserved on the output
+        assert 7 in out["out"].columns
+
+    def test_position_decode_selected_list_label_rejected(self) -> None:
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=_object_columns(["p", [1, 2]]))}
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            decode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+    def test_historical_encode_duplicate_nan_corruption_closed(self) -> None:
+        # Review 001 corruption case: two physical NaN labels with both
+        # group_by and code addressing NaN previously made row[NaN] a Series
+        # and serialized its string representation as the cell. Now rejected.
+        frames = {
+            "s": pd.DataFrame(
+                [["G", "x", "y"]], columns=_object_columns(["g", np.nan, np.nan])
+            ),
+            "_meta": {"sentinel": {"keep": ["unchanged"]}},
+        }
+        before_frame = frames["s"].copy()
+        before_meta = copy.deepcopy(frames["_meta"])
+
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                group_by="g",
+                code=np.nan,
+                value="v",
+                mode="whole_cell_code",
+            )
+
+        assert "out" not in frames
+        assert "cell_codecs" not in frames["_meta"]
+        assert frames["_meta"] == before_meta
+        assert frames["s"].equals(before_frame)
+        # The column labels are still the two NaN objects (no Series serialized).
+        assert frames["s"].shape == before_frame.shape
+
+    def test_historical_decode_selected_list_label_rejected(self) -> None:
+        frames = {
+            "s": pd.DataFrame([["x", "y"]], columns=_object_columns(["value", [1, 2]]))
+        }
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            decode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                mode="whole_cell_code",
+            )
+        assert "out" not in frames
+
+    def test_tuple_columns_rejected_by_flat_frame_guard(self) -> None:
+        # Tuple/MultiIndex operation surfaces are deliberately rejected by the
+        # flat-frame guard (not promised by this slice), independently of the
+        # scalar-addressable physical-label boundary.
+        frames = {"s": pd.DataFrame([["x", "y"]], columns=[("a", "b"), ("c", "d")])}
+        with pytest.raises(ValueError, match="MultiIndex/tuple columns"):
+            encode_cell_values(
+                frames,
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": [("a", "b")],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+            )
+        assert "out" not in frames
+
+
+class TestPositionGrammarSoundness:
+    """B2: every value accepted by encode decodes unambiguously."""
+
+    @staticmethod
+    def _intent(separator: str, absent_value: str) -> dict:
+        return {
+            "participating_columns": ["a", "b", "c"],
+            "compact_column": "packed",
+            "separator": separator,
+            "absent_value": absent_value,
+        }
+
+    def test_separator_contains_absent_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not overlap"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="--", absent_value="-"),
+            )
+
+    def test_absent_contains_separator_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not overlap"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "B", "c": "C"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="/", absent_value="-/-"),
+            )
+
+    def test_review_001_counterexample_now_rejected(self) -> None:
+        # separator="--", absent_value="-", values ["A","","B"] previously
+        # encoded to "A-----B" which then failed to decode.
+        with pytest.raises(ValueError, match="must not overlap"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "A", "b": "", "c": "B"}])},
+                source="s",
+                output="out",
+                codec_intent=self._intent(separator="--", absent_value="-"),
+            )
+
+    def test_valid_non_overlapping_declaration_roundtrips(self) -> None:
+        intent = self._intent(separator="|", absent_value="-")
+        frames = {"s": pd.DataFrame([{"a": "A", "b": "", "c": "B"}])}
+        encoded = encode_cell_values(frames, source="s", output="packed_f", codec_intent=intent)
+        decoded = decode_cell_values(encoded, source="packed_f", output="round", codec_intent=intent)
+        assert decoded["round"][["a", "b", "c"]].to_dict(orient="records") == [
+            {"a": "A", "b": "", "c": "B"}
+        ]
+
+
+class TestHistoricalDeclarationValidation:
+    """I1/I2/I3: historical declaration validation before data shortcuts."""
+
+    def test_split_tokens_empty_group_encode_validates_delimiter(self) -> None:
+        # I1: delimiter="" must fail even for an all-empty group (empty fast
+        # path must not skip delimiter validation).
+        with pytest.raises(ValueError, match="non-empty delimiter"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"g": "G", "code": ""}])},
+                source="s",
+                output="out",
+                group_by="g",
+                mode="split_tokens",
+                delimiter="",
+            )
+
+    def test_split_tokens_empty_cell_decode_validates_delimiter(self) -> None:
+        # I1: delimiter="" must fail for an empty compact cell with
+        # drop_empty=False (data-independent declaration validity).
+        with pytest.raises(ValueError, match="non-empty delimiter"):
+            decode_cell_values(
+                {"s": pd.DataFrame([{"id": "1", "value": ""}])},
+                source="s",
+                output="out",
+                mode="split_tokens",
+                delimiter="",
+                drop_empty=False,
+            )
+
+    def test_duplicate_passthrough_declarations_rejected(self) -> None:
+        # I2: duplicate passthrough must never create duplicate output columns.
+        with pytest.raises(ValueError, match="duplicate field"):
+            decode_cell_values(
+                {"s": pd.DataFrame([{"id": "1", "value": "x"}])},
+                source="s",
+                output="out",
+                mode="whole_cell_code",
+                passthrough_columns=["id", "id"],
+            )
+
+    def test_codec_intent_with_historical_mode_rejected(self) -> None:
+        # I3: mutual exclusion enforced, not silent position precedence.
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            encode_cell_values(
+                {"s": pd.DataFrame([{"a": "x"}])},
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+                mode="whole_cell_code",
+                group_by="a",
+            )
+
+    def test_codec_intent_with_historical_group_by_rejected(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            decode_cell_values(
+                {"s": pd.DataFrame([{"a": "x", "p": "y"}])},
+                source="s",
+                output="out",
+                codec_intent={
+                    "participating_columns": ["a"],
+                    "compact_column": "p",
+                    "separator": "|",
+                    "absent_value": "-",
+                },
+                passthrough_columns=["a"],
+            )
+
+    def test_codec_intent_alone_still_works(self) -> None:
+        # Untouched historical defaults are not caller intent: position path
+        # works with only codec_intent supplied.
+        out = encode_cell_values(
+            {"s": pd.DataFrame([{"a": "A", "b": "B"}])},
+            source="s",
+            output="out",
+            codec_intent={
+                "participating_columns": ["a", "b"],
+                "compact_column": "p",
+                "separator": "|",
+                "absent_value": "-",
+            },
+        )
+        assert out["out"]["p"].tolist() == ["A|B"]

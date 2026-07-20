@@ -47,6 +47,12 @@ def parse_cell_value(
 ) -> ParsedCellValue:
     """Parse and validate one compact cell string according to explicit config."""
     _ensure_valid_mode(mode)
+    # Validate the explicit delimiter before any data-dependent shortcut: an
+    # empty compact cell must not let an invalid delimiter="" pass just because
+    # the empty fast path returns early. whole_cell_code does not use the
+    # delimiter, so its behavior is unchanged.
+    if mode == _SPLIT_TOKENS:
+        _ensure_delimiter(delimiter)
     text = _cell_to_text(cell_value, strip=strip, normalize_case=normalize_case)
     if text == "":
         return ParsedCellValue(mode=mode, values=())
@@ -66,7 +72,6 @@ def parse_cell_value(
         )
         return ParsedCellValue(mode=mode, values=values)
 
-    _ensure_delimiter(delimiter)
     values = tuple(
         _normalize_text(part, strip=strip, normalize_case=normalize_case)
         for part in text.split(delimiter)
@@ -103,6 +108,11 @@ def serialize_cell_value(
 ) -> str:
     """Serialize already structured code/token values into a deterministic cell string."""
     _ensure_valid_mode(mode)
+    # Validate the explicit delimiter before the empty-group shortcut so an
+    # all-empty group cannot let an invalid delimiter="" pass. whole_cell_code
+    # does not use the delimiter, so its behavior is unchanged.
+    if mode == _SPLIT_TOKENS:
+        _ensure_delimiter(delimiter)
     values = _structured_values(value, mode=mode, strip=strip, normalize_case=normalize_case)
     if not values:
         return ""
@@ -123,7 +133,6 @@ def serialize_cell_value(
         )
         return values[0]
 
-    _ensure_delimiter(delimiter)
     ambiguous = [token for token in values if delimiter in token]
     if ambiguous:
         raise ValueError(
