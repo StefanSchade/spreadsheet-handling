@@ -56,7 +56,6 @@ SUPPORTED_ROOT_NAMES = frozenset(
     }
 )
 BLOCKED_ROOTS_BY_NAME = {
-    "cell_codecs": ReferenceRoot.CELL_CODECS,
     "compact_multiaxis": ReferenceRoot.COMPACT_MULTIAXIS,
     "legend_blocks": ReferenceRoot.LEGEND_BLOCKS,
     "sparse_defaults": ReferenceRoot.SPARSE_DEFAULTS,
@@ -66,6 +65,9 @@ OUT_OF_SCOPE_ROOT_NAMES = frozenset(
     {
         "_hidden",
         "auto_filter",
+        # Legacy family: no producer or runtime consumer remains; tolerated
+        # pass-through sediment whose stale references block nothing.
+        "cell_codecs",
         "column_widths",
         "freeze_header",
         "header_fill_rgb",

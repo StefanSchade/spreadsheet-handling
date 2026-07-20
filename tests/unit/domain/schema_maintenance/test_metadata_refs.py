@@ -421,6 +421,32 @@ def test_fk_drop_blocks_even_when_prune_is_requested() -> None:
     assert list(result.frames["characters"].columns) == ["id", "name", "home_place_id", "notes"]
 
 
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+def test_legacy_cell_codecs_payload_is_ignored_sediment() -> None:
+    # The retired cell_codecs family has no producer or runtime reader;
+    # legacy payloads are tolerated pass-through sediment whose stale
+    # references must not block schema maintenance.
+    frames = _base_frames(
+        {
+            "cell_codecs": {
+                "legacy": {
+                    "operation": "encode_cell_values",
+                    "source": "characters",
+                    "output": "characters_cells",
+                    "group_by": ["id"],
+                    "code": "name",
+                    "value": "value",
+                }
+            }
+        }
+    )
+
+    result = rename_column(frames, _rename())
+
+    assert not result.report.blocked
+    assert result.frames["_meta"]["cell_codecs"] == frames["_meta"]["cell_codecs"]
+
+
 @pytest.mark.parametrize("root", ["compact_multiaxis"])
 def test_detected_transformation_structured_reference_blocks(root: str) -> None:
     frames = _base_frames(

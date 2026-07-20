@@ -834,7 +834,6 @@ def _handle_blocked_roots(
     if affected is None:
         return
     for root_name in (
-        "cell_codecs",
         "compact_multiaxis",
         "legend_blocks",
         "sparse_defaults",

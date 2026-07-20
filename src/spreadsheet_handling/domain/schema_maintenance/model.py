@@ -38,7 +38,6 @@ class ReferenceRoot(Enum):
     XREF_CROSSTABLE = "xref_crosstable"
     SPLIT_BY_DISCRIMINATOR = "split_by_discriminator"
     COMPACT_MULTIAXIS = "compact_multiaxis"
-    CELL_CODECS = "cell_codecs"
     SPARSE_DEFAULTS = "sparse_defaults"
     LEGEND_BLOCKS = "legend_blocks"
     DERIVED = "derived"
