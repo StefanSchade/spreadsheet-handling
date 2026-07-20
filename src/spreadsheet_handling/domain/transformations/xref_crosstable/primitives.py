@@ -83,6 +83,21 @@ def _has_deterministic_equality(value: Any) -> bool:
         return False
 
 
+def _is_hashable(value: Any) -> bool:
+    """True when ``value`` can be hashed.
+
+    pandas addresses a column label through a hash lookup, so an unhashable
+    label (e.g. a Python ``list``) cannot be selected as a scalar column and
+    would raise a raw ``TypeError`` inside membership/selection. A hashable
+    tuple label stays valid.
+    """
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
 def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
     """Reject physical column labels that cannot address a scalar field.
 
@@ -98,6 +113,9 @@ def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None
     * deterministically comparable -- a label whose equality yields an
       ambiguous truth value (e.g. a multi-element ndarray) cannot be
       de-duplicated or addressed;
+    * hashable -- pandas addresses a column label through a hash lookup, so
+      an unhashable label (e.g. a Python ``list``) cannot be selected and
+      would raise a raw ``TypeError`` inside membership/selection;
     * unique -- duplicate labels make ``row[label]`` yield a ``Series``
       instead of a scalar, silently corrupting cell values.
 
@@ -118,6 +136,13 @@ def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None
             f"Frame {frame_name!r} has physical column label(s) with ambiguous "
             f"equality {ambiguous!r}; physical labels must be deterministically "
             "comparable to address a scalar column"
+        )
+    unhashable = [label for label in labels if not _is_hashable(label)]
+    if unhashable:
+        raise ValueError(
+            f"Frame {frame_name!r} has unhashable physical column label(s) "
+            f"{unhashable!r}; physical labels must be hashable to address a "
+            "scalar column"
         )
     # Every remaining label compares with an unambiguous boolean, so this
     # equality-based duplicate detection is safe and stays non-hashing so

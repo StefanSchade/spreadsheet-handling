@@ -2135,6 +2135,63 @@ class TestMissingLikePhysicalLabelBoundary:
         with pytest.raises(ValueError, match="ambiguous equality"):
             _ensure_unique_physical_labels(frame, frame_name="array_frame")
 
+    def test_unhashable_relation_label_gets_contract_diagnostic(self) -> None:
+        # Review 004 counterexample: a list label is non-missing and its
+        # self-equality converts to True, so it previously passed the boundary
+        # and later raised a raw ``TypeError: unhashable type: 'list'`` inside
+        # pandas membership. It must now fail with the XRef physical-label
+        # diagnostic before any pandas operation.
+        frames = {
+            "rel": pd.DataFrame(
+                [["r1", "A", "x", "y"]], columns=["r", "k", "v", [1, 2]]
+            )
+        }
+
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys="r",
+                column_key="k",
+                value=[1, 2],
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+        assert "_meta" not in frames
+        assert list(frames["rel"].columns)[:3] == ["r", "k", "v"]
+
+    def test_unhashable_base_relation_label_gets_contract_diagnostic(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame(
+                [["r9", "B", "kept", "z"]], columns=["r", "k", "v", [1, 2]]
+            ),
+        }
+
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                base_relation="base",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+        assert "_meta" not in frames
+        assert "rel" not in frames
+
+    def test_unhashable_physical_label_is_rejected_by_boundary(self) -> None:
+        frame = pd.DataFrame(
+            [[1, 2]], columns=pd.Index(["r", [1, 2]], dtype=object)
+        )
+
+        with pytest.raises(ValueError, match="unhashable physical column label"):
+            _ensure_unique_physical_labels(frame, frame_name="list_frame")
+
     def test_valid_string_full_projection_still_schedules_cleanup(self) -> None:
         # Guard: the missing-like/ambiguity boundary did not regress the
         # ordinary valid contract+expand cleanup scheduling.
