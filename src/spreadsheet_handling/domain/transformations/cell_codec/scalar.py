@@ -124,6 +124,13 @@ def serialize_cell_value(
         return values[0]
 
     _ensure_delimiter(delimiter)
+    ambiguous = [token for token in values if delimiter in token]
+    if ambiguous:
+        raise ValueError(
+            f"split_tokens token(s) {ambiguous!r} contain the delimiter "
+            f"{delimiter!r}; the serialized cell could not be decoded "
+            "unambiguously"
+        )
     canonical_values = _canonicalize_values(
         values,
         canonical_order=canonical_order,

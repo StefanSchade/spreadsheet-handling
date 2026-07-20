@@ -1,9 +1,24 @@
 """Cell value codec - DataFrame projection (frame side).
 
 Frame half of the ``cell_codec`` package. Owns the DataFrame-level decode /
-encode publics, the frame-shape guards, the grouping helper, and the
-``_meta.cell_codecs`` write shape. Delegates per-cell parse / serialize to
-``.scalar`` via its public entry points; carries no scalar-helper imports.
+encode publics, the frame-shape guards, and the grouping helper. Delegates
+per-cell parse / serialize to ``.scalar`` via its public entry points;
+carries no scalar-helper imports.
+
+Cell Codec intent lives entirely in explicit step configuration
+(``codec_intent`` for the position-based contract, explicit ``mode`` plus
+codec parameters for the historical code-row contract consumed by
+``compact_multiaxis``). No ``_meta.cell_codecs`` entries are produced: no
+runtime consumer ever read them, so the family follows the projection-family
+rule that metadata without a concrete decision consumer is not persisted.
+Legacy ``_meta.cell_codecs`` payloads in old sidecars or workbooks are
+tolerated pass-through sediment.
+
+The codec is string-oriented (see
+``ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE``): position-based participating
+values must be strings (or empty); decoded values are strings, and empty /
+missing participating values normalize to the configured ``absent_value``
+token and decode back to ``""``.
 """
 from __future__ import annotations
 
@@ -17,8 +32,6 @@ from spreadsheet_handling.domain._cell_primitives import _is_empty_cell, _values
 from .scalar import parse_cell_value, serialize_cell_value
 
 Frames = dict[str, Any]
-
-_META_KEY = "cell_codecs"
 
 
 def decode_cell_values(
@@ -92,7 +105,9 @@ def _decode_legacy_code_rows(
     strip: bool,
     name: str | None,
 ) -> Frames:
+    del name
     source_frame = _require_frame(frames, source)
+    _ensure_unique_physical_labels(source_frame, frame_name=source)
     _ensure_columns(source_frame, [value], frame_name=source)
     passthrough = (
         _as_list(passthrough_columns, "passthrough_columns")
@@ -127,29 +142,6 @@ def _decode_legacy_code_rows(
     decoded = pd.DataFrame(records, columns=[*passthrough, code])
     out: dict[str, Any] = dict(frames)
     out[output] = decoded
-    _write_codec_meta(
-        out,
-        config_id=name or output,
-        payload={
-            "operation": "decode_cell_values",
-            "source": source,
-            "output": output,
-            "value": value,
-            "code": code,
-            "passthrough_columns": list(passthrough),
-            "drop_empty": bool(drop_empty),
-            **_codec_config_payload(
-                mode=mode,
-                delimiter=delimiter,
-                allowed_codes=allowed_codes,
-                allowed_tokens=allowed_tokens,
-                allowed_from_legend=allowed_from_legend,
-                canonical_order=None,
-                normalize_case=normalize_case,
-                strip=strip,
-            ),
-        },
-    )
     return out
 
 
@@ -226,8 +218,11 @@ def _encode_legacy_code_rows(
     strip: bool,
     name: str | None,
 ) -> Frames:
+    del name
     source_frame = _require_frame(frames, source)
+    _ensure_unique_physical_labels(source_frame, frame_name=source)
     group_cols = _as_list(group_by, "group_by")
+    _ensure_unique_field_list(group_cols, "group_by")
     _ensure_columns(source_frame, [*group_cols, code], frame_name=source)
     _ensure_output_name_does_not_collide(group_cols, code=value)
 
@@ -260,28 +255,6 @@ def _encode_legacy_code_rows(
     encoded = pd.DataFrame(records, columns=[*group_cols, value])
     out: dict[str, Any] = dict(frames)
     out[output] = encoded
-    _write_codec_meta(
-        out,
-        config_id=name or output,
-        payload={
-            "operation": "encode_cell_values",
-            "source": source,
-            "output": output,
-            "group_by": list(group_cols),
-            "code": code,
-            "value": value,
-            **_codec_config_payload(
-                mode=mode,
-                delimiter=delimiter,
-                allowed_codes=allowed_codes,
-                allowed_tokens=allowed_tokens,
-                allowed_from_legend=allowed_from_legend,
-                canonical_order=canonical_order,
-                normalize_case=normalize_case,
-                strip=strip,
-            ),
-        },
-    )
     return out
 
 
@@ -353,46 +326,45 @@ def _meta_from_frames(frames: Mapping[str, Any]) -> Mapping[str, Any]:
     return meta if isinstance(meta, Mapping) else {}
 
 
-def _codec_config_payload(
-    *,
-    mode: str,
-    delimiter: str,
-    allowed_codes: Iterable[Any] | None,
-    allowed_tokens: Iterable[Any] | None,
-    allowed_from_legend: str | None,
-    canonical_order: Iterable[Any] | None,
-    normalize_case: str | None,
-    strip: bool,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "mode": mode,
-        "delimiter": delimiter,
-        "strip": bool(strip),
-    }
-    if allowed_codes is not None:
-        payload["allowed_codes"] = list(allowed_codes)
-    if allowed_tokens is not None:
-        payload["allowed_tokens"] = list(allowed_tokens)
-    if allowed_from_legend is not None:
-        payload["allowed_from_legend"] = allowed_from_legend
-    if canonical_order is not None:
-        payload["canonical_order"] = list(canonical_order)
-    if normalize_case is not None:
-        payload["normalize_case"] = normalize_case
-    return payload
+def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
+    """Reject duplicate physical column labels with a codec diagnostic.
+
+    Duplicate labels make ``row[label]`` indexing non-scalar (a ``Series``),
+    which would corrupt encoded/decoded cell values silently. Equality-based
+    detection avoids hashing so unusual labels still get the deterministic
+    diagnostic instead of raw pandas behavior.
+    """
+    duplicates: list[Any] = []
+    seen: list[Any] = []
+    for label in df.columns.tolist():
+        if any(_values_equal(label, existing) for existing in seen):
+            if not any(_values_equal(label, existing) for existing in duplicates):
+                duplicates.append(label)
+        else:
+            seen.append(label)
+    if duplicates:
+        raise ValueError(
+            f"Frame {frame_name!r} has duplicate physical column label(s) "
+            f"{duplicates!r}; duplicate columns cannot be addressed as "
+            "scalar fields"
+        )
 
 
-def _write_codec_meta(
-    out: dict[str, Any],
-    *,
-    config_id: str,
-    payload: dict[str, Any],
-) -> None:
-    meta = dict(out.get("_meta") or {})
-    configs = dict(meta.get(_META_KEY) or {})
-    configs[config_id] = payload
-    meta[_META_KEY] = configs
-    out["_meta"] = meta
+def _ensure_unique_field_list(values: list[Any], field_name: str) -> None:
+    """Reject duplicate entries in a configured field list."""
+    duplicates: list[Any] = []
+    seen: list[Any] = []
+    for value in values:
+        if any(_values_equal(value, existing) for existing in seen):
+            if not any(_values_equal(value, existing) for existing in duplicates):
+                duplicates.append(value)
+        else:
+            seen.append(value)
+    if duplicates:
+        raise ValueError(
+            f"{field_name} contains duplicate field(s) {duplicates!r}; "
+            "configured fields must be unique"
+        )
 
 
 def _encode_position_based(
@@ -403,7 +375,9 @@ def _encode_position_based(
     codec_intent: Mapping[str, Any],
     name: str | None,
 ) -> Frames:
+    del name
     source_frame = _require_frame(frames, source)
+    _ensure_unique_physical_labels(source_frame, frame_name=source)
     intent = _position_intent(codec_intent)
     _ensure_columns(source_frame, intent["participating_columns"], frame_name=source)
     _reject_helper_participating_columns(frames, source, intent["participating_columns"])
@@ -428,16 +402,6 @@ def _encode_position_based(
 
     out: dict[str, Any] = dict(frames)
     out[output] = pd.DataFrame(records, columns=[*passthrough, compact_column])
-    _write_codec_meta(
-        out,
-        config_id=name or output,
-        payload={
-            "operation": "encode_cell_values",
-            "source": source,
-            "output": output,
-            **_position_meta_payload(intent),
-        },
-    )
     return out
 
 
@@ -449,11 +413,22 @@ def _decode_position_based(
     codec_intent: Mapping[str, Any],
     name: str | None,
 ) -> Frames:
+    del name
     source_frame = _require_frame(frames, source)
+    _ensure_unique_physical_labels(source_frame, frame_name=source)
     intent = _position_intent(codec_intent)
     compact_column = intent["compact_column"]
     _ensure_columns(source_frame, [compact_column], frame_name=source)
     passthrough = [column for column in source_frame.columns if column != compact_column]
+    decoded_overlap = [
+        column for column in intent["participating_columns"] if column in passthrough
+    ]
+    if decoded_overlap:
+        raise ValueError(
+            f"decoded participating column(s) {decoded_overlap!r} already "
+            f"exist on frame {source!r}; decoding would silently overwrite "
+            "them"
+        )
 
     records: list[dict[Any, Any]] = []
     for _, source_row in source_frame.iterrows():
@@ -468,16 +443,6 @@ def _decode_position_based(
 
     out: dict[str, Any] = dict(frames)
     out[output] = pd.DataFrame(records, columns=[*passthrough, *intent["participating_columns"]])
-    _write_codec_meta(
-        out,
-        config_id=name or output,
-        payload={
-            "operation": "decode_cell_values",
-            "source": source,
-            "output": output,
-            **_position_meta_payload(intent),
-        },
-    )
     return out
 
 
@@ -486,15 +451,26 @@ def _position_intent(codec_intent: Mapping[str, Any]) -> dict[str, Any]:
         codec_intent.get("participating_columns"),
         "codec_intent.participating_columns",
     )
+    _ensure_unique_field_list(participating_columns, "codec_intent.participating_columns")
     compact_column = codec_intent.get("compact_column")
     if not isinstance(compact_column, str) or compact_column == "":
         raise ValueError("codec_intent.compact_column must be a non-empty string")
+    if compact_column in participating_columns:
+        raise ValueError(
+            f"codec_intent.compact_column {compact_column!r} must not also be "
+            "a participating column"
+        )
     separator = codec_intent.get("separator")
     if not isinstance(separator, str) or separator == "":
         raise ValueError("codec_intent.separator must be a non-empty string")
     absent_value = codec_intent.get("absent_value")
     if not isinstance(absent_value, str) or absent_value == "":
         raise ValueError("codec_intent.absent_value must be a non-empty string")
+    if separator in absent_value:
+        raise ValueError(
+            f"codec_intent.absent_value {absent_value!r} must not contain the "
+            f"separator {separator!r}"
+        )
     return {
         "participating_columns": participating_columns,
         "compact_column": compact_column,
@@ -516,7 +492,14 @@ def _encode_compact_value(
         if _is_empty_cell(raw_value):
             tokens.append(absent_value)
             continue
-        token = str(raw_value)
+        if not isinstance(raw_value, str):
+            raise ValueError(
+                f"participating column {column!r} contains non-string value "
+                f"{raw_value!r}; Cell Codec is string-oriented "
+                "(ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE) and typed values "
+                "would silently change type through the compact-cell roundtrip"
+            )
+        token = raw_value
         if token == absent_value:
             raise ValueError(
                 f"participating column {column!r} uses absent-value marker "
@@ -551,15 +534,6 @@ def _decode_compact_value(
             raise ValueError(f"compact value contains empty token for column {column!r}")
         decoded[column] = "" if token == absent_value else token
     return decoded
-
-
-def _position_meta_payload(intent: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "participating_columns": list(intent["participating_columns"]),
-        "compact_column": intent["compact_column"],
-        "separator": intent["separator"],
-        "absent_value": intent["absent_value"],
-    }
 
 
 def _reject_helper_participating_columns(
