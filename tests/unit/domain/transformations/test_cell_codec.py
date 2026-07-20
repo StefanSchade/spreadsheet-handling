@@ -795,3 +795,66 @@ class TestHistoricalDeclarationValidation:
             },
         )
         assert out["out"]["p"].tolist() == ["A|B"]
+
+
+class TestGeneratedOutputLabelBoundary:
+    """R002-B1: historical generated output labels are validated.
+
+    Historical decode's generated `code` label and historical encode's
+    generated `value` label reach the shared scalar-addressability boundary
+    before collision/membership/record/output construction.
+    """
+
+    @staticmethod
+    def _assert_clean(frames: dict, before_meta: object) -> None:
+        assert "out" not in frames
+        assert frames.get("_meta") == before_meta
+
+    @pytest.mark.parametrize(
+        "bad",
+        [[1, 2], pd.NA, None, np.array([1, 2])],
+        ids=["list", "pd_NA", "None", "ndarray"],
+    )
+    def test_decode_generated_code_label_rejected(self, bad: object) -> None:
+        frames = {"s": pd.DataFrame([{"id": "r", "value": "A"}]), "_meta": {"k": 1}}
+        before = copy.deepcopy(frames["_meta"])
+        before_frame = frames["s"].copy()
+        with pytest.raises(ValueError, match="cannot address a scalar column"):
+            decode_cell_values(
+                frames, source="s", output="out", mode="whole_cell_code", code=bad,
+            )
+        self._assert_clean(frames, before)
+        assert frames["s"].equals(before_frame)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [[1, 2], pd.NA, None, np.array([1, 2])],
+        ids=["list", "pd_NA", "None", "ndarray"],
+    )
+    def test_encode_generated_value_label_rejected(self, bad: object) -> None:
+        frames = {"s": pd.DataFrame([{"g": "G", "code": "A"}]), "_meta": {"k": 1}}
+        before = copy.deepcopy(frames["_meta"])
+        before_frame = frames["s"].copy()
+        with pytest.raises(ValueError, match="cannot address a scalar column"):
+            encode_cell_values(
+                frames, source="s", output="out", group_by="g",
+                mode="whole_cell_code", value=bad,
+            )
+        self._assert_clean(frames, before)
+        assert frames["s"].equals(before_frame)
+
+    def test_decode_ordinary_string_code_label_supported(self) -> None:
+        out = decode_cell_values(
+            {"s": pd.DataFrame([{"id": "r", "value": "A"}])},
+            source="s", output="out", mode="whole_cell_code", code="mycode",
+        )
+        assert list(out["out"].columns) == ["id", "mycode"]
+
+    def test_encode_numeric_value_label_supported(self) -> None:
+        # Generated output labels are not string-only; a numeric scalar label
+        # is scalar-addressable.
+        out = encode_cell_values(
+            {"s": pd.DataFrame([{"g": "G", "code": "A"}])},
+            source="s", output="out", group_by="g", mode="whole_cell_code", value=7,
+        )
+        assert 7 in out["out"].columns

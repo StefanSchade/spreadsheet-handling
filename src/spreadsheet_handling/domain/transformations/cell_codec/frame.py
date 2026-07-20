@@ -185,7 +185,14 @@ def _decode_legacy_code_rows(
     del name
     source_frame = _require_frame(frames, source)
     _ensure_unique_physical_labels(source_frame, frame_name=source)
+    # ``value`` addresses a source column; ``code`` names the generated output
+    # column. Both must be scalar-addressable before any collision membership,
+    # record-dict key construction, or DataFrame output-label construction, so
+    # a missing/unhashable/ambiguous label gets the deterministic codec
+    # diagnostic instead of a raw pandas ``TypeError`` or a pandas-normalized
+    # ``NaN`` output label.
     _ensure_addressable_selector(value, field_name="value")
+    _ensure_addressable_selector(code, field_name="code")
     _ensure_columns(source_frame, [value], frame_name=source)
     passthrough = (
         _as_list(passthrough_columns, "passthrough_columns")
@@ -322,7 +329,12 @@ def _encode_legacy_code_rows(
     _ensure_unique_physical_labels(source_frame, frame_name=source)
     group_cols = _as_list(group_by, "group_by")
     _ensure_configured_field_labels(group_cols, field_name="group_by")
+    # ``code`` addresses a source column; ``value`` names the generated output
+    # (compact) column. Both must be scalar-addressable before any collision
+    # membership, record-dict key construction, or DataFrame output-label
+    # construction.
     _ensure_addressable_selector(code, field_name="code")
+    _ensure_addressable_selector(value, field_name="value")
     _ensure_columns(source_frame, [*group_cols, code], frame_name=source)
     _ensure_output_name_does_not_collide(group_cols, code=value)
 
