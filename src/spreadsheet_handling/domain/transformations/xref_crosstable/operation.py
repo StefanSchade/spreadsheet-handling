@@ -87,21 +87,26 @@ def expand_xref(
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
     _ensure_output_names_do_not_collide(row_key_cols, column_key=column_key, value=value)
 
-    value_cols = (
-        _as_list(value_columns, "value_columns")
-        if value_columns is not None
-        else [col for col in source.columns if col not in row_key_cols]
-    )
+    if value_columns is not None:
+        value_cols = _as_list(value_columns, "value_columns")
+        # Configured selectors are not yet validated (unlike the physical
+        # header row above): route them through the identity validator before
+        # any equality/membership so pd.NA, an ndarray, or a numeric/empty/
+        # unhashable selector gets the deterministic XRef diagnostic instead
+        # of a raw ambiguity error from the overlap check below. Only after
+        # validation reduces them to valid string identities do overlap and
+        # selection run.
+        _ensure_column_identity_list(value_cols, f"Frame {matrix!r} value_columns")
+    else:
+        # Inferred value columns are a subset of the physical matrix header
+        # row already validated above, so they are valid string identities.
+        value_cols = [col for col in source.columns if col not in row_key_cols]
     row_key_overlap = [col for col in value_cols if col in row_key_cols]
     if row_key_overlap:
         raise ValueError(
             f"value_columns must not overlap row_keys: {row_key_overlap!r}; "
             "a row-identity field cannot also be a value column"
         )
-    # Expanded labels become relation column-identity values: enforce the
-    # carrier-stable contract (unique, non-empty strings) on the physical
-    # matrix labels selected for expansion.
-    _ensure_column_identity_list(value_cols, f"Frame {matrix!r} value_columns")
     _ensure_columns(source, value_cols, frame_name=matrix, field_name="value_columns")
     if drop_source:
         unexpanded = [

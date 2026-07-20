@@ -53,18 +53,78 @@ def _ensure_flat_axis_labels(values: Iterable[Any], field_name: str) -> None:
         )
 
 
-def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
-    """Reject duplicate physical column labels with a contract diagnostic.
+def _is_missing_like(value: Any) -> bool:
+    """True for a scalar missing label (``None`` / ``NaN`` / ``pd.NA``).
 
-    Duplicate labels make positional indexing non-scalar (``row[label]``
-    yields a ``Series``), so any duplicated physical field would corrupt
-    cell values silently. Equality-based detection deliberately avoids
-    hashing so unusual labels still get the XRef diagnostic instead of a
-    raw pandas ``TypeError``.
+    Array-like labels (tuples, ndarrays) are not scalar missing values and
+    return ``False`` here; their addressability is checked separately by
+    :func:`_has_deterministic_equality`.
     """
+    if value is None:
+        return True
+    if not pd.api.types.is_scalar(value):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_deterministic_equality(value: Any) -> bool:
+    """True when ``value == value`` yields an unambiguous boolean.
+
+    A label whose self-comparison is ambiguous (e.g. a multi-element
+    ndarray, whose ``==`` yields an array) cannot be de-duplicated or
+    addressed as a scalar column.
+    """
+    try:
+        return bool(value == value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _ensure_unique_physical_labels(df: pd.DataFrame, *, frame_name: str) -> None:
+    """Reject physical column labels that cannot address a scalar field.
+
+    This is the physical-frame column-label boundary, distinct from the
+    matrix-axis identity contract (:func:`_ensure_column_identity_values`).
+    Physical labels are *not* required to be strings: numeric or tuple
+    labels are permitted when they are non-missing, unique, deterministically
+    comparable, and scalar-addressable. They must be:
+
+    * non-missing -- a missing label (``None`` / ``NaN`` / ``pd.NA``) cannot
+      address a scalar column and is not even equal to itself (``NaN``) or
+      unambiguously comparable (``pd.NA``);
+    * deterministically comparable -- a label whose equality yields an
+      ambiguous truth value (e.g. a multi-element ndarray) cannot be
+      de-duplicated or addressed;
+    * unique -- duplicate labels make ``row[label]`` yield a ``Series``
+      instead of a scalar, silently corrupting cell values.
+
+    Validation runs before any pandas selection, equality-based membership,
+    metadata write, or cleanup scheduling.
+    """
+    labels = df.columns.tolist()
+    missing = [label for label in labels if _is_missing_like(label)]
+    if missing:
+        raise ValueError(
+            f"Frame {frame_name!r} has missing-like physical column label(s) "
+            f"{missing!r}; physical labels must be non-missing to address a "
+            "scalar column"
+        )
+    ambiguous = [label for label in labels if not _has_deterministic_equality(label)]
+    if ambiguous:
+        raise ValueError(
+            f"Frame {frame_name!r} has physical column label(s) with ambiguous "
+            f"equality {ambiguous!r}; physical labels must be deterministically "
+            "comparable to address a scalar column"
+        )
+    # Every remaining label compares with an unambiguous boolean, so this
+    # equality-based duplicate detection is safe and stays non-hashing so
+    # valid tuple labels are not rejected for being unhashable-by-value.
     duplicates: list[Any] = []
     seen: list[Any] = []
-    for label in df.columns.tolist():
+    for label in labels:
         if any(_values_equal(label, existing) for existing in seen):
             if not any(_values_equal(label, existing) for existing in duplicates):
                 duplicates.append(label)

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.transformations.xref_crosstable import (
     contract_xref,
     expand_xref,
+)
+from spreadsheet_handling.domain.transformations.xref_crosstable.primitives import (
+    _ensure_unique_physical_labels,
 )
 
 
@@ -1974,6 +1978,188 @@ class TestIdentitySourcesValidatedBeforePandas:
         )
 
         assert frames["_meta"] == snapshot
+
+
+@pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
+class TestMissingLikePhysicalLabelBoundary:
+    """Physical-label boundary rejects missing-like/ambiguity-producing labels.
+
+    Closes the two final-review (`5350b22`) findings: equality-based
+    duplicate detection did not equate missing-like labels, and explicit
+    ``value_columns`` were compared with ``row_keys`` before validation.
+    Physical labels are validated for scalar addressability without imposing
+    a global string-only rule (see the accepted tuple label below).
+    """
+
+    @staticmethod
+    def _assert_no_cleanup(frames: dict) -> None:
+        meta = frames.get("_meta") or {}
+        assert "pipeline_cleanup" not in meta
+
+    def test_duplicate_nan_relation_labels_fail_without_series_cell(self) -> None:
+        # Final-review 4.1 counterexample: duplicate NaN value fields escaped
+        # equality-based detection, produced a Series cell, and still wrote a
+        # cleanup command dropping the only scalar source representation.
+        nan = np.nan
+        frames = {
+            "rel": pd.DataFrame(
+                [["r1", "A", "x", "y"]], columns=["r", "k", nan, nan]
+            )
+        }
+
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys="r",
+                column_key="k",
+                value=nan,
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+        assert list(frames["rel"].columns)[:2] == ["r", "k"]
+
+    def test_duplicate_pd_na_relation_labels_fail(self) -> None:
+        # Final-review 4.1: duplicate pd.NA labels previously raised a raw
+        # ``TypeError: boolean value of NA is ambiguous`` (or escaped) rather
+        # than a deterministic XRef diagnostic.
+        frames = {
+            "rel": pd.DataFrame(
+                [["r1", "A", "x", "y"]], columns=["r", "k", pd.NA, pd.NA]
+            )
+        }
+
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            contract_xref(
+                frames,
+                relation="rel",
+                output="matrix",
+                row_keys="r",
+                column_key="k",
+                value=pd.NA,
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_duplicate_missing_like_base_relation_labels_fail(self) -> None:
+        frames = {
+            "matrix": pd.DataFrame([{"r": "r1", "A": "x"}]),
+            "base": pd.DataFrame(
+                [["r9", "B", "kept"]], columns=["r", np.nan, np.nan]
+            ),
+        }
+
+        with pytest.raises(ValueError, match="missing-like physical column label"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                base_relation="base",
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_value_columns_pd_na_gets_contract_diagnostic(self) -> None:
+        # Final-review 4.2: ``pd.NA in row_key_cols`` raised a raw TypeError
+        # before the identity validator ran.
+        frames = {"matrix": pd.DataFrame([{"r": "r1", "A": "x", "B": "y"}])}
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                value_columns=[pd.NA],
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_value_columns_numpy_array_gets_contract_diagnostic(self) -> None:
+        # Final-review 4.2: a multi-element ndarray selector raised a raw
+        # ``ValueError: truth value ... ambiguous`` from list membership.
+        frames = {"matrix": pd.DataFrame([{"r": "r1", "A": "x", "B": "y"}])}
+
+        with pytest.raises(ValueError, match="non-empty string column"):
+            expand_xref(
+                frames,
+                matrix="matrix",
+                output="rel",
+                row_keys="r",
+                column_key="k",
+                value="v",
+                value_columns=[np.array([1, 2])],
+                drop_source=True,
+            )
+        self._assert_no_cleanup(frames)
+
+    def test_valid_tuple_physical_labels_are_not_rejected(self) -> None:
+        # The correction must not impose a global string-only physical-label
+        # rule. Tuple labels are non-missing, unique, deterministically
+        # comparable, and scalar-addressable, so the physical-label boundary
+        # accepts them where the operation mechanically reaches it. (The
+        # first-slice frame check still blocks tuple columns on the operation
+        # API surface; this exercises the boundary primitive directly.)
+        frame = pd.DataFrame(
+            [[1, 2]],
+            columns=[("aktiv", "Sparvertrag"), ("passiv", "Annuitätendarlehen")],
+        )
+
+        _ensure_unique_physical_labels(frame, frame_name="tuple_frame")
+
+    def test_duplicate_tuple_physical_labels_are_rejected(self) -> None:
+        frame = pd.DataFrame(
+            [[1, 2]],
+            columns=[("aktiv", "Sparvertrag"), ("aktiv", "Sparvertrag")],
+        )
+
+        with pytest.raises(ValueError, match="duplicate physical column label"):
+            _ensure_unique_physical_labels(frame, frame_name="tuple_frame")
+
+    def test_numeric_physical_labels_are_not_rejected(self) -> None:
+        # Physical labels are not required to be strings; a unique numeric
+        # label is scalar-addressable and must pass the boundary.
+        frame = pd.DataFrame([[1, 2]], columns=["r", 7])
+
+        _ensure_unique_physical_labels(frame, frame_name="numeric_frame")
+
+    def test_ambiguous_equality_physical_labels_are_rejected(self) -> None:
+        frame = pd.DataFrame([[1, 2]], columns=pd.Index(["r", np.array([1, 2])], dtype=object))
+
+        with pytest.raises(ValueError, match="ambiguous equality"):
+            _ensure_unique_physical_labels(frame, frame_name="array_frame")
+
+    def test_valid_string_full_projection_still_schedules_cleanup(self) -> None:
+        # Guard: the missing-like/ambiguity boundary did not regress the
+        # ordinary valid contract+expand cleanup scheduling.
+        rel = pd.DataFrame(
+            [["r1", "c1", "v1"], ["r1", "c2", "v2"]],
+            columns=["r", "column_key", "value"],
+        )
+
+        contracted = contract_xref(
+            {"rel": rel},
+            relation="rel",
+            output="matrix",
+            row_keys="r",
+            drop_source=True,
+        )
+        assert contracted["_meta"]["pipeline_cleanup"]["drop_frames"] == ["rel"]
+
+        expanded = expand_xref(
+            contracted,
+            matrix="matrix",
+            output="rel2",
+            row_keys="r",
+            drop_source=True,
+        )
+        assert expanded["_meta"]["pipeline_cleanup"]["drop_frames"] == ["rel", "matrix"]
 
 
 @pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
