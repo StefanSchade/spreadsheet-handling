@@ -932,6 +932,104 @@ class TestEffectiveValueMutualExclusion:
             assert params["code"].default == "code"
 
 
+class TestNoneDefaultCollectionDistinction:
+    """R003-I1: a collection cannot impersonate a scalar ``None`` default.
+
+    Effective-default comparison is category-aware for ``None`` defaults: any
+    actual non-``None`` object (including a singleton object ndarray) supplied
+    for a structurally meaningful ``None``-default parameter is distinct
+    historical intent and conflicts with ``codec_intent``, without a raw NumPy
+    ambiguity error.
+    """
+
+    @staticmethod
+    def _pos() -> dict:
+        return {
+            "participating_columns": ["a", "b"],
+            "compact_column": "p",
+            "separator": "|",
+            "absent_value": "-",
+        }
+
+    @pytest.mark.parametrize(
+        "collection",
+        [
+            np.array([None], dtype=object),
+            np.array([1], dtype=object),
+            np.array([1, 2]),
+            ["A"],
+            [],
+            ("A",),
+        ],
+        ids=["obj_array_none", "obj_array_int", "multi_array", "list", "empty_list", "tuple"],
+    )
+    def test_encode_none_default_collection_conflicts(self, collection: object) -> None:
+        frames = {
+            "s": pd.DataFrame([{"a": "A", "b": "B"}]),
+            "_meta": {"sentinel": {"keep": ["unchanged"]}},
+        }
+        before_meta = copy.deepcopy(frames["_meta"])
+        before_frame = frames["s"].copy()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            encode_cell_values(
+                frames, source="s", output="out",
+                codec_intent=self._pos(), allowed_tokens=collection,
+            )
+        assert "out" not in frames
+        assert "cell_codecs" not in frames["_meta"]
+        assert "pipeline_cleanup" not in frames["_meta"]
+        assert frames["_meta"] == before_meta
+        assert frames["s"].equals(before_frame)
+
+    @pytest.mark.parametrize(
+        "collection",
+        [
+            np.array([None], dtype=object),
+            np.array([1], dtype=object),
+            ["A"],
+            [],
+        ],
+        ids=["obj_array_none", "obj_array_int", "list", "empty_list"],
+    )
+    def test_decode_none_default_collection_conflicts(self, collection: object) -> None:
+        frames = {"s": pd.DataFrame([{"p": "A|B"}])}
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            decode_cell_values(
+                frames, source="s", output="out",
+                codec_intent=self._pos(), allowed_codes=collection,
+            )
+        assert "out" not in frames
+
+    def test_actual_none_remains_default_equivalent(self) -> None:
+        out = encode_cell_values(
+            {"s": pd.DataFrame([{"a": "A", "b": "B"}])},
+            source="s", output="out",
+            codec_intent=self._pos(),
+            allowed_tokens=None,
+            allowed_codes=None,
+            group_by=None,
+            canonical_order=None,
+        )
+        assert out["out"]["p"].tolist() == ["A|B"]
+
+    def test_none_default_collection_conflicts_in_pipeline_binding(self) -> None:
+        from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
+
+        steps = build_steps_from_config(
+            [
+                {
+                    "step": "encode_cell_values",
+                    "source": "s",
+                    "output": "out",
+                    "codec_intent": self._pos(),
+                    "allowed_tokens": np.array([None], dtype=object),
+                }
+            ]
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            run_pipeline({"s": pd.DataFrame([{"a": "A", "b": "B"}])}, steps)
+
+
 class TestGeneratedOutputLabelBoundary:
     """R002-B1: historical generated output labels are validated.
 

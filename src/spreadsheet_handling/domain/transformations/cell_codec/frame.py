@@ -53,7 +53,17 @@ def _differs_from_default(value: Any, default: Any) -> bool:
     semantically equivalent to leaving the default untouched, so it does not
     conflict with ``codec_intent``. A value that cannot be compared to the
     default is treated as distinct (conflict), which is the safe direction.
+
+    Comparison is category-aware for the ``None`` default: a structurally
+    meaningful parameter whose documented default is ``None`` treats *any*
+    actual non-``None`` object as distinct intent, compared by identity rather
+    than equality. General ``value != default`` cannot be used here because a
+    NumPy object array such as ``np.array([None], dtype=object)`` compares
+    element-wise against ``None`` to a one-element false array, whose ``bool``
+    is false, and would silently impersonate the scalar default.
     """
+    if default is None:
+        return value is not None
     try:
         return bool(value != default)
     except (TypeError, ValueError):
