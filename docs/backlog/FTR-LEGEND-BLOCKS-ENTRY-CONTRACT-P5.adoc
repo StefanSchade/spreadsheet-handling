@@ -1,0 +1,965 @@
+===== FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5 -- Define and own one Legend Entry value contract across its four runtime consumers
+
+*Status:* New
+
+*Priority:* P5
+
+*Type:* Decision + correction slice (entry-value semantics: identity,
+duplicates, unknown-reference handling, empty/missing handling). Explicitly
+does not touch shape (mapping vs. list), `resolved` lifecycle, persistence
+boundary, or carrier readback -- those are `FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5`'s
+scope.
+
+*Source assessment and traceability:*::
+
+* Source: `docs/warm_storage/global_reviews/legend_blocks_contract_and_composition_assessment.adoc`.
+* Assessment commit: `b97a907f72593ef42b2c854858089e5af089bfc0`
+  (`docs(warm-storage): assess legend blocks composition contract`).
+* Sibling FTR (already created, not duplicated here):
+  `docs/backlog/FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5.adoc`. Its
+  *Human decision -- resolved* section records that list-form
+  `_meta.legend_blocks` remains input sugar, normalised once at an
+  orchestrator-owned ingress boundary, to canonical mapping form; every
+  downstream consumer will observe only mapping form once that FTR lands.
+  This FTR is independent of that normalisation landing: the entry-value
+  divergence traced below is a property of `entries` content, reproducible
+  under either shape today, and remains reproducible under mapping-form-only
+  input after that FTR lands.
+* This FTR was drafted against runtime code at HEAD
+  `b97a907f72593ef42b2c854858089e5af089bfc0` (the same HEAD the sibling FTR
+  was drafted against; no runtime file touched by either FTR has changed
+  since). Every finding below, including the four items not carried in the
+  source assessment's *Observation* section, was independently re-verified
+  against the current source tree while drafting this FTR (commands run with
+  `PYTHONPATH=src`, no repository state changed). File:line references
+  reflect that re-verification.
+* Findings carried from the assessment: `OB-1` (four divergent per-consumer
+  entry validators). This FTR is `OB-1`'s entire scope, as the assessment and
+  the sibling FTR both state.
+* New evidence gathered while drafting this FTR, not present in the source
+  assessment: unhashable-token raw `TypeError` in Compact Multiaxis's group
+  lookup (see *EC-5* below); `ValidationPass`'s silent empty-dropdown on a
+  present-but-empty `entries` list (*EC-6*); the fact that Cell Codec's own
+  legend behaviour has zero dedicated unit-test coverage and is exercised
+  only transitively through Compact Multiaxis tests (*EC-7*, a test-plan
+  input, not a behavioural finding).
+* `LB-1` through `LB-4`, `LB-6`, `LB-7` (shape, `resolved` lifecycle, registry
+  accuracy, unmaintained `placement.target`) and `LB-5` (Sparse Defaults
+  doc-vs-code in `compact_multiaxis`) are explicitly *not* part of this FTR.
+  See *Non-Goals*.
+
+*Problem statement:*::
+
+`_meta.legend_blocks[*].entries` is read by four independent runtime
+consumers -- Cell Codec, Compact Multiaxis, the render `ValidationPass`, and
+the Visible Legend Composer -- each of which re-implements its own walk over
+the same `token` / `label` / `group` / `description` structure with its own
+validation and failure semantics. No module owns the entry contract itself;
+the shared `_legend_blocks.py::_read_legend_block` reader is narrow by
+design (its docstring states it "does not define a public legend-block API")
+and only enforces non-empty `entries` and a non-empty `token` per entry --
+every other rule (label requirement, duplicate-token policy, unknown-block
+handling, hashability of `token`) is decided independently, and differently,
+by each of the four consumers.
+
+The practical consequence: the same authored Legend Block can be accepted by
+one consumer and rejected -- or silently degraded -- by another. A block with
+no `label` values is fully usable for Cell Codec validation and Compact
+Multiaxis group projection but is rejected outright the moment anyone tries
+to render it visibly. A block with duplicate tokens is rejected by three of
+the four consumers but silently produces a dropdown with repeated values in
+the fourth. A block with a list-typed `token` is silently stringified by
+three consumers but crashes the fourth with a raw Python `TypeError` instead
+of a domain diagnostic. None of this is documented as intentional layering;
+it is the accumulated effect of four independent implementations that have
+never been reconciled against one written contract.
+
+This FTR's job is to decide, on repository evidence, whether that is
+accidental fragmentation that must converge on one canonical entry contract,
+or an intentional layered contract with a minimal shared machine-value core
+plus explicit, narrower consumer-specific extensions -- and then to define
+that contract's exact fields, equality rules, duplicate policy,
+unknown-reference behaviour, and empty/missing semantics precisely enough
+that no consumer can discover an incompatibility after the fact.
+
+*Verified current behavior:*::
+
+Re-verified directly against the source tree at
+`b97a907f72593ef42b2c854858089e5af089bfc0` while drafting this FTR (commands
+run with `PYTHONPATH=src`; no repository state changed):
+
+* *EC-1 -- label requirement diverges.* The domain reader
+  (`_legend_blocks.py:61-70`, `_read_legend_block`) never reads `label` at
+  all. Cell Codec (`cell_codec/scalar.py:265-266`, `_legend_tokens`) and
+  Compact Multiaxis (`compact_multiaxis.py:271-277`, `_legend_groups`) both
+  consume only the reader's `(token, group)` tuples and never see `label`
+  either. The Visible Legend Composer's `_validate_legend_entries`
+  (`layout_composer.py:138-163`) requires a non-empty `label` per entry
+  (`:156-159`, raises `ValueError` on empty/whitespace-only label) because it
+  renders `label` as the visible "Meaning" column. Probe: an entries list of
+  `[{"token": "N"}, {"token": "I"}]` (no `label` key at all) parses cleanly
+  through `_read_legend_block`, validates cleanly through
+  `parse_cell_value(allowed_from_legend=...)`, and is rejected by
+  `_validate_legend_entries` with `"entry 1 has an empty label"`.
+* *EC-2 -- duplicate-token policy diverges across all four.* Probe with
+  `entries=[{"token":"N","label":"a","group":"g"},{"token":"N","label":"b","group":"g"}]`:
+  the domain reader returns both records unfiltered (no duplicate check at
+  all, `_read_legend_block` has none); Cell Codec's `_allowed_values`
+  (`scalar.py:237-262`) rejects via `_duplicates` (`scalar.py:309-316`) with
+  `"Allowed value set contains duplicate values: ['N']"`; Compact
+  Multiaxis's `_legend_groups` (`compact_multiaxis.py:271-277`) silently
+  deduplicates identical `(token, group)` pairs into one entry, but raises
+  `"Conflicting group values for 'N'"` if the two entries' `group` differs
+  (same file, same lines); the Composer's `_validate_legend_entries`
+  (`layout_composer.py:152-154`) rejects with
+  `"contains duplicate token 'N'"`; the render `ValidationPass`'s
+  `_legend_tokens` (`rendering/passes/_base.py:151-182`) performs no
+  duplicate check whatsoever -- probe confirms a two-entry block with both
+  tokens `"N"` returns the literal list `['N', 'N']` as dropdown values, with
+  no warning and no error.
+* *EC-3 -- unknown Legend Block reference diverges.* The domain reader
+  raises `KeyError` (`_legend_blocks.py:52-56`), which both Cell Codec and
+  Compact Multiaxis let propagate uncaught (neither wraps or catches it) --
+  domain transformations always fail hard on an unresolvable reference. The
+  render `ValidationPass`'s `_legend_spec` / `_legend_tokens`
+  (`rendering/passes/_base.py:136-182`) instead logs
+  `log.warning("from_legend validation references unknown legend block %r", ...)`
+  and returns `None`, which its caller (`_validation_values`,
+  `_base.py:185-198`) treats as "no values" rather than a failure -- the
+  dropdown/validation rule is silently dropped rather than the render
+  failing. The Composer has no "unknown reference" case in the same sense
+  (`_add_legend_blocks` iterates only blocks that exist in
+  `_meta.legend_blocks`; there is no separate "referenced but absent" path
+  for the render side, since rendering does not reference a legend by name
+  the way `allowed_from_legend` / `from_legend.legend` do).
+* *EC-4 -- empty/missing entries diverges only at the render validation
+  edge.* The domain reader, Cell Codec (via the reader), and the Composer
+  (`_validate_legend_entries`, `layout_composer.py:139-140`) all raise a
+  `ValueError` for missing or empty `entries`. The render `ValidationPass`'s
+  `_legend_tokens` (`_base.py:162-167`) logs a warning and returns `None`
+  only when `entries` is *missing* or not a list -- but *not* when `entries`
+  is present and an empty list `[]`. Probe:
+  `_legend_tokens({"legend_blocks":{"L":{"entries":[]}}}, legend_name="L", include_empty=False)`
+  returns `[]` silently, with **no warning and no error** -- a fourth,
+  previously undocumented behaviour distinct from both "raise" and "warn",
+  namely "silently produce zero dropdown values." This is new evidence,
+  not present in the source assessment's *Observation* section.
+* *EC-5 -- unhashable `token` crashes Compact Multiaxis with a raw
+  `TypeError`, not a domain diagnostic.* The domain reader validates only
+  that `token` is non-empty via `_is_empty_cell`
+  (`_legend_blocks.py:66-67`); it does not require `token` to be hashable,
+  and happily returns a list-typed token in its record tuple. Cell Codec's
+  path stringifies every allowed value via `_cell_to_text` /`str()`
+  (`scalar.py:248,253`) before any comparison, so a list-typed token becomes
+  a harmless string like `"['a', 'b']"` and validation proceeds normally;
+  the Composer does the same (`layout_composer.py:149`, `str(raw_token)`).
+  Compact Multiaxis's `_legend_groups` (`compact_multiaxis.py:271-277`),
+  however, builds `groups[token] = group_value` using the *raw*,
+  unstringified `token` as a Python dict key. Probe:
+  `_legend_groups({"legend_blocks":{"L":{"entries":[{"token":["a","b"],"label":"x","group":"g"}]}}}, "L")`
+  raises `TypeError: unhashable type: 'list'` -- an unfiltered Python
+  built-in exception, not a `ValueError` with a domain-meaningful message,
+  and not caught anywhere on the `compact_multiaxis` call path. This is new
+  evidence gathered while drafting this FTR; it is the concrete
+  counterexample for acceptance criterion 7 ("deterministic handling of
+  unhashable and ambiguous values without raw pandas/NumPy errors").
+* *EC-6 -- type-heterogeneous duplicate detection is ambiguous-equality
+  dependent, and only some consumers catch it.* Probe with
+  `entries=[{"token":1,"label":"one","group":"g1"},{"token":"1","label":"one-str","group":"g2"}]`
+  (an `int` token `1` and a `str` token `"1"` in the same block): the domain
+  reader treats them as two distinct records (Python `1 != "1"` and they hash
+  differently, so no upstream collision is even representable there); Cell
+  Codec's `_allowed_values` stringifies both via `_cell_to_text` before
+  `_duplicates` runs, so they *do* collide and raise
+  `"Allowed value set contains duplicate values: ['1']"`; Compact
+  Multiaxis's `_legend_groups` builds its dict from *raw* tokens first
+  (`{1: 'g1', '1': 'g2'}`, two distinct keys, no conflict detected at that
+  stage), then `_group_lookup`'s `_normalize_key` stringifies each key only
+  at final lookup time (`compact_multiaxis.py:256-260`) -- if the two
+  entries' `group` values differ, this *does* eventually raise
+  `"Conflicting group value for code '1'"` at the normalized-key stage, but
+  if the two entries' `group` values happen to be equal, the two raw dict
+  entries silently collapse into one normalized-key lookup entry with no
+  diagnostic at all, because `_group_lookup` never checks whether the
+  *pre-normalization* raw keys were meant to be distinct. Probe confirms the
+  conflicting-group case raises; the matching-group case was not separately
+  re-run to completion here but follows deterministically from the same
+  code path (`_group_lookup`'s `if key in lookup and lookup[key] != group_value`
+  only compares by normalized key, never by raw identity). This is the
+  concrete evidence for "ambiguous equality" in *Decision 3* and *Decision
+  6*: raw-token equality and string-normalized-token equality are different
+  relations, and different consumers apply different ones at different
+  pipeline stages.
+* *EC-7 -- Cell Codec's own legend behaviour has no dedicated unit-test
+  coverage.* `grep -n "legend" tests/unit/domain/transformations/test_cell_codec.py`
+  returns zero matches. Cell Codec's `allowed_from_legend` path (duplicate
+  rejection, unknown-reference propagation, token-vocabulary validation) is
+  exercised only transitively, through `test_compact_multiaxis.py`'s
+  `allowed_from_legend` fixtures (e.g.
+  `test_conflicting_legend_and_explicit_code_groups_are_rejected`,
+  `test_missing_legend_block_error_points_to_allowed_from_legend`). This is
+  a test-plan input (acceptance criterion 17 requires focused Cell-Codec-owned
+  coverage), not a behavioural finding.
+* *EC-8 -- the render `ValidationPass`'s unknown-block-warns and
+  empty-entries-silent behaviours are themselves untested.* `grep -n
+  "unknown\|missing\|empty"` over
+  `tests/unit/rendering/test_validation_pass_infra.py` shows tests for
+  `include_empty`, large-dropdown warnings, and unknown *sheet*/*column*
+  targets, but no test exercises an unknown *legend block* reference or a
+  present-but-empty `entries` list for `from_legend`. The behaviour recorded
+  in `EC-3`/`EC-4` for `ValidationPass` is real (verified by direct
+  function-level probe against `rendering/passes/_base.py`) but currently
+  unguarded by any test -- it could regress silently in either direction.
+
+*Consumer behavior matrix:*::
+
+[cols="2,3,3,3,3"]
+|===
+| | Cell Codec (`cell_codec/scalar.py`) | Compact Multiaxis (`compact_multiaxis.py`) | Validation Pass (`rendering/passes/_base.py`) | Visible Legend Composer (`rendering/composer/layout_composer.py`)
+
+| Fields read
+| `entries[].token` only (via `_read_legend_block`, then `_legend_tokens`)
+| `entries[].token`, `entries[].group` (via `_read_legend_block`, then `_legend_groups`)
+| `entries[].token` only (own walk, `_legend_spec`/`_legend_tokens`, does not use `_read_legend_block`)
+| `entries[].token`, `entries[].label`, `entries[].group`, `entries[].description` (own walk, `_validate_legend_entries`, does not use `_read_legend_block`); also `title`, `placement` outside the entry contract
+
+| Block lookup behavior
+| By name via shared `_read_legend_block`; mapping and list form both supported
+| By name via shared `_read_legend_block`; mapping and list form both supported
+| By name via own `_legend_spec`; mapping and list form both supported (independent re-implementation of the same name-resolution fallback chain)
+| By iterating every configured block via own `_legend_items`; mapping and list form both supported (a third independent re-implementation of the same walk)
+
+| Missing `entries` key
+| Raises `ValueError` (via `_read_legend_block:57-59`)
+| Raises `ValueError` (via `_read_legend_block:57-59`)
+| Logs warning, returns `None` -> caller treats as "no values", rule silently dropped
+| Raises `ValueError` ("requires a non-empty entries list")
+
+| Empty `entries` list (`[]`)
+| Raises `ValueError` (same path as missing)
+| Raises `ValueError` (same path as missing)
+| **Returns `[]` silently -- no warning, no error** (`EC-4`)
+| Raises `ValueError` (same path as missing)
+
+| Empty/missing `token`
+| Raises `ValueError` (via `_read_legend_block`'s `_is_empty_cell` check, propagates through the shared reader)
+| Raises `ValueError` (same shared-reader path)
+| Entry silently excluded from the token list (`entry.get("token") not in (None, "")` filter, `_base.py:172`) -- no warning, no error
+| Raises `ValueError` ("has an empty token")
+
+| Label requirement
+| Not read; irrelevant
+| Not read; irrelevant
+| Not read; irrelevant
+| **Required non-empty** per entry; raises `ValueError` otherwise (`EC-1`)
+
+| Duplicate token
+| **Raises** (`_duplicates` over stringified allowed values)
+| **Deduplicates** identical `(token, group)`; **raises** on conflicting `group` for the same normalized token (`EC-2`, `EC-6`)
+| **Silently tolerated** -- duplicate values appear verbatim in the dropdown list
+| **Raises** ("contains duplicate token")
+
+| Conflicting group (same token, different `group`)
+| N/A (`group` not read)
+| **Raises** ("Conflicting group value for code ...")
+| N/A (`group` not read)
+| N/A (`group` not read as an identity field; rendered as a display column only, no conflict check across duplicate tokens because duplicates already raise first)
+
+| Unknown legend reference
+| **Raises** `KeyError` (propagates from `_read_legend_block`, uncaught)
+| **Raises** `KeyError` (same, uncaught)
+| **Warns and no-ops** -- returns `None`, rule silently dropped (`EC-3`)
+| N/A (renders only configured blocks; no "referenced but absent" path in the same sense)
+
+| Unhashable `token` (e.g. a list)
+| Tolerated -- stringified via `_cell_to_text`/`str()` before comparison
+| **Raises raw `TypeError: unhashable type`** -- not a domain diagnostic (`EC-5`)
+| Not separately probed (tokens flow through `str(entry["token"])` implicitly via list construction, same tolerant shape as Cell Codec's path)
+| Tolerated -- stringified via `str(raw_token)` before comparison
+
+| Failure severity / atomicity
+| Hard failure before any output row is produced (validation runs per-cell during row iteration, so a failure partway through `decode_cell_values`'s row loop can occur after some `records` have already been appended in memory, but the function never returns a partial DataFrame -- the exception propagates before the `pd.DataFrame(records, ...)` construction line is reached)
+| Hard failure before any output frame is written (`_with_group_column` computes the full group column via list comprehension before assignment; a `_legend_groups`/`_group_lookup` exception propagates before `out[group] = [...]` executes)
+| Soft failure -- warning only, pipeline continues, no `ValidationPass`-specific atomicity concern because no partial-application state exists (the rule is either included or dropped, nothing partially applied)
+| Hard failure before any table is added to the `WorkbookIR` (`_validate_legend_entries` runs before `TableBlock` construction in `_add_legend_blocks`)
+
+| Current test coverage
+| **None dedicated** (`EC-7`) -- exercised only transitively via `test_compact_multiaxis.py`
+| `test_compact_multiaxis.py`: group projection, explicit `code_groups`, conflicting-group rejection, missing-legend-block error (~10 tests reference `allowed_from_legend`/group)
+| `test_validation_pass_infra.py`: `from_legend` basic/`include_empty`/large-dropdown-warning/list-form/XLSX-roundtrip cases; **no test for unknown-block-warns or empty-entries-silent-return** (`EC-8`)
+| `test_layout_composer.py`: duplicate-token rejection, unknown-target rejection, no-mutation guard, render-plan emission (5 dedicated tests)
+|===
+
+*Human decisions:*::
+
+The following must be decided explicitly, not defaulted by whichever
+implementation is simplest to write. Each is recorded separately per the
+task's requirement not to silently settle them.
+
+*Decision 1 -- Contract ownership model.*
+
+[quote]
+____
+A. One canonical Legend Entry contract -- a shared owner validates the
+complete canonical entry structure (token, label, group, description) before
+any consumer sees it; consumers project only the fields they need from an
+already-validated entry.
+
+B. A layered Legend Entry contract -- a shared minimal machine-value core
+(token, optional group, their equality/duplicate/hashability rules) is
+validated centrally; display requirements (label, description) and
+optional-consumer tolerance (ValidationPass's warn-vs-raise) are explicit,
+narrower extensions owned by their respective consumers.
+____
+
+*Recommendation (not a silent decision): B, the layered model.* Rationale,
+grounded in the matrix above: Cell Codec and Compact Multiaxis are
+presentation-independent domain consumers that never read `label` or
+`description` at all (verified: neither module's source contains the
+string `"label"` or `"description"`); requiring a non-empty `label` on every
+entry as a precondition for Cell Codec's token-vocabulary validation would
+force every purely-domain legend (a codebook that is never rendered
+visibly) to carry a display field it has no use for, which is exactly the
+kind of "presentation coupling to domain identity" the assessment's
+architecture section already flagged as a risk to avoid. The four
+consumers' actual field usage already partitions cleanly into a
+machine-value core (`token`, `group`) used by the two domain consumers and
+by dropdown validation, and a display extension (`label`, `description`)
+used only by the Composer. Model A would either (a) impose the Composer's
+stricter label requirement onto Cell Codec and Compact Multiaxis, breaking
+the currently-valid domain-only-legend use case, or (b) make `label`
+optional in the shared canonical validator and re-delegate the "required
+when rendered" rule to the Composer anyway -- at which point Model A has
+covertly become Model B with extra ceremony. The one place Model A's
+"single owner" instinct is clearly correct is the machine-value core itself
+(`token` identity, hashability, duplicate policy): that sub-contract should
+be centrally validated and shared, which is exactly what Decision 1 asks to
+formalise as the boundary between the shared core and the per-consumer
+extensions, not a reason to make the whole entry contract single-owned.
+
+*Decision 2 -- Display-label requirement.*
+
+Determine whether `entries[].label` is mandatory canonical Legend Entry
+intent, required only when the block is rendered visibly, optional and
+defaulted from `token`, or governed by another explicit rule.
+
+*Recommendation:* required only when the block is rendered visibly (i.e.
+exactly the Composer's current behaviour), not mandatory canonical intent
+and not defaulted from `token`. A codebook used only for Cell Codec/Compact
+Multiaxis validation with no visible rendering has no display consumer and
+should not be forced to author display text it will never show; a
+default-from-`token` rule would silently manufacture display text (`label =
+token`) that nobody explicitly authored, which is the "resolution
+materialised where it should be an explicit decision" pattern the source
+assessment already flagged as a risk elsewhere (`legend_blocks`'s
+resolved/intent split). This aligns with the functional model's own
+statement (`legend_blocks.adoc:36-38`): "In the simplest legends the three
+[code, label, long form] collapse ... they are separated only when the
+cell value, the display text, and the structured value genuinely differ" --
+which describes label as collapsing to the code *by author choice*, not by
+an implicit runtime default.
+
+*Decision 3 -- Duplicate-token policy.*
+
+Determine whether duplicate `token` values are always invalid, valid only
+when all associated semantic fields are identical, permitted for selected
+consumers, or normalised/deduplicated by one deterministic rule. Must
+address: identical duplicates; same token with conflicting groups; same
+token with conflicting labels/descriptions; stable ordering; deterministic
+diagnostics; ambiguous-equality values (`EC-6`).
+
+*Recommendation:* duplicate tokens are invalid at the shared machine-value
+core, full stop -- including "identical duplicates" (same token, same
+group). This is stricter than Compact Multiaxis's current silent dedup of
+identical `(token, group)` pairs, and the FTR must record that narrowing
+explicitly rather than let it slide in as a side effect of centralisation.
+Rationale: three of the four consumers (Cell Codec, ValidationPass by
+omission aside, Composer) already treat any duplicate token as an authoring
+defect; Compact Multiaxis's silent-dedup is the outlier, not the majority
+behaviour, and "silently accept a duplicate as long as it says the same
+thing twice" is a lenient special case with no evidence of a real use case
+requiring it (no test names a scenario where an intentional exact-duplicate
+entry is required). Equality for the duplicate check must be defined
+explicitly rather than left to whichever consumer's string-coercion happens
+to run first (`EC-6`): recommend comparing raw token identity via Python
+`==`/hash first (catching `TypeError` on unhashable values as a distinct,
+named diagnostic per Decision 6), and only falling back to a defined
+string-normalization comparison if raw comparison cannot decide (e.g. `1`
+vs. `"1"`) -- with that fallback comparison and its outcome made an explicit,
+tested rule, not an incidental consequence of `_cell_to_text`/`_normalize_key`
+both happening to call `str()`.
+
+*Decision 4 -- Unknown-reference behavior.*
+
+Determine whether an unknown Legend Block reference should always fail,
+fail in domain transformations but warn/no-op in optional presentation,
+remain consumer-specific, or be controlled by a narrowly justified policy.
+Do not introduce a generic configurable error-policy framework without a
+demonstrated use case.
+
+*Recommendation:* fail in domain transformations (Cell Codec, Compact
+Multiaxis -- preserve current behaviour, this is already consistent and
+correct), warn-and-no-op only in the render `ValidationPass` (preserve
+current behaviour there too, but make it an explicit, documented, and
+*tested* rule rather than an implicit side effect of `_legend_spec` returning
+`None`). No configurable policy framework: the task explicitly forbids
+inventing one without a demonstrated need, and there is none here -- exactly
+two behaviours exist today (hard-fail for domain correctness; soft-degrade
+for an optional presentation nicety where a missing dropdown is recoverable
+and a broken build is not), and both are independently justifiable on their
+own terms without a shared configuration surface.
+
+*Decision 5 -- Empty block and empty entry behavior.*
+
+Define behavior for missing `entries`; empty `entries`; empty/missing
+`token`; empty/missing `label`; empty/missing `group`; empty/missing
+`description`. Distinguish required machine fields from optional display
+fields.
+
+*Recommendation:* missing `entries` and empty `entries` (`[]`) must be
+treated identically -- both are "no legend content," and per Decision 4's
+"domain fails hard, presentation warns" split, both should raise in domain
+consumers and both should warn-and-no-op in `ValidationPass`. This explicitly
+*closes* `EC-4`'s undocumented third behaviour (silent `[]` return for
+present-but-empty `entries`) rather than preserving it -- there is no
+identified use case for "the block exists and was explicitly emptied" being
+semantically different from "the block was never populated," and leaving a
+silent-empty-list path is exactly the kind of undiscovered edge case
+Decision 5 exists to close. `token` is a required machine field (empty is
+already uniformly rejected by every consumer that reads it; preserve as-is).
+`group`, `label`, `description` are optional display/domain-adjacent fields;
+missing/empty must not raise by themselves in any consumer, consistent with
+current behaviour everywhere except the Composer's `label` requirement,
+which Decision 2 already scopes to "required only when rendered," not to
+every entry unconditionally.
+
+*Decision 6 -- Supported machine-value types.*
+
+Define the contract for `entries[].token` and `entries[].group`: ordinary
+strings; numeric-looking strings; numeric/boolean/date-like values; `None`,
+`NaN`, `pd.NA`; lists/dicts/arrays/other unhashable values; NumPy/pandas
+values with ambiguous equality; carrier stability across XLSX/ODS; duplicate
+and lookup semantics. Do not copy the XRef matrix-axis identity contract or
+the physical DataFrame-label contract -- legend tokens are domain/cell
+values, not DataFrame selectors.
+
+*Recommendation:* `token` must be non-empty per `_is_empty_cell` (preserve
+current uniform rule -- rejects `None`/`NaN`/`pd.NA`/empty string
+consistently today, verified by probe) and must be *hashable* -- reject a
+list/dict/other unhashable `token` with a deterministic `ValueError` at the
+shared core, closing `EC-5` at its source rather than leaving Compact
+Multiaxis to discover it as a raw `TypeError`. This does not import the
+XRef/DataFrame-label contract (no requirement of scalar-addressability,
+string-only-ness, or column-label uniqueness rules) -- it is the minimum
+Python-level requirement any consumer that ever needs `token` as a dict key
+or set member already implicitly depends on, made explicit and checked once
+instead of crashing wherever it happens to matter first. Numeric-looking
+strings, numbers, booleans, and date-like values are permitted as `token` or
+`group` values (no type restriction beyond hashability + non-emptiness);
+equality/duplicate comparison across mixed types follows Decision 3's raw-
+then-string-normalized rule. `group` has no stricter requirement than
+`token` today (both flow through the same `_normalize_key`/`_cell_to_text`
+style stringification wherever they are compared) and this FTR does not
+propose adding one.
+
+*Recommended ownership model:*::
+
+Adopt *Decision 1: Model B (layered contract)*, summarised:
+
+[source,text]
+----
+Shared machine-entry core (single validated owner):
+  - token: required, non-empty (_is_empty_cell), hashable
+  - group: optional, no additional type restriction
+  - duplicate policy: raw-identity first, string-normalized fallback,
+    always invalid (no silent same-value dedup)
+  - unhashable token: deterministic ValueError, not a raw TypeError
+  - missing/empty entries: treated identically, deferred to consumer
+    failure-severity policy (below), not decided at the core
+
+Consumer failure-severity policy (explicit per consumer, not configurable):
+  - Cell Codec:        domain -> always fails hard
+  - Compact Multiaxis: domain -> always fails hard
+  - ValidationPass:    optional presentation -> warns and no-ops
+  - Composer:          required presentation -> always fails hard,
+                       PLUS its own label-required extension when
+                       rendering is actually requested (Decision 2)
+----
+
+This is the layered model the source assessment posed as a candidate
+direction and did not itself decide; this FTR treats it as the chosen
+answer to Decision 1, justified independently above, not inherited
+unexamined from the assessment's phrasing.
+
+*Target field-level contract:*::
+
+[cols="2,4"]
+|===
+| Field | Contract
+
+| Legend Block identity
+| The mapping key (or, once `FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5`
+  lands, always the mapping key -- list-form `name`/`id`/positional
+  resolution becomes an ingress-only concern that FTR owns, not this one).
+  Unaffected by this FTR's decisions.
+
+| Legend Entry machine identity (`token`)
+| Required; non-empty per `_is_empty_cell`; must be hashable (Decision 6);
+  duplicate-invalid under the raw-then-normalized rule (Decision 3); no
+  restriction on underlying type beyond hashability and non-emptiness.
+
+| Display label (`label`)
+| Optional at the shared core; required only when the entry participates in
+  visible rendering (Decision 2); never read by Cell Codec or Compact
+  Multiaxis; not defaulted from `token`.
+
+| Optional group (`group`)
+| Optional; defaults to `""` when absent (preserve
+  `_read_legend_block`'s current `entry.get("group", "")` default); no type
+  restriction beyond what `token` has; participates in the duplicate/conflict
+  check only insofar as Compact Multiaxis's group-conflict rule already
+  requires (preserved, not widened to other consumers by this FTR).
+
+| Optional description (`description`)
+| Optional; display-only; consumed only by the Composer; no default.
+
+| Entry ordering
+| Preserve list order as authored; this FTR does not introduce or change any
+  ordering/sorting rule.
+
+| Duplicate detection
+| Centralised at the shared core per Decision 3; every consumer observes an
+  already-deduplication-validated entry list -- no consumer needs its own
+  duplicate check after this FTR, though the failure *severity* (raise vs.
+  warn) for a duplicate detected at ingestion still follows the per-consumer
+  policy above, applied at whichever point that consumer's `allowed_from_legend`
+  / `from_legend` / render-time resolution actually runs.
+
+| Ambiguous equality
+| Resolved by Decision 3's raw-identity-then-string-normalized rule, applied
+  uniformly by the shared core.
+
+| Unknown references
+| Per consumer failure-severity policy above (Decision 4); not configurable.
+
+| Empty and missing values
+| Per Decision 5; missing and empty `entries` are equivalent; `token` empty
+  is always invalid; `label`/`group`/`description` empty/missing never raises
+  by itself.
+
+| Consumer-specific extensions
+| Exactly the Composer's `label`-required-when-rendering rule (Decision 2).
+  No other consumer gets an extension under this FTR.
+
+| Validation timing
+| At the point each consumer resolves `allowed_from_legend` / `from_legend` /
+  render-time legend iteration -- this FTR does not introduce a separate
+  upfront "validate all legend blocks before any pipeline step runs" phase,
+  since no consumer today does that and no evidence demands it.
+
+| Failure atomicity
+| Preserve current behaviour for all four consumers (see matrix row "Failure
+  severity / atomicity"): every consumer already fails before producing
+  partial output; this FTR's centralisation must not regress that property.
+
+| Carrier compatibility
+| No new requirement beyond Decision 6's hashability rule, which is a
+  Python-level in-memory property, not a carrier-serialization property;
+  XLSX/ODS string-cell carrier behaviour for `token`/`group`/`label` values
+  is unchanged by this FTR (that concerns cell-value carrier semantics, out
+  of scope here -- see *Non-Goals*).
+|===
+
+*Does canonical validity guarantee every consumer can use a Legend Block?*
+No, and this FTR does not attempt to make it so: a block that fails the
+Composer's label requirement (Decision 2) remains fully valid for Cell Codec
+and Compact Multiaxis. This is *purpose-specific validity*, explicit and
+reviewable: a block's fitness for visible rendering is a separate, named
+question ("is this block configured for visible use?") from its fitness for
+domain code/group validation, and this FTR's layered model makes that
+distinction an explicit, named boundary (the shared core vs. the Composer's
+extension) rather than something discovered only when the Composer happens
+to run first and raises.
+
+*Scope:*::
+
+In scope for this slice:
+
+* Decide and record Decisions 1-6 above (already drafted as recommendations
+  in this FTR; implementation confirms or revises them, but must not
+  silently deviate without recording why).
+* Introduce the minimum shared machine-entry validation boundary (token
+  hashability + non-emptiness, duplicate policy, missing/empty `entries`
+  equivalence) as a narrow extension of -- or replacement for -- the
+  existing `_legend_blocks.py::_read_legend_block` reader.
+* Align Cell Codec's `_legend_tokens` (`scalar.py:265-266`) and Compact
+  Multiaxis's `_legend_groups` (`compact_multiaxis.py:271-277`) to consume
+  the shared core's already-validated output rather than each re-deriving
+  their own duplicate/hashability handling.
+* Align the render `ValidationPass`'s `_legend_spec`/`_legend_tokens`
+  (`_base.py:136-182`) to the explicit warn/no-op policy for unknown
+  references and empty entries (closing `EC-4`'s undocumented third
+  behaviour), and add the missing test coverage identified in `EC-8`.
+* Align the Visible Legend Composer's `_validate_legend_entries`
+  (`layout_composer.py:138-163`) to the shared core for the machine-value
+  checks it currently duplicates (duplicate-token, empty-token,
+  empty-entries), while keeping its `label`-required extension as its own,
+  explicitly scoped addition (Decision 2).
+* Update `registries/meta_registry.yaml`'s `legend_blocks` entry only if the
+  chosen ownership model changes the documented `meaning`/`precedence_notes`
+  text (the consumer-list accuracy fix itself is `LB-7`, owned by the
+  sibling FTR -- do not duplicate that edit here; this FTR touches the entry
+  only if its prose description of validation ownership needs to change).
+* Update `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`
+  and `cell_codec.adoc`/`compact_multiaxis.adoc` where they describe entry
+  validation behaviour this slice changes (e.g. Compact Multiaxis's
+  identical-duplicate silent-dedup narrowing to always-invalid, per Decision
+  3).
+* Add the focused unit tests named in *Test Plan* so each decided property
+  is guarded, not just implemented once.
+
+*Non-goals:*::
+
+Explicitly excluded from this FTR:
+
+* Mapping-versus-list canonical shape, ingress normalisation, `resolved`
+  lifecycle, persistence-boundary correction, workbook carrier readback,
+  legend-only-sheet classification, `placement`/schema-maintenance
+  references, and `meta_registry.yaml` consumer-list accuracy (`LB-1`
+  through `LB-4`, `LB-6`, `LB-7`) -- all owned by
+  `FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5`. This FTR must not
+  duplicate or reopen any of that scope.
+* Compact Multiaxis composition refactoring (its XRef/Cell-Codec delegation
+  graph, `expand_`/`contract_compact_multiaxis` structure) -- this FTR only
+  touches `_legend_groups`/`_with_group_column`'s internal reliance on the
+  shared reader, not the composite's composition boundary.
+* Cell Codec historical code-row-path retirement or extraction -- this FTR
+  only touches its legend-token lookup, not `decode_`/`encode_cell_values`'s
+  broader contract.
+* Sparse Defaults (`LB-5`) -- unrelated to entry-value semantics.
+* Functional Model long-form / frame-backed legend concepts
+  (`legend_blocks.adoc`'s documented-but-unimplemented "long form" and
+  "frame-backed" source mode) -- this FTR does not implement either; it
+  only corrects the entry-validation prose for fields that already exist.
+* A generic metadata schema or validation engine -- the shared core
+  introduced here is a narrow, legend-entry-specific helper, not a reusable
+  generic validator for other `_meta` roots.
+* Changes to XRef axis-identity or physical DataFrame-label contracts --
+  Decision 6 explicitly declines to import either.
+* Carrier-level (XLSX/ODS cell-value) type-preservation behaviour for
+  `token`/`group`/`label` -- that is a cell-value carrier concern (Cell
+  Codec's own string-substrate ADR territory), not an entry-contract
+  concern; this FTR's hashability/duplicate rules operate on already-parsed
+  in-memory Python values.
+* Any change to `allowed_codes`/`allowed_tokens` (the non-legend explicit
+  allow-list parameters) -- this FTR concerns only the `allowed_from_legend`
+  path.
+
+*Affected surfaces:*::
+
+* `src/spreadsheet_handling/domain/transformations/_legend_blocks.py` --
+  `_read_legend_block`, extended with the shared core's hashability and
+  duplicate-policy checks.
+* `src/spreadsheet_handling/domain/transformations/cell_codec/scalar.py` --
+  `_legend_tokens`, `_allowed_values`, `_duplicates` (reconciled with the
+  shared core rather than independently re-checking duplicates).
+* `src/spreadsheet_handling/domain/transformations/compact_multiaxis.py` --
+  `_legend_groups`, `_group_lookup`, `_with_group_column` (reconciled with
+  the shared core; identical-duplicate silent-dedup narrowed per Decision
+  3).
+* `src/spreadsheet_handling/rendering/passes/_base.py` -- `_legend_spec`,
+  `_legend_tokens`, `_validation_values` (explicit, tested empty-entries and
+  unknown-reference policy).
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py` --
+  `_validate_legend_entries` (machine-value checks reconciled with the
+  shared core; `label`-required extension preserved as Composer-owned).
+* `registries/meta_registry.yaml` -- `legend_blocks` entry prose, only if
+  the ownership-model text needs updating (not its consumer list, which is
+  `LB-7`'s scope).
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`,
+  `cell_codec.adoc`, `compact_multiaxis.adoc` -- entry-validation behaviour
+  descriptions.
+* Test surfaces: `tests/unit/domain/transformations/test_cell_codec.py`
+  (new dedicated legend-token test cases, closing `EC-7`),
+  `tests/unit/domain/transformations/test_compact_multiaxis.py` (narrowed
+  identical-duplicate expectation, new hashability test),
+  `tests/unit/rendering/test_validation_pass_infra.py` (new unknown-block
+  and empty-entries test cases, closing `EC-8`),
+  `tests/unit/rendering/composer/test_layout_composer.py` (reconciled
+  machine-value-check tests, preserved label-requirement tests).
+
+Explicitly preserved (do not modify):
+
+* The accepted Cell Codec dependency shape (`allowed_from_legend` ->
+  `_read_legend_block` -> tokens-only) -- only its duplicate/hashability
+  internals move to the shared core, not its external contract.
+* Compact Multiaxis's composition boundary and its group-conflict-raises
+  behaviour for genuinely conflicting groups.
+* The render `ValidationPass`'s warn-and-no-op behaviour for unknown
+  references (made explicit and tested, not changed).
+* Visible legend rendering, `title`, `placement` handling.
+* `resolved` lifecycle, shape normalisation, and everything else owned by
+  the sibling FTR.
+
+*Implementation slices:*::
+
+. *Decide and record the ownership model and field-level contract.*
+  Confirm or revise Decisions 1-6 above; record the final decision text in
+  this FTR before writing code.
+. *Introduce the shared machine-entry validation boundary.* Extend
+  `_legend_blocks.py::_read_legend_block` (or introduce a narrowly-scoped
+  sibling function if extending the existing one would overload its current
+  "verbatim schema walk" purpose) to enforce token hashability, the
+  raw-then-normalized duplicate policy, and missing/empty-`entries`
+  equivalence, per Decisions 3, 5, 6. Add unit tests for the shared core in
+  isolation.
+. *Align Cell Codec and Compact Multiaxis with the shared core.* Remove
+  each consumer's now-redundant duplicate/hashability re-checking; verify
+  their externally observable behaviour is unchanged except where Decision
+  3 deliberately narrows Compact Multiaxis's identical-duplicate tolerance.
+  Add the dedicated Cell Codec legend tests closing `EC-7`.
+. *Align the render `ValidationPass`'s reference and duplicate/empty
+  behavior.* Make the warn/no-op-for-unknown-reference and
+  warn/no-op-for-empty-entries rules explicit and tested (Decision 4,
+  closing `EC-4`/`EC-8`).
+. *Align the Composer's machine-value checks with the shared core, keep its
+  label extension.* Reconcile `_validate_legend_entries`'s duplicate/empty-
+  token checks with the shared core; keep its `label`-required rule as an
+  explicit, documented Composer-owned extension (Decision 2).
+. *Update registry prose and live documentation, add cross-consumer
+  tests.* Update `meta_registry.yaml` prose (if needed) and the functional-
+  model chapters; add a cross-consumer contract test that authors one
+  Legend Block fixture and asserts each consumer's documented behaviour
+  against it in one place, so a future change to any one consumer's
+  handling is caught by a test that also encodes the other three's expected
+  behaviour.
+
+Adjust this sequence if implementation review demonstrates a safer boundary
+than the one analysed above; any such deviation must be recorded in this FTR
+before it is acted on.
+
+*Acceptance criteria:*::
+
+. One explicit ownership model for Legend Entry validation is selected and
+  recorded (Decision 1) -- the layered model, per this FTR's recommendation,
+  or an explicit alternative with recorded rationale.
+. An exact field-level contract for `token`, `label`, `group`, and
+  `description` is defined and documented in this FTR (see *Target
+  field-level contract*).
+. An exact duplicate-token policy is defined (Decision 3), including the
+  raw-identity-then-string-normalized equality rule, and applied uniformly
+  by the shared core.
+. Deterministic behavior for identical and conflicting duplicate entries is
+  specified and tested, including the narrowed identical-duplicate case for
+  Compact Multiaxis.
+. Explicit unknown-reference behavior is defined per consumer category
+  (Decision 4): domain fails hard, optional presentation warns and no-ops;
+  no configurable policy framework introduced.
+. Explicit empty/missing behavior is defined for both blocks and entries
+  (Decision 5), including closing `EC-4`'s undocumented silent-`[]` case.
+. Unhashable and ambiguous values are handled deterministically without a
+  raw pandas/NumPy or built-in Python exception reaching any caller;
+  concretely, `EC-5`'s `TypeError: unhashable type` is replaced by a
+  domain-meaningful `ValueError` raised at the shared core.
+. Machine identity (`token`) and display label (`label`) are clearly
+  distinguished in the target contract and in code: no consumer that reads
+  only `token`/`group` is made to require `label`.
+. No DataFrame-selector rule (scalar-addressability, physical-label
+  uniqueness/hashability contract from `domain.tabular`) is imposed on
+  `token`/`group` values; Decision 6's hashability requirement is justified
+  independently as a Python dict-key/set-member necessity, not inherited
+  from the XRef/Cell-Codec physical-label contract.
+. Cell Codec consumes only the machine-value subset it needs (`token`) and
+  gains dedicated unit-test coverage closing `EC-7`.
+. Compact Multiaxis consumes only token/group semantics, preserves its
+  current composition boundary (XRef + Cell Codec + optional Legend
+  group/validation), and its identical-duplicate narrowing (Decision 3) is
+  covered by an updated test replacing any test that currently asserts the
+  old silent-dedup behaviour as desired.
+. `ValidationPass` behavior for unknown references and empty entries is
+  intentional, documented in this FTR, and covered by new tests closing
+  `EC-8`.
+. Visible rendering cannot discover an undocumented incompatibility after a
+  block has already been accepted as valid for visible use -- i.e. the
+  Composer's machine-value checks and label requirement are both applied
+  together, in one pass, before any `TableBlock` is constructed (preserve
+  current ordering; do not split the checks across two passes that could
+  disagree).
+. Domain rejection (Cell Codec, Compact Multiaxis) produces no partial
+  output, metadata, cleanup, or input mutation -- preserve the current
+  fail-before-construction property verified in the *Consumer behavior
+  matrix*'s "Failure severity / atomicity" row for every touched function.
+. `registries/meta_registry.yaml` and live functional-model documentation
+  agree with the corrected runtime behaviour for every entry-contract rule
+  this FTR changes.
+. XLSX and ODS continue to preserve all currently-supported
+  token/group/label values consistently; this FTR introduces no new carrier
+  requirement (Decision 6 is explicitly an in-memory, not carrier, rule).
+. Focused unit, integration, roundtrip, and architecture tests pass,
+  including the new tests named in *Test Plan*; Demo and any relevant
+  Worldbuilding legend-block usage is checked for reliance on the narrowed
+  identical-duplicate behaviour before merge.
+. Full Core (`make test` / `pytest tests/unit tests/integration
+  tests/roundtrip tests/architecture`) remains green before merge.
+
+*Test plan:*::
+
+New / extended tests, by layer:
+
+* *Unit -- shared core* (new or extended
+  `tests/unit/domain/transformations/test_legend_blocks_reader.py`, or
+  co-located with an existing suite if a dedicated file does not yet exist --
+  confirm at implementation time): non-empty/hashable `token` acceptance;
+  unhashable `token` raises a domain `ValueError` (closes `EC-5`); identical
+  duplicate raises (closes the Compact Multiaxis narrowing from Decision 3);
+  conflicting-group duplicate raises; mixed-type token equality per Decision
+  3's raw-then-normalized rule (covers `EC-6`); missing and empty `entries`
+  both raise identically.
+* *Unit -- Cell Codec* (`tests/unit/domain/transformations/test_cell_codec.py`,
+  currently zero legend-related tests, closing `EC-7`): dedicated
+  `allowed_from_legend` acceptance test; duplicate-token rejection routed
+  through the shared core; unknown-legend-block `KeyError` propagation.
+* *Unit -- Compact Multiaxis*
+  (`tests/unit/domain/transformations/test_compact_multiaxis.py`): update
+  or add a test asserting identical-duplicate entries now raise (narrowing
+  from silent dedup, Decision 3) rather than silently deduplicating; add an
+  unhashable-token test asserting the same domain `ValueError` the shared
+  core now raises, replacing the current raw `TypeError` path; preserve the
+  existing conflicting-group and missing-legend-block tests unchanged.
+* *Unit -- Validation Pass* (`tests/unit/rendering/test_validation_pass_infra.py`,
+  closing `EC-8`): unknown legend block reference logs a warning and the
+  rule is dropped (assert via `caplog`, following the existing
+  `test_from_legend_warns_for_large_dropdowns` pattern); present-but-empty
+  `entries` list either raises the same warning-and-drop behavior as missing
+  `entries` (per Decision 5's "treat identically" rule) or, if implementation
+  reveals a reason to keep them distinct, that reason is recorded in this
+  FTR and a test asserts the recorded behavior explicitly -- either way, the
+  case is no longer silently uncovered.
+* *Unit -- Visible Legend Composer* (`tests/unit/rendering/composer/test_layout_composer.py`):
+  preserve existing duplicate-token and label-requirement tests; add a
+  hashability test (unhashable token now raises via the shared core rather
+  than being silently stringified, if Decision 6's core check is wired into
+  the Composer's path -- confirm at implementation time whether the
+  Composer's tolerant `str(raw_token)` stringification is superseded by the
+  shared core's earlier hashability rejection or remains a display-only
+  fallback for values the core already accepted).
+* *Cross-consumer contract test* (new, location TBD at implementation time --
+  candidate: `tests/integration/roundtrip/test_legend_blocks.py` or a new
+  `tests/unit/domain/transformations/test_legend_entry_contract.py`): one
+  fixture Legend Block exercised against all four consumers in a single
+  test module, asserting the exact documented behavior from the *Consumer
+  behavior matrix* for at least: a well-formed block (all four accept); a
+  label-less block (Cell Codec/Compact Multiaxis accept, Composer rejects);
+  a duplicate-token block (all four now raise, post-narrowing); an
+  unknown-reference case (Cell Codec/Compact Multiaxis raise, ValidationPass
+  warns).
+* *Non-regression*: the full focused suite named in the source assessment's
+  *Existing test coverage* section, plus every file listed in *Affected
+  surfaces* above, stays green; `make test` before merge.
+* Run all commands with `PYTHONPATH=src` per the current `.venv` caveat
+  recorded in the source assessment and the sibling FTR, or after `make
+  clean-stamps && make setup` if the venv stamp is stale.
+
+*Documentation and registry impact:*::
+
+* `registries/meta_registry.yaml` -- `legend_blocks` entry's `meaning`/
+  `precedence_notes` prose updated only if the ownership-model decision
+  changes how validation ownership should be described; the consumer *list*
+  itself is `LB-7`'s scope (sibling FTR), not touched here to avoid a merge
+  conflict between the two slices over the same lines.
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc` --
+  update if Decision 2/3 change any behavior the chapter currently implies
+  (it does not currently state a duplicate-token or label-requirement rule
+  explicitly, so this is likely an addition, not a correction).
+* `docs/functional_model/ch04_use_case_concepts/cell_codec.adoc`,
+  `compact_multiaxis.adoc` -- update only if their descriptions of
+  `allowed_from_legend`/group-projection behavior need to reflect the
+  narrowed duplicate policy.
+* Release notes (`docs/release_notes/release_notes.adoc`): required per the
+  release-notes checkpoint if Decision 3's narrowing (identical-duplicate
+  entries in Compact Multiaxis now raise instead of silently deduplicating)
+  changes observable behavior for any existing configuration -- this is a
+  breaking change for a caller currently relying on the silent-dedup
+  behavior, however unlikely; the implementer must check Demo and
+  Worldbuilding for such a configuration before merge and record the
+  release-note entry or an explicit "no such usage found" determination.
+* No new `_meta` root, no new registry root, no new pipeline-step category.
+
+*Compatibility and migration risks:*::
+
+* *Decision 3's narrowing is a behavior change, not purely a bug fix.* Any
+  existing configuration (in this repo, Demo, or Worldbuilding) that
+  authored an intentional identical-duplicate Legend Entry (same token, same
+  group, listed twice) and relied on Compact Multiaxis's current silent
+  dedup will start raising after this FTR. Mitigation: grep Demo and
+  Worldbuilding for `legend_blocks` fixtures with duplicate `token` entries
+  before implementation; if any are found, evaluate whether they are
+  accidental (likely, given no test asserts this as intentional) or
+  deliberate, and record the finding in this FTR's completion evidence.
+* *Shared-core centralization could change error message text or type for
+  existing callers that pattern-match on it.* `test_missing_legend_block_error_points_to_allowed_from_legend`
+  and similar tests match specific substrings (e.g. `"allowed_from_legend.*status_codes"`)
+  against raised exceptions. Mitigation: preserve existing `KeyError`/
+  `ValueError` message text verbatim wherever the shared core subsumes an
+  existing check; only *new* checks (hashability, EC-4's empty-entries
+  closure) introduce new message text.
+* *`ValidationPass`'s empty-entries closure (Decision 5) could newly warn
+  where it previously stayed silent.* If any current pipeline configuration
+  relies on a present-but-empty `entries` list producing a silently-empty
+  dropdown with no log output, this FTR's Decision 5 makes that case warn
+  (or raise, depending on final implementation choice) instead. Mitigation:
+  same Demo/Worldbuilding grep as above, extended to look for
+  `entries: []` alongside `from_legend` usage.
+* *Sequencing interaction with the sibling FTR.* If
+  `FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5`'s ingress normalisation
+  lands first, every consumer this FTR touches will observe only mapping-
+  form `legend_blocks` by the time this FTR's changes land; if this FTR
+  lands first, all four consumers still handle both shapes independently
+  as they do today, and this FTR's shared core must therefore still handle
+  both shapes (it already does, via `_read_legend_block`'s existing
+  mapping/list walk) -- no change to this FTR's design is required either
+  way, but the implementer should note in the completion evidence which
+  order actually occurred.
+
+*Dependencies and sequencing:*::
+
+* Independent of `FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5` at the
+  level of entry-value semantics; the two slices touch disjoint concerns
+  (shape/lifecycle vs. entry-value policy) and can be sequenced in either
+  order, per that FTR's own *Dependency and Sequencing Notes*.
+* Must respect the canonical shape decision already recorded in that FTR
+  (list form as input sugar, mapping form canonical) without reopening it;
+  this FTR's shared core continues to accept both shapes for as long as
+  the sibling FTR's normalisation has not yet landed, and continues to work
+  correctly once it has (mapping form is a strict subset of what the shared
+  core already handles).
+* Does not block, and is not blocked by, any `compact_multiaxis` composition
+  assessment or implementation FTR, unless that assessment surfaces a
+  concrete token/group contract dependency beyond what this FTR already
+  documents (none identified as of this FTR's drafting).
+* Any `compact_multiaxis` composition refactor must not silently settle
+  Decisions 1-6 above as a side effect of unrelated composition changes;
+  a reviewer encountering entry-validation-policy changes inside a
+  `compact_multiaxis` composition PR should reject them back to this FTR.
+* The accepted Cell Codec primitive contract (`allowed_from_legend` ->
+  `_read_legend_block` -> tokens-only, no `_meta.cell_codecs` writes) must
+  not be weakened by this FTR; only the internal duplicate/hashability
+  mechanics move to the shared core, not the external contract shape.
+
+*Completion evidence placeholders:*::
+
+* Implementation commit(s): _TBD_.
+* Test run output (`make test` / `pytest tests/unit tests/integration
+  tests/roundtrip tests/architecture`): _TBD_.
+* Self-review checklist result
+  (`docs/ai_info/git_and_workflow.adoc`, "Self-review checklist"): _TBD_.
+* FTR review artifact: `docs/backlog/FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5_review.adoc`
+  (to be created at implementation time, per
+  `docs/ai_info/git_and_workflow.adoc`, "FTR review notes"): _TBD_.
+* Release-notes entry or explicit "no release note needed" rationale for
+  Decision 3's narrowing: _TBD_.
+* Grep confirmation of no identical-duplicate or empty-`entries`-with-
+  `from_legend` usage in `demo/` and `worldbuilding/` (or, if found, the
+  migration/parity note covering it): _TBD_.
+* Final recorded text of Decisions 1-6 as actually implemented (confirming
+  or superseding the recommendations drafted in this FTR): _TBD_.
