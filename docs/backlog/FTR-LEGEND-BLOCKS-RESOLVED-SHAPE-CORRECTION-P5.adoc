@@ -1,0 +1,605 @@
+===== FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5 -- Correct Legend Blocks `resolved`-facet persistence, carrier-readback, and legend-surface shape defects
+
+*Status:* New
+
+*Priority:* P5
+
+*Type:* Correction slice (persistence boundary, carrier readback, workbook
+projection, registry accuracy). Non-blocking with respect to the
+`compact_multiaxis` composition assessment -- none of these findings sit on
+the surface `compact_multiaxis` depends on.
+
+*Source assessment and traceability:*::
+
+* Source: `docs/warm_storage/global_reviews/legend_blocks_contract_and_composition_assessment.adoc`.
+* Assessment commit: `b97a907f72593ef42b2c854858089e5af089bfc0`
+  (`docs(warm-storage): assess legend blocks composition contract`).
+* This FTR was drafted against runtime code at the same HEAD
+  (`b97a907f72593ef42b2c854858089e5af089bfc0`); every finding below was
+  re-verified against the current source tree during drafting, not copied
+  mechanically from the assessment. File:line references reflect that
+  re-verification.
+* Findings carried into this FTR: `LB-1`, `LB-2`, `LB-3`, `LB-4`, `LB-7`.
+* `LB-6` (`placement.target` is an unmaintained frame reference) is carried
+  as a bounded, explicit non-goal -- see *Non-Goals*. Re-inspection of
+  `domain/schema_maintenance/{columns,operations}.py` confirms the current
+  schema-maintenance surface performs only column-level operations
+  (`rename_column`, `add_column`, `drop_column`) scoped to a
+  `target_frame`; there is no frame-rename operation anywhere in
+  `schema_maintenance`. The assessment's premise -- that frame renames are
+  out of the current maintenance scope -- still holds at this HEAD, so
+  `LB-6` is not pulled into this slice.
+* `LB-5` (Sparse Defaults doc-vs-code in `compact_multiaxis`) is explicitly
+  *not* part of this FTR. It belongs to the `compact_multiaxis` composition
+  assessment thread the source assessment cleared for; pulling it in here
+  would mix an unrelated doc-vs-code question into a persistence/carrier
+  correction slice.
+* `OB-1` (four divergent per-consumer entry validators for `label` /
+  duplicate tokens / unknown legend references / empty entries / warning
+  vs. error) is explicitly out of scope here and belongs to the sibling FTR
+  `FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5` (not created by this task). See
+  *Non-Goals*.
+* `LB-7` (registry consumer-list accuracy) is included in this slice per the
+  assessment's own note that it "can fold into either slice above."
+
+*Problem statement:*::
+
+Legend Blocks' `resolved` facet (`_meta.legend_blocks[*].resolved`) is
+render-derived Resolution: a snapshot of the visible legend table's
+carrier coordinates, written fresh by the composer on every render and
+consumed by the XLSX/ODS parsers as a readback hint. The repository's
+Intent-vs-Resolution rule
+(`docs/ai_info/agent_rules.adoc`, "Persistence boundary for `_meta`") is
+explicit that Resolution must not survive a structured, carrier-neutral
+persist. Current code honours that rule only for the *mapping* form of
+`_meta.legend_blocks`; the *list* form (a form the domain reader, composer,
+and validation pass all already accept) is not recognised by the
+persistence boundary or by either carrier parser's legend-hint
+recognition, so it diverges silently at both ends. Separately, even the
+mapping form's carrier readback briefly promotes `resolved` back into
+canonical `_meta` before it is next overwritten or stripped, and a legend
+rendered onto its own dedicated sheet is not distinguished from an
+ordinary payload frame on structured readback -- both contrary to the
+functional model's own stated target
+(`docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`, "not
+trusted from a prior `_meta`"; "generated legend surfaces do not become
+ordinary payload frames"). Finally, `registries/meta_registry.yaml`'s
+`legend_blocks` consumer list omits three real runtime consumers, making
+the registry an inaccurate contract statement for anyone using it to judge
+coupling before a future change.
+
+*Verified evidence:*::
+
+Re-verified directly against the source tree at
+`b97a907f72593ef42b2c854858089e5af089bfc0` while drafting this FTR
+(commands run with `PYTHONPATH=src`, no repository state changed):
+
+* *LB-1* -- `src/spreadsheet_handling/pipeline/persistence_boundary.py:161-178`,
+  `_project_legend_blocks`. The function's first line is
+  `if not isinstance(legend_blocks, Mapping): return legend_blocks` --
+  a list-form value is returned completely unchanged, `resolved` included.
+  The mapping-form branch below it strips `resolved` per block.
+* *LB-2* -- `src/spreadsheet_handling/rendering/workbook_projection.py`.
+  `_hidden_meta_to_frames_meta` (:110-118) parses the carrier blob and
+  passes it through `canonicalize_workbook_meta` (:60-107) before
+  returning it as `frames["_meta"]`. `canonicalize_workbook_meta` only
+  unwraps a nested `workbook_meta_blob` wrapper and strips
+  `_CARRIER_LAYER_MARKER_KEYS` empty-signature entries; it contains no
+  `legend_blocks` or `resolved` handling. `resolved` written into the
+  blob by the composer therefore reaches canonical `_meta.legend_blocks`
+  on every workbook readback, mapping form included.
+* *LB-3* -- `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py:346-374`
+  and `src/spreadsheet_handling/io_backends/ods/odf_parser.py:866-895`,
+  both named `_legend_table_hints`. Both guard
+  `raw = workbook_meta.get("legend_blocks"); if not isinstance(raw, dict): return []`
+  and then iterate `raw.items()`. A list-form legend therefore produces no
+  hints on readback in either backend -- the asymmetry is carrier-parity
+  *within* the list form, not a divergence between XLSX and ODS (both
+  backends already behave identically to each other; both are equally
+  blind to the list form).
+* *LB-4* -- `src/spreadsheet_handling/rendering/workbook_projection.py:121-155`,
+  `workbookir_to_frames`. `tbl = sh.tables[0]` is projected into a frame
+  for every visible sheet unconditionally; there is no check against
+  `tbl.kind`, even though `_apply_legend_table_hints` in both parsers
+  (`openpyxl_parser.py:376-388`, `odf_parser.py:898-909`) already sets
+  `table.kind = "legend"` on a recognised legend table. The classification
+  exists on the `TableIR`/`SheetIR` value; `workbookir_to_frames` does not
+  read it.
+* *LB-7* -- `registries/meta_registry.yaml:586-604`, the `legend_blocks`
+  entry. `consumer:` lists only `rendering.composer.layout_composer.compose_workbook`,
+  the two parsers' `parse_workbook`, and
+  `rendering.workbook_projection.workbookir_to_frames`. Grep confirms three
+  additional real runtime readers of `_meta.legend_blocks` are absent from
+  that list: `cell_codec/scalar.py:265` (`allowed_from_legend` token
+  vocabulary), `compact_multiaxis.py:271-277` (`_legend_groups` token/group
+  projection), and `rendering/passes/_base.py:151-182` (`from_legend`
+  dropdown-validation source).
+
+*Current behavior:*::
+
+* Structured sidecar persist (`json_dir`/`yaml_dir`/`xml_dir`/`csv_dir`):
+  mapping-form `legend_blocks` has `resolved` stripped; list-form
+  `legend_blocks` does not, and a derived render coordinate snapshot is
+  written into a carrier-neutral, supposedly Intent-only artifact.
+* Workbook readback (`xlsx`/`ods`, mapping form): `resolved` re-enters
+  canonical `_meta.legend_blocks[*].resolved` immediately after
+  `parse_workbook`, and stays there until the next render overwrites it or
+  the next structured persist strips it. `resolved` is *always* freshly
+  overwritten on the next render (`layout_composer.py:246`,
+  unconditional), so this leak cannot influence layout -- but it is
+  present as canonical state between those two events, contrary to the
+  functional model's stated intent.
+* Workbook readback (list form): the legend renders correctly (composer
+  and domain reader both already accept list form), but on readback
+  neither parser recognises the rendered table as a legend surface,
+  because `_legend_table_hints` only walks a `dict`. A list-form legend on
+  its own sheet is at risk of becoming a payload frame purely because of
+  its shape, independent of `LB-4`.
+* A legend with default placement (no explicit `target`) renders on a new
+  sheet named after the legend block. `workbookir_to_frames` projects that
+  sheet's first table into an ordinary frame regardless of `kind`, so the
+  legend reappears as spreadsheet data (`frames` gain an extra payload
+  entry, e.g. `['data', 'L']`) on structured readback. A legend anchored to
+  the data sheet does not exhibit this, because it shares the data sheet's
+  first table rather than occupying its own sheet.
+* `meta_registry.yaml`'s `legend_blocks` consumer list understates real
+  coupling by three entries; nothing currently guards this (the registry
+  architecture tests pass regardless).
+
+*Target contract:*::
+
+Subject to the human decision below:
+
+* Durable Legend Blocks Intent (`entries`, `title`, `placement`, `target`,
+  block identity) has exactly one canonical runtime shape.
+* `resolved` is carrier-derived Resolution. It is never durable canonical
+  Intent, regardless of the shape `legend_blocks` is authored in.
+* Rendering may produce `resolved` on a render-local copy, as it already
+  does (`layout_composer.py` clones before writing).
+* Carrier parsers may consume `resolved` as a readback hint to recognise a
+  rendered legend surface -- this is the one legitimate reason `resolved`
+  exists in the carrier blob at all.
+* Canonical readback must not retain Resolution once its carrier purpose
+  (surface recognition) is complete.
+* Every structured persistence path strips Resolution, for every accepted
+  `legend_blocks` shape -- not only the mapping form.
+* XLSX and ODS apply equivalent legend-surface recognition for every
+  accepted shape (they already agree with each other; the gap is
+  shape-coverage, not backend divergence).
+* A visible legend-only sheet is support/presentation material. It does
+  not become a domain payload frame on structured readback.
+* `meta_registry.yaml`'s `legend_blocks` producer/consumer statement
+  reflects all real runtime consumers.
+
+*Human decision:*::
+
+*The following must be decided before implementation, not defaulted
+silently:*
+
+[quote]
+____
+Should list-form `_meta.legend_blocks` remain a supported canonical and
+carrier shape, or should it be accepted only as input sugar and
+normalised once to the mapping form?
+____
+
+*Recommendation (not a silent decision):* accept list form as input sugar
+and normalise it to the mapping form at one well-defined ingress boundary.
+Rationale: the mapping form is already the only shape every non-domain
+consumer (persistence boundary, both carrier parsers) actually implements
+correctly; the list form's only current advantage is convenience at
+authoring time (positional `legend_{i}` naming). Patching every consumer's
+list branch (persistence boundary *and* both parsers, with a matching
+carrier-hint change) would triple the surface this correction slice has to
+touch and would leave the same two-shape divergence available to the next
+consumer that gets added. Normalising once removes the shape question from
+every downstream consumer permanently.
+
+*Ingress boundary analysis.* This must not become an arbitrary
+renderer-only normalisation -- the domain reader, validation pass,
+persistence boundary, and both carrier parsers all currently read
+`legend_blocks` independently, and a renderer-local fix would leave the
+other four blind to the list form exactly as they are today. Re-inspection
+of `src/spreadsheet_handling/application/orchestrator.py::orchestrate`
+(:98-131) shows the orchestrator already owns exactly this class of
+whole-run, shape-level rule as part of its macro flow, symmetric on both
+ends of a run:
+
+[source,text]
+----
+frames = _load_frames(inp, header_levels=header_levels)      <-- load
+...
+frames = execute_final_domain_cleanup(frames)                 <-- cleanup boundary
+frames["_meta"] = project_meta_to_persistable_contract(meta)  <-- persistence boundary
+_save_frames(out, frames)
+----
+
+The persistence boundary at the bottom of this flow is documented
+(`docs/ai_info/agent_rules.adoc`, "Persistence boundary for `_meta`";
+`docs/semantic_model/08_lifecycle_and_update_semantics.adoc`, "Persistence
+boundary") as orchestrator-owned, carrier-neutral, and running for *every*
+output kind immediately before the saver -- explicitly not a configurable
+pipeline step. The natural, symmetric counterpart is an ingress-side
+normalisation immediately after `_load_frames` (:102), running for every
+*input* kind (structured sidecar and workbook carrier readback alike)
+before any pipeline step or the composer ever sees `_meta`. Placed there,
+every consumer -- domain reader, validation pass, composer, persistence
+boundary, carrier parsers on the *next* round-trip -- observes only the
+mapping form, and the normalisation is written once.
+
+This is a distinct concern from the "load-time sanitizer" the FK-helper
+lifecycle work deliberately rejected
+(`docs/semantic_model/08_lifecycle_and_update_semantics.adoc`, "Operational
+scope: post-pipeline, write-side only"). That rejection was about
+retroactively cleaning *contaminated* pre-existing data, a broader
+lifecycle/quarantine question intentionally deferred to
+`FTR-FK-HELPER-POLICY-LIFECYCLE-P4A`. Normalising an already-accepted
+alternate *shape* of well-formed Legend Blocks Intent into one canonical
+shape is a narrower, purely structural rule with no bearing on that
+deferred question; the implementation must not be named or documented in
+a way that conflates the two.
+
+The implementation slice that establishes this (see *Implementation
+Slices*, item 1) should evaluate, but is not required to adopt, the opt-in
+`contract_lifecycle` model
+(`docs/technical_model/ch05_registries/registry_semantics/05_contract_lifecycle.adoc`)
+for documenting the list-form deprecation on the `legend_blocks`
+`meta_registry.yaml` entry. That model's stated pilot is
+`_meta.helper_policies.fk`, and `agent_rules.adoc` explicitly cautions
+against retrofitting it onto stable single-shape entries -- so this is a
+judgment call for the implementer, made explicitly, not a default.
+
+*Scope:*::
+
+In scope for this slice:
+
+* Decide and implement the list-form ingress normalisation (or the
+  alternative the human decision selects) as a single, orchestrator-owned
+  rule.
+* Correct `pipeline/persistence_boundary.py::_project_legend_blocks` so
+  Resolution is stripped for every accepted `legend_blocks` shape reaching
+  it (moot for list form if normalisation lands first and removes list
+  form from the persistence boundary's input entirely; still required as
+  a defensive/guarded property either way).
+* Correct canonical workbook readback so `resolved` does not survive as
+  canonical `_meta.legend_blocks[*].resolved` once carrier recognition is
+  complete (`workbook_projection.py`).
+* Align XLSX and ODS legend-surface recognition so every accepted shape is
+  recognised equivalently by both parsers' `_legend_table_hints`.
+* Prevent a legend-only sheet from being projected as an ordinary payload
+  frame by `workbookir_to_frames`.
+* Correct `registries/meta_registry.yaml`'s `legend_blocks` consumer list
+  to include `cell_codec`, `compact_multiaxis`, and the render
+  `ValidationPass`.
+* Add the focused unit/integration/architecture guards named in *Test
+  Plan* so each corrected property is guarded, not just fixed once.
+* Update `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`
+  and any other live functional/technical/user documentation whose
+  described behaviour this slice changes (e.g. if list form becomes
+  input-only sugar, the doc's shape description must say so explicitly).
+
+*Non-Goals:*::
+
+* Entry-value policy unification -- the divergent `label` requirement,
+  duplicate-token handling, unknown-legend-reference handling, empty-entry
+  handling, and warning-vs-error behaviour across the four entry
+  consumers (`OB-1`). That is the entire scope of the sibling FTR
+  `FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5`, not created by this task. This
+  slice must not touch per-consumer entry validation rules.
+* `LB-6` (`placement.target` unmaintained frame reference). Recorded as a
+  bounded follow-up: schema-maintenance has no frame-rename operation
+  today (verified above), so there is nothing in the current
+  schema-maintenance surface for this slice to wire `placement.target`
+  into. If a future FTR adds frame-rename maintenance, that FTR should
+  pick up `placement.target` at the same time; this slice does not
+  speculatively add frame-rename tracking.
+* `LB-5` (Sparse Defaults doc-vs-code in `compact_multiaxis`). Tracked
+  against the `compact_multiaxis` composition assessment thread, not this
+  slice.
+* Refactoring Compact Multiaxis (`_legend_groups`, `_with_group_column`,
+  or its composition graph). It is a read-only consumer of the token/group
+  slice this FTR does not change.
+* Changing Sparse Defaults behaviour.
+* Changing the accepted Cell Codec dependency on legend tokens
+  (`allowed_from_legend` -> `_read_legend_block` -> tokens-only). This
+  slice preserves that contract unchanged; it is only additionally listed
+  as a registry consumer (`LB-7`).
+* Changing dropdown validation behaviour (`ValidationPass.from_legend`)
+  beyond adding it to the registry consumer list.
+* Changing visible legend rendering, entry order, or existing mapping-form
+  roundtrips.
+* Introducing a generic frame ontology or a `kind`-based generic
+  presentation/payload classification beyond what is needed to keep a
+  legend-only sheet out of `workbookir_to_frames`'s payload projection.
+* Registry changes beyond the `legend_blocks` entry's consumer list (and,
+  if the human decision's normalisation path is chosen, an explicit
+  shape/lifecycle note on that same entry). No new registry roots.
+
+*Affected surfaces:*::
+
+* `src/spreadsheet_handling/pipeline/persistence_boundary.py` --
+  `_project_legend_blocks`.
+* `src/spreadsheet_handling/application/orchestrator.py` -- new ingress
+  normalisation call site, symmetric to the existing persistence-boundary
+  call site.
+* A new or extended carrier-neutral module for the ingress normalisation
+  itself (placement decided during implementation; candidate:
+  alongside `pipeline/persistence_boundary.py` as a sibling module, given
+  the explicit symmetry argued above).
+* `src/spreadsheet_handling/rendering/workbook_projection.py` --
+  `canonicalize_workbook_meta` / `_hidden_meta_to_frames_meta` (`resolved`
+  stripping) and `workbookir_to_frames` (legend-sheet exclusion from
+  payload projection).
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_parser.py` --
+  `_legend_table_hints`.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` --
+  `_legend_table_hints`.
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py` --
+  render-local `resolved` production; touched only if the normalisation
+  changes what shape the composer receives, not its `resolved`-writing
+  logic itself.
+* `registries/meta_registry.yaml` -- `legend_blocks` entry consumer list
+  (and, if adopted, shape/lifecycle documentation).
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc` and
+  any technical/user documentation describing current list-form or
+  `resolved` behaviour that this slice changes.
+* Test surfaces: `tests/unit/pipeline/test_persistence_boundary.py`,
+  `tests/integration/roundtrip/test_legend_blocks.py`,
+  `tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+  (and an ODS-side equivalent if one needs to be added -- none currently
+  exists under `tests/integration/io_backends/ods/`, see *Test Plan*),
+  `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`,
+  `tests/architecture/semantic_invariants/test_meta_registry.py`.
+
+Explicitly preserved (do not modify):
+
+* The accepted Cell Codec dependency on legend tokens.
+* The Compact Multiaxis token/group reader (`_legend_groups`,
+  `_with_group_column`).
+* Visible legend rendering.
+* Dropdown validation behaviour (`ValidationPass.from_legend`).
+* Entry order.
+* Existing mapping-form roundtrips.
+* Carrier neutrality of the persistable `_meta` contract.
+* No generic frame ontology.
+
+*Implementation Slices:*::
+
+. *Decide and establish canonical shape normalisation.* Record the human
+  decision above as taken (or amended) in this FTR. If normalisation is
+  adopted, implement the ingress-side normalisation function and wire it
+  into `orchestrate()` immediately after `_load_frames`, symmetric to the
+  existing persistence boundary. Add unit tests for the normaliser in
+  isolation (list -> mapping, mapping passthrough, malformed list-entry
+  rejection).
+. *Correct persistence and canonical readback Resolution handling.* Fix
+  `_project_legend_blocks` so `resolved` cannot survive structured
+  persistence for any input shape reaching it (`LB-1`). Fix
+  `workbook_projection.py` so canonical readback does not retain
+  `resolved` once carrier recognition has consumed it (`LB-2`).
+. *Align XLSX/ODS legend-surface recognition.* Ensure both parsers'
+  `_legend_table_hints` recognise every canonical shape reaching them
+  consistently with each other (`LB-3`). If normalisation (slice 1) already
+  guarantees parsers only ever see the mapping form, this slice may reduce
+  to a guard test rather than a code change -- verify against the
+  slice-1 outcome rather than assuming both are needed.
+. *Prevent legend-only support sheets from becoming payload frames.*
+  `workbookir_to_frames` must skip (or otherwise not project as an
+  ordinary frame) a sheet whose only table is `kind == "legend"` (`LB-4`).
+. *Correct registry/docs and add guards.* Update
+  `registries/meta_registry.yaml`'s `legend_blocks` consumer list
+  (`LB-7`). Add the architecture/roundtrip guards from *Test Plan*. Update
+  `legend_blocks.adoc` and any other live documentation whose described
+  behaviour changed.
+
+Adjust this sequence if implementation review demonstrates a safer
+boundary than the one analysed above -- e.g. if wiring the normaliser into
+`orchestrate()` turns out to conflict with a call path that bypasses
+`orchestrate()` entirely. Any such deviation must be recorded in this FTR
+before it is acted on, not discovered retroactively in a review note.
+
+*Acceptance Criteria:*::
+
+. A canonical shape policy for `_meta.legend_blocks` is selected (list
+  form as input-only sugar normalised at ingress, per the recommendation,
+  or an explicit alternative) and documented in this FTR and in
+  `registries/meta_registry.yaml`.
+. Mapping-form and list-form `legend_blocks` input cannot diverge in
+  observable behaviour across structured persistence and carrier readback
+  -- either because list form is normalised away before any consumer sees
+  it, or because every consumer (persistence boundary, both parsers)
+  demonstrably handles both shapes identically.
+. `resolved` never survives carrier-neutral structured persistence
+  (`json_dir`/`yaml_dir`/`xml_dir`/`csv_dir`), for any accepted input
+  shape. Guarded by a persistence-boundary test using a list-form fixture
+  (none exists today).
+. Carrier readback (`xlsx`/`ods`) does not leave `resolved` present in
+  canonical `_meta.legend_blocks` returned by `workbookir_to_frames` /
+  `frames["_meta"]` once the carrier-recognition purpose is served.
+  Guarded by a roundtrip or workbook-projection test asserting `resolved`
+  is absent from post-readback canonical meta.
+. A stale `resolved` value cannot influence later layout. (Already true
+  today via unconditional overwrite in `layout_composer.py:246` -- this
+  criterion is a non-regression guard, not new behaviour.)
+. XLSX and ODS classify equivalent legend surfaces consistently with each
+  other for every accepted shape. Guarded by a parity assertion (existing
+  or new) covering both backends with the same fixture.
+. A legend rendered on its own dedicated sheet does not appear as an
+  ordinary payload frame in `workbookir_to_frames`'s output. Guarded by a
+  roundtrip test using default (no `target`) legend placement -- the exact
+  gap the assessment's probe demonstrated (`frames` gaining an extra
+  `'L'`-style entry).
+. A legend anchored to the data sheet continues to roundtrip correctly
+  (non-regression of the existing clean case).
+. Cell Codec (`allowed_from_legend` token vocabulary), Compact Multiaxis
+  (`_legend_groups` token/group projection), and the render
+  `ValidationPass` (`from_legend` dropdown source) remain functional and
+  unmodified in behaviour; existing focused test suites for each
+  (`test_cell_codec.py`, `test_compact_multiaxis.py`,
+  `test_validation_pass_infra.py`) stay green.
+. `registries/meta_registry.yaml`'s `legend_blocks` entry lists all real
+  consumers: the four existing entries plus `cell_codec`,
+  `compact_multiaxis`, and the render `ValidationPass`.
+. A rejected or malformed `legend_blocks` shape (e.g. an unrecognised list
+  entry, or a shape neither list nor mapping) fails deterministically
+  before producing output, with no partial mutation of `_meta` or partial
+  writes to any output backend.
+. Full Core (`pytest tests/unit tests/integration tests/roundtrip
+  tests/architecture` / `make test`), architecture, the focused carrier
+  roundtrip suites named in *Test Plan*, Demo, and any relevant
+  Worldbuilding validation touching legend-block pipelines all remain
+  green.
+
+*Test Plan:*::
+
+New / extended tests, by layer:
+
+* *Unit -- ingress normalisation* (if adopted): list-form input normalised
+  to mapping form; mapping-form input passed through unchanged; positional
+  (`legend_{i}`) and `name`/`id`-keyed list entries all resolve to the same
+  identity rule the domain reader already uses
+  (`_read_legend_block`); malformed list entries (missing identity,
+  duplicate resolved names) fail deterministically.
+* *Unit -- persistence boundary* (`tests/unit/pipeline/test_persistence_boundary.py`):
+  add a list-form `legend_blocks` fixture; assert `resolved` is stripped
+  from it exactly as it already is for mapping form. This closes the
+  assessment's identified coverage gap directly.
+* *Integration -- roundtrip* (`tests/integration/roundtrip/test_legend_blocks.py`):
+  add a case asserting `resolved` is absent from canonical `_meta` returned
+  after `save_xlsx`/`load_xlsx` (closes the `LB-2` coverage gap); add a case
+  with default (own-sheet) legend placement asserting the readback frame
+  set does not gain a payload entry for the legend sheet (closes the `LB-4`
+  coverage gap); add a case exercising the chosen list-form policy
+  end-to-end.
+* *Integration -- carrier parity*
+  (`tests/integration/io_backends/xlsx/test_workbook_meta_blob_carrier.py`
+  and, if none exists, a new ODS-side equivalent under
+  `tests/integration/io_backends/ods/` -- confirmed absent from the current
+  tree): assert XLSX and ODS produce equivalent legend-hint recognition for
+  the same fixture.
+* *Architecture guards*
+  (`tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`,
+  `test_meta_registry.py`): extend or add a guard asserting the persistence
+  boundary strips `resolved` for both shapes if both remain independently
+  reachable after this slice; extend the registry-consistency guard (or
+  add one) that fails if `meta_registry.yaml`'s `legend_blocks` consumer
+  list omits a module that actually reads `_meta.legend_blocks` -- this
+  directly prevents `LB-7` from recurring silently.
+* *Non-regression*: full existing focused suite named in the source
+  assessment's *Existing test coverage* section must stay green
+  (`test_compact_multiaxis.py`, `test_cell_codec.py`,
+  `test_legend_blocks.py`, `test_layout_composer.py`,
+  `test_persistence_boundary.py`, `test_metadata_refs.py`,
+  `test_meta_carrier_boundary_guards.py`, `test_meta_registry.py`,
+  `test_meta_registry_hardening.py`, `test_workbook_meta_blob_carrier.py`,
+  `test_validation_pass_infra.py`, `test_role_targeted_validations.py`),
+  plus the full active suite (`make test`) before merge.
+* Run all commands with `PYTHONPATH=src` per the current `.venv` caveat
+  recorded in the source assessment, or after `make clean-stamps && make
+  setup` if the venv stamp is stale.
+
+*Documentation / Registry Impact:*::
+
+* `registries/meta_registry.yaml` -- `legend_blocks` entry `consumer:`
+  list gains three entries (`LB-7`). This is a gated registry change per
+  `docs/ai_info/agent_rules.adoc` ("Metadata, registry, and step-surface
+  changes"): survey before editing, and if the human decision adopts
+  list-form-as-sugar, decide explicitly whether that is documented as a
+  plain prose note or via the opt-in `contract_lifecycle` block (see
+  *Human Decision*).
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc` --
+  already states the target behaviour this slice restores for `LB-2`
+  ("not trusted from a prior `_meta`") and `LB-4` ("generated legend
+  surfaces do not become ordinary payload frames"); no content change
+  needed there for those two findings beyond confirming the doc still
+  matches code once fixed. If list form is normalised to input-only sugar,
+  this doc must gain an explicit statement of that shape rule, since it
+  currently does not distinguish list and mapping form at all.
+* Release notes (`docs/release_notes/release_notes.adoc`): required per
+  the release-notes checkpoint if the shape decision changes any
+  user-facing behaviour (e.g. list-form `legend_blocks` no longer round-trips
+  as list form in persisted sidecars). If the implementer determines no
+  user-facing behaviour changes (e.g. list form was never documented as a
+  stable persisted shape to begin with), record that determination
+  explicitly in the FTR review artifact instead of silently skipping the
+  entry.
+* No new `_meta` root, no new registry root, no new pipeline-step
+  category.
+
+*Risks:*::
+
+* *Ingress normalisation touches every input kind.* Wiring a new call into
+  `orchestrate()` immediately after `_load_frames` runs for every backend
+  (`csv_dir`, `json_dir`, `yaml_dir`, `xml_dir`, `xlsx`, `ods`, `calc`), not
+  only the carrier paths this FTR is centred on. Mitigation: the
+  normalisation must be a no-op whenever `legend_blocks` is absent or
+  already mapping-form (the common case for every non-legend pipeline),
+  and slice 1's unit tests must cover the no-op path explicitly so a
+  regression there cannot silently affect unrelated pipelines.
+* *List-form deprecation breaks an undiscovered external producer.* If any
+  consumer repository (demo, worldbuilding) authors `legend_blocks` in
+  list form today, normalising it to mapping form changes what a
+  structured sidecar contains, even though runtime behaviour is intended
+  to be equivalent. Mitigation: grep the demo and worldbuilding repos for
+  list-form `legend_blocks` authoring before implementation; if found,
+  the release-notes entry must call out the shape-preserving-vs-shape-normalising
+  distinction explicitly.
+* *`workbookir_to_frames` legend-sheet exclusion has a narrow correctness
+  window.* Skipping a sheet by `kind == "legend"` must not skip a sheet
+  that happens to contain both a legend table and unrelated payload data
+  (mixed-content sheet). Mitigation: the fix should key off the specific
+  table's `kind`, not the sheet as a whole, consistent with how
+  `_apply_legend_table_hints` already sets `kind` per-table rather than
+  per-sheet; the data-sheet-anchored legend case (which shares its sheet
+  with payload data) is the acceptance-criteria non-regression case that
+  catches an over-broad sheet-level exclusion.
+* *Registry-completeness guard false positives.* A guard that fails when
+  `meta_registry.yaml` omits a real `legend_blocks` reader could false-positive
+  on incidental string matches (e.g. a comment or an unrelated `legend_blocks`-named
+  local variable). Mitigation: scope the guard to actual import/attribute
+  read sites already enumerated in the source assessment's *Producers and
+  consumers* table, not a blind grep.
+* *Scope creep into entry-value policy.* Because the four consumers this
+  slice touches are the same four consumers `OB-1` describes as divergent
+  on `label`/duplicate/unknown-reference handling, there is a standing
+  temptation to "fix it while we're in there." Mitigation: the *Non-Goals*
+  section forbids it explicitly; any reviewer encountering entry-validation
+  changes in this slice's diff should reject them back to
+  `FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5`.
+
+*Dependency and Sequencing Notes:*::
+
+* No dependency on `FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5` (the sibling FTR
+  this task explicitly does not create) -- the two slices touch disjoint
+  concerns (shape/lifecycle vs. entry-value policy) and can be sequenced
+  in either order. This FTR does not block on it.
+* No dependency on a `compact_multiaxis` composition assessment or
+  implementation FTR -- the source assessment confirms `compact_multiaxis`
+  does not exercise any of the surfaces this slice touches.
+* Slice 1 (ingress normalisation) should land before slices 2-4 if the
+  human decision adopts normalisation, since slices 3 and possibly 2 may
+  shrink in scope once list form no longer reaches the persistence
+  boundary or the carrier parsers directly (see the conditional note under
+  *Implementation Slices*, item 3).
+* Slice 5 (registry/docs) should land last so the registry and
+  documentation describe the corrected, post-fix behaviour rather than an
+  intermediate state.
+
+*Completion Evidence Placeholders:*::
+
+* Implementation commit(s): _TBD_.
+* Test run output (`make test` / `pytest tests/unit tests/integration
+  tests/roundtrip tests/architecture`): _TBD_.
+* Self-review checklist result
+  (`docs/ai_info/git_and_workflow.adoc`, "Self-review checklist"): _TBD_.
+* FTR review artifact: `docs/backlog/FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5_review.adoc`
+  (to be created at implementation time, per
+  `docs/ai_info/git_and_workflow.adoc`, "FTR review notes"): _TBD_.
+* Release-notes entry or explicit "no release note needed" rationale:
+  _TBD_.
+* Grep confirmation of no list-form `legend_blocks` usage in `demo/` and
+  `worldbuilding/` (or, if found, the migration/parity note covering it):
+  _TBD_.
+* Final disposition of the `contract_lifecycle` question for the
+  `legend_blocks` registry entry (adopted / not adopted, with rationale):
+  _TBD_.
