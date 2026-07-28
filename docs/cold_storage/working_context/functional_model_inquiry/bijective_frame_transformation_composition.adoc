@@ -1,0 +1,369 @@
+= Inquiry: Composable Bijective Frame Transformations And Roundtrip Pipelines
+
+[NOTE]
+====
+This is informal working context for Functional Model inquiry.
+It preserves a foundational design idea for maintainers, reviewers, and LLM
+agents. It is not yet a normative contract and does not override accepted FTRs,
+live runtime behavior, or the Semantic Model.
+====
+
+== Core Idea
+
+The framework should be understood as a system for composing reversible
+transformations between frame representations.
+
+A transformation does not merely produce a convenient spreadsheet shape. It
+maps one explicit frame representation to another representation and provides a
+corresponding inverse mapping.
+
+For one transformation pair:
+
+[source,text]
+----
+T  : Frame_A -> Frame_B
+T⁻¹: Frame_B -> Frame_A
+----
+
+The desired roundtrip property is:
+
+[source,text]
+----
+T⁻¹(T(a)) = a
+----
+
+for every input `a` inside the declared valid domain of `T`.
+
+In practice, some transformations are only conditionally bijective. Their
+inverse may require explicit configuration, stable keys, declared ordering,
+sidecar intent, a base frame, or another feature-owned input. The important
+point is that these requirements are part of the transformation contract; they
+must not be recovered through accidental conventions or heuristic inference.
+
+== Composition Across Arbitrarily Many Transformations
+
+The idea is not limited to two transformations. Any number of compatible frame
+transformations may be chained:
+
+[source,text]
+----
+Frame_0
+  --T1--> Frame_1
+  --T2--> Frame_2
+  --T3--> ...
+  --Tn--> Frame_n
+----
+
+The forward representation is therefore:
+
+[source,text]
+----
+Frame_n = Tn(...T3(T2(T1(Frame_0)))...)
+----
+
+or, using composition notation:
+
+[source,text]
+----
+Forward = Tn ∘ ... ∘ T3 ∘ T2 ∘ T1
+----
+
+The reverse pipeline applies the corresponding inverses in the opposite order:
+
+[source,text]
+----
+Frame_0 = T1⁻¹(T2⁻¹(T3⁻¹(...Tn⁻¹(Frame_n))...)))
+----
+
+or:
+
+[source,text]
+----
+Reverse = T1⁻¹ ∘ T2⁻¹ ∘ T3⁻¹ ∘ ... ∘ Tn⁻¹
+----
+
+The reversal of order is essential. The inverse of a composition is:
+
+[source,text]
+----
+(Tn ∘ ... ∘ T2 ∘ T1)⁻¹
+  = T1⁻¹ ∘ T2⁻¹ ∘ ... ∘ Tn⁻¹
+----
+
+This is the general pipeline model:
+
+[source,text]
+----
+canonical representation
+  -> intermediate representation 1
+  -> intermediate representation 2
+  -> ...
+  -> workbook-facing representation
+
+workbook-facing representation
+  -> inverse of the last transformation
+  -> inverse of the preceding transformation
+  -> ...
+  -> canonical representation
+----
+
+Each intermediate frame is a legitimate representation boundary. It is not
+merely an implementation detail if another transformation consumes or produces
+that shape.
+
+== Example: Codec And Crosstable Composition
+
+A compact multiaxis workbook is one example of the general rule.
+
+The forward path from canonical relation to spreadsheet representation is:
+
+[source,text]
+----
+canonical relation
+  --codec contract/encode--> compact relation
+  --XRef contract--> crosstable / spreadsheet representation
+----
+
+Formally:
+
+[source,text]
+----
+spreadsheet_representation
+  = xref_to_crosstable(codec_contract(json_representation))
+----
+
+The reverse path is:
+
+[source,text]
+----
+spreadsheet representation
+  --XRef expand--> compact relation
+  --codec expand/decode--> canonical relation
+----
+
+Formally:
+
+[source,text]
+----
+json_representation
+  = codec_expand(crosstable_to_xref(spreadsheet_representation))
+----
+
+The order is not an arbitrary implementation choice. XRef must reconstruct the
+compact relation before the codec can expand compact values back into the
+canonical row representation.
+
+Compact Multiaxis should therefore be understood as a convenience composition
+of existing reversible frame transformations, not as a new monolithic
+transformation with parallel semantics.
+
+== Intermediate Representations Own Their Own Roundtrip Inputs
+
+Every transformation operates at a specific representation boundary.
+Configuration, inverse intent, ordering information, and base-state inputs must
+match that boundary.
+
+For the example above:
+
+* Cell Codec owns the mapping between canonical rows and compact cell-value
+  rows.
+* XRef owns the mapping between a compact long relation and a crosstable.
+* A base relation used by XRef must therefore have the compact long-relation
+  shape expected by XRef, not the canonical pre-codec shape and not the final
+  spreadsheet shape.
+
+This yields a general rule:
+
+[IMPORTANT]
+====
+A base frame, merge input, or inverse-state input belongs to the representation
+boundary of the transformation that consumes it.
+====
+
+A composite may need to derive the correct intermediate base representation by
+running the preceding forward transformations before delegating to the inverse
+transformation that owns scoped recomposition.
+
+== Partial Spreadsheet Projections And Scoped Recomposition
+
+A workbook surface may intentionally expose only a subset of a larger canonical
+relation. In that case, a simple reconstruction from visible workbook content
+is not sufficient: rows outside the visible projection must survive the
+roundtrip.
+
+The inverse transformation that expands the workbook representation therefore
+may need a base frame:
+
+[source,text]
+----
+visible workbook representation
++ prior base representation at the same transformation boundary
+  -> replace the represented scope
+  -> preserve rows outside that scope
+  -> reconstructed complete representation
+----
+
+For a composed pipeline, this merge happens before earlier inverse
+transformations are applied.
+
+Example:
+
+[source,text]
+----
+canonical JSON relation
+  --codec contract--> compact base relation
+
+edited spreadsheet matrix
+  --XRef expand with compact base relation-->
+     complete compact relation
+  --codec expand-->
+     complete canonical JSON relation
+----
+
+The base relation is already codec-contracted because XRef works on the compact
+relation boundary. This permits XRef's scoped recomposition to preserve
+relations outside the currently represented matrix value or axis scope.
+
+A composite wrapper must not accidentally remove this capability merely because
+it hides the intermediate frame from the pipeline author. If a wrapped primitive
+owns scoped recomposition, the composite must either expose the required base
+input or derive and pass the correct intermediate base frame explicitly.
+
+== Transformation Contracts Must Compose, Not Leak
+
+For arbitrary composition to remain understandable and reversible, each
+transformation should have a bounded contract:
+
+* explicit input and output frame shapes;
+* explicit valid-domain conditions;
+* explicit inverse operation;
+* explicit additional inverse inputs, if required;
+* explicit preservation and replacement scope;
+* deterministic conflict and ordering behavior;
+* caller-input and failure atomicity;
+* feature-owned metadata only where metadata is actually required;
+* no dependence on accidental metadata produced by another internal step.
+
+A composite transformation should delegate these contracts rather than
+reimplement them. It may coordinate intermediate frames, but it should preserve
+the semantic capabilities of its constituent transformations.
+
+In particular:
+
+* an internal temporary frame may be hidden from the public result;
+* persistent metadata must not refer to that deleted temporary frame;
+* suppressing internal metadata must not suppress the primitive's actual data
+  semantics, such as scoped recomposition;
+* diagnostics traces may explain the composition but must not silently become
+  inverse configuration;
+* explicit pipeline configuration and feature-owned operative state remain the
+  authorities.
+
+== Roundtrip Identity And Observable Equivalence
+
+Strict byte-for-byte or row-order identity is not always the appropriate
+criterion. A transformation contract must state what identity means for its
+representation.
+
+Possible identity levels include:
+
+* exact frame equality, including row and column order;
+* equality after declared canonical ordering;
+* equality of keyed records regardless of physical row order;
+* equality after omission of declared derived or presentation-only fields;
+* equality within an explicitly represented projection scope while preserving
+  the base state outside that scope.
+
+The roundtrip property should therefore be read as:
+
+[source,text]
+----
+Reverse(Forward(frame)) ≡ frame
+----
+
+where `≡` is the contractually declared equivalence relation for that
+transformation chain.
+
+This does not weaken the bijective design goal. It makes the actual identity
+boundary explicit instead of confusing physical serialization details with
+semantic information.
+
+== Conditions For Safe Arbitrary Composition
+
+A chain of reversible frame transformations produces a roundtrip when all of the
+following hold:
+
+. The output representation of each transformation matches the input
+  representation required by the next transformation.
+. Each transformation receives the configuration and operative state required
+  by its inverse.
+. The inverse functions are applied in exact reverse order.
+. Information removed from the visible representation is either derivable,
+  explicitly persisted, or preserved through a base frame at the correct
+  representation boundary.
+. Projection and replacement scopes are explicit.
+. Ordering and duplicate semantics are deterministic.
+. Composite wrappers preserve the contracts of their primitives.
+. No intermediate capability is lost merely because the intermediate frame is
+  temporary or hidden from the user-facing pipeline.
+
+If one stage is lossy without an explicit recovery source, then the complete
+chain is not bijective, regardless of whether all other stages are reversible.
+
+== Design Consequences For The Framework
+
+This foundational idea suggests several architectural expectations:
+
+* Transformation families should be modeled as paired forward and reverse frame
+  mappings rather than isolated convenience functions.
+* Composite transformations should be explainable as ordered compositions of
+  these pairs.
+* The framework should make intermediate representation contracts visible to
+  documentation, registries, tests, and agents even when runtime frames are
+  temporary.
+* Base-relation and scoped-recomposition capabilities must remain available
+  through composites.
+* Tests should verify roundtrip behavior for chains, not only primitives in
+  isolation.
+* Tests should include partial projections where out-of-scope base rows must be
+  preserved.
+* Metadata should be classified by actual role: operative inverse intent,
+  resolution state, diagnostics trace, or carrier-only content.
+* A diagnostics trace is not a substitute for an inverse contract.
+* A generic pipeline may be arbitrarily deep as long as representation
+  boundaries and inverse requirements remain explicit and composable.
+
+== Open Inquiry Questions
+
+This note records the design direction but does not resolve all contracts.
+Questions for later Functional Model and implementation review include:
+
+* Which existing transformation families are truly bijective, conditionally
+  bijective, projection-preserving, or intentionally lossy?
+* How should the registries describe the input/output representation boundary of
+  each transformation and inverse?
+* How should a composite expose or derive base frames required by an internal
+  primitive?
+* Does Compact Multiaxis currently preserve XRef scoped recomposition through a
+  compacted `base_relation`, or is this a composition gap?
+* Which equivalence relation applies to ordering, sparse rows, defaults, helper
+  columns, and presentation-only data?
+* How should pipelines validate that a declared reverse chain is structurally
+  compatible with its forward chain?
+* Can transformation composition be represented declaratively without creating
+  a new central ontology or metadata message bus?
+
+== Working Summary
+
+The central philosophy is:
+
+[quote]
+____
+Frame transformations may be chained to arbitrary depth when each stage has an
+explicit inverse and the reverse pipeline applies those inverses in the opposite
+order. Intermediate representations are real contract boundaries. Any state
+needed to preserve information outside a visible projection must be supplied at
+the boundary of the transformation that owns the merge. Composite wrappers may
+hide intermediate frames, but they must not discard the reversible semantics of
+the primitives they compose.
+____
