@@ -1,0 +1,189 @@
+===== FTR-COMPACT-MULTIAXIS-SCOPED-RECOMPOSITION-P4A -- Wire XRef scoped recomposition (`base_relation`) through Compact Multiaxis so partial spreadsheet projections preserve out-of-scope canonical rows
+
+*Status:* New
+
+*Priority:* P4A
+
+*Type:* Composition capability preservation (reverse/forward roundtrip
+correctness for partial projections). Reuses existing Cell Codec and XRef
+`base_relation` contracts; introduces *no* new merge algorithm inside Compact
+Multiaxis.
+
+*Depends on / sequencing:*::
+
+* Depends on `FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5` (accepted;
+  metadata-persistence contract now truthful).
+* Should be sequenced *before* the final broad Compact Multiaxis acceptance
+  review, because it changes the reversibility contract of the family for
+  partial projections. The narrow metadata-persistence correction did not
+  introduce, worsen, or depend on this gap; this FTR is independent of it.
+* Independent of `FTR-CELL-CODEC-LEGACY-CODE-ROW-RETIREMENT-P4A`,
+  `FTR-COMPACT-MULTIAXIS-TRACE-LIFECYCLE-COMMANDS-P5`, and the Legend Blocks
+  FTRs; none is reopened here.
+
+*Source and maintainer intent:*::
+
+* Raised by
+  `docs/warm_storage/global_reviews/FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5_review_001_acceptance.adoc`
+  (scoped-recomposition inquiry, CONFIRMED).
+* Maintainer intent recorded in
+  `docs/cold_storage/working_context/functional_model_inquiry/bijective_frame_transformation_composition.adoc`:
+  a composite may compose arbitrarily many reversible frame-to-frame
+  transformations, applying the inverses in reverse order; intermediate
+  representations are real contract boundaries; and *a composite wrapper must
+  not discard the reversible semantics of the primitives it composes merely
+  because it hides the intermediate frame*.
+
+*Maintainer-intent composition (for reference):*::
+
+Forward:
+
+[source,text]
+----
+canonical relation
+  → Cell Codec contract/encode → compact encoded relation
+  → XRef contract               → spreadsheet matrix
+----
+
+Reverse:
+
+[source,text]
+----
+spreadsheet matrix
+  → XRef expand   → compact encoded relation
+  → Cell Codec expand/decode → canonical relation
+----
+
+A base frame, merge input, or inverse-state input belongs to the representation
+boundary of the transformation that consumes it. XRef owns the matrix↔relation
+boundary, so a base relation supplied to XRef must have the *compact encoded
+relation* shape (codec-contracted), not the canonical pre-codec shape and not
+the final spreadsheet shape.
+
+*Problem statement:*::
+
+Compact Multiaxis exposes parameters (`value_columns`, and the matrix frame
+itself) that can present only a subset of a larger canonical relation -- a
+*partial spreadsheet projection*. On the reverse/import path,
+`expand_compact_multiaxis` delegates to `expand_xref` but does *not* pass or
+derive a `base_relation`
+(`src/spreadsheet_handling/domain/transformations/compact_multiaxis.py`; the
+`expand_xref` call omits `base_relation`, and the composite exposes no
+codec-contracted base parameter). The underlying XRef primitive *does* support
+scoped recomposition: `expand_xref(..., base_relation=...)` appends out-of-scope
+base rows after the in-scope matrix rows
+(`src/spreadsheet_handling/domain/transformations/xref_crosstable/operation.py`,
+out-of-scope append loop).
+
+Consequently, when a partial Compact Multiaxis projection is reimported and its
+resulting relation replaces the full canonical relation, rows outside the
+visible matrix scope are lost. The composite hides the intermediate compact
+relation frame, and in doing so hides XRef's scoped-recomposition capability
+from the pipeline author.
+
+*Confirming evidence:*::
+
+Adversarial probe (`PYTHONPATH=src`): expanding a partial matrix
+(`feature_id=f1`, only column `P-001`) yields only
+`[{feature_id: f1, column_key: P-001, code: Z}]`; canonical rows for `P-002`,
+`P-003` outside the visible projection are not recoverable from that call. XRef
+`base_relation` (already covered by XRef tests) is the primitive capability that
+would preserve them.
+
+*Required correction (reuse, not reinvention):*::
+
+The detailed non-wrapper composition can already preserve out-of-scope rows by:
+
+. contracting the canonical base relation with the Cell Codec to the *compact
+  encoded relation* shape XRef expects;
+. passing that compact intermediate relation as the XRef `base_relation`;
+. applying XRef scoped recomposition (in-scope matrix rows replace the
+  represented scope; out-of-scope base rows are preserved);
+. decoding the merged compact relation back to the canonical relation with the
+  Cell Codec.
+
+The correction therefore *wires an existing primitive capability through the
+composite*. It must:
+
+* expose an explicit composite-level base input (e.g. a canonical
+  `base_relation` frame name and/or a pre-compacted base frame), owned and
+  documented by Compact Multiaxis;
+* derive the correct codec-contracted intermediate base frame at the XRef
+  boundary by running the forward Cell Codec encode on the canonical base
+  before delegating to `expand_xref`;
+* forbid any parallel merge/dedup logic inside Compact Multiaxis -- the merge is
+  XRef's scoped recomposition and the shape transform is Cell Codec's;
+* preserve caller-input and failure atomicity and the accepted temporary-frame
+  discipline (the intermediate base frame is a locally-created temp, deleted
+  before return, and never leaks into persisted metadata -- consistent with
+  `FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5`).
+
+*Forward/reverse and intermediate-frame shapes:*::
+
+* Canonical relation: `[*row_keys, column_key, code (, group)]`.
+* Compact encoded relation (XRef boundary): `[*row_keys, column_key, value]`.
+* Spreadsheet matrix: `[*row_keys, <one column per column_key value>]`.
+* The composite-supplied base for XRef expand must be the *compact encoded
+  relation*, produced by encoding the canonical base with the same codec
+  configuration used for the current run.
+
+*Scope of behavior to define and test:*::
+
+* Deletions inside the visible scope: an emptied/removed in-scope cell replaces
+  (removes) exactly that address; it must not resurrect from the base.
+* Preservation outside the visible scope: base rows whose `(row_id,
+  column_key)` address is not covered by the visible matrix survive unchanged.
+* Ordering: deterministic column order (explicit `column_keys` → derived first
+  occurrence) and deterministic row order for in-scope-then-out-of-scope.
+* Empty values / `drop_empty` interaction with scoped recomposition.
+* Duplicate `(row, column)` addresses across visible and base: deterministic
+  rejection or defined precedence (visible wins).
+* Codec modes (`whole_cell_code`, `split_tokens`) both honored on the base
+  encode and the merged decode.
+* Failure atomicity: a failure in base encode, XRef expand, or decode leaves
+  caller state, the prior successful trace, and prior XRef metadata unchanged;
+  no temp base frame leaks.
+* Persistence: no intermediate base or temp frame reference appears in any
+  persisted metadata root; the diagnostics trace remains diagnostics-only.
+* Consumer tests: a partial-projection roundtrip that preserves out-of-scope
+  rows, exercised through the pipeline binder and at least one carrier
+  (structured JSON and/or XLSX/ODS).
+
+*Compatibility and migration:*::
+
+* Full (non-partial) projections must be unchanged: when the visible matrix
+  covers the whole canonical scope, or when no `base_relation` is supplied,
+  behavior is identical to today.
+* The base input is opt-in; existing pipelines that expand a full matrix are
+  unaffected.
+* Current in-repo consumers (the single Worldbuilding
+  `expand_compact_multiaxis` pipeline) expose the full matrix and do not rely on
+  scoped recomposition today; verify this remains true and that the reverse
+  chain is structurally compatible with its forward chain.
+
+*Non-goals:*::
+
+* No new merge/garbage-collection/ontology mechanism inside Compact Multiaxis.
+* No redesign of XRef or Cell Codec.
+* No promotion of `_meta.compact_multiaxis` to operative inverse intent.
+* No composite plan object.
+* No change to the accepted metadata-persistence correction contract.
+
+*Acceptance criteria:*::
+
+. A partial Compact Multiaxis projection reimported against a supplied base
+  relation preserves out-of-scope canonical rows and replaces exactly the
+  visible scope.
+. The preservation is achieved solely by composing Cell Codec encode + XRef
+  `base_relation` scoped recomposition + Cell Codec decode; no parallel merge
+  logic exists in Compact Multiaxis.
+. Full-projection and no-base behavior is byte-for-byte unchanged from the
+  pre-FTR contract.
+. Deletions inside scope, ordering, empty/`drop_empty`, duplicates, and both
+  codec modes are covered by tests.
+. Caller-input and failure atomicity hold; no temp/base frame or temp-frame
+  reference leaks into returned or persisted metadata.
+. Persistence and at least one workbook carrier roundtrip the corrected
+  behavior.
+. Demo and current Worldbuilding flows remain green; release-note impact is
+  determined and recorded.
