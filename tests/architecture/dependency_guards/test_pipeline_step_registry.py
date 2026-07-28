@@ -1,6 +1,8 @@
 """Architecture guards for the reviewed pipeline step registry artifact."""
+
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,10 @@ import spreadsheet_handling.pipeline.execution as execution_module
 import spreadsheet_handling.pipeline.registry as registry_module
 from spreadsheet_handling.pipeline.registry import REGISTRY
 from spreadsheet_handling.pipeline.types import StepRegistration
+from spreadsheet_handling.domain.transformations.compact_multiaxis import (
+    contract_compact_multiaxis,
+    expand_compact_multiaxis,
+)
 
 
 pytestmark = [
@@ -149,6 +155,30 @@ def test_pipeline_step_registry_resolves_runtime_targets() -> None:
         else:
             assert entry["target"] is None
             assert entry["factory_shape"] in {"plain_factory", "plugin_factory"}
+
+
+@pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5")
+def test_compact_multiaxis_registry_parameters_match_public_signatures() -> None:
+    entries = _entries_by_name()
+    functions = {
+        "expand_compact_multiaxis": expand_compact_multiaxis,
+        "contract_compact_multiaxis": contract_compact_multiaxis,
+    }
+
+    for name, function in functions.items():
+        signature = inspect.signature(function)
+        public_parameters = {
+            parameter_name: parameter
+            for parameter_name, parameter in signature.parameters.items()
+            if parameter_name != "frames"
+        }
+        registered = entries[name]["parameters"]
+
+        assert set(registered) == set(public_parameters), name
+        for parameter_name, parameter in public_parameters.items():
+            assert registered[parameter_name]["required"] is (
+                parameter.default is inspect.Parameter.empty
+            ), (name, parameter_name)
 
 
 def test_pipeline_step_registry_composites_declare_resolving_wrapped_steps() -> None:

@@ -136,6 +136,36 @@ def test_meta_registry_code_references_resolve_or_are_explicitly_narrative():
                     continue
 
                 assert _resolve_code_reference(reference), (
-                    f"Unresolvable {field_name} reference {reference!r} "
-                    f"for entry {entry['name']!r}"
+                    f"Unresolvable {field_name} reference {reference!r} for entry {entry['name']!r}"
                 )
+
+
+@pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5")
+def test_compact_multiaxis_registry_declares_diagnostics_only_contract():
+    registry = _load_registry()
+    entry = next(item for item in registry["entries"] if item["name"] == "compact_multiaxis")
+    contract_text = " ".join(
+        str(entry[field])
+        for field in (
+            "meaning",
+            "render_relevance",
+            "persistence_behavior",
+            "roundtrip_relevance",
+            "merge_behavior",
+            "precedence_notes",
+        )
+    ).lower()
+
+    assert entry["producer"] == [
+        "domain.transformations.compact_multiaxis.expand_compact_multiaxis",
+        "domain.transformations.compact_multiaxis.contract_compact_multiaxis",
+    ]
+    assert entry["consumer"] == ["no runtime semantic consumer"]
+    assert "diagnostics" in contract_text
+    assert "non-authoritative" in contract_text
+    assert "not inverse intent" in contract_text
+    assert "no runtime transformation reads" in contract_text
+    assert "no sparse defaults behavior" in contract_text
+    assert "excluded from schema-maintenance blocking" in contract_text
+    assert "different ids coexist" in contract_text
+    assert "trace-lifecycle-commands" in contract_text

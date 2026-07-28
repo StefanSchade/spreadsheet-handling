@@ -76,9 +76,11 @@ Metadata references to removed frames follow narrow per-family policies:
   *not* a conflict -- a source frame may be legitimately removed after a
   lossless projection;
 * transformation intent families (``xref_crosstable``,
-  ``compact_multiaxis``, ``split_by_discriminator``, ``legend_blocks``,
-  ``helper_policies``) are preserved unchanged: inverse transformations need
-  them to recreate absent frames. ``cell_codecs`` is *not* in this set --
+  ``split_by_discriminator``, ``legend_blocks``, ``helper_policies``) are
+  preserved unchanged because their consumers may need them after cleanup.
+  ``compact_multiaxis`` is also preserved unchanged, but only as a
+  diagnostics/composition trace; no runtime inverse reads it. ``cell_codecs``
+  is *not* in the operative set --
   Cell Codec intent lives entirely in explicit step configuration and no
   runtime transform reads ``_meta.cell_codecs``; any legacy payload is inert
   pass-through sediment, preserved by generic metadata pass-through rather

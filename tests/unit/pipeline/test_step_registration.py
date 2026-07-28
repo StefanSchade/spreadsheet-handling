@@ -259,20 +259,22 @@ def test_sparse_default_steps_are_config_addressable() -> None:
 @pytest.mark.ftr("FTR-RESOURCE-FALLBACK-OVERRIDE-SEMANTICS-P4A")
 def test_normalize_resource_overrides_step_is_config_addressable() -> None:
     frames = {
-        "localized_values": pd.DataFrame([
-            {
-                "resource_key": "greeting",
-                "locale": "en",
-                "context_id": "default",
-                "text": "Hello",
-            },
-            {
-                "resource_key": "greeting",
-                "locale": "en",
-                "context_id": "product_a",
-                "text": "",
-            },
-        ])
+        "localized_values": pd.DataFrame(
+            [
+                {
+                    "resource_key": "greeting",
+                    "locale": "en",
+                    "context_id": "default",
+                    "text": "Hello",
+                },
+                {
+                    "resource_key": "greeting",
+                    "locale": "en",
+                    "context_id": "product_a",
+                    "text": "",
+                },
+            ]
+        )
     }
     steps = build_steps_from_config(
         [
@@ -468,9 +470,11 @@ def test_configure_workbook_view_step_is_config_addressable() -> None:
 
 def test_cell_codec_steps_are_config_addressable() -> None:
     frames = {
-        "expanded": pd.DataFrame([
-            {"id": "row-1", "a": "A", "b": "B", "c": "C"},
-        ]),
+        "expanded": pd.DataFrame(
+            [
+                {"id": "row-1", "a": "A", "b": "B", "c": "C"},
+            ]
+        ),
     }
     codec_intent = {
         "participating_columns": ["a", "b", "c"],
@@ -508,6 +512,7 @@ def test_cell_codec_steps_are_config_addressable() -> None:
     ]
 
 
+@pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5")
 def test_compact_multiaxis_steps_are_config_addressable() -> None:
     frames = {
         "matrix": pd.DataFrame(
@@ -528,6 +533,7 @@ def test_compact_multiaxis_steps_are_config_addressable() -> None:
                 "mode": "split_tokens",
                 "delimiter": "-",
                 "allowed_tokens": ["E", "K"],
+                "drop_empty": True,
             },
             {
                 "step": "contract_compact_multiaxis",
