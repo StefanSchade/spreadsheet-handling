@@ -71,7 +71,13 @@ def apply_metadata_rules(
         )
 
     if affected_column is None:
-        return _result(_with_meta_if_changed(proposed_frames, updated_meta, False), request, frame_changes, tuple(metadata_changes), ())
+        return _result(
+            _with_meta_if_changed(proposed_frames, updated_meta, False),
+            request,
+            frame_changes,
+            tuple(metadata_changes),
+            (),
+        )
 
     resolver = build_sheet_resolver(meta, request.target_frame)
     _handle_constraints(updated_meta, resolver, request, metadata_changes, failures)
@@ -165,7 +171,9 @@ def _handle_constraints(
                 )
             )
         elif request.kind == SchemaOperationKind.DROP_COLUMN:
-            failures.append(_blocked_reference(ReferenceRoot.CONSTRAINTS, path, request, str(column)))
+            failures.append(
+                _blocked_reference(ReferenceRoot.CONSTRAINTS, path, request, str(column))
+            )
             kept.append(entry)
         else:
             kept.append(entry)
@@ -304,7 +312,9 @@ def _handle_helper_policies(
     if helper_policies is None:
         return
     if not isinstance(helper_policies, Mapping):
-        failures.append(_malformed("helper_policies", "_meta.helper_policies must be a mapping", request))
+        failures.append(
+            _malformed("helper_policies", "_meta.helper_policies must be a mapping", request)
+        )
         return
     updated_helper_policies = dict(helper_policies)
     _handle_fk_policies(updated_helper_policies, request, changes, failures)
@@ -323,7 +333,9 @@ def _handle_fk_policies(
     if fk is None:
         return
     if not isinstance(fk, Mapping):
-        failures.append(_malformed("helper_policies.fk", "_meta.helper_policies.fk must be a mapping", request))
+        failures.append(
+            _malformed("helper_policies.fk", "_meta.helper_policies.fk must be a mapping", request)
+        )
         return
 
     updated_fk = dict(fk)
@@ -358,7 +370,9 @@ def _handle_lookup_policies(
         return
     if not isinstance(lookup, Mapping):
         failures.append(
-            _malformed("helper_policies.lookup", "_meta.helper_policies.lookup must be a mapping", request)
+            _malformed(
+                "helper_policies.lookup", "_meta.helper_policies.lookup must be a mapping", request
+            )
         )
         return
 
@@ -457,7 +471,9 @@ def _rename_lookup_policy_columns(
         if value is None:
             continue
         if not _is_sequence(value):
-            failures.append(_malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request))
+            failures.append(
+                _malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request)
+            )
             continue
         if affected in value:
             updated[field] = [
@@ -468,7 +484,9 @@ def _rename_lookup_policy_columns(
     order = entry.get("order")
     if order is not None:
         if not isinstance(order, Mapping):
-            failures.append(_malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request))
+            failures.append(
+                _malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request)
+            )
         else:
             sort_by = order.get("sort_by")
             if sort_by is None:
@@ -517,14 +535,18 @@ def _block_lookup_drop_if_referenced(
         if affected in key:
             referenced.append(f"{path}.key")
     elif key is not None:
-        failures.append(_malformed(f"{path}.key", f"_meta.{path}.key must be a string or list", request))
+        failures.append(
+            _malformed(f"{path}.key", f"_meta.{path}.key must be a string or list", request)
+        )
 
     for field in ("allowed_helpers", "default_helpers"):
         value = entry.get(field)
         if value is None:
             continue
         if not _is_sequence(value):
-            failures.append(_malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request))
+            failures.append(
+                _malformed(f"{path}.{field}", f"_meta.{path}.{field} must be a list", request)
+            )
         elif affected in value:
             referenced.append(f"{path}.{field}")
 
@@ -546,7 +568,9 @@ def _block_lookup_drop_if_referenced(
                 )
             )
     elif order is not None:
-        failures.append(_malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request))
+        failures.append(
+            _malformed(f"{path}.order", f"_meta.{path}.order must be a mapping", request)
+        )
 
     # Lookup lists carry cross-field invariants (default_helpers within
     # allowed_helpers, sort_by within key/allowed_helpers), so pruning one
@@ -564,7 +588,9 @@ def _block_lookup_drop_if_referenced(
             )
         )
         failures.append(
-            _blocked_reference(ReferenceRoot.HELPER_POLICIES_LOOKUP, reference_path, request, affected)
+            _blocked_reference(
+                ReferenceRoot.HELPER_POLICIES_LOOKUP, reference_path, request, affected
+            )
         )
 
 
@@ -607,7 +633,10 @@ def _handle_fk_relations(
             updated_relations.append(updated_relation)
             continue
 
-        if relation.get("source_frame") == request.target_frame and relation.get("source_column") == affected:
+        if (
+            relation.get("source_frame") == request.target_frame
+            and relation.get("source_column") == affected
+        ):
             updated_relation["source_column"] = request.target_column
             changes.append(
                 _change(
@@ -619,7 +648,10 @@ def _handle_fk_relations(
                     f"Renamed FK relation source_column to {request.target_column!r}",
                 )
             )
-        if relation.get("target_frame") == request.target_frame and relation.get("target_key") == affected:
+        if (
+            relation.get("target_frame") == request.target_frame
+            and relation.get("target_key") == affected
+        ):
             updated_relation["target_key"] = request.target_column
             changes.append(
                 _change(
@@ -681,9 +713,15 @@ def _block_fk_drop_if_referenced(
 ) -> None:
     affected = _affected_column(request)
     referenced = False
-    if relation.get("source_frame") == request.target_frame and relation.get("source_column") == affected:
+    if (
+        relation.get("source_frame") == request.target_frame
+        and relation.get("source_column") == affected
+    ):
         referenced = True
-    if relation.get("target_frame") == request.target_frame and relation.get("target_key") == affected:
+    if (
+        relation.get("target_frame") == request.target_frame
+        and relation.get("target_key") == affected
+    ):
         referenced = True
     helper_columns = relation.get("helper_columns")
     if relation.get("target_frame") == request.target_frame and _is_sequence(helper_columns):
@@ -834,7 +872,6 @@ def _handle_blocked_roots(
     if affected is None:
         return
     for root_name in (
-        "compact_multiaxis",
         "legend_blocks",
         "sparse_defaults",
         "split_by_discriminator",
@@ -882,7 +919,9 @@ def _handle_plugin_roots(
                     "Plugin-owned structured frame/column reference is not rewritten",
                 )
             )
-            failures.append(_blocked_reference(ReferenceRoot.UNKNOWN_PLUGIN, root_name, request, affected))
+            failures.append(
+                _blocked_reference(ReferenceRoot.UNKNOWN_PLUGIN, root_name, request, affected)
+            )
 
 
 def _affected_column(request: SchemaMaintenanceRequest) -> str | None:
@@ -943,11 +982,17 @@ def _change(
     )
 
 
-def _malformed(path: str, message: str, request: SchemaMaintenanceRequest) -> SchemaMaintenanceFailure:
-    return _failure("malformed_meta", message, request.target_frame, _affected_column(request), path)
+def _malformed(
+    path: str, message: str, request: SchemaMaintenanceRequest
+) -> SchemaMaintenanceFailure:
+    return _failure(
+        "malformed_meta", message, request.target_frame, _affected_column(request), path
+    )
 
 
-def _ambiguous(path: str, request: SchemaMaintenanceRequest, column: Any) -> SchemaMaintenanceFailure:
+def _ambiguous(
+    path: str, request: SchemaMaintenanceRequest, column: Any
+) -> SchemaMaintenanceFailure:
     return _failure(
         "ambiguous_metadata_reference",
         f"_meta.{path} cannot be resolved to a single frame",

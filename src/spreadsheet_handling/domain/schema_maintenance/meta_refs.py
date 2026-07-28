@@ -56,7 +56,6 @@ SUPPORTED_ROOT_NAMES = frozenset(
     }
 )
 BLOCKED_ROOTS_BY_NAME = {
-    "compact_multiaxis": ReferenceRoot.COMPACT_MULTIAXIS,
     "legend_blocks": ReferenceRoot.LEGEND_BLOCKS,
     "sparse_defaults": ReferenceRoot.SPARSE_DEFAULTS,
     "split_by_discriminator": ReferenceRoot.SPLIT_BY_DISCRIMINATOR,
@@ -68,6 +67,10 @@ OUT_OF_SCOPE_ROOT_NAMES = frozenset(
         # Legacy family: no producer or runtime consumer remains; tolerated
         # pass-through sediment whose stale references block nothing.
         "cell_codecs",
+        # Persistent feature diagnostics only: no runtime transformation
+        # reads this root, so its descriptive fields do not block or get
+        # rewritten by column schema maintenance.
+        "compact_multiaxis",
         "column_widths",
         "freeze_header",
         "header_fill_rgb",
@@ -164,7 +167,9 @@ def contains_structured_reference(value: Any, target_frame: str, column: str) ->
     if isinstance(value, Mapping):
         if _mapping_contains_reference(value, target_frame, column):
             return True
-        return any(contains_structured_reference(child, target_frame, column) for child in value.values())
+        return any(
+            contains_structured_reference(child, target_frame, column) for child in value.values()
+        )
     if _is_sequence(value):
         return any(contains_structured_reference(child, target_frame, column) for child in value)
     return False
@@ -173,7 +178,9 @@ def contains_structured_reference(value: Any, target_frame: str, column: str) ->
 def _mapping_contains_reference(value: Mapping[str, Any], target_frame: str, column: str) -> bool:
     has_frame = any(str(value.get(key)) == target_frame for key in FRAME_KEYS if key in value)
     has_column = any(str(value.get(key)) == column for key in COLUMN_KEYS if key in value)
-    has_column_list = any(_sequence_contains(value.get(key), column) for key in COLUMN_LIST_KEYS if key in value)
+    has_column_list = any(
+        _sequence_contains(value.get(key), column) for key in COLUMN_LIST_KEYS if key in value
+    )
     return has_frame and (has_column or has_column_list)
 
 

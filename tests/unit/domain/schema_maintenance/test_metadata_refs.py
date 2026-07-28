@@ -15,8 +15,14 @@ from spreadsheet_handling.domain.schema_maintenance import (
     rename_column,
     reorder_columns,
 )
+from spreadsheet_handling.domain.transformations.compact_multiaxis import (
+    expand_compact_multiaxis,
+)
 
-pytestmark = pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS")
+pytestmark = [
+    pytest.mark.ftr("FTR-SCHEMA-EVOLUTION-OPERATIONS"),
+    pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5"),
+]
 
 
 def _base_frames(meta: object | None = None) -> dict[str, object]:
@@ -94,11 +100,7 @@ def _fk_meta() -> dict:
 
 def test_rename_updates_constraints_column_when_sheet_matches_target_frame() -> None:
     frames = _base_frames(
-        {
-            "constraints": [
-                {"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}
-            ]
-        }
+        {"constraints": [{"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}]}
     )
 
     result = rename_column(frames, _rename())
@@ -115,14 +117,8 @@ def test_rename_updates_constraints_column_when_sheet_mapping_resolves_target_fr
     # actually rendered on that sheet.
     frames = _base_frames(
         {
-            "workbook_view": {
-                "sheet_mappings": [
-                    {"sheet": "Characters", "frame": "characters"}
-                ]
-            },
-            "constraints": [
-                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
-            ],
+            "workbook_view": {"sheet_mappings": [{"sheet": "Characters", "frame": "characters"}]},
+            "constraints": [{"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}],
         }
     )
 
@@ -149,9 +145,7 @@ def test_rename_of_other_frame_leaves_sheet_scoped_references_of_mapped_frame() 
                     }
                 ]
             },
-            "constraints": [
-                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
-            ],
+            "constraints": [{"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}],
         }
     )
 
@@ -180,7 +174,9 @@ def test_legacy_canonical_frame_key_is_not_a_generic_structured_reference() -> N
     }
 
 
-def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_target_frame() -> None:
+def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_target_frame() -> (
+    None
+):
     frames = _base_frames(
         {
             "workbook_view": {
@@ -191,9 +187,7 @@ def test_rename_updates_constraints_column_when_workbook_view_sheets_resolves_ta
                     }
                 ]
             },
-            "constraints": [
-                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
-            ],
+            "constraints": [{"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}],
         }
     )
 
@@ -222,9 +216,7 @@ def test_rename_blocks_conflicting_workbook_view_sheet_resolution() -> None:
                     }
                 ],
             },
-            "constraints": [
-                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
-            ],
+            "constraints": [{"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}],
         }
     )
 
@@ -237,11 +229,7 @@ def test_rename_blocks_conflicting_workbook_view_sheet_resolution() -> None:
 
 def test_rename_blocks_ambiguous_constraints_sheet_resolution() -> None:
     frames = _base_frames(
-        {
-            "constraints": [
-                {"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}
-            ]
-        }
+        {"constraints": [{"sheet": "Characters", "column": "name", "rule": {"type": "in_list"}}]}
     )
     original_meta = copy.deepcopy(frames["_meta"])
 
@@ -255,11 +243,7 @@ def test_rename_blocks_ambiguous_constraints_sheet_resolution() -> None:
 
 def test_drop_blocks_constraint_reference_by_default() -> None:
     frames = _base_frames(
-        {
-            "constraints": [
-                {"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}
-            ]
-        }
+        {"constraints": [{"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}]}
     )
 
     result = drop_column(frames, _drop())
@@ -292,11 +276,7 @@ def test_drop_with_prune_removes_supported_constraint_reference() -> None:
 def test_rename_updates_supported_sheet_helper_and_editable_columns() -> None:
     frames = _base_frames(
         {
-            "workbook_view": {
-                "sheet_mappings": [
-                    {"sheet": "Characters", "frame": "characters"}
-                ]
-            },
+            "workbook_view": {"sheet_mappings": [{"sheet": "Characters", "frame": "characters"}]},
             "sheets": {
                 "Characters": {
                     "helper_columns": ["name"],
@@ -447,24 +427,34 @@ def test_legacy_cell_codecs_payload_is_ignored_sediment() -> None:
     assert result.frames["_meta"]["cell_codecs"] == frames["_meta"]["cell_codecs"]
 
 
-@pytest.mark.parametrize("root", ["compact_multiaxis"])
-def test_detected_transformation_structured_reference_blocks(root: str) -> None:
-    frames = _base_frames(
-        {
-            root: {
-                "story_matrix": {
-                    "frame": "characters",
-                    "value_column": "name",
-                }
-            }
-        }
+@pytest.mark.parametrize("operation", ["rename", "drop"])
+def test_real_compact_diagnostics_trace_does_not_block_schema_maintenance(
+    operation: str,
+) -> None:
+    frames = _base_frames()
+    produced = expand_compact_multiaxis(
+        frames,
+        matrix="characters",
+        output="character_names",
+        row_keys=["id"],
+        value_columns=["name"],
+        name="character_name_matrix",
     )
+    trace_before = copy.deepcopy(produced["_meta"]["compact_multiaxis"])
 
-    result = rename_column(frames, _rename())
+    if operation == "rename":
+        result = rename_column(produced, _rename())
+        assert "display_name" in result.frames["characters"].columns
+    else:
+        result = drop_column(produced, _drop())
+        assert "name" not in result.frames["characters"].columns
 
-    assert result.report.blocked
-    assert result.report.metadata_changes[0].action is ReferenceAction.BLOCKED
-    assert result.report.failures[0].code == "blocking_metadata_reference"
+    assert not result.report.blocked
+    assert result.frames["_meta"]["compact_multiaxis"] == trace_before
+    assert all(
+        change.root is not ReferenceRoot.COMPACT_MULTIAXIS
+        for change in result.report.metadata_changes
+    )
 
 
 class TestXrefCrosstableReferences:
@@ -655,9 +645,7 @@ class TestXrefCrosstableReferences:
         assert not result.report.blocked
 
     def test_malformed_xref_root_fails(self) -> None:
-        result = rename_column(
-            _base_frames({"xref_crosstable": ["not-a-mapping"]}), _rename()
-        )
+        result = rename_column(_base_frames({"xref_crosstable": ["not-a-mapping"]}), _rename())
 
         assert result.report.blocked
         assert result.report.failures[0].code == "malformed_meta"
@@ -780,9 +768,7 @@ def test_meta_absent_operation_succeeds_without_metadata_changes() -> None:
 
 def test_reorder_with_metadata_does_not_rewrite_or_block_metadata() -> None:
     meta = {
-        "constraints": [
-            {"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}
-        ],
+        "constraints": [{"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}],
         "sheets": {
             "characters": {
                 "helper_columns": ["home_place_id"],
@@ -857,11 +843,7 @@ def test_malformed_meta_shapes_block_safely(meta: object, expected_path: str) ->
 
 def test_unknown_non_structured_metadata_root_is_not_heuristically_scanned_or_rewritten() -> None:
     frames = _base_frames(
-        {
-            "plugin_notes": {
-                "text": "characters.name appears here but is not a structured reference"
-            }
-        }
+        {"plugin_notes": {"text": "characters.name appears here but is not a structured reference"}}
     )
 
     result = rename_column(frames, _rename())
@@ -889,11 +871,7 @@ def test_plugin_owned_structured_frame_column_reference_blocks() -> None:
 
 def test_report_is_still_not_added_as_frame_or_under_meta() -> None:
     frames = _base_frames(
-        {
-            "constraints": [
-                {"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}
-            ]
-        }
+        {"constraints": [{"sheet": "characters", "column": "name", "rule": {"type": "in_list"}}]}
     )
 
     result = rename_column(frames, _rename())
@@ -974,11 +952,14 @@ def test_rename_updates_lookup_policy_composite_key_and_scalar_sort_by() -> None
 def test_rename_leaves_lookup_policies_of_other_frames_untouched() -> None:
     frames = _base_frames(_lookup_meta())
 
-    result = rename_column(frames, _rename(frame="characters", source="name", target="display_name"))
+    result = rename_column(
+        frames, _rename(frame="characters", source="name", target="display_name")
+    )
 
     assert not result.report.blocked
-    assert result.frames["_meta"]["helper_policies"]["lookup"] == (
-        _lookup_meta()["helper_policies"]["lookup"]
+    assert (
+        result.frames["_meta"]["helper_policies"]["lookup"]
+        == (_lookup_meta()["helper_policies"]["lookup"])
     )
     assert not [
         change
@@ -1015,8 +996,9 @@ def test_lookup_policy_does_not_block_unreferenced_drop() -> None:
 
     assert not result.report.blocked
     assert "notes" not in result.frames["characters"].columns
-    assert result.frames["_meta"]["helper_policies"]["lookup"] == (
-        _lookup_meta()["helper_policies"]["lookup"]
+    assert (
+        result.frames["_meta"]["helper_policies"]["lookup"]
+        == (_lookup_meta()["helper_policies"]["lookup"])
     )
 
 
@@ -1095,9 +1077,7 @@ def test_unhandled_helper_policy_subtree_without_matching_reference_does_not_blo
 def test_handled_fk_and_lookup_subtrees_stay_maintained_next_to_unhandled_ones() -> None:
     meta = _fk_meta()
     meta["helper_policies"]["lookup"] = _lookup_meta()["helper_policies"]["lookup"]
-    meta["helper_policies"]["future_plugin"] = {
-        "targets": [{"frame": "places", "column": "id"}]
-    }
+    meta["helper_policies"]["future_plugin"] = {"targets": [{"frame": "places", "column": "id"}]}
     frames = _base_frames(meta)
 
     result = rename_column(frames, _rename(frame="places", source="name", target="label"))
@@ -1107,6 +1087,7 @@ def test_handled_fk_and_lookup_subtrees_stay_maintained_next_to_unhandled_ones()
     assert relation["helper_columns"][0]["target_field"] == "label"
     policy = result.frames["_meta"]["helper_policies"]["lookup"]["places"]
     assert policy["allowed_helpers"] == ["label"]
-    assert result.frames["_meta"]["helper_policies"]["future_plugin"] == (
-        meta["helper_policies"]["future_plugin"]
+    assert (
+        result.frames["_meta"]["helper_policies"]["future_plugin"]
+        == (meta["helper_policies"]["future_plugin"])
     )
