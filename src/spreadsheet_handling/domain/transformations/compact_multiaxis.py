@@ -4,9 +4,11 @@ This module composes the generic XRef and cell-codec primitives. It keeps
 matrix axes, cell codes, and optional code groups generic; domain meaning stays
 outside this layer.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from typing import Any
 
 import pandas as pd
@@ -18,6 +20,8 @@ from .xref_crosstable import contract_xref, expand_xref
 Frames = dict[str, Any]
 
 _META_KEY = "compact_multiaxis"
+_XREF_META_KEY = "xref_crosstable"
+_ABSENT = object()
 
 
 def expand_compact_multiaxis(
@@ -50,6 +54,7 @@ def expand_compact_multiaxis(
     passthrough = [*row_key_cols, column_key]
     _ensure_distinct_output_columns(passthrough, code=code, group=group)
 
+    prior_xref = _snapshot_xref_meta(frames)
     temp_relation = _temp_frame_name(frames, f"__compact_multiaxis_{config_id}_xref")
     expanded = expand_xref(
         frames,
@@ -94,6 +99,7 @@ def expand_compact_multiaxis(
             strip=strip,
         )
 
+    _restore_xref_meta(out, prior_xref)
     _write_multiaxis_meta(
         out,
         config_id=config_id,
@@ -151,6 +157,7 @@ def contract_compact_multiaxis(
     row_key_cols = _as_list(row_keys, "row_keys")
     group_by = [*row_key_cols, column_key]
 
+    prior_xref = _snapshot_xref_meta(frames)
     temp_relation = _temp_frame_name(frames, f"__compact_multiaxis_{config_id}_encoded")
     encoded = encode_cell_values(
         frames,
@@ -183,6 +190,7 @@ def contract_compact_multiaxis(
 
     out: dict[str, Any] = dict(contracted)
     out.pop(temp_relation, None)
+    _restore_xref_meta(out, prior_xref)
     _write_multiaxis_meta(
         out,
         config_id=config_id,
@@ -272,7 +280,9 @@ def _legend_groups(meta: Mapping[str, Any], legend_name: str) -> dict[Any, Any]:
     groups: dict[Any, Any] = {}
     for token, group_value in _read_legend_block(meta, legend_name):
         if token in groups and groups[token] != group_value:
-            raise ValueError(f"Legend block {legend_name!r} has conflicting group values for {token!r}")
+            raise ValueError(
+                f"Legend block {legend_name!r} has conflicting group values for {token!r}"
+            )
         groups[token] = group_value
     return groups
 
@@ -384,6 +394,25 @@ def _write_multiaxis_meta(
 ) -> None:
     meta = dict(out.get("_meta") or {})
     configs = dict(meta.get(_META_KEY) or {})
-    configs[config_id] = payload
+    configs[config_id] = deepcopy(payload)
     meta[_META_KEY] = configs
+    out["_meta"] = meta
+
+
+def _snapshot_xref_meta(frames: Mapping[str, Any]) -> Any:
+    """Copy the caller's XRef root before the composite delegates to XRef."""
+    meta = frames.get("_meta")
+    if not isinstance(meta, Mapping) or _XREF_META_KEY not in meta:
+        return _ABSENT
+    return deepcopy(meta[_XREF_META_KEY])
+
+
+def _restore_xref_meta(out: dict[str, Any], prior_xref: Any) -> None:
+    """Suppress the internal XRef leg by restoring the caller's prior root."""
+    meta = dict(out.get("_meta") or {})
+    prior_was_empty_mapping = isinstance(prior_xref, Mapping) and not prior_xref
+    if prior_xref is _ABSENT or prior_was_empty_mapping:
+        meta.pop(_XREF_META_KEY, None)
+    else:
+        meta[_XREF_META_KEY] = prior_xref
     out["_meta"] = meta

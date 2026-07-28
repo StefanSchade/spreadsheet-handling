@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import copy
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.domain.pipeline_cleanup import execute_final_domain_cleanup
 from spreadsheet_handling.domain.transformations.compact_multiaxis import (
     contract_compact_multiaxis,
     expand_compact_multiaxis,
 )
+from spreadsheet_handling.domain.transformations.xref_crosstable import (
+    contract_xref,
+    expand_xref,
+)
 
 
-pytestmark = pytest.mark.ftr("FTR-COMPACT-MULTIAXIS")
+pytestmark = [
+    pytest.mark.ftr("FTR-COMPACT-MULTIAXIS"),
+    pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5"),
+]
 
 
 def _legend_meta() -> dict:
@@ -26,13 +38,29 @@ def _legend_meta() -> dict:
     }
 
 
+def _assert_no_internal_temp_reference(value: Any) -> None:
+    if isinstance(value, str):
+        assert "__compact_multiaxis_" not in value
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _assert_no_internal_temp_reference(key)
+            _assert_no_internal_temp_reference(child)
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for child in value:
+            _assert_no_internal_temp_reference(child)
+
+
 def test_expand_compact_multiaxis_produces_generic_long_form_with_legend_group() -> None:
     frames = {
-        "product_matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", "S"],
-            "P-002": ["E-R-K", ""],
-        }),
+        "product_matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "P-001": ["E", "S"],
+                "P-002": ["E-R-K", ""],
+            }
+        ),
         "_meta": _legend_meta(),
     }
 
@@ -58,10 +86,12 @@ def test_expand_compact_multiaxis_produces_generic_long_form_with_legend_group()
 
 def test_expand_compact_multiaxis_can_project_explicit_code_groups_without_legend() -> None:
     frames = {
-        "product_matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", "S"],
-        })
+        "product_matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "P-001": ["E", "S"],
+            }
+        )
     }
 
     out = expand_compact_multiaxis(
@@ -87,10 +117,12 @@ def test_expand_compact_multiaxis_can_project_explicit_code_groups_without_legen
 
 def test_conflicting_legend_and_explicit_code_groups_are_rejected() -> None:
     frames = {
-        "product_matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["E"],
-        }),
+        "product_matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        ),
         "_meta": _legend_meta(),
     }
 
@@ -109,11 +141,13 @@ def test_conflicting_legend_and_explicit_code_groups_are_rejected() -> None:
 
 def test_compact_multiaxis_whole_cell_roundtrip_can_preserve_empty_cells_when_configured() -> None:
     frames = {
-        "product_matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", "S"],
-            "P-002": ["E-R-K", ""],
-        }),
+        "product_matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "P-001": ["E", "S"],
+                "P-002": ["E-R-K", ""],
+            }
+        ),
         "_meta": _legend_meta(),
     }
     expanded = expand_compact_multiaxis(
@@ -143,10 +177,12 @@ def test_compact_multiaxis_whole_cell_roundtrip_can_preserve_empty_cells_when_co
 
 def test_compact_multiaxis_sparse_default_keeps_sparse_relations_sparse() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1", "f2"],
-            "P-001": ["E", ""],
-        }),
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "P-001": ["E", ""],
+            }
+        ),
         "_meta": _legend_meta(),
     }
 
@@ -177,11 +213,13 @@ def test_compact_multiaxis_sparse_default_keeps_sparse_relations_sparse() -> Non
 @pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
 def test_display_labels_roundtrip_only_when_configured_as_row_keys() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "feature_label": ["Display label"],
-            "P-001": ["E"],
-        }),
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "feature_label": ["Display label"],
+                "P-001": ["E"],
+            }
+        ),
         "_meta": _legend_meta(),
     }
 
@@ -227,10 +265,12 @@ def test_display_labels_roundtrip_only_when_configured_as_row_keys() -> None:
 
 def test_split_token_multiaxis_roundtrip_uses_canonical_order() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["K-E"],
-        })
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["K-E"],
+            }
+        )
     }
 
     expanded = expand_compact_multiaxis(
@@ -265,10 +305,12 @@ def test_split_token_multiaxis_roundtrip_uses_canonical_order() -> None:
 
 def test_expand_rejects_dense_axes_until_explicitly_implemented() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["E"],
-        })
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        )
     }
 
     with pytest.raises(NotImplementedError, match="dense_axes"):
@@ -286,10 +328,12 @@ def test_expand_rejects_dense_axes_until_explicitly_implemented() -> None:
 @pytest.mark.ftr("FTR-COMPACT-TRANSFORM-API-ERGONOMICS-P4")
 def test_missing_legend_block_error_points_to_allowed_from_legend() -> None:
     frames = {
-        "matrix": pd.DataFrame({
-            "feature_id": ["f1"],
-            "P-001": ["E"],
-        })
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        )
     }
 
     with pytest.raises(KeyError, match="allowed_from_legend.*status_codes"):
@@ -306,9 +350,11 @@ def test_missing_legend_block_error_points_to_allowed_from_legend() -> None:
 
 def test_contract_rejects_dense_axes_until_explicitly_implemented() -> None:
     frames = {
-        "explicit": pd.DataFrame([
-            {"feature_id": "f1", "column_key": "P-001", "code": "E"},
-        ])
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "P-001", "code": "E"},
+            ]
+        )
     }
 
     with pytest.raises(NotImplementedError, match="dense_axes"):
@@ -322,3 +368,585 @@ def test_contract_rejects_dense_axes_until_explicitly_implemented() -> None:
                 "columns_from": {"frame": "Markets", "key": "market_id"},
             },
         )
+
+
+def test_expand_suppresses_internal_xref_meta_when_no_prior_root_exists() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        ),
+    }
+
+    out = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+    )
+
+    assert "xref_crosstable" not in out["_meta"]
+    _assert_no_internal_temp_reference(out["_meta"])
+
+
+def test_contract_suppresses_internal_xref_meta_when_no_prior_root_exists() -> None:
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "P-001", "code": "E"},
+            ]
+        ),
+    }
+
+    out = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix",
+        row_keys=["feature_id"],
+    )
+
+    assert "xref_crosstable" not in out["_meta"]
+    _assert_no_internal_temp_reference(out["_meta"])
+
+
+def test_empty_prior_xref_root_is_omitted_after_internal_leg() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        ),
+        "_meta": {"xref_crosstable": {}},
+    }
+
+    out = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+    )
+
+    assert "xref_crosstable" not in out["_meta"]
+    assert frames["_meta"] == {"xref_crosstable": {}}
+
+
+def test_unrelated_xref_entries_survive_without_internal_config_entry() -> None:
+    unrelated = {
+        "relation": "other_relation",
+        "matrix": "other_matrix",
+        "row_keys": ["id"],
+        "column_keys": ["B", "A"],
+    }
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        ),
+        "_meta": {"xref_crosstable": {"other": unrelated}},
+    }
+
+    out = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        name="compact",
+    )
+
+    assert out["_meta"]["xref_crosstable"] == {"other": unrelated}
+    assert "compact" not in out["_meta"]["xref_crosstable"]
+
+
+def test_prior_same_id_xref_entry_is_restored_exactly_and_defensively() -> None:
+    prior_entry = {
+        "relation": "public_relation",
+        "matrix": "public_matrix",
+        "row_keys": ["feature_id"],
+        "column_keys": ["P-002", "P-001"],
+        "dense_axes": {
+            "columns_from": {"frame": "products", "key": "name"},
+            "resolved": {"column_keys": ["P-002", "P-001"]},
+        },
+    }
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "P-001", "code": "E"},
+                {"feature_id": "f1", "column_key": "P-002", "code": "S"},
+            ]
+        ),
+        "_meta": {
+            "xref_crosstable": {
+                "compact": prior_entry,
+                "other": {"relation": "other", "matrix": "other_matrix"},
+            },
+        },
+    }
+    before = copy.deepcopy(frames["_meta"])
+
+    out = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix",
+        row_keys=["feature_id"],
+        name="compact",
+    )
+
+    assert out["_meta"]["xref_crosstable"] == before["xref_crosstable"]
+    assert frames["_meta"] == before
+    restored = out["_meta"]["xref_crosstable"]["compact"]
+    assert restored is not prior_entry
+    assert restored["column_keys"] is not prior_entry["column_keys"]
+    assert restored["dense_axes"] is not prior_entry["dense_axes"]
+    assert list(out["matrix"].columns) == ["feature_id", "P-002", "P-001"]
+
+
+def test_bare_xref_metadata_behavior_is_unchanged() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "P-001": ["E"],
+            }
+        ),
+    }
+
+    out = expand_xref(
+        frames,
+        matrix="matrix",
+        output="relation",
+        row_keys=["feature_id"],
+        name="bare",
+    )
+
+    assert out["_meta"]["xref_crosstable"]["bare"] == {
+        "matrix": "matrix",
+        "relation": "relation",
+        "row_keys": ["feature_id"],
+        "column_keys": ["P-001"],
+    }
+
+
+def test_worldbuilding_shaped_bare_xref_intent_survives_compact_expand() -> None:
+    frames = {
+        "story_group_named": pd.DataFrame(
+            [
+                {"story_id": "s1", "group_name": "B", "code": "E"},
+                {"story_id": "s1", "group_name": "A", "code": "K"},
+            ]
+        ),
+    }
+    contracted = contract_xref(
+        frames,
+        relation="story_group_named",
+        output="story_group_matrix",
+        row_keys=["story_id"],
+        column_key="group_name",
+        value="code",
+        column_keys=["A", "B"],
+        name="story_group_matrix",
+    )
+    prior_xref = copy.deepcopy(contracted["_meta"]["xref_crosstable"])
+
+    out = expand_compact_multiaxis(
+        contracted,
+        matrix="story_group_matrix",
+        output="story_group_named_reimported",
+        row_keys=["story_id"],
+        column_key="group_name",
+        value="value",
+        code="code",
+        mode="whole_cell_code",
+        drop_empty=True,
+        name="story_group_matrix",
+    )
+
+    assert out["_meta"]["xref_crosstable"] == prior_xref
+    assert out["story_group_named_reimported"].to_dict(orient="records") == [
+        {"story_id": "s1", "group_name": "A", "code": "K"},
+        {"story_id": "s1", "group_name": "B", "code": "E"},
+    ]
+
+
+def test_contract_explicit_column_keys_override_relation_order() -> None:
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+                {"feature_id": "f1", "column_key": "B", "code": "K"},
+            ]
+        ),
+    }
+
+    out = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix",
+        row_keys=["feature_id"],
+        column_keys=["B", "A"],
+    )
+
+    assert list(out["matrix"].columns) == ["feature_id", "B", "A"]
+    assert out["_meta"]["compact_multiaxis"]["explicit"]["column_keys"] == ["B", "A"]
+
+
+def test_contract_without_prior_xref_derives_first_occurrence_column_order() -> None:
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "B", "code": "K"},
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+                {"feature_id": "f2", "column_key": "A", "code": "S"},
+            ]
+        ),
+    }
+
+    out = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix",
+        row_keys=["feature_id"],
+    )
+
+    assert list(out["matrix"].columns) == ["feature_id", "B", "A"]
+    trace = out["_meta"]["compact_multiaxis"]["explicit"]
+    assert trace["column_keys"] is None
+    assert trace["canonical_order"] is None
+
+
+def test_same_id_expand_then_contract_uses_relation_derived_order() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "B": ["K", ""],
+                "A": ["E", "S"],
+            }
+        ),
+    }
+    expanded = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        drop_empty=True,
+        name="shared",
+    )
+
+    out = contract_compact_multiaxis(
+        expanded,
+        relation="explicit",
+        output="roundtrip",
+        row_keys=["feature_id"],
+        name="shared",
+    )
+
+    assert "xref_crosstable" not in expanded["_meta"]
+    assert "xref_crosstable" not in out["_meta"]
+    assert list(out["roundtrip"].columns) == ["feature_id", "B", "A"]
+
+
+def test_sparse_roundtrip_column_order_is_deterministic_for_relation_row_order() -> None:
+    first = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1", "f2"],
+                "A": ["", "E"],
+                "B": ["K", ""],
+            }
+        ),
+    }
+    reversed_rows = {
+        "matrix": first["matrix"].iloc[::-1].reset_index(drop=True),
+    }
+
+    def roundtrip_columns(frames: dict[str, Any]) -> list[Any]:
+        expanded = expand_compact_multiaxis(
+            frames,
+            matrix="matrix",
+            output="explicit",
+            row_keys=["feature_id"],
+            drop_empty=True,
+            name="shared",
+        )
+        contracted = contract_compact_multiaxis(
+            expanded,
+            relation="explicit",
+            output="roundtrip",
+            row_keys=["feature_id"],
+            name="shared",
+        )
+        repeated = expand_compact_multiaxis(
+            contracted,
+            matrix="roundtrip",
+            output="explicit_again",
+            row_keys=["feature_id"],
+            drop_empty=True,
+            name="shared",
+        )
+        repeated_contract = contract_compact_multiaxis(
+            repeated,
+            relation="explicit_again",
+            output="roundtrip_again",
+            row_keys=["feature_id"],
+            name="shared",
+        )
+        assert list(repeated_contract["roundtrip_again"].columns) == list(
+            contracted["roundtrip"].columns
+        )
+        return list(contracted["roundtrip"].columns)
+
+    assert roundtrip_columns(first) == ["feature_id", "B", "A"]
+    assert roundtrip_columns(reversed_rows) == ["feature_id", "A", "B"]
+
+
+def test_same_id_trace_replaces_atomically_without_history_accumulation() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "A": ["E"],
+            }
+        ),
+    }
+    expanded = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        name="shared",
+    )
+    out = contract_compact_multiaxis(
+        expanded,
+        relation="explicit",
+        output="roundtrip",
+        row_keys=["feature_id"],
+        name="shared",
+    )
+
+    configs = out["_meta"]["compact_multiaxis"]
+    assert list(configs) == ["shared"]
+    assert isinstance(configs["shared"], dict)
+    assert configs["shared"]["operation"] == "contract_compact_multiaxis"
+    assert not isinstance(configs["shared"], list)
+
+
+def test_different_trace_ids_coexist_and_absence_does_not_prune() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "A": ["E"],
+            }
+        ),
+    }
+    first = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit_one",
+        row_keys=["feature_id"],
+        name="one",
+    )
+    out = expand_compact_multiaxis(
+        first,
+        matrix="matrix",
+        output="explicit_two",
+        row_keys=["feature_id"],
+        name="two",
+    )
+
+    assert list(out["_meta"]["compact_multiaxis"]) == ["one", "two"]
+    assert out["_meta"]["compact_multiaxis"]["one"] == first["_meta"]["compact_multiaxis"]["one"]
+
+
+def test_failed_same_id_rerun_preserves_prior_trace_and_caller_state() -> None:
+    initial = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "A": ["E"],
+            }
+        ),
+        "_meta": {
+            "xref_crosstable": {
+                "shared": {
+                    "relation": "caller_relation",
+                    "matrix": "caller_matrix",
+                    "row_keys": ["feature_id"],
+                    "column_keys": ["A"],
+                },
+            },
+        },
+    }
+    successful = expand_compact_multiaxis(
+        initial,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        allowed_codes=["E"],
+        name="shared",
+    )
+    prior_meta = copy.deepcopy(successful["_meta"])
+    prior_matrix = successful["matrix"].copy(deep=True)
+
+    with pytest.raises(ValueError, match="Invalid cell code"):
+        expand_compact_multiaxis(
+            successful,
+            matrix="matrix",
+            output="explicit_failed",
+            row_keys=["feature_id"],
+            allowed_codes=["K"],
+            name="shared",
+        )
+
+    assert successful["_meta"] == prior_meta
+    pd.testing.assert_frame_equal(successful["matrix"], prior_matrix)
+    assert "explicit_failed" not in successful
+    assert not any(key.startswith("__compact_multiaxis_") for key in successful)
+    assert "pipeline_cleanup" not in successful["_meta"]
+
+
+def test_trace_defensively_copies_authored_collections_and_mappings() -> None:
+    allowed_codes = ["E"]
+    code_groups = {" e ": {"label": ["input"]}}
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "A": [" e "],
+            }
+        ),
+    }
+
+    out = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+        value_columns=["A"],
+        allowed_codes=allowed_codes,
+        code_groups=code_groups,
+        normalize_case="upper",
+        strip=True,
+    )
+    trace = out["_meta"]["compact_multiaxis"]["explicit"]
+
+    allowed_codes.append("K")
+    code_groups[" e "]["label"].append("changed")
+
+    assert trace["allowed_codes"] == ["E"]
+    assert trace["code_groups"] == {"E": {"label": ["input"]}}
+    assert trace["value_columns"] == ["A"]
+    assert trace["normalize_case"] == "upper"
+    assert trace["strip"] is True
+
+
+def test_trace_records_authored_orders_without_backfilling_inference() -> None:
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "B", "code": "K"},
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+            ]
+        ),
+    }
+    authored_column_keys = ["A", "B"]
+    authored_canonical_order = ["E", "K"]
+
+    explicit = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix_explicit",
+        row_keys=["feature_id"],
+        column_keys=authored_column_keys,
+        mode="split_tokens",
+        allowed_tokens=["E", "K"],
+        canonical_order=authored_canonical_order,
+        name="explicit_config",
+    )
+    inferred = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix_inferred",
+        row_keys=["feature_id"],
+        name="inferred_config",
+    )
+
+    authored_column_keys.reverse()
+    authored_canonical_order.reverse()
+    explicit_trace = explicit["_meta"]["compact_multiaxis"]["explicit_config"]
+    inferred_trace = inferred["_meta"]["compact_multiaxis"]["inferred_config"]
+    assert explicit_trace["column_keys"] == ["A", "B"]
+    assert explicit_trace["canonical_order"] == ["E", "K"]
+    assert inferred_trace["column_keys"] is None
+    assert inferred_trace["canonical_order"] is None
+
+
+def test_conflicting_compact_trace_is_ignored_by_runtime() -> None:
+    frames = {
+        "explicit": pd.DataFrame(
+            [
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+                {"feature_id": "f1", "column_key": "B", "code": "K"},
+            ]
+        ),
+        "_meta": {
+            "compact_multiaxis": {
+                "shared": {
+                    "mode": "WRONG",
+                    "column_key": "BOGUS",
+                    "code": "NOPE",
+                    "column_keys": ["B", "A"],
+                },
+            },
+        },
+    }
+
+    out = contract_compact_multiaxis(
+        frames,
+        relation="explicit",
+        output="matrix",
+        row_keys=["feature_id"],
+        column_keys=["A", "B"],
+        name="shared",
+    )
+
+    assert list(out["matrix"].columns) == ["feature_id", "A", "B"]
+    assert out["matrix"].to_dict(orient="records") == [
+        {"feature_id": "f1", "A": "E", "B": "K"},
+    ]
+
+
+def test_trace_and_final_cleanup_contain_only_public_frame_names() -> None:
+    frames = {
+        "matrix": pd.DataFrame(
+            {
+                "feature_id": ["f1"],
+                "A": ["E"],
+            }
+        ),
+    }
+    expanded = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="explicit",
+        row_keys=["feature_id"],
+    )
+    with_cleanup = {
+        **expanded,
+        "_meta": {
+            **expanded["_meta"],
+            "pipeline_cleanup": {"keep_frames": ["matrix", "explicit"]},
+        },
+    }
+
+    cleaned = execute_final_domain_cleanup(with_cleanup)
+
+    assert "pipeline_cleanup" not in cleaned["_meta"]
+    assert set(cleaned) == {"matrix", "explicit", "_meta"}
+    _assert_no_internal_temp_reference(cleaned["_meta"])
