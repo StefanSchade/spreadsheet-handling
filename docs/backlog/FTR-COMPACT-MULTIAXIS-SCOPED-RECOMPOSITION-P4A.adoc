@@ -1,6 +1,9 @@
 ===== FTR-COMPACT-MULTIAXIS-SCOPED-RECOMPOSITION-P4A -- Wire XRef scoped recomposition (`base_relation`) through Compact Multiaxis so partial spreadsheet projections preserve out-of-scope canonical rows
 
-*Status:* New
+*Status:* Implemented -- pending independent acceptance review. See
+*Implementation evidence* below and the implementation self-review
+`docs/backlog/FTR-COMPACT-MULTIAXIS-SCOPED-RECOMPOSITION-P4A_implementation_review.adoc`.
+Not accepted; acceptance requires an independent review artifact.
 
 *Priority:* P4A
 
@@ -187,3 +190,110 @@ composite*. It must:
   behavior.
 . Demo and current Worldbuilding flows remain green; release-note impact is
   determined and recorded.
+
+*Implementation evidence:*::
+
+Final public API (`src/spreadsheet_handling/domain/transformations/compact_multiaxis.py`):
+
+* `expand_compact_multiaxis` gains one opt-in keyword-only parameter
+  `base_canonical_relation: str | None = None`. It names a frame holding the
+  *canonical* relation `[*row_keys, column_key, code (, group)]` -- the pre-codec
+  shape this composite produces on the forward path -- deliberately *not* the
+  compact XRef-boundary shape that `expand_xref`'s own `base_relation` takes. The
+  name states the representation the caller provides so it cannot be mistaken for
+  an XRef-shaped base. `contract_compact_multiaxis` is unchanged.
+
+Exact intermediate-frame composition (reverse direction,
+`expand_compact_multiaxis`):
+
+[source,text]
+----
+base_canonical_relation frame  (canonical: [*row_keys, column_key, code (, group)])
+  → encode_cell_values(group_by=[*row_keys, column_key], code, value, mode, …)
+      → temp __compact_multiaxis_<config_id>_base
+        (compact encoded relation: [*row_keys, column_key, value])
+
+matrix + temp base
+  → expand_xref(output=__compact_multiaxis_<config_id>_xref,
+                base_relation=temp base, drop_empty=False)
+      → recomposed compact relation (in-scope matrix rows, then out-of-scope base rows)
+
+  → decode_cell_values(source=xref temp, output, mode, drop_empty=caller, …)
+      → canonical result   (+ optional group column recomputed over all rows)
+----
+
+When `base_canonical_relation is None` the encode leg is skipped, `expand_source`
+is the caller mapping, and `expand_xref` is called with `base_relation=None` --
+byte-for-byte the pre-FTR call.
+
+How the canonical base is encoded: via the existing Cell Codec forward path
+(`encode_cell_values`, historical code-row mode) using the *same effective codec
+configuration* passed to the run (`mode`, `delimiter`, `allowed_codes`,
+`allowed_tokens`, `allowed_from_legend`, `normalize_case`, `strip`) and
+`group_by = [*row_keys, column_key]`. This is the identical forward encode leg
+that `contract_compact_multiaxis` uses, so the base reaches XRef in exactly the
+shape XRef consumes. An optional `group` column on the base is ignored by the
+encode (it is not in `group_by` nor the `code` selector) and is recomputed for
+every output row by the existing `_with_group_column` step.
+
+How XRef scoped recomposition is invoked: the wrapped `expand_xref` is called
+with `base_relation` set to the temp encoded base and `drop_empty=False`. XRef
+builds `in_scope_addresses` for every `(row_id, value_column)` of the matrix and
+appends only base rows whose address is *not* in that set -- the accepted,
+unmodified XRef `base_relation` append loop. No merge/dedup/scope logic was added
+to Compact Multiaxis.
+
+How deletions and out-of-scope preservation work: because `expand_xref` runs with
+`drop_empty=False`, a cleared in-scope cell still marks its address in-scope
+(suppressing any base row at that address) and yields an empty-value in-scope
+record; the composite's `decode_cell_values` then drops that empty record under
+the caller's `drop_empty` (default `True`), so the address disappears rather than
+resurrecting from the base. Base rows whose address is outside the visible matrix
+survive unchanged. The compact encoded base is unique per `(row_keys,
+column_key)` (encode groups by that key), so "visible wins" holds and no
+duplicate base row can survive in-scope.
+
+Metadata behavior: unchanged from the accepted P5 correction. The internal XRef
+leg is still snapshotted/restored (`_snapshot_xref_meta`/`_restore_xref_meta`);
+`expand_xref`'s payload never records `base_relation`, so no temp base name
+enters XRef metadata; `encode_cell_values` writes no `_meta`. The diagnostics
+trace `_meta.compact_multiaxis[config_id]` records the authored
+`base_canonical_relation` (a public frame name or `null`) for truthful
+diagnostics only -- it remains non-authoritative and unread by runtime. No temp
+frame name leaks into returned or persisted metadata (asserted recursively).
+
+Compatibility when the base argument is omitted: identical to the pre-FTR
+contract; existing full-matrix pipelines (including the single Worldbuilding
+`expand_compact_multiaxis` step, which passes no base) are unaffected.
+
+Tests and validation:
+
+* `tests/unit/domain/transformations/test_compact_multiaxis_scoped_recomposition.py`
+  (18 tests): out-of-scope preservation; full-projection no-duplicates;
+  visible-scope replacement, deletion, and new-address addition; ordering;
+  duplicate-address visible-wins; `whole_cell_code` + `split_tokens` codec modes;
+  legend-group recomputation over base rows; `normalize_case`/`strip` on the base
+  encode; empty matrix / empty base / both empty; a monkeypatch spy proving the
+  base reaches XRef as the compact `[*row_keys, column_key, value]` shape (not the
+  canonical `code` shape); invalid base-code propagation; failure atomicity +
+  caller immutability; temp/metadata hygiene; prior XRef metadata survival.
+* `tests/integration/pipeline/test_compact_multiaxis_scoped_recomposition_carrier.py`
+  (1 test): pipeline-binder exposure of `base_canonical_relation` + JSON carrier
+  roundtrip preserving out-of-scope rows.
+* Registry: `registries/pipeline_step_registry.json` expand entry adds the
+  `base_canonical_relation` parameter, the `__compact_multiaxis_<name>_base`
+  internal frame, and `encode_cell_values` to `wrapped_steps`; the architecture
+  signature guard
+  (`test_compact_multiaxis_registry_parameters_match_public_signatures`) passes.
+
+Validation commands and counts are recorded in the implementation self-review.
+
+Known non-goals honored: no second merge algorithm; no XRef/Cell Codec redesign;
+no promotion of the diagnostics trace to operative intent; no trace-lifecycle
+commands; no YAML/callable-contract redesign (the known
+`CONC-PIPELINE-YAML-CALLABLE-CONTRACT` `name`-forwarding behavior is unchanged
+and did not block this slice -- `config_id` still defaults to `output`).
+
+Remaining follow-ups: none required by this slice. The pre-existing
+`CONC-PIPELINE-YAML-CALLABLE-CONTRACT` (`name` not forwarded to the callable) and
+`FTR-COMPACT-MULTIAXIS-TRACE-LIFECYCLE-COMMANDS-P5` remain open and untouched.
