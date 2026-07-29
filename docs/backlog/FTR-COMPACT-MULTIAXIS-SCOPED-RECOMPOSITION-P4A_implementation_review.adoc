@@ -1,0 +1,214 @@
+= Compact Multiaxis Scoped Recomposition — Implementation Self-Review
+
+[NOTE]
+====
+This is an *implementation self-review* by the implementing agent. It is
+evidence for a later independent acceptance review, not proof of acceptance.
+It does not authorize marking the FTR accepted. The independent acceptance
+review is a separate artifact and was not performed here.
+====
+
+:ftr: FTR-COMPACT-MULTIAXIS-SCOPED-RECOMPOSITION-P4A
+:reviewed-branch: ftr-compact-multiaxis-scoped-recomposition-p4a
+:base-commit: 617c6bc (chore(project_memory): ... outcomes)
+
+== Scope reviewed
+
+Wiring XRef `base_relation` scoped recomposition through
+`expand_compact_multiaxis` via an opt-in `base_canonical_relation` frame name,
+using the existing Cell Codec encode + XRef `base_relation` + Cell Codec decode
+composition. No redesign of XRef, Cell Codec, or Compact Multiaxis composition
+mechanics.
+
+Files changed:
+
+* `src/spreadsheet_handling/domain/transformations/compact_multiaxis.py`
+* `registries/pipeline_step_registry.json`
+* `tests/unit/domain/transformations/test_compact_multiaxis_scoped_recomposition.py` (new)
+* `tests/integration/pipeline/test_compact_multiaxis_scoped_recomposition_carrier.py` (new)
+* `docs/functional_model/ch04_use_case_concepts/compact_multiaxis.adoc`
+* `docs/user_guide/ch03_transformation_catalog/02_bijective_transforms.adoc`
+* `docs/technical_model/ch04_concepts/compact_transforms.adoc`
+* `docs/release_notes/release_notes.adoc`
+* `docs/backlog/FTR-COMPACT-MULTIAXIS-SCOPED-RECOMPOSITION-P4A.adoc` (status + evidence)
+* this artifact
+
+== Adversarial questions
+
+*Did the implementation truly reuse XRef `base_relation`?* Yes. The composite
+calls the unmodified `expand_xref(..., base_relation=<temp compact base>)`. The
+XRef out-of-scope append loop and `in_scope_addresses` construction are
+untouched. The spy test
+(`test_base_is_cell_codec_contracted_before_xref_consumption`) captures the
+frame handed to `expand_xref` and confirms it is consumed as `base_relation`.
+
+*Was the base relation encoded under the identical Cell Codec contract?* Yes.
+The base encode is `encode_cell_values(group_by=[*row_keys, column_key],
+code=code, value=value, mode=mode, delimiter=delimiter,
+allowed_codes/allowed_tokens/allowed_from_legend=…, normalize_case=…, strip=…)`
+— the same effective codec configuration passed to the run and the same forward
+encode leg `contract_compact_multiaxis` uses. The spy test asserts the resulting
+base has the compact `[*row_keys, column_key, value]` shape (no `code` column).
+`test_normalize_case_and_strip_applied_to_base_encode` confirms case/strip apply
+to the base identically.
+
+*Can any out-of-scope row still be lost?* Not by this composite. Preservation is
+delegated to XRef's append loop; the encode does not drop rows (it groups them),
+and decode preserves them under the same codec. Covered by
+`test_partial_projection_preserves_out_of_scope_rows`,
+`test_empty_matrix_with_base_preserves_all_base_rows`,
+`test_ordering_is_in_scope_then_out_of_scope`, and the carrier roundtrip. A row
+can only be absent if its address is in the visible scope (replacement) or its
+value is cleared (deletion), which is the intended contract.
+
+*Can any in-scope base row survive as a duplicate?* No. The compact encoded base
+is unique per `(row_keys, column_key)` (encode groups by that key), and XRef
+suppresses any base row whose address is in `in_scope_addresses`. Asserted by
+`test_partial_projection_preserves_out_of_scope_rows` (single P-001 row),
+`test_full_projection_with_base_has_no_duplicate_base_rows`, and
+`test_duplicate_visible_and_base_address_lets_visible_win`.
+
+*Do clears remove matching in-scope rows?* Yes.
+`test_deletion_inside_visible_scope_removes_matching_row`: a cleared in-scope
+cell marks its address in-scope (suppressing the base row) and its empty-value
+in-scope record is dropped at decode under the caller's `drop_empty` default;
+out-of-scope rows survive.
+
+*Is ordering delegated consistently?* Yes. In-scope matrix rows first, then
+out-of-scope base rows in first-occurrence order — XRef's ordering, not a new
+Compact policy. `test_ordering_is_in_scope_then_out_of_scope`.
+
+*Did the change alter behavior when no base is supplied?* No. With
+`base_canonical_relation=None` the encode leg is skipped, `expand_source` is the
+caller mapping, and `expand_xref` is called with `base_relation=None` — the
+byte-for-byte pre-FTR call. `test_no_base_relation_reproduces_pre_ftr_full_replacement`
+plus the entire pre-existing `test_compact_multiaxis.py` (unchanged, green) and
+the Worldbuilding consumer (green) confirm this.
+
+*Did any metadata trace become operative?* No. The diagnostics trace records the
+authored `base_canonical_relation` (a public frame name or `null`) for
+truthfulness only; no runtime path reads it. XRef metadata restore/suppress is
+unchanged; `encode_cell_values` writes no `_meta`; `expand_xref`'s payload never
+records `base_relation`. `test_temp_base_frame_never_leaks_into_result_or_metadata`
+and `test_prior_xref_metadata_survives_scoped_recomposition`.
+
+*Can temporary names leak?* No. Both `__compact_multiaxis_<id>_xref` and
+`__compact_multiaxis_<id>_base` are popped from the result, and neither the XRef
+payload nor the diagnostics trace records the base temp name. Recursive
+`_assert_no_internal_temp_reference` over the result `_meta` (unit + carrier).
+
+*Are caller state and prior traces safe on failure?* Yes. Every leg operates on
+`dict(frames)` copies; on any exception (base encode, XRef expand, decode) the
+function returns nothing and the caller mapping/metadata are untouched.
+`test_failure_in_base_encode_preserves_caller_and_prior_trace` and
+`test_invalid_base_code_propagates_codec_error`.
+
+*Is the YAML/registry contract truthful?* Yes. The registry expand entry adds
+`base_canonical_relation` (`required: false`), the
+`__compact_multiaxis_<name>_base` internal frame, and `encode_cell_values` in
+`wrapped_steps`; the notes state it takes the canonical (not XRef-compact) shape.
+`test_compact_multiaxis_registry_parameters_match_public_signatures` and the
+pipeline-semantics guards pass. The generic binder forwards
+`base_canonical_relation` through `**kwargs`; the carrier integration test drives
+it end-to-end.
+
+*Was any unrelated primitive contract changed?* No. XRef and Cell Codec source
+are untouched. Only the composite and its registry entry changed.
+
+*Does documentation distinguish local expand/contract from project direction?*
+Yes. The functional-model and technical-model docs state that local
+`expand`/`contract` name the data-shape change while
+`contract_compact_multiaxis` is the project-level forward direction and
+`expand_compact_multiaxis` the reverse, and they describe the representation
+expected at each boundary and that the Cold Storage inquiry is intent, not a
+universal accepted rule.
+
+== Findings
+
+*Blocking:* none.
+
+*Important:* none.
+
+*Minor:* none.
+
+*Observations:*
+
+* *O-1 (config identity, pre-existing).* Because the generic binder does not
+  forward YAML `name` to the callable (`CONC-PIPELINE-YAML-CALLABLE-CONTRACT`),
+  the diagnostics `config_id` — including the new `base_canonical_relation`
+  field — is keyed by `output` under the binder, not by an author-chosen id.
+  This affects only the non-authoritative trace and is owned by the existing
+  concern / `FTR-COMPACT-MULTIAXIS-TRACE-LIFECYCLE-COMMANDS-P5`. Not addressed
+  here by design (explicit non-goal).
+* *O-2 (base token ordering).* `expand` has no `canonical_order` parameter, so
+  out-of-scope base cells with multiple tokens (`split_tokens`) are serialized
+  in base first-occurrence order before being split back. This is deterministic
+  and only affects the intra-cell token order of *preserved* rows, never their
+  presence. If a future need arises to align preserved-row token order with an
+  authored `canonical_order`, that is a separate opt-in extension.
+* *O-3 (frame_contract descriptiveness).* The registry `frame_contract.reads`/
+  `preserves` list `base_canonical_relation`, which is read only when supplied.
+  This is descriptive of the configured case and consistent with how required
+  frame roles are listed; the parameter `required:false` and the notes make the
+  opt-in nature explicit.
+
+== Validation
+
+Environment: `PYTHONPATH=src` with the repo `.venv` (the venv otherwise resolves
+a stale installed copy). Commands and counts:
+
+[source,console]
+----
+# Focused transformations + carriers + full architecture
+pytest tests/unit/domain/transformations/test_compact_multiaxis.py \
+       tests/unit/domain/transformations/test_compact_multiaxis_scoped_recomposition.py \
+       tests/unit/domain/transformations/test_xref_crosstable.py \
+       tests/unit/domain/transformations/test_cell_codec.py \
+       tests/integration/pipeline/test_compact_multiaxis_meta_carriers.py \
+       tests/integration/pipeline/test_compact_multiaxis_scoped_recomposition_carrier.py \
+       tests/architecture
+# 372 passed
+
+# Pipeline + roundtrip + schema maintenance + cleanup
+pytest tests/unit/pipeline tests/integration/pipeline \
+       tests/integration/roundtrip tests/unit/domain/schema_maintenance \
+       tests/unit/domain/test_pipeline_cleanup.py
+# 348 passed
+
+# Full Core suite
+pytest tests/unit tests/integration tests/roundtrip tests/architecture
+# 1711 passed, 1 xfailed
+
+# New tests only
+pytest tests/unit/domain/transformations/test_compact_multiaxis_scoped_recomposition.py \
+       tests/integration/pipeline/test_compact_multiaxis_scoped_recomposition_carrier.py
+# 19 passed
+----
+
+Worldbuilding consumer (dino_insel forward+reverse roundtrip, xlsx + ods
+carriers). Its subprocess launches `sheets-run` from the venv, so the core
+package was editable-installed (`pip install -e . --no-deps`) to make
+`sheets-run` reflect the working tree before running:
+
+[source,console]
+----
+python -m pytest worldbuilding/tests/test_dino_insel_workbook_view.py
+# 2 passed
+----
+
+Against the pre-existing *stale* site-packages copy the same test reported 2
+failures unrelated to this change (the installed copy predated the working
+tree); after the editable install it is green, confirming the additive change
+does not affect the full-matrix consumer.
+
+Tree hygiene:
+
+[source,console]
+----
+git diff --check   # clean (no whitespace errors)
+git status --short # clean after commits
+----
+
+== Verdict
+
+IMPLEMENTATION READY FOR INDEPENDENT REVIEW
