@@ -84,9 +84,10 @@ def test_no_base_relation_reproduces_pre_ftr_full_replacement() -> None:
     assert without_base["rel"].to_dict(orient="records") == [
         {"feature_id": "f1", "column_key": "P-001", "code": "Z"},
     ]
-    assert without_base["_meta"]["compact_multiaxis"]["rel"][
+    assert (
         "base_canonical_relation"
-    ] is None
+        not in without_base["_meta"]["compact_multiaxis"]["rel"]
+    )
 
 
 # --- Core preservation ------------------------------------------------------
@@ -160,6 +161,31 @@ def test_deletion_inside_visible_scope_removes_matching_row() -> None:
     # The cleared in-scope P-001 address is removed and does not resurrect from
     # the base; unrelated out-of-scope rows survive.
     assert out["rel"].to_dict(orient="records") == [
+        {"feature_id": "f1", "column_key": "P-002", "code": "K"},
+        {"feature_id": "f1", "column_key": "P-003", "code": "S"},
+    ]
+
+
+def test_deletion_with_drop_empty_false_keeps_truthful_empty_row() -> None:
+    frames = {
+        "matrix": pd.DataFrame({"feature_id": ["f1"], "P-001": [""]}),
+        "base": _canonical_base(),
+    }
+
+    out = expand_compact_multiaxis(
+        frames,
+        matrix="matrix",
+        output="rel",
+        row_keys=["feature_id"],
+        value_columns=["P-001"],
+        base_canonical_relation="base",
+        drop_empty=False,
+    )
+
+    # XRef's non-dropping expansion still suppresses the matching base address.
+    # The caller's codec policy then retains one truthful empty canonical row.
+    assert out["rel"].to_dict(orient="records") == [
+        {"feature_id": "f1", "column_key": "P-001", "code": ""},
         {"feature_id": "f1", "column_key": "P-002", "code": "K"},
         {"feature_id": "f1", "column_key": "P-003", "code": "S"},
     ]

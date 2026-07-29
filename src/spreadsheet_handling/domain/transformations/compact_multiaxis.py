@@ -66,8 +66,8 @@ def expand_compact_multiaxis(
 
     No row-merge/dedup logic lives here: replacement, deletion, ordering, and
     ambiguity are owned by XRef; the shape transform is owned by Cell Codec.
-    Omitting ``base_canonical_relation`` (the default) reproduces the pre-FTR
-    full-replacement behavior byte-for-byte.
+    Omitting ``base_canonical_relation`` (the default) preserves the pre-FTR
+    full-replacement behavior and metadata shape.
     """
     _reject_dense_axes(dense_axes)
     config_id = name or output
@@ -84,7 +84,7 @@ def expand_compact_multiaxis(
     # locally-created intermediate; it never leaves this function or enters any
     # persisted metadata. When no base is supplied, ``expand_source`` is the
     # caller mapping and ``temp_base``/``base_relation`` stay ``None`` -- the
-    # exact pre-FTR call.
+    # pre-FTR behavior.
     expand_source: Mapping[str, Any] = frames
     temp_base: str | None = None
     if base_canonical_relation is not None:
@@ -169,7 +169,11 @@ def expand_compact_multiaxis(
             "code": code,
             "group": group,
             "drop_empty": bool(drop_empty),
-            "base_canonical_relation": base_canonical_relation,
+            **(
+                {"base_canonical_relation": base_canonical_relation}
+                if base_canonical_relation is not None
+                else {}
+            ),
             **_codec_payload(
                 mode=mode,
                 delimiter=delimiter,
