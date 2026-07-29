@@ -45,9 +45,30 @@ def expand_compact_multiaxis(
     strip: bool = False,
     drop_empty: bool = True,
     dense_axes: Mapping[str, Any] | None = None,
+    base_canonical_relation: str | None = None,
     name: str | None = None,
 ) -> Frames:
-    """Expand a compact matrix into generic explicit code rows."""
+    """Expand a compact matrix into generic explicit code rows.
+
+    ``base_canonical_relation`` is the opt-in scoped-recomposition input. It
+    names a frame holding the *canonical* relation ``[*row_keys, column_key,
+    code (, group)]`` (the pre-codec shape this composite produces on the
+    forward path), not the compact XRef-boundary shape. When supplied, the
+    composite reconstructs a *partial* spreadsheet projection without losing
+    out-of-scope canonical rows by composing existing primitives:
+
+    #. Cell Codec encode of the canonical base to the compact encoded relation
+       ``[*row_keys, column_key, value]`` XRef expects, under the *same*
+       effective codec configuration used for the matrix result;
+    #. XRef ``base_relation`` scoped recomposition -- in-scope matrix addresses
+       replace exactly the visible scope; out-of-scope base rows are preserved;
+    #. Cell Codec decode of the merged compact relation back to canonical rows.
+
+    No row-merge/dedup logic lives here: replacement, deletion, ordering, and
+    ambiguity are owned by XRef; the shape transform is owned by Cell Codec.
+    Omitting ``base_canonical_relation`` (the default) reproduces the pre-FTR
+    full-replacement behavior byte-for-byte.
+    """
     _reject_dense_axes(dense_axes)
     config_id = name or output
     row_key_cols = _as_list(row_keys, "row_keys")
@@ -56,8 +77,39 @@ def expand_compact_multiaxis(
 
     prior_xref = _snapshot_xref_meta(frames)
     temp_relation = _temp_frame_name(frames, f"__compact_multiaxis_{config_id}_xref")
+
+    # Scoped recomposition (opt-in): contract the canonical base with the same
+    # Cell Codec configuration used for the matrix result so it reaches XRef in
+    # the compact encoded-relation shape XRef owns. The temp base frame is a
+    # locally-created intermediate; it never leaves this function or enters any
+    # persisted metadata. When no base is supplied, ``expand_source`` is the
+    # caller mapping and ``temp_base``/``base_relation`` stay ``None`` -- the
+    # exact pre-FTR call.
+    expand_source: Mapping[str, Any] = frames
+    temp_base: str | None = None
+    if base_canonical_relation is not None:
+        temp_base = _temp_frame_name(
+            frames, f"__compact_multiaxis_{config_id}_base"
+        )
+        expand_source = encode_cell_values(
+            frames,
+            source=base_canonical_relation,
+            output=temp_base,
+            group_by=passthrough,
+            code=code,
+            value=value,
+            mode=mode,
+            delimiter=delimiter,
+            allowed_codes=allowed_codes,
+            allowed_tokens=allowed_tokens,
+            allowed_from_legend=allowed_from_legend,
+            normalize_case=normalize_case,
+            strip=strip,
+            name=config_id,
+        )
+
     expanded = expand_xref(
-        frames,
+        expand_source,
         matrix=matrix,
         output=temp_relation,
         row_keys=row_key_cols,
@@ -65,6 +117,7 @@ def expand_compact_multiaxis(
         column_key=column_key,
         value=value,
         drop_empty=False,
+        base_relation=temp_base,
         name=config_id,
     )
     decoded = decode_cell_values(
@@ -87,6 +140,8 @@ def expand_compact_multiaxis(
 
     out: dict[str, Any] = dict(decoded)
     out.pop(temp_relation, None)
+    if temp_base is not None:
+        out.pop(temp_base, None)
     if group is not None:
         out[output] = _with_group_column(
             out[output],
@@ -114,6 +169,7 @@ def expand_compact_multiaxis(
             "code": code,
             "group": group,
             "drop_empty": bool(drop_empty),
+            "base_canonical_relation": base_canonical_relation,
             **_codec_payload(
                 mode=mode,
                 delimiter=delimiter,
