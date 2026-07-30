@@ -1,0 +1,290 @@
+===== Independent Acceptance Review -- FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5
+
+*Review date:* 2026-07-30
+
+*Repository state reviewed:* Core repository root
+`/home/stefan/repos/spreadsheet-handling/core`, branch `main`, clean at
+`39ad483`. Reviewed ancestry is exactly
+`631b825 -> 88c686d -> 631dabb -> 39ad483`. The complete three-commit diff
+contains only this FTR's runtime/tests, registry/live documentation, and
+implementation self-review; the unrelated adoption content in `631b825` is
+outside the diff. No sibling-repository change is part of the reviewed commits.
+
+*Commit-date anomaly:* `631b825` and `88c686d` both have author date
+`2026-06-01T16:59:13+02:00`, while their committer dates are respectively
+`2026-07-30T15:32:49+02:00` and `2026-07-30T16:48:22+02:00`. Git ancestry,
+not the duplicated author date, establishes implementation order. This is
+history metadata, not an implementation finding.
+
+== Verdict
+
+*Not accepted.* There are no blocking findings, but the three important
+findings below each contradict an explicit reviewed boundary contract. In
+combination they require a focused correction and independent re-review; they
+are not safely deferrable documentation polish.
+
+== Findings
+
+=== Important I-1 -- `legend_blocks: null` escapes the canonical-shape contract
+
+`domain.ingress.legend_blocks._normalize_root` treats `None` as absent and
+`normalize_legend_blocks_shape` returns the original Frames with the explicit
+root still set to `None`. The persistence boundary also passes it through.
+An application-level JSON-directory probe therefore returned and wrote
+`legend_blocks: null`.
+
+This preserves the old falsey/no-render behavior, and optional roots elsewhere
+often treat `None` as absent. It nevertheless contradicts the reviewed FTR:
+only an *absent key* is a no-op, every present root that is neither mapping nor
+list must fail, and runtime/persisted Legend Blocks are mapping-only. The new
+unit test silently creates an undocumented exception, while the registry and
+live documentation state the stricter contract.
+
+*Disposition:* important undocumented contract gap. Decide explicitly whether
+`null` is rejected or canonicalized to actual absence/empty mapping, then align
+runtime, tests, registry, and docs. Keeping an explicit persisted `null` is not
+compatible with the accepted mapping-only invariant.
+
+=== Important I-2 -- `apply_overrides` failure is not atomic
+
+`get_meta` makes only a shallow top-level copy. `apply_overrides` then mutates
+the existing nested `sheets` mapping before invoking ingress. A probe starting
+from canonical Legend metadata, adding a sheet override, and introducing two
+duplicate Legend identities through `defaults` raised the expected
+`ValueError` but changed
+`frames["_meta"]["sheets"]["Data"]["freeze_header"]` from `False` to `True`.
+
+The orchestrator still suppresses the saver and later steps, but a direct
+maintained `apply_overrides` caller observes partial mutation. This falsifies
+the FTR's caller-graph immutability/failure-atomicity criterion and the
+self-review's claim that canonicalizing before `set_meta` makes this boundary
+atomic.
+
+*Disposition:* build the whole override candidate without sharing/mutating the
+caller's nested `sheets` mapping, and add an override-stage failure test that
+checks the complete object graph plus saver suppression.
+
+=== Important I-3 -- ingress is YAML-invokable through the public plugin step
+
+Ingress is correctly absent from `pipeline.registry.REGISTRY` and
+`registries/pipeline_step_registry.json`; short-name builds fail. However, the
+registered public `plugin` step accepts a dotted Frames callable. This YAML
+configuration builds and runs successfully:
+
+[source,yaml]
+----
+- step: plugin
+  dotted: spreadsheet_handling.domain.ingress:run_domain_ingress
+----
+
+The new architecture guard checks only candidate step names and misses this
+maintained extension path. Current Legend normalization is idempotent, so the
+probe showed no immediate semantic drift, but the reviewed contract says
+ingress is not YAML-buildable/selectable. User-controlled invocation also
+weakens that guarantee for every future ordered ingress rule.
+
+*Disposition:* either enforce non-addressability through the plugin surface,
+or explicitly revise the settled contract to distinguish “no dedicated
+registered step” from unsupported-but-executable plugin use. Add a guard for
+the chosen rule; the current absolute documentation is false.
+
+=== Minor
+
+None independent of the important findings.
+
+=== Observations
+
+* The focused tests add 34 test functions (38 parametrized cases), but do not
+  cover `apply_overrides` failure atomicity, the plugin dotted-call route, or
+  duplicate ingress invocation. The `None` case is covered with the wrong
+  expectation relative to the reviewed FTR.
+* JSON directory is the only reviewed simple backend that persists canonical
+  `_meta` as `_meta.yaml`; CSV/YAML/XML simple savers discard `_meta`. The
+  shared orchestrator persistence boundary still supplies canonical mapping to
+  every saver, but the new on-disk structured-persistence test proves only the
+  JSON sidecar. Future evidence should state this backend capability distinction
+  rather than imply four metadata sidecars.
+* The not-yet-accepted FTR has no include in `_ftrs_open.adoc`. Correction work
+  must restore truthful active tracking; completion cleanup is not yet allowed.
+
+== Ingress and call-graph assessment
+
+The maintained macro call graph is structurally correct:
+
+[source,text]
+----
+CLI / run_app / schema-maintenance application
+  -> application.orchestrator.orchestrate
+  -> router loader
+  -> run_domain_ingress
+  -> configured steps
+       -> bootstrap_meta -> post-merge run_domain_ingress
+       -> load_and_apply_overrides -> apply_overrides
+          -> post-merge run_domain_ingress
+  -> final cleanup
+  -> persistence projection
+  -> router saver
+----
+
+All router-backed input kinds converge before the first configured step.
+`domain.ingress` has no forbidden higher-layer imports, exposes one explicit
+ordered `INGRESS_RULES` tuple, and is a reusable carrier-neutral
+`Frames -> Frames` boundary. Arbitrary plugins remain responsible for returning
+canonical Frames. Direct `run_pipeline`, transformation, render, and backend
+calls remain lower-level preconditioned APIs.
+
+Calling ingress twice is value-idempotent. The coordinator itself and
+`bootstrap_meta` preserve caller state on normalization failure. The
+`apply_overrides` invocation path does not, per I-2. Registry
+non-registration is correct, but YAML non-buildability is not, per I-3.
+
+== Normalization contract assessment
+
+Independent inspection/probes confirmed:
+
+* mapping order, block field order, and authored values are preserved apart
+  from deliberate `resolved` pruning;
+* list order becomes mapping insertion order;
+* identity is `name`, then `id`, then one-based `legend_<n>`, preserving the
+  prior truthiness/`str(...)` behavior;
+* empty list becomes empty mapping and empty mapping remains empty;
+* duplicate explicit identities and explicit/positional collisions fail with
+  the position and resolved identity;
+* non-mapping list members and non-`None` unsupported root types fail;
+* ingress does not mutate caller-owned nested Legend structures, and its own
+  failure is atomic; and
+* no Entry Contract token/label/duplicate-entry policy was added.
+
+The exception is explicit `None`, which is neither rejected nor canonicalized
+and therefore keeps a non-mapping root visible downstream and in persistence
+(I-1).
+
+== Downstream mapping-only and `resolved` lifecycle assessment
+
+Dual-shape walks were removed from the shared domain reader, composer, and
+validation lookup. Cell Codec and Compact Multiaxis use the shared mapping-key
+reader; schema maintenance and persistence operate on mapping form; parser
+hints remain intentionally mapping-only. Malformed mapping member handling and
+Entry Contract divergence were not changed.
+
+The successful lifecycle is coherent and carrier-symmetric:
+
+[source,text]
+----
+external authored mapping/list
+  -> ingress mapping + stale resolved removed
+  -> composer clone + fresh render-local resolved
+  -> XLSX/ODS embedded carrier
+  -> parser consumes resolved and marks TableBlock.kind == "legend"
+  -> workbookir_to_frames excludes support table and strips resolved
+  -> canonical mapping readback
+  -> later render recreates fresh resolved
+----
+
+The persistence boundary remains a defensive second strip for mapping-form
+runtime producers. XLSX and ODS tests prove classification before stripping,
+canonical readback without `resolved`, and fresh reconstruction. No
+carrier-specific lifecycle asymmetry was found.
+
+== Own-sheet projection assessment
+
+The shared change is narrow: only the already-selected `tables[0]` is omitted
+when its parser classification is `kind == "legend"`. Default-placement
+Legend-only sheets are therefore absent in both XLSX and ODS readback; a data
+table followed by a colocated Legend still returns the data; empty sheets still
+return an empty DataFrame. Multiple/manual tables do not create a new
+second-table loss because generic projection already selected only the first
+table.
+
+Residual risk: classification trusts carrier `resolved` coordinates. A
+deliberately overlapping Legend at `(1,1)` marks both the payload anchor and
+Legend anchor as `kind == "legend"` in both parsers, so projection returns no
+payload frame. The carrier has already overwritten that payload with Legend
+cells, so this is not a new legitimate-data regression, but overlap/tampered
+hint behavior remains outside the narrow fix and deserves watch-only status.
+
+== Registry and documentation assessment
+
+Every newly named code reference resolves and has the claimed current role.
+The reviewed semantic readers/projectors are present: shared domain reader,
+Cell Codec, Compact Multiaxis, ValidationPass, composer, both parsers, schema
+maintenance, persistence projection, and workbook projection. Canonical-shape
+and carrier-local `resolved` producers are distinguished in the registry prose.
+Generic merge/cleanup/serialization machinery is not misrepresented as a
+Legend semantic consumer.
+
+The User Guide and release note correctly document list authoring through
+maintained application/config ingress and the tightened low-level precondition;
+the release note is in the active unreleased section. Entry Contract semantics
+remain explicitly out of scope. Registry/live-doc truth is overstated only for
+the `null` and YAML-buildability exceptions in I-1/I-3.
+
+== Test and validation evidence
+
+All Python commands used `PYTHONPATH=src`; an import probe resolved
+`spreadsheet_handling` from this working tree's `src/`.
+
+[cols="3,1,3"]
+|===
+| Command | Result | Assessment
+
+| `PYTHONPATH=src .venv/bin/pytest -o addopts='' -q` plus the 14 focused
+Legend/ingress/consumer/registry files
+| 291 passed
+| Focused affected surface green.
+
+| `PYTHONPATH=src .venv/bin/pytest -o addopts='' -q tests/architecture`
+| 143 passed
+| Architecture suite green; it does not cover the plugin route.
+
+| `PYTHONPATH=src .venv/bin/pytest -o addopts='' -q
+tests/architecture/semantic_invariants/test_meta_registry.py
+tests/architecture/semantic_invariants/test_meta_registry_hardening.py`
+| 11 passed
+| Registry structure/references green.
+
+| `PYTHONPATH=src .venv/bin/pytest -o addopts='' -q -m 'not legacy and not
+prehex and not slow' tests/unit tests/integration tests/architecture
+tests/roundtrip`
+| 1750 passed, 1 xfailed
+| Full active Core suite green.
+
+| `.venv/bin/ruff check` on every changed source/test file
+| clean
+| No lint finding.
+
+| `PYTHONPATH=src .venv/bin/python tools/check_source_style.py`
+| 0 errors, 78 warnings, 2 allowlisted findings
+| Guard passes; warnings remain advisory.
+
+| `git diff --check 631b825..39ad483`
+| clean
+| Reviewed commits have no whitespace errors.
+
+| `asciidoctor -o /tmp/<artifact>.html <changed-adoc>` for all six changed/new
+AsciiDoc artifacts
+| all exit 0
+| Changed documentation renders.
+
+| Independent inline Python probes (`PYTHONPATH=src .venv/bin/python`)
+| ordinary/idempotent cases pass; I-1/I-2/I-3 reproduced
+| Probes attempted to falsify the self-review rather than mirror implementation.
+|===
+
+== Residual risks and lifecycle cleanup
+
+Entry-value semantics and `placement.target` maintenance remain correctly
+deferred to their owning work. Simple-backend metadata capability and
+overlap/tampered Legend hints remain observations, not scope expansion.
+
+This FTR must remain active with status “pending independent acceptance
+review”; do not archive the FTR, pre-implementation review, self-review, or this
+acceptance review. `_ftrs_open.adoc` currently has no include for this
+not-yet-accepted FTR, so the correction work must restore truthful active
+tracking rather than perform completion cleanup. After the three important
+findings are corrected and independently accepted, the normal cleanup should
+mark it Done, remove any restored active include, and move the complete
+artifact bundle to `docs/cold_storage/backlog/ftrs_done/`. No new follow-up FTR
+is needed if the corrections remain inside this boundary slice.
+
+LEGEND BLOCKS RESOLVED-SHAPE SLICE NOT ACCEPTED
