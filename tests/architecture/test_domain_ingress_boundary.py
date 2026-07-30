@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from spreadsheet_handling.application import orchestrator
 from spreadsheet_handling.domain import ingress as ingress_pkg
+from spreadsheet_handling.domain import meta_bootstrap, yaml_overrides
 from spreadsheet_handling.domain.ingress import INGRESS_RULES, run_domain_ingress
 from spreadsheet_handling.pipeline.build import build_steps_from_config
 from spreadsheet_handling.pipeline.registry import REGISTRY
@@ -29,6 +31,15 @@ _INGRESS_STEP_CANDIDATES = (
     "ingress",
     "legend_blocks_shape",
     "normalize_legend_blocks_shape",
+)
+
+_INGRESS_PLUGIN_CALLABLES = (
+    "spreadsheet_handling.domain.ingress:run_domain_ingress",
+    "spreadsheet_handling.domain.ingress.coordinator:run_domain_ingress",
+    (
+        "spreadsheet_handling.domain.ingress.legend_blocks:"
+        "normalize_legend_blocks_shape"
+    ),
 )
 
 
@@ -52,6 +63,23 @@ def test_ingress_is_not_buildable_from_yaml_config():
     for candidate in _INGRESS_STEP_CANDIDATES:
         with pytest.raises(KeyError, match="Unknown step"):
             build_steps_from_config([{"step": candidate}])
+
+
+@pytest.mark.parametrize("dotted", _INGRESS_PLUGIN_CALLABLES)
+def test_ingress_namespace_is_not_addressable_through_plugin_yaml(dotted):
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not plugin-addressable",
+    ):
+        build_steps_from_config([{"step": "plugin", "dotted": dotted}])
+
+
+def test_ingress_callable_is_not_reexported_through_invocation_modules():
+    # Import the package namespace at call sites so the coordinator does not
+    # acquire alternate dotted-callable plugin paths as an incidental alias.
+    assert not hasattr(orchestrator, "run_domain_ingress")
+    assert not hasattr(meta_bootstrap, "run_domain_ingress")
+    assert not hasattr(yaml_overrides, "run_domain_ingress")
 
 
 def test_domain_ingress_does_not_import_forbidden_layers():
