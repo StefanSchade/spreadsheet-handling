@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
+from typing import Any, Callable
+
 _FRAMEWORK_INTERNAL_CONFIGURATION_NAMESPACES: tuple[str, ...] = (
     "spreadsheet_handling.domain.ingress",
 )
@@ -11,10 +14,12 @@ def ensure_configuration_addressable(reference: str) -> None:
     """Reject framework-owned callables from maintained configuration paths.
 
     ``reference`` may use ``module:function`` or ``module.function`` form.
-    This function owns only the framework namespace boundary; importing and
-    callable validation remain the responsibility of the calling resolver.
     """
-    module_path = _module_path(reference)
+    module_path, _ = _split_reference(reference)
+    _ensure_module_addressable(reference, module_path)
+
+
+def _ensure_module_addressable(reference: str, module_path: str) -> None:
     for namespace in _FRAMEWORK_INTERNAL_CONFIGURATION_NAMESPACES:
         if module_path == namespace or module_path.startswith(f"{namespace}."):
             raise ValueError(
@@ -23,7 +28,17 @@ def ensure_configuration_addressable(reference: str) -> None:
             )
 
 
-def _module_path(reference: str) -> str:
+def resolve_configuration_callable(reference: str) -> Callable[..., Any]:
+    """Resolve a configuration-derived callable through the ownership boundary."""
+    module_path, attribute = _split_reference(reference)
+    _ensure_module_addressable(reference, module_path)
+    target = getattr(importlib.import_module(module_path), attribute)
+    if not callable(target):
+        raise TypeError(f"Not callable: {reference}")
+    return target
+
+
+def _split_reference(reference: str) -> tuple[str, str]:
     if not isinstance(reference, str):
         raise TypeError("Dotted callable reference must be a string")
     if not reference or any(character.isspace() for character in reference):
@@ -46,7 +61,7 @@ def _module_path(reference: str) -> str:
         raise ValueError(
             "Dotted callable reference must use module:function or module.function form"
         )
-    return module_path
+    return module_path, attribute
 
 
-__all__ = ["ensure_configuration_addressable"]
+__all__ = ["ensure_configuration_addressable", "resolve_configuration_callable"]

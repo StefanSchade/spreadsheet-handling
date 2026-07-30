@@ -9,10 +9,16 @@ import pytest
 from spreadsheet_handling.domain import ingress as ingress_package
 from spreadsheet_handling.domain.ingress import coordinator as ingress_coordinator
 from spreadsheet_handling.domain.ingress import legend_blocks as ingress_legend_rule
-from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
-from spreadsheet_handling.pipeline import registry as pipeline_registry
-from spreadsheet_handling.pipeline import steps as pipeline_steps
-from spreadsheet_handling.pipeline.steps import make_frames_target_step
+from spreadsheet_handling.pipeline import (
+    build_steps_from_config,
+    build_steps_from_yaml,
+    run_pipeline,
+)
+from spreadsheet_handling.pipeline import dotted_paths as pipeline_dotted_paths
+from spreadsheet_handling.pipeline.steps import (
+    make_builder_target_step,
+    make_frames_target_step,
+)
 
 pytestmark = pytest.mark.ftr("FTR-TEST-HARNESS")
 
@@ -69,6 +75,11 @@ def test_dotted_path_step(tmp_path: Path, monkeypatch):
                 out = dict(frames)
                 out["_plugin_marker"] = marker
                 return out
+
+            def mark_nested_target(frames, *, marker: str):
+                out = dict(frames)
+                out["_nested_marker"] = marker
+                return out
             """
         ),
         encoding="utf-8",
@@ -91,6 +102,15 @@ def test_dotted_path_step(tmp_path: Path, monkeypatch):
                 "dotted": "extsteps.steps:mark_external_plugin",
                 "args": {"marker": "external"},
             },
+            {
+                "step": (
+                    "spreadsheet_handling.pipeline.steps:"
+                    "make_frames_target_step"
+                ),
+                "target": "extsteps.steps:mark_nested_target",
+                "name": "nested_external",
+                "marker": "nested",
+            },
         ]
         steps = build_steps_from_config(cfg)
 
@@ -100,6 +120,7 @@ def test_dotted_path_step(tmp_path: Path, monkeypatch):
         assert set(out["A"].columns) == {"id", "name"}  # external transform applied
         assert "dropme" not in out["A"].columns
         assert out["_plugin_marker"] == "external"
+        assert out["_nested_marker"] == "nested"
     finally:
         # Clean up.
         sys.path = [p for p in sys.path if p != str(tmp_path)]
@@ -162,12 +183,128 @@ def test_framework_ingress_namespace_is_rejected_in_final_dot_plugin_form(dotted
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+@pytest.mark.parametrize(
+    ("dotted", "owner", "attribute"),
+    _INGRESS_TARGETS,
+)
+def test_framework_ingress_namespace_is_rejected_as_nested_string_target(
+    dotted,
+    owner,
+    attribute,
+    monkeypatch,
+):
+    invoked = False
+
+    def invocation_sentinel(*args, **kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("framework ingress callable was invoked")
+
+    monkeypatch.setattr(owner, attribute, invocation_sentinel)
+    spec = {
+        "step": "spreadsheet_handling.pipeline.steps:make_frames_target_step",
+        "target": dotted,
+        "name": "forbidden_nested_target",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not configuration/plugin-addressable",
+    ):
+        build_steps_from_config([spec])
+
+    assert invoked is False
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_framework_ingress_nested_target_rejection_precedes_target_import(monkeypatch):
+    imported: list[str] = []
+    real_import = importlib.import_module
+
+    def import_sentinel(module_path):
+        imported.append(module_path)
+        if module_path.startswith("spreadsheet_handling.domain.ingress"):
+            raise AssertionError(f"unexpected import of {module_path}")
+        return real_import(module_path)
+
+    monkeypatch.setattr(
+        pipeline_dotted_paths.importlib,
+        "import_module",
+        import_sentinel,
+    )
+    spec = {
+        "step": "spreadsheet_handling.pipeline.steps:make_frames_target_step",
+        "target": "spreadsheet_handling.domain.ingress:run_domain_ingress",
+        "name": "forbidden_nested_target",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not configuration/plugin-addressable",
+    ):
+        build_steps_from_config([spec])
+
+    assert imported == ["spreadsheet_handling.pipeline.steps"]
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_builder_binder_rejects_nested_ingress_string_target():
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not configuration/plugin-addressable",
+    ):
+        make_builder_target_step(
+            target="spreadsheet_handling.domain.ingress:run_domain_ingress",
+            name="forbidden_nested_builder",
+        )
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_yaml_nested_ingress_target_is_rejected_before_invocation(
+    tmp_path,
+    monkeypatch,
+):
+    invoked = False
+
+    def invocation_sentinel(*args, **kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("framework ingress callable was invoked")
+
+    monkeypatch.setattr(
+        ingress_coordinator,
+        "run_domain_ingress",
+        invocation_sentinel,
+    )
+    config_path = tmp_path / "pipeline.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: spreadsheet_handling.pipeline.steps:make_frames_target_step
+                target: spreadsheet_handling.domain.ingress.coordinator:run_domain_ingress
+                name: forbidden_nested_target
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not configuration/plugin-addressable",
+    ):
+        build_steps_from_yaml(str(config_path))
+
+    assert invoked is False
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 @pytest.mark.parametrize("surface", ["plugin", "colon_factory"])
 def test_framework_ingress_rejection_precedes_import(surface, monkeypatch):
     def fail_import(module_path):
         raise AssertionError(f"unexpected import of {module_path}")
 
-    monkeypatch.setattr(pipeline_steps.importlib, "import_module", fail_import)
+    monkeypatch.setattr(pipeline_dotted_paths.importlib, "import_module", fail_import)
     dotted = "spreadsheet_handling.domain.ingress:run_domain_ingress"
     spec = (
         {"step": "plugin", "dotted": dotted}
@@ -198,7 +335,7 @@ def test_malformed_plugin_dotted_references_fail_before_import(dotted, monkeypat
     def fail_import(module_path):
         raise AssertionError(f"unexpected import of {module_path}")
 
-    monkeypatch.setattr(pipeline_steps.importlib, "import_module", fail_import)
+    monkeypatch.setattr(pipeline_dotted_paths.importlib, "import_module", fail_import)
     with pytest.raises(ValueError, match="Dotted callable reference"):
         build_steps_from_config([{"step": "plugin", "dotted": dotted}])
 
@@ -219,7 +356,7 @@ def test_malformed_colon_factory_references_fail_before_import(dotted, monkeypat
     def fail_import(module_path):
         raise AssertionError(f"unexpected import of {module_path}")
 
-    monkeypatch.setattr(pipeline_registry.importlib, "import_module", fail_import)
+    monkeypatch.setattr(pipeline_dotted_paths.importlib, "import_module", fail_import)
     with pytest.raises(ValueError, match="Dotted callable reference"):
         build_steps_from_config([{"step": dotted}])
 
@@ -287,6 +424,31 @@ def test_direct_python_callable_target_is_not_treated_as_dotted_config():
     step = make_frames_target_step(target=mark, name="mark", marker="direct")
 
     assert step({}) == {"marker": "direct"}
+
+
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_unrelated_domain_nested_string_target_remains_addressable():
+    steps = build_steps_from_config(
+        [
+            {
+                "step": (
+                    "spreadsheet_handling.pipeline.steps:"
+                    "make_frames_target_step"
+                ),
+                "target": (
+                    "spreadsheet_handling.domain.meta_bootstrap:"
+                    "bootstrap_meta"
+                ),
+                "name": "nested_internal",
+            }
+        ]
+    )
+    frames = {"payload": pd.DataFrame({"id": [1]}), "_meta": {"legend_blocks": None}}
+
+    out = run_pipeline(frames, steps)
+
+    assert out is frames
+    assert out["_meta"]["legend_blocks"] == {}
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")

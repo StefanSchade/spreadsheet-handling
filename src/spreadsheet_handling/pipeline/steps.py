@@ -5,11 +5,10 @@ Factories use lazy imports to avoid loading domain/core modules at import time.
 """
 from __future__ import annotations
 
-import importlib
 import logging
 from typing import Any, Callable, Dict
 
-from .dotted_paths import ensure_configuration_addressable
+from .dotted_paths import resolve_configuration_callable
 from .types import BoundStep, Frames
 
 log = logging.getLogger("sheets.pipeline")
@@ -19,24 +18,8 @@ log = logging.getLogger("sheets.pipeline")
 # Plugin support
 # ---------------------------------------------------------------------------
 
-def _resolve_callable(dotted: str) -> Callable[..., Any]:
-    """
-    Import a dotted callable like 'package.module:function' or 'package.module.attr'.
-    Accepts both 'pkg.mod:func' and 'pkg.mod.func' styles.
-    """
-    if ":" in dotted:
-        mod_path, attr = dotted.split(":", 1)
-    else:
-        mod_path, attr = dotted.rsplit(".", 1)
-    mod = importlib.import_module(mod_path)
-    fn = getattr(mod, attr)
-    if not callable(fn):
-        raise TypeError(f"Not callable: {dotted}")
-    return fn
-
-
 def _resolve_target(target: str | Callable[..., Any]) -> Callable[..., Any]:
-    return _resolve_callable(target) if isinstance(target, str) else target
+    return resolve_configuration_callable(target) if isinstance(target, str) else target
 
 
 def _target_label(target: str | Callable[..., Any]) -> str:
@@ -53,8 +36,7 @@ def make_plugin_step(*, dotted: str, args: Dict[str, Any] | None = None, name: s
     dotted: dotted path to a callable
     args: optional dict of kwargs passed to the callable
     """
-    ensure_configuration_addressable(dotted)
-    fn = _resolve_callable(dotted)
+    fn = resolve_configuration_callable(dotted)
     cfg = {"dotted": dotted, "args": dict(args or {})}
 
     def run(fr: Frames) -> Frames:

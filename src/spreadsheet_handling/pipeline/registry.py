@@ -6,10 +6,9 @@ configuration into executable steps lives in pipeline/build.py.
 
 from __future__ import annotations
 
-import importlib
 from typing import Dict
 
-from .dotted_paths import ensure_configuration_addressable
+from .dotted_paths import resolve_configuration_callable
 from .types import StepFactory, StepRegistration
 
 from .steps import (
@@ -189,11 +188,5 @@ def resolve_registration(step_id: str) -> StepRegistration | None:
     if entry:
         return entry if isinstance(entry, StepRegistration) else StepRegistration(factory=entry)
     if ":" in step_id:
-        ensure_configuration_addressable(step_id)
-        mod_name, func_name = step_id.split(":", 1)
-        mod = importlib.import_module(mod_name)
-        factory = getattr(mod, func_name, None)
-        if factory is None:
-            raise AttributeError(f"Factory '{func_name}' not found in module '{mod_name}'")
-        return StepRegistration(factory=factory)
+        return StepRegistration(factory=resolve_configuration_callable(step_id))
     return None

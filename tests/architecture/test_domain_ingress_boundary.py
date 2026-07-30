@@ -85,6 +85,34 @@ def test_ingress_namespace_is_not_addressable_through_yaml_routes(dotted, route)
         build_steps_from_config([spec])
 
 
+@pytest.mark.parametrize("dotted", _INGRESS_PLUGIN_CALLABLES)
+def test_ingress_namespace_is_not_addressable_as_nested_string_target(dotted):
+    spec = {
+        "step": "spreadsheet_handling.pipeline.steps:make_frames_target_step",
+        "target": dotted,
+        "name": "forbidden_nested_target",
+    }
+    with pytest.raises(
+        ValueError,
+        match="framework-internal and not configuration/plugin-addressable",
+    ):
+        build_steps_from_config([spec])
+
+
+def test_configuration_callable_resolution_has_one_pipeline_owner():
+    pipeline_root = Path("src/spreadsheet_handling/pipeline")
+    dotted_paths_source = (pipeline_root / "dotted_paths.py").read_text(encoding="utf-8")
+    steps_source = (pipeline_root / "steps.py").read_text(encoding="utf-8")
+    registry_source = (pipeline_root / "registry.py").read_text(encoding="utf-8")
+
+    assert "def resolve_configuration_callable(" in dotted_paths_source
+    assert "importlib.import_module(" in dotted_paths_source
+    assert "resolve_configuration_callable" in steps_source
+    assert "resolve_configuration_callable" in registry_source
+    assert "importlib.import_module(" not in steps_source
+    assert "importlib.import_module(" not in registry_source
+
+
 def test_ingress_callable_is_not_reexported_through_invocation_modules():
     # Import the package namespace at call sites so the coordinator does not
     # acquire alternate dotted-callable plugin paths as an incidental alias.
