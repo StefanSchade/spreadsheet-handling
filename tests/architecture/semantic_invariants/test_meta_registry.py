@@ -54,6 +54,45 @@ def test_meta_registry_entry_names_are_unique():
     assert len(names) == len(set(names))
 
 
+@pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+def test_legend_blocks_entry_names_reviewed_producers_and_consumers():
+    """Guard the reviewed legend_blocks producer/consumer surface (LB-7).
+
+    The registry must name domain.ingress as the canonical-shape producer, the
+    composer as the carrier-local resolved producer, and every current semantic
+    reader/projector as a consumer. This is a focused list guard, not a generic
+    source-scanning framework.
+    """
+    registry = _load_registry()
+    entry = next(e for e in registry["entries"] if e["name"] == "legend_blocks")
+
+    producers = set(entry["producer"])
+    consumers = set(entry["consumer"])
+
+    assert {
+        "domain.ingress.run_domain_ingress",
+        "rendering.composer.layout_composer.compose_workbook",
+    } <= producers
+
+    assert {
+        "domain.transformations._legend_blocks._read_legend_block",
+        "domain.transformations.cell_codec.scalar",
+        "domain.transformations.compact_multiaxis",
+        "rendering.passes.validation_pass.ValidationPass",
+        "rendering.composer.layout_composer.compose_workbook",
+        "io_backends.xlsx.openpyxl_parser.parse_workbook",
+        "io_backends.ods.odf_parser.parse_workbook",
+        "domain.schema_maintenance.meta_update",
+        "pipeline.persistence_boundary.project_meta_to_persistable_contract",
+        "rendering.workbook_projection.workbookir_to_frames",
+    } <= consumers
+
+    # Canonical mapping-only shape and the ingress normalization are documented.
+    scope_and_origin = f"{entry['scope']} {entry['origin']}".lower()
+    assert "mapping" in scope_and_origin
+    assert "ingress" in scope_and_origin
+
+
 def test_meta_registry_seeds_current_known_entries():
     registry = _load_registry()
     names = {entry["name"] for entry in registry["entries"]}
