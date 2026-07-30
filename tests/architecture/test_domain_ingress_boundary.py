@@ -42,6 +42,11 @@ _INGRESS_PLUGIN_CALLABLES = (
     ),
 )
 
+_INGRESS_CONFIGURATION_ROUTES = (
+    "plugin",
+    "colon_factory",
+)
+
 
 def test_ingress_is_not_in_runtime_pipeline_registry():
     for candidate in _INGRESS_STEP_CANDIDATES:
@@ -66,12 +71,18 @@ def test_ingress_is_not_buildable_from_yaml_config():
 
 
 @pytest.mark.parametrize("dotted", _INGRESS_PLUGIN_CALLABLES)
-def test_ingress_namespace_is_not_addressable_through_plugin_yaml(dotted):
+@pytest.mark.parametrize("route", _INGRESS_CONFIGURATION_ROUTES)
+def test_ingress_namespace_is_not_addressable_through_yaml_routes(dotted, route):
+    spec = (
+        {"step": "plugin", "dotted": dotted}
+        if route == "plugin"
+        else {"step": dotted, "frames": {"_meta": {"legend_blocks": None}}}
+    )
     with pytest.raises(
         ValueError,
-        match="framework-internal and not plugin-addressable",
+        match="framework-internal and not configuration/plugin-addressable",
     ):
-        build_steps_from_config([{"step": "plugin", "dotted": dotted}])
+        build_steps_from_config([spec])
 
 
 def test_ingress_callable_is_not_reexported_through_invocation_modules():

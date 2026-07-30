@@ -9,13 +9,10 @@ import importlib
 import logging
 from typing import Any, Callable, Dict
 
+from .dotted_paths import ensure_configuration_addressable
 from .types import BoundStep, Frames
 
 log = logging.getLogger("sheets.pipeline")
-
-_FRAMEWORK_INTERNAL_PLUGIN_NAMESPACES = (
-    "spreadsheet_handling.domain.ingress",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -50,24 +47,13 @@ def _target_label(target: str | Callable[..., Any]) -> str:
     return f"{module}:{qualname}" if module else qualname
 
 
-def _ensure_plugin_addressable(dotted: str) -> None:
-    """Reject framework-owned macro-flow callables at the plugin boundary."""
-    module_path = dotted.split(":", 1)[0] if ":" in dotted else dotted.rsplit(".", 1)[0]
-    for namespace in _FRAMEWORK_INTERNAL_PLUGIN_NAMESPACES:
-        if module_path == namespace or module_path.startswith(f"{namespace}."):
-            raise ValueError(
-                f"Plugin callable {dotted!r} is framework-internal and not "
-                "plugin-addressable"
-            )
-
-
 def make_plugin_step(*, dotted: str, args: Dict[str, Any] | None = None, name: str = "plugin") -> BoundStep:
     """
     Factory for a 'plugin' step.
     dotted: dotted path to a callable
     args: optional dict of kwargs passed to the callable
     """
-    _ensure_plugin_addressable(dotted)
+    ensure_configuration_addressable(dotted)
     fn = _resolve_callable(dotted)
     cfg = {"dotted": dotted, "args": dict(args or {})}
 
