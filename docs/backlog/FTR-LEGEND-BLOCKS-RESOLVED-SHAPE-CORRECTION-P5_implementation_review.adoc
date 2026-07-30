@@ -1,0 +1,154 @@
+===== Implementation Self-Review -- FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5
+
+*Review type:* Implementation self-review (evidence only). This artifact does
+not accept, archive, or move the FTR; independent acceptance review is a later
+task.
+
+*Baseline:* implemented on top of `main` at `631b825` (which is the reviewed
+FTR commit `90ffc51` plus the unrelated adoption commit; the adoption commit
+did not affect scope).
+
+*Environment:* the project `.venv` binds the working tree (`pyproject.toml`
+sets `pythonpath = ["src"]`); commands were additionally run with
+`PYTHONPATH=src` per the repository caveat.
+
+== Behavior implemented
+
+External `_meta.legend_blocks` authoring still accepts both a mapping and a
+list; a new framework-owned `domain.ingress` coordinator normalizes list form
+(identity resolved `name` -> `id` -> positional `legend_<n>`) to the canonical
+insertion-ordered mapping once, at every maintained external-metadata entry,
+and drops any pre-existing render-derived `resolved` facet. Downstream domain,
+render, and validation readers were reduced to the mapping-only contract.
+Canonical XLSX/ODS workbook readback now strips `resolved` after the parser has
+used it to classify the legend surface, and a default-placement legend on its
+own sheet no longer round-trips as a payload frame. The `legend_blocks`
+meta-registry entry was corrected to name its full producer/consumer surface.
+
+== Ingress invocation points
+
+Ingress runs automatically and atomically (candidate built before any write) at
+the three maintained boundaries identified by the review:
+
+. `application.orchestrator.orchestrate` -- immediately after `_load_frames`,
+  before the first configured step (covers every router-backed input kind).
+. `domain.meta_bootstrap.bootstrap_meta` -- on the post-merge candidate before
+  it is written back (profile/CLI overrides can introduce workbook meta).
+. `domain.yaml_overrides.apply_overrides` -- on the merged candidate before
+  write-back (`load_and_apply_overrides` inherits this).
+
+Ingress is not registered (`pipeline.registry.REGISTRY`,
+`registries/pipeline_step_registry.json`) and is not YAML-buildable; guarded by
+`tests/architecture/test_domain_ingress_boundary.py`.
+
+== Files changed
+
+Runtime:
+
+* `src/spreadsheet_handling/domain/ingress/__init__.py` (new)
+* `src/spreadsheet_handling/domain/ingress/coordinator.py` (new) -- ordered,
+  visible `INGRESS_RULES` sequence + `run_domain_ingress`
+* `src/spreadsheet_handling/domain/ingress/legend_blocks.py` (new) -- shape
+  normalization + `resolved` strip; pure, atomic, non-mutating
+* `src/spreadsheet_handling/application/orchestrator.py` -- invoke ingress
+  after load
+* `src/spreadsheet_handling/domain/meta_bootstrap.py` -- post-merge ingress
+* `src/spreadsheet_handling/domain/yaml_overrides.py` -- post-merge ingress
+* `src/spreadsheet_handling/domain/transformations/_legend_blocks.py` --
+  mapping-only reader
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py` --
+  mapping-only `_legend_items` / `_clone_legend_blocks`
+* `src/spreadsheet_handling/rendering/passes/_base.py` -- mapping-only
+  `_legend_spec`
+* `src/spreadsheet_handling/rendering/workbook_projection.py` -- strip
+  `resolved` at readback; exclude `kind == "legend"` selected tables from
+  payload frames
+
+Registry / docs:
+
+* `registries/meta_registry.yaml` -- corrected `legend_blocks` entry
+* `docs/functional_model/ch04_use_case_concepts/legend_blocks.adoc`
+* `docs/technical_model/ch08_architecture_details/pipeline_semantics.adoc`
+* `docs/user_guide/ch03_transformation_catalog/02_bijective_transforms.adoc`
+* `docs/release_notes/release_notes.adoc`
+* `docs/backlog/FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5.adoc` (status)
+
+Tests:
+
+* `tests/unit/domain/ingress/test_legend_blocks_ingress.py` (new, 21)
+* `tests/integration/pipeline/test_domain_ingress_boundaries.py` (new, 7)
+* `tests/architecture/test_domain_ingress_boundary.py` (new, 5)
+* `tests/architecture/semantic_invariants/test_meta_registry.py` (+1 guard)
+* `tests/integration/roundtrip/test_legend_blocks.py` (updated LB-2
+  characterizations; +2 own-sheet; +1 parametrized list-authoring parity)
+* `tests/unit/rendering/test_validation_pass_infra.py` (list-form test
+  re-pointed through ingress)
+
+== Adversarial self-review
+
+* *Can list form reach any downstream consumer without ingress?* Not through a
+  maintained path: all three external-meta boundaries normalize. The three
+  downstream readers now reject/ignore list form rather than silently handling
+  it, and the composer raises on list form -- so a bypassing low-level caller
+  fails fast rather than getting a second compatibility surface.
+* *Do all maintained external-meta paths invoke ingress?* Yes -- orchestrator
+  load, `bootstrap_meta`, `apply_overrides`. Loader/CLI/`run_app`/
+  schema-maintenance all converge on `orchestrate`. Confirmed by
+  `test_domain_ingress_boundaries.py`.
+* *Is canonical mapping input altered unnecessarily?* No -- field order and
+  values are preserved; only `resolved` is dropped (a documented separate
+  rule). Guarded by `test_mapping_form_is_preserved_value_and_order`.
+* *Can partial failure mutate caller nested metadata?* No -- the coordinator
+  builds the full candidate before returning, and `bootstrap_meta` /
+  `apply_overrides` canonicalize before `set_meta`, so an ingress failure
+  leaves caller frames unchanged. Guarded by the immutability/atomic tests and
+  `test_bootstrap_meta_failure_does_not_write_list_form_back`.
+* *Does `resolved` survive structured persistence or canonical workbook
+  readback?* No -- stripped at ingress, at the persistence boundary (existing,
+  mapping-form), and at `workbookir_to_frames` after classification. Guarded on
+  both carriers.
+* *Can a legend surface become an unintended payload frame?* No -- own-sheet
+  default-placement legends are excluded; colocated legends were always
+  `tables[1]` and remain unaffected (data frame unchanged).
+* *Are XLSX and ODS equivalent?* Yes -- the fix lives in the shared
+  `workbookir_to_frames` projection, so parity is structural. Verified by
+  parametrized and paired carrier tests.
+* *Did any public YAML or registry surface change unexpectedly?* No -- ingress
+  is absent from both step registries and is not YAML-buildable; the
+  `pipeline_step_registry.json` was not modified.
+* *Does the registry name every real producer and consumer?* Yes -- re-surveyed
+  from source; guarded by
+  `test_legend_blocks_entry_names_reviewed_producers_and_consumers`, whose
+  references also pass the existing code-reference resolver hardening test.
+* *Did the implementation absorb Entry Contract policy?* No -- `entries` values,
+  token validity, labels, and duplicate entry tokens are untouched.
+* *Is the new package a reusable pattern rather than a one-off?* Yes -- it
+  mirrors `domain.schema_maintenance` (package with model/coordinator/rule),
+  exposes an ordered `INGRESS_RULES` sequence, and is invoked by the
+  orchestrator, not hidden as a private legend helper.
+
+== Validation
+
+* Focused new + affected suites: green (34 new/added tests).
+* Full active Core suite
+  (`pytest -m 'not legacy and not prehex and not slow' tests/unit
+  tests/integration tests/architecture tests/roundtrip`): *1750 passed,
+  1 xfailed*.
+* `tools/check_source_style.py`: exit 0 (pre-existing complexity WARNs only;
+  none introduced by this slice -- the touched composer readers got simpler).
+* `ruff check` on changed source and tests: clean.
+* `git diff --check`: clean.
+* Changed AsciiDoc files render under `asciidoctor` without errors.
+
+== Residual risk / deferred
+
+* Entry-value semantics remain divergent across the four consumers -- owned by
+  `FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5` (out of scope, unchanged here).
+* `placement.target` remains an unmaintained frame reference (LB-6, deferred
+  until a frame-rename capability exists).
+* `domain.egress` is documented as a reserved future concept only; no generic
+  egress engine was built.
+
+== Verdict
+
+READY FOR INDEPENDENT REVIEW
