@@ -29,7 +29,7 @@ from typing import Any, Dict
 
 import yaml
 
-from .ingress import run_domain_ingress
+from . import ingress as domain_ingress
 from .meta_bootstrap import deep_merge, get_meta, set_meta
 
 
@@ -71,19 +71,26 @@ def apply_overrides(
     # Per-sheet overrides
     sheet_cfgs = overrides.get("sheets")
     if sheet_cfgs and isinstance(sheet_cfgs, dict):
-        sheets_meta = meta.setdefault("sheets", {})
+        # ``get_meta`` intentionally copies only the top-level mapping. Build a
+        # separate sheets candidate before merging so a later merge or ingress
+        # failure cannot mutate caller-owned per-sheet metadata.
+        existing_sheets = meta.get("sheets")
+        sheets_meta = {} if existing_sheets is None else dict(existing_sheets)
         for sheet_name, sheet_opts in sheet_cfgs.items():
             if not isinstance(sheet_opts, dict):
                 continue
             existing = sheets_meta.get(sheet_name, {})
             sheets_meta[sheet_name] = deep_merge(existing, sheet_opts)
+        meta = dict(meta)
+        meta["sheets"] = sheets_meta
 
     # apply_overrides is the other maintained configuration-to-meta boundary:
     # overrides can introduce externally authored workbook metadata, so run the
     # domain ingress coordinator on the merged candidate before writing it
     # back. Automatic internal post-merge enforcement, not a selectable step;
-    # canonicalizing before set_meta keeps the merge atomic on ingress failure.
-    canonical = run_domain_ingress({"_meta": meta}).get("_meta", meta)
+    # The complete candidate is independent of caller-owned mappings;
+    # canonicalizing before set_meta keeps every merge/ingress failure atomic.
+    canonical = domain_ingress.run_domain_ingress({"_meta": meta}).get("_meta", meta)
 
     set_meta(frames, canonical)
     return frames

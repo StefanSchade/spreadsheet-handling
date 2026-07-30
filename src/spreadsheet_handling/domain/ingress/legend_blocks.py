@@ -36,12 +36,14 @@ def normalize_legend_blocks_shape(frames: Frames) -> Frames:
     """Return ``frames`` with ``_meta.legend_blocks`` in canonical mapping form.
 
     A no-op when there is no ``_meta`` mapping or no ``legend_blocks`` root.
-    List form becomes an insertion-ordered mapping keyed by resolved identity;
-    mapping form is preserved value-for-value (field order included). In both
-    forms a pre-existing ``resolved`` facet is removed from every block.
+    An explicit ``None`` root is treated as an absent declaration and
+    canonicalized to an empty mapping. List form becomes an insertion-ordered
+    mapping keyed by resolved identity; mapping form is preserved
+    value-for-value (field order included). In both forms a pre-existing
+    ``resolved`` facet is removed from every block.
 
     Raises ``ValueError`` for a non-mapping list member, a duplicate resolved
-    identity, or a root that is neither a mapping nor a list.
+    identity, or a non-``None`` root that is neither a mapping nor a list.
     """
     meta = frames.get("_meta")
     if not isinstance(meta, Mapping) or _ROOT_KEY not in meta:
@@ -49,9 +51,6 @@ def normalize_legend_blocks_shape(frames: Frames) -> Frames:
 
     raw = meta[_ROOT_KEY]
     normalized = _normalize_root(raw)
-    if normalized is None:
-        # Degenerate empty root (``None``); treat as absent and leave untouched.
-        return frames
 
     new_meta = dict(meta)
     new_meta[_ROOT_KEY] = normalized
@@ -60,9 +59,9 @@ def normalize_legend_blocks_shape(frames: Frames) -> Frames:
     return new_frames
 
 
-def _normalize_root(raw: Any) -> dict[str, Any] | None:
+def _normalize_root(raw: Any) -> dict[str, Any]:
     if raw is None:
-        return None
+        return {}
     if isinstance(raw, Mapping):
         return _normalize_mapping(raw)
     if isinstance(raw, list):

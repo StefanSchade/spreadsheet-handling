@@ -284,6 +284,12 @@ class TestIntentVsResolutionSlice:
         assert block["placement"]["anchor"] == "right_of_table"
         assert block["entries"][0]["token"] == "C"
 
+    @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+    def test_explicit_null_legend_blocks_projects_to_empty_mapping(self) -> None:
+        out = project_meta_to_persistable_contract({"legend_blocks": None})
+
+        assert out["legend_blocks"] == {}
+
     def test_drops_xref_crosstable_column_keys_facet(self) -> None:
         meta = {
             "xref_crosstable": {

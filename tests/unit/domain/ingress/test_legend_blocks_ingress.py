@@ -1,11 +1,11 @@
 """Unit tests for the domain ingress Legend Blocks shape-normalization rule.
 
 Covers the FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5 shape contract:
-absent/None root no-op, mapping preservation, list-to-ordered-mapping
-conversion, name/id/positional identity, empty list, malformed members,
-duplicate identities, unsupported root, ``resolved`` pruning, immutability, and
-atomic failure. Entry-value policy is intentionally untouched (that is the
-sibling FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5's scope).
+absent root no-op, explicit-None canonicalization, mapping preservation,
+list-to-ordered-mapping conversion, name/id/positional identity, empty list,
+malformed members, duplicate identities, unsupported root, ``resolved``
+pruning, immutability, and atomic failure. Entry-value policy is intentionally
+untouched (that is the sibling FTR-LEGEND-BLOCKS-ENTRY-CONTRACT-P5's scope).
 """
 
 from __future__ import annotations
@@ -39,10 +39,13 @@ def test_absent_legend_blocks_root_is_noop():
     assert run_domain_ingress(frames) is frames
 
 
-def test_none_legend_blocks_root_is_noop():
+def test_none_legend_blocks_root_becomes_empty_mapping_without_input_mutation():
     frames = {"_meta": {"legend_blocks": None}}
     out = run_domain_ingress(frames)
-    assert out["_meta"]["legend_blocks"] is None
+    assert out["_meta"]["legend_blocks"] == {}
+    assert frames == {"_meta": {"legend_blocks": None}}
+    assert out is not frames
+    assert out["_meta"] is not frames["_meta"]
 
 
 # --- mapping preservation --------------------------------------------------

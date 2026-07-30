@@ -9,6 +9,7 @@ See FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import yaml
 from spreadsheet_handling.application.orchestrator import orchestrate
 from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
 from spreadsheet_handling.domain.yaml_overrides import apply_overrides
+from spreadsheet_handling.pipeline.build import build_steps_from_config
 
 pytestmark = pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 
@@ -72,6 +74,25 @@ def test_orchestrate_load_normalizes_list_form_before_persistence(tmp_path: Path
     assert persisted["status_codes"]["entries"] == [{"token": "A", "label": "Active"}]
 
 
+def test_orchestrate_load_canonicalizes_null_before_structured_persistence(
+    tmp_path: Path,
+):
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    _write_json_dir(
+        in_dir,
+        {"product": [{"id": "P-1"}]},
+        meta={"legend_blocks": None},
+    )
+
+    frames = orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "json_dir", "path": str(out_dir)},
+    )
+
+    assert frames["_meta"]["legend_blocks"] == {}
+    assert _read_out_meta(out_dir)["legend_blocks"] == {}
+
+
 def test_orchestrate_ingress_failure_suppresses_saver(tmp_path: Path):
     in_dir, out_dir = tmp_path / "in", tmp_path / "out"
     _write_json_dir(
@@ -119,15 +140,30 @@ def test_bootstrap_meta_normalizes_list_form_from_profile_defaults():
     assert "resolved" not in blocks["p"]
 
 
-def test_bootstrap_meta_failure_does_not_write_list_form_back():
-    frames = {"_meta": {"legend_blocks": {"kept": {"entries": [{"token": "K"}]}}}}
+def test_bootstrap_meta_failure_leaves_complete_caller_graph_unchanged():
+    frames = {
+        "_meta": {
+            "legend_blocks": {"kept": {"entries": [{"token": "K"}]}},
+            "sheets": {"Data": {"options": {"freeze_header": False}}},
+        }
+    }
+    before = copy.deepcopy(frames)
+    meta = frames["_meta"]
+    sheets = meta["sheets"]
+    sheet_meta = sheets["Data"]
+    options = sheet_meta["options"]
+
     with pytest.raises(ValueError):
         bootstrap_meta(
             frames,
             cli_overrides={"legend_blocks": [{"name": "d"}, {"name": "d"}]},
         )
-    # Atomic: caller frames unchanged (canonical mapping form retained).
-    assert frames["_meta"]["legend_blocks"] == {"kept": {"entries": [{"token": "K"}]}}
+
+    assert frames == before
+    assert frames["_meta"] is meta
+    assert frames["_meta"]["sheets"] is sheets
+    assert frames["_meta"]["sheets"]["Data"] is sheet_meta
+    assert frames["_meta"]["sheets"]["Data"]["options"] is options
 
 
 # --- apply_overrides boundary ----------------------------------------------
@@ -150,3 +186,116 @@ def test_apply_overrides_strips_resolved_from_mapping_form():
     }
     apply_overrides(frames, {})
     assert "resolved" not in frames["_meta"]["legend_blocks"]["m"]
+
+
+def test_apply_overrides_failure_leaves_complete_caller_graph_unchanged():
+    frames = {
+        "_meta": {
+            "legend_blocks": {"kept": {"entries": [{"token": "K"}]}},
+            "sheets": {
+                "Data": {
+                    "freeze_header": False,
+                    "options": {"column_widths": {"A": 12}},
+                }
+            },
+        }
+    }
+    before = copy.deepcopy(frames)
+    meta = frames["_meta"]
+    sheets = meta["sheets"]
+    sheet_meta = sheets["Data"]
+    options = sheet_meta["options"]
+    column_widths = options["column_widths"]
+
+    with pytest.raises(ValueError, match="duplicate legend block identity"):
+        apply_overrides(
+            frames,
+            {
+                "defaults": {
+                    "legend_blocks": [{"name": "dup"}, {"name": "dup"}],
+                },
+                "sheets": {
+                    "Data": {
+                        "freeze_header": True,
+                        "options": {"column_widths": {"B": 20}},
+                    }
+                },
+            },
+        )
+
+    assert frames == before
+    assert frames["_meta"] is meta
+    assert frames["_meta"]["sheets"] is sheets
+    assert frames["_meta"]["sheets"]["Data"] is sheet_meta
+    assert frames["_meta"]["sheets"]["Data"]["options"] is options
+    assert frames["_meta"]["sheets"]["Data"]["options"]["column_widths"] is column_widths
+
+
+def test_apply_overrides_success_preserves_merge_precedence_and_nested_values():
+    frames = {
+        "_meta": {
+            "auto_filter": False,
+            "sheets": {
+                "Data": {
+                    "freeze_header": False,
+                    "options": {"column_widths": {"A": 12}},
+                },
+                "Untouched": {"freeze_header": True},
+            },
+        }
+    }
+
+    apply_overrides(
+        frames,
+        {
+            "defaults": {"auto_filter": True, "freeze_header": False},
+            "sheets": {
+                "Data": {
+                    "freeze_header": True,
+                    "options": {"column_widths": {"B": 20}},
+                }
+            },
+        },
+    )
+
+    assert frames["_meta"]["auto_filter"] is True
+    assert frames["_meta"]["freeze_header"] is False
+    assert frames["_meta"]["sheets"]["Data"] == {
+        "freeze_header": True,
+        "options": {"column_widths": {"A": 12, "B": 20}},
+    }
+    assert frames["_meta"]["sheets"]["Untouched"] == {"freeze_header": True}
+
+
+def test_apply_overrides_ingress_failure_suppresses_saver(tmp_path: Path):
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    _write_json_dir(
+        in_dir,
+        {"Data": [{"id": "D-1"}]},
+        meta={
+            "legend_blocks": {"kept": {"entries": [{"token": "K"}]}},
+            "sheets": {"Data": {"freeze_header": False}},
+        },
+    )
+    steps = build_steps_from_config(
+        [
+            {
+                "step": "apply_overrides",
+                "overrides": {
+                    "defaults": {
+                        "legend_blocks": [{"name": "dup"}, {"name": "dup"}],
+                    },
+                    "sheets": {"Data": {"freeze_header": True}},
+                },
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="duplicate legend block identity"):
+        orchestrate(
+            input={"kind": "json_dir", "path": str(in_dir)},
+            output={"kind": "json_dir", "path": str(out_dir)},
+            steps=steps,
+        )
+
+    assert not out_dir.exists()

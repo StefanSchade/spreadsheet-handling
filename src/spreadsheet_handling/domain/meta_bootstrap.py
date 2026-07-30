@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from .ingress import run_domain_ingress
+from . import ingress as domain_ingress
 
 
 def deep_merge(base: dict, overlay: dict) -> dict:
@@ -77,7 +77,7 @@ def bootstrap_meta(
     # it back. This is automatic internal post-merge enforcement, not a
     # separately selectable pipeline step. Canonicalizing before set_meta keeps
     # the merge atomic: an ingress failure leaves *frames* unchanged.
-    canonical = run_domain_ingress({"_meta": merged}).get("_meta", merged)
+    canonical = domain_ingress.run_domain_ingress({"_meta": merged}).get("_meta", merged)
 
     set_meta(frames, canonical)
     return frames

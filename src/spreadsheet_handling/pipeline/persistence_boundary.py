@@ -159,13 +159,18 @@ def project_meta_to_persistable_contract(meta: Mapping[str, Any] | None) -> dict
 
 
 def _project_legend_blocks(legend_blocks: Any) -> Any:
-    """Strip ``resolved`` Resolution facet from each legend block.
+    """Canonicalize an absent declaration and strip ``resolved`` per block.
 
     The ``resolved`` sub-key holds layout coordinates written by
     ``rendering/composer/layout_composer.py::_resolve_legend_position``;
     they are recomputed on every render. The legend's Intent facets
     (``title``, ``entries``, ``placement``, ``target``) are preserved.
     """
+    if legend_blocks is None:
+        # Defense in depth for callers that bypass maintained domain ingress:
+        # an explicit absent declaration must never be emitted as persisted
+        # ``legend_blocks: null``.
+        return {}
     if not isinstance(legend_blocks, Mapping):
         return legend_blocks
 
