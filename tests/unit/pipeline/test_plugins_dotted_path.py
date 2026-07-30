@@ -250,17 +250,31 @@ def test_existing_internal_colon_factory_remains_addressable():
     steps = build_steps_from_config(
         [{"step": "spreadsheet_handling.pipeline.steps:make_identity_step"}]
     )
+    payload = pd.DataFrame({"id": [1], "value": ["kept"]})
+    frames = {"payload": payload, "_meta": {"kept": True}}
 
     assert len(steps) == 1
     assert steps[0].name == "identity"
+    out = run_pipeline(frames, steps)
+    assert out is frames
+    assert out["payload"] is payload
+    assert out["payload"].to_dict(orient="records") == [{"id": 1, "value": "kept"}]
+    assert out["_meta"] == {"kept": True}
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
 def test_registered_short_name_remains_addressable():
     steps = build_steps_from_config([{"step": "identity"}])
+    payload = pd.DataFrame({"id": [1], "value": ["kept"]})
+    frames = {"payload": payload, "_meta": {"kept": True}}
 
     assert len(steps) == 1
     assert steps[0].name == "identity"
+    out = run_pipeline(frames, steps)
+    assert out is frames
+    assert out["payload"] is payload
+    assert out["payload"].to_dict(orient="records") == [{"id": 1, "value": "kept"}]
+    assert out["_meta"] == {"kept": True}
 
 
 @pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
