@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from spreadsheet_handling.domain.tabular import ensure_unique_physical_column_labels
@@ -15,6 +17,22 @@ from .model import (
     AxisOrderPolicy,
     ResolvedAxisMapping,
     ResolvedAxisMember,
+)
+
+_EXACT_NUMPY_INTEGER_TYPES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+)
+_EXACT_NUMPY_FLOAT_TYPES = (
+    np.float16,
+    np.float32,
+    np.float64,
 )
 
 
@@ -30,60 +48,23 @@ class _SourceRecord:
         return (*self.order_values, self.key)
 
 
-def _safe_repr(value: Any) -> str:
-    try:
-        rendered = repr(value)
-    except Exception:
-        return f"<{type(value).__name__} with unavailable repr>"
-    if len(rendered) > 160:
-        return f"{rendered[:157]}..."
-    return rendered
-
-
-def _is_missing_scalar(value: Any) -> bool:
-    if value is None:
-        return True
-    if not pd.api.types.is_scalar(value):
-        return False
-    try:
-        missing = pd.isna(value)
-        return bool(missing)
-    except Exception:
-        return False
-
-
-def _has_reflexive_unambiguous_equality(value: Any) -> bool:
-    try:
-        return bool(value == value)
-    except Exception:
-        return False
-
-
-def _is_hashable(value: Any) -> bool:
-    try:
-        hash(value)
-    except Exception:
-        return False
-    return True
+def _is_exact_nan(value: Any) -> bool:
+    if type(value) is float:
+        return math.isnan(value)
+    if any(type(value) is value_type for value_type in _EXACT_NUMPY_FLOAT_TYPES):
+        return bool(np.isnan(value))
+    return False
 
 
 def _text_value_diagnostic(value: Any) -> str:
-    if _is_missing_scalar(value):
-        return f"missing value {_safe_repr(value)}"
-
-    problems: list[str] = []
-    if not pd.api.types.is_scalar(value):
-        problems.append("non-scalar")
-    if not _has_reflexive_unambiguous_equality(value):
-        problems.append("ambiguous equality")
-    if not _is_hashable(value):
-        problems.append("unhashable")
-    if problems:
-        return f"{'/'.join(problems)} value {_safe_repr(value)}"
-    if not isinstance(value, str):
-        return f"non-string value {_safe_repr(value)} ({type(value).__name__})"
-    if not value.strip():
-        return f"empty value {_safe_repr(value)}"
+    if value is None or value is pd.NA:
+        return "missing value"
+    if _is_exact_nan(value):
+        return "missing value"
+    if type(value) is not str:
+        return f"non-string value of type {type(value).__name__}"
+    if not str.strip(value):
+        return "empty value"
     return ""
 
 
@@ -112,34 +93,33 @@ def _require_order_value(
     row_position: int,
     column: str,
 ) -> Any:
-    if _is_missing_scalar(value):
+    if value is None or value is pd.NA:
         raise AxisMappingError(
             f"Axis mapping source frame {source_frame!r} row {row_position} "
-            f"order column {column!r} contains missing value {_safe_repr(value)}"
+            f"order column {column!r} contains a missing value"
         )
-    if not pd.api.types.is_scalar(value):
+    if _is_exact_nan(value):
         raise AxisMappingError(
             f"Axis mapping source frame {source_frame!r} row {row_position} "
-            f"order column {column!r} contains non-scalar value {_safe_repr(value)}"
+            f"order column {column!r} contains a missing value"
         )
-    if not _has_reflexive_unambiguous_equality(value):
+    if any(type(value) is value_type for value_type in _EXACT_NUMPY_INTEGER_TYPES):
+        return int(value)
+    if type(value) is not str and type(value) is not int:
         raise AxisMappingError(
             f"Axis mapping source frame {source_frame!r} row {row_position} "
-            f"order column {column!r} has ambiguous or non-reflexive equality "
-            f"for value {_safe_repr(value)}"
+            f"order column {column!r} must contain exact built-in string or "
+            f"integer values; got {type(value).__name__}"
         )
     return value
 
 
-def _column_position(columns: Sequence[Any], configured: str) -> int | None:
-    for position, column in enumerate(columns):
-        try:
-            equal = bool(column == configured)
-        except Exception:
-            equal = False
-        if equal:
-            return position
-    return None
+def _column_positions(columns: Sequence[Any], configured: str) -> tuple[int, ...]:
+    return tuple(
+        position
+        for position, column in enumerate(columns)
+        if type(column) is str and column == configured
+    )
 
 
 def _require_source_frame(
@@ -162,7 +142,7 @@ def _require_source_frame(
             source,
             frame_name=intent.source_frame,
         )
-    except Exception as exc:
+    except ValueError as exc:
         raise AxisMappingError(f"Invalid axis mapping source: {exc}") from None
 
     configured_columns = (
@@ -174,12 +154,18 @@ def _require_source_frame(
     positions: dict[str, int] = {}
     missing: list[str] = []
     for configured in configured_columns:
-        position = _column_position(physical_columns, configured)
-        if position is None:
+        matching_positions = _column_positions(physical_columns, configured)
+        if not matching_positions:
             if configured not in missing:
                 missing.append(configured)
             continue
-        positions[configured] = position
+        if len(matching_positions) > 1:
+            raise AxisMappingError(
+                f"Axis mapping source frame {intent.source_frame!r} has "
+                f"ambiguous duplicate exact matches for configured column "
+                f"{configured!r} at positions {list(matching_positions)!r}"
+            )
+        positions[configured] = matching_positions[0]
     if missing:
         raise AxisMappingError(
             f"Axis mapping source frame {intent.source_frame!r} is missing "
@@ -280,11 +266,24 @@ def _ensure_bijection(records: Sequence[_SourceRecord], *, source_frame: str) ->
         label_keys[record.labels] = record.key
 
 
-def _strictly_less(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
-    try:
-        return bool(left < right)
-    except Exception:
-        return False
+def _ensure_homogeneous_order_columns(
+    records: Sequence[_SourceRecord],
+    *,
+    intent: AxisMappingIntent,
+) -> None:
+    for column_index, column in enumerate(intent.order_columns):
+        value_types = {
+            type(record.order_values[column_index])
+            for record in records
+        }
+        if len(value_types) <= 1:
+            continue
+        type_names = sorted(value_type.__name__ for value_type in value_types)
+        raise AxisMappingError(
+            f"Axis mapping source frame {intent.source_frame!r} order column "
+            f"{column!r} must use one exact supported type for every row; "
+            f"got mixed types {type_names!r}"
+        )
 
 
 def _configured_order(
@@ -292,33 +291,8 @@ def _configured_order(
     *,
     intent: AxisMappingIntent,
 ) -> list[_SourceRecord]:
-    try:
-        ordered = sorted(records, key=lambda record: record.configured_sort_key)
-        reverse_input_ordered = sorted(
-            reversed(records),
-            key=lambda record: record.configured_sort_key,
-        )
-    except Exception as exc:
-        raise AxisMappingError(
-            f"Axis mapping source frame {intent.source_frame!r} order columns "
-            f"{list(intent.order_columns)!r} cannot be compared deterministically: "
-            f"{type(exc).__name__}: {exc}"
-        ) from None
-
-    ordered_keys = [record.key for record in ordered]
-    reverse_ordered_keys = [record.key for record in reverse_input_ordered]
-    adjacent_are_strict = all(
-        _strictly_less(left.configured_sort_key, right.configured_sort_key)
-        for left, right in zip(ordered, ordered[1:])
-    )
-    if ordered_keys != reverse_ordered_keys or not adjacent_are_strict:
-        raise AxisMappingError(
-            f"Axis mapping source frame {intent.source_frame!r} order columns "
-            f"{list(intent.order_columns)!r} do not define deterministic, "
-            "strictly comparable ordering values; canonical key tie-breaking "
-            "could not establish a total order"
-        )
-    return ordered
+    _ensure_homogeneous_order_columns(records, intent=intent)
+    return sorted(records, key=lambda record: record.configured_sort_key)
 
 
 def _ordered_records(
@@ -363,7 +337,7 @@ def resolve_axis_mapping(
 
     The resolver reads only. It returns no Frames and writes no metadata.
     """
-    if not isinstance(intent, AxisMappingIntent):
+    if type(intent) is not AxisMappingIntent:
         raise AxisMappingError("intent must be an AxisMappingIntent")
     validated_used_keys = _materialize_used_keys(used_keys)
     source, positions = _require_source_frame(frames, intent)

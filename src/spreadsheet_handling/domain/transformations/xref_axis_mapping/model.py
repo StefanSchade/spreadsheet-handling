@@ -1,7 +1,7 @@
 """Typed values for the internal XRef axis-mapping model."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -22,12 +22,15 @@ class AxisOrderPolicy(str, Enum):
 
 
 def _require_non_empty_string(value: Any, *, field_name: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise AxisMappingError(
-            f"{field_name} must be a non-empty string; got {type(value).__name__}"
+            f"{field_name} must be an exact built-in non-empty string; "
+            f"got {type(value).__name__}"
         )
-    if not value.strip():
-        raise AxisMappingError(f"{field_name} must be a non-empty string")
+    if not str.strip(value):
+        raise AxisMappingError(
+            f"{field_name} must be an exact built-in non-empty string"
+        )
     return value
 
 
@@ -67,7 +70,7 @@ class AxisMappingIntent:
             raise AxisMappingError("label_columns must contain at least one column")
         object.__setattr__(self, "label_columns", label_columns)
 
-        if not isinstance(self.order_policy, AxisOrderPolicy):
+        if type(self.order_policy) is not AxisOrderPolicy:
             raise AxisMappingError(
                 "order_policy must be an AxisOrderPolicy; select "
                 "AxisOrderPolicy.SOURCE_ROW or AxisOrderPolicy.COLUMNS explicitly"
@@ -109,8 +112,10 @@ class ResolvedAxisMember:
     def __post_init__(self) -> None:
         _require_non_empty_string(self.key, field_name="ResolvedAxisMember.key")
         _resolved_labels(self.labels, field_name="ResolvedAxisMember.labels")
-        if isinstance(self.position, bool) or not isinstance(self.position, int):
-            raise AxisMappingError("ResolvedAxisMember.position must be an integer")
+        if type(self.position) is not int:
+            raise AxisMappingError(
+                "ResolvedAxisMember.position must be an exact built-in integer"
+            )
         if self.position < 0:
             raise AxisMappingError("ResolvedAxisMember.position must not be negative")
 
@@ -143,15 +148,15 @@ class ResolvedAxisMapping:
             )
         object.__setattr__(self, "label_columns", label_columns)
 
-        if isinstance(self.members, (str, bytes)):
+        if isinstance(self.members, (str, bytes, Mapping, Set)):
             raise AxisMappingError(
-                "ResolvedAxisMapping.members must be an ordered collection of members"
+                "ResolvedAxisMapping.members must be an ordered iterable of members"
             )
         try:
             members = tuple(self.members)
         except TypeError:
             raise AxisMappingError(
-                "ResolvedAxisMapping.members must be an ordered collection of members"
+                "ResolvedAxisMapping.members must be an ordered iterable of members"
             ) from None
         object.__setattr__(self, "members", members)
 
@@ -159,7 +164,7 @@ class ResolvedAxisMapping:
         key_by_labels: dict[tuple[str, ...], str] = {}
         expected_arity = len(label_columns)
         for expected_position, member in enumerate(members):
-            if not isinstance(member, ResolvedAxisMember):
+            if type(member) is not ResolvedAxisMember:
                 raise AxisMappingError(
                     "ResolvedAxisMapping.members must contain ResolvedAxisMember values"
                 )

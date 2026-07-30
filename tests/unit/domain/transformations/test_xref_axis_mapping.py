@@ -13,8 +13,10 @@ from spreadsheet_handling.domain.transformations.xref_axis_mapping import (
     AxisMappingIntent,
     AxisOrderPolicy,
     ResolvedAxisMapping,
+    ResolvedAxisMember,
     resolve_axis_mapping,
 )
+import spreadsheet_handling.domain.transformations.xref_axis_mapping.resolver as resolver_module
 
 pytestmark = pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
 
@@ -48,6 +50,92 @@ class _ExplosiveEquality:
 
     def __repr__(self) -> str:
         return "_ExplosiveEquality()"
+
+
+class _CyclicOrder(str):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return (str(self), str(other)) in {("a", "b"), ("b", "c"), ("c", "a")}
+
+
+class _AsymmetricOrder(str):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return str(self) != str(other)
+
+
+class _NonTransitiveOrder(str):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return (str(self), str(other)) in {("a", "b"), ("b", "c")}
+
+
+class _StatefulOrder(str):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return type(self).comparisons % 2 == 0
+
+
+class _ExceptionRaisingOrder(str):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        raise RuntimeError("comparison must not run")
+
+
+class _EqualToEveryString:
+    def __init__(self) -> None:
+        self.string_comparisons = 0
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is str:
+            self.string_comparisons += 1
+            return True
+        return other is self
+
+    def __hash__(self) -> int:
+        return 101
+
+    def __repr__(self) -> str:
+        return "_EqualToEveryString()"
+
+
+class _HostileStripString(str):
+    strip_calls = 0
+
+    def strip(self, *args: object, **kwargs: object) -> str:
+        type(self).strip_calls += 1
+        raise RuntimeError("strip must not run")
+
+
+class _HostileReprString(str):
+    repr_calls = 0
+
+    def __repr__(self) -> str:
+        type(self).repr_calls += 1
+        raise RuntimeError("repr must not run")
+
+
+class _MutableHashString(str):
+    hash_calls = 0
+
+    def __new__(cls, value: str) -> _MutableHashString:
+        instance = super().__new__(cls, value)
+        instance.salt = 0
+        return instance
+
+    def __hash__(self) -> int:
+        type(self).hash_calls += 1
+        return super().__hash__() + self.salt
 
 
 class TestValidResolution:
@@ -388,9 +476,9 @@ class TestInvalidSourceValues:
             ("", "empty"),
             (" ", "empty"),
             (7, "non-string"),
-            (["A"], "non-scalar/unhashable"),
-            (np.array([1, 2]), "ambiguous equality"),
-            (_ExplosiveEquality(), "ambiguous equality"),
+            (["A"], "non-string"),
+            (np.array([1, 2]), "non-string"),
+            (_ExplosiveEquality(), "non-string"),
         ],
     )
     def test_visible_labels_fail_through_deliberate_diagnostics(
@@ -418,7 +506,7 @@ class TestInvalidSourceValues:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="visible label.*unhashable"):
+        with pytest.raises(AxisMappingError, match="visible label.*non-string"):
             resolve_axis_mapping(frames, _intent())
 
     def test_unknown_used_key_is_rejected_after_complete_mapping_validation(self) -> None:
@@ -474,7 +562,7 @@ class TestInvalidOrdering:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="order column 'rank'.*non-scalar"):
+        with pytest.raises(AxisMappingError, match="order column 'rank'.*exact built-in"):
             resolve_axis_mapping(
                 frames,
                 _intent(
@@ -492,7 +580,7 @@ class TestInvalidOrdering:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="cannot be compared deterministically"):
+        with pytest.raises(AxisMappingError, match="mixed types"):
             resolve_axis_mapping(
                 frames,
                 _intent(
@@ -510,7 +598,7 @@ class TestInvalidOrdering:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="do not define deterministic"):
+        with pytest.raises(AxisMappingError, match="exact built-in"):
             resolve_axis_mapping(
                 frames,
                 _intent(
@@ -518,6 +606,358 @@ class TestInvalidOrdering:
                     order_columns=("rank",),
                 ),
             )
+
+
+class TestAdversarialOrderValues:
+    @staticmethod
+    def _assert_rejected_before_comparison(
+        values: list[str],
+        value_type: type[str],
+    ) -> None:
+        value_type.comparisons = 0  # type: ignore[attr-defined]
+        order_values = [value_type(value) for value in values]
+        frames = {
+            "axis": pd.DataFrame({
+                "key": [f"key-{value}" for value in values],
+                "label": [value.upper() for value in values],
+                "rank": order_values,
+            })
+        }
+        source = frames["axis"]
+        source_id = id(source)
+        meta = {"sentinel": ["unchanged"]}
+        frames["_meta"] = meta
+
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            resolve_axis_mapping(
+                frames,
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            )
+
+        assert value_type.comparisons == 0  # type: ignore[attr-defined]
+        assert id(frames["axis"]) == source_id
+        assert frames["axis"] is source
+        assert frames["_meta"] is meta
+        assert meta == {"sentinel": ["unchanged"]}
+        assert all(
+            source.iloc[position, 2] is order_value
+            for position, order_value in enumerate(order_values)
+        )
+
+    def test_cyclic_comparator_is_rejected_without_invocation(self) -> None:
+        self._assert_rejected_before_comparison(["a", "b", "c"], _CyclicOrder)
+
+    def test_asymmetric_comparator_is_rejected_without_invocation(self) -> None:
+        self._assert_rejected_before_comparison(["a", "b"], _AsymmetricOrder)
+
+    def test_non_transitive_comparator_is_rejected_without_invocation(self) -> None:
+        self._assert_rejected_before_comparison(["a", "b", "c"], _NonTransitiveOrder)
+
+    def test_stateful_comparator_is_rejected_without_invocation(self) -> None:
+        self._assert_rejected_before_comparison(["a", "b"], _StatefulOrder)
+
+    def test_exception_raising_comparator_is_rejected_without_invocation(self) -> None:
+        self._assert_rejected_before_comparison(["a", "b"], _ExceptionRaisingOrder)
+
+    @pytest.mark.parametrize("value", [True, 1.0, float("inf"), [1], object()])
+    def test_unsupported_order_type_is_rejected_deliberately(
+        self,
+        value: object,
+    ) -> None:
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-a"],
+                "label": ["A"],
+                "rank": [value],
+            })
+        }
+
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            resolve_axis_mapping(
+                frames,
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            )
+
+    def test_mixed_supported_types_in_one_order_column_are_rejected(self) -> None:
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-a", "key-b"],
+                "label": ["A", "B"],
+                "rank": pd.Series([1, "2"], dtype=object),
+            })
+        }
+
+        with pytest.raises(AxisMappingError, match="mixed types.*int.*str"):
+            resolve_axis_mapping(
+                frames,
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            )
+
+    def test_each_order_column_may_use_its_own_supported_type(self) -> None:
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-b", "key-a", "key-c"],
+                "label": ["B", "A", "C"],
+                "rank": [1, 1, 1],
+                "group": ["b", "a", "a"],
+            })
+        }
+
+        resolved = resolve_axis_mapping(
+            frames,
+            _intent(
+                order_policy=AxisOrderPolicy.COLUMNS,
+                order_columns=("rank", "group"),
+            ),
+        )
+
+        assert [member.key for member in resolved] == ["key-a", "key-c", "key-b"]
+
+    def test_supported_ties_use_exact_canonical_key_as_final_tie_breaker(self) -> None:
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-b", "key-a"],
+                "label": ["B", "A"],
+                "rank": [1, 1],
+            })
+        }
+
+        resolved = resolve_axis_mapping(
+            frames,
+            _intent(
+                order_policy=AxisOrderPolicy.COLUMNS,
+                order_columns=("rank",),
+            ),
+        )
+
+        assert [member.key for member in resolved] == ["key-a", "key-b"]
+
+
+class TestAdversarialExactStringsAndPhysicalLabels:
+    def test_unusual_physical_label_cannot_impersonate_configured_strings(
+        self,
+    ) -> None:
+        alias = _EqualToEveryString()
+        frame = pd.DataFrame(
+            [["actual"]],
+            columns=pd.Index([alias], dtype=object),
+        )
+
+        with pytest.raises(
+            AxisMappingError,
+            match=r"missing configured column.*key.*label",
+        ):
+            resolve_axis_mapping({"axis": frame}, _intent())
+
+        assert alias.string_comparisons == 0
+
+    @pytest.mark.parametrize(
+        "constructor",
+        [
+            lambda value: AxisMappingIntent(
+                value,
+                "key",
+                ("label",),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                value,
+                ("label",),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                "key",
+                (value,),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                "key",
+                ("label",),
+                AxisOrderPolicy.COLUMNS,
+                (value,),
+            ),
+            lambda value: ResolvedAxisMember(value, ("A",), 0),
+            lambda value: ResolvedAxisMember("key", (value,), 0),
+            lambda value: ResolvedAxisMapping(
+                (value,),
+                (ResolvedAxisMember("key", ("A",), 0),),
+            ),
+        ],
+    )
+    def test_hostile_strip_subclass_is_rejected_by_every_direct_model_boundary(
+        self,
+        constructor: object,
+    ) -> None:
+        _HostileStripString.strip_calls = 0
+        value = _HostileStripString("hostile")
+
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            constructor(value)  # type: ignore[operator]
+
+        assert _HostileStripString.strip_calls == 0
+
+    def test_hostile_repr_subclass_never_reaches_repr_in_diagnostics(self) -> None:
+        _HostileReprString.repr_calls = 0
+        value = _HostileReprString("hostile")
+
+        with pytest.raises(AxisMappingError, match="_HostileReprString"):
+            ResolvedAxisMember(value, ("A",), 0)
+
+        assert _HostileReprString.repr_calls == 0
+
+    def test_mutable_hash_subclass_is_rejected_before_hashing(self) -> None:
+        _MutableHashString.hash_calls = 0
+        value = _MutableHashString("key-a")
+
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            ResolvedAxisMember(value, ("A",), 0)
+
+        assert _MutableHashString.hash_calls == 0
+
+    def test_both_lookup_directions_reject_subclasses_without_destabilizing_mapping(
+        self,
+    ) -> None:
+        resolved = ResolvedAxisMapping(
+            ["label"],  # type: ignore[arg-type]
+            [ResolvedAxisMember("key-a", ("A",), 0)],  # type: ignore[arg-type]
+        )
+        _MutableHashString.hash_calls = 0
+        hostile_key = _MutableHashString("key-a")
+        hostile_label = _MutableHashString("A")
+
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            resolved.labels_for_key(hostile_key)
+        with pytest.raises(AxisMappingError, match="exact built-in"):
+            resolved.key_for_labels((hostile_label,))
+
+        hostile_key.salt = 10
+        hostile_label.salt = 20
+        assert _MutableHashString.hash_calls == 0
+        assert resolved.labels_for_key("key-a") == ("A",)
+        assert resolved.key_for_labels(("A",)) == "key-a"
+        assert type(resolved.members[0].key) is str
+        assert type(resolved.members[0].labels[0]) is str
+
+    def test_source_and_used_key_subclasses_fail_without_hostile_methods(self) -> None:
+        _HostileStripString.strip_calls = 0
+        _HostileReprString.repr_calls = 0
+        frames = {
+            "axis": pd.DataFrame({
+                "key": [_HostileStripString("key-a")],
+                "label": ["A"],
+            })
+        }
+
+        with pytest.raises(AxisMappingError, match="non-string"):
+            resolve_axis_mapping(frames, _intent())
+        with pytest.raises(AxisMappingError, match="non-string"):
+            resolve_axis_mapping(
+                {"axis": pd.DataFrame({"key": ["key-a"], "label": ["A"]})},
+                _intent(),
+                used_keys=[_HostileReprString("key-a")],
+            )
+
+        assert _HostileStripString.strip_calls == 0
+        assert _HostileReprString.repr_calls == 0
+
+
+class TestDirectModelConstruction:
+    def test_positions_must_be_exact_contiguous_zero_based_integers(self) -> None:
+        with pytest.raises(AxisMappingError, match="exact built-in integer"):
+            ResolvedAxisMember("key", ("A",), True)
+        with pytest.raises(AxisMappingError, match="start at zero"):
+            ResolvedAxisMapping(
+                ("label",),
+                (ResolvedAxisMember("key", ("A",), 1),),
+            )
+
+    def test_wrong_arity_and_duplicate_members_fail_directly(self) -> None:
+        with pytest.raises(AxisMappingError, match="arity 2; expected 1"):
+            ResolvedAxisMapping(
+                ("label",),
+                (ResolvedAxisMember("key", ("A", "B"), 0),),
+            )
+        with pytest.raises(AxisMappingError, match="duplicate canonical key"):
+            ResolvedAxisMapping(
+                ("label",),
+                (
+                    ResolvedAxisMember("key", ("A",), 0),
+                    ResolvedAxisMember("key", ("B",), 1),
+                ),
+            )
+        with pytest.raises(AxisMappingError, match="duplicate complete"):
+            ResolvedAxisMapping(
+                ("label",),
+                (
+                    ResolvedAxisMember("key-a", ("A",), 0),
+                    ResolvedAxisMember("key-b", ("A",), 1),
+                ),
+            )
+
+    def test_ordered_iterables_are_copied_and_unordered_containers_rejected(
+        self,
+    ) -> None:
+        labels = ["label"]
+        members = [ResolvedAxisMember("key", ("A",), 0)]
+        resolved = ResolvedAxisMapping(labels, (member for member in members))  # type: ignore[arg-type]
+
+        labels[0] = "changed"
+        members.clear()
+        assert resolved.label_columns == ("label",)
+        assert resolved.members == (ResolvedAxisMember("key", ("A",), 0),)
+
+        with pytest.raises(AxisMappingError, match="ordered iterable"):
+            ResolvedAxisMapping(("label",), {ResolvedAxisMember("key", ("A",), 0)})  # type: ignore[arg-type]
+
+    def test_derived_maps_are_equal_when_members_are_equal(self) -> None:
+        first = ResolvedAxisMapping(
+            ("label",),
+            (ResolvedAxisMember("key", ("A",), 0),),
+        )
+        second = ResolvedAxisMapping(
+            ["label"],  # type: ignore[arg-type]
+            [ResolvedAxisMember("key", ("A",), 0)],  # type: ignore[arg-type]
+        )
+
+        assert first == second
+        assert first.labels_for_key("key") == second.labels_for_key("key")
+        assert first.key_for_labels(("A",)) == second.key_for_labels(("A",))
+
+
+class TestNarrowExceptionTranslation:
+    def test_unrelated_physical_helper_defect_is_not_relabelled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_with_programming_defect(*args: object, **kwargs: object) -> None:
+            raise AssertionError("simulated helper defect")
+
+        monkeypatch.setattr(
+            resolver_module,
+            "ensure_unique_physical_column_labels",
+            fail_with_programming_defect,
+        )
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-a"],
+                "label": ["A"],
+            })
+        }
+
+        with pytest.raises(AssertionError, match="simulated helper defect"):
+            resolve_axis_mapping(frames, _intent())
 
 
 class TestLookupValidation:
