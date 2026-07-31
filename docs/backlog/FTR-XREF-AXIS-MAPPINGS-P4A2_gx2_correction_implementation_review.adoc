@@ -1,0 +1,355 @@
+= GX-2 Correction Implementation Review: Public Pairing and Configuration Contracts
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+*The GX-2 correction is ready for independent acceptance review 002.* Runtime
+correction `bc21216` implements correction confirmation 001 (`e0abd94`) without
+deviation and closes all three findings from rejected acceptance review 001
+(`95dbdda`):
+
+* `GX2-A-B1` -- raw `GroupedMatrix` construction now fails deliberately; the
+  exported `grouped_matrix_from_canonical` factory and inverse both prove the
+  exact current canonical frame/header relation under the one live mapping;
+* `GX2-A-I1` -- each grouped composite owns `row_keys` once as an exact tuple,
+  safely supporting one-shot iterables without duplicating XRef/GX-1 semantic
+  validation;
+* `GX2-A-I2` -- grouped target `name` is removed and replaced by
+  `xref_config_id`; YAML `name` remains only the pipeline step/log name, while
+  direct Python and YAML can both select XRef metadata identity explicitly.
+
+No XRef, resolver, Slice 2, GX-1, rendering, parser, backend, metadata,
+persistence, cleanup, application, CLI, or schema-maintenance implementation was
+changed. GX-2 is corrected but not accepted; GX-3 has not begun.
+
+== Reviewed state and commits
+
+* Repository: `/home/stefan/repos/spreadsheet-handling/core`, branch `main`; no
+  branch created/switched, nothing pushed.
+* Rejection baseline: `95dbdda`.
+* Correction confirmation: `e0abd94`
+  (`docs(FTR-XREF-AXIS-MAPPINGS-P4A2): confirm GX-2 correction`).
+* Runtime/test/registry/public-doc correction: `bc21216`
+  (`fix(FTR-XREF-AXIS-MAPPINGS-P4A2): correct grouped XRef public contracts`).
+* This self-review and minimum lifecycle/supersession notes are documentation
+  only and committed separately after validation.
+
+The correction confirmation was treated as the exact implementation contract;
+the rejected self-review was treated only as historical claims. All corrected
+behavior below was checked against source, tests, registry authority, public
+builder/execution, and live validation.
+
+== Before and after
+
+[cols="2,3,3",options="header"]
+|===
+| Contract | Rejected implementation | Corrected implementation
+
+| Carrier construction
+| Public dataclass constructor accepted any DataFrame plus exact
+  `GroupedHeader`; only component types were checked.
+| `GroupedMatrix(...)` always raises `GroupedXrefError` naming
+  `grouped_matrix_from_canonical`; only a feature-private raw classmethod can
+  allocate after validation.
+
+| Pair proof
+| Inverse checked only exact carrier type and descriptor/frame width indirectly
+  in GX-1; same-width foreign/reordered data could be silently relabelled.
+| Public factory and inverse re-derive the complete GX-1 descriptor from the
+  current canonical frame and live mapping, requiring exact descriptor equality
+  before construction/restoration.
+
+| Mutable DataFrame
+| Reference freeze prevented field rebinding but later column mutation was not
+  detected.
+| Reference-freeze/identity semantics remain honest; inverse semantic
+  revalidation catches later column mutation while cell edits remain supported.
+
+| `row_keys`
+| Caller iterable was passed to XRef then consumed again for dynamic-header
+  isolation; a generator was exhausted.
+| `_owned_row_keys` consumes once into a tuple and the same tuple is reused.
+
+| XRef config ID
+| Direct target `name` reached XRef, but builder/YAML reserved the same spelling
+  for `BoundStep.name`, making target forwarding and ambiguity resolution
+  inaccessible.
+| Direct target and YAML use `xref_config_id`; generic YAML `name` stays the step
+  name. No ambiguous compatibility alias remains.
+|===
+
+== Pairing mechanism
+
+`GroupedMatrix` remains `@dataclass(frozen=True, eq=False, init=False)` with
+exactly `frame` and `header` fields. Its custom `__init__` rejects every ordinary
+direct call without inspecting arguments. `_from_validated_pair` is private and
+uses `object.__new__` / `object.__setattr__` only after feature-owned validation.
+It is not exported.
+
+`grouped_matrix_from_canonical(frame, header, *, mapping)` is exported from the
+feature package. `_validate_canonical_pair`:
+
+. requires a pandas DataFrame and exact `GroupedHeader`;
+. extracts exact row-key labels from the descriptor's `RowKeyColumn` entries;
+. calls accepted GX-1 `build_grouped_header` on the *current* canonical flat
+  frame, using the supplied exact `ResolvedAxisMapping` and carried level names;
+. requires the resulting frozen descriptor to equal the carried descriptor;
+. raises one deliberate `GroupedXrefError` when valid components do not describe
+  the same exact pair.
+
+Malformed canonical frames/mappings retain GX-1/resolver exception ownership
+(`GroupedHeaderError` / `AxisMappingError`). There is no broad exception
+translation. `expand_grouped_xref` invokes the same validator immediately after
+its one live mapping resolution and before `restore_flat_matrix`, local rebinding,
+or `expand_xref`.
+
+Exact re-derivation proves the semantic relation directly. It uses no stored
+column snapshot, mutable-content hash, collision-prone fingerprint, object token,
+sidecar, `_meta`, persisted mapping, or `MultiIndex` source of truth.
+
+== Pairing regression closure
+
+Committed regressions prove:
+
+* direct raw construction fails and points to the public factory;
+* exact canonical forward pair/factory construction succeeds;
+* identity equality and identity hash remain unchanged;
+* edited cell values with unchanged headers remain valid;
+* reordered dynamic columns fail exact pair equality;
+* a moved row-key column fails because `RowKeyColumn.position` changes;
+* an unrelated same-width frame fails because its canonical schema projects to a
+  different descriptor;
+* changed mapping labels make the old descriptor stale and fail pair equality;
+* `MultiIndex` and altered/unknown headers fail through GX-1/resolver before
+  construction/restoration;
+* mutating a valid carrier's DataFrame columns after construction is caught by
+  inverse revalidation before output, metadata, cleanup, or value swap;
+* inverse moved-row-key, `MultiIndex`, and altered-header probes fail before
+  wrapped `expand_xref`.
+
+The original silent corruption (`k1=A1`, `k2=A2` becoming `k1=A2`, `k2=A1`) is
+no longer representable through the public factory and cannot survive inverse
+revalidation. An unrelated DataFrame with the *same exact canonical schema and
+mapping* remains intentionally compatible: canonical physical headers still
+bind every value to the correct key. Cell/data provenance is not the pairing
+contract and values must remain workbook-editable.
+
+== GX-3/GX-4 compatibility
+
+The public factory is the only future carrier construction seam. GX-3/GX-4
+readback will:
+
+[source,text]
+----
+parse exact visible tuples and physical positions
+-> resolve the configured live mapping once
+-> map each complete tuple to its canonical string key
+-> build the canonical flat DataFrame in retained physical order
+-> grouped_matrix_from_canonical(frame, parsed_header, mapping=mapping)
+----
+
+Reordered/deleted valid workbook columns therefore construct a smaller/reordered
+but exactly paired carrier; unknown, duplicate, partial, incomplete, or
+depth-changed tuples fail before factory success. XLSX and ODS share this
+backend-neutral rule. Nothing in `bc21216` implements workbook parsing,
+rendering, merge geometry, or persistence, and no GX-3/GX-4 file changed.
+
+== Row-key ownership
+
+`_owned_row_keys` is deliberately container-only normalization:
+
+* bare string -> one-element built-in tuple;
+* list/tuple/other iterable -> one owned built-in tuple;
+* one-shot iterable -> consumed exactly once;
+* `bytes`, `bytearray`, and non-iterable -> safe `GroupedXrefError` with constant
+  shape guidance.
+
+It does not validate empty declarations, element types, duplicate fields, or
+existence. Unchanged XRef and accepted GX-1 retain those semantics and
+diagnostics. Both directions normalize once. Forward passes the same tuple
+object to unchanged `contract_xref`, dynamic-header isolation, and GX-1 header
+construction; inverse passes its owned tuple to unchanged `expand_xref`. Pair
+validation derives authoritative descriptor row-key positions from the
+descriptor, not by re-consuming caller input.
+
+Tests cover string/list/tuple/generator forms, a two-key generator in both
+directions, an iterator that raises if iterated twice, same-object forwarding to
+XRef/GX-1, exact physical-order `used_keys`, safe unsupported containers, and
+unchanged XRef duplicate-row-key ownership. The rejected false
+`Used canonical axis key(s) ['rk1', 'rk2'] ... missing` path no longer occurs.
+
+== Direct Python and YAML config identity
+
+Corrected signatures are identical to correction confirmation 001: every
+provisional grouped `name: str | None` parameter is replaced by
+`xref_config_id: str | None = None`; every other asymmetric parameter and default
+is unchanged. When present, the grouped boundary requires an exact non-empty
+built-in string, then forwards it as unchanged XRef's `name=`. `None` retains
+unchanged XRef relation/output fallback behavior.
+
+Direct Python:
+
+[source,python]
+----
+contract_grouped_xref(..., xref_config_id="loan_axis")
+expand_grouped_xref(..., xref_config_id="loan_axis")
+----
+
+Config/YAML:
+
+[source,yaml]
+----
+- step: contract_grouped_xref
+  name: readable_step_for_logs
+  xref_config_id: loan_axis
+  # ...
+----
+
+`build_steps_from_config` consumes `name` into `BoundStep.name` and leaves
+`xref_config_id` in the target config. The public-build regression constructs
+two XRef metadata entries matching one matrix and proves
+`xref_config_id: wanted` selects the exact one while `name:
+readable_inverse_step` remains only the step name. Direct forward and inverse ID
+tests, invalid-ID tests, signature absence of grouped `name`, JSON parameter
+maps, and the generalized family signature guard all pass.
+
+Because provisional GX-2 was rejected before acceptance/adoption, no deprecated
+`name` target alias is retained. This is the confirmed correction, not a
+compatibility deviation.
+
+== Forward and inverse composition
+
+Forward still performs one unchanged `contract_xref`, one live
+`resolve_axis_mapping(..., used_keys=exact_dynamic_headers)`, GX-1 header
+projection, validated carrier construction, and one output publication. The
+factory re-derives the header purely to prove pairing; it does not resolve again,
+call XRef again, persist anything, or create a second output.
+
+Inverse still performs one live resolution, now pair validation, GX-1 local
+restoration, one local rebinding of the public `matrix` name, one unchanged
+`expand_xref`, and carrier restoration unless cleanup was requested. A spy proves
+one resolver call despite factory/pair validation. `base_relation`,
+`value_columns`, row/value field names, cleanup, and direct XRef config-ID
+forwarding remain unchanged.
+
+No private Frames entry exists in either direction. The only flat matrix is the
+carrier field or a local rebinding of the real public name.
+
+== Atomicity, nonmutation, metadata, and cleanup
+
+Pair validation is read-only and occurs before inverse restoration/expansion.
+On every pairing/schema failure:
+
+* caller Frames and caller `_meta` are unchanged;
+* the carrier's DataFrame is not further mutated;
+* no canonical output is inserted;
+* no XRef metadata entry or cleanup command is written;
+* no transient flat/private frame exists.
+
+Forward remains build-then-publish over unchanged `contract_xref`'s copied
+Frames. Factory failure discards the interim output/metadata/cleanup copy.
+
+Metadata ownership is unchanged: only XRef writes `_meta.xref_crosstable` and
+only existing cleanup logic writes transient
+`_meta.pipeline_cleanup.drop_frames`. `xref_config_id` chooses the XRef entry key
+but adds no grouped metadata. `composite_metadata_policy: preserve_public`
+remains accurate. Final cleanup still removes only caller-named `relation` /
+`matrix` inputs after complete success and consumes the command. No mapping,
+descriptor, header depth, schema, or fingerprint persists.
+
+== Registry and public documentation
+
+Runtime `StepRegistration` targets are unchanged. Both JSON entries remain
+symmetric `composite` declarations with correct inverse links,
+`wrapped_steps`, metadata/frame contracts, empty `internal_frames`, conditional
+bijection reasons, and `base_relation` static read/preserve convention.
+
+Parameter maps replace `name` with `xref_config_id`; notes distinguish YAML step
+name from XRef config identity and describe validated carrier construction and
+inverse revalidation. The family signature guard proves exact parameter names
+and required flags for Slice 2, corrected GX-2, and compact multiaxis.
+
+The user guide and release note now explain raw-constructor rejection, public
+factory validation, mutable cell values versus immutable pairing, future
+GX-3/GX-4 canonical reconstruction, one-shot row ownership, direct/YAML
+`xref_config_id`, YAML-only step `name`, no grouped metadata, and no current
+workbook support. Historical GX-2 confirmation/self-review artifacts receive
+explicit supersession banners rather than being silently rewritten; the
+rejection and correction record remains auditable.
+
+== Protected surfaces and architecture
+
+Diff from correction-confirmation commit `e0abd94` contains only:
+
+* GX-2 package init/matrix/composites;
+* GX-2 unit/public-build tests;
+* runtime JSON registry;
+* active grouped-XRef user guide and release note.
+
+Empty protected diff was verified for `xref_crosstable/**`,
+`xref_axis_mapping/**`, Slice 2 runtime, GX-1 model/projection, rendering, IO
+backends, application, CLI, schema maintenance, and persistence boundary.
+Transformation architecture, cross-family direction, registry-target,
+signature, composite, metadata, and pipeline-semantics guards pass. Dependency
+direction remains grouped-XRef -> accepted mapping/GX-1/XRef; no reverse import
+or carrier-layer dependency appears.
+
+== Tests and validation evidence
+
+Commands ran from `/home/stefan/repos/spreadsheet-handling/core` with Python
+3.13.5, pandas 3.0.2, NumPy 2.4.4, and Asciidoctor 2.0.23.
+
+Focused validation passed for:
+
+* all GX-1 and GX-2/correction unit tests;
+* grouped public build/run integration;
+* complete XRef resolver and XRef transformation suites;
+* final domain cleanup;
+* pipeline registry/signature/composite/meta and pipeline-semantics guards;
+* all domain-transformation architecture guards.
+
+Full active Core suite:
+
+[source,console]
+----
+.venv/bin/pytest -m 'not legacy and not prehex and not slow' \
+  tests/unit tests/integration tests/roundtrip tests/architecture
+# 2046 passed, 1 xfailed in 10.08s
+----
+
+The xfail is the pre-existing unrelated
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` pathological missing-FK helper
+case.
+
+Additional checks:
+
+* Ruff on every changed Python/test file: all checks passed;
+* source-style guard: 0 errors, baseline 78 warnings and 2 allowlisted findings;
+  no grouped-XRef warning after docstring tightening;
+* Asciidoctor rendering of every changed/current GX-2/FTR/user/release artifact:
+  passed;
+* `git diff --check` and protected-surface checks: clean.
+
+== Deviations
+
+None. One test initially expected obsolete duplicate-row-key wording; runtime
+correctly emitted the existing XRef-owned diagnostic, so the test regex was
+aligned without changing runtime or exception ownership. Two source-style
+function-length warnings introduced by expanded explanatory docstrings were
+removed by tightening those docstrings; no behavior or confirmed contract
+changed.
+
+The public factory performs pure header re-derivation even though the forward
+just built that header. This is explicitly allowed by correction confirmation:
+it proves the same public factory contract used by future carriers and does not
+add resolution, persistence, or output. No optimization bypass was introduced.
+
+== Lifecycle
+
+The owning FTR remains open. Slice 1, Slice 2, and GX-1 remain accepted. GX-2 is
+corrected and awaits independent acceptance review 002; it is not marked
+accepted here. GX-3, GX-4, and GX-5 remain pending. No FTR is archived, no open
+include is removed, and no GX-3 implementation or carrier change begins.
+
+GROUPED XREF GX-2 CORRECTION READY FOR ACCEPTANCE REVIEW 002
