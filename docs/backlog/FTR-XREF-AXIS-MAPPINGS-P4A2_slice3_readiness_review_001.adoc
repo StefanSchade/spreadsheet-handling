@@ -1,0 +1,527 @@
+= Slice 3 Pre-Implementation Readiness Review 001: Hierarchical XRef Axis Labels
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+Slice 3 of `FTR-XREF-AXIS-MAPPINGS-P4A2` is *not ready for implementation*.
+
+Slice 3 does not lack a *possible* coherent contract, and it is correctly
+sequenced after accepted Slices 1 and 2. It is blocked on a single unresolved
+architectural decision that the FTR itself explicitly defers: *the logical
+DataFrame representation of a multi-component axis label and the interface by
+which that representation is handed to Grouped Columns (Slice 4)*. That choice
+is not a local naming/parameter detail settleable at the acceptance gate (as
+Slice 2's two open items were). It determines the entire user-visible
+capability, whether Slice 3 has any persistable/testable result at all, whether
+the projection stays a value-substitution or becomes a shape-change, and the
+Slice 3 -> Slice 4 boundary. Because it cannot be proven non-controversial in a
+read-only readiness pass, it is recorded as a blocking finding for a short
+clarification/design step rather than settled here.
+
+This review is independent and read-only with respect to runtime code. It reads
+and classifies existing artifacts, runtime, registry, and live behaviour as
+evidence. It modifies no executable file, registry, or FTR.
+
+Repository state read: git root `core/`, branch `main`, clean worktree, HEAD
+`64666b6` (Slice 2 acceptance). No branch created or switched; nothing pushed.
+
+== What Slice 1 and Slice 2 already deliver (evidence)
+
+The load-bearing fact for Slice 3 sizing: *Slice 1 already implemented the
+complete multi-level tuple model.* The resolver is arity-agnostic today.
+
+Live probe (project venv, Python 3.13.5):
+
+[source,text]
+----
+resolve_axis_mapping over source {k, fam, lab}, label_columns=("fam","lab")
+  -> label_arity 2
+  -> labels_for_key("credit.annuity_loan") == ("Kredit", "Annuitätendarlehen")
+  -> key_for_labels(("Kredit","Annuitätendarlehen")) == "credit.annuity_loan"
+----
+
+`ResolvedAxisMapping` (`xref_axis_mapping/model.py`) already enforces fixed
+arity, exact built-in tuples of exact built-in non-empty strings, duplicate
+complete-tuple rejection, contiguous positions, exact forward/inverse lookup,
+and immutability -- for *any* arity. The FTR records 132 focused tests covering
+one-, two-, and three-level mappings.
+
+Slice 2 (`xref_axis_projection.py`) is *hard-wired to arity one*: both
+`project_axis_labels` and `restore_axis_keys` build
+`AxisMappingIntent(label_columns=(label_column,))` and unwrap/`wrap` a single
+string (`labels_for_key(value)[0]`, `key_for_labels((value,))`). They swap the
+*values* of one relation column (default `column_key`) in place, then compose
+*around* unchanged `contract_xref` / `expand_xref`.
+
+Consequence: Slice 3 adds *no resolver/model capability*. Slice 3 is purely a
+*projection-transformation + relation-representation* question: how a
+multi-component label appears in a Frames-level relation, and how the outbound
+and inbound transformations produce/consume it.
+
+== The blocking constraint: unchanged XRef cannot carry a tuple
+
+`contract_xref` / `expand_xref` enforce a *carrier-stable* axis-identity
+contract: every matrix-axis identity (relation `column_key` values and every
+matrix header) must be a *unique, non-empty built-in string*, and MultiIndex /
+tuple columns are rejected outright
+(`xref_crosstable/primitives.py:49-65`, `_ensure_column_identity_values`).
+
+Live probe:
+
+[source,text]
+----
+contract_xref over a relation whose column_key holds ('A','B')
+  -> ValueError: "... column_key values must contain non-empty string column
+     identities; invalid value(s): [('A', 'B')] ..."
+----
+
+Therefore a multi-component label *cannot* traverse unchanged XRef in any of the
+three shapes a naive Slice 3 might produce:
+
+* a tuple in the single `column_key` column -> rejected as a non-string identity;
+* a MultiIndex matrix header -> rejected as a MultiIndex column;
+* a `" / "`-joined string -> forbidden by the FTR non-goal
+  "No tuple-to-string delimiter encoding".
+
+The Slice 2 property that made it independently useful -- readable headers via
+*unchanged XRef* and *unchanged carriers* -- does *not* transfer to multi-level.
+Grouped physical headers (MultiIndex matrix + multi-row spreadsheet header) are
+Slice 4 / `FTR-XREF-GROUPED-COLUMNS-P4A2` by design. So Slice 3, to remain
+independent of Slice 4 and to change no XRef code, must operate *entirely at the
+long-form relation level* and cannot round-trip a multi-level label through a
+matrix.
+
+This is the crux the readiness question turns on: what *independently useful and
+testable* long-form result can Slice 3 produce, and in what representation?
+
+== Candidate representations
+
+[cols="1,3,2",options="header"]
+|===
+| # | Representation | Assessment
+
+| A
+| *Tuple in one column* -- outbound writes an exact built-in tuple into the
+  relation's `column_key`; inbound reads it. Shape-preserving; matches the FTR
+  Purpose bijection literally; uses the resolver's arity-N tuple directly.
+| *Coherent but not independently useful.* The output cannot pass `contract_xref`
+  (tuple rejected), cannot persist as an ordinary frame, and has no current
+  consumer. It is a pure in-memory intermediate that only Slice 4 can consume.
+  Testable, but fails the "independently useful result" bar the task sets.
+
+| B
+| *Explicit level columns (long form)* -- outbound replaces the single
+  `column_key` with N flat-string level columns
+  (e.g. `story_id \| family \| character \| value`); inbound collapses the N
+  columns back to the canonical `column_key`. Shape-changing.
+| *The strongest candidate.* It persists and round-trips through XLSX/ODS as an
+  ordinary flat frame with *zero carrier change*, is human-readable, and is
+  exactly Grouped Columns' documented expanded long form
+  (`feature_id \| product_family \| variant_id \| value`). But it expands "axis
+  projection" from value-substitution to a *reshape*, adds/removes columns,
+  raises row-identity/uniqueness questions across N columns, and *commits the
+  Slice 3 -> Slice 4 interface* before Slice 4 is designed.
+
+| C
+| *MultiIndex on the matrix* -- the physical grouped matrix shape.
+| *Not Slice 3.* This is the physical carrier work explicitly owned by Slice 4 /
+  Grouped Columns. Selecting it here would absorb Slice 4.
+|===
+
+Representation **B** is the only candidate that yields an independently useful,
+persistable, testable result without carrier work, and it aligns with the
+Grouped Columns FTR's own documented long form. It is the recommended target
+*if* the clarification confirms it. But choosing B is a real public-surface and
+cross-slice-interface decision, not an implementation detail -- see risks.
+
+== Exact capability boundary (recommended shape, pending clarification)
+
+Under the recommended representation B, Slice 3 delivers:
+
+[source,text]
+----
+canonical relation:  row_keys | column_key(canonical) | value
+  -> project_axis_label_columns   (Slice 3 outbound)
+canonical -> N flat-string level columns
+relation:            row_keys | level_1 ... level_n | value      (long form)
+
+relation:            row_keys | level_1 ... level_n | value
+  -> restore_axis_keys_from_columns  (Slice 3 inbound)
+N flat-string level columns -> canonical
+canonical relation:  row_keys | column_key(canonical) | value
+----
+
+Forward/inverse flow, precisely:
+
+* *outbound*: for each relation row, take the canonical key in `column_key`,
+  resolve its complete visible label tuple via `labels_for_key`, and write the
+  tuple's components into N declared, ordered, flat-string level columns (the
+  single `column_key` is dropped/replaced). Completeness is enforced via
+  `used_keys` before publish.
+* *inbound*: for each relation row, read the N level columns positionally into an
+  exact built-in tuple, resolve the canonical key via `key_for_labels` (which
+  validates arity and rejects unknown complete tuples), and write it back into a
+  single canonical `column_key`.
+
+Slice 3 operates *only on relation values reshaped into explicit flat-string
+columns*. It does *not* operate on matrix headers, does *not* build a
+`MultiIndex`, does *not* touch XRef, and does *not* introduce a tuple-valued
+DataFrame column.
+
+== Relationship to Slices 1, 2, and 4
+
+* *Slice 1 (accepted):* Slice 3 *reuses* the resolver and its arity-N tuple
+  model unchanged. No reopening. The resolver already validates every
+  value-level rule Slice 3 relies on.
+* *Slice 2 (accepted):* Slice 3 must *not* break or reinterpret the flat
+  one-level steps. Existing flat YAML and Python calls stay valid unchanged. The
+  arity-1 case must remain expressible either through the retained Slice 2 steps
+  or as the degenerate N=1 case of the Slice 3 steps -- the clarification must
+  choose (see public-API decision).
+* *Slice 4 (`FTR-XREF-GROUPED-COLUMNS-P4A2`):* the boundary must be:
+  ** *Slice 3* owns canonical-key <-> explicit long-form level columns (logical,
+     flat strings, no carrier).
+  ** *Slice 4* owns explicit long-form level columns <-> grouped matrix
+     (MultiIndex matrix headers, multi-row XLSX/ODS headers, merge geometry,
+     carrier parity). This matches Grouped Columns' documented expand/contract.
+  Slice 3 must not absorb any MultiIndex/multi-row/carrier work; conversely it
+  must produce exactly the long form Grouped Columns will consume.
+
+== Representation contract (for the chosen internal shape)
+
+Regardless of which candidate is confirmed, the internal identity remains the
+Slice 1 value: an *exact built-in tuple of exact built-in non-empty strings*,
+fixed arity, produced only by the resolver. Slice 3 must:
+
+* *Arity*: fix arity = number of declared level columns; a relation whose level
+  columns do not match arity fails.
+* *Empty components*: no empty component (resolver already rejects empty label
+  values). Slice 3 defines no empty-level policy (consistent with the FTR).
+* *Duplicate complete labels*: rejected by the resolver's `_ensure_bijection` /
+  `ResolvedAxisMapping`; repeated *upper-level* components with distinct complete
+  tuples remain valid.
+* *Type normalization*: level-column values read from the relation are held to
+  the same exact-non-empty-string contract as the resolver's inbound labels;
+  pandas/NumPy carrier scalars are described with the constant safe diagnostic,
+  never introspected.
+* *Ownership*: copy the Frames mapping; produce a new output DataFrame; never
+  mutate input frames, input DataFrames, or caller `_meta` (Slice 2 pattern).
+* *Exact identity / ordering / diagnostics*: exact tuple identity for inverse
+  lookup; deterministic order inherited from the resolver's declared policy;
+  feature-specific `AxisMappingError` carrying frame/column/row context.
+
+Representation A (tuple-in-column) would additionally have to define a
+tuple-valued DataFrame column contract with *no* current consumer -- another
+reason it is not recommended.
+
+== Public API decision (unresolved -- part of the block)
+
+Slice 2's public surface is singular: `label_column`, plus the
+substitution-irrelevant `order_policy` / `order_columns`. Slice 3 needs a
+multi-level surface. The options are genuinely open and consequential:
+
+. *New steps* (recommended if B is confirmed), e.g.
+  `project_axis_label_columns` / `restore_axis_keys_from_columns`, taking
+  `label_columns` (ordered, arity>=1) and `column_keys` (the N output level
+  columns). Clean, but a *parallel API* -- the FTR forbids parallel APIs
+  "without a migration or coexistence rationale". The rationale here is that the
+  two Slice 2 steps are value-substitution (one column in/out) while Slice 3 is a
+  reshape (one column <-> N columns); they are not the same operation. This is a
+  defensible coexistence rationale, but it must be *stated and accepted at a
+  gate*, not assumed.
+. *Generalize Slice 2* -- widen `label_column` to accept a sequence or add
+  `label_columns`. Risk: it silently changes a shape-preserving step into a
+  shape-changing one, complicating the accepted flat contract.
+
+Existing flat YAML must remain valid unchanged under either option. Which option
+is correct depends on the representation decision and is therefore part of the
+same block.
+
+== XRef compatibility conclusion
+
+*Slice 3 is possible without modifying XRef only if it never routes a
+multi-level label through XRef.* Under representation B it does not: the outbound
+step ends at the long-form relation, before any grouped `contract_xref` (Slice
+4); the inbound step begins after grouped `expand_xref` (Slice 4). No tuple, no
+MultiIndex, and no delimiter-joined string ever reaches unchanged
+`contract_xref` / `expand_xref`. XRef stays byte-for-byte unchanged.
+
+No intermediate tuple-to-string encoding is authorized; the FTR non-goal and the
+carrier assessment below both forbid it. If a future design wants a multi-level
+matrix, that is Slice 4's grouped-header carrier contract, not a Slice 3
+encoding.
+
+== Persistence / metadata conclusion
+
+*No persisted Intent and no new `_meta` root are required or permitted in Slice
+3.* As in Slice 2: resolve live from source frames plus explicit configuration;
+fail if a source frame is absent rather than trusting stale/visible text. The
+`_meta.xref_crosstable` contract, the meta registry
+(`registries/meta_registry.yaml`), the persistence boundary, and
+schema-maintenance stay unchanged. The only permissible `_meta` touch is the
+existing transient `_meta.pipeline_cleanup` drop command under an optional
+`drop_source`, copied-before-write (Slice 2 pattern). A persistent discovery
+Intent, if ever justified, remains a separate gated slice with its own
+producer/consumer/persistence/schema-maintenance analysis.
+
+== Carrier / header-shape dependency assessment
+
+Independently of the backend, current grouped/MultiIndex header support is
+*mechanical delimiter encoding*, not a semantic tuple carrier:
+
+* render -> frames uses `tuple(h.split(" / "))`
+  (`rendering/workbook_projection.py:172-174`), reconstructing a MultiIndex by
+  splitting a flat header on the literal `" / "`.
+* JSON key-path nesting builds a MultiIndex by splitting on `.`
+  (`core/df_build.py:15-30`).
+
+Both are the *lossy `" / "` / delimiter flattening the FTR explicitly bans* for
+axis tuples ("without lossy `\" / \"` flattening or merge-dependent inference").
+They are *mechanically present but semantically unsuitable* for XRef axis-label
+tuples: a label component containing `" / "` or `.` would corrupt, and neither
+path preserves level names or guarantees exact tuple identity for XRef axes.
+
+Conclusion: representation B needs *no* carrier change precisely because it keeps
+everything as ordinary flat string columns. Any *grouped-header* carrier work
+(MultiIndex matrix, multi-row XLSX/ODS headers, merge geometry, level names,
+per-backend parity, repeated-carrier safety per the adapter read-path rule) is
+Slice 4 and must not be inferred from these delimiter helpers. Backend parity
+must not be assumed from one carrier; both XLSX and ODS need explicit treatment
+*in Slice 4*.
+
+== Robustness contract (Domain Boundary Robustness, level 2)
+
+Slice 3's ingress is competent-user workflow input; the resolver owns value-level
+validation. Explicit correctness obligations (must be tested, must fail cleanly,
+must publish no partial output/`_meta`):
+
+* exact built-in tuple ownership and exact component string types (delegated to
+  the resolver; asserted at the transform boundary);
+* fixed arity: N level columns in, N-tuple out; mismatched arity fails;
+* no ambiguous duplicate complete labels (resolver `_ensure_bijection`);
+* deterministic ordering per the resolver's declared policy;
+* deliberate `AxisMappingError` diagnostics with frame/column/row context; no
+  execution of a rejected value's `repr`/type/hash/eq/iteration;
+* failure atomicity scoped to Frames, the output DataFrame, and `_meta`
+  (build-then-publish);
+* no mutation of input frames, input DataFrames, or caller `_meta`.
+
+Arbitrary hostile in-process Python (level 4) stays out of scope. Any genuine
+violation of an explicit guarantee remains a correctness finding, not
+threat-model expansion. No new shared helper is justified unless Slice 3 proves a
+second genuine consumer of the *same* accepted/rejected vocabulary,
+normalization, ownership, diagnostics, and layer (semantic-DRY bar); reuse the
+Slice 1 resolver and the existing `domain/tabular` physical-label helpers.
+
+== Required runtime surfaces (once unblocked, representation B)
+
+* New transform functions in
+  `domain/transformations/xref_axis_projection.py` (or a sibling module):
+  outbound `canonical column_key -> N level columns`, inbound
+  `N level columns -> canonical column_key`, both consuming the Slice 1
+  resolver, both build-then-publish with `_meta` pass-through and optional
+  `drop_source`.
+* Two `StepRegistration` entries in `pipeline/registry.py` and two symmetric,
+  fully-populated `registries/pipeline_step_registry.json` entries (16 required
+  fields; mutually referential `inverse`).
+* No change to `xref_crosstable/**`, `xref_axis_mapping/**`,
+  `meta_registry.yaml`, `persistence_boundary.py`, `schema_maintenance/**`,
+  `io_backends/**`, `rendering/**`, adapters.
+
+== Required tests (once unblocked)
+
+* focused resolver/model reuse tests (multi-level via the Slice 1 resolver);
+* outbound projection: canonical -> N level columns; row order, index, and
+  non-axis columns preserved;
+* inbound projection: N level columns -> canonical;
+* *pure Frames inverse roundtrip*: outbound -> inbound reproduces the canonical
+  relation exactly, both order policies;
+* Slice 2 flat compatibility: the arity-1 flat steps still round-trip unchanged
+  (and, if generalized, the N=1 case equals the flat step);
+* failure cases: unknown used key, unknown complete tuple, wrong arity, empty
+  component, missing source frame, duplicate keys/tuples -- all clean, atomic,
+  no partial output/`_meta`;
+* ownership/atomicity: input frames and `_meta` unmutated; no output frame on
+  failure;
+* *XLSX and ODS roundtrip of the long-form relation as ordinary flat frames*
+  (proving no carrier change is needed and exact identity survives) -- treated
+  per-backend, not inferred from one;
+* public `build_steps_from_config` / `run_pipeline` smoke and a
+  registered-parameters-match-signature guard for the new steps;
+* registry symmetry + transformation layer-boundary + public-API guards.
+
+*XRef composition tests and grouped-header / MultiIndex / multi-row carrier
+tests are Slice 4, not Slice 3.*
+
+== F-1 (Slice 2 minor) disposition
+
+Slice 2 review 001 left minor *F-1*: no committed public-build smoke and no
+registered-parameters-match-signature guard for `project_axis_labels` /
+`restore_axis_keys`. Recommendation: *close F-1 opportunistically in Slice 3*
+only because Slice 3 will touch the exact same public-build/registry/signature
+surface and should add the same guard for its own new steps -- adding it for all
+four entries is marginal cost. Do *not* expand Slice 3 solely to close F-1, and
+do not block Slice 3 on it. If the block above is resolved and Slice 3 proceeds,
+folding F-1 in is appropriate; otherwise F-1 remains a separate low-touch
+follow-up.
+
+== Documentation / registry obligations (once unblocked)
+
+* `registries/pipeline_step_registry.json` (blocking guard) + `registry.py`;
+* `docs/user_guide/ch03_transformation_catalog/02_bijective_transforms.adoc`
+  (extend the axis-projection catalogue for the multi-level pair);
+* `docs/release_notes/release_notes.adoc` -- bullet under the active unreleased
+  section;
+* a short Functional/Technical Model note that hierarchical axis projection is a
+  logical long-form vocabulary reshape *distinct from* XRef shape conversion and
+  from Slice 4 grouped headers;
+* no meta-registry / persistence-boundary / schema-maintenance change.
+
+== Explicit non-goals for Slice 3
+
+* No `MultiIndex` matrix, no multi-row spreadsheet headers, no merge geometry --
+  Slice 4.
+* No change to `contract_xref` / `expand_xref` or their contracts.
+* No tuple-to-string delimiter encoding; no reuse of the `" / "` / `.` header
+  helpers for axis tuples.
+* No new persisted `_meta` root; no schema-maintenance change.
+* No `project_by_role` replacement, discriminator multiprojection, XRef-view
+  wrapper, or adoption migration (Slice 5).
+* No reopening of the Slice 1 resolver or the Slice 2 flat steps.
+
+== Risks and unresolved decisions
+
+* *R-1 (blocking).* The logical representation (A tuple-in-column vs B explicit
+  level columns) and the Slice 3 -> Grouped Columns interface are unresolved in
+  the FTR ("the logical DataFrame representation passed from Slice 3 to Grouped
+  Columns"). The useful choice (B) commits that interface before Slice 4 is
+  designed; the FTR asked for the two to be *coordinated*.
+* *R-2 (blocking).* Representation B changes "axis projection" from a
+  value-substitution to a *reshape* (one column <-> N columns), a genuine
+  public-surface expansion that needs the FTR's per-slice public-surface gate,
+  not an in-context improvisation.
+* *R-3 (important).* Parallel-vs-generalized public API is unresolved and the FTR
+  forbids parallel APIs without an accepted coexistence rationale.
+* *R-4 (observation).* Row-identity/uniqueness semantics across N level columns
+  (how completeness and duplicate-tuple detection map to multi-column relation
+  rows) need explicit specification once B is confirmed.
+
+== Sizing conclusion
+
+Slice 3 is *appropriately small once the representation is fixed* -- it adds no
+model, no XRef change, no carrier change, no metadata, and (under B) no
+grouped-header work; it is two Frames->Frames transforms plus registry/tests/docs,
+comparable in size to Slice 2. It is *not* too broad and does *not* need
+splitting. It is, however, *blocked* on the R-1/R-2/R-3 decisions above. It is
+still a useful independent slice *if and only if* representation B (or an
+equivalently persistable long-form representation) is confirmed; representation A
+alone would produce no independently useful result and should not be approved on
+its own.
+
+== Recommended sequence (smallest path to READY)
+
+. *Short clarification/design step* (documentation-level, cross-referencing
+  `FTR-XREF-GROUPED-COLUMNS-P4A2`) that:
+  .. confirms representation B (explicit flat-string long-form level columns) as
+     the logical Slice 3 output and the Slice 4 input;
+  .. confirms new coexisting steps with a stated rationale vs generalizing the
+     Slice 2 steps;
+  .. specifies row-identity/completeness/duplicate semantics across N columns;
+  .. records the minimal FTR edit that fixes Slice 3 wording accordingly.
+. Then a normal Slice 3 confirmation/implementation pass following the runtime /
+  tests / docs surfaces above, optionally folding in F-1.
+
+== Exact acceptance criteria (for the eventual Slice 3, representation B)
+
+* Outbound turns a canonical relation into an explicit N-level-column long-form
+  relation; inbound restores the canonical relation exactly (both order
+  policies), proven by a pure Frames roundtrip.
+* The long-form relation round-trips through XLSX and ODS as ordinary flat
+  frames with exact identity and *no carrier or XRef change*, proven per backend.
+* Every explicit correctness obligation fails cleanly with an `AxisMappingError`
+  and publishes no partial output/`_meta`; input frames and `_meta` are never
+  mutated; no new `_meta` root is written.
+* The accepted Slice 2 flat steps and existing flat YAML remain valid unchanged;
+  arity-1 behaviour is preserved.
+* Both new steps are registered with symmetric runtime/JSON entries; registry,
+  layer-boundary, public-API, and (folded F-1) parameter-signature guards pass.
+* `xref_crosstable/**`, `xref_axis_mapping/**`, `meta_registry.yaml`,
+  `persistence_boundary.py`, `schema_maintenance/**`, `io_backends/**`,
+  `rendering/**`, and adapters are unchanged.
+* User-guide catalogue entry and a release note exist; full active suite, ruff,
+  source-style guard, and Asciidoctor pass; `git diff --check` clean.
+
+== FTR correction assessment
+
+The active FTR's Slice 3 wording ("Expose the already shared tuple model to a
+backend-neutral hierarchical column projection ... Coordinate its logical frame
+contract with Grouped Columns") is *not stale or wrong*, but it is
+*architecturally incomplete*: it names the coordination requirement without
+resolving it, and it lists "the logical DataFrame representation passed from
+Slice 3 to Grouped Columns" as an open later-slice decision. Resolving that is a
+*substantive architectural choice* (representation, reshape-vs-substitution,
+public-API coexistence, Slice 3/Slice 4 interface), not a documentation-only
+clarification of already-approved intent, and it cannot be proven
+non-controversial in this read-only pass.
+
+Per the FTR correction rule, this reviewer therefore makes *no FTR edit* and
+records the required correction as the blocking finding R-1/R-2/R-3 above, to be
+settled in the short clarification/design step (recommended sequence, item 1).
+Only that step should edit the FTR.
+
+== Findings by severity
+
+=== Blocking
+
+* *R-1.* Unresolved logical representation and Slice 3 -> Grouped Columns
+  interface (FTR-deferred). Slice 3 cannot be implemented without it, and the
+  useful resolution commits a cross-slice interface.
+* *R-2.* Representation B expands axis projection from value-substitution to a
+  shape-changing reshape -- a public-surface change requiring the per-slice
+  public-surface gate.
+
+=== Important
+
+* *R-3.* Parallel-vs-generalized public API decision is open; the FTR forbids
+  parallel APIs without an accepted coexistence rationale.
+
+=== Minor
+
+* *F-1 (carried from Slice 2).* No public-build smoke / parameter-signature guard
+  for the axis-projection steps; recommended to close opportunistically inside
+  Slice 3, not to expand Slice 3 for it.
+
+=== Observations
+
+* *R-4.* Row-identity/completeness/duplicate semantics across N level columns
+  need explicit specification once representation B is confirmed.
+* Existing MultiIndex/grouped-header helpers (`" / "` / `.` splitting) are
+  mechanical delimiter encoders, not a semantic tuple carrier, and must not be
+  reused for axis tuples.
+* Slice 1's resolver already covers the full multi-level model; Slice 3 adds no
+  model, only a projection/representation surface.
+
+== Validation
+
+Read-only review; no executable file, registry, or FTR was modified.
+
+* Live probes (project venv, Python 3.13.5, pandas 3.0.2, NumPy 2.4.4):
+  ** `resolve_axis_mapping` produced arity-2 tuples and exact forward/inverse
+     lookup for the credit/deposit example;
+  ** `contract_xref` rejected a tuple `column_key` value with the carrier-stable
+     non-empty-string diagnostic.
+* Symbol/path checks: `xref_axis_mapping/{model,resolver}.py`,
+  `xref_axis_projection.py`, `xref_crosstable/{operation,primitives}.py`,
+  `rendering/workbook_projection.py`, `core/df_build.py`,
+  `registries/pipeline_step_registry.json` axis entries,
+  `docs/user_guide/ch03_transformation_catalog/`, the Domain Boundary Robustness
+  concept/ADR, and the two axis/projection test modules all exist at the cited
+  paths.
+* Asciidoctor render of this artifact -- see command log.
+* `git diff --check`: clean (only this new artifact is added).
+
+No existing runtime tests were re-run because this task modifies no executable
+file; current capability was confirmed by the two targeted live probes above.
+
+XREF AXIS MAPPINGS SLICE 3 NOT READY FOR IMPLEMENTATION
