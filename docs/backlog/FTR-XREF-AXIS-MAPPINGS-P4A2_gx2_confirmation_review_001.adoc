@@ -1,0 +1,737 @@
+= GX-2 Confirmation Review 001: Grouped-XRef Composites
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+*GX-2 is ready for implementation.* The merged grouped-XRef architecture
+(`FTR-XREF-AXIS-MAPPINGS-P4A2_slice3_4_architecture_confirmation_001.adoc`), the
+accepted GX-1 foundation (confirmation `35e7221`, implementation `2fc71b8`,
+self-review `3187638`, acceptance `ad28e64`), the accepted Slice 1 resolver, the
+accepted Slice 2 composite precedent (`xref_axis_projection.py`), and the
+unchanged XRef primitives together fix a precise, minimal, and independently
+testable implementation contract for the first public grouped-XRef capability:
+`contract_grouped_xref` / `expand_grouped_xref`.
+
+No blocking or important finding survives. Every open decision the architecture
+left at the Frames boundary -- how the `(flat matrix, GroupedHeader)` pair is
+carried as a single Frames value, and how the GX1-A-M2 mispairing hazard is
+closed -- is resolved below by a single feature-owned grouped-matrix carrier that
+is built only by `contract_grouped_xref` and unwrapped only by
+`expand_grouped_xref`. That carrier makes mispairing *structurally unreachable
+through the public API*, so *no GX-1 runtime change is required* and the accepted
+GX-1 contract is not reopened.
+
+This review is read-only with respect to runtime code. No runtime, test,
+registry, or backlog-behaviour file is modified. The only added artifact is this
+review. No FTR edit is needed (see <<ftr>>).
+
+Repository state read: git root `core/`, branch `main`, clean worktree, HEAD
+`ad28e64` (GX-1 acceptance). No branch created/switched; nothing pushed. GX-2 is
+*not* implemented in this task.
+
+== Reviewed state and method
+
+* Relevant accepted commits verified present: `35e7221`, `2fc71b8`, `3187638`,
+  `ad28e64`.
+* Runtime re-derived from source:
+  `xref_crosstable/operation.py` (`contract_xref` / `expand_xref`, `name`
+  -> `config_id`, `_write_xref_meta`, `drop_source` value-loss guards),
+  `xref_axis_projection.py` (Slice 2 composite pattern: `_prepare` / `_publish`,
+  `resolve_axis_mapping(..., used_keys=...)`, `mark_frames_for_cleanup`),
+  `xref_axis_mapping/{model,resolver}.py` (`AxisMappingIntent`,
+  `ResolvedAxisMapping`, `labels_for_key` / `key_for_labels`, `used_keys`
+  completeness), `grouped_xref/{model,projection}.py` (GX-1),
+  `pipeline/build.py` (`build_steps_from_config`, `name` popping),
+  `pipeline/registry.py` (`StepRegistration`, `make_frames_target_step`),
+  `registries/pipeline_step_registry.json`, and
+  `tests/architecture/dependency_guards/test_pipeline_step_registry.py`
+  (registry guards + the `compact_multiaxis` signature-drift guard).
+* Live probes (project venv, pandas 3.0.2) confirmed the end-to-end composition
+  is realizable (see <<validation>>).
+
+[[capability]]
+== Exact public capability
+
+GX-2 adds two public, directional pipeline composites in the existing
+`grouped_xref` package, wrapping *unchanged* XRef plus the accepted GX-1
+primitives:
+
+* `contract_grouped_xref` -- canonical relation -> (unchanged `contract_xref`) ->
+  private flat canonical-string matrix -> (GX-1 `build_grouped_header`) ->
+  *published grouped-matrix representation* (flat matrix + `GroupedHeader`).
+* `expand_grouped_xref` -- grouped-matrix representation -> (GX-1
+  `restore_flat_matrix`) -> private flat canonical-string matrix -> (unchanged
+  `expand_xref`) -> canonical relation.
+
+GX-2 is the *public-surface slice*: it applies the YAML/registry gate, closes the
+Slice 2 F-1 follow-up, and adds a user guide entry and a release note. It does
+*not* begin XLSX/ODS carrier work (GX-3/GX-4), touch rendering/IR, alter XRef, the
+Slice 1 resolver, the Slice 2 flat steps, or the accepted GX-1 primitives.
+
+[[representation]]
+== Runtime representation (question 1)
+
+*Decision: GX-2 publishes a dedicated feature-owned grouped-matrix carrier --
+call it `GroupedMatrix` -- that bundles the flat canonical-string DataFrame and
+its `GroupedHeader` descriptor as a single Frames value under the composite's
+`output` name.* This is the smallest honest embodiment, at the Frames boundary,
+of the architecture's "grouped matrix representation = flat DataFrame +
+`GroupedHeader` descriptor" (architecture section 2/3).
+
+[source,python]
+----
+# grouped_xref/matrix.py  (illustrative, not final code)
+
+@dataclass(frozen=True, eq=False)
+class GroupedMatrix:
+    """Opaque Frames-boundary carrier: a flat canonical matrix + its descriptor.
+
+    Built only by contract_grouped_xref; unwrapped only by expand_grouped_xref
+    and (later) the GX-3/GX-4 carriers. It is a *carrier*, not a value object:
+    it deliberately does NOT claim value-equality or hashability, because it
+    holds a mutable pandas DataFrame (identical to how Frames already hold
+    mutable DataFrames as values).
+    """
+    frame: pd.DataFrame        # flat, canonical-string headers (contract_xref output)
+    header: GroupedHeader      # the trusted, immutable GX-1 descriptor
+----
+
+Why this over the assessed alternatives:
+
+[cols="1,3",options="header"]
+|===
+| Candidate | Assessment
+
+| Dedicated grouped-matrix carrier value (chosen)
+| One Frames value; frame+descriptor are trusted-by-construction (solves the
+  pairing question, <<pairing>>). Consumable later by GX-3/GX-4 (they unwrap it
+  to drive the header grid) and reversible by `expand_grouped_xref`.
+
+| Feature-owned Frames entry + descriptor sidecar frame
+| *Rejected.* A sidecar under a magic name (e.g. `output + "::grouped_header"`)
+  reintroduces name-coupled mispairing (GX1-A-M2 at the Frames level), pollutes
+  the frames namespace with a non-DataFrame value, and has no trusted pairing.
+
+| Structured wrapper / opaque pair held in one Frames value
+| *This is the chosen option* -- `GroupedMatrix` is exactly "an opaque pair held
+  in one Frames value".
+
+| Transient `_meta`
+| *Rejected by task constraint and on merit.* The descriptor is not run-local
+  scheduling state; storing it in generic `_meta` for convenience is prohibited.
+
+| New durable domain representation / persisted mapping
+| *Rejected.* No resolved mapping is persisted (architecture section 9); header
+  depth is configured, not persisted.
+|===
+
+The honesty caveat the GX-1 confirmation raised -- *do not freeze a DataFrame
+into a value object claiming immutability/hashability/value-equality* -- is
+respected: `GroupedMatrix` is an *opaque carrier* with identity semantics
+(`eq=False`, no value hash), mirroring how a bare DataFrame already lives as a
+mutable Frames value. This does *not* contradict the GX-1 decision to keep the
+DataFrame out of the frozen descriptor: the descriptor
+(`GroupedHeader`) stays a pure frozen value object; `GroupedMatrix` is a separate,
+GX-2-owned Frames-boundary carrier, not a second identity model. `pandas.MultiIndex`
+is still never the source of truth.
+
+Within GX-2 no other step consumes `output`; the carrier is produced by the
+forward and consumed by the inverse only. GX-3/GX-4 later teach the render/carrier
+path to unwrap it -- a natural, additive extension, not a GX-2 obligation.
+
+[[pairing]]
+== Pairing solution (questions 4, 12)
+
+*The `GroupedMatrix` carrier is the pairing solution.* GX1-A-M2 (the GX-1 inverse
+trusts the descriptor and ignores the paired frame's own labels, so a mispaired
+same-width frame is silently relabelled) is closed *structurally*:
+
+* `contract_grouped_xref` is the *only* producer of a `GroupedMatrix`; it builds
+  the frame and descriptor together from one resolution and one `contract_xref`
+  output, so they are a trusted pair by construction.
+* `expand_grouped_xref` reads the pair from `frames[matrix]`; *it exposes no
+  descriptor parameter*, so a caller cannot supply a descriptor paired with a
+  foreign frame. The mispairing path GX1-A-M2 probed is unreachable through the
+  public composite surface.
+* The only way to mispair is to hand-construct a `GroupedMatrix` with a
+  mismatched frame/header in-process -- arbitrary hostile in-process Python, which
+  Domain Boundary Robustness level 4 places out of scope.
+
+This satisfies the policy "do not rely only on developer discipline if the public
+API allows arbitrary mispairing": the public API *does not* allow mispairing.
+
+*GX-1 hardening decision (question 12): no GX-1 runtime change is required, and
+none should be made in GX-2.* The wrapper pairing fully solves GX1-A-M2. The cheap
+row-key `(position, label)` cross-check that acceptance noted as *available* would
+(a) not catch pure dynamic-column reordering anyway, (b) go beyond the accepted,
+frozen GX-1 count-only contract, and (c) add a runtime change to an accepted slice
+for a hazard the wrapper already makes unreachable. It is explicitly declined. No
+redundant canonical keys are added to `GroupedHeader`. `expand_grouped_xref` must
+still validate that `frames[matrix]` *is* a `GroupedMatrix` (type check ->
+`GroupedXrefError`), so a non-grouped or foreign frame under `matrix` fails
+cleanly rather than reaching `restore_flat_matrix`.
+
+[[signatures]]
+== Exact public signatures (question 5)
+
+Confirmed, refined from architecture section 6 to expose only genuinely required
+parameters and to avoid misleading symmetry (contract-only vs expand-only XRef
+parameters are kept asymmetric, exactly as the underlying primitives are).
+
+[source,python]
+----
+def contract_grouped_xref(
+    frames, *,
+    relation: str,                       # canonical relation frame name (in)
+    output: str,                         # grouped-matrix frame name (out)
+    row_keys: str | Iterable[Any],       # -> contract_xref AND build_grouped_header
+    source_frame: str,                   # -> AxisMappingIntent (live source)
+    key_column: str,                     # -> AxisMappingIntent
+    label_columns: Iterable[str],        # -> AxisMappingIntent (arity N)
+    column_key: str = "column_key",      # -> contract_xref (relation axis-id col)
+    value: str = "value",                # -> contract_xref
+    column_keys: Iterable[Any] | None = None,   # -> contract_xref
+    dense_axes: Mapping[str, Any] | None = None, # -> contract_xref
+    fill_value: Any = "",                # -> contract_xref
+    level_names: Iterable[str] | None = None,    # -> build_grouped_header (default label_columns)
+    order_policy: Any = "source_row",    # -> resolver
+    order_columns: Iterable[Any] = (),   # -> resolver
+    drop_source: bool = False,
+    name: str | None = None,             # -> contract_xref config id
+) -> Frames: ...
+
+def expand_grouped_xref(
+    frames, *,
+    matrix: str,                         # grouped-matrix frame name (in)
+    output: str,                         # canonical relation frame name (out)
+    row_keys: str | Iterable[Any],       # -> expand_xref
+    source_frame: str,                   # -> AxisMappingIntent (live source)
+    key_column: str,                     # -> AxisMappingIntent
+    label_columns: Iterable[str],        # -> AxisMappingIntent (arity N)
+    column_key: str = "column_key",      # -> expand_xref
+    value: str = "value",                # -> expand_xref
+    value_columns: Iterable[Any] | None = None,  # -> expand_xref
+    base_relation: str | None = None,    # -> expand_xref
+    order_policy: Any = "source_row",    # -> resolver
+    order_columns: Iterable[Any] = (),   # -> resolver
+    drop_source: bool = False,
+    name: str | None = None,             # -> expand_xref config id
+) -> Frames: ...
+----
+
+Parameter dispositions:
+
+* *Forwarded XRef parameters, unchanged semantics:* `row_keys`, `column_key`,
+  `value`, `column_keys` (contract), `value_columns` (expand), `dense_axes`
+  (contract), `fill_value` (contract), `base_relation` (expand). `drop_empty` is
+  *not* exposed: the grouped roundtrip contracts a fresh matrix each run and the
+  fill/empty policy is an XRef flat-path concern; omit it unless GX-3/GX-4 prove a
+  need (avoid unused symmetry).
+* *Axis-mapping parameters:* `source_frame`, `key_column`, `label_columns`
+  (arity N; note the *plural* -- unlike Slice 2's flat single `label_column`),
+  `level_names`, `order_policy`, `order_columns`. These build one
+  `AxisMappingIntent` per call.
+* *Defaults stated exactly:* `column_key="column_key"`, `value="value"`,
+  `column_keys=None`, `dense_axes=None`, `fill_value=""`, `value_columns=None`,
+  `base_relation=None`, `level_names=None` (-> `mapping.label_columns`),
+  `order_policy="source_row"`, `order_columns=()`, `drop_source=False`,
+  `name=None`.
+* *No mode-heavy unified API; no descriptor parameter on the inverse* (pairing).
+* Slice 2's `project_axis_labels` / `restore_axis_keys` stay unchanged and remain
+  the correct choice when no grouping is wanted.
+
+[[composition]]
+== XRef composition (question 2)
+
+*GX-2 calls the existing public `contract_xref` / `expand_xref` and the public
+GX-1 primitives; it factors no new helper and duplicates no XRef logic.*
+
+Forward `contract_grouped_xref`:
+
+. validate composite parameters and the `relation` frame at ingress (reuse the
+  Slice 2 `_prepare`-style precheck: `relation`/`output`/`column_key` non-empty
+  strings, distinct output under `drop_source`, relation present and physically
+  valid);
+. `interim = contract_xref(frames, relation=relation, output=output,
+  row_keys=row_keys, column_key=column_key, value=value, column_keys=column_keys,
+  dense_axes=dense_axes, fill_value=fill_value, drop_source=drop_source,
+  name=name)` -- the flat matrix is `interim[output]`, a *component of the
+  representation*, never a separately addressable published frame;
+. resolve the mapping *once* from the live `frames` with `used_keys` = the
+  matrix's dynamic (non-row-key) headers (<<resolution>>);
+. `header = build_grouped_header(interim[output], row_keys=row_keys,
+  mapping=mapping, level_names=level_names)`;
+. publish: `out = dict(interim); out[output] = GroupedMatrix(frame=interim[output],
+  header=header)`. `interim` already carries the XRef `_meta` and (under
+  `drop_source`) the relation cleanup mark, both produced atomically inside the
+  discardable copy.
+
+Inverse `expand_grouped_xref`:
+
+. validate parameters; require `frames[matrix]` to be a `GroupedMatrix`
+  (`GroupedXrefError` otherwise);
+. resolve the mapping *once* from the live `frames` (no `used_keys`; per-tuple
+  completeness is enforced by `key_for_labels`);
+. `flat = restore_flat_matrix(gm.frame, gm.header, mapping=mapping)`;
+. `interim = dict(frames); interim[matrix] = flat` -- rebind the *real* `matrix`
+  name locally to the unwrapped flat DataFrame, so no private frame name is ever
+  created;
+. `result = expand_xref(interim, matrix=matrix, output=output, row_keys=row_keys,
+  column_key=column_key, value=value, value_columns=value_columns,
+  base_relation=base_relation, drop_source=drop_source, name=name)`;
+. if `drop_source` is false, restore the grouped representation:
+  `result[matrix] = gm` (keep the wrapper, not the transient unwrapped frame).
+
+Private-frame handling (question 2 requirements):
+
+* *Never leaks:* the flat matrix is only ever the wrapper's `frame` field
+  (forward) or a local rebinding of the real `matrix` name (inverse). No
+  throwaway frame name is introduced, so nothing private can appear in the
+  returned Frames or in `_meta.xref_crosstable`.
+* *Never collides with user frames:* GX-2 uses only the caller-supplied `output`
+  / `matrix` names.
+* *Never partially published on failure:* both directions operate on the copied
+  dict returned by `contract_xref` / `expand_xref` (each does `dict(frames)`
+  internally) and build the wrapper before the final assignment (<<atomicity>>).
+
+[[resolution]]
+== Mapping resolution (question 3, honours GX1-A-M1)
+
+* *Exact `AxisMappingIntent`:* `AxisMappingIntent(source_frame=source_frame,
+  key_column=key_column, label_columns=tuple(label_columns),
+  order_policy=_order_policy(order_policy), order_columns=order_columns)`.
+  `label_columns` is arity N (plural), the grouped generalization of Slice 2's
+  one-element intent.
+* *Resolved once per call, both directions* (GX1-A-M1 / GX1-M1). GX-2 owns the
+  single `resolve_axis_mapping` call and hands the immutable `ResolvedAxisMapping`
+  to GX-1; GX-1 never resolves (verified: `grouped_xref` imports only
+  `ResolvedAxisMapping`).
+* *`used_keys` completeness on forward:* pass the matrix's dynamic headers (the
+  canonical keys that become grouped columns) as `used_keys`, so a used canonical
+  key missing from the source fails *before* any publication -- the tightest
+  completeness check. (`build_grouped_header` also rejects unknown keys via
+  `labels_for_key`; `used_keys` makes the completeness guarantee explicit and
+  owned by the composite, as the confirmation requires.)
+* *Reverse resolution:* re-resolve from the live source; `restore_flat_matrix`
+  rejects unknown / wrong-arity / incomplete / duplicate visible tuples via
+  `key_for_labels`.
+* *Conditional bijection across separate runs:* forward and inverse are exactly
+  invertible when both resolve the *same* key/label bijection from the *same*
+  live source frame and intent (identical to Slice 2). A changed or absent source
+  frame breaks losslessness -- declared as `conditionally_bijective` in the
+  registry with that reason.
+* *Diagnostics on source-mapping drift:* an absent source frame -> resolver
+  "source frame was not found"; a used key dropped from the source -> "used
+  canonical axis key(s) ... are missing"; a visible tuple whose components changed
+  -> `key_for_labels` "unknown complete visible label tuple". Non-guessing
+  throughout.
+* *No resolved mapping is persisted* (architecture section 9).
+
+[[metadata]]
+== Metadata and `name` contract (question 6)
+
+* *Grouped composites expose `name`*, forwarded verbatim to the internal
+  `contract_xref` / `expand_xref`, where it becomes the XRef `config_id`
+  (`name or relation` on contract, `name or output` on expand -- unchanged XRef
+  behaviour).
+* *XRef metadata describes only the internal flat XRef operation*, never the
+  grouped composite. `_meta.xref_crosstable.<config_id>` is written by unchanged
+  XRef exactly as today; grouped-XRef adds nothing to it and repurposes none of
+  its facets (architecture section 9). *Metadata ownership remains entirely
+  XRef-owned.*
+* *No temporary/private name can leak into `_meta`:* because the internal
+  `contract_xref` writes `output` as its `matrix` (the composite's real public
+  name) and the inverse rebinds the real `matrix` name, the `_meta` payload only
+  ever references caller-supplied names. Verified live: `contract_xref` with
+  `output="mtx"` wrote `_meta.xref_crosstable["rel"]` with `matrix="mtx"` and left
+  the caller frames and `_meta` untouched.
+* *Inverse finds the correct existing XRef config* the same way flat XRef does --
+  via a forwarded `name`. A basic grouped roundtrip does *not* require the config
+  (`expand_xref` infers `value_columns` from the matrix columns); the config only
+  carries dense-axis intent, exactly as in flat XRef.
+* *No new grouped-XRef metadata root* -- not proven necessary.
+
+[[dropsource]]
+== `drop_source` contract (question 7)
+
+* *Forward:* `drop_source=True` asserts the grouped matrix supersedes the
+  `relation`. GX-2 forwards `drop_source` to the internal `contract_xref`, which
+  applies its existing value-loss guards (relation must contain no fields beyond
+  `row_keys + column_key + value`; matrix columns must cover every relation column
+  key) and marks the *relation* for cleanup. Grouping only relabels headers, so
+  XRef's value-loss profile is exactly correct -- no separate grouped value-loss
+  guard is needed, and duplicating one would be wrong.
+* *Inverse:* `drop_source=True` asserts the expanded relation supersedes the
+  grouped matrix. GX-2 forwards `drop_source` to the internal `expand_xref`, which
+  marks the *`matrix`* name for cleanup (its existing guard rejects an explicit
+  `value_columns` subset that would strand matrix columns).
+* *Source/output distinction:* `drop_source and relation == output` (forward) /
+  `matrix == output` (inverse) is rejected at ingress before any work, mirroring
+  Slice 2 and XRef.
+* *Cleanup marking only after complete success:* the cleanup mark is written by
+  the internal primitive *into the discardable copied dict*; GX-2 publishes it
+  only after the grouped projection succeeds. A failure after `contract_xref`
+  discards the whole copy, mark included (<<atomicity>>).
+* *No private frame marking:* the marked frame is always the caller's `relation` /
+  `matrix` name, never a private frame.
+* *Compatible with XRef's own cleanup behaviour:* GX-2 reuses `mark_frames_for_cleanup`
+  transitively through the primitives; it adds no second cleanup mechanism.
+
+[[frames]]
+== Frames and registry contract (question 8)
+
+Two `composite` entries in `registries/pipeline_step_registry.json` plus matching
+`StepRegistration(factory=make_frames_target_step, target=...)` runtime
+registrations (mirroring `project_axis_labels`).
+
+`contract_grouped_xref` entry:
+
+* `category`: `composite`; `subtype`: e.g. `grouped_relation_to_matrix`;
+  `factory_shape`: `frames_target`; `status`: `current`.
+* `frame_contract`: `reads` `[relation, source_frame]`; `writes` `[output]`;
+  `preserves` `[relation, source_frame]`; `replaces`/`drops`/`internal_frames`
+  `[]` (no separate intermediate frame name exists); `view_outputs` `[output]`.
+* `meta_contract`: `reads` `[xref_crosstable]` (contract_xref reads prior dense
+  config); `writes` `[xref_crosstable (persistent), pipeline_cleanup.drop_frames
+  (transient, only under drop_source)]` -- exactly the internal `contract_xref`
+  footprint, declared honestly.
+* `inverse`: `kind` `conditionally_bijective`, `inverse_step`
+  `expand_grouped_xref`, `reason` citing live-source re-resolution.
+* `wrapped_steps`: `["contract_xref"]` (the composite guard requires non-empty
+  wrapped_steps that resolve to registered entries; the GX-1 primitives are not
+  registered steps, so only the registered XRef step is listed -- this is the
+  accurate composite declaration the task asks for). `aliases`: `[]`.
+* `references.ftr`: `FTR-XREF-AXIS-MAPPINGS-P4A2`; `docs`: this GX-2 confirmation.
+* `parameters`: every non-`frames` parameter with `required`/`type`/`source_kind`
+  matching the signature, plus notes for `source_frame` (live, fail-if-absent,
+  nothing persisted), `label_columns` (arity N), `order_policy`, `drop_source`.
+
+`expand_grouped_xref` entry is symmetric: `subtype`
+`grouped_matrix_to_relation`; `frame_contract.reads` `[matrix, source_frame]`,
+`writes` `[output]`, `preserves` `[matrix, source_frame]`; `wrapped_steps`
+`["expand_xref"]`; `inverse_step` `contract_grouped_xref`; `meta_contract` mirrors
+`expand_xref`.
+
+The registry thus represents GX-2 as a genuine *composite* (category + non-empty
+`wrapped_steps`), not a pretend primitive.
+
+[[f1]]
+== Pipeline builder and Slice 2 F-1 closure (question 9)
+
+Close F-1 in GX-2, per architecture section 13. Two committed additions:
+
+. *Public build/run smoke.* A test that builds `contract_grouped_xref ->
+  expand_grouped_xref` (and, at marginal cost, the Slice 2
+  `project_axis_labels -> restore_axis_keys`) via `build_steps_from_config`
+  and runs them through `run_pipeline`, asserting the canonical relation
+  round-trips and that YAML `name` is popped by the builder and consumed as the
+  XRef config id.
+. *One reusable parameter-signature guard.* Generalize the existing
+  `test_compact_multiaxis_registry_parameters_match_public_signatures` into a
+  single data-driven assertion that, for every `frames_target` / `builder_target`
+  registry entry, imports the `target` and asserts `set(registered params) ==
+  set(signature params) - {"frames"}` and that each `required` flag matches
+  `default is empty`. This covers Slice 2 flat steps, GX-2 grouped steps, and
+  `compact_multiaxis` at once -- one reusable registry/signature assertion, no
+  per-feature duplication (task question 9 and architecture section 13). If a
+  fully generic sweep surfaces a pre-existing entry that legitimately diverges,
+  scope the guard to the axis/grouped/compact family rather than weakening it.
+
+Marking F-1 closed in GX-2 requires the Slice 2 acceptance F-1 disposition to be
+updated when GX-2 lands (documentation-only).
+
+[[atomicity]]
+== Atomicity (question 10)
+
+*Build-then-publish holds without a bespoke transaction, because the internal
+primitives already return copied Frames.* Verified live: `contract_xref` does
+`out = dict(frames)`, builds a fresh matrix, writes `_meta`, and returns a *new*
+dict; the caller's `frames` and `_meta` are untouched. `expand_xref` behaves the
+same.
+
+Consequently:
+
+* *Forward:* `resolve_axis_mapping` (read-only) and `build_grouped_header`
+  (read-only, build-then-return) run *after* `contract_xref` on its discardable
+  `interim` copy. A failure at resolution or header build simply discards
+  `interim` and raises -- leaving *no* private output frame, *no* private XRef
+  `_meta`, *no* cleanup command, and the caller's Frames/`_meta` unchanged. The
+  wrapper is assigned only on the last line, after everything succeeds.
+* *Inverse:* `resolve_axis_mapping` and `restore_flat_matrix` run *before* the
+  `interim` rebinding and the `expand_xref` call; a failure there mutates nothing.
+  `expand_xref` builds its own copy, so its failure leaves the caller untouched.
+* The task's stated failure point -- "after `contract_xref` but before grouped
+  publication" -- is exactly the resolution/`build_grouped_header` window on the
+  discardable copy: it leaves no private frame, no private XRef metadata, no
+  cleanup command, and caller Frames/`_meta` unchanged. *Confirmed.*
+
+GX-2 must not pre-mutate the caller's `frames`, must resolve/build before the
+final wrapper assignment, and must never forward a partially built dict.
+
+[[validation-diagnostics]]
+== Validation and diagnostics (question 11)
+
+* *Feature-owned error type:* a `GroupedXrefError` (a `ValueError` subclass,
+  mirroring `AxisMappingError` / `GroupedHeaderError`) for composite-owned
+  failures: missing/invalid composite parameters, `frames[matrix]` not a
+  `GroupedMatrix`, output collisions, `drop_source` with `relation == output` /
+  `matrix == output`.
+* *Do not wrap deliberate domain errors:* resolver failures stay
+  `AxisMappingError`; GX-1 header/tuple failures stay `GroupedHeaderError`; XRef
+  failures stay `ValueError` from XRef. Wrap only where additional composite
+  context is genuinely needed (e.g. relabelling "frame not found" for the grouped
+  `matrix` input). Reuse the safe-diagnostic discipline (constant detail; never
+  execute a rejected value's `repr`/`type`/`hash`/`eq`/iteration).
+* *No raw `KeyError` / pandas / `TypeError` leaks* for supported malformed public
+  input: a missing frame, a non-`GroupedMatrix` under `matrix`, an unknown
+  canonical key/tuple, a source-frame drift, or a duplicate tuple all produce a
+  deterministic `GroupedXrefError` / `AxisMappingError` / `GroupedHeaderError` /
+  XRef `ValueError`.
+
+[[tests]]
+== Tests (question 13)
+
+Focused GX-2 tests in `tests/unit/domain/transformations/test_grouped_xref.py`
+(extend) and an integration/public-build module, marked
+`pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")`:
+
+* *Forward composite* -- relation -> `GroupedMatrix` under `output`; descriptor
+  carries exact arity-N tuples; flat frame has canonical headers.
+* *Inverse composite* -- `GroupedMatrix` -> canonical relation.
+* *Exact Frames roundtrip* -- `contract_grouped_xref` then `expand_grouped_xref`
+  reproduces the canonical relation exactly. *Use a dense relation (or
+  `drop_empty` semantics on a separate flat check):* the live probe confirmed a
+  *sparse* relation densifies via XRef `fill_value` (6 rows from 4), which is
+  inherent XRef behaviour, not a grouped defect -- the roundtrip test fixture must
+  be dense so the assertion is meaningful.
+* *Arity 2 and 3.*
+* *Repeated upper labels* with distinct complete tuples preserved through the
+  composite.
+* *Literal delimiter components* (`" / "`, `"."`) inside tuples survive.
+* *Both resolver order policies* (`source_row`, `columns`) -- roundtrip identical.
+* *Mapping completeness* -- a used canonical key absent from the source fails on
+  forward (`used_keys`) before publication.
+* *Source-mapping drift* -- contract with one source, expand with a source missing
+  a tuple -> `key_for_labels` rejection; absent source frame -> resolver
+  rejection.
+* *Private-intermediate non-leakage* -- after forward, `output` holds a
+  `GroupedMatrix` (not a bare matrix) and no extra/private frame name exists;
+  after inverse, no private frame and (without `drop_source`) `matrix` still holds
+  the `GroupedMatrix`.
+* *`_meta` ownership* -- only `xref_crosstable` (XRef-owned) and, under
+  `drop_source`, transient `pipeline_cleanup.drop_frames`; no grouped root; no
+  private name in the payload.
+* *XRef metadata correctness* -- forwarded `name` becomes the XRef `config_id`;
+  payload references only public names.
+* *Failure after XRef but before grouped publication* -- inject a resolution /
+  header failure post-`contract_xref`; assert caller Frames + `_meta` unchanged,
+  no output frame, no cleanup command.
+* *`drop_source`* -- forward marks `relation`, inverse marks `matrix`, only after
+  success; `relation == output` / `matrix == output` rejected.
+* *Output collisions* -- duplicate restored headers / duplicate complete tuples
+  rejected (inherited from GX-1 / XRef).
+* *Frame/descriptor pairing* -- `expand_grouped_xref` on a non-`GroupedMatrix`
+  frame under `matrix` fails cleanly; there is no public path to supply a foreign
+  descriptor.
+* *Public build/run path* -- the F-1 smoke through `build_steps_from_config` /
+  `run_pipeline`.
+* *Registry/signature guard* -- the generalized parameter-signature assertion
+  covers both grouped entries (and Slice 2).
+* *Slice 2 compatibility* -- existing flat steps and flat YAML remain valid and
+  unchanged.
+* *Architecture guards* -- layer-boundary, registry-target-symmetry, composite
+  `wrapped_steps`, and meta-registry guards pass with the two new composites.
+
+*No XLSX/ODS carrier tests belong to GX-2* (GX-3/GX-4).
+
+[[docs]]
+== Documentation (question 14)
+
+* *Pipeline registry JSON* -- two composite entries.
+* *Runtime registry* -- two `StepRegistration`s.
+* *User guide* -- a grouped-XRef section in
+  `docs/user_guide/ch03_transformation_catalog/02_bijective_transforms.adoc`
+  (parameter tables, a YAML example, the conditional-bijection + live-source
+  requirement, the grouped-matrix representation, and "no persistence").
+* *Release notes* -- a bullet under the active `== unknown -- planned` section
+  (new public capability). Required (public import/YAML/registry surface).
+* *Functional/Technical Model* -- an optional short note on the `GroupedMatrix`
+  carrier if the implementer judges it needs a home beyond this review and the
+  architecture confirmation; not mandatory.
+* *GX-2 implementation self-review* -- required per the repository review
+  contract, recording validation evidence and any deviation.
+* *FTR status* -- update the GX-2 line to "accepted" only at the GX-2 *acceptance*
+  gate, not at implementation; note F-1 closed.
+
+[[nongoals]]
+== Non-goals
+
+* No XLSX/ODS carrier, rendering, IR, composer, or parser change (GX-3/GX-4).
+* No change to `contract_xref` / `expand_xref`, the Slice 1 resolver, the Slice 2
+  flat steps, or the accepted GX-1 primitives/model.
+* No new `_meta` root; no persisted resolution; no persisted header depth.
+* No `MultiIndex`/`" / "`/delimiter/dot-splitting/merge-geometry encoding.
+* No redundant canonical keys in `GroupedHeader`; no GX-1 runtime hardening.
+* No adoption chain or view wrapper (GX-5); no discriminator multiprojection.
+* No `drop_empty` exposure unless a later carrier slice proves the need.
+
+[[findings]]
+== Findings by severity
+
+=== Blocking
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+* *GX2-C-M1 (roundtrip fixture must be dense).* A *sparse* canonical relation does
+  not survive `contract_grouped_xref -> expand_grouped_xref` unchanged, because
+  `contract_xref` densifies with `fill_value` (probe: 6 rows from 4) -- pure XRef
+  behaviour, unaffected by grouping. *Action:* GX-2 roundtrip fixtures must be
+  dense (or assert on the drop_empty/non-empty subset), so the exactness assertion
+  is meaningful. Not a defect; a test-design obligation.
+* *GX2-C-M2 (`GroupedMatrix` carrier honesty).* The carrier holds a mutable
+  DataFrame; it must *not* be a frozen value object claiming value-equality /
+  hashability (that dishonesty is what the GX-1 confirmation rejected for the
+  descriptor). *Action:* implement it as an opaque identity-semantics carrier
+  (`eq=False`, no value hash), and test that it is not treated as a hashable value
+  object.
+* *GX2-C-M3 (F-1 guard generality).* Prefer one data-driven
+  registered-parameters-match-signature guard over the whole `frames_target`
+  family; if a fully generic sweep trips a pre-existing entry, scope it to the
+  axis/grouped/compact family rather than weakening the assertion. *Action:*
+  implement the reusable form; do not duplicate a per-step guard.
+
+=== Observations
+
+* *GX2-C-O1.* GX-2 introduces exactly one new public type (`GroupedMatrix`); the
+  identity model, bijection, and header projection are all reused. This is the
+  single genuinely new design element and the reason GX-2 is coherent as one
+  slice.
+* *GX2-C-O2.* The inverse's "rebind the real `matrix` name to the unwrapped flat
+  DataFrame on a local copy" pattern is the key trick that avoids any private
+  frame name in `_meta` / cleanup while still reusing unchanged `expand_xref`.
+* *GX2-C-O3.* GX-3/GX-4 will unwrap `GroupedMatrix` to drive the header grid; the
+  carrier is the forward-compatible representation the architecture anticipated.
+
+[[sizing]]
+== Scope and sizing (question 15)
+
+*GX-2 is one coherent implementation slice; do not split.* It is the
+public-surface unit: the `GroupedMatrix` carrier, the two composites, the two
+registry + runtime registrations, the F-1 public-build smoke and generalized
+signature guard, the user guide entry, and the release note. The only genuinely
+new design element is the carrier; everything else is thin composition over
+accepted primitives plus registry/doc surface -- comparable in size to Slice 2
+plus the folded F-1. Splitting the carrier from the composites would recreate the
+"descriptor with no producer/consumer" seam the GX-1 sizing decision warned
+against. Keep GX-2 whole. If, during implementation, the generalized F-1 guard
+proves disruptive to unrelated entries, narrow its scope (GX2-C-M3) rather than
+splitting the slice.
+
+[[sequence]]
+== Recommended implementation sequence
+
+. Add `grouped_xref/matrix.py`: the `GroupedMatrix` carrier and `GroupedXrefError`.
+. Add `grouped_xref/composites.py`: `contract_grouped_xref` then
+  `expand_grouped_xref`, composing unchanged `contract_xref` / `expand_xref`,
+  `resolve_axis_mapping` (once, `used_keys` on forward), and the GX-1 primitives;
+  build-then-publish on the copied interim dict.
+. Export the two composites (and the carrier) from `grouped_xref/__init__.py` for
+  the pipeline registry target; keep GX-1 primitives as-is.
+. Register both composites in `pipeline/registry.py` and
+  `registries/pipeline_step_registry.json` (`composite`, `wrapped_steps`).
+. Extend `test_grouped_xref.py` with the forward/inverse/roundtrip/failure/
+  metadata/drop_source/pairing cases; add the F-1 public-build smoke; generalize
+  the parameter-signature guard.
+. User guide + release note; GX-2 implementation self-review; run the focused
+  suite, architecture guards, ruff, source-style guard, Asciidoctor; commit
+  implementation and self-review per the separate-commit rule.
+
+[[acceptance]]
+== Exact acceptance criteria for GX-2
+
+* `contract_grouped_xref` = unchanged `contract_xref` then GX-1 forward
+  projection, publishing a `GroupedMatrix(frame, header)` under `output` whose
+  descriptor carries exact arity-N visible tuples and single-level row keys;
+  `expand_grouped_xref` = GX-1 inverse then unchanged `expand_xref`; a Frames-level
+  roundtrip over a *dense* relation reproduces the canonical relation exactly under
+  both order policies, for arity 2 and 3, with repeated upper labels and literal
+  delimiter components preserved.
+* The `(frame, header)` pair is trusted-by-construction: the inverse exposes no
+  descriptor parameter and rejects a non-`GroupedMatrix` `matrix` frame; GX1-A-M2
+  mispairing is unreachable through the public API; no GX-1 runtime change is made.
+* Mapping is resolved once per call and handed to both directions; forward
+  `used_keys` completeness is owned by the composite; source-mapping drift and
+  absent source frames produce safe resolver/`key_for_labels` diagnostics; no
+  resolution is persisted.
+* The private flat matrix never leaks (no extra frame name, none in `_meta`);
+  `_meta` ownership stays entirely XRef-owned (only `xref_crosstable` and, under
+  `drop_source`, transient `pipeline_cleanup.drop_frames`); forwarded `name`
+  becomes the XRef `config_id`; no grouped `_meta` root.
+* `drop_source` marks `relation` (forward) / `matrix` (inverse) only after full
+  success, reuses XRef's value-loss guards, rejects `== output`, and never marks a
+  private frame; a failure after `contract_xref` but before grouped publication
+  leaves caller Frames and `_meta` unchanged.
+* Both composites are registered with symmetric runtime/JSON `composite` entries
+  (non-empty `wrapped_steps`); the registry-target, layer-boundary, composite, and
+  meta-registry guards pass; the folded F-1 public-build smoke and the generalized
+  parameter-signature guard pass and cover Slice 2 + GX-2; Slice 2 flat steps and
+  flat YAML remain valid unchanged.
+* User guide entry + release note (active unreleased section) present; GX-2
+  implementation self-review committed separately; ruff, source-style guard, and
+  Asciidoctor pass; `git diff --check` clean.
+
+[[ftr]]
+== FTR correction assessment
+
+*No FTR edit is needed.* The owning FTR already records the merged architecture,
+the GX-1..GX-5 sequence with GX-2 described as "`contract_grouped_xref` /
+`expand_grouped_xref` wrapping unchanged XRef plus GX-1; registry, docs, release
+note; Frames/descriptor-level roundtrip. Applies the public-surface gate and
+closes the Slice 2 F-1 follow-up", GX-1 as accepted, and the OPEN GX-3/GX-4
+carrier items. This review adds Frames-boundary precision (the `GroupedMatrix`
+carrier, the pairing solution, the metadata/drop-source/atomicity contracts)
+consistent with that wording; it introduces no new lifecycle status and no
+contradiction. The merged Slice 3/4 decision and the accepted GX-1 contract are
+not reopened.
+
+[[validation]]
+== Validation
+
+Read-only with respect to runtime; the only added file is this review artifact.
+
+* Symbol/path checks (all exist at the cited paths): `contract_xref` /
+  `expand_xref` (`name` -> `config_id`, `_write_xref_meta`, `drop_source`
+  value-loss guards); `xref_axis_projection.py` (Slice 2 `_prepare` / `_publish`,
+  `resolve_axis_mapping(..., used_keys=...)`, `mark_frames_for_cleanup`);
+  `resolve_axis_mapping` + `AxisMappingIntent` (arity-N `label_columns`,
+  `used_keys` completeness); `build_grouped_header` / `restore_flat_matrix` +
+  `GroupedHeader` (GX-1); `build_steps_from_config` (`name` popping);
+  `pipeline/registry.py` (`StepRegistration`, `make_frames_target_step`);
+  `pipeline_step_registry.json` `project_axis_labels` / `contract_xref` entries;
+  `test_pipeline_step_registry.py` composite + `compact_multiaxis` signature guard.
+* No `contract_grouped_xref` / `expand_grouped_xref` / `GroupedMatrix` exists yet
+  (greenfield confirmed).
+* Live probes (project venv, pandas 3.0.2):
+  ** `contract_xref` returns a copied Frames dict; caller `frames` and `_meta`
+     untouched; `_meta.xref_crosstable["rel"]` written with `matrix="mtx"`.
+  ** `contract_xref -> build_grouped_header -> restore_flat_matrix` is bit-exact
+     (`restored.equals(matrix)` True), proving the GX-2 forward/inverse header
+     projection composes losslessly over unchanged XRef for an arity-2 mapping.
+  ** the composite relation roundtrip differs only by XRef `fill_value`
+     densification (6 rows from a sparse 4-row relation), identical to plain
+     `contract_xref -> expand_xref`; with `drop_empty` + non-empty filter it
+     matches the sparse original exactly -- confirming the difference is
+     XRef-inherent, not grouped (GX2-C-M1).
+* `git diff --check`: clean (only this artifact added).
+* Asciidoctor render of this artifact: clean (see command log).
+
+No full runtime suite was run because this task modifies no executable file.
+
+GROUPED XREF GX-2 READY FOR IMPLEMENTATION
