@@ -1,0 +1,301 @@
+= Slice 2 Implementation Self-Review: Flat XRef Axis-Label Projection
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+Slice 2 of `FTR-XREF-AXIS-MAPPINGS-P4A2` is implemented against the accepted
+confirmation contract
+(`FTR-XREF-AXIS-MAPPINGS-P4A2_slice2_confirmation_review_001.adoc`) and is ready
+for independent acceptance review 001.
+
+The feature commit `958adb8` adds two opt-in `Frames -> Frames` pipeline steps --
+`project_axis_labels` (outbound) and `restore_axis_keys` (inbound) -- that swap a
+relation's axis-identity column between canonical keys and flat one-level visible
+labels, composed around unchanged `contract_xref` / `expand_xref`, plus their
+registrations, symmetric registry entry, focused unit tests, XLSX/ODS roundtrip
+integration tests, a user-guide catalogue entry, and a release note. No Slice 1,
+XRef, metadata-registry, persistence-boundary, schema-maintenance, rendering, or
+adapter surface changed.
+
+== Repository state
+
+* Branch `main`; feature commit `958adb8` on top of the Slice 2 confirmation
+  commit `6a5cd8c`.
+* This self-review is the second commit and adds only this artifact.
+
+== Delivered change set (feature commit `958adb8`)
+
+[cols="2,3",options="header"]
+|===
+| File | Change
+
+| `src/spreadsheet_handling/domain/transformations/xref_axis_projection.py`
+| New module: `project_axis_labels`, `restore_axis_keys`, and small private
+  ingress/publish helpers. Composes the Slice 1 resolver; imports only pandas,
+  `domain.pipeline_cleanup`, `domain.tabular`, and the `xref_axis_mapping`
+  package public API.
+
+| `src/spreadsheet_handling/pipeline/registry.py`
+| Two `StepRegistration(factory=make_frames_target_step, target=...)` entries.
+
+| `registries/pipeline_step_registry.json`
+| Two symmetric entries (category `primitive`, status `current`, factory_shape
+  `frames_target`) with all 16 required fields.
+
+| `tests/unit/domain/transformations/test_xref_axis_projection.py`
+| 19 focused tests.
+
+| `tests/integration/io_backends/test_xref_axis_projection_roundtrip.py`
+| 3 XLSX/ODS roundtrip tests.
+
+| `docs/user_guide/ch03_transformation_catalog/02_bijective_transforms.adoc`
+| `project_axis_labels` / `restore_axis_keys` catalogue entry with parameter
+  table, losslessness condition, and a YAML example.
+
+| `docs/release_notes/release_notes.adoc`
+| Bullet under the active `== unknown -- planned` section.
+|===
+
+== Verification against the confirmation contract
+
+=== Exact implementation vs. contract
+
+* *Public names / output model:* settled `project_axis_labels` /
+  `restore_axis_keys`, source-to-output with a distinct `output` frame and
+  optional `drop_source`.
+* *Flat one-level only:* the intent is built with a single-element
+  `label_columns=(label_column,)`, so every resolved label tuple has arity one
+  and is unwrapped (`labels_for_key(key)[0]`); inbound wraps each label as a
+  one-element tuple (`key_for_labels((value,))`). No tuple/MultiIndex/grouped
+  behavior is introduced.
+* *Consumes Slice 1 resolver only:* the module calls `resolve_axis_mapping`,
+  `labels_for_key`, and `key_for_labels`, and reuses `AxisMappingError`,
+  `AxisMappingIntent`, and `AxisOrderPolicy`. It does not re-implement the
+  exact-string / exact-tuple / safe-diagnostic / NumPy-integer contracts, so no
+  new shared helper is extracted (semantic-DRY bar unmet).
+
+=== Two evidence-driven refinements to the recommended parameter shape
+
+The confirmation review settled names and output model and explicitly noted the
+parameter shape was "confirmable at the acceptance gate (low risk)". Two minor
+refinements were made because implementation exposed concrete issues; both are
+recorded here for the acceptance reviewer:
+
+. *`name` parameter omitted.* The recommended signature listed `name=None` by
+  analogy to XRef, where `name` keys a persisted `_meta.xref_crosstable.<id>`
+  config. These steps write no feature-owned `_meta`, so `name` would be an
+  unused, misleading public parameter. Omitting it keeps the public surface
+  honest. This is the only settled-signature deviation.
+. *`order_policy` / `order_columns` retained but documented as substitution-
+  irrelevant.* They are forwarded to the resolver unchanged, but value
+  substitution does not consume member order, so a projection roundtrip is
+  identical under both policies. This is documented in the module, the
+  user-guide entry, and the registry `notes`, and asserted by
+  `test_roundtrip_result_is_order_policy_independent`. `SOURCE_ROW` is
+  documented as relative to caller-supplied source-frame row order, with no
+  serialized ordering contract, per the task instruction.
+
+Neither refinement re-opens a settled decision; both keep the contract's intent
+while removing misleading or unused surface.
+
+=== No Slice 1 or XRef changes
+
+`git show --stat 958adb8` touches no file under
+`domain/transformations/xref_axis_mapping/` or
+`domain/transformations/xref_crosstable/`. XRef and the resolver package are
+byte-for-byte unchanged; the two steps run before `contract_xref` and after
+`expand_xref` as separate steps. Verified: no protected surface
+(`xref_axis_mapping`, `xref_crosstable`, `meta_registry`, `persistence_boundary`,
+`schema_maintenance`) appears in the commit's file list.
+
+=== No new persisted metadata
+
+`reads: []` and the only declared write is the pre-existing transient
+`_meta.pipeline_cleanup.drop_frames` (contributed by `mark_frames_for_cleanup`
+only when `drop_source=True`). No new `_meta` root is introduced, and
+`registries/meta_registry.yaml` is unchanged. `test_meta_is_passed_through_
+untouched_by_default` asserts `_meta` is carried through unchanged on the default
+path; the inverse resolves from the live source frame, so no mapping Resolution
+is persisted. Consequently no metadata-registry, persistence-boundary, or
+schema-maintenance change was needed or made.
+
+=== Ownership and failure atomicity
+
+* *Ownership:* the output frame is `df.copy()` with the substituted column; the
+  input relation DataFrame is never mutated in place, and `dict(frames)`
+  shallow-copies the mapping. `mark_frames_for_cleanup` copies `_meta` before
+  mutating. Verified by `test_inputs_are_not_mutated` and
+  `test_drop_source_marks_relation_without_mutating_input_meta`.
+* *Build-then-publish atomicity (scope: Frames dict, output DataFrame, `_meta`):*
+  the full mapping is resolved and every value substituted (raising on any bad
+  key/label) before `_publish` creates the output frame or marks cleanup.
+  Verified by `test_failure_publishes_no_output_frame` (an unknown key leaves the
+  frame set unchanged and creates no output frame). Arbitrary caller-iterator
+  side effects remain outside the promise, consistent with Slice 1.
+
+=== Registry symmetry
+
+`set(entries) == set(REGISTRY)` and `runtime_name` symmetry hold; both entries
+pass the required-field, enum, parameter-shape, meta-contract, and target-
+resolution guards. Verified by
+`tests/architecture/dependency_guards/test_pipeline_step_registry.py` (all pass)
+and the transformation layer/public-API guards under
+`tests/architecture/domain_transformations/`.
+
+=== XLSX/ODS identity roundtrip
+
+`test_xref_axis_projection_roundtrip.py` proves the canonical vocabulary survives
+`project_axis_labels -> contract_xref -> write -> read -> expand_xref ->
+restore_axis_keys` for both XLSX and ODS, that matrix headers persist as flat
+strings (no MultiIndex), and that XLSX and ODS restore identically. No carrier or
+XRef change was required.
+
+=== Documentation / public-surface completeness
+
+* User-guide catalogue entry with full parameter table, losslessness condition,
+  and YAML example.
+* Release note under the active planned section (public opt-in steps ->
+  release-notes checkpoint satisfied).
+* Registry entries carry the FTR reference and confirmation-review path.
+
+== Adversarial correctness obligations (all covered)
+
+[cols="3,2",options="header"]
+|===
+| Obligation | Test
+
+| Outbound unknown canonical key fails
+| `test_outbound_unknown_canonical_key_fails`
+
+| Inbound unknown visible label fails
+| `test_inbound_unknown_visible_label_fails`
+
+| Missing source frame fails
+| `test_missing_source_frame_fails`
+
+| Missing relation / missing axis column fails
+| `test_missing_relation_frame_fails`, `test_missing_axis_column_fails`
+
+| Duplicate source labels fail the bijection
+| `test_duplicate_source_labels_fail_bijection`
+
+| Invalid `order_policy` fails with a feature diagnostic
+| `test_invalid_order_policy_string_fails`
+
+| Exact flat-string roundtrip identity (XLSX and ODS)
+| `test_flat_axis_projection_roundtrips_through_carrier`,
+  `test_xlsx_and_ods_restore_identically`
+|===
+
+Out-of-scope (level-4) hostile in-process objects are not defended beyond the
+resolver's narrow value contract, per the accepted Domain Boundary Robustness
+policy. No genuine explicit-guarantee violation (immutability, atomicity, exact
+identity, deterministic order) was found during self-probing.
+
+== Validation results
+
+All commands ran from `/home/stefan/repos/spreadsheet-handling/core` with the
+project virtualenv (Python 3.13.5, NumPy 2.4.4, pandas 3.0.2).
+
+Focused unit tests:
+
+[source,console]
+----
+.venv/bin/python -m pytest -o addopts='' -q \
+  tests/unit/domain/transformations/test_xref_axis_projection.py
+----
+
+Result: 19 passed.
+
+Registry and transformation architecture guards:
+
+[source,console]
+----
+.venv/bin/python -m pytest -o addopts='' -q \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py \
+  tests/architecture/domain_transformations/
+----
+
+Result: 17 passed.
+
+XLSX/ODS roundtrip integration tests:
+
+[source,console]
+----
+.venv/bin/python -m pytest -o addopts='' -q \
+  tests/integration/io_backends/test_xref_axis_projection_roundtrip.py
+----
+
+Result: 3 passed.
+
+Full active Core suite:
+
+[source,console]
+----
+make test PYTEST_OPTS="-o addopts='' -q"
+----
+
+Result: 1955 passed, 1 xfailed (baseline was 1933 passed, 1 xfailed; +19 unit
+and +3 integration tests).
+
+Ruff:
+
+[source,console]
+----
+.venv/bin/ruff check \
+  src/spreadsheet_handling/domain/transformations/xref_axis_projection.py \
+  src/spreadsheet_handling/pipeline/registry.py \
+  tests/unit/domain/transformations/test_xref_axis_projection.py \
+  tests/integration/io_backends/test_xref_axis_projection_roundtrip.py
+----
+
+Result: All checks passed.
+
+Source-style guard:
+
+[source,console]
+----
+.venv/bin/python tools/check_source_style.py
+----
+
+Result: 0 errors, 78 warnings, 2 allowlisted findings; no warning in the new
+feature files (baseline count unchanged from acceptance review 003).
+
+Asciidoctor (Asciidoctor 2.0.23): the changed release notes, the user-guide
+bijective-transforms chapter, and this self-review render cleanly.
+
+`git diff --check` / `git diff --cached --check`: clean.
+
+== Non-goals confirmed (unchanged in this slice)
+
+No multi-level tuple projection, no MultiIndex, no grouped headers, no
+tuple-to-string delimiter encoding; no new carrier/render behavior beyond proving
+existing flat-string roundtrip; no `project_by_role` replacement; no
+discriminator multiprojection; no XRef-view wrapper; no adoption migration; no
+persisted mapping Intent.
+
+== Residual risks
+
+* `SOURCE_ROW` ordering remains deterministic only relative to caller-supplied
+  source-frame row order; this slice deliberately defines no serialized ordering
+  contract (documented, not a defect).
+* The platform-derived exact NumPy integer vocabulary and the resolver's scoped
+  atomicity promise are inherited from Slice 1 and unchanged; their watch-only
+  residuals carry forward.
+* Multi-level (Slice 3) and grouped-header carrier (Slice 4) work remain open;
+  the staged FTR stays open and on the active backlog.
+
+== Lifecycle cleanup check
+
+`FTR-XREF-AXIS-MAPPINGS-P4A2` is a staged capability contract; Slices 3--5 remain
+unimplemented. Its status must not become `Done`, its include must remain in
+`docs/backlog/_ftrs_open.adoc`, and no companion artifact moves to cold storage.
+No lifecycle cleanup is performed in this slice.
+
+== Readiness
+
+Independent acceptance review 001 is the next gate. This is an implementation
+self-review; a reviewer should treat its claims as evidence to verify, not proof.
+
+XREF AXIS MAPPINGS SLICE 2 READY FOR ACCEPTANCE REVIEW 001
