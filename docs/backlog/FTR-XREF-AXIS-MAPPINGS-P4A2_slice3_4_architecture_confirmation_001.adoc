@@ -1,0 +1,513 @@
+= Merged Slice 3/4 Architecture Confirmation 001: Grouped XRef
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+The independent architecture decision -- *MERGE SLICES 3 AND 4* into a single
+grouped-XRef capability that projects visible label tuples onto matrix headers
+*after* unchanged `contract_xref` and restores canonical string headers *before*
+unchanged `expand_xref` -- is *confirmed*. It is compatible with current
+repository contracts, it resolves the Slice 3 readiness blockers R-1/R-2/R-3,
+and it converts cleanly into a staged implementation plan. The architectural
+capability is merged; implementation stays sliced (model, composite, XLSX, ODS,
+adoption).
+
+This confirmation is read-only with respect to runtime code. Every material
+claim below was re-derived from source, the registry, and live probes. Minimal
+documentation-only FTR edits accompany this artifact to establish a single
+source of truth (see FTR ownership).
+
+Repository state read: git root `core/`, branch `main`, clean worktree, HEAD
+`ce7fc50` (Slice 3 readiness review). No branch created/switched; nothing pushed.
+
+== 1. Validation of the merge decision
+
+Confirmed on repository evidence:
+
+* *No standalone consumer for a public long-form level-column projection.*
+  Grep across `src/` and `registries/` finds no `grouped_xref`, `column_axis`,
+  or `grouped_columns` implementation, and no pipeline step consumes a
+  multi-level long-form relation: `contract_xref` takes a *single* `column_key`
+  (`xref_crosstable/operation.py:222-227`). The only documented consumer of an
+  explicit level-column long form is `FTR-XREF-GROUPED-COLUMNS-P4A2` itself,
+  which is `Status: New` and unimplemented. The readiness review's
+  representation B therefore had no independent client -- publishing it would
+  expose a transient intermediate with lasting naming/placement/collision/
+  inverse/migration/documentation contracts for no consumer. *The decision to
+  reject a public long-form API is correct.*
+* *Canonical string identities should remain inside XRef.* `contract_xref` /
+  `expand_xref` enforce a carrier-stable contract: matrix-axis identities must be
+  unique non-empty built-in strings, and MultiIndex/tuple columns are rejected
+  (`xref_crosstable/primitives.py:49-65`, `_ensure_column_identity_values`; live
+  probe: a tuple `column_key` value is rejected). Keeping canonical strings
+  inside XRef preserves the accepted Slice 1/2 architecture and needs zero XRef
+  change. *Correct.*
+* *Grouped visible tuples belong to a matrix/header projection layer.* The render
+  path already turns a `MultiIndex` DataFrame into a multi-row header grid with
+  merges (`rendering/composer/layout_composer.py:28-81`). Projecting visible
+  tuples onto matrix headers *after* `contract_xref` slots directly into this
+  layer without touching relation<->matrix shape logic. *Correct and reuses
+  existing machinery.*
+* *Merging removes an artificial boundary, not merely creating an oversized
+  slice.* Because representation B had no independent consumer and no independent
+  carrier, the old Slice 3/Slice 4 seam was artificial: Slice 3's only client was
+  Slice 4. Merging the *capability* while keeping *implementation* sliced (below)
+  respects FTR sizing. *Correct.*
+
+No repository contract or consumer invalidates the decision. One steering
+refinement is adopted rather than copied verbatim: the internal representation is
+a *feature-owned grouped-header descriptor*, not a bare `MultiIndex`, because the
+existing `MultiIndex` carrier path is lossy (see sections 3 and 8).
+
+== 2. Exact forward and inverse composition
+
+[source,text]
+----
+FORWARD (contract_grouped_xref)
+  canonical relation            row_keys | column_key(canonical str) | value
+  -> contract_xref  [UNCHANGED] owns relation<->matrix shape, dense axes, scope
+  -> matrix         [private]   flat, canonical string headers
+  -> grouped-header projection [NEW, internal primitive]
+                                dynamic (non-row-key) headers: canonical str
+                                -> exact visible tuple via resolver labels_for_key
+  -> grouped matrix representation  flat DataFrame + GroupedHeader descriptor
+  -> render IR (header grid + merges, driven by the descriptor)
+  -> XLSX/ODS carrier           lossless multi-row header
+
+INVERSE (expand_grouped_xref)
+  workbook grouped headers
+  -> parser: exact visible tuple reconstruction (merge-independent)
+  -> grouped matrix representation  flat DataFrame + GroupedHeader descriptor
+  -> restore canonical string headers [NEW, internal primitive]
+                                dynamic headers: visible tuple
+                                -> canonical str via resolver key_for_labels
+  -> matrix         [private]   flat, canonical string headers
+  -> expand_xref    [UNCHANGED]
+  -> canonical relation         row_keys | column_key(canonical str) | value
+----
+
+*Grouped-header projection is both an internal primitive and a public
+composite:*
+
+* *Internal primitive* -- a pure matrix-header transformation:
+  `(flat canonical matrix, resolved mapping, level config) -> grouped matrix`
+  and its exact inverse. It rewrites only *headers of dynamic columns*; it never
+  reshapes relation<->matrix and never re-implements XRef.
+* *Public composite* -- `contract_grouped_xref` / `expand_grouped_xref` wrap
+  *unchanged* `contract_xref` / `expand_xref` plus the primitive. The
+  intermediate flat matrix is a private local frame, never published under a
+  user-visible name.
+
+XRef relation/matrix logic is used, never duplicated.
+
+== 3. Internal structured representation
+
+*Decision: a feature-owned, frozen `GroupedHeader` descriptor carried alongside
+the flat matrix DataFrame is the authoritative backend-neutral representation.*
+`pandas.MultiIndex` is used only as a contained adapter into the existing render
+composer, never as the lossless source of truth.
+
+Assessed alternatives:
+
+[cols="1,3",options="header"]
+|===
+| Candidate | Assessment
+
+| Bare `pandas.MultiIndex`
+| *Rejected as the authoritative form.* MultiIndex forces *uniform arity* across
+  all columns, so row-key columns must be padded (ambiguous, see section 4). The
+  existing MultiIndex<->carrier path is *lossy*: headers flatten with `" / "`
+  and drop empty parts (`layout_composer.py:83-90`,
+  `io_backends/{xlsx,ods}/parser_interpretation.py`), and reconstruction splits
+  on `" / "` (`rendering/workbook_projection.py:172-174`). It cannot preserve a
+  literal `" / "` inside a component, an empty middle level, or level names.
+| Explicit descriptor + flat DataFrame
+| *Chosen.* A per-column classification (`row_key` vs `dynamic`) plus, for each
+  dynamic column, its exact arity-N tuple, level order, and level names. Lossless,
+  no padding ambiguity, backend-neutral, decoupled from `" / "` and merges.
+| Bespoke value object per level
+| Unnecessary; the descriptor already carries the value semantics.
+|===
+
+`GroupedHeader` must preserve, by construction: exact tuple components; fixed
+arity (= number of level columns); level order; literal delimiter characters
+(no split/join); repeated upper-level labels (distinct complete tuples, per the
+resolver's bijection); dynamic column order (data order, re-derivable by the
+resolver); the row-key vs dynamic distinction; and exact inverse reconstruction
+via `key_for_labels`. It must *not* rely on `" / "` flattening, dot splitting,
+merge geometry, or string parsing.
+
+== 4. Row-key header representation
+
+*Decision: row-key columns are explicitly classified in the descriptor as
+single-level `row_key` entries; their label occupies the leaf (bottom) header
+row, upper rows are rendered blank for those columns.* Blankness is a *rendering
+artifact of a declared single-level column*, not an empty tuple component in the
+axis-label space.
+
+* No padded tuples are stored: the descriptor records `row_key` columns with one
+  label, not an N-tuple with `""` fillers.
+* No sentinel/empty-string *semantics* are introduced into the tuple vocabulary;
+  the resolver still forbids empty components for dynamic labels.
+* Classification is authoritative from XRef's declared `row_keys` (forward) and
+  from the composite's configuration (inverse), never inferred from header shape
+  -- so a blank upper header cell above a row-key column cannot collide with or
+  masquerade as a dynamic tuple.
+* A dynamic column may not have blank upper levels (that would be an incomplete
+  tuple -> rejected, section 7).
+
+== 5. Header depth and level names
+
+Authoritative sources (configuration is sufficient; *no durable resolved intent
+is persisted*):
+
+* *tuple arity / header depth* -- the axis-mapping configuration
+  (`label_columns` count), equivalently the grouped column-axis `levels` count.
+* *level names* -- the composite's `level_names` parameter (aligned with the
+  Grouped Columns FTR `levels: [{name: ...}]` sketch).
+* *configured label-column order* -- `label_columns` order = level order (top to
+  leaf).
+* *dynamic vs row-key classification* -- XRef's declared `row_keys` are row-key
+  columns; every other matrix column is dynamic.
+
+The inverse (`expand_grouped_xref`) is driven by the same explicit configuration
+plus live source frames, exactly as Slice 2. Therefore the parser need *not*
+auto-detect depth from merge geometry for this feature: depth is known from
+config, and the parser's obligation is only to surface the physical header cells
+losslessly (section 8). No persisted Resolution.
+
+== 6. Public API
+
+*Decision: two true composites wrapping unchanged XRef plus the grouped-header
+primitive. The grouped-header primitive stays internal (no public low-level
+projection step) until a genuine independent consumer appears.*
+
+[source,text]
+----
+contract_grouped_xref(
+    frames, *,
+    relation, output,                        # XRef relation in, grouped matrix out
+    row_keys, value="value", column_key="column_key",   # forwarded to contract_xref
+    column_keys=None, dense_axes=None, fill_value="",    # forwarded to contract_xref
+    source_frame, key_column, label_columns,  # -> AxisMappingIntent (arity N)
+    level_names=None,                          # descriptor level names (default label_columns)
+    order_policy="source_row", order_columns=(),   # forwarded to resolver
+    drop_source=False, name=None,
+)
+
+expand_grouped_xref(
+    frames, *,
+    matrix, output,                            # grouped matrix in, XRef relation out
+    row_keys, value="value", column_key="column_key",   # forwarded to expand_xref
+    value_columns=None, base_relation=None,    # forwarded to expand_xref
+    source_frame, key_column, label_columns,
+    level_names=None,
+    order_policy="source_row", order_columns=(),
+    drop_source=False, name=None,
+)
+----
+
+* *Forwarded XRef parameters* (exposed, not reinterpreted): `row_keys`,
+  `column_key`, `value`, `column_keys` / `value_columns`, `dense_axes`,
+  `fill_value`, `base_relation`. Their semantics are XRef's; the composite passes
+  them straight through to the unchanged primitive.
+* *Added axis-mapping parameters*: `source_frame`, `key_column`, `label_columns`
+  (arity N -> the resolver), `level_names`, `order_policy`, `order_columns`.
+* *No mode-heavy unified API*; two explicit directional composites.
+* *No parallel public low-level projection steps* without a consumer.
+* *No leaked temporary frame names*: the private flat matrix lives under a local,
+  non-published name.
+* *No second XRef implementation.*
+* *Accepted Slice 2 APIs (`project_axis_labels` / `restore_axis_keys`) remain
+  unchanged*; the flat one-level path stays valid and is the correct choice when
+  no grouping is wanted.
+
+== 7. Edit / reorder policy (workbook round-trip)
+
+Identity is canonical; visible tuples are never parsed as identity. Behavior on
+user edits to the grouped matrix:
+
+[cols="2,1,3",options="header"]
+|===
+| User action | Outcome | Rationale
+
+| Reorder grouped columns
+| Supported / reconciled
+| Column order is data; each column's tuple resolves via `key_for_labels`
+  regardless of order; canonical order re-derives from the resolver next contract.
+
+| Delete a grouped column
+| Supported / reconciled
+| The pair is simply absent from the matrix; `expand_xref` produces fewer
+  relation rows -- an ordinary scope edit, consistent with existing XRef expand.
+
+| Insert an unknown grouped column (tuple not in mapping)
+| Rejected (diagnostic)
+| `key_for_labels` raises "unknown complete visible label tuple"; non-guessing.
+
+| Duplicate a complete grouped tuple
+| Rejected (diagnostic)
+| Two matrix columns resolving to the same canonical key -> duplicate header
+  identity; XRef already rejects duplicate column identities.
+
+| Edit one tuple component (partial edit)
+| Rejected (diagnostic)
+| Produces a tuple absent from the mapping -> unknown complete tuple; *not*
+  interpreted as an identity change (visible labels are not identity).
+
+| Incomplete tuple (missing level / blank component)
+| Rejected (diagnostic)
+| Arity/empty-component violation from the resolver.
+
+| Change header depth
+| Rejected (diagnostic)
+| Physical arity mismatch against configured `label_columns` count.
+
+| Alter a row-key header
+| Governed by existing XRef row-key semantics, not the tuple path
+| Row-key columns are single-level; a spurious upper-level label above a row-key
+  column is rejected (dynamic-only upper levels).
+|===
+
+Exact, non-guessing inverse behavior is preserved throughout.
+
+== 8. XLSX and ODS carrier contract
+
+The feature needs a *lossless, merge-independent* multi-row header round-trip.
+The current machinery does not provide it and must be extended:
+
+* *Rendering / composer* -- reuse the grid+merge algorithm
+  (`layout_composer._build_header_grid_and_merges`) but drive it from the
+  `GroupedHeader` descriptor's exact tuples, not from a `" / "`-joined
+  `MultiIndex`. Do not route grouped-XRef headers through
+  `_flatten_header_to_strings`.
+* *IR* -- `TableBlock` currently carries only a flat `headers: List[str]` +
+  `header_rows` + a `header_map` (`rendering/ir.py:29-41`). It must carry a
+  lossless per-level header structure (the descriptor or an equivalent exact
+  grid) so the writer emits exact per-level cells.
+* *XLSX writer/parser* -- writer emits the exact header grid; parser must
+  reconstruct exact per-column tuples from the physical header cells. *Current
+  gap:* `_detect_header_rows` infers depth *from merge geometry only*
+  (`io_backends/xlsx/parser_interpretation.py:173-190`) and the reader flattens
+  with `" / ".join(p for p in parts if p)` (drops empties, splits ambiguously).
+  Grouped-XRef must reconstruct tuples from *every* physical header cell using
+  the *configured* depth, resolving merged masters into each covered cell, so a
+  matrix whose repeated upper labels were written as repeated literal cells
+  (unmerged) reconstructs identically to one where they were merged.
+* *ODS writer/parser* -- same contract; ODS additionally represents repeats via
+  `table:number-columns-repeated` / `table:number-rows-repeated`. Per the
+  review-instructions adapter read-path rule, header reconstruction must bound
+  expansion by the parsed extent and add carrier-level XML assertions, not merely
+  round-trip through the project's own parser.
+* *Merge handling* -- merges are a *presentation* choice; parsing must not depend
+  on them. Semantic parity across XLSX and ODS is required and must be proven
+  per backend, not inferred from one.
+
+*Compatibility risk (flagged):* the existing `" / "` flatten/split path serves
+JSON key-path nesting. The lossless grouped-header representation must be
+additive or must preserve that path's behavior; the carrier slices' own
+confirmation must prove no regression to existing multi-row-header consumers.
+
+== 9. Metadata and persistence
+
+*Decision: no new canonical `_meta`; existing configuration only.*
+
+* *Intent* -- the axis-mapping configuration (`source_frame`, `key_column`,
+  `label_columns`, order policy) and the grouped-column `level_names`. Explicit,
+  supplied by the pipeline config on every run.
+* *Resolution* -- the resolved tuples and their order. Run-local, never
+  persisted (identical to Slice 2).
+* *`_meta.xref_crosstable`* -- written by unchanged XRef exactly as today;
+  grouped-XRef adds nothing to it and does not repurpose its
+  `column_keys` / `dense_axes.resolved` facets.
+* *No narrowly-scoped durable declaration is required*, because the inverse is
+  fully driven by explicit configuration plus live source frames, and header
+  depth is configured, not persisted. The parser reconstructs visible tuples from
+  the physical header, not from persisted mapping metadata.
+
+Because no metadata is added, there are no new producer/consumer/persistence/
+schema-maintenance/conflict/registry-ownership obligations. Metadata is not
+introduced merely to simplify implementation.
+
+== 10. Robustness and failure ownership
+
+Domain Boundary Robustness, level 2 (competent-user workflow input); the Slice 1
+resolver owns value-level validation. Build-then-publish.
+
+*Failure atomicity scope* -- on any failure, none of the following is partially
+published: the output Frames mapping; output DataFrames; the `GroupedHeader`
+structures; the *transient private XRef matrix frame and any XRef config it
+writes*; `_meta.pipeline_cleanup` cleanup commands; caller `_meta`. In
+particular the private intermediate matrix must never leak into the returned
+frames on failure, and `drop_source` marking happens only after successful
+projection.
+
+*Diagnostics* must safely identify: the frame; the physical/dynamic column
+position; the complete tuple; the failing level; and source-mapping context.
+They must not execute a rejected value's `repr`/type/hash/eq/iteration (constant
+safe detail plus context, per the resolver's established pattern).
+
+Arbitrary hostile in-process Python (level 4) remains out of scope. Any genuine
+violation of an explicit guarantee (immutability, deterministic order, exact
+identity, atomicity, non-mutation) remains a reportable correctness finding.
+
+No new shared helper is justified unless a second genuine consumer proves the
+same accepted/rejected vocabulary, normalization, ownership, diagnostics, and
+layer; reuse the Slice 1 resolver, `domain/tabular` physical-label helpers, and
+the existing composer grid algorithm.
+
+== 11. Scope and slicing
+
+The merged *capability* is one architecture; *implementation* is sliced. Smallest
+coherent sequence:
+
+. *GX-1 -- grouped matrix/header model + pure projection primitive.* The
+  `GroupedHeader` descriptor value object and a pure forward/inverse header
+  projection (flat canonical matrix <-> grouped matrix) over the Slice 1
+  resolver. No carrier, no public step, no metadata. Independently testable.
+. *GX-2 -- grouped-XRef composites.* `contract_grouped_xref` /
+  `expand_grouped_xref` around unchanged XRef + GX-1; registry entries, user
+  guide, release note; Frames/descriptor-level roundtrip proven. Public-surface
+  gate here. (Close Slice 2 F-1 here -- section 13.)
+. *GX-3 -- XLSX carrier.* Lossless multi-row header write + merge-independent
+  exact-tuple read; carrier-level tests including repeated/unmerged upper levels
+  and literal-delimiter components.
+. *GX-4 -- ODS carrier + parity.* Same contract; ODS repeated-carrier safety;
+  carrier-level XML assertions; XLSX/ODS semantic parity.
+. *GX-5 -- adoption / optional view composition.* Replace one adoption chain;
+  measure whether a thin view wrapper is justified (absorbs the old Slice 5).
+
+Each of GX-1..GX-5 is sized for one implementation context and one acceptance
+gate. No single context is forced to carry the whole capability.
+
+*Historical labels:* the old "Slice 3 (hierarchical logical labels)" and "Slice 4
+(grouped-header integration)" collapse into this merged grouped-XRef capability,
+implemented as GX-1..GX-5. The old "Slice 5 (adoption)" becomes GX-5. The FTR
+retains the historical Slice 3/4/5 references for traceability but marks them
+superseded by GX-1..GX-5.
+
+== 12. FTR ownership and correction plan
+
+To avoid two overlapping active sources of truth:
+
+* *`FTR-XREF-AXIS-MAPPINGS-P4A2` becomes the single owning implementation FTR*
+  for grouped XRef. It already owns the axis identity model and the accepted
+  Slices 1--2 and the resolver, and grouped XRef is a header projection over that
+  model. Its Slice 3/4/5 wording is replaced by the merged grouped-XRef
+  architecture and the GX-1..GX-5 sequence, pointing to this confirmation.
+* *`FTR-XREF-GROUPED-COLUMNS-P4A2` becomes a superseded design artifact.* Its
+  design intent (grouped column axis, expand/contract, MultiIndex-or-flat,
+  identity via mappings not visible labels) is absorbed into the owning FTR. Its
+  status changes to *Superseded* with a pointer; its body is retained for
+  historical traceability. Full lifecycle archival (moving it to cold storage /
+  removing its `_ftrs_open.adoc` include) is a separate follow-up, not performed
+  in this planning task.
+
+Minimal documentation-only edits made with this artifact (see the diff): the
+owning FTR's Status/Slice-3/Slice-4/Slice-5/Remaining-decisions wording, and the
+superseded FTR's Status pointer. No implementation is claimed; open carrier
+questions are carried forward as named risks, not hidden.
+
+== 13. Slice 2 F-1 disposition
+
+Close F-1 (public-build smoke + registered-parameters-match-signature guard) *in
+GX-2*, when the grouped-XRef composites add new registry/public-build/signature
+surface -- the same guard should cover all axis/grouped steps at once, at
+marginal cost. Do not handle it as a separate change now, and do not defer it
+past GX-2. It does not distort the merged architecture.
+
+== Exact acceptance criteria per implementation slice
+
+*GX-1 (model + primitive):*
+
+* A flat canonical-string matrix + resolved mapping projects to a `GroupedHeader`
+  grouped matrix whose dynamic columns carry exact arity-N tuples and whose
+  row-key columns are single-level; the inverse restores the exact flat canonical
+  matrix (pure, both order policies).
+* Repeated upper-level labels with distinct complete tuples are preserved; literal
+  delimiter characters in components survive; empty/duplicate/wrong-arity tuples
+  are rejected with safe diagnostics; input frames unmutated; no partial output.
+* No carrier, public step, registry, or metadata change.
+
+*GX-2 (composites):*
+
+* `contract_grouped_xref` = unchanged `contract_xref` then grouped projection;
+  `expand_grouped_xref` = tuple reconstruction, canonical restore, then unchanged
+  `expand_xref`; a Frames-level roundtrip reproduces the canonical relation
+  exactly.
+* The private intermediate matrix is never published; `_meta` untouched (only
+  transient cleanup under `drop_source`); XRef and the resolver package unchanged.
+* Both steps registered with symmetric runtime/JSON entries; registry,
+  layer-boundary, public-API, and the folded F-1 parameter-signature guard pass;
+  user guide + release note present.
+* Slice 2 flat steps and existing flat YAML remain valid unchanged.
+
+*GX-3 (XLSX carrier):*
+
+* A grouped matrix round-trips through XLSX with exact tuple reconstruction using
+  configured depth, independent of whether repeated upper labels were merged;
+  literal-delimiter and repeated-label cases proven; carrier-level assertions on
+  the written header cells.
+
+*GX-4 (ODS carrier + parity):*
+
+* Same as GX-3 for ODS, with repeated-carrier bounding and ODF XML carrier
+  assertions; XLSX and ODS produce semantically identical reconstructed tuples.
+
+*GX-5 (adoption):*
+
+* One real adoption chain uses the composites end to end; a view wrapper is added
+  only if measured as justified.
+
+== Findings by severity
+
+=== Blocking
+
+None. The merged architecture is resolved at the architectural level; R-1/R-2/R-3
+from the readiness review are resolved (no public long-form API; canonical
+strings stay in XRef; representation and API fixed).
+
+=== Important
+
+* *GX-C1 (carrier).* Lossless, merge-independent multi-row header round-trip does
+  not exist today: `_detect_header_rows` (both backends) depends on merge
+  geometry and readers flatten with `" / "` dropping empties. GX-3/GX-4 must
+  deliver a lossless path driven by configured depth and exact header cells, and
+  prove no regression to the existing `" / "` JSON-nesting path.
+
+=== Minor
+
+* *GX-C2.* `TableBlock` carries only flat `headers`; a lossless per-level header
+  structure must be threaded through the IR without breaking existing single-row
+  consumers.
+* *F-1 (carried).* Close in GX-2 as above.
+
+=== Observations
+
+* The existing `layout_composer` grid+merge algorithm is reusable for rendering
+  once driven by the descriptor rather than a `" / "`-joined MultiIndex.
+* Slice 1's resolver already provides the entire arity-N model; grouped XRef adds
+  a header-projection and carrier surface, not a new identity model.
+* Bare `MultiIndex` remains acceptable as a contained render adapter but must not
+  become the lossless source of truth.
+
+== Validation
+
+Read-only with respect to runtime; documentation-only FTR edits accompany this
+artifact.
+
+* Live probes (project venv, Python 3.13.5, pandas 3.0.2): `contract_xref`
+  rejects a tuple `column_key`; the Slice 1 resolver yields arity-N tuples with
+  exact inverse lookup (re-confirmed from the readiness review).
+* Symbol/path checks: no `grouped_xref`/`column_axis` implementation exists;
+  `contract_xref`/`expand_xref` take a single `column_key`;
+  `layout_composer._build_header_grid_and_merges`,
+  `_flatten_header_to_strings`, `rendering/workbook_projection.py:172-174`,
+  `io_backends/{xlsx,ods}/parser_interpretation.py` `_detect_header_rows` +
+  `" / "` flattening, and `rendering/ir.py` `TableBlock` all exist at the cited
+  paths.
+* Asciidoctor render of this artifact and the two edited FTRs -- see command log.
+* `git diff --check`: clean.
+
+XREF AXIS MAPPINGS SLICES 3 AND 4 MERGE CONFIRMED
