@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
 from pathlib import Path
@@ -15,10 +16,6 @@ import spreadsheet_handling.pipeline.execution as execution_module
 import spreadsheet_handling.pipeline.registry as registry_module
 from spreadsheet_handling.pipeline.registry import REGISTRY
 from spreadsheet_handling.pipeline.types import StepRegistration
-from spreadsheet_handling.domain.transformations.compact_multiaxis import (
-    contract_compact_multiaxis,
-    expand_compact_multiaxis,
-)
 
 
 pytestmark = [
@@ -157,28 +154,51 @@ def test_pipeline_step_registry_resolves_runtime_targets() -> None:
             assert entry["factory_shape"] in {"plain_factory", "plugin_factory"}
 
 
+# Axis / grouped / compact composite+projection family whose registered
+# parameters are guarded to match their public runtime signatures exactly. This
+# is the reusable form that closes Slice 2 follow-up F-1 (per
+# ``FTR-XREF-AXIS-MAPPINGS-P4A2_gx2_confirmation_review_001.adoc``), covering the
+# Slice 2 flat axis steps, the GX-2 grouped composites, and compact_multiaxis in
+# one data-driven assertion. It is deliberately scoped to this family rather than
+# every frames_target entry because some legacy primitives (e.g. ``contract_xref``
+# omits ``dense_axes``, ``expand_xref`` omits ``base_relation``) intentionally do
+# not enumerate every signature parameter; widening the sweep would assert against
+# those pre-existing choices instead of protecting this family from drift.
+_SIGNATURE_GUARDED_STEPS = (
+    "project_axis_labels",
+    "restore_axis_keys",
+    "contract_grouped_xref",
+    "expand_grouped_xref",
+    "contract_compact_multiaxis",
+    "expand_compact_multiaxis",
+)
+
+
+def _import_registry_target(target: str) -> Any:
+    module_path, _, attribute = target.partition(":")
+    module = importlib.import_module(module_path)
+    return getattr(module, attribute)
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
 @pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5")
-def test_compact_multiaxis_registry_parameters_match_public_signatures() -> None:
-    entries = _entries_by_name()
-    functions = {
-        "expand_compact_multiaxis": expand_compact_multiaxis,
-        "contract_compact_multiaxis": contract_compact_multiaxis,
+@pytest.mark.parametrize("name", _SIGNATURE_GUARDED_STEPS)
+def test_family_registry_parameters_match_public_signatures(name: str) -> None:
+    entry = _entries_by_name()[name]
+    function = _import_registry_target(entry["target"])
+    signature = inspect.signature(function)
+    public_parameters = {
+        parameter_name: parameter
+        for parameter_name, parameter in signature.parameters.items()
+        if parameter_name != "frames"
     }
+    registered = entry["parameters"]
 
-    for name, function in functions.items():
-        signature = inspect.signature(function)
-        public_parameters = {
-            parameter_name: parameter
-            for parameter_name, parameter in signature.parameters.items()
-            if parameter_name != "frames"
-        }
-        registered = entries[name]["parameters"]
-
-        assert set(registered) == set(public_parameters), name
-        for parameter_name, parameter in public_parameters.items():
-            assert registered[parameter_name]["required"] is (
-                parameter.default is inspect.Parameter.empty
-            ), (name, parameter_name)
+    assert set(registered) == set(public_parameters), name
+    for parameter_name, parameter in public_parameters.items():
+        assert registered[parameter_name]["required"] is (
+            parameter.default is inspect.Parameter.empty
+        ), (name, parameter_name)
 
 
 def test_pipeline_step_registry_composites_declare_resolving_wrapped_steps() -> None:
