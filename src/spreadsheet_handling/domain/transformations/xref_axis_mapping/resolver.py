@@ -1,7 +1,7 @@
 """Pure resolver for canonical XRef axis keys and visible label tuples."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 import math
 from typing import Any
@@ -17,17 +17,32 @@ from .model import (
     AxisOrderPolicy,
     ResolvedAxisMapping,
     ResolvedAxisMember,
+    _unsupported_type_detail,
 )
 
-_EXACT_NUMPY_INTEGER_TYPES = (
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
+
+class _ExactNumpyIntegerTypes:
+    """Deduplicated exact types with identity-only membership."""
+
+    def __init__(self, candidates: Iterable[type[Any]]) -> None:
+        distinct: list[type[Any]] = []
+        for candidate in candidates:
+            if not any(candidate is existing for existing in distinct):
+                distinct.append(candidate)
+        self._types = tuple(distinct)
+
+    def __contains__(self, candidate: object) -> bool:
+        return any(candidate is supported for supported in self._types)
+
+    def __iter__(self) -> Iterator[type[Any]]:
+        return iter(self._types)
+
+    def __len__(self) -> int:
+        return len(self._types)
+
+
+_SUPPORTED_EXACT_NUMPY_INTEGER_TYPES = _ExactNumpyIntegerTypes(
+    np.dtype(type_code).type for type_code in np.typecodes["AllInteger"]
 )
 _EXACT_NUMPY_FLOAT_TYPES = (
     np.float16,
@@ -62,7 +77,7 @@ def _text_value_diagnostic(value: Any) -> str:
     if _is_exact_nan(value):
         return "missing value"
     if type(value) is not str:
-        return f"non-string value of type {type(value).__name__}"
+        return _unsupported_type_detail()
     if not str.strip(value):
         return "empty value"
     return ""
@@ -103,13 +118,13 @@ def _require_order_value(
             f"Axis mapping source frame {source_frame!r} row {row_position} "
             f"order column {column!r} contains a missing value"
         )
-    if any(type(value) is value_type for value_type in _EXACT_NUMPY_INTEGER_TYPES):
+    if type(value) in _SUPPORTED_EXACT_NUMPY_INTEGER_TYPES:
         return int(value)
     if type(value) is not str and type(value) is not int:
         raise AxisMappingError(
             f"Axis mapping source frame {source_frame!r} row {row_position} "
             f"order column {column!r} must contain exact built-in string or "
-            f"integer values; got {type(value).__name__}"
+            f"integer values; got {_unsupported_type_detail()}"
         )
     return value
 
@@ -278,7 +293,9 @@ def _ensure_homogeneous_order_columns(
         }
         if len(value_types) <= 1:
             continue
-        type_names = sorted(value_type.__name__ for value_type in value_types)
+        type_names = sorted(
+            "int" if value_type is int else "str" for value_type in value_types
+        )
         raise AxisMappingError(
             f"Axis mapping source frame {intent.source_frame!r} order column "
             f"{column!r} must use one exact supported type for every row; "

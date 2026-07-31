@@ -21,11 +21,16 @@ class AxisOrderPolicy(str, Enum):
     COLUMNS = "columns"
 
 
+def _unsupported_type_detail() -> str:
+    """Describe an invalid type without inspecting caller-controlled type metadata."""
+    return "unsupported value type"
+
+
 def _require_non_empty_string(value: Any, *, field_name: str) -> str:
     if type(value) is not str:
         raise AxisMappingError(
             f"{field_name} must be an exact built-in non-empty string; "
-            f"got {type(value).__name__}"
+            f"got {_unsupported_type_detail()}"
         )
     if not str.strip(value):
         raise AxisMappingError(
@@ -92,8 +97,10 @@ class AxisMappingIntent:
 
 
 def _resolved_labels(value: Any, *, field_name: str) -> tuple[str, ...]:
-    if not isinstance(value, tuple):
-        raise AxisMappingError(f"{field_name} must be a tuple of visible labels")
+    if type(value) is not tuple:
+        raise AxisMappingError(
+            f"{field_name} must be an exact built-in tuple of visible labels"
+        )
     if not value:
         raise AxisMappingError(f"{field_name} must contain at least one visible label")
     for index, label in enumerate(value):
@@ -168,6 +175,10 @@ class ResolvedAxisMapping:
                 raise AxisMappingError(
                     "ResolvedAxisMapping.members must contain ResolvedAxisMember values"
                 )
+            _resolved_labels(
+                member.labels,
+                field_name=f"ResolvedAxisMapping.members[{expected_position}].labels",
+            )
             if member.position != expected_position:
                 raise AxisMappingError(
                     "ResolvedAxisMapping member positions must be contiguous and "

@@ -138,6 +138,126 @@ class _MutableHashString(str):
         return super().__hash__() + self.salt
 
 
+_hostile_type_name_calls = 0
+_hostile_type_hash_calls = 0
+_hostile_type_equality_calls = 0
+
+
+class _HostileTypeMeta(type):
+    def __getattribute__(cls, name: str) -> object:
+        global _hostile_type_name_calls
+        if name == "__name__":
+            _hostile_type_name_calls += 1
+            raise RuntimeError("type name must not be read")
+        return super().__getattribute__(name)
+
+    def __hash__(cls) -> int:
+        global _hostile_type_hash_calls
+        _hostile_type_hash_calls += 1
+        raise RuntimeError("type hash must not run")
+
+    def __eq__(cls, other: object) -> bool:
+        global _hostile_type_equality_calls
+        _hostile_type_equality_calls += 1
+        raise RuntimeError("type equality must not run")
+
+
+class _HostileType(metaclass=_HostileTypeMeta):
+    pass
+
+
+class _HostileMutableTuple(tuple[str, ...]):
+    len_calls = 0
+    iteration_calls = 0
+    hash_calls = 0
+    equality_calls = 0
+    repr_calls = 0
+
+    def __new__(cls, values: tuple[str, ...]) -> _HostileMutableTuple:
+        instance = super().__new__(cls, values)
+        instance.salt = 0
+        return instance
+
+    @classmethod
+    def reset_calls(cls) -> None:
+        cls.len_calls = 0
+        cls.iteration_calls = 0
+        cls.hash_calls = 0
+        cls.equality_calls = 0
+        cls.repr_calls = 0
+
+    def __len__(self) -> int:
+        type(self).len_calls += 1
+        raise RuntimeError("length must not run")
+
+    def __iter__(self) -> object:
+        type(self).iteration_calls += 1
+        raise RuntimeError("iteration must not run")
+
+    def __hash__(self) -> int:
+        type(self).hash_calls += 1
+        return tuple.__hash__(self) + self.salt
+
+    def __eq__(self, other: object) -> bool:
+        type(self).equality_calls += 1
+        raise RuntimeError("equality must not run")
+
+    def __repr__(self) -> str:
+        type(self).repr_calls += 1
+        raise RuntimeError("representation must not run")
+
+
+class _HostileNumpyInteger(np.int64):
+    conversion_calls = 0
+
+    def __int__(self) -> int:
+        type(self).conversion_calls += 1
+        raise RuntimeError("conversion must not run")
+
+
+_NUMPY_INTEGER_ALIASES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.byte,
+    np.ubyte,
+    np.short,
+    np.ushort,
+    np.intc,
+    np.uintc,
+    np.int_,
+    np.uint,
+    np.longlong,
+    np.ulonglong,
+    np.intp,
+    np.uintp,
+)
+_DISTINCT_NUMPY_INTEGER_TYPES = tuple(dict.fromkeys(_NUMPY_INTEGER_ALIASES))
+_NULLABLE_INTEGER_DTYPES = (
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+)
+
+
+def _forge_member_with_labels(labels: object) -> ResolvedAxisMember:
+    member = object.__new__(ResolvedAxisMember)
+    object.__setattr__(member, "key", "key-a")
+    object.__setattr__(member, "labels", labels)
+    object.__setattr__(member, "position", 0)
+    return member
+
+
 class TestValidResolution:
     def test_one_level_mapping_supports_exact_forward_and_inverse_lookup(self) -> None:
         frames = {
@@ -475,10 +595,10 @@ class TestInvalidSourceValues:
             (pd.NA, "missing"),
             ("", "empty"),
             (" ", "empty"),
-            (7, "non-string"),
-            (["A"], "non-string"),
-            (np.array([1, 2]), "non-string"),
-            (_ExplosiveEquality(), "non-string"),
+            (7, "unsupported value type"),
+            (["A"], "unsupported value type"),
+            (np.array([1, 2]), "unsupported value type"),
+            (_ExplosiveEquality(), "unsupported value type"),
         ],
     )
     def test_visible_labels_fail_through_deliberate_diagnostics(
@@ -506,7 +626,7 @@ class TestInvalidSourceValues:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="visible label.*non-string"):
+        with pytest.raises(AxisMappingError, match="visible label.*unsupported value type"):
             resolve_axis_mapping(frames, _intent())
 
     def test_unknown_used_key_is_rejected_after_complete_mapping_validation(self) -> None:
@@ -742,6 +862,117 @@ class TestAdversarialOrderValues:
         assert [member.key for member in resolved] == ["key-a", "key-b"]
 
 
+class TestCompleteNumpyIntegerVocabulary:
+    def test_supported_exact_types_are_platform_complete_and_deduplicated(
+        self,
+    ) -> None:
+        expected_types = frozenset(_NUMPY_INTEGER_ALIASES)
+
+        supported_types = resolver_module._SUPPORTED_EXACT_NUMPY_INTEGER_TYPES
+        assert frozenset(supported_types) == expected_types
+        assert np.longlong in expected_types
+        assert np.ulonglong in expected_types
+        assert len(supported_types) == len(expected_types)
+        assert len(_DISTINCT_NUMPY_INTEGER_TYPES) == len(expected_types)
+
+    @pytest.mark.parametrize("value_type", _DISTINCT_NUMPY_INTEGER_TYPES)
+    def test_every_distinct_exact_type_survives_pandas_and_orders_boundaries(
+        self,
+        value_type: type[np.integer],
+    ) -> None:
+        limits = np.iinfo(value_type)
+        typed_values = np.array([limits.max, limits.min], dtype=value_type)
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["maximum", "minimum"],
+                "label": ["Maximum", "Minimum"],
+                "rank": typed_values,
+            })
+        }
+
+        assert type(frames["axis"].iloc[0, 2]) is value_type
+        assert type(frames["axis"].iloc[1, 2]) is value_type
+
+        resolved = resolve_axis_mapping(
+            frames,
+            _intent(
+                order_policy=AxisOrderPolicy.COLUMNS,
+                order_columns=("rank",),
+            ),
+        )
+
+        assert [member.key for member in resolved] == ["minimum", "maximum"]
+
+    @pytest.mark.parametrize("nullable_dtype", _NULLABLE_INTEGER_DTYPES)
+    def test_nullable_integer_concrete_values_normalize_and_order(
+        self,
+        nullable_dtype: str,
+    ) -> None:
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-b", "key-a"],
+                "label": ["B", "A"],
+                "rank": pd.Series([2, 1], dtype=nullable_dtype),
+            })
+        }
+        extracted_type = type(frames["axis"].iloc[0, 2])
+
+        assert extracted_type in resolver_module._SUPPORTED_EXACT_NUMPY_INTEGER_TYPES
+        resolved = resolve_axis_mapping(
+            frames,
+            _intent(
+                order_policy=AxisOrderPolicy.COLUMNS,
+                order_columns=("rank",),
+            ),
+        )
+
+        assert [member.key for member in resolved] == ["key-a", "key-b"]
+
+    def test_mixed_python_and_each_numpy_integer_normalize_to_builtin_int(
+        self,
+    ) -> None:
+        for value_type in _DISTINCT_NUMPY_INTEGER_TYPES:
+            frames = {
+                "axis": pd.DataFrame({
+                    "key": ["key-b", "key-a"],
+                    "label": ["B", "A"],
+                    "rank": pd.Series([value_type(2), 1], dtype=object),
+                })
+            }
+
+            resolved = resolve_axis_mapping(
+                frames,
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            )
+
+            assert [member.key for member in resolved] == ["key-a", "key-b"]
+
+    def test_numpy_integer_subclass_is_rejected_without_conversion(self) -> None:
+        value = _HostileNumpyInteger(1)
+        frames = {
+            "axis": pd.DataFrame({
+                "key": ["key-a"],
+                "label": ["A"],
+                "rank": pd.Series([value], dtype=object),
+            })
+        }
+        _HostileNumpyInteger.conversion_calls = 0
+
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
+            resolve_axis_mapping(
+                frames,
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            )
+
+        assert _HostileNumpyInteger.conversion_calls == 0
+
+
 class TestAdversarialExactStringsAndPhysicalLabels:
     def test_unusual_physical_label_cannot_impersonate_configured_strings(
         self,
@@ -812,7 +1043,7 @@ class TestAdversarialExactStringsAndPhysicalLabels:
         _HostileReprString.repr_calls = 0
         value = _HostileReprString("hostile")
 
-        with pytest.raises(AxisMappingError, match="_HostileReprString"):
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
             ResolvedAxisMember(value, ("A",), 0)
 
         assert _HostileReprString.repr_calls == 0
@@ -860,9 +1091,9 @@ class TestAdversarialExactStringsAndPhysicalLabels:
             })
         }
 
-        with pytest.raises(AxisMappingError, match="non-string"):
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
             resolve_axis_mapping(frames, _intent())
-        with pytest.raises(AxisMappingError, match="non-string"):
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
             resolve_axis_mapping(
                 {"axis": pd.DataFrame({"key": ["key-a"], "label": ["A"]})},
                 _intent(),
@@ -871,6 +1102,184 @@ class TestAdversarialExactStringsAndPhysicalLabels:
 
         assert _HostileStripString.strip_calls == 0
         assert _HostileReprString.repr_calls == 0
+
+
+class TestDiagnosticSafety:
+    @pytest.mark.parametrize(
+        "reject",
+        [
+            lambda value: AxisMappingIntent(
+                value,
+                "key",
+                ("label",),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                value,
+                ("label",),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                "key",
+                (value,),
+                AxisOrderPolicy.SOURCE_ROW,
+            ),
+            lambda value: AxisMappingIntent(
+                "axis",
+                "key",
+                ("label",),
+                AxisOrderPolicy.COLUMNS,
+                (value,),
+            ),
+            lambda value: ResolvedAxisMember(value, ("A",), 0),
+            lambda value: ResolvedAxisMember("key-a", (value,), 0),
+            lambda value: ResolvedAxisMapping(
+                (value,),
+                (ResolvedAxisMember("key-a", ("A",), 0),),
+            ),
+            lambda value: ResolvedAxisMapping(
+                ("label",),
+                (ResolvedAxisMember("key-a", ("A",), 0),),
+            ).labels_for_key(value),
+            lambda value: ResolvedAxisMapping(
+                ("label",),
+                (ResolvedAxisMember("key-a", ("A",), 0),),
+            ).key_for_labels((value,)),
+        ],
+    )
+    def test_direct_boundaries_do_not_read_hostile_type_names(
+        self,
+        reject: object,
+    ) -> None:
+        global _hostile_type_name_calls
+        global _hostile_type_hash_calls
+        global _hostile_type_equality_calls
+        _hostile_type_name_calls = 0
+        _hostile_type_hash_calls = 0
+        _hostile_type_equality_calls = 0
+
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
+            reject(_HostileType())  # type: ignore[operator]
+
+        assert _hostile_type_name_calls == 0
+        assert _hostile_type_hash_calls == 0
+        assert _hostile_type_equality_calls == 0
+
+    @pytest.mark.parametrize(
+        "reject",
+        [
+            lambda value: resolve_axis_mapping(
+                {
+                    "axis": pd.DataFrame({
+                        "key": pd.Series([value], dtype=object),
+                        "label": ["A"],
+                    })
+                },
+                _intent(),
+            ),
+            lambda value: resolve_axis_mapping(
+                {
+                    "axis": pd.DataFrame({
+                        "key": ["key-a"],
+                        "label": pd.Series([value], dtype=object),
+                    })
+                },
+                _intent(),
+            ),
+            lambda value: resolve_axis_mapping(
+                {"axis": pd.DataFrame({"key": ["key-a"], "label": ["A"]})},
+                _intent(),
+                used_keys=[value],
+            ),
+            lambda value: resolve_axis_mapping(
+                {
+                    "axis": pd.DataFrame({
+                        "key": ["key-a"],
+                        "label": ["A"],
+                        "rank": pd.Series([value], dtype=object),
+                    })
+                },
+                _intent(
+                    order_policy=AxisOrderPolicy.COLUMNS,
+                    order_columns=("rank",),
+                ),
+            ),
+        ],
+    )
+    def test_resolver_boundaries_do_not_read_hostile_type_names(
+        self,
+        reject: object,
+    ) -> None:
+        global _hostile_type_name_calls
+        global _hostile_type_hash_calls
+        global _hostile_type_equality_calls
+        _hostile_type_name_calls = 0
+        _hostile_type_hash_calls = 0
+        _hostile_type_equality_calls = 0
+
+        with pytest.raises(AxisMappingError, match="unsupported value type"):
+            reject(_HostileType())  # type: ignore[operator]
+
+        assert _hostile_type_name_calls == 0
+        assert _hostile_type_hash_calls == 0
+        assert _hostile_type_equality_calls == 0
+
+
+class TestExactVisibleLabelTuples:
+    @pytest.mark.parametrize(
+        "reject",
+        [
+            lambda labels: ResolvedAxisMember("key-a", labels, 0),
+            lambda labels: ResolvedAxisMapping(
+                ("label",),
+                (_forge_member_with_labels(labels),),
+            ),
+            lambda labels: ResolvedAxisMapping(
+                ("label",),
+                (ResolvedAxisMember("key-a", ("A",), 0),),
+            ).key_for_labels(labels),
+        ],
+    )
+    def test_tuple_subclasses_are_rejected_before_hostile_methods(
+        self,
+        reject: object,
+    ) -> None:
+        labels = _HostileMutableTuple(("A",))
+        _HostileMutableTuple.reset_calls()
+
+        with pytest.raises(AxisMappingError, match="exact built-in tuple"):
+            reject(labels)  # type: ignore[operator]
+
+        assert _HostileMutableTuple.len_calls == 0
+        assert _HostileMutableTuple.iteration_calls == 0
+        assert _HostileMutableTuple.hash_calls == 0
+        assert _HostileMutableTuple.equality_calls == 0
+        assert _HostileMutableTuple.repr_calls == 0
+
+        labels.salt = 100
+        stable = ResolvedAxisMapping(
+            ("label",),
+            (ResolvedAxisMember("key-a", ("A",), 0),),
+        )
+        assert stable.labels_for_key("key-a") == ("A",)
+        assert stable.key_for_labels(("A",)) == "key-a"
+
+    def test_direct_and_resolved_labels_use_only_exact_builtin_tuples(self) -> None:
+        direct = ResolvedAxisMapping(
+            ("label",),
+            (ResolvedAxisMember("key-a", ("A",), 0),),
+        )
+        resolved = resolve_axis_mapping(
+            {"axis": pd.DataFrame({"key": ["key-b"], "label": ["B"]})},
+            _intent(),
+        )
+
+        for mapping in (direct, resolved):
+            assert type(mapping.members[0].labels) is tuple
+            assert type(mapping.labels_for_key(mapping.members[0].key)) is tuple
+            assert all(type(labels) is tuple for labels in mapping._key_by_labels)
 
 
 class TestDirectModelConstruction:
@@ -983,7 +1392,7 @@ class TestLookupValidation:
         self,
         resolved: ResolvedAxisMapping,
     ) -> None:
-        with pytest.raises(AxisMappingError, match="must be a tuple"):
+        with pytest.raises(AxisMappingError, match="exact built-in tuple"):
             resolved.key_for_labels("Kredit / Produkt")  # type: ignore[arg-type]
 
     def test_unknown_key_is_rejected(self, resolved: ResolvedAxisMapping) -> None:
