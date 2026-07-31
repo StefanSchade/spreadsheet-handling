@@ -1,0 +1,413 @@
+= GX-1 Acceptance Review 001: Grouped Matrix/Header Model + Pure Projection Primitive
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+*GX-1 is accepted.* The grouped-header model and the two pure projection
+primitives (`build_grouped_header`, `restore_flat_matrix`) implement the confirmed
+GX-1 contract
+(`FTR-XREF-AXIS-MAPPINGS-P4A2_gx1_confirmation_review_001.adoc`) faithfully and
+exactly. Model correctness, exact forward/inverse semantics, ownership and
+immutability, failure atomicity, safe diagnostics, and architectural scope were
+independently re-derived from source and confirmed by targeted live probes and
+the full active Core suite. No blocking or important finding survives. The one
+substantive residual -- the inverse trusts the descriptor and ignores the paired
+frame's own labels, so a *mispaired* same-width frame is silently relabelled --
+is a faithful consequence of the deliberately decoupled architecture (count-only
+consistency check, no canonical keys stored in the descriptor). It violates no
+explicit GX-1 guarantee and is correctly owned by GX-2, which produces and pairs
+the frame and descriptor together. It is recorded as a minor GX-2 carry-forward,
+not a GX-1 defect.
+
+This review is read-only with respect to runtime code. No runtime, test,
+registry, or backlog-behaviour file was modified. The only added artifact is this
+review; a minimal documentation-only status note recording GX-1 acceptance was
+added to the owning FTR.
+
+== Reviewed state
+
+* Git root `core/`, branch `main`, clean worktree at start; no branch created or
+  switched; nothing pushed.
+* Relevant commits: `35e7221` (GX-1 confirmation review), `2fc71b8` (GX-1 runtime
+  + focused tests), `3187638` (GX-1 implementation self-review, HEAD).
+* Reviewed runtime surface (added by `2fc71b8`, unchanged since):
+  `src/spreadsheet_handling/domain/transformations/grouped_xref/{__init__,model,projection}.py`
+  and `tests/unit/domain/transformations/test_grouped_xref.py`.
+* Cross-checked dependencies read from source:
+  `xref_axis_mapping/{model,resolver}.py` (`ResolvedAxisMapping`,
+  `labels_for_key`, `key_for_labels`, `label_arity`, arity-N tuple bijection,
+  duplicate-complete-tuple rejection) and
+  `domain/tabular/physical_labels.py` (`ensure_unique_field_declaration`,
+  `ensure_unique_physical_column_labels`).
+* The implementation self-review was treated as a set of claims to verify, not as
+  proof.
+
+== Model assessment
+
+`GroupedHeaderError`, `RowKeyColumn`, `DynamicColumn`, and `GroupedHeader` match
+the confirmed field-level shape. Verified from source:
+
+* *Frozen immutability, hashability, value equality.* All four are
+  `@dataclass(frozen=True)`; `FrozenInstanceError` on assignment and hash/set
+  value-equality are proven by
+  `test_model_is_frozen_and_hashable_with_value_equality`.
+* *Exact built-in ownership.* Strings are validated with `type(value) is str`
+  and non-empty (`_require_non_empty_string`); `labels` is required to be an exact
+  `tuple` (`type(self.labels) is not tuple`); `position` requires
+  `type(value) is int` and non-negative. No `str`/`tuple`/`int` subclass is
+  accepted -- consistent with the accepted robustness boundary and the resolver's
+  identical discipline.
+* *No retained caller-owned mutable container.* `level_names` and `columns` are
+  copied into owned tuples in `__post_init__`;
+  `test_model_copies_caller_sequences_into_owned_tuples` mutates the caller lists
+  after construction and proves the descriptor is unchanged. No DataFrame is a
+  field of any value object.
+* *Contiguous positions, dynamic-label arity, level-name rules.*
+  `GroupedHeader.__post_init__` enforces `position == index`, rejects foreign
+  column types (`type(column) is not RowKeyColumn and type(column) is not
+  DynamicColumn`), enforces `len(labels) == arity` per dynamic column, requires a
+  non-empty `level_names`, and reuses `ensure_unique_field_declaration` for
+  uniqueness. Empty/duplicate/wrong-length level names are rejected.
+* *No redundant canonical keys.* `DynamicColumn` stores only the visible `labels`
+  tuple and its `position`; canonical identity is never duplicated into the
+  descriptor. Single source of truth confirmed.
+
+`isinstance` vs exact-type use is deliberate and consistent: container-shape
+gates that must accept ordinary sequences use `isinstance` (rejecting
+`str`/`bytes`/`Mapping`/`Set`); value-identity gates that must reject subclasses
+use `type(x) is T`. This matches the resolver and the Domain Boundary Robustness
+concept.
+
+== Forward assessment (`build_grouped_header`)
+
+Verified against the confirmed contract:
+
+* *Consumes an already-resolved `ResolvedAxisMapping`; never resolves.* Import
+  inspection confirms `grouped_xref` imports only `ResolvedAxisMapping` from
+  `xref_axis_mapping`; `resolve_axis_mapping` is not imported or called.
+* *Row keys explicit, precedence over dynamic.* `row_keys` is normalized
+  (bare string wrapped; `bytes`/`bytearray` rejected), each element validated as
+  an exact non-empty string, duplicates rejected. A declared row key that is also
+  a valid canonical dynamic key is classified as a row-key column
+  (`test_forward_row_key_precedence_over_would_be_dynamic_key`). Every non-row-key
+  physical column is dynamic.
+* *Flat physical constraints enforced.* `MultiIndex` and tuple-valued labels are
+  rejected explicitly; non-string / whitespace-only dynamic headers are rejected
+  (`_require_dynamic_header`); duplicate physical string columns are rejected in
+  `_classify_columns`.
+* *Unknown canonical headers fail through the resolver.* Dynamic labels are
+  resolved via `mapping.labels_for_key(header)`, which raises `AxisMappingError`
+  on an unknown key (`test_forward_rejects_unknown_canonical_key`).
+* *Level names default and validate.* Default is `mapping.label_columns`; wrong
+  length is rejected in `_resolve_level_names`; empty/duplicate explicit names are
+  rejected by the model.
+* *Order/position preserved; no mutation; atomic.* Columns are built in physical
+  order with `position == physical index`; the frame is neither mutated nor
+  transformed (`test_forward_does_not_mutate_frame_or_row_keys`); the descriptor
+  is built fully before return, so no partial descriptor is published on failure.
+
+*Independent edge probes* (not identical to committed tests) confirmed safe
+rejection without invoking hostile `__eq__`/`__repr__` for a hostile object placed
+in `row_keys` and in explicit `level_names`, and for a hostile `level_names` /
+`DynamicColumn.labels` entry at the model boundary. All raised a clean
+`GroupedHeaderError`.
+
+*Refinement noted (correct):* the missing-declared-row-key check runs as a safe
+presence precheck over exact-string physical labels *before* dynamic resolution,
+so a missing row key yields a `GroupedHeaderError` (per the confirmation's
+diagnostics-table ownership) rather than falling through to an
+`AxisMappingError`. This is an evidence-driven refinement consistent with the
+contract, not a deviation.
+
+== Inverse assessment (`restore_flat_matrix`)
+
+Verified against the confirmed contract:
+
+* *Descriptor is authoritative for visible tuple identity.* Output labels are
+  built solely from the descriptor: each `RowKeyColumn.label` is kept, each
+  `DynamicColumn.labels` is resolved via `mapping.key_for_labels(...)` (resolver
+  rejects unknown/wrong-arity/incomplete/malformed tuples with `AxisMappingError`).
+  The frame's own column labels are not read for identity.
+* *Duplicate restored headers rejected.* A `seen` set rejects a restored label
+  collision, covering duplicate complete visible tuples and row-key/dynamic
+  collisions (`test_inverse_rejects_duplicate_complete_tuple`,
+  `test_inverse_rejects_row_key_dynamic_collision`). Detection is safely ordered
+  over exact strings.
+* *Descriptor/frame count mismatch fails cleanly.* `len(header.columns) !=
+  frame.shape[1]` raises `GroupedHeaderError`
+  (`test_inverse_rejects_descriptor_dataframe_mismatch`). Because model positions
+  are contiguous `0..n-1`, the count check alone makes every descriptor position
+  address a real physical column, satisfying the confirmed position check.
+* *Data/index/order/dtype preserved; independently owned; atomic.* `frame.copy()`
+  (deep) then positional relabel preserves data, index, row order, physical column
+  order, and dtypes; the returned frame is independent
+  (`test_inverse_does_not_mutate_input_frame` mutates the result and the input is
+  unchanged); all resolution and duplicate detection complete *before* `frame.copy()`
+  runs, so no partial frame is published on failure
+  (`test_inverse_atomic_on_failure`).
+
+The inverse's deliberate disregard of frame labels is the crux of the
+descriptor/frame consistency question below.
+
+== Descriptor/frame consistency assessment
+
+The confirmed architecture deliberately keeps the DataFrame and descriptor
+separate and stores no canonical keys in the descriptor; the confirmed inverse
+consistency check is column-count plus "each position addresses a real physical
+column". The implementation matches this exactly.
+
+An independent probe confirmed the residual coupling behaviour precisely: pairing
+a valid descriptor with a *different* same-width frame (dynamic data columns
+permuted and the row-key column moved to another physical position) is *silently
+accepted*; the inverse relabels positionally from the descriptor, producing a
+frame whose data no longer corresponds to its labels. A `MultiIndex` input frame
+is likewise silently flattened. This affects reordered data columns, unrelated
+same-width frames, row-key columns at unexpected positions, and stale
+descriptors.
+
+*Classification: accepted limitation, mitigation owned by GX-2.* This is not a
+GX-1 defect: GX-1 is a pure primitive over a `(frame, descriptor)` pair that the
+forward produces together, and it faithfully implements the confirmed count-only
+check. It violates no explicit GX-1 guarantee (GX-1 guarantees an exact roundtrip
+only for the frame the descriptor was built from). GX-2 -- which resolves once,
+runs the forward, and holds both artifacts -- must pass them as a trusted pair and
+must never pair a descriptor with a foreign frame. A cheap partial hardening is
+*available* should GX-2 want defence in depth: the descriptor already stores each
+`RowKeyColumn`'s `(position, label)`, so `frame.columns[position] == label` would
+catch the probed mispairing (row-key moved / unrelated frame); it would not catch
+pure dynamic-column reordering. Adding such a check to GX-1 now would go beyond
+the confirmed contract and is explicitly *not required* for acceptance. Recorded
+as GX1-A-M2 below.
+
+== Validation and diagnostics assessment
+
+Domain Boundary Robustness level 2 applied. Verified:
+
+* Rejected values are never inspected through `repr`/`type`/`hash`/`eq`/iteration
+  for diagnostics: type checks use `type(x) is T`; the constant
+  `_unsupported_type_detail()` (`"unsupported value type"`) is used; error text
+  interpolates only already-validated exact strings or safe structural context
+  (positions, counts). Independent hostile-object probes at both the model and the
+  projection boundary (level names, `row_keys`, dynamic labels) raised clean
+  `GroupedHeaderError`s without triggering the hostile methods.
+* Exact-type validation is deliberate and localized behind small named helpers
+  (`_require_non_empty_string`, `_require_position`, `_owned_string_tuple`,
+  `_require_dynamic_header`, `_string_labels`); the domain flow stays readable and
+  the defensive introspection is not over-broad.
+* Errors carry useful stage/position/field context (physical position, field
+  name/index, counts).
+* Resolver-owned failures remain `AxisMappingError`; feature-owned structural
+  failures use `GroupedHeaderError` (a `ValueError` subclass mirroring
+  `AxisMappingError`).
+* No raw pandas or unrelated Python exception leaks for supported malformed
+  inputs: non-DataFrame, non-mapping, `MultiIndex`, tuple-valued, duplicate,
+  non-string, and empty headers all yield deterministic `GroupedHeaderError` /
+  `AxisMappingError`.
+
+== Ownership and atomicity assessment
+
+* *Caller frame never mutated:* forward reads only; inverse copies. Proven by the
+  two non-mutation tests and an independent no-mutation re-check.
+* *Inverse output independence:* deep copy; mutating the result leaves the input
+  untouched.
+* *Caller sequences copied:* `row_keys` and `level_names` are read and copied into
+  owned tuples; no caller container is retained by reference.
+* *Frozen objects hold only immutable owned values:* exact `str`/`tuple`/`int`
+  only; no DataFrame, list, or mapping is retained.
+* *All validation precedes publication:* the full descriptor (forward) and the
+  full output-label sequence (inverse) are built before anything is returned; on
+  failure nothing is published.
+* *No hidden state:* no `_meta`, no Frames mapping, no cleanup command, no global
+  mutation. Atomicity scope is exactly the returned descriptor / DataFrame.
+
+== Architecture and scope assessment
+
+* *Backend-neutral, carrier-free, rendering-free, pipeline-free, registry-free,
+  metadata-free, persistence-free.* Import scan confirms `grouped_xref` imports
+  only `pandas`, stdlib, `..xref_axis_mapping` (`ResolvedAxisMapping` only), and
+  `domain.tabular` (`ensure_unique_field_declaration`). No `rendering`,
+  `io_backends`, `pipeline`, `cli`, `application`, registry, `_meta`, or YAML
+  import or reference (the only textual matches are docstrings asserting their
+  absence).
+* *No accidental public surface.* `git status` shows only added files; no tracked
+  file was modified by `2fc71b8`. No `StepRegistration`, no
+  `pipeline_step_registry.json` entry, no YAML surface, no top-level transformation
+  export (`transformations/__init__.py` is untouched). Package-local `__init__`
+  exports the four typed values plus two primitives for feature-internal GX-2 use
+  only -- appropriate, and it does not prematurely constitute a public pipeline
+  contract.
+* Architecture guards pass:
+  `tests/architecture/domain_transformations/` (layer boundaries, cross-family
+  imports, package public API, pipeline-registry) -- 5 passed; the new package is
+  covered automatically and the pipeline-registry guard is satisfied by absence.
+
+== Test assessment
+
+32 focused tests pass. Independent evaluation of quality (not count):
+
+* *Genuinely proven:* model ownership/immutability/equality/hashability;
+  contiguous positions and arity; level-name defaulting and empty/duplicate/
+  wrong-length rejection; forward row-key/dynamic classification and precedence;
+  inverse canonical restoration; the exact `flat -> forward -> inverse -> flat`
+  roundtrip under both `source_row` and `columns` order policies; arity 2 and 3;
+  repeated upper-level labels with distinct complete tuples; literal `" / "` and
+  `"."` components; single/multiple/bare-string row keys; missing/duplicate row
+  keys; shuffled physical column order; non-monotonic index; unknown/wrong-arity/
+  duplicate tuples; `MultiIndex`/tuple/duplicate/non-string/empty physical headers;
+  descriptor/frame mismatch; input non-mutation; atomic failure; and safe
+  diagnostics via `_ExplosiveEquality`.
+* *Roundtrip assertions are not false positives.* An independent probe confirmed
+  that on this pandas build `DataFrame.equals` is *label-* and *dtype-sensitive*
+  (differently-labelled or differently-typed same-data frames compare unequal), so
+  `restored.equals(flat)` genuinely proves canonical-label and dtype restoration;
+  `test_inverse_restores_canonical_headers` adds an explicit column-label
+  assertion as belt-and-suspenders.
+* *Copy independence* is explicitly tested; *dtype* preservation is implicitly but
+  genuinely covered by the dtype-sensitive `.equals` roundtrips over the
+  mixed-dtype fixture, so a separate dtype assertion is optional, not required.
+* *Minor test-surface gaps (non-blocking):* explicit-`level_names` duplicate/empty
+  rejection is exercised at the model boundary but not through
+  `build_grouped_header` (the forward delegates, so risk is low); the
+  descriptor/frame *mispairing* hazard (as opposed to count mismatch) is not
+  asserted, consistent with it being GX-2's responsibility.
+
+== Contract-deviation assessment
+
+Compared line by line against the confirmation review:
+
+* Missing-row-key precheck before dynamic resolution -- *correct evidence-driven
+  refinement* (preserves the confirmed diagnostic ownership).
+* Physical-boundary validation hand-rolled (exact-non-empty-string vocabulary +
+  inline string-duplicate detection) instead of calling
+  `ensure_unique_physical_column_labels` -- *harmless implementation detail*: the
+  forward's effective vocabulary is *stricter* (all physical labels must be exact
+  non-empty strings, matching the XRef matrix-axis identity contract), and the
+  problematic label categories that helper guards (missing/ambiguous/unhashable/
+  duplicate) are all rejected by the exact-string requirement. Complete and safely
+  ordered.
+* `row_keys` duplicate detection via an inline set over already-validated exact
+  strings instead of `ensure_unique_field_declaration` -- *harmless implementation
+  detail*, functionally equivalent and safe.
+* Everything else (model shape, input coupling, forward/inverse frame contract,
+  ownership, atomicity, diagnostics, package placement) *conforms exactly*.
+
+No settled architecture is reopened; no contradictory evidence was found in
+current code.
+
+== GX-2 readiness conclusion
+
+GX-1 is a sound dependency for GX-2:
+
+* GX-2 can resolve the mapping *once* and hand the same immutable
+  `ResolvedAxisMapping` to both directions; GX-1 never pushes resolution down
+  (GX1-M1, reaffirmed).
+* The descriptor carries enough for later rendering: exact arity-N visible tuples,
+  level names, physical order/position, and the row-key-vs-dynamic distinction --
+  no `" / "` flattening or merge-geometry assumption leaked in.
+* No premature carrier/rendering/pipeline assumption leaked into GX-1.
+* The only limitation GX-2 must own is frame/descriptor pairing (GX1-A-M2): GX-2
+  must produce and pass the pair together and never pair a descriptor with a
+  foreign frame. This does not block starting GX-2.
+
+== Findings by severity
+
+=== Blocking
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+* *GX1-A-M1 (input coupling -- reaffirms confirmation GX1-M1).* GX-1 consumes an
+  already-resolved `ResolvedAxisMapping` and never calls `resolve_axis_mapping`.
+  GX-2 must own resolving once (with `used_keys` completeness on the forward side)
+  and pass the same immutable mapping to both directions. Evidence: import scan;
+  `test`s construct the mapping themselves. Risk if ignored: GX-2 accidentally
+  pushing resolution into GX-1. Action: honour in GX-2. Disposition: GX-2
+  ownership.
+* *GX1-A-M2 (descriptor/frame pairing unchecked beyond column count).* The inverse
+  ignores the frame's own labels and relabels positionally from the descriptor;
+  probing shows a mispaired same-width frame (reordered/unrelated/stale/
+  `MultiIndex`) is silently accepted and its data<->label correspondence
+  corrupted. Evidence: live probe P2/P3 (see Validation evidence). Risk if
+  ignored: a future caller that pairs a descriptor with a frame it did not produce
+  gets silently wrong data. This conforms to the confirmed count-only contract and
+  violates no explicit GX-1 guarantee, so it is *not* a GX-1 defect. Action: GX-2
+  must pair frame+descriptor as a trusted unit; optionally add the cheap row-key
+  `(position, label)` cross-check for defence in depth. Disposition: accepted
+  limitation, GX-2 ownership.
+
+=== Observations
+
+* *GX1-A-O1.* Forward enforces a stricter exact-non-empty-string physical
+  vocabulary than `ensure_unique_physical_column_labels`, and hand-rolls
+  `row_keys`/physical-column duplicate detection rather than delegating to the
+  named `domain/tabular` helpers. Functionally equivalent and safe for the
+  exact-string vocabulary; a reader expecting the shared helper will not find it.
+* *GX1-A-O2.* The inverse does not validate the input frame's physical boundary
+  (a `MultiIndex` input is silently flattened). Benign because the descriptor is
+  authoritative and count-checked; folds into GX1-A-M2.
+* *GX1-A-O3.* dtype and column-label preservation are genuinely (if implicitly)
+  proven because `DataFrame.equals` is label- and dtype-sensitive on this pandas
+  build (verified by probe); an explicit dtype assertion would be
+  belt-and-suspenders.
+* *GX1-A-O4.* Explicit-`level_names` duplicate/empty rejection is proven at the
+  model boundary but not through `build_grouped_header`; low risk given delegation.
+
+== Lifecycle conclusion
+
+GX-1 is accepted; the owning FTR `FTR-XREF-AXIS-MAPPINGS-P4A2` *stays open*. GX-1
+is recorded as accepted; GX-2..GX-5 remain pending. The FTR must not be archived
+and GX-2 must not begin in this task. A single documentation-only status note
+recording GX-1 acceptance is added to the owning FTR with this artifact; no other
+lifecycle move is warranted (no residual GX-1 scope, no follow-up FTR needed for
+GX-1). The GX-1 companion reviews remain alongside the active FTR while the
+workstream continues.
+
+== Validation evidence
+
+Read-only with respect to runtime; the only added files are this artifact and a
+minimal FTR status note.
+
+[source,text]
+----
+.venv/bin/pytest -q tests/unit/domain/transformations/test_grouped_xref.py
+    # 32 passed
+.venv/bin/pytest -q tests/unit/domain/transformations/test_xref_axis_mapping.py
+    # 132 passed
+.venv/bin/pytest -q tests/architecture/domain_transformations/
+    # 5 passed (layer boundaries, cross-family imports, package public API,
+    #           pipeline registry)
+.venv/bin/pytest -q -m 'not legacy and not prehex and not slow' \
+    tests/unit tests/integration tests/roundtrip tests/architecture
+    # exit 0; one pre-existing xfail (BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A),
+    #         no code changed after implementation commit 2fc71b8
+.venv/bin/ruff check .../grouped_xref .../test_grouped_xref.py   # All checks passed
+.venv/bin/python tools/check_source_style.py                     # exit 0 (only
+    # pre-existing WARNs in rendering/tests; none in grouped_xref)
+git diff --check                                                 # clean
+asciidoctor -o /dev/null <this artifact> and the FTR status edit # render clean
+----
+
+Targeted independent live probes (project venv, pandas 3.0.2):
+
+* *P1* -- `DataFrame.equals` is label-sensitive and dtype-sensitive, so the
+  roundtrip `.equals` assertions genuinely prove canonical-label and dtype
+  restoration.
+* *P2* -- a mispaired same-width frame (dynamic columns permuted, row-key moved)
+  is silently accepted by `restore_flat_matrix`, corrupting data<->label
+  correspondence (GX1-A-M2); the descriptor's stored row-key `(position, label)`
+  would catch this particular case via a `frame.columns[position] == label`
+  cross-check.
+* *P3* -- a `MultiIndex` input frame is silently flattened by the inverse
+  (GX1-A-O2).
+* *P4* -- hostile objects (`__eq__`/`__repr__` raising) placed in `level_names`,
+  `DynamicColumn.labels`, `row_keys`, and explicit forward `level_names` are all
+  rejected with a clean `GroupedHeaderError` and never have their hostile methods
+  invoked.
+
+GROUPED XREF GX-1 ACCEPTED IN REVIEW 001
