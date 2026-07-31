@@ -1,0 +1,477 @@
+= Slice 2 Pre-Implementation Confirmation Review: XRef Axis-Label Projection
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+Slice 2 of `FTR-XREF-AXIS-MAPPINGS-P4A2` is *ready for implementation*. Its
+predecessor is settled (Slice 1 accepted in independent acceptance review 003,
+commit `cbf0226`), the repository-wide Domain Boundary Robustness policy it must
+respect is accepted (`FTR-DOMAIN-BOUNDARY-ROBUSTNESS-P4A` Slice 1, commits
+`08afe70`/`88a0c37`), and the composition target (`contract_xref` /
+`expand_xref`) is unchanged and flat-string compatible. The FTR needs no
+correction; the two design questions it deliberately left open (public
+names/parameter shape and in-place-versus-output) are settled below as an
+implementation contract rather than blockers.
+
+This review is read-only. It reads and classifies existing artifacts and code
+as evidence; it modifies no executable file, registry, or FTR.
+
+Repository state read: branch `main`, clean worktree, HEAD `88a0c37`.
+
+== Current Slice 2 definition (as written)
+
+The active FTR authorizes Slice 2 as:
+
+____
+*Slice 2 -- flat one-level projection transformations.* Add separately
+reviewable outbound and inbound transformations composed around unchanged XRef.
+Decide names and parameter shape in that slice, then apply the
+YAML/public-surface gate and registry/documentation/release-note obligations.
+Prove flat-string XLSX and ODS roundtrip without adding grouped headers.
+____
+
+Architecturally the FTR fixes the direction (unchanged XRef, projection on
+either side):
+
+[source,text]
+----
+canonical relation with keys
+-> outbound axis projection   (Slice 2)
+-> relation with visible one-level labels
+-> contract_xref             (unchanged)
+-> editable matrix
+
+editable matrix
+-> expand_xref               (unchanged)
+-> relation with visible one-level labels
+-> inbound axis projection    (Slice 2)
+-> canonical relation with keys
+----
+
+Outbound and inbound are *standalone* `Frames -> Frames` steps that run before
+`contract_xref` and after `expand_xref` respectively. They are not wrappers that
+own XRef shape conversion.
+
+== Confirmed scope
+
+*In scope for Slice 2:*
+
+. Two pure `Frames -> Frames` transformations that substitute the axis-identity
+  vocabulary of a *relation* frame's axis-identity column (default
+  `column_key`), using the accepted Slice 1 resolver:
++
+** *outbound* replaces each canonical key with its resolved flat one-level
+   visible label;
+** *inbound* replaces each resolved flat one-level visible label with its
+   canonical key.
+. Flat one-level only: the visible label is a single string (the resolver's
+  arity-1 tuple, unwrapped). Multi-level tuples remain Slice 3; grouped physical
+  headers remain Slice 4.
+. Public-surface gate: register both steps, document them, and add a release
+  note.
+. Prove exact flat-string roundtrip across XLSX and ODS through unchanged XRef
+  and unchanged carriers.
+
+*Explicitly out of scope (non-goals) for Slice 2:*
+
+* No change to `contract_xref` / `expand_xref` behavior or their contracts.
+* No new persisted `_meta` root, and no repurposing of
+  `_meta.xref_crosstable.column_keys` / `dense_axes.resolved` as mapping truth.
+  Inverse projection resolves from live source frames plus explicit
+  configuration and fails if the source frame is absent.
+* No metadata-registry, persistence-boundary, or schema-maintenance change
+  (follows directly from "no new persisted reference").
+* No multi-level tuple projection, no MultiIndex, no grouped headers, no
+  tuple-to-string delimiter encoding, no new carrier/render behavior beyond
+  proving existing flat-string roundtrip.
+* No replacement of `project_by_role`, no discriminator/facet multiprojection,
+  no XRef-view wrapper, no adoption migration (Slice 5).
+* No reopening of Slice 1 unless Slice 2 exposes a concrete accepted-contract
+  contradiction; none is identified here.
+
+== Dependencies on Slice 1
+
+Slice 2 depends only on the accepted internal package
+`spreadsheet_handling.domain.transformations.xref_axis_mapping` and its public
+symbols:
+
+* `AxisMappingIntent`, `AxisOrderPolicy` -- to declare the source frame, key
+  column, single label column, and ordering policy;
+* `resolve_axis_mapping(frames, intent, *, used_keys=...)` -- to resolve the
+  ordered, immutable, bijective mapping from live source frames, with completeness
+  checked against the relation's actually-used axis keys;
+* `ResolvedAxisMapping.labels_for_key` (outbound) and
+  `ResolvedAxisMapping.key_for_labels` (inbound) -- for exact forward/inverse
+  substitution;
+* `AxisMappingError` -- the deliberate diagnostic already carrying
+  frame/row/role/column context.
+
+The resolver is pure, read-only, returns no Frames, and writes no metadata; it
+already fails atomically before returning. Slice 2 is a genuine *second*
+in-repo consumer of this resolver, but it consumes the resolver's public API --
+it does *not* re-implement the exact-string, exact-tuple, safe-diagnostic, or
+NumPy-integer contracts, so no helper extraction is triggered (see robustness
+review below).
+
+Slice 2 also legitimately reuses the already-shared physical-table boundary
+helpers in `spreadsheet_handling.domain.tabular`
+(`ensure_unique_physical_column_labels`, `ensure_unique_field_declaration`) for
+its own parameter/frame validation, consistent with their existing multi-consumer
+status.
+
+== Scope still correct after Slice 1 and repo evolution
+
+Yes. Nothing in accepted Slice 1 or the later Domain Boundary Robustness policy
+narrows or widens the Slice 2 boundary the FTR drew:
+
+* Slice 1 delivered exactly the pure model/resolver the FTR authorized; it added
+  no public, registry, metadata, or carrier surface, so all of that work still
+  belongs to Slice 2 as planned.
+* `contract_xref` / `expand_xref` still validate participating matrix-axis
+  identities as unique, non-empty strings and still reject MultiIndex/tuple
+  columns in the current slice. Flat one-level labels are exact non-empty
+  strings, so Slice 2's substituted values satisfy XRef's identity contract and
+  XRef needs no change -- exactly the FTR's premise.
+* The Domain Boundary Robustness policy did not authorize any runtime extraction
+  and confirmed no second consumer justified promoting the resolver's local
+  helpers; Slice 2 reuses the resolver rather than duplicating those helpers, so
+  that conclusion still holds.
+
+== Files and layers Slice 2 should modify
+
+[cols="2,3",options="header"]
+|===
+| Surface | Change
+
+| New transform module (recommended
+  `src/spreadsheet_handling/domain/transformations/xref_axis_projection.py`)
+| Two `Frames -> Frames` functions composing the Slice 1 resolver around
+  unchanged XRef. Structural precedent:
+  `domain/transformations/compact_multiaxis.py` (a composite that imports the
+  XRef primitives, copies Frames, uses local temporaries, and never leaks
+  intermediates into persisted metadata).
+
+| `src/spreadsheet_handling/pipeline/registry.py`
+| Add two `StepRegistration(factory=make_frames_target_step, target=...)`
+  entries, mirroring the `expand_xref` / `contract_xref` registrations.
+
+| `registries/pipeline_step_registry.json`
+| Add two symmetric entries. The registry guard asserts
+  `set(entries) == set(REGISTRY)` and `runtime_name` symmetry, and enforces the
+  16 required fields (`name`, `runtime_name`, `category`, `subtype`, `status`,
+  `purpose`, `factory_shape`, `target`, `parameters`, `meta_contract`,
+  `frame_contract`, `inverse`, `wrapped_steps`, `aliases`, `references`).
+  Category `primitive` (or `composite` if the implementer wraps XRef), status
+  `current`, factory_shape `frames_target`.
+
+| `docs/user_guide/ch03_transformation_catalog/`
+| Document the pair (a new axis-projection subsection or an addition to
+  `02_bijective_transforms.adoc`).
+
+| `docs/release_notes/release_notes.adoc`
+| Add a bullet under the active `== unknown -- planned` section (new opt-in
+  public steps).
+|===
+
+A short Technical Model / Functional Model note (that flat axis-label projection
+is an opt-in vocabulary swap composed around unchanged XRef, distinct from XRef
+shape conversion) is *recommended but minimal*; the identity model itself is
+already settled in the FTR and Slice 1.
+
+== Files and layers that must remain untouched
+
+* `src/spreadsheet_handling/domain/transformations/xref_crosstable/**` -- XRef
+  behavior and contracts are unchanged; this is the whole point of the chosen
+  architecture.
+* `src/spreadsheet_handling/domain/transformations/xref_axis_mapping/**` --
+  accepted Slice 1; reuse only, no reopening.
+* `registries/meta_registry.yaml`, `src/spreadsheet_handling/pipeline/persistence_boundary.py`,
+  `src/spreadsheet_handling/domain/schema_maintenance/**` -- no new persisted
+  reference, therefore no change.
+* `src/spreadsheet_handling/io_backends/**`, `rendering/**`, adapters, and
+  MultiHeader/grouped-column carrier code -- flat strings only; no new carrier
+  behavior.
+* `domain/tabular/**` internals -- reuse the existing helpers; do not add a new
+  shared axis helper (no proven second consumer of a new contract).
+
+== Runtime and documentation surfaces
+
+* *Runtime:* two new opt-in pipeline steps; both read live source frames plus a
+  relation frame and emit a new relation frame with a substituted axis-identity
+  column. No change to any existing step.
+* *Configuration/YAML:* two new step names with declared parameters (public
+  surface -> gated).
+* *Metadata:* none introduced; existing `_meta` is passed through untouched.
+* *Persistence/roundtrip:* the substituted relation is an ordinary flat-string
+  relation; persistence and carrier behavior are unchanged. Roundtrip identity
+  is the new obligation to *prove*, not new behavior to add.
+* *Documentation:* transformation catalog entry + release note (+ optional short
+  model note).
+
+== Validation / ownership / diagnostic / atomicity contract
+
+Under the accepted Domain Boundary Robustness policy (level-2 competent-user
+workflow input at the transform boundary; the resolver already owns value-level
+validation):
+
+* *Validate at ingress, simplify internally.* Validate the transform's own
+  parameters (frame names, `column_key`, output name, `drop_source` collisions)
+  and the relation's physical labels via the shared `domain/tabular` helper.
+  Delegate all axis-value validation (exact strings, ordering vocabulary,
+  bijection, arity) to `resolve_axis_mapping`. Do not re-defend the value object
+  model a second time.
+* *Ownership.* Copy the Frames mapping; produce a new output DataFrame; never
+  mutate input frames or the caller's mapping (respect pandas copy semantics).
+  Resolved values returned by the resolver are already exact built-in strings.
+* *Diagnostics.* Raise feature-specific errors (reuse `AxisMappingError` or a
+  thin projection-local subclass) carrying frame/column/row context. Do not run
+  a rejected value's `repr`/type/hash/eq/iteration merely to describe it; a
+  constant type detail plus surrounding context is the accepted pattern.
+* *Atomicity (scope: Frames dict, the output DataFrame, and `_meta`).* Resolve
+  the full mapping and validate every used key/label *before* assigning the
+  output frame. On any failure, publish no partial output frame, no partial
+  substitution, and no `_meta` mutation. The promise is not extended to
+  arbitrary caller iterator side effects (consistent with Slice 1's scoped
+  promise).
+* *No fake sandbox.* Add no hostile-object introspection beyond what the
+  resolver already performs; hostile in-process Python is a level-4 non-goal.
+
+== Adversarial correctness obligations vs. out-of-scope hostile cases
+
+*Explicit correctness obligations (must be tested and must fail cleanly):*
+
+* outbound: a canonical key present in the relation's axis column but missing
+  from the mapping source fails (resolver `used_keys` completeness);
+* inbound: a visible label present in the expanded relation but not resolvable to
+  a canonical key fails (`key_for_labels` "unknown complete visible label
+  tuple");
+* duplicate source keys, duplicate complete labels, wrong arity, empty labels,
+  and invalid ordering data fail before any output frame is published
+  (resolver);
+* a missing/absent source frame fails rather than trusting stale or visible
+  text;
+* exact flat-string roundtrip identity is preserved end to end (see tests).
+
+*Out of scope (do not expand the threat model):* arbitrary hostile in-process
+objects beyond the resolver's narrow value contract; multi-level tuple handling;
+grouped-header carrier attacks. Report a genuine violation of an explicit
+guarantee (atomicity, non-mutation, exact identity, deterministic order) if a
+probe finds one -- that remains a correctness finding, not threat-model
+expansion.
+
+== Failure-atomicity scope required
+
+The output Frames mapping, the substituted output DataFrame, and `_meta` must
+never be partially published on failure. Because the resolver raises before
+returning and the transform assigns `out[output]` only after successful full
+substitution, atomicity is achievable by construction (build-then-publish). This
+must be asserted by a focused test (a failing key/label leaves the input frames
+and `_meta` unchanged and creates no output frame).
+
+== Shared-helper (semantic DRY) assessment
+
+No new shared helper is justified by Slice 2. Slice 2 consumes the Slice 1
+resolver through its public API; it does not duplicate the exact-string,
+exact-tuple, safe-diagnostic-detail, or exact-NumPy-integer contracts, so the
+robustness policy's "two genuine consumers of the same accepted/rejected
+vocabulary, normalization, ownership, diagnostics, and layer" bar is not met for
+any new extraction. Reuse of the existing multi-consumer `domain/tabular`
+physical-label helpers is legitimate and is *not* a new extraction. Validation
+that is specific to axis projection stays feature-local.
+
+== Compatibility expectations
+
+* Axis projection remains opt-in; existing flat XRef YAML, Python calls,
+  matrices, and metadata stay valid.
+* Existing pipelines that enrich a relation with a unique visible name and use
+  that name directly as the XRef key remain supported and unaffected.
+* Direct XRef callers may still use visible strings as their declared axis
+  identity; only the explicit axis-projection boundary promises restoration to a
+  different canonical key.
+* No migration of existing consumers is required.
+
+== Required tests
+
+*Focused unit tests (new module):*
+
+* outbound substitution: canonical keys -> flat labels in the relation's axis
+  column, other columns and row order preserved;
+* inbound substitution: flat labels -> canonical keys;
+* pure Frames roundtrip: outbound -> `contract_xref` -> `expand_xref` -> inbound
+  reproduces the original canonical relation exactly (both `SOURCE_ROW` and
+  `COLUMNS` order policies);
+* failure cases: unknown used key, unknown visible label, missing source frame,
+  duplicate/ambiguous mapping, wrong arity/empty label (delegated to resolver but
+  asserted at the transform boundary);
+* ownership/atomicity: input frames and `_meta` unmutated; no output frame on
+  failure;
+* `_meta` pass-through: no new root written.
+
+*Integration / roundtrip tests:*
+
+* exact flat-string roundtrip through *both* XLSX and ODS carriers
+  (canonical -> label -> matrix -> persist -> read -> label -> canonical),
+  alongside the existing parity harness under
+  `tests/integration/io_backends/` -- proving no carrier change is needed and no
+  identity is lost.
+
+*Architecture guards (must pass; existing guards, generally no new guard file):*
+
+* registry symmetry and required-field contract
+  (`tests/architecture/dependency_guards/test_pipeline_step_registry.py`);
+* transformation layer boundaries -- no import of `io_backends`, `rendering`,
+  `cli`, `application`
+  (`tests/architecture/domain_transformations/test_layer_boundaries.py`);
+* package public-API and registry-uses-public-transform-apis guards.
+
+*Schema-maintenance / meta-registry checks:* none required; instead assert (by
+leaving them unchanged) that no `_meta` root and no schema-maintenance reference
+were added.
+
+== Required documentation / registry updates (same slice)
+
+* `registries/pipeline_step_registry.json` -- two symmetric, fully-populated
+  entries (registry guard is blocking).
+* `src/spreadsheet_handling/pipeline/registry.py` -- two `StepRegistration`
+  entries.
+* `docs/user_guide/ch03_transformation_catalog/` -- catalog entry for the pair.
+* `docs/release_notes/release_notes.adoc` -- bullet under `== unknown --
+  planned`.
+* Optional minimal Technical/Functional Model note; not blocking.
+
+== Settled design decisions (implementation contract)
+
+The FTR left two decisions open; both are settled here so the implementation
+agent does not re-litigate them. Final public names are confirmable at the
+acceptance gate (low risk).
+
+. *Output model: source-to-output.* Each transform takes an input relation and
+  writes a distinct `output` frame, with an optional `drop_source`, matching
+  `contract_xref` / `expand_xref` and `compact_multiaxis`. Not in-place.
+. *Recommended names and parameter shape:*
++
+[source,text]
+----
+project_axis_labels(               # outbound: canonical keys -> visible labels
+    frames, *,
+    relation,                      # input relation frame (canonical keys)
+    output,                        # output relation frame (visible labels)
+    source_frame, key_column, label_column,   # -> AxisMappingIntent (arity 1)
+    order_policy="source_row", order_columns=(),
+    column_key="column_key",       # relation column holding axis identity
+    drop_source=False, name=None,
+)
+
+restore_axis_keys(                 # inbound: visible labels -> canonical keys
+    frames, *,
+    relation,                      # input relation frame (visible labels)
+    output,                        # output relation frame (canonical keys)
+    source_frame, key_column, label_column,
+    order_policy="source_row", order_columns=(),
+    column_key="column_key",
+    drop_source=False, name=None,
+)
+----
++
+Both build one `AxisMappingIntent` with `label_columns=(label_column,)`, call
+`resolve_axis_mapping` with `used_keys` = the distinct axis-column values
+(outbound) or with the relation's labels checked via `key_for_labels`
+(inbound), then substitute. `_meta` is passed through untouched.
+
+== Recommended implementation sequence
+
+. Confirm/adjust the settled names and parameter shape (above); write the module
+  skeleton with build-then-publish structure and `_meta` pass-through.
+. Implement outbound (`project_axis_labels`): resolve, completeness-check used
+  keys, substitute canonical -> label, publish output.
+. Implement inbound (`restore_axis_keys`): resolve, substitute label ->
+  canonical via `key_for_labels`, publish output.
+. Add focused unit tests (substitution, pure Frames roundtrip, failures,
+  ownership/atomicity, `_meta` pass-through).
+. Register both steps in `registry.py` and add symmetric
+  `pipeline_step_registry.json` entries; make the registry and layer guards
+  green.
+. Add the XLSX and ODS flat-string roundtrip integration test.
+. Add the user-guide catalog entry and the release-note bullet; run the full
+  suite, ruff, source-style guard, and Asciidoctor.
+
+== Exact implementation acceptance criteria
+
+* Outbound then `contract_xref` then `expand_xref` then inbound reproduces the
+  original canonical relation exactly, for flat one-level mappings, under both
+  order policies.
+* The same identity survives an XLSX roundtrip and an ODS roundtrip with no
+  carrier or XRef change.
+* Every explicit correctness obligation above fails cleanly with a
+  feature-specific diagnostic and publishes no partial output/`_meta`.
+* Input frames and `_meta` are never mutated; no new `_meta` root is written.
+* Both steps are registered with symmetric runtime and JSON registry entries;
+  the registry, layer-boundary, and public-API guards pass.
+* User-guide catalog entry and a release note under the active planned section
+  exist; the release-notes checkpoint is satisfied.
+* `contract_xref` / `expand_xref` and the Slice 1 resolver package are unchanged.
+* No metadata-registry, persistence-boundary, or schema-maintenance change.
+* Full active Core suite, ruff, source-style guard, and Asciidoctor all pass;
+  `git diff --check` is clean.
+
+== Findings
+
+=== Blocking
+
+None.
+
+=== Important
+
+* *I-1 (design decision to settle, not a defect).* The FTR leaves public names
+  and in-place-versus-output open. Left unsettled, an implementation agent could
+  re-open design mid-slice. *Resolved in this review* by settling source-to-output
+  and the recommended names/parameter shape; the acceptance gate confirms final
+  names. No FTR edit is required.
+
+=== Minor
+
+* *M-1.* Slice 2 must consciously *not* introduce a persisted mapping `_meta`
+  root; doing so would silently drag in meta-registry, persistence-boundary, and
+  schema-maintenance obligations the FTR defers to a separate gated slice. The
+  contract above makes `_meta` pass-through explicit.
+* *M-2.* `SOURCE_ROW` ordering is deterministic only relative to caller-supplied
+  row order (recorded residual risk in acceptance review 003). Slice 2 does not
+  need to change this, but its public parameter documentation should state that
+  ordering follows the resolver's declared policy rather than promising a
+  serialized ordering vocabulary (that remains a later decision).
+
+=== Observations
+
+* The `compact_multiaxis` composite is a close and current structural precedent
+  (composes XRef primitives, copies Frames, keeps intermediates out of persisted
+  metadata, registered symmetrically). Following it will keep Slice 2 idiomatic.
+* Slice 2 is comfortably sized for one implementation context and one acceptance
+  gate: two single-purpose transforms, flat one-level only, no new metadata, no
+  new carrier behavior beyond proving existing flat-string roundtrip.
+
+== FTR correction assessment
+
+The FTR is precise and correctly staged; *no correction is required* to begin
+Slice 2. The open items it lists for Slice 2 are design choices this
+confirmation review settles, not gaps or staleness. No editorial change was made
+in this read-only task.
+
+== Validation
+
+Read-only review; no executable file, registry, or FTR was modified.
+
+* Asciidoctor render of this artifact (Asciidoctor 2.0.23) -- see command below.
+* Path/symbol existence checks: the Slice 1 package imports and exposes
+  `resolve_axis_mapping`, `AxisMappingIntent`, `AxisOrderPolicy`,
+  `ResolvedAxisMapping`, `ResolvedAxisMember`, `AxisMappingError`; `registry.py`
+  registers `expand_xref` / `contract_xref` via `make_frames_target_step`;
+  `registries/pipeline_step_registry.json` and the registry guard enforce
+  symmetry and the 16 required fields; `domain/tabular` exposes the reused
+  physical-label helpers; `compact_multiaxis.py`, the XRef crosstable operation,
+  and the io-backends parity harness exist at the cited paths.
+* `git diff --check`: clean (only this new artifact is added).
+
+No runtime tests were required because this task modifies no executable file.
+
+XREF AXIS MAPPINGS SLICE 2 READY FOR IMPLEMENTATION
