@@ -20,14 +20,14 @@ resolution.
 Contract highlights (per the GX-2 confirmation review):
 
 * *Runtime representation* -- the flat DataFrame and its ``GroupedHeader`` travel
-  as one Frames value, the :class:`GroupedMatrix` carrier, so the pair is trusted
-  by construction and GX1-A-M2 mispairing is unreachable through the public API.
+  as one Frames value, the :class:`GroupedMatrix` carrier. Public construction
+  and inverse use both prove their exact semantic pairing under the live mapping.
 * *Mapping resolution* -- resolved exactly once per call and handed to GX-1; the
   forward enforces ``used_keys`` completeness against the matrix's dynamic
   headers; the inverse relies on exact ``key_for_labels``. Nothing is persisted.
-* *Metadata* -- ``name`` forwards to XRef, which owns ``_meta.xref_crosstable``
-  exactly as today; grouped-XRef adds no metadata root and only ever references
-  caller-supplied public frame names.
+* *Metadata* -- ``xref_config_id`` forwards as unchanged XRef's ``name`` and
+  selects its ``_meta.xref_crosstable`` entry. YAML ``name`` remains the generic
+  pipeline step name; grouped-XRef adds no metadata root.
 * *Atomicity* -- ``contract_xref`` / ``expand_xref`` each return copied Frames,
   so a failure after the wrapped call and before grouped publication discards the
   interim copy and leaves caller Frames, ``_meta``, and cleanup commands
@@ -51,7 +51,12 @@ from ..xref_axis_mapping import (
     resolve_axis_mapping,
 )
 
-from .matrix import GroupedMatrix, GroupedXrefError
+from .matrix import (
+    GroupedMatrix,
+    GroupedXrefError,
+    _validate_grouped_matrix_pair,
+    grouped_matrix_from_canonical,
+)
 from .projection import build_grouped_header, restore_flat_matrix
 
 Frames = dict[str, Any]
@@ -67,6 +72,12 @@ def _require_name(value: Any, *, field_name: str) -> str:
     if type(value) is not str or not value.strip():
         raise GroupedXrefError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _require_optional_name(value: Any, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_name(value, field_name=field_name)
 
 
 def _order_policy(value: Any) -> AxisOrderPolicy:
@@ -119,27 +130,24 @@ def _build_intent(
     )
 
 
-def _row_key_labels(row_keys: str | Iterable[Any]) -> frozenset[Any]:
-    """Row-key labels as a membership set, to isolate the dynamic headers.
-
-    ``row_keys`` has already been validated by the wrapped ``contract_xref`` /
-    ``expand_xref`` call before this runs, so this only reshapes a known-valid
-    value; it duplicates no XRef validation.
-    """
+def _owned_row_keys(row_keys: str | Iterable[Any]) -> tuple[Any, ...]:
+    """Own one reusable declaration without duplicating XRef semantics."""
     if isinstance(row_keys, str):
-        return frozenset((row_keys,))
+        return (row_keys,)
     if isinstance(row_keys, (bytes, bytearray)):
         raise GroupedXrefError("row_keys must be a string or a sequence of strings")
     try:
-        return frozenset(row_keys)
+        return tuple(row_keys)
     except TypeError:
         raise GroupedXrefError(
             "row_keys must be a string or a sequence of strings"
         ) from None
 
 
-def _dynamic_headers(frame: pd.DataFrame, row_keys: str | Iterable[Any]) -> list[Any]:
-    row_key_set = _row_key_labels(row_keys)
+def _dynamic_headers(frame: pd.DataFrame, row_keys: tuple[Any, ...]) -> list[Any]:
+    # The wrapped XRef call has already narrowed this exact owned declaration
+    # and the physical matrix headers to unique non-empty strings.
+    row_key_set = frozenset(row_keys)
     return [label for label in frame.columns if label not in row_key_set]
 
 
@@ -161,28 +169,25 @@ def contract_grouped_xref(
     order_policy: Any = "source_row",
     order_columns: Iterable[Any] = (),
     drop_source: bool = False,
-    name: str | None = None,
+    xref_config_id: str | None = None,
 ) -> Frames:
     """Forward: contract a canonical relation into a grouped-matrix carrier.
 
-    Runs unchanged ``contract_xref`` to produce the flat canonical-string matrix,
-    then GX-1 ``build_grouped_header`` to attach the visible label tuples, and
-    publishes a :class:`GroupedMatrix` under ``output``. The axis mapping is
-    resolved once from the live ``source_frame`` with ``used_keys`` completeness
-    against the matrix's dynamic canonical headers.
-
-    ``name`` and ``drop_source`` forward to ``contract_xref`` (whose value-loss
-    guards remain authoritative and whose ``_meta.xref_crosstable`` write is the
-    only metadata produced). A failure at resolution or header projection --
-    after ``contract_xref`` but before publication -- discards the interim copy
-    and leaves the caller's Frames, ``_meta``, and cleanup commands unchanged.
+    Composes unchanged ``contract_xref`` with GX-1 under one live mapping, then
+    publishes a validated carrier. ``xref_config_id`` selects XRef metadata;
+    YAML ``name`` remains the pipeline step name. Publication is atomic.
     """
     _require_frames(frames)
     _require_name(relation, field_name="relation")
     _require_name(output, field_name="output")
     _require_name(column_key, field_name="column_key")
+    config_id = _require_optional_name(
+        xref_config_id,
+        field_name="xref_config_id",
+    )
     if drop_source and relation == output:
         raise GroupedXrefError("drop_source requires a distinct output frame")
+    owned_row_keys = _owned_row_keys(row_keys)
     intent = _build_intent(
         source_frame=source_frame,
         key_column=key_column,
@@ -196,30 +201,34 @@ def contract_grouped_xref(
         frames,
         relation=relation,
         output=output,
-        row_keys=row_keys,
+        row_keys=owned_row_keys,
         column_key=column_key,
         value=value,
         column_keys=column_keys,
         fill_value=fill_value,
         dense_axes=dense_axes,
         drop_source=drop_source,
-        name=name,
+        name=config_id,
     )
     flat = interim[output]
     # The flat matrix is a component of the grouped representation, never a
     # separately addressable published frame. ``used_keys`` are exactly the
     # dynamic canonical headers that become grouped columns, giving the tightest
     # completeness check owned by this composite (GX1-A-M1).
-    used_keys = _dynamic_headers(flat, row_keys)
+    used_keys = _dynamic_headers(flat, owned_row_keys)
     mapping = resolve_axis_mapping(frames, intent, used_keys=used_keys)
     header = build_grouped_header(
         flat,
-        row_keys=row_keys,
+        row_keys=owned_row_keys,
         mapping=mapping,
         level_names=level_names,
     )
     out: dict[str, Any] = dict(interim)
-    out[output] = GroupedMatrix(frame=flat, header=header)
+    out[output] = grouped_matrix_from_canonical(
+        flat,
+        header,
+        mapping=mapping,
+    )
     return out
 
 
@@ -239,28 +248,28 @@ def expand_grouped_xref(
     order_policy: Any = "source_row",
     order_columns: Iterable[Any] = (),
     drop_source: bool = False,
-    name: str | None = None,
+    xref_config_id: str | None = None,
 ) -> Frames:
     """Inverse: expand a grouped-matrix carrier into a canonical relation.
 
-    Requires ``frames[matrix]`` to be a :class:`GroupedMatrix` produced by
-    :func:`contract_grouped_xref`; a bare DataFrame or other value is rejected
-    with :class:`GroupedXrefError`. There is deliberately *no* descriptor or raw
-    header parameter, so a caller cannot pair a descriptor with a foreign frame
-    (GX1-A-M2 mispairing stays structurally unreachable).
-
-    Resolves the axis mapping once from the live ``source_frame``, restores the
-    flat canonical matrix via GX-1, rebinds the caller's real ``matrix`` name to
-    the flat DataFrame on a local copy (so no private frame name is created), and
-    runs unchanged ``expand_xref``. With ``drop_source=False`` the original
-    :class:`GroupedMatrix` is kept under ``matrix``; with ``drop_source=True`` the
-    ``matrix`` name is marked for cleanup by ``expand_xref`` and is not restored.
+    Requires ``frames[matrix]`` to be a :class:`GroupedMatrix` built through the
+    validated canonical factory. The current frame/header pair is revalidated
+    under the live mapping before restoration, catching post-construction column
+    mutation and stale or foreign pairing.
+    Resolves once, restores through GX-1, locally rebinds the real ``matrix``
+    name, and runs unchanged ``expand_xref`` without a private frame. The carrier
+    is preserved unless ``drop_source`` marks it for final cleanup.
     """
     _require_frames(frames)
     _require_name(matrix, field_name="matrix")
     _require_name(output, field_name="output")
+    config_id = _require_optional_name(
+        xref_config_id,
+        field_name="xref_config_id",
+    )
     if drop_source and matrix == output:
         raise GroupedXrefError("drop_source requires a distinct output frame")
+    owned_row_keys = _owned_row_keys(row_keys)
     if matrix not in frames:
         raise GroupedXrefError(f"Grouped matrix frame {matrix!r} was not found")
     grouped = frames[matrix]
@@ -279,6 +288,7 @@ def expand_grouped_xref(
     # Resolve once from the live source; ``restore_flat_matrix`` rejects unknown,
     # wrong-arity, incomplete, or duplicate visible tuples via ``key_for_labels``.
     mapping = resolve_axis_mapping(frames, intent)
+    _validate_grouped_matrix_pair(grouped, mapping=mapping)
     flat = restore_flat_matrix(grouped.frame, grouped.header, mapping=mapping)
     # Rebind the *real* ``matrix`` name locally to the unwrapped flat DataFrame:
     # ``expand_xref`` then reads a flat matrix under the public name and never
@@ -289,13 +299,13 @@ def expand_grouped_xref(
         interim,
         matrix=matrix,
         output=output,
-        row_keys=row_keys,
+        row_keys=owned_row_keys,
         value_columns=value_columns,
         column_key=column_key,
         value=value,
         base_relation=base_relation,
         drop_source=drop_source,
-        name=name,
+        name=config_id,
     )
     if not drop_source:
         # Keep the grouped representation under ``matrix`` (the local rebinding to

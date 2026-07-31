@@ -12,12 +12,17 @@ from __future__ import annotations
 
 import copy
 import inspect
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
 
 from spreadsheet_handling.domain.transformations.xref_axis_mapping import (
     AxisMappingError,
+    AxisMappingIntent,
+    AxisOrderPolicy,
+    ResolvedAxisMapping,
+    resolve_axis_mapping,
 )
 from spreadsheet_handling.domain.transformations.grouped_xref import (
     DynamicColumn,
@@ -28,7 +33,9 @@ from spreadsheet_handling.domain.transformations.grouped_xref import (
     RowKeyColumn,
     contract_grouped_xref,
     expand_grouped_xref,
+    grouped_matrix_from_canonical,
 )
+import spreadsheet_handling.domain.transformations.grouped_xref.composites as composites
 
 pytestmark = pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
 
@@ -51,6 +58,21 @@ def _dense_relation(row_ids: tuple[str, ...] = ("r1", "r2")) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _dense_relation_two_row_keys() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "rk1": rk1,
+                "rk2": rk2,
+                "column_key": key,
+                "value": f"{rk1}:{rk2}:{key}",
+            }
+            for rk1, rk2 in (("a", "x"), ("b", "y"))
+            for key in _KEYS2
+        ]
+    )
+
+
 def _source2() -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -63,6 +85,19 @@ def _source2() -> pd.DataFrame:
 
 def _frames() -> dict[str, object]:
     return {"rel": _dense_relation(), "src": _source2()}
+
+
+def _mapping(source: pd.DataFrame | None = None) -> ResolvedAxisMapping:
+    frames = {"src": _source2() if source is None else source}
+    return resolve_axis_mapping(
+        frames,
+        AxisMappingIntent(
+            source_frame="src",
+            key_column="key",
+            label_columns=("grp", "leaf"),
+            order_policy=AxisOrderPolicy.SOURCE_ROW,
+        ),
+    )
 
 
 def _forward(frames: dict[str, object], **overrides: object) -> dict[str, object]:
@@ -86,31 +121,155 @@ def _sorted(relation: pd.DataFrame) -> pd.DataFrame:
 # GroupedMatrix carrier                                                        #
 # --------------------------------------------------------------------------- #
 
-def test_carrier_validates_frame_and_header_types() -> None:
+def test_carrier_direct_construction_is_rejected_deliberately() -> None:
+    header = GroupedHeader(
+        level_names=("grp", "leaf"),
+        columns=(RowKeyColumn(label="row_id", position=0),),
+    )
+    with pytest.raises(GroupedXrefError, match="grouped_matrix_from_canonical"):
+        GroupedMatrix(frame=pd.DataFrame({"row_id": [1]}), header=header)
+
+
+def test_public_factory_validates_frame_and_header_types() -> None:
     header = GroupedHeader(
         level_names=("grp", "leaf"),
         columns=(RowKeyColumn(label="row_id", position=0),),
     )
     with pytest.raises(GroupedXrefError):
-        GroupedMatrix(frame=[1, 2, 3], header=header)  # type: ignore[arg-type]
+        grouped_matrix_from_canonical(  # type: ignore[arg-type]
+            [1, 2, 3], header, mapping=_mapping()
+        )
     with pytest.raises(GroupedXrefError):
-        GroupedMatrix(frame=pd.DataFrame({"row_id": [1]}), header=object())  # type: ignore[arg-type]
+        grouped_matrix_from_canonical(  # type: ignore[arg-type]
+            pd.DataFrame({"row_id": [1]}), object(), mapping=_mapping()
+        )
 
 
 def test_carrier_has_identity_semantics_not_value_equality() -> None:
-    header = GroupedHeader(
-        level_names=("grp", "leaf"),
-        columns=(RowKeyColumn(label="row_id", position=0),),
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    a = grouped_matrix_from_canonical(
+        produced.frame,
+        produced.header,
+        mapping=_mapping(),
     )
-    frame = pd.DataFrame({"row_id": [1]})
-    a = GroupedMatrix(frame=frame, header=header)
-    b = GroupedMatrix(frame=frame, header=header)
+    b = grouped_matrix_from_canonical(
+        produced.frame,
+        produced.header,
+        mapping=_mapping(),
+    )
     # Same content, distinct instances: NOT equal (identity semantics, not a
     # value object), and hashable only by identity.
     assert a == a
     assert a != b
     assert hash(a) == hash(a)
     assert hash(a) != hash(b)
+
+
+def test_public_factory_accepts_exact_canonical_pair_for_future_carriers() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    rebuilt = grouped_matrix_from_canonical(
+        produced.frame,
+        produced.header,
+        mapping=_mapping(),
+    )
+    assert rebuilt.frame is produced.frame
+    assert rebuilt.header is produced.header
+
+
+def test_public_factory_allows_cell_edits_with_unchanged_schema() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    edited = produced.frame.copy()
+    edited.loc[0, _KEYS2[0]] = "edited"
+    rebuilt = grouped_matrix_from_canonical(
+        edited,
+        produced.header,
+        mapping=_mapping(),
+    )
+    assert rebuilt.frame.loc[0, _KEYS2[0]] == "edited"
+
+
+def test_public_factory_rejects_reordered_dynamic_columns() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    foreign = produced.frame[["row_id", _KEYS2[1], _KEYS2[0], _KEYS2[2]]]
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        grouped_matrix_from_canonical(
+            foreign,
+            produced.header,
+            mapping=_mapping(),
+        )
+
+
+def test_public_factory_rejects_moved_row_key() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    foreign = produced.frame[[_KEYS2[0], "row_id", _KEYS2[1], _KEYS2[2]]]
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        grouped_matrix_from_canonical(
+            foreign,
+            produced.header,
+            mapping=_mapping(),
+        )
+
+
+def test_public_factory_rejects_unrelated_same_width_frame() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    unrelated_source = pd.DataFrame(
+        {
+            "key": ["other.1", "other.2", "other.3"],
+            "grp": ["Other", "Other", "Other"],
+            "leaf": ["One", "Two", "Three"],
+        }
+    )
+    unrelated = produced.frame.copy()
+    unrelated.columns = ["row_id", "other.1", "other.2", "other.3"]
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        grouped_matrix_from_canonical(
+            unrelated,
+            produced.header,
+            mapping=_mapping(unrelated_source),
+        )
+
+
+def test_public_factory_rejects_stale_header_after_mapping_label_change() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    changed = _source2()
+    changed.loc[changed["key"] == _KEYS2[0], "leaf"] = "Changed"
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        grouped_matrix_from_canonical(
+            produced.frame,
+            produced.header,
+            mapping=_mapping(changed),
+        )
+
+
+def test_public_factory_rejects_multiindex_and_altered_headers() -> None:
+    produced = _forward(_frames())["mtx"]
+    assert isinstance(produced, GroupedMatrix)
+    multiindex = produced.frame.copy()
+    multiindex.columns = pd.MultiIndex.from_tuples(
+        [("row_id", ""), *((key, "") for key in _KEYS2)]
+    )
+    with pytest.raises(GroupedHeaderError, match="MultiIndex"):
+        grouped_matrix_from_canonical(
+            multiindex,
+            produced.header,
+            mapping=_mapping(),
+        )
+
+    altered = produced.frame.copy()
+    altered.columns = ["row_id", "unknown", _KEYS2[1], _KEYS2[2]]
+    with pytest.raises(AxisMappingError, match="Unknown canonical axis key"):
+        grouped_matrix_from_canonical(
+            altered,
+            produced.header,
+            mapping=_mapping(),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +335,104 @@ def test_forward_rejects_drop_source_into_same_output() -> None:
         _forward(_frames(), output="rel", drop_source=True)
 
 
+@pytest.mark.parametrize("shape", ["list", "tuple", "generator"])
+def test_forward_owns_multiple_row_keys_for_every_iterable_shape(shape: str) -> None:
+    declarations: object
+    if shape == "list":
+        declarations = ["rk1", "rk2"]
+    elif shape == "tuple":
+        declarations = ("rk1", "rk2")
+    else:
+        declarations = (key for key in ("rk1", "rk2"))
+    out = contract_grouped_xref(
+        {"rel": _dense_relation_two_row_keys(), "src": _source2()},
+        relation="rel",
+        output="mtx",
+        row_keys=declarations,  # type: ignore[arg-type]
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )
+    grouped = out["mtx"]
+    assert isinstance(grouped, GroupedMatrix)
+    assert list(grouped.frame.columns[:2]) == ["rk1", "rk2"]
+
+
+def test_forward_consumes_one_shot_row_keys_once_and_reuses_owned_tuple() -> None:
+    class OneShotRowKeys:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("row_keys was iterated more than once")
+            return iter(("rk1", "rk2"))
+
+    declaration = OneShotRowKeys()
+    with (
+        patch.object(
+            composites,
+            "contract_xref",
+            wraps=composites.contract_xref,
+        ) as xref_spy,
+        patch.object(
+            composites,
+            "build_grouped_header",
+            wraps=composites.build_grouped_header,
+        ) as header_spy,
+        patch.object(
+            composites,
+            "resolve_axis_mapping",
+            wraps=composites.resolve_axis_mapping,
+        ) as resolver_spy,
+    ):
+        contract_grouped_xref(
+            {"rel": _dense_relation_two_row_keys(), "src": _source2()},
+            relation="rel",
+            output="mtx",
+            row_keys=declaration,
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+
+    assert declaration.iterations == 1
+    xref_row_keys = xref_spy.call_args.kwargs["row_keys"]
+    header_row_keys = header_spy.call_args.kwargs["row_keys"]
+    assert xref_row_keys is header_row_keys
+    assert xref_row_keys == ("rk1", "rk2")
+    assert resolver_spy.call_count == 1
+    assert resolver_spy.call_args.kwargs["used_keys"] == list(_KEYS2)
+
+
+@pytest.mark.parametrize("invalid", [b"rk1", bytearray(b"rk1"), 42])
+def test_row_key_container_shape_failures_are_safe(invalid: object) -> None:
+    with pytest.raises(GroupedXrefError, match="row_keys must be"):
+        contract_grouped_xref(
+            _frames(),
+            relation="rel",
+            output="mtx",
+            row_keys=invalid,  # type: ignore[arg-type]
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+
+
+def test_duplicate_row_key_semantics_remain_owned_by_xref() -> None:
+    with pytest.raises(ValueError, match="row_keys contains duplicate field"):
+        contract_grouped_xref(
+            {"rel": _dense_relation_two_row_keys(), "src": _source2()},
+            relation="rel",
+            output="mtx",
+            row_keys=(key for key in ("rk1", "rk1")),
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Metadata / name ownership                                                    #
 # --------------------------------------------------------------------------- #
@@ -193,9 +450,16 @@ def test_forward_metadata_is_xref_owned_with_public_names_only() -> None:
     assert "mtx" in (payload["matrix"],)
 
 
-def test_forward_name_becomes_xref_config_id() -> None:
-    out = _forward(_frames(), name="my_axis")
+def test_forward_xref_config_id_becomes_xref_config_id() -> None:
+    out = _forward(_frames(), xref_config_id="my_axis")
     assert set(out["_meta"]["xref_crosstable"]) == {"my_axis"}
+
+
+def test_xref_config_id_requires_exact_non_empty_string() -> None:
+    with pytest.raises(GroupedXrefError, match="xref_config_id"):
+        _forward(_frames(), xref_config_id=" ")
+    with pytest.raises(GroupedXrefError, match="xref_config_id"):
+        _forward(_frames(), xref_config_id=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +500,63 @@ def test_inverse_restores_canonical_relation_exact_dense_roundtrip() -> None:
     )
 
 
+@pytest.mark.parametrize("shape", ["string", "list", "tuple", "generator"])
+def test_inverse_owns_row_keys_once_for_every_iterable_shape(shape: str) -> None:
+    if shape == "string":
+        forward_row_keys: object = "row_id"
+        inverse_row_keys: object = "row_id"
+    elif shape == "list":
+        forward_row_keys = ["row_id"]
+        inverse_row_keys = ["row_id"]
+    elif shape == "tuple":
+        forward_row_keys = ("row_id",)
+        inverse_row_keys = ("row_id",)
+    else:
+        forward_row_keys = (key for key in ("row_id",))
+        inverse_row_keys = (key for key in ("row_id",))
+    frames = _frames()
+    forward = _forward(frames, row_keys=forward_row_keys)
+    inverse = expand_grouped_xref(
+        {"mtx": forward["mtx"], "src": frames["src"]},
+        matrix="mtx",
+        output="rel_out",
+        row_keys=inverse_row_keys,  # type: ignore[arg-type]
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )
+    pd.testing.assert_frame_equal(
+        _sorted(inverse["rel_out"]),
+        _sorted(_dense_relation()),
+    )
+
+
+def test_inverse_accepts_one_shot_two_row_key_generator() -> None:
+    relation = _dense_relation_two_row_keys()
+    forward = contract_grouped_xref(
+        {"rel": relation, "src": _source2()},
+        relation="rel",
+        output="mtx",
+        row_keys=["rk1", "rk2"],
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )
+    inverse = expand_grouped_xref(
+        {"mtx": forward["mtx"], "src": _source2()},
+        matrix="mtx",
+        output="rel_out",
+        row_keys=(key for key in ("rk1", "rk2")),
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )
+    pd.testing.assert_frame_equal(
+        inverse["rel_out"].sort_values(["rk1", "rk2", "column_key"]).reset_index(drop=True),
+        relation.sort_values(["rk1", "rk2", "column_key"]).reset_index(drop=True),
+    )
+
+
 def test_inverse_requires_grouped_matrix_carrier() -> None:
     frames = {"mtx": _dense_relation(), "src": _source2()}
     with pytest.raises(GroupedXrefError):
@@ -270,6 +591,13 @@ def test_inverse_exposes_no_descriptor_parameter() -> None:
     assert "grouped_header" not in params
 
 
+def test_grouped_signatures_use_xref_config_id_not_name() -> None:
+    for function in (contract_grouped_xref, expand_grouped_xref):
+        params = set(inspect.signature(function).parameters)
+        assert "xref_config_id" in params
+        assert "name" not in params
+
+
 def test_inverse_keeps_grouped_matrix_when_not_dropping_source() -> None:
     frames = _frames()
     forward = _forward(frames)
@@ -294,7 +622,7 @@ def test_mapping_drift_between_forward_and_inverse_is_rejected() -> None:
     # descriptor still carries the old visible tuple, which no longer resolves.
     drifted = _source2()
     drifted.loc[drifted["key"] == "deposit.balance", "leaf"] = "Sichteinlage"
-    with pytest.raises(AxisMappingError):
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
         expand_grouped_xref(
             {"mtx": forward["mtx"], "src": drifted},
             matrix="mtx",
@@ -304,6 +632,126 @@ def test_mapping_drift_between_forward_and_inverse_is_rejected() -> None:
             key_column="key",
             label_columns=["grp", "leaf"],
         )
+
+
+def test_inverse_revalidates_pair_after_dataframe_column_mutation() -> None:
+    frames = _frames()
+    forward = _forward(frames)
+    grouped = forward["mtx"]
+    assert isinstance(grouped, GroupedMatrix)
+    grouped.frame.columns = [
+        "row_id",
+        _KEYS2[1],
+        _KEYS2[0],
+        _KEYS2[2],
+    ]
+    caller = {"mtx": grouped, "src": frames["src"]}
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        expand_grouped_xref(
+            caller,
+            matrix="mtx",
+            output="rel_out",
+            row_keys="row_id",
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+    assert set(caller) == {"mtx", "src"}
+    assert "_meta" not in caller
+
+
+def test_inverse_rejects_moved_row_key_before_expansion() -> None:
+    frames = _frames()
+    grouped = _forward(frames)["mtx"]
+    assert isinstance(grouped, GroupedMatrix)
+    grouped.frame.columns = [
+        _KEYS2[0],
+        "row_id",
+        _KEYS2[1],
+        _KEYS2[2],
+    ]
+    caller = {"mtx": grouped, "src": frames["src"]}
+    with pytest.raises(GroupedXrefError, match="pairing does not match"):
+        expand_grouped_xref(
+            caller,
+            matrix="mtx",
+            output="rel_out",
+            row_keys="row_id",
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+    assert "rel_out" not in caller
+
+
+def test_inverse_rejects_multiindex_and_altered_headers_before_expansion() -> None:
+    frames = _frames()
+    grouped = _forward(frames)["mtx"]
+    assert isinstance(grouped, GroupedMatrix)
+    grouped.frame.columns = pd.MultiIndex.from_tuples(
+        [("row_id", ""), *((key, "") for key in _KEYS2)]
+    )
+    with pytest.raises(GroupedHeaderError, match="MultiIndex"):
+        expand_grouped_xref(
+            {"mtx": grouped, "src": frames["src"]},
+            matrix="mtx",
+            output="rel_out",
+            row_keys="row_id",
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+
+    grouped = _forward(frames)["mtx"]
+    assert isinstance(grouped, GroupedMatrix)
+    grouped.frame.columns = ["row_id", "unknown", _KEYS2[1], _KEYS2[2]]
+    with pytest.raises(AxisMappingError, match="Unknown canonical axis key"):
+        expand_grouped_xref(
+            {"mtx": grouped, "src": frames["src"]},
+            matrix="mtx",
+            output="rel_out",
+            row_keys="row_id",
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+
+
+def test_inverse_xref_config_id_becomes_xref_config_id() -> None:
+    frames = _frames()
+    forward = _forward(frames)
+    inverse = expand_grouped_xref(
+        {"mtx": forward["mtx"], "src": frames["src"]},
+        matrix="mtx",
+        output="rel_out",
+        row_keys="row_id",
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+        xref_config_id="my_inverse_axis",
+    )
+    assert set(inverse["_meta"]["xref_crosstable"]) == {"my_inverse_axis"}
+
+
+def test_inverse_resolves_mapping_exactly_once_for_pair_check_and_restore() -> None:
+    frames = _frames()
+    forward = _forward(frames)
+    with patch.object(
+        composites,
+        "resolve_axis_mapping",
+        wraps=composites.resolve_axis_mapping,
+    ) as resolver_spy:
+        expand_grouped_xref(
+            {"mtx": forward["mtx"], "src": frames["src"]},
+            matrix="mtx",
+            output="rel_out",
+            row_keys="row_id",
+            source_frame="src",
+            key_column="key",
+            label_columns=["grp", "leaf"],
+        )
+    assert resolver_spy.call_count == 1
+    assert "used_keys" not in resolver_spy.call_args.kwargs
 
 
 def test_inverse_rejects_drop_source_into_same_output() -> None:

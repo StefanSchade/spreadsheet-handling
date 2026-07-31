@@ -6,7 +6,8 @@
   primitives (``build_grouped_header`` / ``restore_flat_matrix``).
 * GX-2 adds the public composites (``contract_grouped_xref`` /
   ``expand_grouped_xref``), the Frames-boundary :class:`GroupedMatrix` carrier,
-  and :class:`GroupedXrefError`.
+  its validated :func:`grouped_matrix_from_canonical` construction seam, and
+  :class:`GroupedXrefError`.
 
 The composites are the public pipeline surface (registered in
 ``pipeline/registry.py`` and ``registries/pipeline_step_registry.json``); the
@@ -22,7 +23,11 @@ from .model import (
     RowKeyColumn,
 )
 from .projection import build_grouped_header, restore_flat_matrix
-from .matrix import GroupedMatrix, GroupedXrefError
+from .matrix import (
+    GroupedMatrix,
+    GroupedXrefError,
+    grouped_matrix_from_canonical,
+)
 from .composites import contract_grouped_xref, expand_grouped_xref
 
 __all__ = [
@@ -34,6 +39,7 @@ __all__ = [
     "restore_flat_matrix",
     "GroupedMatrix",
     "GroupedXrefError",
+    "grouped_matrix_from_canonical",
     "contract_grouped_xref",
     "expand_grouped_xref",
 ]
