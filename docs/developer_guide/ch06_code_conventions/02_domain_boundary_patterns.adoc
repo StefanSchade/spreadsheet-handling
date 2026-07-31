@@ -1,0 +1,189 @@
+=== Domain Boundary Patterns
+
+Six small patterns for writing robust domain boundaries. They are the readable,
+example-driven companion to the normative
+link:../../technical_model/ch04_concepts/domain_boundary_robustness.adoc[Domain
+Boundary Robustness] concept and the
+link:../../technical_model/ch03_architecture_decisions/ADR-DOMAIN-BOUNDARY-ROBUSTNESS.adoc[ADR].
+
+Read the concept for the *rules*; use this catalogue for *how the code looks*.
+You do not need to know Python metaclasses to apply these patterns -- each one
+lists search terms if you want to go deeper.
+
+[NOTE]
+====
+Exact-type checks (`type(x) is str`) are *not* a default style rule. Idiomatic
+Python usually prefers `isinstance`. Reach for an exact-type boundary only when a
+value's *identity, comparison, hashing, or immutability* is part of a contract
+and a subclass could quietly break it. If you cannot name the contract, use
+`isinstance`.
+====
+
+==== 1. Exact built-in value boundary
+
+*Intent:* Accept only an exact built-in type when subclass behaviour could break
+a stability contract (identity, ordering, hashing, immutability).
+
+*Use when:* the value is stored, hashed, compared, or used as a key, and a
+subclass could override those operations.
+
+*Do not use when:* you only need the value's data and any subclass would behave
+identically -- prefer `isinstance` there.
+
+*Minimal example:*
+[source,python]
+----
+def _identity(value: object) -> str:
+    # A str subclass may override __eq__/__hash__ and destabilize a key.
+    if type(value) is not str or not value.strip():
+        raise DomainError("unsupported value type")
+    return value
+----
+
+*Review questions:*
+
+* What breaks if a subclass overrides equality, hashing, or comparison here?
+* Is the exact-type check justified by a named contract, or is it reflexive?
+
+*Search terms:* `Python exact type check`, `subclass rejection`,
+`value-object boundary`, `Liskov substitution trade-off`.
+
+==== 2. Normalize at ingress
+
+*Intent:* Validate the accepted carrier type and convert immediately to one
+canonical internal value, so downstream code never re-inspects carrier quirks.
+
+*Use when:* inputs arrive as a family of interchangeable carriers (for example
+several NumPy integer scalars) that should behave as one internal type.
+
+*Do not use when:* the carrier distinction is itself meaningful downstream.
+
+*Minimal example:*
+[source,python]
+----
+def _to_int(value: object) -> int:
+    # Accept only documented exact carriers, then normalize to built-in int.
+    if type(value) in _SUPPORTED_EXACT_NUMPY_INTEGER_TYPES:
+        return int(value)
+    if type(value) is int and type(value) is not bool:
+        return value
+    raise DomainError("unsupported value type")
+----
+
+*Review questions:*
+
+* After ingress, does any later code still branch on the carrier type?
+* Do mixed accepted carriers become one homogeneous internal type?
+
+*Search terms:* `canonicalization`, `NumPy scalar normalization`,
+`anti-corruption layer`, `normalize on input`.
+
+==== 3. Defensive ownership copy
+
+*Intent:* When the framework retains a caller-owned container, copy it so later
+caller mutation cannot change internal state.
+
+*Use when:* an accepted ordered container is stored in a value object or lookup.
+
+*Do not use when:* the value is consumed immediately and never retained.
+
+*Minimal example:*
+[source,python]
+----
+@dataclass(frozen=True)
+class Resolved:
+    labels: tuple[str, ...]
+
+def make_resolved(labels: Sequence[str]) -> Resolved:
+    # Store an exact built-in tuple the caller cannot later mutate or subclass.
+    return Resolved(labels=tuple(labels))
+----
+
+*Review questions:*
+
+* Can the caller still hold a reference that mutates our stored value?
+* Does `frozen=True` actually protect a mutable member, or only the field?
+
+*Search terms:* `defensive copy`, `aliasing`, `effective immutability`,
+`frozen dataclass mutable members`.
+
+==== 4. Safe diagnostics
+
+*Intent:* Report enough context to locate a fault without executing the rejected
+value's overridable behaviour.
+
+*Use when:* raising on an invalid caller value -- especially its type or `repr`.
+
+*Do not use when:* the value is already known-safe internal data.
+
+*Minimal example:*
+[source,python]
+----
+def _reject(field: str, row: int) -> NoReturn:
+    # Constant detail: never interpolate type(value).__name__ or repr(value).
+    raise DomainError(f"unsupported value type in field {field!r} at row {row}")
+----
+
+*Review questions:*
+
+* Does the message run `repr`, `str`, `__name__`, or comparison on the bad value?
+* Is the surrounding context (field, row, role) enough to debug without it?
+
+*Search terms:* `hostile repr`, `diagnostic side effects`, `exception hygiene`,
+`safe error reporting`.
+
+==== 5. Validate then commit
+
+*Intent:* Build and validate the complete candidate result before publishing any
+mutation or metadata, so a failure leaves the documented graph unchanged.
+
+*Use when:* a transformation writes Frames, `_meta`, or mutates a caller graph.
+
+*Do not use when:* there is no partial-publish risk (a pure return of one value).
+
+*Minimal example:*
+[source,python]
+----
+def apply(frames: Frames) -> Frames:
+    candidate = _build_candidate(frames)   # may raise; nothing published yet
+    _validate(candidate)                   # may raise; still nothing published
+    return _commit(candidate)              # only reached once fully valid
+----
+
+*Review questions:*
+
+* If `_validate` raises, is any output or caller-visible state already changed?
+* What exactly is inside the atomicity promise, and is that scope documented?
+
+*Search terms:* `failure atomicity`, `two-phase update`,
+`strong exception guarantee`, `validate before commit`.
+
+==== 6. Narrow semantic helper
+
+*Intent:* Keep distinct identity concepts in separate helpers; share one only
+when two consumers genuinely need the same contract.
+
+*Use when:* two boundaries have matching accepted *and* rejected vocabularies,
+normalization, ownership, diagnostics, and layer.
+
+*Do not use when:* the checks merely look similar -- for example physical
+column-label validity versus configured field-reference identity are different
+contracts even if both touch strings.
+
+*Minimal example:*
+[source,python]
+----
+# Separate contracts stay separate helpers:
+def ensure_physical_label(label: object) -> None: ...     # DataFrame column labels
+def ensure_field_reference(name: object) -> str: ...      # exact configured identity
+# Merge only when a second consumer proves the SAME contract.
+----
+
+*Review questions:*
+
+* Do these two helpers accept and reject exactly the same values for the same
+  reason?
+* Would merging couple two concepts that may diverge later?
+
+*Search terms:* `semantic DRY`, `bounded abstraction`, `primitive obsession`,
+`accidental semantic coupling`.
