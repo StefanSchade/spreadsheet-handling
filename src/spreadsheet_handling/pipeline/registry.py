@@ -117,6 +117,14 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.xref_crosstable:contract_xref",
     ),
+    "project_axis_labels": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.xref_axis_projection:project_axis_labels",
+    ),
+    "restore_axis_keys": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.xref_axis_projection:restore_axis_keys",
+    ),
     "sparse_collapse": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.sparse_defaults:sparse_collapse",
