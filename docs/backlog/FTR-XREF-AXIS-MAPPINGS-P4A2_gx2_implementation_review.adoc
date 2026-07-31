@@ -1,0 +1,228 @@
+= GX-2 Implementation Self-Review: Grouped-XRef Composites
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+GX-2 -- the first public grouped-XRef capability (`contract_grouped_xref` /
+`expand_grouped_xref`) -- is implemented exactly to the accepted GX-2
+confirmation contract
+(`FTR-XREF-AXIS-MAPPINGS-P4A2_gx2_confirmation_review_001.adoc`). The two
+composites wrap *unchanged* `contract_xref` / `expand_xref` plus the accepted GX-1
+primitives around a feature-owned `GroupedMatrix` carrier that bundles the flat
+canonical matrix and its `GroupedHeader` as one trusted Frames value. Mapping is
+resolved once per call; XRef metadata ownership is preserved; failure atomicity
+holds via the wrapped primitives' copied Frames; the GX1-A-M2 mispairing hazard is
+structurally unreachable through the public surface; and the Slice 2 F-1 follow-up
+is closed. No accepted architecture, GX-1 contract, or GX-2 confirmation decision
+was reopened; no protected surface was modified.
+
+This self-review is the implementation record required by the repository review
+contract. GX-2 is *not* marked accepted; independent acceptance review 001 is the
+next gate.
+
+== Reviewed state
+
+* Git root `core/`, branch `main`, no branch created/switched, nothing pushed.
+* Baseline HEAD at start: `ad28e64` (GX-1 acceptance).
+* Runtime added: `grouped_xref/matrix.py` (`GroupedMatrix`, `GroupedXrefError`),
+  `grouped_xref/composites.py` (`contract_grouped_xref`, `expand_grouped_xref`).
+* Runtime updated: `grouped_xref/__init__.py` (exports), `pipeline/registry.py`
+  (two `StepRegistration`s), `registries/pipeline_step_registry.json` (two
+  composite entries).
+* Tests added: `tests/unit/domain/transformations/test_grouped_xref_composites.py`,
+  `tests/integration/pipeline/test_grouped_xref_public_build.py`.
+* Test generalized: `tests/architecture/dependency_guards/test_pipeline_step_registry.py`
+  (family-scoped registered-parameters/signature guard).
+* Docs updated: user guide bijective-transforms chapter, release notes, Slice 2
+  acceptance review F-1 closure note.
+
+== Confirmation-contract conformance
+
+* *Public capability & signatures* -- both composites match the confirmed
+  asymmetric signatures exactly (forward exposes `column_keys`/`dense_axes`/
+  `fill_value`; inverse exposes `value_columns`/`base_relation`; both take arity-N
+  `label_columns`, `level_names` on forward only, `order_policy`/`order_columns`,
+  `drop_source`, `name`; `drop_empty` deliberately not exposed). Verified by the
+  generalized registry/signature guard: registered params == signature params
+  (minus `frames`) and required flags == "no default".
+* *Runtime representation* -- `contract_grouped_xref` publishes a `GroupedMatrix`
+  under `output`; `expand_grouped_xref` reads it from `matrix`. No sidecar frame,
+  no `_meta` descriptor storage, no `MultiIndex`, no persisted mapping.
+* *XRef composition* -- calls the public `contract_xref` / `expand_xref` and the
+  public GX-1 `build_grouped_header` / `restore_flat_matrix`; no lower-level XRef
+  primitive is called and no XRef logic is duplicated.
+
+== Carrier honesty
+
+`GroupedMatrix` is `@dataclass(frozen=True, eq=False)` holding `frame`
+(`pd.DataFrame`) and `header` (`GroupedHeader`). `frozen=True` only prevents
+rebinding the two references; `eq=False` gives identity equality and identity
+hash, so it makes *no* false value-equality or value-hash claim over the mutable
+DataFrame it carries -- exactly the honesty the GX-1 confirmation demanded and the
+opposite of freezing a DataFrame into a value object. `__post_init__` validates
+`frame` is a pandas DataFrame and `header` is an exact `GroupedHeader`
+(`GroupedXrefError` otherwise). It never copies the frame to feign immutability.
+Proven by `test_carrier_validates_frame_and_header_types` and
+`test_carrier_has_identity_semantics_not_value_equality` (two equal-content
+instances are unequal and hash distinctly).
+
+== Pairing safety (GX1-A-M2)
+
+The inverse exposes *no* descriptor/header parameter
+(`test_inverse_exposes_no_descriptor_parameter`) and requires `frames[matrix]` to
+be a `GroupedMatrix`, rejecting a bare DataFrame or other value
+(`test_inverse_requires_grouped_matrix_carrier`). The frame and descriptor are
+built together by `contract_grouped_xref` and only ever travel inside the carrier,
+so there is no public path to pair a descriptor with a foreign frame. GX1-A-M2
+mispairing is structurally unreachable through the public surface, and -- per the
+accepted decision -- *no GX-1 runtime hardening was added*
+(`grouped_xref/model.py` and `projection.py` are untouched).
+
+== Mapping resolved once
+
+Each composite builds exactly one `AxisMappingIntent` and calls
+`resolve_axis_mapping` exactly once, handing the immutable mapping to GX-1. The
+forward passes `used_keys` = the matrix's dynamic (non-row-key) headers, so a used
+canonical key missing from the source fails before publication
+(`test_forward_used_keys_completeness_rejects_missing_source_key`); a missing
+source frame fails at resolution (`test_forward_missing_source_frame_rejected`).
+The inverse relies on exact `key_for_labels`; a source-mapping change between
+forward and inverse is rejected (`test_mapping_drift_between_forward_and_inverse_is_rejected`).
+No resolution is persisted; GX-1 never resolves (it imports only
+`ResolvedAxisMapping`). Order policy is substitution-irrelevant: the roundtrip is
+identical under `source_row` and `columns`
+(`test_roundtrip_identical_under_both_order_policies`).
+
+== XRef unchanged and reused; metadata ownership
+
+`xref_crosstable/**` and `xref_axis_mapping/**` are untouched (verified: no diff).
+`name` forwards to the wrapped XRef step, which owns `_meta.xref_crosstable`
+exactly as today; the grouped composites add no metadata root and reference only
+caller-supplied public frame names
+(`test_forward_metadata_is_xref_owned_with_public_names_only`,
+`test_forward_name_becomes_xref_config_id`). The registry declares
+`composite_metadata_policy: preserve_public` accordingly.
+
+== No private frame leakage
+
+The forward's flat matrix is a *component* of the `GroupedMatrix` (never a
+separately addressable frame): after a forward call the frames are exactly
+`{inputs} + {output, _meta}` with `output` holding the carrier
+(`test_forward_introduces_no_private_frame`). The inverse rebinds the *real*
+`matrix` name locally to the unwrapped flat DataFrame before calling
+`expand_xref`, so no private frame name ever appears in the output or `_meta`; the
+registry declares `internal_frames: []` honestly.
+
+== `drop_source` atomicity
+
+Forward forwards `drop_source` to `contract_xref` (its value-loss guards remain
+authoritative) and rejects `relation == output`; the relation is marked for
+cleanup only on full success
+(`test_forward_drop_source_marks_relation_for_cleanup`,
+`test_forward_rejects_drop_source_into_same_output`). Inverse forwards
+`drop_source` to `expand_xref`, marks the `matrix` name, rejects `matrix ==
+output`, and does not restore a matrix marked for cleanup
+(`test_inverse_drop_source_marks_matrix_for_cleanup`,
+`test_inverse_rejects_drop_source_into_same_output`). No second cleanup mechanism
+is introduced. Build-then-publish holds because `contract_xref` / `expand_xref`
+each return copied Frames: a failure after the wrapped call but before grouped
+publication discards the interim copy and leaves caller Frames, `_meta`, and
+cleanup commands unchanged
+(`test_failure_after_xref_before_publication_leaves_caller_unchanged`,
+`test_forward_does_not_mutate_caller_frames_or_meta`).
+
+== F-1 closure
+
+Both parts landed in GX-2:
+
+* *Public build/run smoke* -- `test_grouped_xref_public_build.py` drives the GX-2
+  grouped composites *and* the Slice 2 flat axis steps through
+  `build_steps_from_config` + `run_pipeline`, asserting the exact dense-relation
+  roundtrip and that the config `name` is consumed by the builder as the step name
+  (not forwarded to the target as an unexpected argument, so the XRef `config_id`
+  falls back to the relation/output frame name).
+* *One reusable signature guard* --
+  `test_family_registry_parameters_match_public_signatures` replaces the hardcoded
+  `compact_multiaxis` guard with a data-driven, target-importing assertion over the
+  axis/grouped/compact family (both Slice 2 flat steps, both GX-2 composites, both
+  compact_multiaxis). It is scoped to that family rather than every `frames_target`
+  entry because `contract_xref` (omits `dense_axes`) and `expand_xref` (omits
+  `base_relation`) intentionally under-enumerate their signatures; the scoping is
+  documented in the guard. The Slice 2 acceptance review F-1 finding is annotated
+  as closed.
+
+== No carrier/rendering work
+
+`grouped_xref` imports only pandas, stdlib, `xref_axis_mapping`
+(`ResolvedAxisMapping`, intent, resolver), the sibling GX-1 modules, and the
+public `xref_crosstable` composites. No `rendering`, `io_backends`, IR, composer,
+parser, `MultiIndex`, or XLSX/ODS code is touched. The transformation
+layer-boundary guard passes with the new package files.
+
+== Protected surfaces
+
+Untouched (verified by empty `git status` over each path): `xref_crosstable/**`,
+`xref_axis_mapping/**`, `xref_axis_projection.py`, `grouped_xref/model.py`,
+`grouped_xref/projection.py`, `rendering`, `io_backends`, `cli`, `application`,
+schema maintenance, and the persistence boundary. The only test-directory change
+is the allowed generalization of the registry signature guard.
+
+== Tests and full-suite evidence
+
+[source,text]
+----
+.venv/bin/pytest -q tests/unit/domain/transformations/test_grouped_xref.py \
+    tests/unit/domain/transformations/test_grouped_xref_composites.py \
+    tests/integration/pipeline/test_grouped_xref_public_build.py \
+    tests/unit/domain/transformations/test_xref_axis_mapping.py \
+    tests/architecture/dependency_guards/test_pipeline_step_registry.py \
+    tests/architecture/pipeline_semantics/test_pipeline_semantics_guards.py \
+    tests/architecture/domain_transformations/            # all passed
+
+.venv/bin/pytest -m 'not legacy and not prehex and not slow' \
+    tests/unit tests/integration tests/roundtrip tests/architecture
+    # 2017 passed, 1 xfailed
+
+.venv/bin/ruff check <changed python files>               # All checks passed
+.venv/bin/python tools/check_source_style.py              # exit 0 (only
+    # pre-existing rendering/test WARNs; none in grouped_xref or the composites)
+asciidoctor -o /dev/null <changed docs + this review>     # render clean
+git diff --check                                          # clean
+----
+
+The single xfail is the pre-existing, unrelated
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+(`tests/roundtrip/test_pathological_cell_contracts.py::test_missing_fk_key_helper_representation_without_cleanup`);
+no code changed after it and it is not GX-2's concern.
+
+== Evidence-driven deviations
+
+None material. Two implementation choices worth recording:
+
+* The forward computes `used_keys` from the flat matrix's non-row-key columns via
+  a small local `_row_key_labels` set. This reshapes an already-XRef-validated
+  `row_keys` value into a membership set; it duplicates no XRef or resolver
+  validation.
+* The inverse frame contract lists `base_relation` in `reads`/`preserves` (a
+  conditionally read frame), mirroring how `expand_compact_multiaxis` lists its
+  optional base frame; when `base_relation` is `None` no such frame is read.
+
+== Lifecycle
+
+The owning FTR `FTR-XREF-AXIS-MAPPINGS-P4A2` stays open; GX-2 is implemented but
+*not* accepted, and GX-3..GX-5 remain pending. No FTR status line was changed by
+this implementation (status changes belong to the acceptance gate, matching the
+GX-1 pattern). No lifecycle archival is warranted.
+
+== Readiness for independent acceptance
+
+GX-2 meets every exact acceptance criterion in the confirmation review: the
+composite pair, the trusted carrier, single-resolution with forward completeness,
+XRef-owned metadata with public names only, `drop_source` atomicity, the
+structural pairing guarantee with no GX-1 change, symmetric composite registry
+entries with passing guards, the folded F-1 smoke + generalized signature guard,
+Slice 2 compatibility, and the user guide + release note. The surface is verified
+through both direct Python calls and the public build/run path.
+
+GROUPED XREF GX-2 READY FOR ACCEPTANCE REVIEW 001
