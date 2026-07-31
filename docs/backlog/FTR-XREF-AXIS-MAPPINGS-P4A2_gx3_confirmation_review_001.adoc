@@ -1,0 +1,467 @@
+= GX-3 Confirmation Review 001: XLSX Carrier for Grouped XRef
+:revdate: 2026-07-31
+:toc:
+
+== Verdict
+
+*GX-3 is not ready for implementation as a single slice.* The domain semantics
+are already settled and accepted (merged-architecture confirmation
+`266bfd8`, sections 3--10), and the *forward* projection is a bounded extension
+to existing seams. The *reverse* readback, however, cannot be delivered as the
+"smallest coherent carrier integration": it requires a broad, coordinated change
+to the shared XLSX read path that (a) introduces a *configured-depth,
+merge-independent, exact per-cell* multi-row header reconstruction where none
+exists, (b) must be *gated and proven non-regressing* against the many existing
+consumers of the current lossy `" / "` multi-row path, (c) needs a
+per-sheet configured-depth channel into the parser that does not exist today, and
+(d) adds a new public reverse domain step. The accepted architecture itself
+(section 8) flags this as a *compatibility risk* and *mandates* that "the carrier
+slices' own confirmation must prove no regression to existing multi-row-header
+consumers."
+
+This confirmation therefore recommends splitting GX-3 into bounded, independently
+reviewable sub-slices (section "Recommended decomposition") so the risky shared
+carrier extension lands and is regression-proven on its own before grouped-XRef
+domain wiring. No runtime change is made in this task.
+
+Repository state read: git root `core/`, branch `main`, clean worktree, HEAD
+`27b92ae` (GX-2 accepted in review 002). No branch was created or switched and
+nothing was pushed. This artifact is documentation-only.
+
+== Reviewed state and method
+
+Independently inspected against current source:
+
+* the owning FTR (GX-3 line) and the accepted merged grouped-XRef architecture
+  confirmation (`slice3_4_architecture_confirmation_001`, sections 3--10);
+* accepted GX-1 (`model.py`, `projection.py`) and GX-2
+  (`matrix.py`, `composites.py`, `grouped_matrix_from_canonical`) surfaces;
+* the workbook rendering IR (`rendering/ir.py`), composer
+  (`rendering/composer/layout_composer.py`), render-plan builder
+  (`rendering/flow.py`), and IR->frames projection
+  (`rendering/workbook_projection.py`);
+* the XLSX writer/renderer (`io_backends/xlsx/openpyxl_renderer.py`,
+  `xlsx_backend.py`) and parser
+  (`io_backends/xlsx/openpyxl_parser.py`,
+  `io_backends/xlsx/parser_interpretation.py`);
+* the backend contract (`io_backends/spreadsheet_contract.py`,
+  `io_backends/base.py`) and `BackendOptions`;
+* the declarative `domain/workbook_views.py` and the `_meta.workbook_view` seam;
+* relevant XLSX/ODS roundtrip tests
+  (`tests/integration/roundtrip/test_parse_ir_roundtrip.py`,
+  `tests/integration/io_backends/test_xref_axis_projection_roundtrip.py`),
+  and the multi-row consumers under `tests/unit/io_backends/**`;
+* the pipeline registry and step registration boundaries.
+
+The accepted architecture confirmation was treated as binding for *semantics*
+(what the carrier must mean); this confirmation independently determines the
+*integration cost and boundedness* of realizing it in the current code.
+
+== Where the semantics are already fixed (accepted architecture)
+
+The following are *not reopened*; they are inputs:
+
+* the authoritative representation is the feature-owned frozen `GroupedHeader`
+  descriptor plus the flat canonical DataFrame (a `GroupedMatrix`); a bare
+  `pandas.MultiIndex` is rejected as authoritative because the existing
+  MultiIndex<->carrier path is lossy (section 3);
+* row-key columns are single-level: leaf label, blank upper rows as a *rendering
+  artifact*, classified from configuration, never inferred from header shape
+  (section 4);
+* header depth / arity and level names are *configured* (from `label_columns`
+  count and `level_names`), *not persisted*; the parser must reconstruct visible
+  tuples from *physical header cells using the configured depth* (sections 5, 9);
+* edit/reorder policy is fixed: reorder and delete are supported/reconciled;
+  unknown, duplicate, partial, incomplete, depth-changed, or spurious-row-key
+  headers are rejected by the resolver (section 7);
+* the carrier must be lossless and *merge-independent*: repeated upper labels
+  written merged or as repeated literal (unmerged) cells must reconstruct
+  identically; merges are presentation only (section 8);
+* no new `_meta` root; XRef keeps `_meta.xref_crosstable`; no persisted
+  resolution (section 9).
+
+== Core question: the smallest place to cross the workbook boundary
+
+The desired visual/round-trip form (row-key region; N visible header rows for
+dynamic columns; tuples by physical position; optional horizontal merges;
+rectangular data; canonical keys never visible; exact reverse recovery of arity,
+level names, every complete tuple, positions, row keys, and the canonical key per
+tuple via the live mapping) maps onto the current architecture as follows.
+
+*Forward is bounded.* The render pipeline already emits an arbitrary header grid
+plus merges: `flow.build_render_plan` emits one `SetHeader` per non-empty grid
+cell and `MergeCells` from `sh.meta["__header_merges"]`, and `WriteDataBlock` for
+the data region (`rendering/flow.py:222-266`). `SetHeader` writes the cell text
+*verbatim*, so literal `" / "` and any component survive on write. The only gaps
+on the forward side are: (1) `compose_workbook` skips non-DataFrame frame values
+(`layout_composer.py:280`), so a `GroupedMatrix` is silently dropped; and (2) the
+grid/merge builder is driven from a `MultiIndex`
+(`_build_header_grid_and_merges`, `layout_composer.py:28-81`) rather than from the
+`GroupedHeader` descriptor. Both are bounded, additive extensions and match the
+accepted architecture's "reuse the grid+merge algorithm but drive it from the
+descriptor" (section 8).
+
+*Reverse is not bounded.* The read path is
+`parse_workbook(path) -> WorkbookIR -> workbookir_to_frames`
+(`spreadsheet_contract.py:41-47`). Two structural properties of the *current*
+shared reader are incompatible with the accepted contract:
+
+. *Header depth is inferred from merge geometry.* `_detect_header_rows`
+  (`xlsx/parser_interpretation.py:173-190`) decides depth by inspecting merge
+  regions near the anchor. A user who unmerges the upper header rows collapses the
+  detected depth to 1, so the header rows are mis-split into the data region
+  *before any configured depth can be applied*. This directly violates
+  "merge-independent exact-tuple read using configured depth" (FTR GX-3 line;
+  architecture section 8). There is *no per-sheet configured-depth channel* into
+  the parser today: `openpyxl_parser.parse_workbook` never consults
+  `BackendOptions.levels`/`header_levels`, and `ExcelBackend.read_multi` discards
+  its `header_levels` argument entirely (`xlsx_backend.py:42-55`).
+. *Header identity is lossy.* Multi-row headers are flattened with
+  `" / ".join(p for p in parts if p)` (`xlsx/parser_interpretation.py:124-132`)
+  and reconstructed by splitting on `" / "`
+  (`workbook_projection.py:172-174`). This drops empty/blank levels and cannot
+  represent a literal `" / "` inside a component, an incomplete tuple, or a
+  distinct empty middle level -- exactly the cases GX-2/GX-3 must preserve or
+  deliberately reject.
+
+An exact grid *is* extracted on read into `sh.meta["__header_grid"]`
+(`xlsx/parser_interpretation.py:77-80`, resolving merged masters via
+`_cell_value`), but it is not what `workbookir_to_frames` uses for identity, it is
+only populated when `header_rows > 1` (i.e. only when merge-depth-detection
+already succeeded), and it does not forward-fill user-unmerged blank cells. So the
+existing machinery cannot be reused as-is for merge-independent exact reads.
+
+== Representation alternatives (A--D)
+
+[cols="1,3",options="header"]
+|===
+| Alternative | Assessment
+
+| *A. Extend the workbook/sheet IR*
+| *Necessary and chosen by the accepted architecture (section 8), but not
+  sufficient alone.* `TableBlock` already owns `header_rows` and a flat
+  `headers: List[str]` + `header_map` (`ir.py:29-41`) but no lossless per-level
+  structure. Adding an exact per-level header grid (or the descriptor) to
+  `TableBlock` is the natural XLSX/ODS-neutral place and lets the writer emit
+  exact per-level cells. It does *not*, by itself, fix depth detection or the
+  `" / "` read flatten, and normal rendering already consumes `__header_grid`
+  without grouped-specific branching, so this part is bounded.
+
+| *B. Presentation metadata for header rows/tuples/merges/level names*
+| *Rejected as the identity source.* Encoding tuples/merges/level names in
+  `_meta` would either recreate the forbidden persisted-identity/`_meta`-root
+  (architecture section 9) or make readback depend on persisted metadata instead
+  of the physical header -- contradicting "reconstruct visible tuples from the
+  physical header, not from persisted mapping metadata" (section 9) and the
+  editability requirement (a user reorder/delete must reconcile against the
+  *cells*, not a stale sidecar). Merge regions are presentation and must not drive
+  identity (section 8).
+
+| *C. Dedicated XLSX-specific carrier value in Frames*
+| *Rejected.* Frames crossing the domain boundary must be backend-neutral;
+  a backend-specific value violates domain/IO layering and would force GX-4 to
+  duplicate a second model. The accepted representation is already the
+  backend-neutral `GroupedMatrix` (section 3).
+
+| *D. Generic backend-neutral workbook carrier descriptor* (flat data + grouped
+  header geometry + row-key positions + merges + level names)
+| *Partially implied, but must stay minimal.* The IR already is a backend-neutral
+  workbook representation; extending `TableBlock` with an exact per-level header
+  structure (alternative A) is the minimal form of this. Standing up a *parallel*
+  grouped-specific workbook descriptor beside `TableBlock` would be a new
+  framework-inside-the-framework and is explicitly discouraged. The reusable,
+  backend-neutral core (exact grid emit + exact grid read + configured-depth split
+  + forward-fill normalization) is what GX-4 later shares.
+|===
+
+*Design preference honored:* extend `TableBlock` + the composer grid/merge
+algorithm + the parser's exact-grid reconstruction (alternative A/D-minimal); do
+not introduce a parallel grouped-XRef workbook system (C) or a persisted-identity
+sidecar (B). The forward fits this cleanly; the reverse fits it only with the
+shared-parser changes below.
+
+== Workbook visual semantics (confirmed rules)
+
+Consistent with the accepted architecture:
+
+* *Header rows*: exactly `arity` rows (configured), above the data region; data
+  starts at `top + arity`.
+* *Row-key headers*: leaf-row label, blank upper rows (a rendering artifact of a
+  declared single-level column); never a padded tuple; classified from config.
+* *Level-name display*: level names are descriptor/config data; GX-3 need not
+  render them as an extra visible row (they are recovered from config, not cells).
+* *Blank upper cells*: within the dynamic region a blank upper cell is *always* a
+  repeat/merge artifact (dynamic visible labels are non-empty by GX-1
+  invariant), so reverse *forward-fills* blanks from the left at each level
+  unambiguously; a blank above a row-key column is expected and ignored.
+* *Horizontal merge*: optional presentation for contiguous equal upper labels;
+  merged and unmerged-repeated forms must reconstruct identically; identity comes
+  from cell values (master-resolved and forward-filled), never from merge extent.
+* *Literal delimiters / empty-string labels / duplicate or partial tuples /
+  reorder / delete / unknown-added / inconsistent depth*: handled per accepted
+  architecture section 7 (reorder/delete reconciled; the rest rejected by the
+  resolver via `key_for_labels` / arity checks) -- *provided* the reverse reads
+  exact per-cell tuples with configured depth. The current `" / "` reader cannot
+  supply that input.
+* *Merge geometry is never identity*: confirmed; the reverse must not infer depth
+  or identity from merges.
+
+== Forward sequence (bounded)
+
+[source,text]
+----
+GroupedMatrix (frames[output], from contract_grouped_xref)
+-> revalidate the current canonical pair (GX-2 grouped_matrix_from_canonical
+   contract; reuse _validate_grouped_matrix_pair or equivalent read-only proof)
+-> descriptor-driven header grid + contiguous-equal-upper-label merges
+   (new variant of _build_header_grid_and_merges, driven by GroupedHeader,
+   NOT by a " / "-joined MultiIndex)
+-> TableBlock(header_rows=arity, exact per-level grid, data = flat frame values)
+   with sh.meta["__header_grid"]/["__header_merges"] set
+-> existing flow.build_render_plan (SetHeader per cell + MergeCells + WriteDataBlock)
+-> existing openpyxl renderer
+----
+
+Ownership and answers:
+
+* `GroupedMatrix` is consumed in `compose_workbook` (extended to accept it);
+  canonical flat headers are used only to order data columns and are *not* written
+  as visible header cells (only visible tuples appear).
+* row-key columns render leaf label + blank upper rows; the writer emits merges
+  only for contiguous equal dynamic upper labels.
+* the original carrier need not remain in Frames for rendering; normal sheet
+  mapping locates the sheet by frame name exactly as today.
+
+This is a bounded additive extension (composer + IR) with no change to the render
+plan ops or renderer.
+
+== Reverse sequence (not bounded -- the blocker)
+
+[source,text]
+----
+parsed XLSX sheet
+-> (GAP 1) know header depth from CONFIG, not merges
+-> (GAP 2) read every physical header cell into exact tuples by position,
+   resolving merged masters AND forward-filling user-unmerged blanks,
+   WITHOUT " / " flatten
+-> visible tuples + physical positions + row-key columns
+-> (GAP 3) new domain step: resolve one live axis mapping, map each complete
+   tuple to its canonical key (mapping.key_for_labels), build the flat canonical
+   DataFrame, grouped_matrix_from_canonical(...) -> GroupedMatrix
+-> existing expand_grouped_xref (unchanged GX-2)
+----
+
+Concrete unresolved integration cost:
+
+* *GAP 1 -- configured depth into the parser.* No per-sheet header-depth channel
+  exists. `read_multi` ignores `header_levels`; `parse_workbook` never reads
+  `BackendOptions.levels`. Delivering configured depth per grouped sheet requires
+  either new plumbing (BackendOptions/read config -> `parse_workbook` ->
+  `build_visible_sheet_ir`/`_parse_table_block`) or moving the header/data split
+  out of the parser into a domain step fed raw cells. Both change the shared
+  reader's contract.
+* *GAP 2 -- exact, merge-independent per-cell reconstruction.* The reader must
+  stop using `_detect_header_rows` merge inference and `" / "` flatten for grouped
+  sheets, read the exact grid with configured depth, resolve merged masters, and
+  forward-fill unmerged blanks. This is new shared-parser behavior that must be
+  *gated* so ordinary MultiIndex/`" / "` sheets are byte-identical -- the accepted
+  architecture (section 8) explicitly calls this a *compatibility risk* and
+  *requires this confirmation's slice to prove no regression* to existing multi-row
+  consumers. Those consumers are numerous (`tests/unit/io_backends/**`:
+  XML/CSV/JSON/ODS multi-header, `test_ir_multiheader_write`,
+  `test_parse_ir_roundtrip::TestMultiIndexRoundtrip`), so the regression surface is
+  real.
+* *GAP 3 -- new public reverse domain step.* Reconstruction is a domain transform
+  (resolve mapping, `key_for_labels`, `grouped_matrix_from_canonical`) that cannot
+  live in the IO parser. It needs a named public step + registry entry + inverse
+  linkage and its own error ownership.
+
+No mapping is persisted to support readback; the source frame is an ordinary sheet
+read alongside the grouped sheet, and the axis-mapping intent is read-pipeline
+config -- both consistent with the accepted architecture. That part is sound; it
+is the depth/exact-read plumbing that is broad.
+
+== Pipeline / API surface
+
+* Forward: no new public step is strictly required if `compose_workbook` learns to
+  render a `GroupedMatrix` (internal dispatch on an existing domain value). A thin
+  writer-facing option may be needed to select which frame is the grouped sheet.
+* Reverse: a new public domain step is required (GAP 3), e.g.
+  `grouped_matrix_from_workbook_view(frames, *, matrix, source_frame, key_column,
+  label_columns, row_keys, level_names=None, ...)` producing a `GroupedMatrix`
+  under `matrix`, followed by unchanged `expand_grouped_xref`. Exact naming,
+  signature, YAML, registry entry, and inverse relationship must be settled in the
+  sub-slice that owns it; backend names must stay out of the domain API.
+
+Because the reverse needs a configured-depth read channel *and* a new domain step
+*and* a gated exact-read path, the public+internal surface is materially larger
+than "internal dispatch on an existing value."
+
+== Error and robustness contract
+
+Layer ownership (target):
+
+* missing header row / wrong configured depth / physical arity mismatch --
+  reverse reader / resolver arity check (`AxisMappingError` / `GroupedHeaderError`
+  as appropriate);
+* incomplete tuple, tuple not in live mapping, duplicate mapping key, duplicate
+  complete tuple -- resolver `key_for_labels` (`AxisMappingError`), before any
+  `GroupedMatrix` is built;
+* moved/missing row key, spurious upper label above a row key -- classification
+  from config (`GroupedXrefError` / resolver), not header-shape inference;
+* invalid merge crossing tuple boundaries, extra unknown column, MultiIndex at an
+  unsupported boundary -- reader-owned diagnostics before canonical expansion;
+* stale source mapping -- resolver, exactly as Slice 2/GX-2.
+
+All must fail *before* canonical expansion or output publication. Malformed
+ZIP/XML/hostile objects remain out of scope (existing XLSX parser policy). This
+contract is well-defined *once GAP 2 exists*; it depends on the exact reader.
+
+== Atomicity and nonmutation
+
+Target (achievable, standard build-then-publish): malformed workbook input
+publishes no `GroupedMatrix` and no canonical relation; caller Frames and `_meta`
+are unchanged; no cleanup command is written; no partial sheet projection is
+published; successful readback stays editable and reorder/delete-capable within
+the declared rules. This is not the blocker; it rides on GAP 2/GAP 3 being present.
+
+== GX-4 parity seam
+
+Backend-neutral and reusable by GX-4 (do not implement now): the descriptor-driven
+exact header grid, the configured-depth split, and the forward-fill/merge-master
+normalization; the domain reconstruction step. XLSX-specific: openpyxl cell/merge
+reading and rendering. Deliberately deferred to GX-4: ODS
+`table:number-columns-repeated`/`number-rows-repeated` bounded expansion and ODF
+XML carrier assertions (per the review-instructions adapter read-path rule).
+Notably the *same* `_detect_header_rows` + `" / "` gaps exist in
+`io_backends/ods/parser_interpretation.py:151,248`, so the exact-read core should
+be designed backend-neutral to avoid a second divergent implementation in GX-4.
+
+== Tests that would be required (scope indicator)
+
+Forward XLSX: arity 2/3; repeated upper labels; literal delimiters; multiple row
+keys; row-key header geometry; merged and unmerged repeated labels per policy;
+exact data-region placement; no visible canonical keys; existing formatting
+unaffected.
+
+Reverse XLSX: exact untouched roundtrip; edited cells; dynamic-column reorder;
+valid deletion; repeated labels; delimiters; arity 3; merged-cell normalization;
+manually unmerged equivalent headers; unknown/duplicate/partial/incomplete tuple;
+changed depth; moved/missing row key; stale mapping; atomic failure; factory +
+inverse integration.
+
+Cross-feature (mandated no-regression): flat XRef unchanged; ordinary DataFrame
+sheets unchanged; existing MultiIndex `" / "` multi-row consumers unchanged;
+compact multiaxis unchanged; XLSX roundtrip guards; no ODS behavior change; no new
+grouped metadata; no private Frames names.
+
+The reverse + mandated cross-feature no-regression matrix is large and centers on
+the shared parser, reinforcing that the shared carrier extension deserves its own
+gate.
+
+== Sizing
+
+Estimated for the single-slice realization:
+
+* *New/changed runtime modules (~6--8):* `rendering/ir.py` (TableBlock lossless
+  per-level structure); `rendering/composer/layout_composer.py` (GroupedMatrix
+  intake + descriptor-driven grid/merges); `rendering/workbook_projection.py`
+  (exact grouped delivery, gated); `io_backends/xlsx/parser_interpretation.py` +
+  `openpyxl_parser.py` + `xlsx_backend.py`/`base.py` (configured-depth channel +
+  exact reconstruction, gated); a new domain reconstruction module under
+  `domain/transformations/grouped_xref/`; `pipeline/registry.py` +
+  `registries/pipeline_step_registry.json`.
+* *Approx runtime LOC:* ~450--750.
+* *Approx test LOC:* ~600--900 across unit + roundtrip + cross-feature regression.
+* *New public types:* 0 (reuse `GroupedMatrix`); *new public steps:* 1 (reverse
+  reconstruction); *new registry entries:* 1 (+ inverse linkage to
+  `expand_grouped_xref`).
+
+Two of the touched modules (`parser_interpretation.py`,
+`workbook_projection.py`) are shared generic read infrastructure with many
+existing consumers; the change is *additive-but-gated* rather than a green-field
+module, which raises regression risk rather than lowering size.
+
+== Findings
+
+=== Blocking (for a single-slice READY)
+
+* *GX3-C-B1 -- the reverse requires a configured-depth, merge-independent exact
+  header read that does not exist and must modify shared generic parsing.* The
+  current XLSX reader infers depth from merges (`_detect_header_rows`) and
+  flattens identity with `" / "` (dropping empties), with no per-sheet
+  configured-depth channel. Meeting the accepted contract forces new shared-parser
+  behavior gated against existing `" / "`/MultiIndex consumers, whose
+  no-regression proof the accepted architecture (section 8) explicitly makes a
+  precondition of this carrier slice. This is broader than the smallest coherent
+  extension and should be landed and reviewed on its own.
+
+=== Important
+
+* *GX3-C-I1 -- the reverse needs a new public domain reconstruction step whose
+  name/signature/registry contract is unspecified.* It should be settled and
+  reviewed with the grouped-domain sub-slice, not folded into the shared carrier
+  change.
+* *GX3-C-I2 -- backend-neutral core must be designed to serve GX-4.* The identical
+  `_detect_header_rows`/`" / "` gaps in the ODS parser mean the exact-read core
+  must be backend-neutral now to avoid a divergent second implementation later;
+  doing this well argues for a dedicated carrier sub-slice.
+
+=== Minor
+
+* *GX3-C-M1 -- forward is ready.* The `GroupedMatrix`-intake + descriptor-driven
+  grid/merge extension to `compose_workbook` is bounded and low-risk and could be
+  the first sub-slice.
+
+=== Observations
+
+* *GX3-C-O1.* The parser already extracts an exact `__header_grid` (merged masters
+  resolved); the reverse can reuse it once depth is configured and blanks are
+  forward-filled -- reducing, but not eliminating, GAP 2.
+* *GX3-C-O2.* The empty-cell ambiguity dissolves because dynamic visible labels
+  are non-empty by GX-1 invariant, so forward-fill of blank upper cells is
+  unambiguous -- a clean rule for the exact reader.
+
+== Recommended decomposition
+
+Land as sequential, independently gated sub-slices (each with its own review):
+
+. *GX-3a -- backend-neutral exact multi-row header carrier.* Extend `TableBlock`
+  with a lossless per-level header structure; drive the composer grid/merges from
+  it; add a *configured-depth, merge-independent, exact per-cell* read (master
+  resolution + forward-fill) *gated* so the legacy `" / "` path is byte-identical;
+  prove no regression to existing multi-row consumers (the architecture-section-8
+  precondition). No grouped-XRef domain coupling.
+. *GX-3b -- grouped-XRef workbook wiring.* Forward `GroupedMatrix` -> exact header
+  carrier in `compose_workbook`; new public reverse domain step (exact parsed view
+  + live mapping -> `grouped_matrix_from_canonical` -> `GroupedMatrix`) + registry
+  entry + inverse link to unchanged `expand_grouped_xref`.
+. *GX-3c -- XLSX roundtrip and robustness matrix.* Full forward/reverse/edit tests.
+
+GX-4 (ODS) then reuses the GX-3a backend-neutral core and the GX-3b domain step,
+adding only ODS cell/repeat/XML specifics.
+
+== Protected surfaces (unchanged in this task)
+
+No runtime changed. Accepted XRef, resolver, Slice 2, GX-1, GX-2 semantics, ODS,
+application/CLI, schema maintenance, and the persistence boundary are untouched.
+The architecture direction remains grouped-XRef -> resolver/GX-1/XRef with the
+carrier layer additive on top.
+
+== Lifecycle
+
+`FTR-XREF-AXIS-MAPPINGS-P4A2` stays open. Slice 1, Slice 2, GX-1, and GX-2 remain
+accepted. GX-3 is *not ready* as a single slice and is recommended for
+decomposition (GX-3a/b/c). GX-4 and GX-5 remain pending. No FTR status change
+beyond recording this confirmation is required, no artifact is archived, and no
+GX-3 or GX-4 implementation begins.
+
+== Validation evidence
+
+Documentation-only task. Asciidoctor renders this artifact without error;
+`git diff --check` is clean. Architectural claims are grounded in current source
+with file:line references above (render flow, composer, workbook projection, XLSX
+parser interpretation, backend contract) and in the accepted merged-architecture
+confirmation sections 3--10.
+
+GROUPED XREF GX-3 NOT READY FOR IMPLEMENTATION
