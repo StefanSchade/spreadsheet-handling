@@ -1,0 +1,182 @@
+= GX-3b Implementation Self-Review: Grouped-XRef Workbook Wiring
+:revdate: 2026-08-01
+:toc:
+
+== Verdict
+
+*GX-3b is ready for acceptance review 001.* The workbook wiring confirmed in
+`gx3b_confirmation_001` (`be5ecb2`) is implemented exactly as scoped: a bounded
+forward composer dispatch that projects a `GroupedMatrix` into an exact
+`TableBlock.header_grid` (reusing the accepted GX-3a write branch), one small
+backend-neutral `core.ExactTable` carrier exported by generic workbook
+projection, and one registered grouped-domain step
+`reconstruct_grouped_matrix` that turns that carrier back into a validated
+`GroupedMatrix` under one live axis mapping. GX-3b ends at `GroupedMatrix`;
+unchanged `expand_grouped_xref` performs the relation expansion. No second grouped
+carrier, `MultiIndex` source of truth, persisted mapping, grouped `_meta`, or
+private frame name is introduced.
+
+Delta-only; background is in `gx3b_confirmation_001` and the accepted GX-2/GX-3a
+artifacts.
+
+== Forward composition
+
+`compose_workbook` (`rendering/composer/layout_composer.py`) recognises a
+`GroupedMatrix` Frames value in its existing frame loop (before the
+`isinstance(df, pd.DataFrame)` skip) and appends one exact-mode `TableBlock` via
+`_exact_grouped_table_block(name, grouped_matrix_to_exact_table(df))`. The pure
+projection `grouped_matrix_to_exact_table` (`grouped_xref/matrix.py`) reads the
+visible tuples authoritatively from the `GroupedHeader`: a `RowKeyColumn` writes
+its leaf label with blank upper cells; a `DynamicColumn` writes `labels[r]` per
+level (repeated literal labels, no merges). Canonical dynamic keys are never read
+for display -- only `frame.values` becomes the data block. Structural
+revalidation (`frame.shape[1] == len(header.columns)`) raises `GroupedXrefError`
+on a post-construction column mutation. `header_rows == arity`, `header_grid` is
+authoritative, and `sh.meta["__header_grid"]` is not seeded (one truth per table).
+The accepted GX-3a `flow._emit_exact_header_grid` renders the block unchanged --
+no render-plan/writer change. Ordinary DataFrames are unchanged.
+
+== Reverse reconstruction
+
+`reconstruct_grouped_matrix` (`grouped_xref/reconstruction.py`,
+`(frames, **config) -> Frames`) reads `frames[table]` (an `ExactTable`),
+validates rectangular geometry and depth (`len(header_grid) ==
+len(label_columns)`), identifies row-key columns by leaf label, requires blank
+upper cells above them, forward-fills merge-repeat blanks (skipping row-key
+columns), forms each dynamic column's top-to-leaf tuple, resolves one live axis
+mapping, maps tuples back to canonical keys, builds the flat frame in physical
+order, and returns a `GroupedMatrix` through GX-1 `build_grouped_header` + the
+GX-2 `grouped_matrix_from_canonical` factory. No delimiter join/split.
+
+== Public API and registry
+
+* New public types/functions: `core.ExactTable` (1 carrier);
+  `grouped_xref.grouped_matrix_to_exact_table` (forward helper);
+  `grouped_xref.reconstruct_grouped_matrix` (reverse step).
+* `core.header_grid.forward_fill_header_grid` (+ `HeaderGrid`) moved from
+  `rendering.header_grid`, which now re-exports them (GX-3a import path intact).
+* Registry: `reconstruct_grouped_matrix` added to `pipeline/registry.py`
+  (`frames_target`) and mirrored in `registries/pipeline_step_registry.json`
+  (category `primitive`, subtype `exact_table_to_grouped_matrix`, `meta_contract`
+  empty, `inverse.kind = projection_only`, `inverse_step = null`). One registry
+  entry.
+
+== Header interpretation
+
+Matches confirmation §5 exactly: geometry validation, explicit row-key
+identification, `forward_fill_header_grid` with row-key columns skipped, per-level
+non-empty requirement, top-to-leaf tuple, single mapping resolution,
+`key_for_labels` -> canonical key, unknown/duplicate rejection, physical-order
+flat frame, `build_grouped_header`, `grouped_matrix_from_canonical`.
+
+== Row-key policy
+
+Row keys are matched to physical columns by leaf-row label (not blank shape),
+support multiple keys, allow a moved key when its leaf label is unique, and reject
+missing/duplicate/spurious declarations and non-blank upper cells. Row-key order
+in the reconstructed frame follows physical workbook order.
+
+== Reorder / delete behaviour
+
+Dynamic-column reorder and valid dynamic-column deletion produce a valid
+(smaller) `GroupedMatrix`; unknown/duplicate/incomplete tuples, wrong depth, and
+stale mappings are rejected. (Later XRef expansion remains authoritative over
+value-loss.)
+
+== Mapping / factory integration
+
+Exactly one `resolve_axis_mapping` call (asserted by a monkeypatched counter)
+feeds `key_for_labels`, `build_grouped_header`, and the factory revalidation.
+Results are constructed only through `grouped_matrix_from_canonical`.
+
+== Atomicity
+
+The flat frame, header, and carrier are built fully before `output` is placed
+into a copied Frames mapping; any failure raises before assignment, leaving caller
+Frames and `_meta` unchanged (asserted). No cleanup command, no XRef metadata, no
+partial flat frame is published.
+
+== End-to-end XLSX evidence
+
+`test_gx3b_workbook_roundtrip.py`: `GroupedMatrix -> compose ->
+build_spreadsheet_render_plan -> render XLSX -> parse_workbook(exact_header_depths)
+-> workbookir_to_frames (ExactTable) -> reconstruct_grouped_matrix ->
+expand_grouped_xref` reproduces the canonical relation; a public
+`build_steps_from_config` + `run_pipeline` variant covers the registry wiring; and
+the legacy gate stays opt-in (no `exact_header_depths` -> a DataFrame, not an
+`ExactTable`).
+
+== GX-4 reuse seam
+
+The `core.ExactTable` carrier and `core.header_grid.forward_fill_header_grid` are
+backend-neutral; an ODS exact reader (GX-4) can populate `TableBlock.header_grid`
+identically and reach the same `reconstruct_grouped_matrix` step with no
+grouped-domain change. No ODS code is touched here.
+
+== Sizing (actual)
+
+* Runtime: `core/exact_table.py` (new, ~50), `core/header_grid.py` (moved, ~57),
+  `rendering/header_grid.py` (re-export shim), `rendering/composer/layout_composer.py`
+  (dispatch + 2 helpers), `rendering/workbook_projection.py` (ExactTable branch +
+  helper), `grouped_xref/matrix.py` (+`grouped_matrix_to_exact_table`),
+  `grouped_xref/reconstruction.py` (new, ~250), `grouped_xref/__init__.py`
+  (exports), `pipeline/registry.py` (+1). ~330 runtime LOC.
+* Tests: `test_gx3b_forward_composition.py` (11) +
+  `test_gx3b_reconstruction.py` (22) + `test_gx3b_workbook_roundtrip.py` (3) = 36.
+* Public: 1 carrier type, 1 pipeline step (+1 forward helper), 1 registry entry.
+
+== Protected surfaces
+
+Unchanged: XRef implementation, axis resolver, Slice 2, GX-1/GX-2/GX-3a
+semantics, ODS, application/CLI, schema maintenance, persistence boundary. The
+GX-3a helper *relocated* to `core` with a compatibility re-export (no behaviour
+change; its test and the GX-3a `rendering.header_grid` import path pass unchanged).
+`grouped_matrix_to_exact_table`/`reconstruct_grouped_matrix` are additive; the
+GX-2 composites and `GroupedMatrix` semantics are untouched.
+
+== Deviations
+
+* *One new read-only cross-layer edge* `rendering -> domain.transformations.grouped_xref`
+  (composer detects `GroupedMatrix` and calls the pure projection helper). No
+  guard forbids it; it is the task-preferred "dispatch on `GroupedMatrix`, no
+  forward step, one registry entry" sizing (confirmation §2/§10, observation
+  GX3b-C-O1).
+* *`forward_fill_header_grid` moved to `core`* (with a `rendering` re-export) --
+  the confirmed concrete integration contradiction: the domain reverse step could
+  not import the rendering-located helper. GX-3a behaviour is byte-identical.
+* *Source-style:* `compose_workbook` length WARN is pre-existing (86 > 80 at
+  HEAD via AST) and marginally worsened by the dispatch branch (now flagged 93,
+  complexity 18); guard rc 0. `workbook_projection`'s added branch was extracted
+  to `_exact_table_from_block` so it raises no new WARN. No mechanical splitting of
+  accepted code was done.
+* *Narrowing:* explicit `workbook_view.sheets` selection of a `GroupedMatrix`
+  frame is out of scope (rejected by `select_render_frames`'s DataFrame check;
+  GX3b-C-O2). Presentation merges are deliberately omitted (repeated literal
+  labels; identity never depends on merges).
+
+== Validation
+
+Python 3.13, from `core/`.
+
+* GX-3b tests: forward 11, reverse 22, integration 3 -- all pass.
+* GX-1/GX-2/GX-3a, rendering composer/multiheader, `header_grid`: pass.
+* Flat XRef, compact-multiaxis, workbook projection/spreadsheet-contract: pass.
+* ODS unit + integration IO: pass.
+* Architecture guards (layer boundaries, IR clarity, pipeline-step registry
+  mirror + signatures, carrier/meta guards): pass.
+* Full active Core suite (`tests/unit tests/integration tests/roundtrip
+  tests/architecture`): *2103 passed, 1 xfailed* (was 2067/1; +36 additive).
+* Ruff: passed. Source-style guard: rc 0. `git diff --check`: clean.
+  Asciidoctor: this artifact and the confirmation render.
+
+*Known unrelated xfail (reported separately):*
+`tests/roundtrip/test_pathological_cell_contracts.py::test_missing_fk_key_helper_representation_without_cleanup`
+-- `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, pre-existing and unrelated to
+GX-3b.
+
+== Lifecycle
+
+FTR stays open. Slice 1/2, GX-1, GX-2, GX-3a accepted. GX-3b implemented, awaiting
+acceptance review 001. GX-4 (ODS) and GX-5 pending; no ODS work began.
+
+GROUPED XREF GX-3B READY FOR ACCEPTANCE REVIEW 001
