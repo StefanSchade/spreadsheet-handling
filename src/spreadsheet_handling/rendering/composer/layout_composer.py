@@ -3,6 +3,12 @@ import json
 from typing import Dict, Mapping, Any
 import pandas as pd
 
+from spreadsheet_handling.core.exact_table import ExactTable
+from spreadsheet_handling.domain.transformations.grouped_xref import (
+    GroupedMatrix,
+    grouped_matrix_to_exact_table,
+)
+
 from ..ir import WorkbookIR, SheetIR, TableBlock
 from ..workbook_projection import canonicalize_workbook_meta
 
@@ -244,6 +250,39 @@ def _add_legend_blocks(wb: WorkbookIR, meta: Dict[str, Any] | None) -> None:
             "n_cols": table.n_cols,
         }
 
+def _sheet_for(wb: WorkbookIR, name: Any) -> SheetIR:
+    sheet_name = str(name)
+    sh = wb.sheets.get(sheet_name)
+    if sh is None:
+        sh = SheetIR(name=sheet_name)
+        wb.sheets[sheet_name] = sh
+    return sh
+
+
+def _exact_grouped_table_block(name: str, exact: ExactTable) -> TableBlock:
+    """Build an exact-mode TableBlock (GX-3b) from a projected grouped matrix.
+
+    ``header_grid`` is authoritative; ``headers``/``header_map`` carry the
+    non-authoritative leaf row only (no ``" / "`` join), exactly as GX-3a exact
+    tables. ``sh.meta["__header_grid"]`` is deliberately not seeded (one truth
+    per table); the accepted GX-3a write branch renders ``header_grid`` verbatim.
+    """
+    leaf = list(exact.header_grid[-1]) if exact.header_grid else []
+    return TableBlock(
+        frame_name=name,
+        top=1,
+        left=1,
+        header_rows=exact.header_rows,
+        header_cols=1,
+        n_rows=exact.header_rows + len(exact.data),
+        n_cols=exact.n_cols,
+        headers=leaf,
+        header_map={label: idx + 1 for idx, label in enumerate(leaf)},
+        data=[list(record) for record in exact.data],
+        header_grid=exact.header_grid,
+    )
+
+
 def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> WorkbookIR:
     """
     Build a naive 1-table-per-sheet IR:
@@ -274,17 +313,24 @@ def compose_workbook(frames: Mapping[str, Any], meta: Dict[str, Any] | None) -> 
     }
 
     for name, df in frames.items():
-        # skip reserved frames and non-DataFrames
+        # skip reserved frames
         if str(name) in _RESERVED_FRAME_KEYS:
             continue
+
+        # GX-3b: a grouped matrix carrier projects to an exact, lossless
+        # header_grid table (reusing the accepted GX-3a exact-write branch);
+        # canonical dynamic keys are not rendered and identity never depends on
+        # merges. Grouped semantics stay in the pure projection helper.
+        if isinstance(df, GroupedMatrix):
+            sh = _sheet_for(wb, name)
+            sh.tables.append(_exact_grouped_table_block(str(name), grouped_matrix_to_exact_table(df)))
+            continue
+
         if not isinstance(df, pd.DataFrame):
             continue
 
         # sheet
-        sh = wb.sheets.get(name)
-        if sh is None:
-            sh = SheetIR(name=str(name))
-            wb.sheets[str(name)] = sh
+        sh = _sheet_for(wb, name)
 
         # headers and basic geometry
         headers = _flatten_header_to_strings(df)

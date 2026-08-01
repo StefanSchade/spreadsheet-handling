@@ -22,6 +22,8 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.core.exact_table import ExactTable
+
 from ..xref_axis_mapping import ResolvedAxisMapping
 
 from .model import GroupedHeader, RowKeyColumn
@@ -151,8 +153,54 @@ def _validate_grouped_matrix_pair(
     _validate_canonical_pair(grouped.frame, grouped.header, mapping=mapping)
 
 
+def grouped_matrix_to_exact_table(matrix: GroupedMatrix) -> ExactTable:
+    """Project a grouped matrix into a backend-neutral exact table (GX-3b forward).
+
+    The visible label tuples are read authoritatively from the carrier's
+    :class:`GroupedHeader` (they already live there), so no mapping is needed to
+    render. Row-key columns show their leaf label with blank upper cells; dynamic
+    columns show one visible label component per level (repeated literal labels,
+    never merges). Canonical dynamic keys are never rendered -- only
+    ``matrix.frame`` values become the data block, in physical column order.
+
+    Structural revalidation (no mapping): the carried frame width must still match
+    the grouped header, catching a post-construction column mutation.
+    """
+    if type(matrix) is not GroupedMatrix:
+        raise GroupedXrefError(
+            "grouped_matrix_to_exact_table requires a GroupedMatrix carrier"
+        )
+    header = matrix.header
+    frame = matrix.frame
+    n_cols = len(header.columns)
+    if frame.shape[1] != n_cols:
+        raise GroupedXrefError(
+            "GroupedMatrix frame width does not match its grouped header; "
+            f"frame has {frame.shape[1]} column(s), header describes {n_cols}"
+        )
+    depth = header.arity
+    leaf_level = depth - 1
+    grid: list[tuple[str, ...]] = []
+    for level in range(depth):
+        row: list[str] = []
+        for column in header.columns:
+            if type(column) is RowKeyColumn:
+                row.append(column.label if level == leaf_level else "")
+            else:
+                row.append(column.labels[level])
+        grid.append(tuple(row))
+    data = tuple(tuple(record) for record in frame.values.tolist())
+    return ExactTable(
+        header_grid=tuple(grid),
+        data=data,
+        header_rows=depth,
+        n_cols=n_cols,
+    )
+
+
 __all__ = [
     "GroupedMatrix",
     "GroupedXrefError",
     "grouped_matrix_from_canonical",
+    "grouped_matrix_to_exact_table",
 ]

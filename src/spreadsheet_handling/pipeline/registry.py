@@ -133,6 +133,10 @@ REGISTRY: Dict[str, StepRegistration | StepFactory] = {
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.grouped_xref:expand_grouped_xref",
     ),
+    "reconstruct_grouped_matrix": StepRegistration(
+        factory=make_frames_target_step,
+        target="spreadsheet_handling.domain.transformations.grouped_xref:reconstruct_grouped_matrix",
+    ),
     "sparse_collapse": StepRegistration(
         factory=make_frames_target_step,
         target="spreadsheet_handling.domain.transformations.sparse_defaults:sparse_collapse",

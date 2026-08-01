@@ -6,6 +6,8 @@ import ast
 import json
 from typing import Any, Mapping
 
+from spreadsheet_handling.core.exact_table import ExactTable
+
 from .ir import WorkbookIR
 
 
@@ -142,6 +144,16 @@ def _strip_legend_resolved(meta: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _exact_table_from_block(tbl: Any) -> ExactTable:
+    """Project a GX-3a exact ``TableBlock`` into the backend-neutral carrier."""
+    return ExactTable(
+        header_grid=tbl.header_grid,
+        data=tuple(tuple(row) for row in (tbl.data or [])),
+        header_rows=tbl.header_rows,
+        n_cols=tbl.n_cols,
+    )
+
+
 def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
     """
     Convert a :class:`WorkbookIR` into a frames dict suitable for the pipeline.
@@ -166,6 +178,13 @@ def workbookir_to_frames(ir: WorkbookIR) -> dict[str, Any]:
             # payload frame. Default own-sheet placement therefore yields no
             # extra payload frame (LB-4). Data-sheet placement is unaffected:
             # the data table is tables[0] and the colocated legend is tables[1].
+            continue
+        if tbl.header_grid is not None:
+            # GX-3b: publish the lossless exact table (reached only under the
+            # GX-3a opt-in read gate). The grouped-domain reconstruction step
+            # interprets it; generic projection stays free of grouped-XRef
+            # configuration. Every non-exact read is byte-identical.
+            frames[name] = _exact_table_from_block(tbl)
             continue
         data = tbl.data if tbl.data is not None else []
 
