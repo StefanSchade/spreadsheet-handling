@@ -1,0 +1,293 @@
+= GX-3b Acceptance Review 001: Grouped-XRef Workbook Wiring
+:revdate: 2026-08-01
+:toc:
+
+Independent acceptance review of GX-3b (grouped-XRef workbook wiring over the
+accepted GX-3a exact-header carrier). Reviewed read-only; no runtime or tests
+were modified. Delta-only: GX-1, GX-2, and GX-3a foundations are not restated.
+
+Commits reviewed: `d48c8e6` (GX-3a accepted baseline), `be5ecb2` (GX-3b
+confirmation), `7cb66fa` (GX-3b implementation), `b872756` (GX-3b implementation
+self-review). Repository state: git root `core/`, detached `HEAD` at `b872756`,
+clean worktree; no branch created/switched, nothing pushed.
+
+The confirmation, implementation self-review, and shipped tests were treated as
+claims and verified independently through code reading and targeted probes.
+
+== Verdict
+
+*GX-3b is accepted.* The forward and reverse boundaries match the intended
+GX-3b shape exactly:
+
+* forward `GroupedMatrix -> grouped_matrix_to_exact_table -> TableBlock.header_grid
+  -> existing XLSX rendering`;
+* reverse `exact TableBlock -> core.ExactTable -> reconstruct_grouped_matrix ->
+  GroupedMatrix -> unchanged expand_grouped_xref`.
+
+No persisted mapping, grouped `_meta`, `MultiIndex` identity model, private frame
+name, or ODS behavior is introduced. All required review areas pass. One *minor*
+finding (release-notes checkpoint) and four observations are recorded; none block
+acceptance.
+
+== Findings by severity
+
+=== Blocking
+
+None.
+
+=== Important
+
+None.
+
+=== Minor
+
+* *GX3b-A-M1 (release-notes checkpoint not satisfied).* GX-3b adds public
+  surface -- the registered pipeline/YAML step `reconstruct_grouped_matrix`, the
+  public `core.ExactTable` type, and the `grouped_matrix_to_exact_table` helper --
+  and it makes grouped matrices *workbook carriers for XLSX*. The GX-2 bullet in
+  `docs/release_notes/release_notes.adoc` (active `== unknown -- planned`
+  section, lines 54--56) still states "multi-row grouped header write/read for
+  XLSX and ODS is a later slice, so grouped matrices are not yet workbook
+  carriers." That documented limitation is now inaccurate for XLSX (only ODS
+  remains). Neither `7cb66fa` nor the self-review's Validation section added a
+  release-note bullet or recorded why one is not needed, so the
+  `review_instructions.adoc` release-notes checkpoint (including *Known
+  limitations*) is unmet.
++
+  *Evidence:* `git show 7cb66fa --stat` touches no release-notes file;
+  `release_notes.adoc:54-56` still asserts the now-obsolete XLSX limitation.
++
+  *Risk if ignored:* a released "grouped matrices are not yet workbook carriers"
+  statement would understate shipped capability and omit a new public step from
+  the changelog.
++
+  *Recommended action (follow-up, not blocking):* under `== unknown -- planned`
+  add a GX-3b bullet for the XLSX grouped workbook carrier plus
+  `reconstruct_grouped_matrix`, and narrow the limitation to ODS-only; *or*
+  record in the FTR the deliberate deferral of the consolidated workbook-carrier
+  note to GX-4 (which completes XLSX+ODS). This is a documentation checkpoint in
+  an unreleased, unfrozen section; runtime is correct and tested, and the sibling
+  GX-3a carrier slice likewise added no note, so acceptance is not withheld.
+
+=== Observations
+
+* *GX3b-A-O1 (forward pairing residual is out-of-model).* `grouped_matrix_to_exact_table`
+  proves only structural width equality (`frame.shape[1] == len(header.columns)`)
+  and reads headers from `GroupedHeader` and data from `frame.values` by
+  position. A same-width *positional data reorder* of the carried DataFrame would
+  render header/data out of alignment, but this requires unsupported direct
+  in-process rearrangement of the carrier's internal frame schema: the frame
+  binding is frozen (foreign-frame substitution is blocked), `grouped_matrix_from_canonical`
+  proved the pairing at construction, no registered step reorders a carrier's
+  internal columns, and column *rename* has no effect on projection. This matches
+  the accepted GX-1/GX-2 boundary; a live mapping in the forward composer is not
+  warranted.
+* *GX3b-A-O2 (workbook-view narrowing).* Explicit `workbook_view.sheets` selection
+  rejects a `GroupedMatrix` (`rendering/frame_selection.py:57-60` requires a
+  `DataFrame`). The default (no `workbook_view`, or a `workbook_view` without
+  `sheets`) passes the carrier through. GX-5 adoption owns broadening; see below.
+* *GX3b-A-O3 (unknown tuple surfaces `AxisMappingError`).* An unresolvable visible
+  tuple propagates the resolver's own `AxisMappingError` rather than
+  `GroupedXrefError`. This is the documented layering convention (`matrix.py`:
+  "resolver failures stay `AxisMappingError`") and is consistent with GX-2, not a
+  defect.
+* *GX3b-A-O4 (registry category label).* The confirmation §3 informally named the
+  category `transformation`; the implementation used `primitive`. `primitive` is a
+  valid vocabulary term (the most common category, 28 entries) and `transformation`
+  is not in the contract vocabulary at all, so the implementation is correct and
+  the mirror/guard tests pass. No action.
+
+== Forward pairing conclusion
+
+`grouped_matrix_to_exact_table` (`grouped_xref/matrix.py:156`) produces data and
+visible headers in the same physical column order for all supported construction:
+data is `frame.values` in physical order; the grid is built from
+`header.columns[i]` at position `i` (`RowKeyColumn` -> leaf label with blank
+uppers; `DynamicColumn` -> `labels[level]`, repeated literal labels, no merges);
+canonical dynamic keys are never read for display. Probes confirmed: edited data
+values are preserved and rendered (supported); a dropped column is rejected by the
+width guard; a column rename has no effect (frame labels are ignored);
+foreign-frame substitution is blocked by the frozen carrier. The only way to
+produce a silent same-width mispairing is unsupported in-process rearrangement of
+the carrier's internal frame (GX3b-A-O1). *Forward pairing is safe within the
+supported public/pipeline surface; no forward live mapping is required.*
+
+== ExactTable boundary conclusion
+
+`core.ExactTable` (`core/exact_table.py`) is a frozen, leaf-only dataclass
+holding only built-in `str`/`Any` tuples and ints; it imports no pandas,
+rendering, domain, openpyxl, or ODS type, and `test_core_modules_remain_leaf_only`
+passes. `__post_init__` normalises header cells (`None -> ""`, non-string ->
+`str`) -- verified: `header_grid=((None, 123), ...)` normalises to `(("", "123"),
+...)`. It is the single exchanged exact-table value in both directions (no second
+descriptor/frame pair). The constructor performs no geometry validation; instead
+`reconstruct_grouped_matrix._validated_geometry` rejects malformed geometry at the
+domain reconstruction boundary. Probes confirmed rejection of: header-depth
+mismatch, `header_rows` vs grid disagreement, non-rectangular header, data-width
+mismatch, and zero header rows/columns. *Invalid manual construction is caught at
+the correct boundary without unnecessary constructor validation.*
+
+== Data-typing conclusion
+
+The repository's established XLSX read contract *stringifies every data cell*:
+an ordinary typed DataFrame (`int64`/`float64`/`bool`/`date`/blank) round-trips
+back as `str` (`'1'`, `'1.5'`, `'True'`, `'2026-08-01 00:00:00'`, `''`). The
+GX-3b exact path is byte-identical to an equivalent ordinary read of the same
+matrix for int, float, bool, blank, and date cells (probes compared both paths on
+the same values). *GX-3b does not regress supported typing relative to an
+equivalent ordinary workbook read;* no type preservation beyond the established
+contract is claimed or required.
+
+== Reverse reconstruction conclusion
+
+`reconstruct_grouped_matrix` (`grouped_xref/reconstruction.py`) was verified to:
+require an `ExactTable` input (bare DataFrame rejected); validate rectangular
+geometry and configured depth (`len(header_grid) == len(label_columns)`); identify
+row keys by unique leaf label (not blank shape); require blank upper cells above
+row keys; forward-fill only non-row-key columns via the accepted GX-3a
+`forward_fill_header_grid`; use no delimiter join/split; resolve *exactly one*
+live mapping (monkeypatch counter = 1) feeding `key_for_labels`,
+`build_grouped_header`, and the factory; reject unknown, duplicate, and incomplete
+tuples; build columns/data in physical order; construct the result only through
+`grouped_matrix_from_canonical`; and publish atomically (`out = dict(frames)` only
+after full success -- on failure the input mapping and `_meta` are untouched and
+`output` is never added). `drop_source` removes the input frame and rejects
+`table == output`. A missing source frame fails (`AxisMappingError`) rather than
+trusting stale text. Arity 2 and 3, moved/multiple row keys, reordered dynamic
+columns, valid deletion, and edited values all reconstruct correctly end to end.
+
+== Row-key and forward-fill handling
+
+Probed and confirmed: two adjacent row keys; a row key between dynamic columns; a
+leading dynamic blank (rejected as incomplete); a blank immediately after a
+skipped row-key column (fill does *not* cross the row key -> incomplete ->
+rejected); a duplicate leaf label shared by a row key and a dynamic column
+(rejected as multi-match); and a non-blank upper cell above a declared row key
+(rejected). `forward_fill_header_grid` resets its carry at every skipped column,
+so a fill run never crosses a row-key column and an incomplete tuple can never be
+silently completed into an unrelated valid tuple.
+
+== Registry / API conclusion
+
+Runtime `REGISTRY["reconstruct_grouped_matrix"]`
+(`pipeline/registry.py`, `StepRegistration(make_frames_target_step, target=...)`)
+and the JSON mirror agree on signature, `frames_target` factory shape,
+parameters, frame contract (`reads: [table, source_frame]`, `writes: [output]`,
+`preserves: [source_frame]`), empty `meta_contract`, and a truthful
+`inverse` (`kind: projection_only`, `inverse_step: null`, reason names the
+`compose_workbook` grouped projection). `drop_source` is documented as caller-
+asserted. YAML `name` is the step name only; the XRef config identity
+(`xref_config_id`) is deliberately not consumed here (GX-3b ends at
+`GroupedMatrix`). The registry mirror and signature guards pass under
+`tests/architecture`.
+
+== Layering conclusion
+
+The deliberate edge `rendering.composer -> domain.transformations.grouped_xref`
+(composer detects a `GroupedMatrix` and calls the pure projection helper) is
+consistent with the outer-to-inner hexagonal direction; no active guard forbids
+`rendering` importing `domain`, and the full `tests/architecture` suite passes.
+It does not create a cycle: `domain` imports no `rendering`/`io_backends`
+(reconstruction imports only `core` and sibling grouped-XRef modules), `core`
+stays leaf, and openpyxl types do not escape the XLSX adapter (the exact data
+originates from the already-projected IR). The dispatch is bounded to one
+documented carrier through one pure helper; it does not establish an uncontrolled
+per-feature branching pattern in generic rendering. No ODS code changed and no
+grouped-metadata/persistence change exists.
+
+== Workbook-view limitation ownership
+
+The limitation (explicit `workbook_view.sheets` selection rejects a
+`GroupedMatrix`) is a *valid GX-3b scope boundary*, not a break of the forward
+public path: the normal supported workflow (no `workbook_view`, or one without an
+explicit `sheets` list) passes the carrier straight to `compose_workbook`, as the
+shipped end-to-end test and independent probes exercise. Broadening explicit-sheet
+selection to grouped carriers is GX-5 adoption responsibility. Recorded as
+observation GX3b-A-O2.
+
+== End-to-end evidence
+
+Independent full-pipeline probes through *real XLSX* (`GroupedMatrix ->
+compose_workbook -> build_spreadsheet_render_plan -> render_workbook ->
+parse_workbook(exact_header_depths) -> workbookir_to_frames (ExactTable) ->
+reconstruct_grouped_matrix -> expand_grouped_xref`) reproduced the canonical
+relation for: untouched roundtrip; edited cell (value preserved); dynamic reorder;
+valid deletion (dropped key absent, smaller matrix); literal `" / "` label
+component surviving verbatim (the exact path bypasses the legacy delimiter-split
+branch that would corrupt it); arity 3; and repeated/blank upper cells. The legacy
+read without the exact gate yields a `DataFrame`, not an `ExactTable`
+(opt-in preserved). The shipped `test_gx3b_workbook_roundtrip.py`,
+`test_gx3b_reconstruction.py`, and `test_gx3b_forward_composition.py` (52 tests)
+pass.
+
+== Protected surfaces
+
+Unchanged and re-verified green: flat XRef and axis-projection roundtrips;
+compact-multiaxis (unit + carrier + contract); ordinary workbook projection and
+spreadsheet contract; GX-1/GX-2/GX-3a; ODS unit + integration + parity; XLSX
+parser/writer/roundtrip; architecture layer/IR/registry/carrier/meta guards. The
+GX-3a `forward_fill_header_grid` relocation to `core` with a `rendering.header_grid`
+re-export is behaviour-identical (GX-3a import path and tests pass). No XRef
+implementation, resolver, Slice 1/2, schema-maintenance, application/CLI, or
+persistence change.
+
+== Complexity / sizing
+
+GX-3b remains the intended small shape: one neutral carrier (`core.ExactTable`),
+one forward projection helper (`grouped_matrix_to_exact_table`), one reverse
+domain step (`reconstruct_grouped_matrix`), one composer dispatch branch, one
+registry entry (runtime + JSON). Actual: ~330 runtime LOC across the expected
+files; public surface = 1 type + 1 step (+1 forward helper) + 1 registry entry.
+The `compose_workbook` source-style WARN (93 lines / complexity 18) is the
+pre-existing helper marginally extended by the bounded dispatch; the source-style
+guard returns rc 0. No generic workbook framework or speculative hardening is
+present or warranted.
+
+== GX-4 readiness
+
+GX-3b leaves a clean seam for GX-4 (ODS): `core.ExactTable` and
+`core.header_grid.forward_fill_header_grid` are backend-neutral, so an ODS exact
+reader can populate `TableBlock.header_grid` and reach the identical
+`reconstruct_grouped_matrix` step with no grouped-domain change. The forward
+composer already emits an exact `TableBlock` independent of backend. The two
+carry-forward items for GX-4/GX-5 are the release-notes consolidation (GX3b-A-M1)
+and explicit-`workbook_view.sheets` grouped-carrier adoption (GX3b-A-O2).
+
+== Validation
+
+All commands run from `core/` with `.venv` (Python 3.13.5), read-only.
+
+* GX-1/GX-2 + XRef/compact regressions
+  (`test_grouped_xref*`, `test_xref_axis_*`, `test_xref_crosstable`,
+  `test_compact_multiaxis*`, `test_xref_axis_projection_roundtrip`): pass.
+* GX-3a + GX-3b (`test_gx3a_exact_headers`, `test_gx3b_forward_composition`,
+  `test_gx3b_reconstruction`, `test_gx3b_workbook_roundtrip`): 52 pass.
+* Rendering + io_backends unit, ODS unit + `tests/integration/io_backends`
+  (incl. ODS roundtrip/parity/display-metadata): pass.
+* `tests/architecture` (layer boundaries, IR clarity, pipeline-step registry
+  mirror + signatures, carrier/meta guards): pass.
+* Independent probes (typing, forward pairing, reverse edge cases, malformed
+  geometry, row-key/blank handling, atomicity, drop_source, single mapping
+  resolution, end-to-end XLSX scenarios): all as expected.
+* Full active Core suite (`tests/unit tests/integration tests/roundtrip
+  tests/architecture`): *2103 passed, 1 xfailed*.
+* Ruff (`ruff check src/spreadsheet_handling`, the project lint scope): passed.
+  Source-style guard (`tools/check_source_style.py`): rc 0 (WARN only).
+  `git diff --check`: clean. Asciidoctor renders this artifact.
+
+*Known unrelated xfail (reported separately):*
+`tests/roundtrip/test_pathological_cell_contracts.py::test_missing_fk_key_helper_representation_without_cleanup`
+-- `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, pre-existing and unrelated to
+GX-3b.
+
+== Lifecycle cleanup check
+
+FTR-XREF-AXIS-MAPPINGS-P4A2 stays *open*: GX-3b is one sub-slice of a staged
+capability; GX-4 (ODS) and GX-5 remain pending. No status change to `Done`, no
+`_ftrs_open.adoc` include removal, and no cold-storage move is due. Residual scope
+(ODS grouped carrier, explicit-sheet adoption, release-notes consolidation) is
+tracked by the existing GX-4/GX-5 plan and finding GX3b-A-M1; no new follow-up FTR
+is required. Only the FTR status line is updated in this change to record GX-3b
+acceptance.
+
+GROUPED XREF GX-3B ACCEPTED IN REVIEW 001
