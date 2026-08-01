@@ -1,0 +1,134 @@
+= GX-3a Implementation Self-Review: Exact Multi-Row Header Carrier
+:revdate: 2026-08-01
+:toc:
+
+== Verdict
+
+*GX-3a is ready for acceptance review 001.* The opt-in, backend-neutral exact
+multi-row header capability confirmed in `gx3a_confirmation_001` (`310d468`) is
+implemented exactly as scoped: a configured-depth, merge-independent, lossless
+per-cell `header_grid` write/read path for XLSX, gated so legacy behaviour is
+byte-identical when unused. No grouped-XRef, axis-mapping, XRef-metadata,
+pipeline/registry, or ODS surface is touched.
+
+Delta-only; background is in `gx3a_confirmation_001`.
+
+== New exact representation
+
+`TableBlock.header_grid: tuple[tuple[str, ...], ...] | None = None`
+(`rendering/ir.py`). When set it is authoritative for header identity in exact
+mode: one inner tuple per header row (top->leaf), each holding the verbatim cell
+string (merged masters resolved, blanks kept as `""`). `header_rows == len(grid)`;
+`headers`/`header_map` carry the leaf row only (non-authoritative, no `" / "`
+join). `None` in legacy mode -> existing behaviour unchanged.
+
+== Opt-in gate
+
+`parse_workbook(path, *, exact_header_depths: Mapping[str, int] | None = None)`
+(`io_backends/xlsx/openpyxl_parser.py`): a sheet-name -> configured-depth map;
+listed sheets read in exact mode, all others unchanged. Depths are validated as
+positive integers up front (`ValueError` otherwise, before the workbook is
+opened). Reachable from the backend via
+`ExcelBackend.read_multi(..., options={"extra": {"exact_header_depths": {...}}})`,
+threaded with `functools.partial` so `read_spreadsheet_frames(path, *, parser=...)`
+is unchanged. No new `BackendOptions` field, no metadata family, no grouped
+vocabulary in generic I/O.
+
+== Read/write flow
+
+*Read (exact):* `_parse_exact_table_block` sets `header_rows = depth`, measures
+`n_cols` on the *leaf* row (`_find_col_extent(..., scan_row=leaf)`, so a blank
+upper cell above a row-key column cannot truncate the count), captures every
+header cell via `_cell_value` (merged master resolution) into `header_grid`, and
+takes data from `top + depth`. Blanks are retained verbatim -- no forward-fill in
+the read path. Exact tables do not also seed the legacy
+`sh.meta["__header_grid"]` (`_seed_legacy_header_grid` skips them: one truth per
+table).
+
+*Write:* `flow.build_render_plan` gains a branch (`_emit_exact_header_grid`) that,
+when `t.header_grid` is set, emits one `SetHeader` per non-blank cell verbatim and
+`WriteDataBlock` at `t.top + len(grid)`. No `MergeCells`, no `MultiIndex`, no
+`" / "` join; existing `SetHeader`/`WriteDataBlock`/renderer are unchanged.
+
+*Deterministic blank forward-fill* is a separate pure helper
+`rendering/header_grid.py::forward_fill_header_grid(grid, *, skip_columns)` for
+GX-3b; it is never called in the read path (GX-3a must not guess row-key vs
+merge-repeat blanks).
+
+== Legacy compatibility evidence
+
+* Without `exact_header_depths`, `parse_workbook` is unchanged: `_detect_header_rows`,
+  the `" / "` flatten, and `sh.meta["__header_grid"]` seeding all run exactly as
+  before; a table's `header_grid` stays `None`.
+* `test_legacy_read_of_exact_file_has_no_header_grid` and
+  `test_ordinary_single_row_sheet_unchanged_without_gate` assert this directly.
+* Full legacy IO/rendering/roundtrip suites (`tests/unit/io_backends`,
+  `tests/unit/rendering`, `tests/integration/roundtrip`,
+  `tests/integration/io_backends`) pass unchanged, including the existing
+  `MultiIndex`/`" / "` multi-row roundtrip and ODS parity tests.
+* Full active Core suite: 2067 passed / 1 xfailed (was 2046 / 1; +21 additive).
+
+== Backend-neutral seam
+
+Backend-neutral: `TableBlock.header_grid`, `forward_fill_header_grid`, the
+render-plan write branch. XLSX-specific: exact extraction in
+`xlsx/parser_interpretation.py` + the `parse_workbook`/`read_multi` gate. No
+openpyxl object enters the IR (`header_grid` holds only `str`). ODS is untouched;
+its identical `_detect_header_rows`/`" / "` gaps are left for GX-4 to serve from
+the same neutral core.
+
+== Sizing (actual)
+
+* Runtime: `rendering/ir.py` (+1 field), `rendering/header_grid.py` (new, ~55
+  lines), `rendering/flow.py` (helper + one branch), `io_backends/xlsx/
+  parser_interpretation.py` (exact block + leaf-row extent + seed helper),
+  `io_backends/xlsx/openpyxl_parser.py` (gate + validator),
+  `io_backends/xlsx/xlsx_backend.py` (option passthrough). ~150 runtime LOC.
+* Tests: `tests/unit/rendering/test_header_grid.py` (5) +
+  `tests/unit/io_backends/xlsx/test_gx3a_exact_headers.py` (16) = 21.
+* Public: 1 IR field, 1 read option, 1 pure helper. 0 pipeline steps, 0 registry
+  entries, 0 domain types.
+
+== Protected surfaces
+
+Unchanged: XRef, resolver, Slice 2, GX-1, GX-2, grouped-XRef package, pipeline
+transformation registry, cleanup/meta contracts, application/CLI, schema
+maintenance, persistence boundary, ODS backend. Only `rendering/` and
+`io_backends/xlsx/` were modified. No grouped-XRef import in rendering or I/O.
+
+== Validation
+
+Python 3.13.5, pandas 3.0.2, Asciidoctor 2.0.23, from `core/`.
+
+* New GX-3a tests: 21 passed (arity 2/3, no-merge/merged/user-unmerged
+  equivalence, literal `" / "`, blanks retained, write/read roundtrip,
+  deterministic data start, malformed depth, atomic pre-parse failure,
+  forward-fill helper, legacy no-regression, backend-option gate).
+* Legacy IO/rendering/roundtrip: 363 passed.
+* Full active Core suite: 2067 passed, 1 xfailed (pre-existing unrelated
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`).
+* Architecture guards: passed. Ruff: passed. `git diff --check`: clean.
+* Source-style guard: 0 errors, rc 0; no *new* warning after extracting
+  `_seed_legacy_header_grid` (see deviations).
+
+== Deviations
+
+* Two *pre-existing* source-style warnings marginally worsened by the additive
+  branches: `flow.build_render_plan` complexity 38->39 (one dispatch branch; body
+  extracted to `_emit_exact_header_grid`) and `openpyxl_parser.parse_workbook`
+  length 88->100 (gate wiring; docstring trimmed). No *new* warning line is
+  introduced -- the one new warning (`build_visible_sheet_ir` 12->13) was removed
+  by extracting `_seed_legacy_header_grid`. Both worsened functions were already
+  above threshold before GX-3a.
+* Exact-mode frame projection (`workbookir_to_frames`) is intentionally *not*
+  implemented; GX-3a's deliverable is the lossless IR `header_grid`. GX-3b adds the
+  tuples->canonical-keys frame join. `read_multi`'s exact option therefore threads
+  to the parser and yields the IR grid but keeps legacy frame projection.
+
+== Lifecycle
+
+FTR stays open. Slice 1/2, GX-1, GX-2 accepted. GX-3a implemented, awaiting
+acceptance review 001. GX-3b/GX-4/GX-5 pending; no grouped-XRef wiring or ODS work
+began.
+
+GROUPED XREF GX-3A READY FOR ACCEPTANCE REVIEW 001
