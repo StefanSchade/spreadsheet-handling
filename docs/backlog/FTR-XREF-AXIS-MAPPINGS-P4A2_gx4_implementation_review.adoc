@@ -1,0 +1,153 @@
+= GX-4 Implementation Review: ODS Grouped Workbook Carrier
+:revdate: 2026-08-01
+:toc:
+
+GX-4 of `FTR-XREF-AXIS-MAPPINGS-P4A2`: ODS adapter support for the accepted
+exact-header / `GroupedMatrix` workbook path. Delta-only; the accepted
+GX-1/GX-2/GX-3a/GX-3b architecture is not restated. ODS adapter work only: no
+grouped-XRef domain semantics, `GroupedMatrix`, `ExactTable`,
+`reconstruct_grouped_matrix`, registry, pipeline steps, mapping/meta carriers,
+XLSX behaviour, workbook-view, application/CLI, or persistence changed.
+
+== Implementation seam
+
+The ODS read path already mirrors the XLSX read path structurally
+(`ods/parser_interpretation.py` parallels `xlsx/parser_interpretation.py` over a
+bounded `ParsedTable` grid). GX-4 adds the same opt-in exact seam the XLSX
+reader gained in GX-3a, reusing every downstream piece unchanged:
+
+* `ods/odf_parser.parse_workbook` gains `exact_header_depths: Mapping[str,int] |
+  None`, validated by `_validated_exact_header_depths` (identical positive-integer
+  contract to XLSX), and passes `exact_header_depth=depths.get(name)` to
+  `build_visible_sheet_ir` per sheet.
+* `ods/parser_interpretation.build_visible_sheet_ir` gains `exact_header_depth`
+  and applies it to the *primary* table only (first anchor, `index == 0`), exactly
+  as XLSX. Legacy `__header_grid` seeding now skips exact tables
+  (`table_block.header_grid is None`), so there is one truth per table.
+* `_parse_table_block` dispatches to the new `_parse_exact_table_block` when a
+  depth is configured; `_find_col_extent` gains a `scan_row` keyword so the column
+  extent is measured on the fully-populated *leaf* header row (a blank upper cell
+  above a row-key column cannot truncate the count).
+* `ods_backend.OdsBackend.read_multi` gains the same `_parser_for_options` seam as
+  the XLSX backend: `options.extra["exact_header_depths"]` selects the exact read
+  via `functools.partial`; absent, the unmodified parser is used.
+
+The forward write required *no* change: `compose_workbook` already projects a
+`GroupedMatrix` into an exact `TableBlock.header_grid`, and
+`flow._emit_exact_header_grid` emits per-cell `SetHeader` ops that the existing
+ODS renderer already writes verbatim (repeated literal labels, no merges).
+
+No XLSX logic is duplicated in ODS: the exact block is the ODS-native analogue
+over `ParsedTable`/`_grid_value`, and everything above `TableBlock.header_grid`
+(`workbookir_to_frames`, `core.ExactTable`, `reconstruct_grouped_matrix`,
+`expand_grouped_xref`) is the shared, unchanged backend-neutral path.
+
+== ODS exact-read behaviour
+
+For a configured sheet at depth `d`:
+
+* the configured depth overrides merge-based inference (`_detect_header_rows` is
+  bypassed);
+* every physical header cell in the first `d` rows is captured verbatim into
+  `TableBlock.header_grid` (`tuple[tuple[str,...],...]`);
+* merged/spanned upper cells resolve to their master value via the existing
+  `_grid_value` merge resolution; repeated *unmerged* labels are captured as-is;
+* blanks stay `""` (row-key upper cells preserved; no forward-fill in the reader);
+* a literal `" / "` inside a component stays literal — no join and no split;
+* the leaf row populates the non-authoritative `headers`/`header_map`;
+* data begins directly below the configured depth;
+* all cell reads go through the already-bounded `ParsedTable`, so ODS
+  row/column-repeat expansion stays within the existing `ParserLimits` extent (no
+  new unbounded materialization path is introduced).
+
+== Legacy compatibility
+
+Unconfigured sheets are byte-identical to before: `exact_header_depth` defaults to
+`None`, `_parse_table_block` takes the unchanged legacy branch, and the legacy
+`__header_grid` seeding is unchanged for non-exact multi-row tables. An
+empty/absent `exact_header_depths` mapping is a no-op; a malformed value (non-int
+or `< 1`) raises `ValueError` with the same message as XLSX. Without the backend
+option, `OdsBackend.read_multi` uses the unmodified parser. The full ODS
+unit/integration/parity suites pass unchanged.
+
+== End-to-end evidence
+
+`tests/integration/io_backends/ods/test_gx4_ods_grouped_roundtrip.py` drives the
+full path `GroupedMatrix -> compose_workbook -> render ODS ->
+parse_workbook(exact_header_depths) -> workbookir_to_frames (ExactTable) ->
+reconstruct_grouped_matrix -> expand_grouped_xref -> canonical relation` and
+reproduces the original relation for: untouched roundtrip; edited data cell;
+dynamic-column reorder; valid dynamic-column deletion; and arity 3.
+`tests/unit/io_backends/ods/test_gx4_exact_headers.py` pins the ODS exact-read
+behaviour directly: repeated unmerged labels (arity 2), merged/spanned upper
+labels resolving to master, arity-3 merged+repeated, blank upper row-key cells
+preserved, literal `" / "` verbatim, configured depth overriding merge inference,
+malformed depth rejected, legacy read unchanged without the gate, and the backend
+`options.extra` opt-in seam.
+
+== Sizing
+
+Runtime: three ODS adapter files, +166/-9 lines.
+
+* `ods/parser_interpretation.py` (+~100): `_parse_exact_table_block`,
+  `_exact_header_cell`, `_find_col_extent` `scan_row` keyword, exact dispatch in
+  `_parse_table_block`, exact-table skip in the `__header_grid` seeding, and the
+  `exact_header_depth` parameter on `build_visible_sheet_ir`.
+* `ods/odf_parser.py` (+~30): `_validated_exact_header_depths`, the
+  `exact_header_depths` parameter, and one `depths.get(name)` argument.
+* `ods/ods_backend.py` (+~30): the `_parser_for_options` seam mirroring XLSX.
+
+Tests: 14 unit + 5 integration = 19 additive. No new public type, step, registry
+entry, carrier, or parser framework.
+
+== Protected surfaces
+
+Unchanged and re-verified green: grouped-XRef domain semantics, `GroupedMatrix`,
+`ExactTable`, `reconstruct_grouped_matrix`, the pipeline registry, all pipeline
+steps, mapping/meta carriers, the entire XLSX path (GX-3a/GX-3b included),
+workbook-view selection, application/CLI, and persistence. No ODS renderer change
+was needed. Existing ODS presentation-metadata, repeated-cell safety, and
+XLSX/ODS parity behaviour is untouched.
+
+== Deviations
+
+* `parse_workbook` (ODS) was already above the source-style function-length
+  threshold at HEAD (pre-existing WARN); the added parameter, docstring, and two
+  lines marginally extend it. The source-style guard returns rc 0 (WARN only). No
+  mechanical splitting of accepted code was done.
+* The exact read is applied to the primary table only (first anchor), matching the
+  accepted XLSX GX-3a scope; colocated legend/secondary tables keep legacy
+  behaviour.
+* Release notes: the GX-2 "grouped matrices are not yet workbook carriers"
+  limitation is now removed and a GX-3b/GX-4 bullet records XLSX+ODS grouped
+  workbook carriers, closing GX-3b acceptance finding GX3b-A-M1.
+
+== Validation
+
+All from `core/` with `.venv` (Python 3.13).
+
+* GX-4 tests: 14 unit + 5 integration — pass.
+* ODS unit + `tests/integration/io_backends` (incl. ODS roundtrip/parity/display
+  metadata): pass.
+* GX-3a, GX-3b (forward composition, reconstruction, workbook roundtrip),
+  rendering: pass.
+* Architecture guards (layer boundaries, IR clarity, pipeline-step registry
+  mirror + signatures, carrier/meta guards): pass.
+* Full active Core suite (`tests/unit tests/integration tests/roundtrip
+  tests/architecture`): *2122 passed, 1 xfailed* (was 2103/1; +19 additive).
+* Ruff (`ruff check src/spreadsheet_handling`): passed. Source-style guard: rc 0.
+  `git diff --check`: clean. Asciidoctor renders this artifact.
+
+*Known unrelated xfail (reported separately):*
+`tests/roundtrip/test_pathological_cell_contracts.py::test_missing_fk_key_helper_representation_without_cleanup`
+-- `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, pre-existing and unrelated to
+GX-4.
+
+== Verdict
+
+GX-4 adds only the opt-in configured-depth exact ODS read behind the existing
+backend option seam, reuses the accepted backend-neutral carrier and domain step
+unchanged, and required no ODS writer change. Legacy reads stay byte-identical and
+all protected surfaces are intact.
+
+GROUPED XREF GX-4 READY FOR ACCEPTANCE REVIEW 001
