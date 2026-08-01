@@ -4,6 +4,10 @@ import pandas as pd
 import pytest
 
 from spreadsheet_handling.core.formulas import LookupFormulaSpec, lookup_formula
+from spreadsheet_handling.domain.transformations.grouped_xref import (
+    GroupedMatrix,
+    contract_grouped_xref,
+)
 from spreadsheet_handling.io_backends.spreadsheet_contract import build_spreadsheet_render_plan
 from spreadsheet_handling.rendering.frame_selection import select_render_frames
 
@@ -11,6 +15,34 @@ pytestmark = [
     pytest.mark.ftr("FTR-FRAME-LIFECYCLE-AND-WORKBOOK-VIEWS-P4"),
     pytest.mark.ftr("FTR-IR-006-RENDER-INPUT-MUTATION-FIX"),
 ]
+
+_GX_KEYS = ("credit.annuity_loan", "credit.fixed_rate_loan", "deposit.balance")
+
+
+def _grouped_matrix() -> GroupedMatrix:
+    relation = pd.DataFrame(
+        [
+            {"row_id": rid, "column_key": key, "value": f"{rid}:{key}"}
+            for rid in ("r1", "r2")
+            for key in _GX_KEYS
+        ]
+    )
+    source = pd.DataFrame(
+        {
+            "key": list(_GX_KEYS),
+            "grp": ["Kredit", "Kredit", "Einlage"],
+            "leaf": ["Annuitaet", "Festzins", "Guthaben"],
+        }
+    )
+    return contract_grouped_xref(
+        {"rel": relation, "src": source},
+        relation="rel",
+        output="Matrix",
+        row_keys=["row_id"],
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )["Matrix"]
 
 
 def _frames_with_meta(meta: dict) -> dict:
@@ -149,3 +181,107 @@ def test_workbook_view_rename_does_not_mutate_source_dataframe() -> None:
 
     # The selected render copy must be a distinct object, not the original.
     assert selected["Orders"] is not original_df
+
+
+# --- GX-5: grouped-XRef workbook adoption ---------------------------------
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configured_selection_includes_grouped_matrix_by_identity_and_renames() -> None:
+    gm = _grouped_matrix()
+    df = pd.DataFrame({"id": [1]})
+    frames = {"grouped": gm, "flat": df, "excluded": _grouped_matrix(), "_meta": {}}
+    meta = {
+        "workbook_view": {
+            "sheets": [
+                {"frame": "flat", "sheet": "Flat"},
+                {"frame": "grouped", "sheet": "Rendered Matrix"},
+            ]
+        }
+    }
+
+    selected = select_render_frames(frames, meta)
+
+    # Declaration order, include/exclude, rename, and carrier identity together.
+    assert list(selected) == ["Flat", "Rendered Matrix", "_meta"]
+    assert selected["Flat"] is df
+    assert selected["Rendered Matrix"] is gm
+    assert "excluded" not in selected
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configured_grouped_selection_rejects_missing_and_duplicate_names() -> None:
+    frames = {"grouped": _grouped_matrix(), "flat": pd.DataFrame({"id": [1]})}
+
+    with pytest.raises(KeyError, match="missing frame"):
+        select_render_frames(
+            frames,
+            {"workbook_view": {"sheets": [{"frame": "absent", "sheet": "X"}]}},
+        )
+
+    with pytest.raises(ValueError, match="Duplicate workbook view sheet name"):
+        select_render_frames(
+            frames,
+            {
+                "workbook_view": {
+                    "sheets": [
+                        {"frame": "grouped", "sheet": "Shared"},
+                        {"frame": "flat", "sheet": "Shared"},
+                    ]
+                }
+            },
+        )
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_grouped_carrier_is_not_formula_rewritten_but_dataframe_still_is() -> None:
+    gm = _grouped_matrix()
+    formula = lookup_formula(
+        source_key_column="id",
+        lookup_sheet="products_view",
+        lookup_key_column="id",
+        lookup_value_column="name",
+    )
+    frames = {
+        "products_view": pd.DataFrame({"id": [1], "name": ["Widget"]}),
+        "orders_view": pd.DataFrame({"ref": [formula]}),
+        "grouped": gm,
+    }
+    meta = {
+        "workbook_view": {
+            "sheets": [
+                {"frame": "products_view", "sheet": "Products"},
+                {"frame": "orders_view", "sheet": "Orders"},
+                {"frame": "grouped", "sheet": "Grouped"},
+            ]
+        }
+    }
+
+    selected = select_render_frames(frames, meta)
+
+    # Formula sheet-name rewriting stays DataFrame-only.
+    assert selected["Orders"]["ref"].iloc[0].lookup_sheet == "Products"
+    # The grouped carrier is retained by identity and never inspected for formulas.
+    assert selected["Grouped"] is gm
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configured_selection_rejects_unsupported_non_renderable_value() -> None:
+    frames = {"weird": object(), "flat": pd.DataFrame({"id": [1]})}
+
+    with pytest.raises(TypeError, match="must be a .*DataFrame or GroupedMatrix"):
+        select_render_frames(
+            frames,
+            {"workbook_view": {"sheets": [{"frame": "weird", "sheet": "W"}]}},
+        )
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_default_path_passes_grouped_carrier_through_unchanged() -> None:
+    gm = _grouped_matrix()
+    frames = {"grouped": gm, "flat": pd.DataFrame({"id": [1]})}
+
+    selected = select_render_frames(frames, None)
+
+    assert list(selected) == ["grouped", "flat"]
+    assert selected["grouped"] is gm

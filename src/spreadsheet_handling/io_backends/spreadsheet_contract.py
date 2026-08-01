@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+import pandas as pd
+
+from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
 from spreadsheet_handling.rendering.composer.layout_composer import compose_workbook
 from spreadsheet_handling.rendering.frame_selection import select_render_frames
 from spreadsheet_handling.rendering.flow import build_render_plan
@@ -47,9 +50,21 @@ def read_spreadsheet_frames(
     return workbookir_to_frames(parser(path))
 
 
+def is_render_carrier(value: Any) -> bool:
+    """Report whether a Frames value is a render carrier the plan preserves as-is.
+
+    GX-5: the router-facing savers delegate this bounded carrier decision to the
+    backend-neutral facade instead of reaching into domain carriers themselves.
+    A ``DataFrame`` or an accepted ``GroupedMatrix`` reaches ``compose_workbook``
+    unchanged; every other value keeps the savers' existing DataFrame coercion.
+    """
+    return isinstance(value, (pd.DataFrame, GroupedMatrix))
+
+
 __all__ = [
     'SpreadsheetParser',
     'SpreadsheetRenderer',
     'build_spreadsheet_render_plan',
+    'is_render_carrier',
     'read_spreadsheet_frames',
 ]

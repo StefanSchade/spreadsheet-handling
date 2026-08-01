@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.core.formulas import LookupFormulaSpec, lookup_formula
+from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
 
 RESERVED_FRAME_KEYS = {"_meta"}
 
@@ -54,9 +55,13 @@ def _select_configured_sheets(
         if frame not in frames:
             raise KeyError(f"workbook_view.sheets entry {index} references missing frame {frame!r}")
         value = frames[frame]
-        if not isinstance(value, pd.DataFrame):
+        # A GroupedMatrix carrier is admitted by identity for selection, order,
+        # and rename exactly as compose_workbook accepts it; its frame is never
+        # inspected here and formula rewriting stays DataFrame-only below.
+        if not isinstance(value, (pd.DataFrame, GroupedMatrix)):
             raise TypeError(
-                f"workbook_view.sheets entry {index} frame {frame!r} must be a DataFrame"
+                f"workbook_view.sheets entry {index} frame {frame!r} must be a "
+                "DataFrame or GroupedMatrix"
             )
 
         sheet = _non_empty_string(

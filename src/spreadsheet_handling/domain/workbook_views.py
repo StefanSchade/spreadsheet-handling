@@ -8,6 +8,9 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.core.exact_table import ExactTable
+from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
+
 Frames = dict[str, Any]
 WORKBOOK_VIEW_SHEET_MAPPINGS_KEY = "sheet_mappings"
 
@@ -112,8 +115,12 @@ def _normalize_sheet_specs(
             raise ValueError(f"sheets entry {index} references reserved frame {frame!r}")
         if frame not in frames:
             raise KeyError(f"sheets entry {index} references missing frame {frame!r}")
-        if not isinstance(frames[frame], pd.DataFrame):
-            raise TypeError(f"sheets entry {index} frame {frame!r} must be a pandas DataFrame")
+        frame_value = frames[frame]
+        is_grouped = isinstance(frame_value, GroupedMatrix)
+        if not is_grouped and not isinstance(frame_value, pd.DataFrame):
+            raise TypeError(
+                f"sheets entry {index} frame {frame!r} must be a pandas DataFrame or GroupedMatrix"
+            )
         if frame in seen_frames:
             raise ValueError(f"Duplicate workbook view frame {frame!r}")
         seen_frames.add(frame)
@@ -139,6 +146,12 @@ def _normalize_sheet_specs(
         options = raw.get("options")
         if options is not None and not isinstance(options, Mapping):
             raise TypeError(f"sheets entry {index} options must be a mapping")
+        if is_grouped and (helper_columns or editable_columns or protection or options):
+            raise ValueError(
+                f"sheets entry {index} frame {frame!r} is a GroupedMatrix; column-targeted "
+                "workbook view options (helper_columns, editable_columns, protection, options) "
+                "are unsupported in GX-5 because grouped identity is the full visible tuple"
+            )
         normalized.append(
             _SheetSpec(
                 frame=frame,
@@ -320,10 +333,13 @@ def _normalize_visible_sheet_names(
     if visible_sheets is None:
         return None
     if isinstance(visible_sheets, Mapping):
+        # Generic projected visible sheets are DataFrames or, under the exact
+        # header-depth read gate, ExactTable carriers (GX-5). Both re-key
+        # unchanged; grouped-XRef configuration is never interpreted here.
         return {
             str(name)
             for name, value in visible_sheets.items()
-            if str(name) != "_meta" and isinstance(value, pd.DataFrame)
+            if str(name) != "_meta" and isinstance(value, (pd.DataFrame, ExactTable))
         }
     if isinstance(visible_sheets, (str, bytes)):
         raise TypeError("visible_sheets must be an iterable of sheet names, not a scalar")

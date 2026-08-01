@@ -14,6 +14,7 @@ from spreadsheet_handling.io_backends.base import (
 )
 from spreadsheet_handling.io_backends.spreadsheet_contract import (
     build_spreadsheet_render_plan,
+    is_render_carrier,
     read_spreadsheet_frames,
 )
 from spreadsheet_handling.io_backends.xlsx.openpyxl_parser import parse_workbook
@@ -109,8 +110,12 @@ def save_xlsx(
         if name_str in _RESERVED_FRAME_KEYS:
             sanitized[name_str] = df
             continue
-        df0 = _ensure_dataframe(df)
-        sanitized[name_str] = df0
+        # GX-5: preserve accepted render carriers (DataFrame or GroupedMatrix)
+        # for the render path; every other value keeps the existing coercion.
+        if is_render_carrier(df):
+            sanitized[name_str] = df
+            continue
+        sanitized[name_str] = _ensure_dataframe(df)
 
     ExcelBackend().write_multi(sanitized, path, options=options)
 

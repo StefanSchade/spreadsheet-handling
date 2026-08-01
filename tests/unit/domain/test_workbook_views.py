@@ -3,6 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.core.exact_table import ExactTable
+from spreadsheet_handling.domain.transformations.grouped_xref import (
+    GroupedMatrix,
+    contract_grouped_xref,
+)
 from spreadsheet_handling.domain.workbook_views import (
     WorkbookViewSheetMapping,
     apply_workbook_view_sheet_mappings,
@@ -12,6 +17,40 @@ from spreadsheet_handling.domain.workbook_views import (
 from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
 
 pytestmark = pytest.mark.ftr("FTR-DECLARATIVE-WORKBOOK-VIEWS-P4A")
+
+_GX_KEYS = ("credit.annuity_loan", "credit.fixed_rate_loan", "deposit.balance")
+
+
+def _grouped_source() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "key": list(_GX_KEYS),
+            "grp": ["Kredit", "Kredit", "Einlage"],
+            "leaf": ["Annuitaet", "Festzins", "Guthaben"],
+        }
+    )
+
+
+def _grouped_relation() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"row_id": rid, "column_key": key, "value": f"{rid}:{key}"}
+            for rid in ("r1", "r2")
+            for key in _GX_KEYS
+        ]
+    )
+
+
+def _grouped_matrix() -> GroupedMatrix:
+    return contract_grouped_xref(
+        {"rel": _grouped_relation(), "src": _grouped_source()},
+        relation="rel",
+        output="Matrix",
+        row_keys=["row_id"],
+        source_frame="src",
+        key_column="key",
+        label_columns=["grp", "leaf"],
+    )["Matrix"]
 
 
 def test_configure_workbook_view_writes_explicit_sheet_projection() -> None:
@@ -474,3 +513,143 @@ def test_apply_workbook_view_sheet_mappings_is_config_addressable_in_pipeline() 
 
     assert set(out) == {"logical", "_meta"}
     pd.testing.assert_frame_equal(out["logical"], df)
+
+
+# --- GX-5: grouped-XRef workbook adoption ---------------------------------
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_selects_grouped_matrix_by_identity_and_renames() -> None:
+    gm = _grouped_matrix()
+    frames = {"grouped": gm}
+
+    out = configure_workbook_view(
+        frames,
+        sheets=[{"frame": "grouped", "sheet": "Rendered Matrix"}],
+    )
+
+    # The exact carrier is preserved: not unwrapped, copied, flattened, or converted.
+    assert out["grouped"] is gm
+    assert out["_meta"]["workbook_view"]["sheets"] == [
+        {"frame": "grouped", "sheet": "Rendered Matrix", "order": 0}
+    ]
+    assert out["_meta"]["workbook_view"]["sheet_mappings"] == [
+        {"sheet": "Rendered Matrix", "frame": "grouped"}
+    ]
+    # A grouped sheet without column-targeted options adds no sheet-options blob.
+    assert "sheets" not in out["_meta"]
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_preserves_mixed_dataframe_and_grouped_order() -> None:
+    gm = _grouped_matrix()
+    df = pd.DataFrame([{"variable_id": "v1"}])
+    frames = {"grouped": gm, "flat": df}
+
+    out = configure_workbook_view(
+        frames,
+        sheets=[
+            {"frame": "flat", "sheet": "Flat"},
+            {"frame": "grouped", "sheet": "Grouped"},
+        ],
+    )
+
+    assert out["flat"] is df
+    assert out["grouped"] is gm
+    assert out["_meta"]["workbook_view"]["sheets"] == [
+        {"frame": "flat", "sheet": "Flat", "order": 0},
+        {"frame": "grouped", "sheet": "Grouped", "order": 1},
+    ]
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_grouped_missing_and_duplicate_sheet_errors() -> None:
+    gm = _grouped_matrix()
+    frames = {"grouped": gm, "flat": pd.DataFrame([{"x": 1}])}
+
+    with pytest.raises(KeyError, match="missing frame"):
+        configure_workbook_view(frames, sheets=[{"frame": "absent", "sheet": "Nope"}])
+
+    with pytest.raises(ValueError, match="Duplicate workbook view sheet name"):
+        configure_workbook_view(
+            frames,
+            sheets=[
+                {"frame": "grouped", "sheet": "Shared"},
+                {"frame": "flat", "sheet": "Shared"},
+            ],
+        )
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_rejects_column_targeted_options_for_grouped_sheet() -> None:
+    gm = _grouped_matrix()
+    frames = {"grouped": gm}
+
+    for ambiguous in (
+        {"helper_columns": ["leaf"]},
+        {"editable_columns": ["leaf"]},
+        {"protection": {"editable_columns": ["leaf"]}},
+        {"options": {"freeze_header": True}},
+    ):
+        with pytest.raises(ValueError, match="unsupported in GX-5"):
+            configure_workbook_view(
+                frames,
+                sheets=[{"frame": "grouped", "sheet": "Grouped", **ambiguous}],
+            )
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_dataframe_options_unaffected_by_grouped_gate() -> None:
+    df = pd.DataFrame([{"ID": "v1", "label": "Rate"}])
+
+    out = configure_workbook_view(
+        {"flat": df},
+        sheets=[{"frame": "flat", "sheet": "Flat", "options": {"freeze_header": True}}],
+    )
+
+    assert out["flat"] is df
+    assert out["_meta"]["sheets"]["Flat"] == {"freeze_header": True}
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_configure_workbook_view_grouped_rejection_leaves_frames_and_meta_unchanged() -> None:
+    gm = _grouped_matrix()
+    meta = {"existing": {"keep": True}}
+    frames = {"grouped": gm, "_meta": meta}
+
+    with pytest.raises(ValueError, match="unsupported in GX-5"):
+        configure_workbook_view(
+            frames,
+            sheets=[{"frame": "grouped", "sheet": "Grouped", "helper_columns": ["leaf"]}],
+        )
+
+    assert frames["grouped"] is gm
+    assert frames["_meta"] is meta
+    assert meta == {"existing": {"keep": True}}
+    assert "workbook_view" not in meta
+
+
+@pytest.mark.ftr("FTR-XREF-AXIS-MAPPINGS-P4A2")
+def test_apply_workbook_view_sheet_mappings_remaps_exact_table_visible_sheet() -> None:
+    exact = ExactTable(
+        header_grid=(("", "Kredit"), ("row_id", "Annuitaet")),
+        data=(("r1", "r1:credit.annuity_loan"),),
+        header_rows=2,
+        n_cols=2,
+    )
+    frames = {
+        "Rendered Matrix": exact,
+        "_meta": {
+            "workbook_view": {
+                "sheet_mappings": [{"sheet": "Rendered Matrix", "frame": "grouped"}]
+            }
+        },
+    }
+
+    out = apply_workbook_view_sheet_mappings(frames, logical_frames=["grouped"])
+
+    # An ExactTable read carrier counts as a projected visible sheet and is
+    # re-keyed to its logical frame unchanged (preserved by identity).
+    assert set(out) == {"grouped", "_meta"}
+    assert "Rendered Matrix" not in out
+    assert out["grouped"] is exact

@@ -16,6 +16,7 @@ from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook
 from spreadsheet_handling.io_backends.ods.odf_renderer import render_workbook
 from spreadsheet_handling.io_backends.spreadsheet_contract import (
     build_spreadsheet_render_plan,
+    is_render_carrier,
     read_spreadsheet_frames,
 )
 
@@ -96,6 +97,11 @@ def save_ods(
     for name, df in frames.items():
         name_str = str(name)
         if name_str in _RESERVED_FRAME_KEYS:
+            sanitized[name_str] = df
+            continue
+        # GX-5: preserve accepted render carriers (DataFrame or GroupedMatrix)
+        # for the render path; every other value keeps the existing coercion.
+        if is_render_carrier(df):
             sanitized[name_str] = df
             continue
         sanitized[name_str] = _ensure_dataframe(df)
