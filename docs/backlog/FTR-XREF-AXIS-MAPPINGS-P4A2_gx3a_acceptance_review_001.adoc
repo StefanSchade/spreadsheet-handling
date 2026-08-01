@@ -1,0 +1,221 @@
+= GX-3a Acceptance Review 001: Backend-Neutral Exact Multi-Row Header Carrier
+:revdate: 2026-08-01
+:toc:
+
+Independent acceptance review of GX-3a (`FTR-XREF-AXIS-MAPPINGS-P4A2`), the
+backend-neutral exact multi-row header carrier. Reviewed commits: `310d468`
+(confirmation), `8ade9ba` (implementation), `8d2d2ce` (self-review). The
+confirmation and self-review were treated as claims and independently
+re-verified. Read-only review; no runtime or test code was modified.
+
+== Verdict
+
+*GX-3a is accepted.* The change delivers exactly the authorized generic
+infrastructure -- an opt-in exact `TableBlock.header_grid`, a configured-depth
+exact XLSX read gated by `parse_workbook(exact_header_depths=...)`, a verbatim
+exact-grid render branch, and a pure `forward_fill_header_grid` helper -- and
+nothing else. Legacy behaviour is byte-identical when the gate is absent. No
+grouped-XRef, axis-mapping, registry, metadata-family, application/CLI,
+persistence, or ODS coupling was found. No blocking or important findings.
+
+== Exact IR representation
+
+Independently confirmed (probes + tests):
+
+* `header_grid` is `tuple[tuple[str, ...], ...]`, one inner tuple per physical
+  header row (top->leaf), every physical cell captured verbatim.
+* Merged masters resolve (`_cell_value` -> `_exact_header_cell`); a merged and a
+  manually repeated-unmerged authoring of the same header reconstruct
+  identically.
+* Blanks are retained as `""`; no forward-fill or drop occurs on the read path.
+* Literal `" / "` inside a header component survives unchanged (no join/split).
+* Exact mode produces exactly one authoritative grid per table
+  (`tbl.header_grid`); `_seed_legacy_header_grid` skips exact tables, so
+  `sh.meta["__header_grid"]` is *not* also seeded for them
+  (probe 9: `__header_grid` absent for the configured sheet).
+* Legacy tables retain `header_grid = None` (verified for an unconfigured sheet
+  in the same workbook and for a legacy read of an exact-authored file).
+
+Verbatim fidelity is stricter than legacy: an integer `0` header cell reads back
+as `"0"` in exact mode (probe 7), where the legacy falsy `str(val) if val`
+path would drop it to `""`. This is correct for the exact contract.
+
+== Configured-depth gate / depth semantics
+
+* Absent/empty gate runs the pre-existing parser path (`exact_header_depth is
+  None` -> `_parse_table_block` -> `_detect_header_rows`); merge-based inference
+  is the only depth source.
+* Configured depth sets `header_rows = depth` directly and never calls
+  `_detect_header_rows`; merge geometry cannot alter it (verified merged vs
+  unmerged equivalence, and depth honoured over a merge that spans 1 row).
+* Data begins deterministically at `top + depth` (probe: `row_id` at row 2,
+  first data at row 3 for depth 2).
+* Width is measured from the *leaf* row (`_find_col_extent(..., scan_row=leaf)`),
+  so a blank upper cell above a row-key column does not truncate `n_cols`
+  (probe 2: `n_cols == 4` with a blank `A1`).
+* Invalid depths fail *before* any workbook is opened:
+  `_validated_exact_header_depths` runs before `openpyxl.load_workbook`, and the
+  atomicity test raises `ValueError` for a nonexistent path.
+  `type(depth) is not int` rejects `bool`, `float`, and `str`; `depth < 1`
+  rejects `0`/negatives.
+* Sheet-name/depth-map keys are deterministic: `depths.get(ws_name)` per visible
+  sheet; unconfigured sheets stay legacy (probe 9).
+
+*First-table narrowing (observation O3):* exact mode applies only to the first
+anchor (`exact_header_depth if index == 0 else None`). This is a documented
+limitation and is consistent with the per-sheet public option, which
+semantically targets the sheet's primary matrix. It is a narrowing worth keeping
+explicitly documented, not a defect.
+
+== Exact reading / writing
+
+Reading: arity 2 and 3, merged upper cells, repeated-unmerged upper cells, upper
+blanks, literal delimiters, row-key-like blank upper cells, configured depth
+without merges, and exact data-region placement were all independently
+exercised. No `" / "` flatten and no grouped/semantic interpretation occurs;
+`headers`/`header_map` carry the non-authoritative leaf row only. Wrong
+configured depth (probe 1) is deterministic: a too-large depth absorbs the first
+data row into the grid -- a caller-configuration error, not corruption.
+
+Writing: `_emit_exact_header_grid` writes every non-blank grid cell verbatim via
+`SetHeader`, skips blanks (physically blank), emits no `MergeCells`, no
+`MultiIndex`, no join/split, and invents no canonical identifiers. Data is placed
+at `top + header_rows`. The exact branch is selected first
+(`if t.header_grid is not None`), so ordinary single-row and legacy multi-row
+rendering paths are untouched.
+
+== Malformed-IR boundary
+
+Probed manually constructed inconsistent `TableBlock` geometry through the public
+IR boundary:
+
+* `header_rows != len(header_grid)` (probe 5) -> a blank spacer row between
+  header and data;
+* non-rectangular grid (probe 4) and grid width `< n_cols` (probe 3) -> header
+  under-written, data written at full `n_cols`;
+* empty grid `()` (probe 6) -> writes without error.
+
+None raise; all are silent geometry mismatches reachable *only* by hand-building
+an internally inconsistent `TableBlock`. This is the *same* latitude the
+pre-existing IR fields already have (`headers`/`n_cols`/`data` are equally
+unvalidated against each other), and the only supported producer -- the parser --
+always yields a rectangular grid with `len(grid) == depth == header_rows` and
+width `== n_cols`. Under normal supported use no ambiguity, corruption, or
+accidental exception arises. *Conclusion: outside the supported
+IR-construction boundary; no validation is required for GX-3a.* Recorded as
+observation O1, not a finding.
+
+== Forward-fill helper
+
+`forward_fill_header_grid` is pure and non-mutating (input identity preserved),
+fills horizontally per level, keeps leading blanks blank, preserves
+`skip_columns` verbatim, and does not carry a fill run across a skipped column
+(a skipped column resets `carry`). Out-of-range `skip_columns` are harmless
+(probe 8). The module imports nothing backend- or domain-specific; the column
+role knowledge (which columns are single-level) is explicitly a caller
+parameter, keeping GX-3b semantics out of GX-3a.
+
+== Legacy compatibility
+
+Full active suite: *2067 passed, 1 xfailed* -- identical to the self-review
+claim. Ordinary single-row read/write, merge-inferred multi-row reads,
+`" / "` flattening, and existing `MultiIndex` reconstruction
+(`workbookir_to_frames`) are all unchanged; the exact-mode leaf headers contain
+no `" / "`, so the `MultiIndex` branch is correctly *not* taken. The new path is
+purely additive and opt-in: with no gate, `_parser_for_options` returns the
+unmodified `parse_workbook`.
+
+== Layering / protected surfaces
+
+* `header_grid` (IR) and `forward_fill_header_grid` are backend-neutral (plain
+  strings / stdlib only).
+* openpyxl types do not escape XLSX parsing: `_exact_header_cell` returns `str`;
+  the grid is `tuple[tuple[str]]`.
+* No grouped-XRef/axis/registry references exist in any of the six changed source
+  files (grep clean); rendering/I/O import no grouped-XRef code.
+* No registry, domain-transformation, `_meta`-family, application, CLI, or
+  persistence change. ODS is untouched (no ODS file in the three-commit diff;
+  ODS regression tests pass).
+
+== Public surface / usability
+
+`parse_workbook(exact_header_depths=...)`,
+`ExcelBackend.read_multi(options.extra["exact_header_depths"])`,
+`TableBlock.header_grid`, and `forward_fill_header_grid` form a coherent,
+bounded, opt-in surface. As documented, GX-3a does not project exact headers into
+Frames -- the authoritative result lives on `WorkbookIR`; `read_multi`'s exact
+option threads to the parser and yields the IR grid but keeps legacy frame
+projection (leaf columns only). This is intended and reserved for GX-3b
+(observation O4), not a defect.
+
+== Test assessment
+
+The 21 test items (16 in `test_gx3a_exact_headers.py` incl. one 5-way
+parametrized rejection test, 5 in `test_header_grid.py`) genuinely cover
+configured depth, merge independence, literal delimiter, raw blanks, exact
+write/read roundtrip, gate reachability, legacy no-regression, and helper
+semantics. Independent live probes (arity 3, integer-`0` verbatim, wrong depth,
+row-key extent, malformed manual geometry, multi-sheet legacy isolation) added
+no new failures. Coverage is adequate; no redundant implementation-detail tests
+are demanded.
+
+== Findings
+
+No blocking or important findings.
+
+[cols="1,3,5",options="header"]
+|===
+| ID | Severity | Note
+| O1 | observation | Manually inconsistent `TableBlock` geometry
+(`header_rows`/grid-shape/`n_cols` mismatch) writes silently. Same unvalidated
+latitude as pre-existing IR fields; unreachable via the parser. Outside the
+supported boundary.
+| O2 | observation | A wrong configured `depth` deterministically absorbs data
+rows into the grid. Caller-configuration error; documented.
+| O3 | observation | Exact mode targets only the first anchor of a configured
+sheet. Documented limitation, consistent with the per-sheet option.
+| O4 | observation | Exact headers are not projected into Frames via
+`read_multi`; the grid lives on `WorkbookIR`. Intended; GX-3b will add the join.
+| O5 | observation | Pre-existing source-style complexity WARNs marginally
+worsened (`build_render_plan` 38->39; `parse_workbook` length 88->100). Guard
+still rc 0; both functions were already above threshold before GX-3a.
+|===
+
+== GX-3b readiness
+
+GX-3a leaves a clean seam for GX-3b: the lossless per-cell grid is available on
+the IR, and the caller-parameterised `forward_fill_header_grid` gives GX-3b the
+merge-repeat vs single-level (row-key) disambiguation hook without embedding
+column-role knowledge in the generic layer. No grouped-XRef wiring, frame
+projection, or ODS work has begun, so GX-3b/GX-4/GX-5 remain cleanly pending.
+
+== Validation evidence
+
+All commands run from `core/` with the project venv.
+
+* GX-3a tests: `pytest tests/unit/io_backends/xlsx/test_gx3a_exact_headers.py
+  tests/unit/rendering/test_header_grid.py` -> *21 passed*.
+* ODS + multi-header/`MultiIndex` selection: *140 passed*.
+* Full active Core suite (`-m 'not legacy and not prehex and not slow'`, unit +
+  integration + roundtrip + architecture): *2067 passed, 1 xfailed*.
+* Ruff (`ruff check src/spreadsheet_handling`): passed.
+* Source-style guard (`tools/check_source_style.py`): rc 0 (WARN-level only; see
+  O5).
+* `git diff --check`: clean.
+* Asciidoctor 2.0.23 available; this artifact renders.
+
+*Known unrelated xfail (reported separately):*
+`tests/roundtrip/test_pathological_cell_contracts.py::test_missing_fk_key_helper_representation_without_cleanup`
+-- `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, pre-existing and unrelated to
+GX-3a.
+
+== Lifecycle cleanup check
+
+GX-3a is a sub-slice acceptance, not a workstream-final verdict; the owning FTR
+`FTR-XREF-AXIS-MAPPINGS-P4A2` stays *open* (GX-3b/GX-4/GX-5 pending). No status
+change to `Done`/`Superseded`, no include removal from `_ftrs_open.adoc`, and no
+companion-artifact move to cold storage is warranted. This review updates only
+the FTR sub-slice status line to record GX-3a acceptance. No residual scope
+beyond the already-planned GX-3b.
+
+GROUPED XREF GX-3A ACCEPTED IN REVIEW 001
