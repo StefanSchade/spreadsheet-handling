@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import functools
 import logging
 from pathlib import Path
 from typing import Any, Dict, Final
 
 import pandas as pd
 
-from spreadsheet_handling.io_backends.base import BackendBase, BackendOptions
+from spreadsheet_handling.io_backends.base import (
+    BackendBase,
+    BackendOptions,
+    coerce_backend_options,
+)
 from spreadsheet_handling.io_backends.ods.odf_parser import parse_workbook
 from spreadsheet_handling.io_backends.ods.odf_renderer import render_workbook
 from spreadsheet_handling.io_backends.spreadsheet_contract import (
@@ -42,7 +47,37 @@ class OdsBackend(BackendBase):
         header_levels: int,
         options: BackendOptions | None = None,
     ) -> Dict[str, pd.DataFrame]:
-        return read_spreadsheet_frames(Path(path), parser=parse_workbook)
+        """Read all visible sheets from an ODS file via the backend contract.
+
+        GX-4 opt-in: ``options.extra["exact_header_depths"]`` (a sheet-name ->
+        configured-depth mapping) selects exact multi-row header reads for the
+        named sheets, mirroring the XLSX backend. Absent it, reads are
+        byte-identical to before.
+        """
+        parser = _parser_for_options(options)
+        return read_spreadsheet_frames(Path(path), parser=parser)
+
+
+def _parser_for_options(options: BackendOptions | Any | None):
+    """Return the workbook parser, honouring an opt-in exact-header-depth map.
+
+    Reads ``exact_header_depths`` from ``options.extra`` (BackendOptions) or from
+    a plain options mapping. Absent, the unmodified ``parse_workbook`` is used, so
+    ordinary reads are byte-identical. Mirrors the XLSX backend seam.
+    """
+    if options is None:
+        return parse_workbook
+    opts = coerce_backend_options(options)
+    if isinstance(opts, BackendOptions):
+        extra = opts.extra or {}
+    elif isinstance(opts, dict):
+        extra = opts.get("extra") if isinstance(opts.get("extra"), dict) else opts
+    else:
+        extra = {}
+    depths = extra.get("exact_header_depths") if isinstance(extra, dict) else None
+    if not depths:
+        return parse_workbook
+    return functools.partial(parse_workbook, exact_header_depths=depths)
 
 
 def save_ods(

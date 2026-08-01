@@ -6,7 +6,7 @@ import csv
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from odf.element import Element
 from odf.namespaces import FONS, OFFICENS, STYLENS, TABLENS, TEXTNS
@@ -1011,12 +1011,39 @@ def _extract_autofilter_ref(database_ranges: list[Element], *, sheet_name: str) 
     return None
 
 
+def _validated_exact_header_depths(
+    exact_header_depths: Mapping[str, int] | None,
+) -> dict[str, int]:
+    """Validate the opt-in GX-4 per-sheet configured header depths.
+
+    Same contract as the GX-3a XLSX reader: values must be positive integers.
+    """
+    if not exact_header_depths:
+        return {}
+    validated: dict[str, int] = {}
+    for sheet_name, depth in exact_header_depths.items():
+        if type(depth) is not int or depth < 1:
+            raise ValueError(
+                "exact_header_depths values must be positive integers; "
+                f"sheet {sheet_name!r} got {depth!r}"
+            )
+        validated[str(sheet_name)] = depth
+    return validated
+
+
 def parse_workbook(
     path: str | Path,
     *,
     limits: ParserLimits = DEFAULT_LIMITS,
+    exact_header_depths: Mapping[str, int] | None = None,
 ) -> WorkbookIR:
-    """Parse an ODS workbook into WorkbookIR."""
+    """Parse an ODS workbook into WorkbookIR.
+
+    ``exact_header_depths`` (GX-4, opt-in) maps a visible sheet name to a
+    configured header depth read in exact mode, mirroring the GX-3a XLSX reader;
+    other sheets are byte-identical to before.
+    """
+    depths = _validated_exact_header_depths(exact_header_depths)
     doc = load(str(path))
     ir = WorkbookIR()
 
@@ -1074,6 +1101,7 @@ def parse_workbook(
             autofilter_ref=autofilter_ref,
             anchors=[(1, 1), *legend_anchors] if legend_anchors else None,
             stop_on_empty_col=bool(legend_anchors),
+            exact_header_depth=depths.get(name),
         )
         _apply_legend_table_hints(sheet, legend_hints)
         sheet.named_ranges = _extract_named_ranges(table, sheet_name=name)

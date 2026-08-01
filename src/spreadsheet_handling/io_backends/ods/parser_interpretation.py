@@ -49,8 +49,16 @@ def build_visible_sheet_ir(
     autofilter_ref: str | None,
     anchors: list[tuple[int, int]] | None = None,
     stop_on_empty_col: bool = False,
+    exact_header_depth: int | None = None,
 ) -> SheetIR:
-    """Interpret a visible ODS sheet into spreadsheet-neutral ``SheetIR``."""
+    """Interpret a visible ODS sheet into spreadsheet-neutral ``SheetIR``.
+
+    When ``exact_header_depth`` is set (GX-4 opt-in, mirroring the GX-3a XLSX
+    path), the *primary* table (the first anchor) is read in exact mode: the
+    configured depth overrides merge-based detection and a lossless per-cell
+    ``header_grid`` is attached. All other tables and every legacy behaviour are
+    unchanged.
+    """
     sheet = SheetIR(name=sheet_name)
 
     options = {}
@@ -61,7 +69,7 @@ def build_visible_sheet_ir(
         sheet.meta["options"] = options
 
     table_starts = anchors or [(1, 1)]
-    for top, left in table_starts:
+    for index, (top, left) in enumerate(table_starts):
         sheet.tables.append(
             _parse_table_block(
                 parsed,
@@ -69,13 +77,16 @@ def build_visible_sheet_ir(
                 top=top,
                 left=left,
                 stop_on_empty_col=stop_on_empty_col,
+                exact_header_depth=exact_header_depth if index == 0 else None,
             )
         )
 
     header_merges: list[tuple[int, int, int, int]] = []
     for table_block in sheet.tables:
         header_merges.extend(_extract_header_merges(parsed, table_block))
-        if table_block.header_rows > 1:
+        # Exact-mode tables are authoritative through ``tbl.header_grid`` and are
+        # skipped so there is one truth per table (mirrors the XLSX read path).
+        if table_block.header_grid is None and table_block.header_rows > 1:
             sheet.meta["__header_grid"] = _extract_header_grid(parsed, table_block)
 
     if header_merges:
@@ -94,7 +105,17 @@ def _parse_table_block(
     top: int,
     left: int,
     stop_on_empty_col: bool,
+    exact_header_depth: int | None = None,
 ) -> TableBlock:
+    if exact_header_depth is not None:
+        return _parse_exact_table_block(
+            parsed,
+            frame_name=frame_name,
+            top=top,
+            left=left,
+            depth=exact_header_depth,
+            stop_on_empty_col=stop_on_empty_col,
+        )
     header_rows = _detect_header_rows(parsed, top, left)
     n_cols = _find_col_extent(parsed, top, left, stop_on_empty_col)
     data_start_row = top + header_rows
@@ -138,6 +159,69 @@ def _parse_table_block(
     )
 
 
+def _exact_header_cell(parsed: ParsedTable, row: int, col: int) -> str:
+    """Read one header cell verbatim, resolving merged masters, blanks as ``""``."""
+    value = _grid_value(parsed, row, col)
+    return "" if value is None else str(value)
+
+
+def _parse_exact_table_block(
+    parsed: ParsedTable,
+    *,
+    frame_name: str,
+    top: int,
+    left: int,
+    depth: int,
+    stop_on_empty_col: bool,
+) -> TableBlock:
+    """GX-4 exact read: configured ``depth`` header rows, lossless ``header_grid``.
+
+    Mirrors the accepted GX-3a XLSX exact block. Column extent is measured on the
+    *leaf* header row (fully populated), never from merge geometry. Every physical
+    header cell is captured verbatim (merged masters resolved, blanks kept as
+    ``""``); no ``" / "`` join is done. ``headers``/``header_map`` carry the
+    non-authoritative leaf row only. Cell reads go through the already-bounded
+    ``ParsedTable`` grid, so ODS row/column-repeat expansion stays within the
+    existing ``ParserLimits`` extent.
+    """
+    header_rows = depth
+    leaf_row = top + header_rows - 1
+    n_cols = _find_col_extent(parsed, top, left, stop_on_empty_col, scan_row=leaf_row)
+    data_start_row = top + header_rows
+    n_data_rows = _find_row_extent(parsed, data_start_row, left, n_cols)
+    n_rows = header_rows + n_data_rows
+
+    header_grid = tuple(
+        tuple(
+            _exact_header_cell(parsed, top + row_off, left + col_off)
+            for col_off in range(n_cols)
+        )
+        for row_off in range(header_rows)
+    )
+    headers = list(header_grid[-1])  # leaf row, non-authoritative
+    header_map = {header: idx + 1 for idx, header in enumerate(headers)}
+
+    data: list[list[Any]] = []
+    for row in range(data_start_row, data_start_row + n_data_rows):
+        data.append(
+            [str(_grid_value(parsed, row, col) or "") for col in range(left, left + n_cols)]
+        )
+
+    return TableBlock(
+        frame_name=frame_name,
+        top=top,
+        left=left,
+        header_rows=header_rows,
+        header_cols=1,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        headers=headers,
+        header_map=header_map,
+        data=data,
+        header_grid=header_grid,
+    )
+
+
 def _grid_value(parsed: ParsedTable, row: int, col: int) -> Any:
     direct = parsed.values.get((row, col))
     if direct not in (None, ""):
@@ -172,11 +256,21 @@ def _find_col_extent(
     top: int,
     left: int,
     stop_on_empty: bool = False,
+    *,
+    scan_row: int | None = None,
 ) -> int:
+    """Find the number of columns by scanning a header row.
+
+    Legacy callers scan the first header row (``scan_row is None``). GX-4 exact
+    mode scans the *leaf* header row instead, which is fully populated (row-key
+    leaf label + dynamic leaf labels), so a blank upper cell above a row-key
+    column cannot truncate the column count (mirrors the XLSX read path).
+    """
+    row = top if scan_row is None else scan_row
     n_cols = 0
     max_scan = max(parsed.max_col, left)
     for col in range(left, max_scan + 1):
-        value = _grid_value(parsed, top, col)
+        value = _grid_value(parsed, row, col)
         if value is None or (isinstance(value, str) and value.strip() == ""):
             if stop_on_empty:
                 break
@@ -184,7 +278,7 @@ def _find_col_extent(
             for lookahead in range(1, 4):
                 if col + lookahead > parsed.max_col:
                     continue
-                later = _grid_value(parsed, top, col + lookahead)
+                later = _grid_value(parsed, row, col + lookahead)
                 if later is not None and str(later).strip():
                     has_more = True
                     break
