@@ -46,8 +46,15 @@ def build_visible_sheet_ir(
     anchors: list[tuple[int, int]] | None,
     stop_on_empty_row: bool,
     stop_on_empty_col: bool,
+    exact_header_depth: int | None = None,
 ) -> SheetIR:
-    """Interpret a visible worksheet into spreadsheet-neutral ``SheetIR``."""
+    """Interpret a visible worksheet into spreadsheet-neutral ``SheetIR``.
+
+    When ``exact_header_depth`` is set (GX-3a opt-in), the *primary* table (the
+    first anchor) is read in exact mode: the configured depth overrides merge-based
+    detection and a lossless per-cell ``header_grid`` is attached. All other tables
+    and every legacy behaviour are unchanged.
+    """
     sh = SheetIR(name=sheet_name)
 
     options = {}
@@ -58,7 +65,7 @@ def build_visible_sheet_ir(
         sh.meta["options"] = options
 
     table_starts = anchors or [(1, 1)]
-    for top, left in table_starts:
+    for index, (top, left) in enumerate(table_starts):
         sh.tables.append(
             _parse_table_block(
                 ws,
@@ -67,6 +74,7 @@ def build_visible_sheet_ir(
                 left=left,
                 stop_on_empty_row=stop_on_empty_row,
                 stop_on_empty_col=stop_on_empty_col,
+                exact_header_depth=exact_header_depth if index == 0 else None,
             )
         )
 
@@ -74,10 +82,7 @@ def build_visible_sheet_ir(
     if header_merges:
         sh.meta["__header_merges"] = header_merges
 
-    for tbl in sh.tables:
-        grid = _extract_header_grid(ws, tbl)
-        if grid and tbl.header_rows > 1:
-            sh.meta["__header_grid"] = grid
+    _seed_legacy_header_grid(sh, ws)
 
     sh.validations = list(validations)
 
@@ -99,6 +104,20 @@ def build_visible_sheet_ir(
     return sh
 
 
+def _seed_legacy_header_grid(sh: SheetIR, ws: Worksheet) -> None:
+    """Seed the legacy sheet-level ``__header_grid`` for non-exact multi-row tables.
+
+    Exact-mode tables are authoritative through ``tbl.header_grid`` and are skipped
+    so there is one truth per table.
+    """
+    for tbl in sh.tables:
+        if tbl.header_grid is not None:
+            continue
+        grid = _extract_header_grid(ws, tbl)
+        if grid and tbl.header_rows > 1:
+            sh.meta["__header_grid"] = grid
+
+
 def _parse_table_block(
     ws: Worksheet,
     *,
@@ -107,8 +126,23 @@ def _parse_table_block(
     left: int,
     stop_on_empty_row: bool,
     stop_on_empty_col: bool,
+    exact_header_depth: int | None = None,
 ) -> TableBlock:
-    """Discover a single table starting at ``(top, left)``."""
+    """Discover a single table starting at ``(top, left)``.
+
+    ``exact_header_depth`` (GX-3a) reads the table in exact mode: configured depth
+    instead of merge inference, and a lossless per-cell ``header_grid``.
+    """
+    if exact_header_depth is not None:
+        return _parse_exact_table_block(
+            ws,
+            frame_name=frame_name,
+            top=top,
+            left=left,
+            depth=exact_header_depth,
+            stop_on_empty_row=stop_on_empty_row,
+            stop_on_empty_col=stop_on_empty_col,
+        )
     header_rows = _detect_header_rows(ws, top, left)
     n_cols = _find_col_extent(ws, top, left, stop_on_empty_col)
     data_start_row = top + header_rows
@@ -155,6 +189,69 @@ def _parse_table_block(
     )
 
 
+def _exact_header_cell(ws: Worksheet, row: int, col: int) -> str:
+    """Read one header cell verbatim, resolving merged masters, blanks as ``""``."""
+    val = _cell_value(ws, row, col)
+    return "" if val is None else str(val)
+
+
+def _parse_exact_table_block(
+    ws: Worksheet,
+    *,
+    frame_name: str,
+    top: int,
+    left: int,
+    depth: int,
+    stop_on_empty_row: bool,
+    stop_on_empty_col: bool,
+) -> TableBlock:
+    """GX-3a exact read: configured ``depth`` header rows, lossless ``header_grid``.
+
+    Column extent is measured on the *leaf* header row (fully populated), never
+    from merge geometry. Every physical header cell is captured verbatim
+    (merged masters resolved, blanks kept as ``""``); no ``" / "`` join is done.
+    ``headers``/``header_map`` carry the non-authoritative leaf row only.
+    """
+    header_rows = depth
+    leaf_row = top + header_rows - 1
+    n_cols = _find_col_extent(ws, top, left, stop_on_empty_col, scan_row=leaf_row)
+    data_start_row = top + header_rows
+    n_data_rows = _find_row_extent(ws, data_start_row, left, n_cols, stop_on_empty_row)
+    n_rows = header_rows + n_data_rows
+
+    header_grid = tuple(
+        tuple(
+            _exact_header_cell(ws, top + row_off, left + col_off)
+            for col_off in range(n_cols)
+        )
+        for row_off in range(header_rows)
+    )
+    headers = list(header_grid[-1])  # leaf row, non-authoritative
+    header_map = {h: idx + 1 for idx, h in enumerate(headers)}
+
+    data: list[list[Any]] = []
+    for r in range(data_start_row, data_start_row + n_data_rows):
+        row_vals: list[Any] = []
+        for c in range(left, left + n_cols):
+            val = ws.cell(row=r, column=c).value
+            row_vals.append(str(val) if val is not None else "")
+        data.append(row_vals)
+
+    return TableBlock(
+        frame_name=frame_name,
+        top=top,
+        left=left,
+        header_rows=header_rows,
+        header_cols=1,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        headers=headers,
+        header_map=header_map,
+        data=data,
+        header_grid=header_grid,
+    )
+
+
 def _cell_value(ws: Worksheet, row: int, col: int) -> Any:
     """Get a cell value, resolving merged cells to their master value."""
     cell = ws.cell(row=row, column=col)
@@ -190,17 +287,31 @@ def _detect_header_rows(ws: Worksheet, top: int, left: int) -> int:
     return 1
 
 
-def _find_col_extent(ws: Worksheet, top: int, left: int, stop_on_empty: bool) -> int:
-    """Find the number of columns by scanning the first header row."""
+def _find_col_extent(
+    ws: Worksheet,
+    top: int,
+    left: int,
+    stop_on_empty: bool,
+    *,
+    scan_row: int | None = None,
+) -> int:
+    """Find the number of columns by scanning a header row.
+
+    Legacy callers scan the first header row (``scan_row is None``). GX-3a exact
+    mode scans the *leaf* header row instead, which is fully populated (row-key
+    leaf label + dynamic leaf labels), so a blank upper cell above a row-key
+    column cannot truncate the column count.
+    """
+    row = top if scan_row is None else scan_row
     n_cols = 0
     for c in range(left, left + 16384):
-        val = _cell_value(ws, top, c)
+        val = _cell_value(ws, row, c)
         if val is None or (isinstance(val, str) and val.strip() == ""):
             if stop_on_empty:
                 break
             has_more = False
             for lookahead in range(1, 4):
-                v2 = _cell_value(ws, top, c + lookahead)
+                v2 = _cell_value(ws, row, c + lookahead)
                 if v2 is not None and str(v2).strip():
                     has_more = True
                     break

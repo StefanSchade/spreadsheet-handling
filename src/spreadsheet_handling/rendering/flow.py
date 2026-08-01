@@ -59,6 +59,21 @@ def _meta_cell_value(key: str, value: Any) -> str:
     return str(value)
 
 
+def _emit_exact_header_grid(plan: RenderPlan, sheet_name: str, t: TableBlock) -> None:
+    """GX-3a exact mode: emit the lossless per-cell header grid verbatim.
+
+    Blank cells are skipped (left empty, as row-key upper cells require). No
+    ``" / "`` join, no ``MultiIndex``, no merge emission -- every non-blank cell
+    is written literally, so the round-trip is lossless without depending on
+    merge geometry.
+    """
+    for row_off, row_vals in enumerate(t.header_grid or ()):
+        r = t.top + row_off
+        for idx, text in enumerate(row_vals, start=0):
+            if text:
+                plan.add(SetHeader(sheet=sheet_name, row=r, col=t.left + idx, text=text))
+
+
 def _header_grid_for_table(sh: SheetIR, table: TableBlock, table_index: int) -> Any:
     if table_index != 0:
         return None
@@ -219,8 +234,10 @@ def build_render_plan(doc: WorkbookIR) -> RenderPlan:
         plan.add(DefineSheet(sheet=sheet_name, order=len(plan.sheet_order)))
 
         for table_index, t in enumerate(sh.tables):
-            header_grid = _header_grid_for_table(sh, t, table_index)
-            if header_grid:
+            if t.header_grid is not None:
+                _emit_exact_header_grid(plan, sheet_name, t)
+            elif _header_grid_for_table(sh, t, table_index):
+                header_grid = _header_grid_for_table(sh, t, table_index)
                 for row_off, row_vals in enumerate(header_grid):
                     r = t.top + row_off
                     for idx, text in enumerate(row_vals, start=0):

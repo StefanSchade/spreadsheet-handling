@@ -39,6 +39,11 @@ class TableBlock:
     data: Optional[List[List]] = None  # row-major 2D data (None = not populated)
     kind: str = "data"
     title: Optional[str] = None
+    # GX-3a: opt-in lossless exact multi-row header grid (header_row x column) of
+    # verbatim cell strings, master-resolved for merges and retaining blanks. When
+    # set it is authoritative for header identity in exact mode; ``None`` keeps the
+    # legacy ``headers``/``header_map``/``__header_grid`` behaviour byte-for-byte.
+    header_grid: Optional[Tuple[Tuple[str, ...], ...]] = None
 
 
 

@@ -6,7 +6,7 @@ import io
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Mapping
 
 import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
@@ -28,7 +28,11 @@ from spreadsheet_handling.rendering.ir import (
 from spreadsheet_handling.core.formulas import ListLiteralFormulaSpec
 
 
-def parse_workbook(path: str | Path) -> WorkbookIR:
+def parse_workbook(
+    path: str | Path,
+    *,
+    exact_header_depths: Mapping[str, int] | None = None,
+) -> WorkbookIR:
     """
     Parse an XLSX workbook into ``WorkbookIR`` via openpyxl.
 
@@ -36,7 +40,11 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
       1. Embedded hidden `_meta` payload
       2. Explicit anchors passed by a future caller extension
       3. Heuristic fallback from sheet contents
+
+    ``exact_header_depths`` (GX-3a, opt-in) maps a visible sheet name to a
+    configured header depth read in exact mode; other sheets are unchanged.
     """
+    depths = _validated_exact_header_depths(exact_header_depths)
     wb = openpyxl.load_workbook(str(path), data_only=True)
     try:
         ir = WorkbookIR()
@@ -69,6 +77,7 @@ def parse_workbook(path: str | Path) -> WorkbookIR:
                 meta_hints=meta_hints,
                 stop_on_empty_row=True,
                 stop_on_empty_col=bool(legend_anchors),
+                exact_header_depth=depths.get(ws_name),
             )
             if column_widths:
                 sheet_ir.meta["__column_widths"] = column_widths
@@ -388,6 +397,23 @@ def _apply_legend_table_hints(sheet: SheetIR, hints: list[dict[str, Any]]) -> No
         table.frame_name = str(hint["frame_name"])
 
 
+def _validated_exact_header_depths(
+    exact_header_depths: Mapping[str, int] | None,
+) -> dict[str, int]:
+    """Validate the opt-in GX-3a per-sheet configured header depths."""
+    if not exact_header_depths:
+        return {}
+    validated: dict[str, int] = {}
+    for sheet_name, depth in exact_header_depths.items():
+        if type(depth) is not int or depth < 1:
+            raise ValueError(
+                "exact_header_depths values must be positive integers; "
+                f"sheet {sheet_name!r} got {depth!r}"
+            )
+        validated[str(sheet_name)] = depth
+    return validated
+
+
 def _parse_visible_sheet(
     ws: Worksheet,
     *,
@@ -396,6 +422,7 @@ def _parse_visible_sheet(
     meta_hints: dict[str, Any],
     stop_on_empty_row: bool,
     stop_on_empty_col: bool,
+    exact_header_depth: int | None = None,
 ) -> SheetIR:
     """Parse a visible worksheet into ``SheetIR`` by composing extraction and interpretation."""
     return build_visible_sheet_ir(
@@ -408,6 +435,7 @@ def _parse_visible_sheet(
         anchors=anchors,
         stop_on_empty_row=stop_on_empty_row,
         stop_on_empty_col=stop_on_empty_col,
+        exact_header_depth=exact_header_depth,
     )
 
 
