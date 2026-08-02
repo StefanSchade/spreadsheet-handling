@@ -22,11 +22,25 @@ runtime capability):
 * ``title`` is a read-only display helper: an edited value is dropped, not
   melted into the XRef relation and not written back to the lookup.
 
-The persistence boundary is exercised through the orchestrator's own projection
-function (``project_meta_to_persistable_contract``) plus the real XLSX and ODS
-backends, so the "``_meta.derived`` is absent after readback" evidence is
-produced by the maintained boundary rule, not hand-injected. Neutral synthetic
-names are used rather than Dino-specific production fixtures.
+The direct XLSX/ODS tests exercise the persistence boundary through the
+orchestrator's own projection function (``project_meta_to_persistable_contract``)
+plus the real XLSX and ODS backends, so the "``_meta.derived`` is absent after
+readback" evidence is produced by the maintained boundary rule, not
+hand-injected. ``test_orchestrated_public_roundtrip_edited_title_discarded``
+additionally proves the exact route end to end through the maintained
+``orchestrate()`` application entry point across a real spreadsheet carrier with
+a physical workbook-cell edit (Slice 2 Correction 001, R001-IMP-002).
+
+Guard limitation (Slice 2 Correction 001, R001-IMP-001):
+``validate_references`` ``no_helper_columns`` and ``apply_derived_column_policy``
+read the *same* durable declaration ``_meta.sheets[<visible sheet>].helper_columns``.
+The guard is therefore a *declaration-bound cleanup postcondition*, not a
+*declaration-completeness* check: when the declaration is omitted, cleanup is a
+no-op and the guard passes while ``title`` survives.
+``test_no_helper_columns_guard_cannot_detect_omitted_declaration`` proves this
+negative. Consumer-owned static verification of the declaration is Slice-3 work.
+
+Neutral synthetic names are used rather than Dino-specific production fixtures.
 """
 
 from __future__ import annotations
@@ -34,9 +48,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import pandas as pd
 import pytest
 
+from spreadsheet_handling.application.orchestrator import orchestrate
+from spreadsheet_handling.io_backends.json_backend import write_json_dir
 from spreadsheet_handling.io_backends.ods.ods_backend import OdsBackend
 from spreadsheet_handling.io_backends.xlsx.xlsx_backend import ExcelBackend
 from spreadsheet_handling.pipeline import build_steps_from_config, run_pipeline
@@ -511,30 +528,95 @@ def test_wrong_order_mapping_before_cleanup_leaves_title(tmp_path: Path) -> None
     assert HELPER not in correct_order[VISIBLE_SHEET].columns
 
 
-def test_missing_helper_declaration_leaves_title_unclassified(tmp_path: Path) -> None:
-    """Without ``helper_columns: [title]`` the durable carrier is empty.
+def test_no_helper_columns_guard_cannot_detect_omitted_declaration(
+    tmp_path: Path,
+) -> None:
+    """NEGATIVE CONTRACT: the guard is declaration-bound, not completeness-checking.
 
-    Core cannot infer that ``title`` is a display helper from its name. When the
-    workbook view omits the declaration, ``_meta.sheets`` carries no helper
-    columns after readback, cleanup by visible sheet name is a safe no-op, and
-    ``title`` stays unclassified and unsafe for the inverse. This makes the
-    declaration dependency visible; it adds no name-based recovery.
+    ``apply_derived_column_policy`` and ``no_helper_columns`` read the *same*
+    durable declaration ``_meta.sheets[<visible sheet>].helper_columns``. When
+    the workbook view omits ``helper_columns: [title]``, cleanup obtains an empty
+    helper set and does nothing, and the guard *also* obtains an empty helper set
+    and reports nothing — so the documented drop-plus-guard sequence *passes*
+    while ``title`` survives, leaving the state unsafe for the inverse.
+
+    This is a negative contract test recording the current limitation, not a
+    desired safety outcome: it proves the guard cannot detect an omitted or
+    mistyped declaration. Consumer-owned static declaration verification is
+    Slice-3 work; Core adds no name inference here.
     """
     forward = _run_forward(_forward_config(declare_helper=False))
     workbook = _persist_and_reload(forward, tmp_path)["xlsx"]
 
-    # No durable helper declaration survived for the visible sheet.
+    # No durable helper declaration survived for the visible sheet, and the
+    # transient _meta.derived provenance is not present as a fallback.
     assert workbook["_meta"].get("sheets", {}).get(VISIBLE_SHEET, {}).get(
         "helper_columns"
     ) in (None, [])
+    assert "derived" not in workbook["_meta"]
 
-    undropped = run_pipeline(workbook, build_steps_from_config([_drop_step()]))
-    assert HELPER in undropped[VISIBLE_SHEET].columns  # title not classified/removed
+    # Run the documented drop-plus-guard sequence with the declaration absent.
+    dropped = run_pipeline(workbook, build_steps_from_config([_drop_step()]))
+
+    # Cleanup is a no-op: title survives (no name inference), and no transient
+    # _meta.derived record is recreated.
+    assert HELPER in dropped[VISIBLE_SHEET].columns
+    assert "derived" not in dropped["_meta"]
+
+    # The decisive negative: the mode=fail guard PASSES (does not raise) even
+    # though the helper is still present.
+    guarded = run_pipeline(dropped, build_steps_from_config([_postcondition_step()]))
+    assert HELPER in guarded[VISIBLE_SHEET].columns  # still present and unsafe
+
+    # And it emits no finding under warn mode (the guard reports nothing).
+    warned = run_pipeline(
+        dropped,
+        build_steps_from_config(
+            [
+                {
+                    "step": "validate_references",
+                    "mode": "warn",
+                    "findings": "guard_findings",
+                    "rules": [{"type": "no_helper_columns", "frame": VISIBLE_SHEET}],
+                }
+            ]
+        ),
+    )
+    assert warned["guard_findings"].empty
+
+    # Concrete downstream harm: the surviving unclassified helper is melted by
+    # the inverse — the state the guard failed to catch is genuinely unsafe.
+    mapped = run_pipeline(guarded, build_steps_from_config([_mapping_step()]))
+    melted = run_pipeline(mapped, build_steps_from_config([_expand_xref_step()]))
+    assert HELPER in melted[RELATION_FRAME][COLUMN_KEY].tolist()
 
 
 # ---------------------------------------------------------------------------
 # Postcondition guard behaviour and caller-state safety on failure
 # ---------------------------------------------------------------------------
+
+
+def test_declaration_present_guard_fails_before_and_passes_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Declaration-present control for the declaration-bound guard.
+
+    With ``helper_columns: [title]`` declared, the guard fails closed *before*
+    cleanup (the declared helper is still present) and passes *after* cleanup
+    removes it. This is the positive counterpart to
+    ``test_no_helper_columns_guard_cannot_detect_omitted_declaration``.
+    """
+    forward = _run_forward(_forward_config())
+    workbook = _persist_and_reload(forward, tmp_path)["xlsx"]
+
+    # Before cleanup: the declared helper is present, so the guard fails closed.
+    with pytest.raises(ValueError, match="Helper columns must be absent"):
+        run_pipeline(workbook, build_steps_from_config([_postcondition_step()]))
+
+    # After cleanup by the visible sheet name: the guard passes (no raise).
+    dropped = run_pipeline(workbook, build_steps_from_config([_drop_step()]))
+    passed = run_pipeline(dropped, build_steps_from_config([_postcondition_step()]))
+    assert HELPER not in passed[VISIBLE_SHEET].columns
 
 
 def test_no_helper_columns_postcondition_fails_when_helper_present(
@@ -558,3 +640,146 @@ def test_no_helper_columns_postcondition_fails_when_helper_present(
     assert list(workbook[VISIBLE_SHEET].columns) == before_columns
     assert workbook["_meta"]["sheets"][VISIBLE_SHEET]["helper_columns"] == before_meta_helpers
     assert HELPER in workbook[VISIBLE_SHEET].columns
+
+
+# ---------------------------------------------------------------------------
+# Maintained public macro-flow through orchestrate() (Correction 001, IMP-002)
+# ---------------------------------------------------------------------------
+
+
+def _orchestrated_forward_config() -> list[dict[str, Any]]:
+    return [
+        {
+            "step": "contract_xref",
+            "relation": RELATION_FRAME,
+            "output": MATRIX_FRAME,
+            "row_keys": [ROW_KEY],
+            "column_key": COLUMN_KEY,
+            "value": VALUE,
+            "column_keys": _AXES,
+            "name": "role",
+        },
+        {
+            "step": "add_lookup_helpers",
+            "source": MATRIX_FRAME,
+            "lookup": LOOKUP_FRAME,
+            "output": MATRIX_FRAME,
+            "source_key": ROW_KEY,
+            "lookup_key": LOOKUP_KEY,
+            "helpers": {"fields": [HELPER]},
+            "order": {"helper_position": "before_key"},
+            "missing": "empty",
+        },
+        {
+            "step": "configure_workbook_view",
+            "sheets": [
+                {"frame": MATRIX_FRAME, "sheet": VISIBLE_SHEET, "helper_columns": [HELPER]},
+                {"frame": LOOKUP_FRAME, "sheet": LOOKUP_SHEET},
+            ],
+        },
+    ]
+
+
+def _orchestrated_reverse_config() -> list[dict[str, Any]]:
+    # One reverse configuration, executed in a single orchestrate() invocation,
+    # in the exact settled order. No static inbound value_columns list.
+    return [
+        _drop_step(),
+        _postcondition_step(),
+        _mapping_step(),
+        _expand_xref_step(),
+    ]
+
+
+def _edit_physical_title_cell(xlsx_path: Path, new_value: str) -> None:
+    """Edit one physical ``title`` cell in the visible ``Matrix View`` sheet.
+
+    This is a genuine workbook-file mutation (openpyxl) performed *between* the
+    forward export and the reverse import, simulating a business edit in the
+    spreadsheet itself rather than a post-readback DataFrame mutation.
+    """
+    workbook = openpyxl.load_workbook(xlsx_path)
+    worksheet = workbook[VISIBLE_SHEET]
+    header = [cell.value for cell in worksheet[1]]
+    title_column = header.index(HELPER) + 1  # 1-based column index
+    worksheet.cell(row=2, column=title_column).value = new_value
+    workbook.save(xlsx_path)
+
+
+def test_orchestrated_public_roundtrip_edited_title_discarded(tmp_path: Path) -> None:
+    """Maintained end-to-end proof of the exact route through ``orchestrate()``.
+
+    Two maintained application-orchestration invocations connected by a real
+    XLSX carrier (``orchestrate()`` owns one configured direction per call):
+
+    * forward: json_dir canonical -> contract_xref -> add_lookup_helpers
+      (asymmetric ``story_id``/``id``) -> configure_workbook_view (logical
+      ``role_matrix`` rendered as visible ``Matrix View``) -> XLSX;
+    * a physical ``title`` cell is edited in the workbook file; and
+    * reverse: XLSX -> one configured pipeline (visible-name drop ->
+      declaration-present ``no_helper_columns`` -> mapping to ``role_matrix`` ->
+      ``expand_xref``) -> json_dir.
+
+    All step binding is public YAML/config; no Python ``.drop`` performs the
+    cleanup, no manual re-key performs the mapping, and no static inbound
+    ``value_columns`` list is used.
+    """
+    in_dir = tmp_path / "canonical"
+    xlsx_path = tmp_path / "workbook.xlsx"
+    reverse_out = tmp_path / "reimported"
+
+    original_relation = _relation()
+    write_json_dir(
+        {RELATION_FRAME: original_relation, LOOKUP_FRAME: _stories(), "_meta": {}},
+        in_dir,
+    )
+
+    # --- Forward through orchestrate() to a real XLSX carrier ---
+    orchestrate(
+        input={"kind": "json_dir", "path": str(in_dir)},
+        output={"kind": "xlsx", "path": str(xlsx_path)},
+        steps=build_steps_from_config(_orchestrated_forward_config()),
+    )
+
+    # --- Physical workbook-cell edit between export and import ---
+    _edit_physical_title_cell(xlsx_path, _EDITED_TITLE)
+
+    # Independently inspect the carrier read-in state (public backend read).
+    read_in = ExcelBackend().read_multi(str(xlsx_path), header_levels=1)
+    assert VISIBLE_SHEET in read_in  # the actual physical sheet name
+    assert MATRIX_FRAME not in read_in
+    assert _EDITED_TITLE in list(read_in[VISIBLE_SHEET][HELPER])  # edit landed physically
+    assert "derived" not in read_in["_meta"]  # transient provenance absent
+    assert read_in["_meta"]["sheets"][VISIBLE_SHEET]["helper_columns"] == [HELPER]
+    assert {
+        entry["sheet"]: entry["frame"]
+        for entry in read_in["_meta"]["workbook_view"]["sheet_mappings"]
+    }[VISIBLE_SHEET] == MATRIX_FRAME
+
+    # --- Reverse through orchestrate() in one configured pipeline ---
+    result = orchestrate(
+        input={"kind": "xlsx", "path": str(xlsx_path)},
+        output={"kind": "json_dir", "path": str(reverse_out)},
+        steps=build_steps_from_config(_orchestrated_reverse_config()),
+    )
+
+    # Mapping produced the logical frame; the visible sheet key is gone.
+    assert MATRIX_FRAME in result
+    assert VISIBLE_SHEET not in result
+
+    relation = result[RELATION_FRAME]
+    # The inverse received no title (edited text discarded, not melted).
+    assert HELPER not in relation.columns
+    assert HELPER not in relation[COLUMN_KEY].tolist()
+    assert _EDITED_TITLE not in relation[VALUE].tolist()
+
+    # Canonical relation equals the original normalized relation.
+    pd.testing.assert_frame_equal(
+        _ordered(relation),
+        _ordered(original_relation),
+        check_dtype=False,
+        obj="orchestrated canonical relation",
+    )
+
+    # The authoritative lookup title is unchanged.
+    assert list(result[LOOKUP_FRAME][HELPER]) == ["First Story", "Second Story"]
