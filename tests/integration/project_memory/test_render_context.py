@@ -28,9 +28,13 @@ def test_render_current_context_uses_asciidoc_templates(tmp_path: Path) -> None:
 
     assert "== Concerns" in text
     assert "CONC-DOMAIN-META-SEMANTICS" in text
+    assert "== Durable Decisions" in text
     assert "== Current Findings" in text
     assert "== Active FTRs" in text
     assert "== Review Sets" in text
     assert "REVSET-GLOBAL-REVIEW-001" in text
     assert "REVSET-TOPIC-FK-HELPER-REVIEWS" in text
+    assert "== Event–FTR Links" in text
+    # The mechanical event–FTR commit join is summarised, not rendered in full.
+    assert "project_memory/derived/event_ftr_links.json" in text
     assert "== Diagnostics" in text

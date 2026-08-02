@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,18 @@ OUTPUT_PATH = ROOT / "docs_generated" / "project_memory" / "current_context.adoc
 RELEASE_NOTE_CANDIDATES_PATH = ROOT / "docs_generated" / "project_memory" / "release_note_candidates.adoc"
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-_HISTORIC_RELEVANCE = frozenset({"historic", "historical"})
+# Lifecycle words that mean an FTR is no longer active work. Matched as whole
+# words so compound statuses such as "done (accepted)" or "superseded (design
+# absorbed)" are correctly recognised as inactive, while active statuses such as
+# "implemented" or "new (active)" are kept.
+_INACTIVE_STATUS_WORDS = frozenset(
+    {"done", "closed", "resolved", "superseded", "historical", "wontfix"}
+)
+_CURRENT_REVIEW_RELEVANCE = frozenset({"current", "partial"})
+# Per-concern cap on the number of most-recent linked events rendered in the
+# default context. Older events stay in canonical memory and remain discoverable
+# there; the concern's current_summary carries the durable posture.
+_MAX_CONCERN_EVENTS = 12
 CONCERN_STATUS_ORDER = {
     ("active", "doing_now"): 0,
     ("active", ""): 1,
@@ -57,30 +69,21 @@ def _concern_rank(row: dict[str, Any]) -> tuple[int, int, str]:
     return (status_rank, _priority_rank(str(row.get("priority", ""))), str(row.get("id", "")))
 
 
+def _status_is_inactive(status: str) -> bool:
+    words = re.findall(r"[a-z0-9]+", status.lower())
+    return any(word in _INACTIVE_STATUS_WORDS for word in words)
+
+
 def _active_ftrs(ftrs: list[dict[str, str]]) -> list[dict[str, str]]:
-    inactive = {"done", "closed", "resolved", "superseded", "historical", "wontfix"}
     rows = [
         row
         for row in ftrs
-        if row.get("status", "") not in inactive
+        if not _status_is_inactive(row.get("status", ""))
         and row.get("current_relevance", "") != "historical"
     ]
     return sorted(
         rows, key=lambda row: (_priority_rank(row.get("priority", "")), row.get("id", ""))
     )
-
-
-def _current_reviews(reviews: list[dict[str, str]]) -> list[dict[str, str]]:
-    rows = [
-        row
-        for row in reviews
-        if row.get("current_relevance", "") in {"current", "partial"}
-        or (
-            row.get("takeaway_confidence", "") == "high"
-            and row.get("current_relevance", "") not in _HISTORIC_RELEVANCE
-        )
-    ]
-    return sorted(rows, key=lambda row: (row.get("date", ""), row.get("id", "")), reverse=True)
 
 
 def _review_sets_grouped(
@@ -96,12 +99,27 @@ def _review_sets_grouped(
     enriched: list[dict[str, Any]] = []
     for rs in sorted(review_sets, key=lambda r: (r.get("category", ""), r.get("id", ""))):
         row: dict[str, Any] = dict(rs)
-        row["reviews"] = sorted(
+        all_reviews = sorted(
             reviews_by_set.get(rs.get("id", ""), []),
             key=lambda r: (r.get("date", ""), r.get("id", "")),
         )
+        # The default context surfaces only currently relevant reviews per set;
+        # routine historical acceptance reviews are kept discoverable through the
+        # set anchor and a count rather than rendered in full. Full detail lives
+        # in the review documents under docs/cold_storage/reviews/.
+        current = [
+            r
+            for r in all_reviews
+            if r.get("current_relevance", "") in _CURRENT_REVIEW_RELEVANCE
+        ]
+        row["reviews"] = current
+        row["historical_review_count"] = len(all_reviews) - len(current)
         enriched.append(row)
     return enriched
+
+
+def _decisions(decisions: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(decisions, key=lambda row: row.get("id", ""))
 
 
 def _concerns_with_events(
@@ -132,7 +150,7 @@ def _concerns_with_events(
     for concern in concerns:
         row: dict[str, Any] = dict(concern)
         linked = events_by_concern.get(concern.get("id", ""), [])
-        row["events"] = sorted(
+        ordered = sorted(
             linked,
             key=lambda event: (
                 _reverse_date_rank(event.get("event_date", "")),
@@ -140,6 +158,10 @@ def _concerns_with_events(
                 event.get("event_id", ""),
             ),
         )
+        # Render only the most recent events per concern in the default context;
+        # keep the rest discoverable via the count and canonical memory.
+        row["events"] = ordered[:_MAX_CONCERN_EVENTS]
+        row["older_event_count"] = max(len(ordered) - _MAX_CONCERN_EVENTS, 0)
         enriched.append(row)
     return sorted(enriched, key=_concern_rank)
 
@@ -193,6 +215,7 @@ def build_render_context() -> dict[str, Any]:
     ftr_dependencies = _read_rows(CANONICAL_DIR / "ftr_dependencies.json")
     review_sets = _read_rows(CANONICAL_DIR / "review_sets.json")
     reviews = _read_rows(CANONICAL_DIR / "reviews.json")
+    decisions = _read_rows(CANONICAL_DIR / "decisions.json")
 
     diagnostics = _diagnostics(
         ftrs=ftrs,
@@ -210,11 +233,12 @@ def build_render_context() -> dict[str, Any]:
             concern_event_xrefs,
         ),
         "current_findings": current_findings,
+        "decisions": _decisions(decisions),
         "active_ftrs": _active_ftrs(ftrs),
         "ftr_blockers": blockers,
         "ftr_dependency_edges": edges,
         "review_sets": _review_sets_grouped(review_sets, reviews),
-        "event_ftr_links": event_ftr_links,
+        "event_ftr_link_count": len(event_ftr_links),
         "diagnostics": diagnostics,
     }
 
