@@ -343,7 +343,7 @@ def _check_enrich_lookup_values(
     severity: str,
 ) -> list[DerivedColumnFinding]:
     lookup_name = str(spec.get("lookup") or "")
-    on_keys = [str(key) for key in (spec.get("on") or [])]
+    payload_keys, lookup_keys = _resolve_mismatch_keys(spec, frame_name=frame_name)
     helper_cols = [str(col) for col in (spec.get("helper_columns") or [])]
 
     lookup_df = lookup_frames.get(lookup_name)
@@ -358,17 +358,22 @@ def _check_enrich_lookup_values(
             message=f"Lookup frame {lookup_name!r} not available; cannot verify enrich_lookup helpers.",
         )]
 
-    if not on_keys or not helper_cols:
+    if not payload_keys or not helper_cols:
         return []
 
-    canonical = _canonical_value_map(lookup_df, on_keys=on_keys, helper_cols=helper_cols)
+    # The lookup frame is keyed by its own key column(s) (``lookup_keys``) and
+    # the payload by the source-side key column(s) (``payload_keys``). In the
+    # symmetric case these are the same name; in the asymmetric case they
+    # differ, but the join-key *values* line up, so the normalized value tuples
+    # match across frames.
+    canonical = _canonical_value_map(lookup_df, on_keys=lookup_keys, helper_cols=helper_cols)
 
     findings: list[DerivedColumnFinding] = []
     for helper_col in helper_cols:
         if helper_col not in payload.columns:
             continue
         mismatching = _column_mismatch_indices(
-            payload, helper_col=helper_col, on_keys=on_keys, canonical=canonical
+            payload, helper_col=helper_col, on_keys=payload_keys, canonical=canonical
         )
         if mismatching:
             findings.append(DerivedColumnFinding(
@@ -384,6 +389,56 @@ def _check_enrich_lookup_values(
                 ),
             ))
     return findings
+
+
+def _resolve_mismatch_keys(
+    spec: Mapping[str, Any],
+    *,
+    frame_name: str,
+) -> tuple[list[str], list[str]]:
+    """Resolve ``(payload_keys, lookup_keys)`` from an ``enrich_lookup`` spec.
+
+    Supports both provenance shapes written by ``enrich_lookup``:
+
+    * *symmetric* — ``{"on": [...]}``: the payload and lookup share the key
+      name(s); ``payload_keys == lookup_keys``. Behaviour is unchanged.
+    * *asymmetric* — ``{"source_key": <s>, "lookup_key": <l>}``: the payload is
+      keyed by ``source_key`` and the lookup frame by ``lookup_key``.
+
+    Malformed provenance is rejected with a clear ``ValueError`` rather than
+    silently skipping the value check: a record must not both carry ``on`` and
+    an asymmetric key, and an asymmetric record must carry *both* halves.
+    """
+    on = spec.get("on")
+    source_key = spec.get("source_key")
+    lookup_key = spec.get("lookup_key")
+    has_asymmetric = source_key is not None or lookup_key is not None
+
+    if on is not None:
+        if has_asymmetric:
+            raise ValueError(
+                f"_meta.derived.sheets[{frame_name!r}].enrich_lookup mixes symmetric "
+                f"`on` with asymmetric `source_key`/`lookup_key`; provide exactly one "
+                f"join-key form"
+            )
+        on_keys = [str(key) for key in (on or [])]
+        return on_keys, on_keys
+
+    if has_asymmetric:
+        missing = [
+            name
+            for name, value in (("source_key", source_key), ("lookup_key", lookup_key))
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                f"_meta.derived.sheets[{frame_name!r}].enrich_lookup asymmetric "
+                f"provenance requires both `source_key` and `lookup_key`; missing "
+                f"{missing}"
+            )
+        return [str(source_key)], [str(lookup_key)]
+
+    return [], []
 
 
 def _column_mismatch_indices(

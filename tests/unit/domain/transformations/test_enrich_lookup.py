@@ -886,3 +886,191 @@ def test_enrich_lookup_asymmetric_generic_dynamic_matrix() -> None:
 
     assert list(out_a["result"].columns) == ["title", "story_id", "Alpha", "Beta"]
     assert list(out_b["result"].columns) == ["title", "story_id", "Beta", "Gamma", "Delta"]
+
+
+# ---------------------------------------------------------------------------
+# Review 001 IMP-001: asymmetric key/helper collision safety (values mode)
+# ---------------------------------------------------------------------------
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_helper_equals_source_key_rejected() -> None:
+    """A helper named like the source key would overwrite the authoritative key."""
+    stories = pd.DataFrame({"id": ["s1", "s2"], "story_id": ["x", "y"], "title": ["A", "B"]})
+    frames = {"matrix": _matrix_story(), "stories": stories}
+    with pytest.raises(ValueError, match="collides with the asymmetric source key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["story_id"]},
+            missing="empty",
+        )
+    # No output frame and no false provenance were written on failure.
+    assert "result" not in frames
+    assert "_meta" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_helper_equals_lookup_key_rejected() -> None:
+    """A helper named like the lookup key would leak the lookup key into output."""
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="collides with the asymmetric lookup key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["id"]},
+            missing="empty",
+        )
+    assert "result" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_independent_source_named_lookup_column_is_safe() -> None:
+    """An unselected lookup column named like the source key does not collide."""
+    stories = pd.DataFrame({
+        "id": ["s1", "s2"],
+        "story_id": ["ignore-me", "ignore-me-too"],
+        "title": ["First", "Second"],
+    })
+    frames = {"matrix": _matrix_story(), "stories": stories}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+    result = out["result"]
+    assert list(result["title"]) == ["First", "Second"]
+    # The source key retains the source values, not the lookup's independent column.
+    assert list(result["story_id"]) == ["s1", "s2"]
+    assert "id" not in result.columns
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_sort_by_source_key_is_safe() -> None:
+    """sort_by on the source key sorts the output key; the lookup's independent
+    same-named column is never projected (temporary sort field vs source key)."""
+    matrix = pd.DataFrame({"story_id": ["s2", "s1"], "dynamic_1": ["b", "a"]})
+    stories = pd.DataFrame({
+        "id": ["s1", "s2"],
+        "story_id": ["zzz", "zzz"],
+        "title": ["First", "Second"],
+    })
+    frames = {"matrix": matrix, "stories": stories}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"sort_by": ["story_id"]},
+        missing="empty",
+    )
+    result = out["result"]
+    assert list(result["story_id"]) == ["s1", "s2"]
+    assert list(result["title"]) == ["First", "Second"]
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_sort_by_lookup_key_rejected() -> None:
+    """A temporary lookup sort field equal to the lookup key would leak it."""
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="collides with the asymmetric lookup key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+            order={"sort_by": ["id"]},
+            missing="empty",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Review 001 IMP-003: explicit asymmetric mode preserved even for equal names
+# ---------------------------------------------------------------------------
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_equal_names_keeps_asymmetric_provenance() -> None:
+    """source_key == lookup_key must still record the asymmetric shape."""
+    matrix = pd.DataFrame({"id": ["s1", "s2"], "dynamic_1": ["a", "b"]})
+    stories = pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]})
+    frames = {"matrix": matrix, "stories": stories}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+
+    prov = out["_meta"]["derived"]["sheets"]["result"]["enrich_lookup"]
+    assert prov == {
+        "lookup": "stories",
+        "source_key": "id",
+        "lookup_key": "id",
+        "helper_columns": ["title"],
+    }
+    assert "on" not in prov
+    assert list(out["result"]["title"]) == ["First", "Second"]
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_pair_ignores_policy_key_applies_non_key_settings() -> None:
+    """An explicit asymmetric pair owns key selection and ignores a conflicting
+    helper-policy ``key``, but still consumes the policy's non-key settings."""
+    frames = {
+        "matrix": _matrix_story(),
+        "stories": _stories(),
+        "_meta": {
+            "helper_policies": {
+                "lookup": {
+                    "stories": {
+                        # Conflicting/irrelevant key is ignored in asymmetric mode.
+                        "key": "some_other_key",
+                        # Non-key settings are still applied.
+                        "allowed_helpers": ["title"],
+                        "default_helpers": ["title"],
+                        "missing": "empty",
+                    }
+                }
+            }
+        },
+    }
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers="default",  # resolved from the policy's non-key default_helpers
+    )
+    result = out["result"]
+    assert list(result["title"]) == ["First", "Second"]
+    assert "id" not in result.columns
+    prov = out["_meta"]["derived"]["sheets"]["result"]["enrich_lookup"]
+    assert prov["source_key"] == "story_id"
+    assert prov["lookup_key"] == "id"
+    assert prov["helper_columns"] == ["title"]

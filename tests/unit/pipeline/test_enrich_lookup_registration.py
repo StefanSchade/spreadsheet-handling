@@ -179,6 +179,42 @@ def test_add_lookup_helpers_yaml_binds_asymmetric_keys(tmp_path: Path) -> None:
     assert "id" not in out["matrix"].columns
 
 
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_add_lookup_helpers_yaml_asymmetric_equal_names_keeps_mode(tmp_path: Path) -> None:
+    """An explicit asymmetric pair with equal key names, bound through YAML,
+    must still record the asymmetric provenance shape (review IMP-003)."""
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: stories
+                output: matrix
+                source_key: id
+                lookup_key: id
+                helpers:
+                  fields: [title]
+                missing: empty
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "stories": pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]}),
+        "matrix_raw": pd.DataFrame({"id": ["s1", "s2"], "dyn": ["x", "y"]}),
+    }
+
+    out = run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+
+    assert list(out["matrix"]["title"]) == ["First", "Second"]
+    prov = out["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"]
+    assert prov["source_key"] == "id"
+    assert prov["lookup_key"] == "id"
+    assert "on" not in prov
+
+
 @pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
 def test_add_lookup_helpers_yaml_diagnoses_unquoted_legacy_on(tmp_path: Path) -> None:
     cfg_path = tmp_path / "pipeline.yaml"

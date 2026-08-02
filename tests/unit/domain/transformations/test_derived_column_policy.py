@@ -451,3 +451,130 @@ def test_stale_provenance_referencing_absent_helper_columns_is_safe() -> None:
     assert "tier" not in out["orders"].columns
     assert len(out["derived_column_findings"]) == 0
     assert "orders" not in out["_meta"].get("derived", {}).get("sheets", {})
+
+
+# ---------------------------------------------------------------------------
+# Review 001 IMP-002: asymmetric enrich_lookup mismatch checking
+# (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2 Slice 1)
+# ---------------------------------------------------------------------------
+
+_asym = pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+
+
+def _frames_with_asymmetric_lookup_helper(*, edited: bool = False, unmatched: bool = False):
+    """matrix frame keyed by ``story_id`` with a helper materialized from
+    ``stories`` keyed by the differently named ``id``.
+    """
+    stories = pd.DataFrame([
+        {"id": "s1", "title": "First"},
+        {"id": "s2", "title": "Second"},
+    ])
+    rows = [
+        {"story_id": "s1", "title": "First" if not edited else "EDITED", "dyn": "a"},
+        {"story_id": "s2", "title": "Second", "dyn": "b"},
+    ]
+    if unmatched:
+        rows.append({"story_id": "s999", "title": "Orphan", "dyn": "c"})
+    matrix = pd.DataFrame(rows)
+    meta = {
+        "derived": {
+            "sheets": {
+                "matrix": {
+                    "enrich_lookup": {
+                        "lookup": "stories",
+                        "source_key": "story_id",
+                        "lookup_key": "id",
+                        "helper_columns": ["title"],
+                    }
+                }
+            }
+        }
+    }
+    return {"_meta": meta, "stories": stories, "matrix": matrix}
+
+
+@_asym
+def test_asymmetric_unchanged_helper_warn_mode_emits_no_findings() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+    findings = out["derived_column_findings"]
+    assert list(findings.columns) == FINDING_COLUMNS
+    assert len(findings) == 0
+    assert "title" not in out["matrix"].columns
+
+
+@_asym
+def test_asymmetric_edited_helper_warn_mode_emits_finding_without_raising() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "derived_value_mismatch"
+    assert row["columns"] == "title"
+    assert row["severity"] == "warn"
+    assert "title" not in out["matrix"].columns
+
+
+@_asym
+def test_asymmetric_unchanged_helper_fail_mode_does_not_raise() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+    assert "title" not in out["matrix"].columns
+
+
+@_asym
+def test_asymmetric_edited_helper_fail_mode_raises() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+
+    with pytest.raises(ValueError, match="derived_value_mismatch"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+@_asym
+def test_asymmetric_unmatched_source_reference_is_not_a_mismatch() -> None:
+    # An unmatched source key (no lookup row) is a separate concern and must not
+    # be reported as a value mismatch — consistent with symmetric behaviour.
+    frames = _frames_with_asymmetric_lookup_helper(unmatched=True)
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+    assert len(out["derived_column_findings"]) == 0
+    assert "title" not in out["matrix"].columns
+
+
+@_asym
+def test_asymmetric_malformed_partial_provenance_raises_clear_error() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+    # Drop the lookup_key half: partial asymmetric provenance must be rejected,
+    # not silently skipped.
+    del frames["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"]["lookup_key"]
+
+    with pytest.raises(ValueError, match=r"requires both `source_key` and `lookup_key`"):
+        apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+
+@_asym
+def test_asymmetric_mixed_on_and_asymmetric_provenance_raises() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+    frames["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"]["on"] = ["story_id"]
+
+    with pytest.raises(ValueError, match="mixes symmetric `on` with asymmetric"):
+        apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+
+@_asym
+def test_asymmetric_drop_mode_is_value_blind() -> None:
+    # policy: drop must never value-check, even with an edited asymmetric helper.
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="drop")
+
+    assert "title" not in out["matrix"].columns
+    assert "derived_column_findings" not in out

@@ -13,6 +13,7 @@ from spreadsheet_handling.core.formulas import lookup_formula
 
 from .policy import (
     _FORMULA_MODES,
+    _ResolvedKeys,
     _resolve_allowed,
     _resolve_fields,
     _resolve_join_keys,
@@ -68,6 +69,16 @@ def enrich_lookup(
         in the source frame than in the lookup frame (e.g. source ``story_id``
         matched against lookup ``id``). The source key is the one that appears
         in the output frame; the lookup key never leaks into the output.
+
+        An explicit ``source_key``/``lookup_key`` pair is *authoritative for
+        join-key selection*: it ignores a configured helper-policy ``key`` while
+        still consuming the policy's non-key settings (helper ``fields``,
+        ``allowed`` fields, ``order``, ``missing`` behaviour, and
+        ``helper_value_mode``). A symmetric inline key, by contrast, is
+        reconciled against the policy ``key`` and fails on conflict. A requested
+        helper or temporary lookup sort field that equals either the source key
+        or the lookup key is rejected with a ``ValueError`` before projection,
+        because it would leak the lookup key or overwrite the source key.
     lookup_key:
         Lookup-side join key for the asymmetric mode; the companion of
         ``source_key``.
@@ -95,7 +106,7 @@ def enrich_lookup(
         referencing the lookup sheet.
     """
     policy = _resolve_policy(lookup, frames)
-    source_keys, lookup_keys = _resolve_join_keys(
+    resolved = _resolve_join_keys(
         on=on,
         key=key,
         keys=keys,
@@ -104,6 +115,8 @@ def enrich_lookup(
         policy=policy,
         lookup=lookup,
     )
+    source_keys = list(resolved.source_keys)
+    lookup_keys = list(resolved.lookup_keys)
     missing_mode = _resolve_missing(missing, policy, lookup)
     order_cfg = _resolve_order(order, policy, lookup)
     value_mode = _resolve_value_mode(helper_value_mode, policy)
@@ -138,6 +151,7 @@ def enrich_lookup(
         if allowed is not None:
             _check_allowed(projection_fields, allowed, lookup)
         _check_column_conflict(source_df, source_keys, projection_fields, source)
+        _check_key_helper_collision(resolved, projection_fields, source, lookup)
 
     use_formulas = value_mode in _FORMULA_MODES
 
@@ -189,7 +203,7 @@ def enrich_lookup(
 
     out = dict(frames)
     out[output] = enriched
-    _write_provenance(out, output, lookup, source_keys, lookup_keys, fields)
+    _write_provenance(out, output, lookup, resolved, fields)
     return out
 
 
@@ -226,6 +240,53 @@ def _check_column_conflict(
             f"Helper field(s) {conflict} already exist in source frame {source!r}; "
             f"this would silently shadow the lookup values"
         )
+
+
+def _check_key_helper_collision(
+    resolved: _ResolvedKeys,
+    projection_fields: list[str],
+    source: str,
+    lookup: str,
+) -> None:
+    """Reject helper/sort fields that collide with an asymmetric key role.
+
+    In asymmetric mode with distinct key names, ``_build_helper_projection``
+    renames the lookup key to the source key before the merge, and formula
+    mode assigns cells by field name. A projected field (a requested helper or
+    a temporary lookup sort helper) that equals either key role would therefore
+    silently:
+
+    * expose the lookup key as an output column (field == lookup key);
+    * overwrite the authoritative source key (field == source key); or
+    * collapse onto the renamed source label and produce a duplicate output
+      label / false helper provenance.
+
+    Rather than surfacing as a pandas duplicate-label or ``KeyError`` after the
+    merge (or, in formula mode, silently corrupting the output), these requests
+    fail here with a clear domain ``ValueError`` before any projection, merge,
+    or formula assignment. Symmetric mode and the equal-name asymmetric case
+    (where the rename is a no-op) keep their established behaviour.
+    """
+    if not resolved.is_asymmetric:
+        return
+    source_key = resolved.source_key
+    lookup_key = resolved.lookup_key
+    if source_key == lookup_key:
+        return
+    for field in projection_fields:
+        if field == lookup_key:
+            raise ValueError(
+                f"Helper/sort field {field!r} collides with the asymmetric lookup key "
+                f"for lookup {lookup!r}; the lookup key must not be projected as an "
+                f"output column because it would leak into the output. Rename the "
+                f"lookup value or drop the field."
+            )
+        if field == source_key:
+            raise ValueError(
+                f"Helper/sort field {field!r} collides with the asymmetric source key "
+                f"for source {source!r}; a helper must not overwrite the authoritative "
+                f"source key. Choose a different lookup value column."
+            )
 
 
 def _check_unmatched_rows(
@@ -383,8 +444,7 @@ def _write_provenance(
     out: Frames,
     output: str,
     lookup: str,
-    source_keys: list[str],
-    lookup_keys: list[str],
+    resolved: _ResolvedKeys,
     fields: list[str] | None,
 ) -> None:
     if fields is None:
@@ -393,14 +453,16 @@ def _write_provenance(
     derived: dict[str, Any] = meta.setdefault("derived", {})
     derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
     record: dict[str, Any] = {"lookup": lookup}
-    if source_keys == lookup_keys:
-        # Symmetric mode: preserve the original observable provenance shape.
-        record["on"] = list(source_keys)
-    else:
+    if resolved.is_asymmetric:
         # Asymmetric mode: record the distinct source/lookup keys additively
-        # instead of a misleading synthetic common ``on`` key.
-        record["source_key"] = source_keys[0]
-        record["lookup_key"] = lookup_keys[0]
+        # instead of a misleading synthetic common ``on`` key. This shape is
+        # written from the *selected* public mode, so an explicit asymmetric
+        # pair with equal key names still records the asymmetric shape (IMP-003).
+        record["source_key"] = resolved.source_key
+        record["lookup_key"] = resolved.lookup_key
+    else:
+        # Symmetric mode: preserve the original observable provenance shape.
+        record["on"] = list(resolved.source_keys)
     record["helper_columns"] = list(fields)
     derived_sheets.setdefault(output, {})["enrich_lookup"] = record
     out["_meta"] = meta

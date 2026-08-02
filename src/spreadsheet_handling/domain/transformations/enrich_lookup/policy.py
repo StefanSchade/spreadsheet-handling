@@ -11,12 +11,49 @@ out of the original flat module.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 Frames = dict[str, Any]
 
 _VALUE_MODES = {"value", "values"}
 _FORMULA_MODES = {"formula", "formulas"}
+
+SYMMETRIC_MODE = "symmetric"
+ASYMMETRIC_MODE = "asymmetric"
+
+
+@dataclass(frozen=True)
+class _ResolvedKeys:
+    """Resolved join-key configuration for a single ``enrich_lookup`` call.
+
+    Carries the *selected public mode* explicitly instead of inferring it from
+    label equality. ``mode`` is ``"symmetric"`` for the ``key``/``keys``/legacy
+    ``"on"``/helper-policy forms and ``"asymmetric"`` for an explicit
+    ``source_key``/``lookup_key`` pair — even when the two key names happen to
+    be equal, because the asymmetric pair has distinct policy-resolution and
+    provenance semantics and must remain distinguishable (see review IMP-003).
+
+    Asymmetric mode is exactly one key per side. Symmetric mode may carry
+    multiple keys (unchanged legacy behaviour); ``source_keys`` and
+    ``lookup_keys`` are equal in that case.
+    """
+
+    mode: str
+    source_keys: tuple[str, ...]
+    lookup_keys: tuple[str, ...]
+
+    @property
+    def is_asymmetric(self) -> bool:
+        return self.mode == ASYMMETRIC_MODE
+
+    @property
+    def source_key(self) -> str:
+        return self.source_keys[0]
+
+    @property
+    def lookup_key(self) -> str:
+        return self.lookup_keys[0]
 
 
 def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:
@@ -41,18 +78,18 @@ def _resolve_join_keys(
     lookup_key: str | None,
     policy: dict[str, Any] | None,
     lookup: str,
-) -> tuple[list[str], list[str]]:
-    """Resolve the public key parameters into an internal ``(source_keys, lookup_keys)`` pair.
+) -> _ResolvedKeys:
+    """Resolve the public key parameters into a ``_ResolvedKeys`` value.
 
     Two mutually exclusive public modes are supported:
 
     * *Symmetric* (``key`` / ``keys`` / legacy ``"on"``, or a helper policy
       ``key``): one key name present under the same spelling in both frames.
-      Returns ``(join_keys, join_keys)`` — behaviour unchanged from before the
-      asymmetric affordance.
+      Returns ``mode="symmetric"`` with equal source/lookup key tuples —
+      behaviour unchanged from before the asymmetric affordance.
     * *Asymmetric* (``source_key`` + ``lookup_key``): a single source-side key
-      matched against a differently named single lookup-side key. Returns
-      ``([source_key], [lookup_key])``.
+      matched against a (possibly differently named) single lookup-side key.
+      Returns ``mode="asymmetric"``, even when the two key names are equal.
 
     Mixing the two modes, or supplying only one half of the asymmetric pair, is
     rejected. There is no precedence between the modes and no partial fallback.
@@ -83,8 +120,13 @@ def _resolve_join_keys(
         resolved_source_key = _require_key_name("source_key", source_key)
         resolved_lookup_key = _require_key_name("lookup_key", lookup_key)
         # The asymmetric pair is fully explicit; the helper-policy `key`
-        # participates only in symmetric resolution.
-        return [resolved_source_key], [resolved_lookup_key]
+        # participates only in symmetric resolution. The mode is recorded
+        # explicitly so equal key names still resolve as asymmetric.
+        return _ResolvedKeys(
+            mode=ASYMMETRIC_MODE,
+            source_keys=(resolved_source_key,),
+            lookup_keys=(resolved_lookup_key,),
+        )
 
     policy_key = policy.get("key") if policy is not None else None
     if len(symmetric_present) > 1:
@@ -98,7 +140,7 @@ def _resolve_join_keys(
         if policy_key is None:
             raise ValueError(f"No join key configured for lookup {lookup!r}")
         join_keys = [policy_key] if isinstance(policy_key, str) else list(policy_key)
-        return join_keys, join_keys
+        return _symmetric_resolved(join_keys)
 
     if key is not None:
         if not isinstance(key, str):
@@ -121,7 +163,12 @@ def _resolve_join_keys(
                 f"Inline join key {join_keys!r} conflicts with resolved helper policy "
                 f"for lookup {lookup!r}: {policy_keys!r}"
             )
-    return join_keys, join_keys
+    return _symmetric_resolved(join_keys)
+
+
+def _symmetric_resolved(join_keys: list[str]) -> _ResolvedKeys:
+    keys = tuple(join_keys)
+    return _ResolvedKeys(mode=SYMMETRIC_MODE, source_keys=keys, lookup_keys=keys)
 
 
 def _require_key_name(param: str, value: Any) -> str:
