@@ -1,0 +1,232 @@
+= FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2 — Replace project_by_role with the lookup/helper family
+:toc:
+:toclevels: 3
+
+Status:: Open (scoped, ready pending reconfirmation gates)
+Priority:: Medium
+Owner:: unassigned
+Provisional ID:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2`
+Evidence:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_assessment_001.adoc` (Outcome A)
+Depends on / relates to:: `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5` (shipped `project_by_role`, to be superseded here); `FTR-EXPLICIT-HELPER-LOOKUP-POLICY-P4` (`enrich_lookup`); `FTR-WORKBOOK-REIMPORT-DERIVED-COLUMN-POLICY-P4A` (`apply_derived_column_policy`)
+
+== 1. Concrete problem
+
+The ten worldbuilding projected-matrix sites compose
+`join_frames(+title)` + `project_by_role` (outbound) and `project_by_role`
+(inbound) to place a read-only display helper (`title`) before the row key on
+export and to drop it before the XRef inverse on import. Assessment 001 proves
+this behaviour is *fully reproducible* by the existing lookup/helper family with
+*no dynamic-ordering step*, making `project_by_role` a redundant public surface
+whose only live consumers are those ten sites.
+
+== 2. Current ten-site pattern
+
+* Outbound (`json_to_spreadsheet.yaml`, 5x): `contract_xref` ->
+  `join_frames(left=matrix, right=stories, left_key=story_id, right_key=id,
+  right_columns=[title])` -> `project_by_role(direction=outbound,
+  helper_columns=[title], key_columns=[story_id])`.
+* Inbound (`spreadsheet_to_json.yaml`, 5x):
+  `project_by_role(direction=inbound, helper_columns=[title],
+  key_columns=[story_id])` -> `expand_xref` / `expand_compact_multiaxis`.
+
+== 3. Proven substitution result
+
+For all five surfaces, real data, through a real XLSX write/read boundary, and a
+generic dynamic-axis test:
+
+* Outbound `add_lookup_helpers` (`enrich_lookup`) with `helper_position:
+  before_key` reproduces the exact matrix view (`[title, story_id, <dynamic>]`),
+  columns and values.
+* Inbound `apply_derived_column_policy(policy: drop)`, bound to the durable
+  workbook-view helper provenance addressed by *sheet name*, reproduces the
+  exact inverse input (`[story_id, <dynamic>]`) and drops `title`.
+* No `project_by_role`, no role-order calculation, no reorder step, no static
+  matrix-column list.
+
+== 4. Read-only helper authority
+
+`title` remains a *read-only display helper*: `stories.id` stays authoritative;
+an edited `title` is discarded inbound (drop mode does not value-check), never
+melted into XRef values, never written back to `stories.title`. This FTR does
+*not* add writeback and does *not* broaden the FK-helper API.
+
+== 5. Selected existing helper capability
+
+* Creation + ordering + provenance: `enrich_lookup` / `add_lookup_helpers`.
+* Removal: `apply_derived_column_policy` (`policy: drop`).
+* Canonical inverse unchanged: `expand_xref` / `expand_compact_multiaxis`.
+
+== 6. Metadata / provenance contract
+
+* Outbound helper materialization writes transient
+  `_meta.derived.sheets.<frame>.enrich_lookup.helper_columns=[title]` (used
+  in-run only).
+* Durable identity for inbound removal is the workbook-view carrier
+  `_meta.sheets.<sheet>.helper_columns=[title]` written by
+  `configure_workbook_view` and *persisted across the workbook boundary*. This
+  is the carrier inbound removal binds to, because the transient `derived`
+  channel is stripped at persistence.
+
+== 7. Outbound operation (per surface)
+
+`contract_xref` -> symmetric-key `title` source -> `add_lookup_helpers`
+(`helpers: {fields: [title]}`, `order: {helper_position: before_key}`,
+`missing: empty`). The symmetric-key source is provided by *one* of the enabling
+options in section 12.
+
+== 8. Inbound operation (per surface)
+
+`apply_derived_column_policy(source=<sheet>, policy: drop)` bound to the durable
+helper carrier, then `expand_xref` / `expand_compact_multiaxis`. The drop must
+occur where the durable provenance is addressable (by sheet name, before
+`apply_workbook_view_sheet_mappings`) or the provenance must be re-keyed to the
+logical frame name by the mapping step.
+
+== 9. Edited-helper treatment
+
+Identical to today: dropped, not melted, not written back. Acceptance requires a
+test that mutates one `title` cell and asserts the canonical relation is
+unchanged.
+
+== 10. Dynamic-ordering disposition
+
+*Eliminated.* No runtime ordering algorithm survives; ordering emerges from
+`before_key` placement (outbound) and order-preserving `drop` (inbound). This
+FTR must not reintroduce a reorder step and must not enumerate dynamic matrix
+columns statically.
+
+== 11. Shared resolver disposition
+
+`resolve_column_roles` is *retained*. It has a second live consumer,
+`validate_columns` (validation role targeting), which is unaffected. The role
+taxonomy remains justified for validation targeting. The
+`helper_columns`/`key_columns` override parameters become unused once
+`project_by_role` is removed; simplifying them is out of scope here.
+
+== 12. Enabling requirement: outbound symmetric key
+
+`enrich_lookup` requires the join key to exist under the *same name* in source
+and lookup. The matrix carries `story_id`; `stories` carries `id`. Choose one:
+
+* *Preferred:* add an optional `source_key` / `lookup_key` pair to
+  `enrich_lookup` (asymmetric join), defaulting to the existing symmetric `key`
+  behaviour. Smallest, backend-neutral, single-purpose change.
+* *Alternative:* introduce a minimal frame/column alias step to expose a
+  `story_id`-keyed `stories` view for the lookup.
+
+This is a *join/alias* concern, not ordering, and must not become a general join
+redesign.
+
+== 13. Fate of project_by_role
+
+Deprecate then remove: migrate the ten sites, then delete
+`project_by_role.py`, its `registry.py` registration, its
+`pipeline_step_registry.json` record, its `implementation_units.json` record,
+and its documentation references; delete/replace the four `project_by_role`
+tests. Keep `resolve_column_roles`.
+
+== 14. Worldbuilding migration
+
+Rewrite the ten sites per sections 7–8. Acceptance: `make export-stories` +
+`make check-reimport` produce byte-identical matrix sheets and
+"Reimport matches canonical data after normalization"; worldbuilding stays
+clean. (Migration lands in the worldbuilding repo in a separate change; this FTR
+governs the Core capability and contract.)
+
+== 15. Project Memory consequences
+
+No Project Memory runtime pipeline invokes `project_by_role`; PM only names the
+originating FTR. After an accepted removal, PM canonical records are updated as
+current-state history in a separate, gated PM change (not in this task).
+
+== 16. Registry / domain-contract consequences
+
+Remove the `project_by_role` step-registry and implementation-unit records;
+rebuild generated domain-contract tables via `make domain-contracts-context`;
+retain historical FTR records unchanged.
+
+== 17. Public API changes
+
+* Removed step: `project_by_role`.
+* Extended step: `add_lookup_helpers` gains optional asymmetric join keys
+  (preferred enabling option) — additive, backward-compatible.
+
+== 18. Compatibility
+
+`add_lookup_helpers`, `apply_derived_column_policy`, `expand_xref`, and
+`expand_compact_multiaxis` are unchanged in existing behaviour; the asymmetric
+key is opt-in. Removing `project_by_role` is a breaking change to that one step
+and is gated behind the ten-site migration.
+
+== 19. Tests
+
+* New: outbound `add_lookup_helpers` equivalence to the retired outbound (all
+  five surfaces); inbound `apply_derived_column_policy` equivalence (all five);
+  edited-helper discard; dynamic-axis genericity; XLSX (and ODS, per section 21)
+  roundtrip.
+* Asymmetric-key unit tests for `enrich_lookup`.
+* Delete/replace the four `project_by_role` tests on removal.
+* Unchanged: resolver tests, `validate_columns` tests, XRef/compact tests.
+
+== 20. Slices
+
+. *Slice 1 — enabling capability:* `enrich_lookup` asymmetric join keys +
+  tests (no consumer change).
+. *Slice 2 — inbound binding:* prove/settle durable-provenance drop by sheet
+  name (or provenance re-key) + tests.
+. *Slice 3 — worldbuilding migration:* migrate ten sites; export/reimport
+  parity.
+. *Slice 4 — removal:* delete `project_by_role` + registry/impl-unit/doc
+  records + tests; rebuild generated contracts.
+
+== 21. Documentation changes
+
+Update `interfaces_and_gates.adoc`, `release_notes.adoc`,
+`developer_guide/ch10...`, `functional_model/.../xref_crosstable.adoc`, and
+`concepts_fk_helpers.adoc` / lookup concept docs to describe the substitution.
+If Slice 1 ships an asymmetric key that is a backend-neutral Core capability,
+add an ODS roundtrip acceptance criterion equivalent to the XLSX one.
+
+== 22. Non-goals
+
+* No grouped-XRef behaviour change.
+* No editable helper / writeback; no FK-helper writeback switch.
+* No universal derived-column DSL.
+* No broad role-ontology redesign; no deletion of the shared resolver.
+* No static enumeration of dynamic matrix columns; no new reorder step.
+* No typing / trusted-ingress work.
+* No unrelated worldbuilding cleanup.
+* No Project Memory update before accepted implementation.
+
+== 23. Protected surfaces
+
+Grouped-XRef, axis mapping, `ExactTable`, WorkbookIR, render composer/flow,
+XLSX/ODS parsers and renderers, the persistence boundary, schema maintenance,
+validation targeting semantics, the shared resolver taxonomy, Project Memory,
+and unrelated worldbuilding data.
+
+== 24. Acceptance criteria
+
+. `add_lookup_helpers` reproduces the exact outbound matrix view (cols+values)
+  for all five surfaces.
+. `apply_derived_column_policy(drop)` reproduces the exact inverse input for all
+  five surfaces and drops `title`.
+. Edited `title` is discarded (canonical relation unchanged).
+. Dynamic-axis genericity holds for at least two differing matrix-column sets.
+. XLSX (and ODS per section 21) roundtrip parity; worldbuilding
+  `check-reimport` green and clean.
+. `project_by_role` and its records/docs/tests are removed; the shared resolver
+  and `validate_columns` remain green.
+
+== 25. Stop / reconfirmation conditions
+
+Reconfirm (do not proceed) if any hold:
+
+* The asymmetric-key affordance cannot be kept minimal/single-purpose (grows
+  into a join redesign).
+* Durable workbook-view provenance cannot be addressed at removal time without a
+  larger persistence-boundary change.
+* A second `project_by_role` runtime consumer appears (currently only the ten
+  worldbuilding sites).
+* `title` acquires writeback semantics (would move it out of read-only display
+  helpers).
