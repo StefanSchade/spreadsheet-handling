@@ -1,0 +1,376 @@
+= Slice 1 Implementation 001: Asymmetric lookup keys for `enrich_lookup` (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Implementation date:: 2026-08-02
+Author:: Claude (Opus 4.8)
+Scope:: *Slice 1 only* — the enabling asymmetric-key capability on
+`enrich_lookup` / the registered `add_lookup_helpers` step. No consumer change,
+no worldbuilding migration, no `project_by_role` removal, no inbound binding.
+Evidence:: assessment 001, confirmation 001, confirmation review 001 (accepted
+Outcome A).
+
+== 1. Baseline commits
+
+[cols="2,3,4"]
+|===
+| Repo | HEAD at start | Working tree at start
+
+| `core`
+| `a9a0e4b` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): include in open backlog`
+| clean
+
+| `worldbuilding`
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| clean (kept read-only; no commit)
+|===
+
+== 2. Exact previous symmetric contract
+
+`enrich_lookup(frames, *, source, lookup, output, key=None, keys=None,
+on=None, helpers=None, order=None, missing=None, helper_value_mode=None)`,
+registered as the public step `add_lookup_helpers`
+(`spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup`).
+
+* The join key(s) had to exist under the *same name* in both source and lookup.
+  Forms `key` (single), `keys` (list), legacy quoted `"on"` (string/list), and a
+  helper-policy `key` were mutually exclusive; exactly one had to resolve.
+* The single resolved list `join_keys` drove: source-key validation, lookup-key
+  validation, duplicate-lookup detection, the `merge(on=join_keys, how="left")`,
+  `missing: fail` unmatched-row detection, `before_key` anchoring, and
+  provenance.
+* Provenance (transient): `_meta.derived.sheets.<output>.enrich_lookup =
+  {"lookup": <lookup>, "on": [<keys>], "helper_columns": [<fields>]}`.
+* `helper_position` in `{after_data (default), before_key}`; `missing` in
+  `{fail (default), empty}`; `helper_value_mode` in `{values (default),
+  formula}`.
+* Output frame is a new frame written to `frames[output]`; source and lookup
+  frames and the caller `frames` mapping are not mutated (a shallow copy is
+  returned).
+
+== 3. Final public API
+
+Two new optional, mutually-exclusive parameters:
+
+`enrich_lookup(frames, *, source, lookup, output, key=None, keys=None,
+on=None, source_key=None, lookup_key=None, helpers=None, order=None,
+missing=None, helper_value_mode=None)`
+
+=== Legacy symmetric mode (unchanged)
+
+[source,yaml]
+----
+key: id           # source key = id, lookup key = id
+----
+
+=== New asymmetric mode (opt-in)
+
+[source,yaml]
+----
+source_key: story_id   # source key = story_id
+lookup_key: id         # lookup key = id
+----
+
+Single key on each side (this is *not* a multi-column join). Only the
+source-side key appears in the output; the lookup-side key never leaks.
+
+== 4. Validation matrix
+
+[cols="4,1,4"]
+|===
+| Parameter combination | Verdict | Reason / error
+
+| `key` alone (or `keys`, quoted `"on"`, or policy `key`)
+| accept
+| Symmetric mode, unchanged.
+
+| `source_key` + `lookup_key`
+| accept
+| Asymmetric mode.
+
+| `key` (or `keys`/`on`) together with `source_key` and/or `lookup_key`
+| reject `ValueError`
+| "...either the symmetric `key`/`keys`/quoted `"on"` form or the asymmetric
+  `source_key`+`lookup_key` pair, not both..."
+
+| `source_key` only
+| reject `ValueError`
+| "Asymmetric ... require both `source_key` and `lookup_key`; missing
+  ['lookup_key']"
+
+| `lookup_key` only
+| reject `ValueError`
+| "...missing ['source_key']"
+
+| blank / whitespace `source_key` or `lookup_key`
+| reject `ValueError`
+| "...must be a non-empty key name"
+
+| non-string `source_key` or `lookup_key`
+| reject `TypeError`
+| "...must be a single string key name"
+
+| neither symmetric nor asymmetric nor policy key
+| reject `ValueError`
+| "No join key configured for lookup ..." (unchanged)
+|===
+
+There is no precedence between the modes and no partial asymmetric fallback. The
+helper-policy `key` participates only in symmetric resolution; asymmetric mode is
+fully explicit and does not consult it.
+
+== 5. Internal resolved-key design
+
+`_resolve_join_keys(...)` now returns a `(source_keys, lookup_keys)` tuple of
+lists (single element each in asymmetric mode; equal lists in symmetric mode).
+All downstream logic consumes exactly that pair — no compatibility branching is
+scattered through join, ordering, diagnostics, or provenance:
+
+* source-key validation iterates `source_keys` against the source frame;
+* lookup-key validation and duplicate detection iterate `lookup_keys` against
+  the lookup frame;
+* `_build_helper_projection` selects `lookup_keys + fields` from the lookup
+  frame, then *renames* `lookup_keys -> source_keys` (a no-op in symmetric mode),
+  so the merge is always `merge(on=source_keys, how="left")` and the lookup-side
+  key name is dropped before it can enter the output;
+* conflict detection, unmatched-row detection, and `before_key` anchoring all use
+  `source_keys` (the names present in the output frame);
+* `_build_formula_enrichment` receives `source_keys[0]`/`lookup_keys[0]` and
+  emits a `LookupFormulaSpec` whose `lookup_key_column` is the lookup-side key.
+
+== 6. Source/lookup cardinality behavior
+
+Preserved exactly:
+
+* missing source key -> `KeyError "Join key '<source_key>' not found in source ..."`;
+* missing lookup key -> `KeyError "Join key '<lookup_key>' not found in lookup ..."`;
+* duplicate lookup values (on `lookup_keys`) -> `ValueError "...duplicate keys..."`;
+* `missing: fail` with unmatched source rows -> `ValueError "...no match in lookup..."`;
+* `missing: empty` fills unmatched helper cells with `""`;
+* helper field already present in source -> `ValueError "...already exist in source..."`.
+
+Uniqueness and cardinality checks are not weakened; asymmetric merges are
+left-joins on a unique lookup key, identical in strength to the symmetric path.
+
+== 7. Ordering behavior
+
+`helper_position: before_key` anchors on the *source-side* key (the key present
+in the output). For the Worldbuilding-shaped case
+(`source: [story_id, dynamic_1, dynamic_2]`, `lookup: [id, title]`,
+`helper: title`) the output is exactly `[title, story_id, dynamic_1,
+dynamic_2]`. `after_data` (default) yields `[story_id, dynamic_1, dynamic_2,
+title]`. Dynamic trailing matrix columns keep their input order. Verified for
+two differing dynamic column sets (`[Alpha, Beta]` and `[Beta, Gamma, Delta]`).
+
+== 8. Provenance before/after
+
+* *Symmetric mode — unchanged*: `{"lookup", "on": [<keys>], "helper_columns"}`.
+  Regression-asserted byte-identical.
+* *Asymmetric mode — additive*: `{"lookup", "source_key": <s>, "lookup_key":
+  <l>, "helper_columns"}`. No misleading synthetic common `on` key is written.
+  The distinction (source key, lookup key, lookup frame, helper columns) is fully
+  recoverable.
+
+The mode is derived from `source_keys == lookup_keys`, so asymmetric parameters
+that happen to name the same key on both sides record the symmetric (accurate)
+shape.
+
+Persistence filtering is unchanged. The transient `derived` channel is stripped
+at the workbook boundary exactly as before (Slice 2 concern). `apply_derived_column_policy`
+`drop` reads only `helper_columns`, so it is unaffected. Its mismatch-policy
+value-check (`warn_on_mismatch` / `fail_on_mismatch`) reads `on`; for an
+asymmetric spec `on` is absent, so that path is a safe no-op — asymmetric
+value-checking is a Slice 2 handoff item (see section 17).
+
+== 9. Mutation / copy behavior
+
+Preserved and explicitly tested for the asymmetric path:
+
+* source DataFrame unchanged (asserted via `assert_frame_equal`);
+* lookup DataFrame unchanged;
+* caller `frames` mapping unchanged (`enrich_lookup` returns a new dict; the
+  output frame is not written into the caller's mapping);
+* the returned output frame is a new frame (merge result);
+* `_meta` is updated on a shallow-copied meta dict; caller-owned nested data is
+  not mutated beyond the established contract.
+
+== 10. Changed files
+
+[cols="3,4"]
+|===
+| File | Change
+
+| `src/.../enrich_lookup/policy.py`
+| `_resolve_join_keys` now accepts `source_key`/`lookup_key`, enforces the
+  mutual-exclusion / both-required / non-blank rules, and returns
+  `(source_keys, lookup_keys)`. New `_require_key_name` validator.
+
+| `src/.../enrich_lookup/operation.py`
+| New `source_key`/`lookup_key` parameters + docstring; consumes the resolved
+  pair throughout; `_build_helper_projection` renames lookup key -> source key;
+  `_build_formula_enrichment` uses distinct source/lookup key columns;
+  `_write_provenance` records symmetric `on` or asymmetric `source_key`/`lookup_key`.
+
+| `registries/pipeline_step_registry.json`
+| Added `source_key` / `lookup_key` parameter records (`inline_only`) to the
+  `add_lookup_helpers` review artifact.
+
+| `tests/unit/domain/transformations/test_enrich_lookup.py`
+| Added the Slice 1 asymmetric unit suite (see section 11).
+
+| `tests/unit/pipeline/test_enrich_lookup_registration.py`
+| Added YAML binding tests for symmetric `key:` and asymmetric
+  `source_key:`/`lookup_key:` through the public pipeline surface.
+
+| `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+| Documented the opt-in asymmetric key pair for `add_lookup_helpers`.
+
+| `docs/release_notes/release_notes.adoc`
+| Added an unreleased-cycle note for the additive public parameter pair.
+|===
+
+No generated artifact was hand-edited; `pipeline_step_registry.json` is a
+manually maintained review artifact (`maintenance_mode: manual_review_artifact`).
+`implementation_units.json` was left unchanged: its `add_lookup_helpers` record
+is a coarse descriptive snapshot ("joins to a lookup frame and materializes
+helper columns"), not a parameter mirror, and the FTR schedules impl-unit churn
+for the Slice 4 removal.
+
+== 11. Test additions
+
+Asymmetric unit tests (all under FTR marker
+`FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2`):
+
+. `source_key != lookup_key` success; lookup key not leaked;
+. `before_key` anchored to source key -> `[title, story_id, dynamic_1, dynamic_2]`;
+. `after_data` position; default position (= after_data);
+. source key missing -> `KeyError`;
+. lookup key missing -> `KeyError`;
+. duplicate lookup key -> `ValueError`;
+. unmatched + `missing: fail` -> `ValueError`;
+. unmatched + `missing: empty` -> `""` fill;
+. helper-column conflict -> `ValueError`;
+. `key` + asymmetric pair rejected;
+. only `source_key` rejected; only `lookup_key` rejected;
+. blank `source_key` rejected; non-string `lookup_key` rejected;
+. caller non-mutation (source, lookup, and `frames` mapping);
+. asymmetric provenance shape; symmetric provenance unchanged;
+. generic dynamic-matrix test (two differing trailing column sets).
+
+Registry/YAML tests: symmetric `key:` and asymmetric
+`source_key:`/`lookup_key:` both bind and run through `build_steps_from_yaml` +
+`run_pipeline`.
+
+== 12. Exact commands and results
+
+[source,bash]
+----
+cd ~/repos/spreadsheet-handling/core
+
+.venv/bin/pytest tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py -q
+# -> all pass
+
+.venv/bin/pytest
+# -> 2165 passed, 1 xfailed in ~10.7s
+
+make domain-contracts-check
+# -> build/domain_contracts/domain_contract_health.json status: ok
+
+git diff --check
+# -> clean
+
+# Existing XLSX+ODS roundtrip integration test that exercises add_lookup_helpers:
+.venv/bin/pytest tests/integration/pipeline/test_localized_resource_matrix_roundtrip.py -q
+# -> 2 passed
+----
+
+Asciidoctor was run on every changed `.adoc` (this artifact, the user-guide
+supporting-steps page, and the release notes) with no errors.
+
+== 13. Domain-contract / registry results
+
+* `make domain-contracts-check` -> status `ok`, writes only to `build/`
+  (gitignored); tree stayed clean.
+* `tests/architecture/dependency_guards/test_pipeline_step_registry.py` -> all
+  pass, including the parameter-shape/enum guard over the new `source_key` /
+  `lookup_key` records. The `add_lookup_helpers` step is *not* in the
+  signature-guarded family, so the additive parameters do not require enumerating
+  the full signature there.
+
+== 14. Worldbuilding-shaped probe result
+
+Read-only probe (synthetic, Worldbuilding-shaped; no worldbuilding file touched),
+run with the new Core API:
+
+[source]
+----
+source matrix: [story_id, dyn_role_A, dyn_role_B]
+lookup stories: [id, title]     (story_id -> stories.id)
+
+columns:    ['title', 'story_id', 'dyn_role_A', 'dyn_role_B']
+titles:     ['Alpha', 'Beta', 'Gamma']
+id leaked:  False
+provenance: {'lookup': 'stories', 'source_key': 'story_id',
+             'lookup_key': 'id', 'helper_columns': ['title']}
+source frame unchanged: True
+----
+
+This proves `story_id -> stories.id` produces `[title, story_id, <dynamic
+columns>]` with the source key anchored, the lookup key suppressed, and the
+source frame unmutated.
+
+== 15. Known non-goals (Slice 1)
+
+* No multi-column asymmetric join; asymmetric mode is single-key each side.
+* No column-renaming feature, frame-alias feature, or broad lookup DSL.
+* No wrapper around `join_frames`; no general join redesign.
+* No worldbuilding-specific special case; the capability is generic.
+* No inbound binding, no `project_by_role` change/removal, no worldbuilding
+  migration, no Project Memory update.
+* No change to `resolve_column_roles`, `apply_derived_column_policy` semantics
+  (drop unchanged; asymmetric value-check deferred), persistence filtering, or
+  any protected surface.
+
+== 16. Residual risks
+
+* Asymmetric mismatch-policy value-checking (`warn_on_mismatch` /
+  `fail_on_mismatch` in `apply_derived_column_policy`) is a safe no-op for
+  asymmetric specs because it keys on the absent `on` field. This is intended for
+  Slice 1 (drop mode, the worldbuilding path, is unaffected) but must be
+  addressed if a later slice value-checks asymmetric helpers.
+* End-to-end XLSX/ODS parity for the *asymmetric* path was not exercised across
+  the persistence boundary in Slice 1 (Slice 1 does not cross that boundary). The
+  existing symmetric XLSX+ODS roundtrip test passes unchanged; asymmetric
+  backend parity remains a parent-FTR / later-slice acceptance criterion
+  (per FTR section 21).
+
+== 17. Slice 2 handoff requirements
+
+. Bind inbound `apply_derived_column_policy(drop)` to the *durable*
+  workbook-view helper carrier (`_meta.sheets.<sheet>.helper_columns`) by sheet
+  name (before `apply_workbook_view_sheet_mappings`) or via a provenance re-key —
+  the transient `enrich_lookup` provenance does not survive the boundary.
+. If asymmetric helpers are to be value-checked, extend
+  `_check_enrich_lookup_values` to key the lookup frame by `lookup_key` and the
+  payload by `source_key` (currently a safe no-op for asymmetric specs).
+. Add an ODS + XLSX roundtrip acceptance test for the asymmetric capability at
+  the point it crosses the persistence boundary.
+
+== 18. Commit hashes
+
+* Commit 1 (runtime + tests + registry + docs):
+  `c965431` `feat(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): support asymmetric lookup keys`
+* Commit 2 (this implementation artifact + FTR progress note):
+  `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 1 implementation`
+
+== 19. Final repository statuses
+
+* `core`: see `git status --short` after both commits (clean working tree).
+* `worldbuilding`: `git status --short` empty; HEAD unchanged at `83dc2bb`; no
+  commit made.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 1 IMPLEMENTED — PENDING INDEPENDENT REVIEW
