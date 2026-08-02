@@ -488,3 +488,401 @@ def test_enrich_lookup_no_provenance_without_helpers() -> None:
     meta = out.get("_meta", {})
     derived = meta.get("derived", {}).get("sheets", {})
     assert "result" not in derived
+
+
+# ---------------------------------------------------------------------------
+# FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2 Slice 1: asymmetric join keys
+# ---------------------------------------------------------------------------
+
+pytestmark_asymmetric = pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+
+
+def _matrix_story() -> pd.DataFrame:
+    """Worldbuilding-shaped source: story_id + dynamic matrix-value columns."""
+    return pd.DataFrame({
+        "story_id": ["s1", "s2"],
+        "dynamic_1": ["a", "b"],
+        "dynamic_2": ["c", "d"],
+    })
+
+
+def _stories() -> pd.DataFrame:
+    """Lookup keyed by ``id`` (not ``story_id``)."""
+    return pd.DataFrame({
+        "id": ["s1", "s2"],
+        "title": ["First", "Second"],
+    })
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_source_key_differs_from_lookup_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+
+    result = out["result"]
+    assert list(result["title"]) == ["First", "Second"]
+    # The lookup-side key must not leak into the output.
+    assert "id" not in result.columns
+    assert "story_id" in result.columns
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_before_key_anchors_on_source_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": "before_key"},
+        missing="empty",
+    )
+
+    assert list(out["result"].columns) == ["title", "story_id", "dynamic_1", "dynamic_2"]
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_after_data_position() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": "after_data"},
+        missing="empty",
+    )
+
+    assert list(out["result"].columns) == ["story_id", "dynamic_1", "dynamic_2", "title"]
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_default_position_is_after_data() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+
+    assert list(out["result"].columns) == ["story_id", "dynamic_1", "dynamic_2", "title"]
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_missing_source_key() -> None:
+    frames = {
+        "matrix": pd.DataFrame({"other": ["x"], "dynamic_1": ["a"]}),
+        "stories": _stories(),
+    }
+    with pytest.raises(KeyError, match="Join key 'story_id' not found in source"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_missing_lookup_key() -> None:
+    frames = {
+        "matrix": _matrix_story(),
+        "stories": pd.DataFrame({"other": ["s1"], "title": ["First"]}),
+    }
+    with pytest.raises(KeyError, match="Join key 'id' not found in lookup"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_duplicate_lookup_key() -> None:
+    frames = {
+        "matrix": _matrix_story(),
+        "stories": pd.DataFrame({"id": ["s1", "s1"], "title": ["First", "Dup"]}),
+    }
+    with pytest.raises(ValueError, match="duplicate keys"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_unmatched_missing_fail() -> None:
+    frames = {
+        "matrix": pd.DataFrame({"story_id": ["s1", "s999"], "dynamic_1": ["a", "b"]}),
+        "stories": _stories(),
+    }
+    with pytest.raises(ValueError, match="no match in lookup"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+            missing="fail",
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_unmatched_missing_empty() -> None:
+    frames = {
+        "matrix": pd.DataFrame({"story_id": ["s1", "s999"], "dynamic_1": ["a", "b"]}),
+        "stories": _stories(),
+    }
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+    result = out["result"]
+    assert result.loc[result["story_id"] == "s999", "title"].iloc[0] == ""
+    assert result.loc[result["story_id"] == "s1", "title"].iloc[0] == "First"
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_helper_conflict() -> None:
+    frames = {
+        "matrix": pd.DataFrame({"story_id": ["s1"], "title": ["already"]}),
+        "stories": _stories(),
+    }
+    with pytest.raises(ValueError, match="already exist in source"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_rejects_key_with_asymmetric_pair() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="not both"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            key="story_id",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_rejects_only_source_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match=r"require both.*missing \['lookup_key'\]"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_rejects_only_lookup_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match=r"require both.*missing \['source_key'\]"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_rejects_blank_source_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="non-empty key name"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="   ",
+            lookup_key="id",
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_rejects_non_string_lookup_key() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(TypeError, match="must be a single string key name"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key=123,  # type: ignore[arg-type]
+            helpers={"fields": ["title"]},
+        )
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_does_not_mutate_caller_frames() -> None:
+    matrix = _matrix_story()
+    stories = _stories()
+    frames = {"matrix": matrix, "stories": stories}
+    matrix_before = matrix.copy(deep=True)
+    stories_before = stories.copy(deep=True)
+    frames_keys_before = set(frames)
+
+    enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": "before_key"},
+        missing="empty",
+    )
+
+    pd.testing.assert_frame_equal(matrix, matrix_before)
+    pd.testing.assert_frame_equal(stories, stories_before)
+    # The caller mapping is not mutated (enrich_lookup returns a new dict).
+    assert set(frames) == frames_keys_before
+    assert "result" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_provenance_records_distinct_keys() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+
+    prov = out["_meta"]["derived"]["sheets"]["result"]["enrich_lookup"]
+    assert prov["lookup"] == "stories"
+    assert prov["source_key"] == "story_id"
+    assert prov["lookup_key"] == "id"
+    assert prov["helper_columns"] == ["title"]
+    # No misleading synthetic common `on` key in asymmetric mode.
+    assert "on" not in prov
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_symmetric_provenance_unchanged() -> None:
+    frames = _frames()
+    out = enrich_lookup(
+        frames,
+        source="variable_usage_matrix_raw",
+        lookup="variables",
+        output="variable_usage_matrix",
+        key="ID",
+        helpers={"fields": ["sort_key", "value_label_de"]},
+    )
+
+    prov = out["_meta"]["derived"]["sheets"]["variable_usage_matrix"]["enrich_lookup"]
+    assert prov == {
+        "lookup": "variables",
+        "on": ["ID"],
+        "helper_columns": ["sort_key", "value_label_de"],
+    }
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_asymmetric_generic_dynamic_matrix() -> None:
+    """Asymmetric enrichment works for runtime-variable trailing columns."""
+    stories = _stories()
+    source_a = pd.DataFrame({
+        "story_id": ["s1", "s2"],
+        "Alpha": ["a1", "a2"],
+        "Beta": ["b1", "b2"],
+    })
+    source_b = pd.DataFrame({
+        "story_id": ["s1", "s2"],
+        "Beta": ["b1", "b2"],
+        "Gamma": ["g1", "g2"],
+        "Delta": ["d1", "d2"],
+    })
+
+    out_a = enrich_lookup(
+        {"matrix": source_a, "stories": stories},
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": "before_key"},
+        missing="empty",
+    )
+    out_b = enrich_lookup(
+        {"matrix": source_b, "stories": stories},
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": "before_key"},
+        missing="empty",
+    )
+
+    assert list(out_a["result"].columns) == ["title", "story_id", "Alpha", "Beta"]
+    assert list(out_b["result"].columns) == ["title", "story_id", "Beta", "Gamma", "Delta"]

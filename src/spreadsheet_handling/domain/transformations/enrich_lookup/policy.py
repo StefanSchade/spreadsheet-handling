@@ -37,26 +37,68 @@ def _resolve_join_keys(
     on: str | list[str] | None,
     key: str | None,
     keys: list[str] | None,
+    source_key: str | None,
+    lookup_key: str | None,
     policy: dict[str, Any] | None,
     lookup: str,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Resolve the public key parameters into an internal ``(source_keys, lookup_keys)`` pair.
+
+    Two mutually exclusive public modes are supported:
+
+    * *Symmetric* (``key`` / ``keys`` / legacy ``"on"``, or a helper policy
+      ``key``): one key name present under the same spelling in both frames.
+      Returns ``(join_keys, join_keys)`` — behaviour unchanged from before the
+      asymmetric affordance.
+    * *Asymmetric* (``source_key`` + ``lookup_key``): a single source-side key
+      matched against a differently named single lookup-side key. Returns
+      ``([source_key], [lookup_key])``.
+
+    Mixing the two modes, or supplying only one half of the asymmetric pair, is
+    rejected. There is no precedence between the modes and no partial fallback.
+    """
+    symmetric_forms = {"on": on, "key": key, "keys": keys}
+    asymmetric_forms = {"source_key": source_key, "lookup_key": lookup_key}
+    symmetric_present = {n: v for n, v in symmetric_forms.items() if v is not None}
+    asymmetric_present = {n: v for n, v in asymmetric_forms.items() if v is not None}
+
+    if symmetric_present and asymmetric_present:
+        raise ValueError(
+            "Configure add_lookup_helpers join keys with either the symmetric "
+            "`key`/`keys`/quoted `\"on\"` form or the asymmetric "
+            "`source_key`+`lookup_key` pair, not both; got "
+            f"{sorted(symmetric_present) + sorted(asymmetric_present)}"
+        )
+
+    if asymmetric_present:
+        missing = [
+            name for name in ("source_key", "lookup_key")
+            if asymmetric_forms[name] is None
+        ]
+        if missing:
+            raise ValueError(
+                "Asymmetric add_lookup_helpers keys require both `source_key` "
+                f"and `lookup_key`; missing {missing}"
+            )
+        resolved_source_key = _require_key_name("source_key", source_key)
+        resolved_lookup_key = _require_key_name("lookup_key", lookup_key)
+        # The asymmetric pair is fully explicit; the helper-policy `key`
+        # participates only in symmetric resolution.
+        return [resolved_source_key], [resolved_lookup_key]
+
     policy_key = policy.get("key") if policy is not None else None
-    configured = {
-        name: value
-        for name, value in {"on": on, "key": key, "keys": keys}.items()
-        if value is not None
-    }
-    if len(configured) > 1:
+    if len(symmetric_present) > 1:
         raise ValueError(
             "Configure add_lookup_helpers join keys with exactly one of "
             "`key`, `keys`, or quoted legacy `\"on\"`; got "
-            f"{sorted(configured)}"
+            f"{sorted(symmetric_present)}"
         )
 
-    if not configured:
+    if not symmetric_present:
         if policy_key is None:
             raise ValueError(f"No join key configured for lookup {lookup!r}")
-        return [policy_key] if isinstance(policy_key, str) else list(policy_key)
+        join_keys = [policy_key] if isinstance(policy_key, str) else list(policy_key)
+        return join_keys, join_keys
 
     if key is not None:
         if not isinstance(key, str):
@@ -79,7 +121,19 @@ def _resolve_join_keys(
                 f"Inline join key {join_keys!r} conflicts with resolved helper policy "
                 f"for lookup {lookup!r}: {policy_keys!r}"
             )
-    return join_keys
+    return join_keys, join_keys
+
+
+def _require_key_name(param: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError(
+            f"add_lookup_helpers `{param}` must be a single string key name"
+        )
+    if not value.strip():
+        raise ValueError(
+            f"add_lookup_helpers `{param}` must be a non-empty key name"
+        )
+    return value
 
 
 def _resolve_missing(

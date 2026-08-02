@@ -116,6 +116,69 @@ def test_add_lookup_helpers_yaml_accepts_quoted_legacy_on(tmp_path: Path) -> Non
     assert list(out["matrix"]["label"]) == ["Zwei", "Eins"]
 
 
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_add_lookup_helpers_yaml_binds_symmetric_key(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: stories
+                output: matrix
+                key: id
+                helpers:
+                  fields: [title]
+                missing: empty
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "stories": pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]}),
+        "matrix_raw": pd.DataFrame({"id": ["s1", "s2"], "dyn": ["x", "y"]}),
+    }
+
+    out = run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+
+    assert list(out["matrix"]["title"]) == ["First", "Second"]
+
+
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_add_lookup_helpers_yaml_binds_asymmetric_keys(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: stories
+                output: matrix
+                source_key: story_id
+                lookup_key: id
+                helpers:
+                  fields: [title]
+                order:
+                  helper_position: before_key
+                missing: empty
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "stories": pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]}),
+        "matrix_raw": pd.DataFrame({"story_id": ["s1", "s2"], "dyn": ["x", "y"]}),
+    }
+
+    out = run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+
+    assert list(out["matrix"].columns) == ["title", "story_id", "dyn"]
+    assert list(out["matrix"]["title"]) == ["First", "Second"]
+    assert "id" not in out["matrix"].columns
+
+
 @pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
 def test_add_lookup_helpers_yaml_diagnoses_unquoted_legacy_on(tmp_path: Path) -> None:
     cfg_path = tmp_path / "pipeline.yaml"

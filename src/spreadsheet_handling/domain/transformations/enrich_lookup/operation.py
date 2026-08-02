@@ -37,6 +37,8 @@ def enrich_lookup(
     key: str | None = None,
     keys: list[str] | None = None,
     on: str | list[str] | None = None,
+    source_key: str | None = None,
+    lookup_key: str | None = None,
     helpers: dict[str, Any] | str | None = None,
     order: dict[str, Any] | None = None,
     missing: str | None = None,
@@ -59,6 +61,16 @@ def enrich_lookup(
     on:
         Legacy join key spelling. In YAML, quote it as ``"on"`` or prefer
         ``key``/``keys`` because unquoted ``on:`` is boolean-like in YAML 1.1.
+    source_key:
+        Source-side join key for the opt-in *asymmetric* mode. Must be supplied
+        together with ``lookup_key`` and is mutually exclusive with
+        ``key``/``keys``/``on``. Use this when the join key has a different name
+        in the source frame than in the lookup frame (e.g. source ``story_id``
+        matched against lookup ``id``). The source key is the one that appears
+        in the output frame; the lookup key never leaks into the output.
+    lookup_key:
+        Lookup-side join key for the asymmetric mode; the companion of
+        ``source_key``.
     helpers:
         Controls which helper fields are projected from the lookup table.
 
@@ -83,10 +95,12 @@ def enrich_lookup(
         referencing the lookup sheet.
     """
     policy = _resolve_policy(lookup, frames)
-    join_keys = _resolve_join_keys(
+    source_keys, lookup_keys = _resolve_join_keys(
         on=on,
         key=key,
         keys=keys,
+        source_key=source_key,
+        lookup_key=lookup_key,
         policy=policy,
         lookup=lookup,
     )
@@ -102,23 +116,28 @@ def enrich_lookup(
     source_df = _require_frame(frames, source)
     lookup_df = _require_frame(frames, lookup)
 
-    for key in join_keys:
-        if key not in source_df.columns:
-            raise KeyError(f"Join key {key!r} not found in source frame {source!r}")
-        if key not in lookup_df.columns:
-            raise KeyError(f"Join key {key!r} not found in lookup frame {lookup!r}")
+    for source_key_name in source_keys:
+        if source_key_name not in source_df.columns:
+            raise KeyError(
+                f"Join key {source_key_name!r} not found in source frame {source!r}"
+            )
+    for lookup_key_name in lookup_keys:
+        if lookup_key_name not in lookup_df.columns:
+            raise KeyError(
+                f"Join key {lookup_key_name!r} not found in lookup frame {lookup!r}"
+            )
 
-    _check_duplicate_lookup_keys(lookup_df, join_keys, lookup)
+    _check_duplicate_lookup_keys(lookup_df, lookup_keys, lookup)
 
     fields = _resolve_fields(helpers, lookup, frames)
     sort_by = order_cfg.get("sort_by")
-    projection_fields = _fields_with_sort_helpers(fields, join_keys, sort_by, lookup_df)
+    projection_fields = _fields_with_sort_helpers(fields, source_keys, sort_by, lookup_df)
     if projection_fields is not None:
         _validate_fields(projection_fields, lookup_df, lookup)
         allowed = _resolve_allowed(helpers, lookup, frames)
         if allowed is not None:
             _check_allowed(projection_fields, allowed, lookup)
-        _check_column_conflict(source_df, join_keys, projection_fields, source)
+        _check_column_conflict(source_df, source_keys, projection_fields, source)
 
     use_formulas = value_mode in _FORMULA_MODES
 
@@ -139,14 +158,16 @@ def enrich_lookup(
 
     if use_formulas and fields is not None:
         enriched = _build_formula_enrichment(
-            source_df, lookup, join_keys, fields, missing_mode,
+            source_df, lookup, source_keys, lookup_keys, fields, missing_mode,
         )
     else:
-        helper_cols = _build_helper_projection(lookup_df, join_keys, projection_fields)
-        enriched = source_df.merge(helper_cols, on=join_keys, how="left")
+        helper_cols = _build_helper_projection(
+            lookup_df, source_keys, lookup_keys, projection_fields,
+        )
+        enriched = source_df.merge(helper_cols, on=source_keys, how="left")
 
         if missing_mode == "fail":
-            _check_unmatched_rows(enriched, source_df, join_keys, fields, source, lookup)
+            _check_unmatched_rows(enriched, source_df, source_keys, fields, source, lookup)
 
     helper_position = order_cfg.get("helper_position", "after_data")
     if helper_position not in _VALID_HELPER_POSITIONS:
@@ -161,14 +182,14 @@ def enrich_lookup(
         enriched = _drop_temporary_sort_helpers(enriched, source_df, fields, sort_by)
 
     if helper_position == "before_key" and fields is not None:
-        enriched = _reorder_helpers_before_key(enriched, join_keys, fields)
+        enriched = _reorder_helpers_before_key(enriched, source_keys, fields)
 
     if not use_formulas:
         enriched = enriched.where(pd.notnull(enriched), "")
 
     out = dict(frames)
     out[output] = enriched
-    _write_provenance(out, output, lookup, join_keys, fields)
+    _write_provenance(out, output, lookup, source_keys, lookup_keys, fields)
     return out
 
 
@@ -290,30 +311,47 @@ def _check_allowed(fields: list[str], allowed: list[str], lookup: str) -> None:
 
 def _build_helper_projection(
     lookup_df: pd.DataFrame,
-    join_keys: list[str],
+    source_keys: list[str],
+    lookup_keys: list[str],
     fields: list[str] | None,
 ) -> pd.DataFrame:
-    if fields is None:
-        return lookup_df.loc[:, join_keys].copy()
-    cols = list(dict.fromkeys(join_keys + fields))
-    return lookup_df.loc[:, cols].copy()
+    """Project the join key(s) and helper fields from the lookup frame.
+
+    The projection is keyed by the *lookup*-side key name(s) and renamed to the
+    *source*-side name(s) so the caller can merge on the source key. In the
+    symmetric case the rename is a no-op; in the asymmetric case this keeps the
+    lookup-side key name out of the merged output.
+    """
+    projection_fields = [] if fields is None else fields
+    cols = list(dict.fromkeys(lookup_keys + projection_fields))
+    projection = lookup_df.loc[:, cols].copy()
+    rename = {
+        lookup_name: source_name
+        for lookup_name, source_name in zip(lookup_keys, source_keys)
+        if lookup_name != source_name
+    }
+    if rename:
+        projection = projection.rename(columns=rename)
+    return projection
 
 
 def _build_formula_enrichment(
     source_df: pd.DataFrame,
     lookup: str,
-    join_keys: list[str],
+    source_keys: list[str],
+    lookup_keys: list[str],
     fields: list[str],
     missing_mode: str,
 ) -> pd.DataFrame:
     """Build an enriched frame with LookupFormulaSpec objects as cell values."""
     enriched = source_df.copy()
-    source_key = join_keys[0]
+    source_key = source_keys[0]
+    lookup_key = lookup_keys[0]
     for field in fields:
         formula = lookup_formula(
             source_key_column=source_key,
             lookup_sheet=lookup,
-            lookup_key_column=source_key,
+            lookup_key_column=lookup_key,
             lookup_value_column=field,
             missing="",
         )
@@ -345,7 +383,8 @@ def _write_provenance(
     out: Frames,
     output: str,
     lookup: str,
-    join_keys: list[str],
+    source_keys: list[str],
+    lookup_keys: list[str],
     fields: list[str] | None,
 ) -> None:
     if fields is None:
@@ -353,9 +392,15 @@ def _write_provenance(
     meta: dict[str, Any] = dict(out.get("_meta") or {})
     derived: dict[str, Any] = meta.setdefault("derived", {})
     derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
-    derived_sheets.setdefault(output, {})["enrich_lookup"] = {
-        "lookup": lookup,
-        "on": join_keys,
-        "helper_columns": list(fields),
-    }
+    record: dict[str, Any] = {"lookup": lookup}
+    if source_keys == lookup_keys:
+        # Symmetric mode: preserve the original observable provenance shape.
+        record["on"] = list(source_keys)
+    else:
+        # Asymmetric mode: record the distinct source/lookup keys additively
+        # instead of a misleading synthetic common ``on`` key.
+        record["source_key"] = source_keys[0]
+        record["lookup_key"] = lookup_keys[0]
+    record["helper_columns"] = list(fields)
+    derived_sheets.setdefault(output, {})["enrich_lookup"] = record
     out["_meta"] = meta
