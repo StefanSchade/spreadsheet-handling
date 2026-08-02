@@ -1,0 +1,570 @@
+= Assessment: Replacing `project_by_role` with an explicit column-projection contract
+:toc:
+:toclevels: 3
+
+[cols="1,3"]
+|===
+| Type      | Current-state assessment + implementation-scope confirmation (read-only investigation).
+| Provisional ID | `FTR-EXPLICIT-COLUMN-PROJECTION-P4A2` (proposed working title only; *not registered*, see §13).
+| Outcome   | *Replacement not warranted.* The working hypothesis is not supported by the evidence. No new step, no deletion, no new FTR, no backlog entry.
+| Baseline HEAD | `9f43fbb chore(project_memory): focus default context on active state`
+| Worktree at start | clean
+| Date      | 2026-08-02
+| Modifies  | Documentation-only. This artifact plus the companion confirmation and confirmation-review. No runtime code, tests, registries, schemas, examples, or user-facing configuration.
+|===
+
+== 1. Executive conclusion
+
+The hypothesis under test was that `project_by_role` presents an unintuitive
+implicit contract, that callers only really need explicit column selection and
+ordering, that a direct `project_columns`-style ordered column list would be
+clearer, and that `project_by_role` could be removed after migration.
+
+The evidence *falsifies* the load-bearing parts of that hypothesis:
+
+* `project_by_role` is *not* a convenience wrapper over an explicit column
+  list. Its essential responsibility is resolving a *dynamic* `matrix_value`
+  column set that is **unknowable at pipeline-authoring time** (the per-cast /
+  per-group columns of a crosstable matrix grow with the data), plus a
+  **direction-coupled retention rule** (inbound drops `display_helper`). An
+  explicit ordered column list cannot name columns that do not exist until
+  runtime, and cannot express "drop the helper on the way back in" without
+  re-enumerating a set it cannot know.
+* An explicit, static, ordered column-projection primitive *already exists*:
+  `extract_frame` (`columns:` selects and orders columns exactly, strict on
+  missing columns, with `rename`, `sort_by`, and NaN->"" normalisation). A new
+  `project_columns` step would duplicate an existing capability under a new
+  name -- exactly what `docs/ai_info/agent_rules.adoc` ("Metadata, registry,
+  and step-surface changes") forbids.
+* `project_by_role` cannot be deleted. Its *only* runtime consumer is the
+  external `worldbuilding` dino_insel pipeline (10 call sites), which is
+  out of scope for this context and which relies on the dynamic-column
+  behaviour that no explicit projection can replace. Inside `core` there are
+  zero runtime call sites -- only tests and the registry entry -- so there is
+  nothing in this repository to migrate atomically.
+* The choice of role-based projection *over* explicit positional column lists
+  was a *recorded, accepted architectural decision*
+  (`FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`, "Adopt Option C + minimal
+  Option-B surface"). The driver review found the *opposite* pain to the
+  hypothesis: the same role partition was being reconstructed with *positional
+  parameters* at four consumer points, and role-based projection removed that
+  duplication. The hypothesis would re-introduce the very pattern the decision
+  eliminated.
+* The owning FTR (`FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`) is still on the open
+  backlog surface pending a lifecycle close. Opening a replacement while the
+  original slice is mid-acceptance is an ownership conflict.
+
+One narrow, *non-blocking* observation survives (see §9): the `direction` knob
+bundles ordering with retention, and outbound `role_order` must be a full
+permutation of all three roles. These are minor rigidities, intentional per
+the decision, and not motivated by any current consumer need. They do not
+justify a replacement step.
+
+Confirmation verdict (companion artifact): *EXPLICIT COLUMN PROJECTION NOT
+READY FOR IMPLEMENTATION* -- not because the repository is complex, but because
+a bounded implementation is blocked by concrete facts: no in-repo consumer,
+essential dynamic-column semantics that explicit projection cannot express, a
+pre-existing equivalent primitive (`extract_frame`), and an open owning FTR.
+
+== 2. Current implementation path
+
+[cols="2,3"]
+|===
+| Concern | Location
+
+| Public callable
+| `src/spreadsheet_handling/domain/transformations/project_by_role.py`
+  :: `project_by_role(frames, *, frame, direction, helper_columns=None,
+  key_columns=None, role_order=None, name=None) -> Frames`
+
+| Role resolver (single source of truth)
+| `src/spreadsheet_handling/domain/column_roles/resolver.py`
+  :: `resolve_column_roles(...)`, `ColumnRoles`, `ROLE_*`, `UnknownRoleError`
+
+| Resolver package export
+| `src/spreadsheet_handling/domain/column_roles/__init__.py`
+
+| Pipeline registration (Python)
+| `src/spreadsheet_handling/pipeline/registry.py:196`
+  (`StepRegistration`, `frames_target` factory)
+
+| Registry contract (JSON)
+| `registries/pipeline_step_registry.json` entry `project_by_role` (~line 4274)
+
+| Public YAML gate
+| `docs/ai_info/interfaces_and_gates.adoc:26`
+
+| Release notes
+| `docs/release_notes/release_notes.adoc:397` (new-step entry), `:415` (migration)
+
+| Owning FTR (open)
+| `docs/backlog/FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5.adoc` (+ `_impl_slice_assessment`,
+  `_review` companions)
+
+| Recorded decision (cold storage)
+| `docs/cold_storage/backlog/ftrs_done/FTR-DYNAMIC-FRAME-PROJECTION-P5_decision.adoc`
+|===
+
+== 3. Complete public-surface inventory
+
+Runtime / source::
+* `project_by_role` callable and its private helpers (`_validate_direction`,
+  `_validate_role_order`, `_outbound_columns`, `_inbound_columns`,
+  `_reorder_dataframe`).
+* `column_roles/resolver.py`: `resolve_column_roles`, `ColumnRoles`,
+  role-name constants, `UnknownRoleError`, and the scattered-source readers
+  (`_row_keys_from_xref_meta`, `_view_helper_columns`, `_sheet_for_frame`,
+  `_fk_helper_provenance_columns`).
+
+Registry / wiring::
+* `pipeline/registry.py:196` (`frames_target` factory binding).
+* `registries/pipeline_step_registry.json` `project_by_role` entry:
+  `category: primitive`, `subtype: role_based_projection`, `status: current`,
+  `factory_shape: frames_target`; parameters `frame` (req), `direction` (req),
+  `helper_columns`, `key_columns`, `role_order`, `name`; `meta_contract.reads`
+  = `xref_crosstable`, `workbook_view`, `sheets`,
+  `derived.sheets.*.helper_columns`; `frame_contract` reads/replaces `frame`;
+  `inverse.kind = conditionally_bijective`.
+* `registries/domain_contracts/canonical/implementation_units.json` reference.
+
+Tests::
+* `tests/unit/domain/transformations/test_project_by_role.py` (unit: outbound,
+  inbound, validation).
+* `tests/unit/domain/column_roles/test_resolver.py` (resolver precedence).
+* `tests/integration/pipeline/test_project_by_role_roundtrip.py` (outbound->inbound roundtrip).
+* `tests/integration/pipeline/test_project_by_role_migration_parity.py`
+  (all 10 surfaces: column shape, row order, empty-cell parity, resolver-input availability).
+* `tests/architecture/dependency_guards/test_project_by_role_uses_shared_resolver.py`
+  (single-source-of-truth guard).
+
+Documentation::
+* `docs/ai_info/interfaces_and_gates.adoc:26` (gated YAML surface).
+* `docs/functional_model/ch04_use_case_concepts/xref_crosstable.adoc:217`.
+* `docs/release_notes/release_notes.adoc` (three lines).
+* `docs/developer_guide/ch10_project_evolution/01_project_evolution.adoc`
+  (historical context).
+* `docs/warm_storage/global_reviews/architecture_health_review.adoc`.
+
+Config / examples in `core`::
+* *None.* No `core` YAML pipeline or example invokes `project_by_role`.
+
+External consumer (out of scope, evidence only)::
+* `worldbuilding/pipelines/dino_insel/json_to_spreadsheet.yaml` (5 outbound
+  sites) and `.../spreadsheet_to_json.yaml` (5 inbound sites), per the owning
+  FTR's *Current call-site inventory*.
+
+== 4. Role-source trace
+
+`resolve_column_roles` computes three role lists for one frame. Precedence and
+sources are concrete (`resolver.py`):
+
+* `row_identity`:
+** explicit `key_columns=` override if given (`_string_list`), *else*
+** `row_keys` declared on a *single* matching `_meta.xref_crosstable[*]`
+   entry whose `matrix == frame` (`_row_keys_from_xref_meta`); *two* matching
+   entries raise `ValueError` (ambiguity), *else*
+** empty (warn-only via `logging.WARNING`; no exception).
+* `display_helper`:
+** explicit `helper_columns=` override if given, *else* the ordered *union* of
+*** `_meta.sheets.<sheet>.helper_columns` for the sheet mapped to `frame` via
+    `_meta.workbook_view.sheets[*]` (`_view_helper_columns` + `_sheet_for_frame`), and
+*** FK-helper `derived` provenance columns under
+    `_meta.derived.sheets.<frame>.helper_columns`
+    (`_fk_helper_provenance_columns` -> `derived_helper_columns_by_sheet`).
+* `matrix_value`: **rest-by-exclusion** -- every frame column not classified as
+  identity or helper. This is the source of the *dynamic* behaviour.
+
+Precedence / ordering rules (verified):
+
+* Explicit overrides *win* over scattered sources (no union with metadata when
+  an override is present).
+* *Within-role order follows the frame's column order*, not the override or
+  source order (`_ordered_intersection` iterates `df.columns`). Override order
+  is intentionally discarded.
+* identity/helper overlap: a column claimed by both is logged and treated as
+  `row_identity` (removed from helper).
+* Missing role metadata: identity -> warn-only empty; helper -> silent empty.
+* Unknown role name only arises via `role_order` validation or
+  `ColumnRoles.columns_for` (`UnknownRoleError`); the three role names are a
+  fixed `frozenset`, not caller-extensible.
+* A single column can be in exactly one role (partition). One role may hold
+  zero columns. Duplicate frame columns are rejected upstream by pandas
+  addressing / the migration-parity fixtures assume unique labels.
+
+The mapping is *derived per run* from current frames + `_meta`; it is **not
+persisted** as a role channel. The FTR and decision both flag this as an
+*interim* computed strategy pending a future unified
+`_meta.derived.sheets.<frame>.column_roles` channel (owned by the foundation
+FTR, explicitly out of scope here).
+
+== 5. Exact behaviour matrix
+
+Verified by reading `project_by_role.py` / `resolver.py` and by a read-only
+probe on small DataFrames (not committed).
+
+[cols="2,3"]
+|===
+| Scenario | Observed behaviour
+
+| Single role
+| `columns_for(role)` returns that role's frame-ordered columns.
+
+| Multiple roles / role ordering
+| Output = concatenation of roles in `role_order`; within-role = frame order;
+  duplicates across roles de-duplicated by first occurrence.
+
+| Ordering within a role
+| Always the input frame's column order. Never re-sorted.
+
+| Columns without a requested role
+| Not possible: every column is partitioned into exactly one role
+  (`matrix_value` catches the rest).
+
+| Column with no role declaration
+| Becomes `matrix_value` by exclusion.
+
+| Requested role with no matching column
+| Contributes nothing; no error (empty role list).
+
+| Unknown role in `role_order`
+| `ValueError` naming the offending value and the accepted names.
+
+| Duplicate role in `role_order`
+| `ValueError` ("must not repeat role names").
+
+| Outbound `role_order` not a full 3-role permutation
+| `ValueError` ("requires role_order to be a permutation of
+  [display_helper, matrix_value, row_identity]"). *Cannot select a subset.*
+
+| Inbound `role_order` containing `display_helper`
+| `ValueError` (inbound drops `display_helper`).
+
+| Empty / missing `direction`
+| `ValueError` (no silent default).
+
+| Missing / blank `frame`
+| `ValueError` ("frame must be a non-empty string").
+
+| Frame absent from state
+| `KeyError` from `resolve_column_roles._require_data_frame`.
+
+| Non-DataFrame frame value
+| `TypeError` ("must be a pandas DataFrame").
+
+| Empty DataFrame
+| Reorders an empty column set; no error (all roles empty).
+
+| `_meta` behaviour
+| Read-only. `_meta` is not written; `out = dict(frames)` copies the mapping,
+  `_meta` object passed through by reference (unchanged).
+
+| Caller-frame mutation
+| *None.* Returns a new `frames` dict; the target frame is replaced with a
+  `.copy()` (`_reorder_dataframe`). Probe confirmed caller frame unchanged.
+
+| Output-frame identity
+| New DataFrame object (copy), same frame *name* (in-place semantics).
+
+| Source == target frame name
+| Always: the step is in-place; there is no separate source/output.
+
+| Column labels / types
+| Labels coerced to `str` in `_reorder_dataframe`; data values (incl. NaN)
+  preserved verbatim (no NaN->"" normalisation).
+
+| Reserved / internal columns
+| No special handling; all columns partitioned by role rules.
+
+| Desired visible order not grouped by role
+| *Unsupported.* Output is always role-grouped; interleaving a specific column
+  between identity columns is impossible (also meaningless for dynamic
+  `matrix_value`).
+|===
+
+Behaviour that exists only incidentally:
+
+* The exact ordering of the union of helper sources depends on frame column
+  order (deterministic, not dict/set iteration order -- `_ordered_intersection`
+  re-imposes frame order, so this is *intentional*, not incidental).
+* The `sorted(...)` in error messages is cosmetic.
+* No behaviour was found that depends on Python dict/set iteration order in a
+  way that leaks into results.
+
+== 6. Responsibility classification
+
+[cols="1,3,1"]
+|===
+| Category | Behaviour | Essential?
+
+| A. Explicit column projection
+| Mechanical reorder/retain of a *known* column list.
+| Present only as the final `df.loc[:, ordered]` step; the *column list itself
+  is not caller-supplied* -- it is derived. So A is not the caller's contract.
+
+| B. Role resolution
+| Translate scattered metadata + dynamic rest-by-exclusion into three ordered
+  column lists.
+| *Essential.* This is the reason the step exists and cannot be expressed by an
+  explicit list (dynamic `matrix_value`).
+
+| C. Schema / semantic validation
+| `direction` validation; `role_order` permutation/subset/duplicate checks;
+  frame-presence and type checks; xref ambiguity.
+| Essential-adjacent (guards), but *coupled to the role model*, not to a
+  generic projection.
+
+| D. Workbook / presentation policy
+| Default outbound order `[display_helper, row_identity, matrix_value]`;
+  inbound drop of `display_helper`.
+| Domain-roundtrip policy (matrix render vs. reimport), configurable via
+  `role_order`. Not pure presentation; it drives the canonical<->matrix
+  roundtrip.
+
+| E. Compatibility baggage
+| `name` parameter is accepted and discarded (`del name`) for binder
+  compatibility.
+| Minor; shared convention across steps. Not replacement-motivating.
+
+| F. Unintended implementation artifact
+| Outbound requiring a *full* 3-role permutation (no subset selection);
+  identity/helper overlap resolution.
+| Arguably over-strict, but harmless and consumer-satisfying. Not a defect.
+|===
+
+Conclusion: the step's core is **B + direction-coupled D**, not A. A generic
+"explicit column projection" transformation would have to *drop* B and D, at
+which point it no longer serves the only consumer.
+
+== 7. Adjacent-capability comparison
+
+[cols="1,1,1,1,1,2"]
+|===
+| Capability | Layer | Mutates/derives | Explicit order | Missing-col | Can it replace `project_by_role`?
+
+| `extract_frame` (`columns`, `rename`, `where`, `sort_by`, `constants`)
+| domain/extractions (Frame)
+| derives `output` from `source`
+| yes (`columns` list)
+| strict (`_ensure_columns` raises)
+| *No for the real consumer* -- cannot name dynamic `matrix_value` columns;
+  cannot express directional drop of a set it cannot enumerate. *Yes* it
+  already covers the *static* explicit-projection need the hypothesis imagines,
+  so no new `project_columns` step is needed.
+
+| `join_frames` (`projections`)
+| domain (Frame)
+| derives view frame
+| partial (per-side projection)
+| strict
+| No -- a join, not a projection; still needs enumerated columns.
+
+| `pivot_frame`
+| domain (Frame)
+| derives display frame
+| n/a
+| n/a
+| No -- pivots long->wide; different operation.
+
+| `configure_workbook_view` sheet options
+| meta/render
+| records intent
+| declaration only
+| n/a
+| No -- render-side only; cannot serve the inbound reimport mirror (the
+  decision's explicit rationale for a dedicated step).
+
+| `apply_derived_column_policy` / `remove_fk_helpers`
+| domain (Frame)
+| drops derived/helper columns
+| n/a
+| provenance-driven
+| No -- drops by provenance, not a general reorder/retain.
+
+| Schema maintenance (add/drop/rename/reorder)
+| domain
+| mutates schema
+| yes for reorder
+| varies
+| No standalone generic "reorder to arbitrary column list" primitive exists
+  beyond `extract_frame`; and none handles dynamic columns.
+|===
+
+Key finding: `extract_frame` is the pre-existing explicit-projection primitive.
+The hypothesis's imagined `project_columns` is **redundant capability**.
+
+== 8. Consumer / call-site inventory
+
+[cols="2,3"]
+|===
+| Consumer class | Detail
+
+| `core` runtime call sites
+| *Zero.* No `core` YAML or example uses `project_by_role`.
+
+| `core` tests
+| 4 files (unit, resolver-shared with validation targeting, roundtrip,
+  migration-parity, architecture guard).
+
+| Documentation-only mentions
+| interfaces_and_gates, functional model, release notes, project-evolution,
+  architecture-health review.
+
+| Maintained external consumer
+| `worldbuilding` dino_insel pipeline: 10 call sites (5 outbound + 5 inbound).
+  *Out of scope for this context.*
+
+| Shared-resolver co-consumer
+| `src/spreadsheet_handling/domain/validations/validate_columns.py` consumes
+  `resolve_column_roles` for `add_validations` role-based targeting
+  (`FTR-DYNAMIC-VIEW-COLUMN-TARGETING-IMPL-P5`, completed). The role taxonomy
+  therefore has *two* live consumers, independent of `project_by_role`.
+
+| External / unknown consumers
+| No evidence of any. No deprecation-cycle obligation is demonstrable.
+|===
+
+The repository *cannot* migrate `project_by_role` away atomically: there is
+nothing in `core` to migrate, and the sole real consumer is external and
+excluded from this context.
+
+== 9. Architecture assessment
+
+Evaluating `project_by_role` against the requested properties:
+
+* *Explicitness at call site*: partial. `frame`/`direction` are explicit;
+  `matrix_value` is intentionally implicit because it is dynamic. Worldbuilding
+  call sites pass explicit `helper_columns`/`key_columns`, so identity/helper
+  are explicit there.
+* *Determinism*: yes -- frame-ordered, override-precedence, single-xref-match.
+* *Local understandability*: moderate. Requires knowing the 3-role taxonomy and
+  that `direction` bundles order + retention.
+* *Composability*: good -- pure `Frames -> Frames`, backend-neutral, no mutation.
+* *Arbitrary desired order*: *no* -- only role-grouped permutations; cannot
+  interleave. No consumer needs this.
+* *Separation of semantic metadata from mechanical projection*: the resolver
+  cleanly separates *resolution* (B) from the mechanical `df.loc` reorder (A).
+* *Layer ownership*: correct (domain/Frame).
+* *Testability*: good (overrides make it unit-testable without `_meta`).
+* *User-documentation ease*: moderate; the role vocabulary needs a primer.
+* *Future typing compatibility*: fine.
+* *Suitability as a public step*: yes for its scoped purpose.
+
+Where is the real problem? Not "only naming" -- the name accurately describes
+the operation. The genuine, *narrow* observations are:
+
+. `direction` conflates *ordering* and *retention* (inbound drop). Intentional
+  per the decision (symmetric pair as one step), but it is the least obvious
+  part of the contract.
+. Outbound `role_order` must be a full 3-role permutation; there is no way to
+  express a subset. This is a rigidity, not a bug.
+
+Neither observation is a replacement driver, and neither has a demonstrated
+consumer need. The hypothesis's premise ("callers only need explicit column
+selection and ordering") does not describe the actual consumer, whose need
+includes *dynamic column discovery* and *directional retention*.
+
+== 10. Options considered
+
+* *Option 1 -- reuse an existing explicit step and delete `project_by_role`.*
+  Rejected. `extract_frame(columns=...)` covers the static case but cannot name
+  dynamic `matrix_value` columns; deletion regresses the (external) consumer.
+* *Option 2 -- introduce one small explicit `project_columns` step.* Rejected.
+  Duplicates `extract_frame`; still cannot serve the dynamic/directional need;
+  violates the "no redundant root/step under a new name" rule.
+* *Option 3 -- separate resolution and projection.* Already the case: the
+  resolver (B) is a separate module from the mechanical reorder (A). No further
+  split is needed, and exposing a public "resolve-then-explicit-project" pair
+  would push the dynamic column list into user YAML, which cannot be authored.
+* *Option 4 -- move selection into Workbook View configuration.* Rejected. The
+  operation is not presentation-only: it runs symmetrically on the inbound
+  reimport path, which the render-side view step cannot own (the decision's
+  documented rationale).
+* *Option 5 -- another bounded result.* The only evidence-supported bounded
+  result is *no change*: keep `project_by_role`, keep `extract_frame` for
+  explicit static projection, and close the owning FTR through its existing
+  lifecycle (not through this assessment).
+
+*Selected: Option 5 (no replacement).*
+
+== 11. Selected target contract
+
+None. No new callable, step, parameter, or schema is introduced. `extract_frame`
+remains the explicit ordered-column-projection primitive for static columns;
+`project_by_role` remains the role-based dynamic matrix projection. The
+column-role resolver remains the single source of truth shared by
+`project_by_role` and `add_validations` targeting.
+
+== 12. Compatibility / removal decision
+
+* No deprecation, no wrapper, no removal. `project_by_role` is not superseded.
+* The project is pre-1.0, but that permits removal only when a replacement
+  exists and consumers can migrate; neither holds here.
+* Role metadata and the role taxonomy are *retained* -- they have a second live
+  consumer (validation targeting) entirely independent of this question.
+
+== 13. FTR ownership decision
+
+* `project_by_role` is owned by `FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5`, which is
+  *still on the open backlog surface* ("Immediate Cleanup / Review Closure")
+  pending a lifecycle close of one migration-parity review gap (the row-order
+  fixture now exists in
+  `tests/integration/pipeline/test_project_by_role_migration_parity.py`; formal
+  closure is a separate task, not this one).
+* No *new* FTR is created. The provisional ID `FTR-EXPLICIT-COLUMN-PROJECTION-P4A2`
+  is used only to name this assessment/confirmation/review trio; it is **not**
+  registered in `docs/backlog/_ftrs_open.adoc` because the scope resolves to
+  *do nothing*.
+* The owning FTR is *not* modified: its open scope concerns implementing /
+  closing `project_by_role`, not replacing it, and editing it here would blur
+  that lifecycle.
+* This work is unrelated to `FTR-META-ONTOLOGY-REMOVAL-...-EPIC-P4A`; no
+  attachment is proposed.
+
+== 14. File-level implementation plan
+
+Not applicable -- no implementation. Had the hypothesis held, the smallest
+slice would have been an `extract_frame` migration note, but the dynamic-column
+blocker prevents even that.
+
+Protected surfaces confirmed untouched by this assessment: grouped-XRef / axis
+mapping, `ExactTable`, WorkbookIR, composer/render, XLSX/ODS parsers &
+renderers, persistence boundary, schema maintenance, CLI, Project Memory,
+worldbuilding consumer behaviour, and the trusted-ingress/type system.
+
+== 15. Test and acceptance plan
+
+No new tests. Baseline (read-only) results recorded in §16 confirm the current
+contract is green. If a future consumer ever demonstrates a genuine need for
+*static* explicit projection in a `core` pipeline, that need is already served
+by `extract_frame` and requires no new step.
+
+== 16. Baseline results, risks, and stop conditions
+
+Baseline focused tests (all passing on `9f43fbb`):
+
+* `test_project_by_role.py`, `test_project_by_role_roundtrip.py`,
+  `test_project_by_role_migration_parity.py`,
+  `test_project_by_role_uses_shared_resolver.py` -- *55 passed*.
+* `test_resolver.py`, `test_select.py` (extract_frame),
+  `test_validation_role_targeting_uses_shared_resolver.py`,
+  `test_pipeline_step_registry.py`, `test_step_registration.py` -- *all passed*.
+
+Read-only probe confirmed: dynamic `matrix_value` rest-by-exclusion; outbound
+order `[title, story_id, <matrix...>]`; inbound drops `title`; caller frame not
+mutated (new dict + DataFrame copy); NaN preserved; outbound subset `role_order`
+rejected; missing identity warn-only.
+
+Risks of proceeding *against* this assessment:
+
+* Re-introducing positional column reconstruction the decision removed.
+* Shipping a redundant `project_columns` step next to `extract_frame`.
+* Regressing the external worldbuilding consumer with no viable migration.
+
+Stop conditions (any one blocks implementation): dynamic `matrix_value` cannot
+be enumerated in YAML; `extract_frame` already covers static projection; sole
+consumer is external/out-of-scope; owning FTR still open.
+
+== Verdict
+
+*Replacement not warranted.* Keep `project_by_role`. See the companion
+confirmation for the exact contract statement and the terminal readiness token.
