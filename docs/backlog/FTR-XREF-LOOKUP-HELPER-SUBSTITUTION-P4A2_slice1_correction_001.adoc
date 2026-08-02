@@ -1,0 +1,415 @@
+= Slice 1 Correction 001: Asymmetric lookup keys for `enrich_lookup` (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Correction date:: 2026-08-02
+Author:: Claude (Opus 4.8)
+Scope:: *Slice 1 correction only* — close the four Important findings and one
+Minor finding raised by independent Slice 1 Review 001 against the additive
+`source_key`/`lookup_key` capability on `enrich_lookup` / `add_lookup_helpers`.
+No consumer change, no Slice-2 persistence binding, no worldbuilding migration,
+no `project_by_role` change, no `resolve_column_roles` change, no Project Memory
+update.
+Authority:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice1_review_001.adoc`
+is authoritative for the required corrections.
+
+== 1. Baseline
+
+[cols="2,3,3"]
+|===
+| Repo | HEAD at start | Working tree at start
+
+| `core`
+| `b46ba9e` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): review Slice 1 implementation`
+| clean
+
+| `worldbuilding`
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| clean (read-only; untouched)
+|===
+
+Runtime under correction: `c965431`
+`feat(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): support asymmetric lookup keys`.
+
+== 2. Review-001 findings addressed
+
+[cols="1,4,1"]
+|===
+| ID | Summary | Blocks Slice 2
+
+| XREF-S1-IMP-001
+| Key/helper collisions are not safely defined (values/formula/sort); accepted
+  helper requests could silently omit a field, publish false provenance, leak
+  the lookup key, overwrite the source key, or fail with raw pandas errors.
+| Yes
+
+| XREF-S1-IMP-002
+| Asymmetric provenance silently disables mismatch checking in
+  `apply_derived_column_policy` (`warn_on_mismatch` / `fail_on_mismatch` read
+  only `on`).
+| Yes
+
+| XREF-S1-IMP-003
+| Explicit asymmetric mode is lost when key names are equal (provenance shape
+  chosen by `source_keys == lookup_keys`, not by selected public mode).
+| Yes
+
+| XREF-S1-IMP-004
+| Changed asymmetric formula path has no tracked test.
+| Yes
+
+| XREF-S1-MIN-001
+| Public docs omit the helper-policy `key` interaction for the asymmetric pair.
+| No
+|===
+
+== 3. Correction per finding
+
+=== 3.1 IMP-001 — key/helper collision safety
+
+A deterministic collision rule is now enforced *before* any projection, merge,
+or formula assignment, in a single guard `_check_key_helper_collision`
+(`enrich_lookup/operation.py`), called inside the `projection_fields`
+validation block so it covers both value and formula modes and the temporary
+sort-helper projection.
+
+Rule (asymmetric mode only; symmetric and equal-name asymmetric are unaffected
+because the lookup-key rename is a no-op there):
+
+* if a projected field (a requested helper *or* a temporary lookup sort helper)
+  equals the *lookup key*, raise `ValueError` — it would leak the lookup key
+  into the output (values mode collapses it onto the renamed key; formula mode
+  emits a lookup-key output column);
+* if a projected field equals the *source key*, raise `ValueError` — it would
+  overwrite the authoritative source key (values mode produces a duplicate
+  output label; formula mode overwrites the key column with formula specs).
+
+Because the guard runs before `out`/provenance is built, a rejected request
+writes *no* output frame and *no* provenance, so provenance can never claim a
+helper that was not materialized.
+
+The concrete review cases now behave as follows (`source_key=story_id`,
+`lookup_key=id`):
+
+[cols="3,2"]
+|===
+| Request | Result
+
+| `helpers.fields=[story_id]`, values mode
+| `ValueError` "collides with the asymmetric source key"
+
+| `helpers.fields=[id]`, values mode
+| `ValueError` "collides with the asymmetric lookup key"
+
+| `helpers.fields=[story_id]`, formula mode
+| `ValueError` (source key) — before formula assignment
+
+| `helpers.fields=[id]`, formula mode
+| `ValueError` (lookup key) — before formula assignment
+
+| lookup frame has an independent non-key `story_id`, `helpers.fields=[title]`
+| Success; source key retains source values; `id` and lookup `story_id` absent
+
+| `order.sort_by=[story_id]` (source key)
+| Success; sorts the output source key; lookup's independent `story_id` not projected
+
+| `order.sort_by=[id]` (lookup key)
+| `ValueError` "collides with the asymmetric lookup key"
+|===
+
+No helper renaming and no general collision-resolution DSL were introduced.
+
+=== 3.2 IMP-002 — asymmetric mismatch checking
+
+`derived_column_policy._check_enrich_lookup_values` now resolves its join keys
+through `_resolve_mismatch_keys(spec)`, which understands both provenance
+shapes:
+
+* symmetric `{"on": [...]}` → payload and lookup share the key name(s)
+  (`payload_keys == lookup_keys`); behaviour unchanged;
+* asymmetric `{"source_key": <s>, "lookup_key": <l>}` → payload is keyed on
+  `source_key`, the lookup frame on `lookup_key`.
+
+The canonical value map is built keying the lookup frame on `lookup_keys`; the
+payload is compared keying on `payload_keys`. The join-key *values* line up
+across the two frames, so the normalized value tuples match even though the
+column names differ. Consequently:
+
+* `warn_on_mismatch` emits a `derived_value_mismatch` finding for an edited
+  asymmetric helper;
+* `fail_on_mismatch` raises for an edited asymmetric helper;
+* an unchanged asymmetric helper yields no findings;
+* an unmatched source reference is skipped (a separate concern), consistent with
+  symmetric behaviour;
+* malformed partial asymmetric provenance (only one of `source_key`/`lookup_key`,
+  or `on` mixed with an asymmetric key) is rejected with a clear `ValueError`
+  rather than silently skipping the check;
+* `policy: drop` remains intentionally value-blind (it never calls the checker).
+
+No Slice-2 persistence binding was implemented; the correction operates only on
+the in-memory `_meta.derived` asymmetric provenance record.
+
+=== 3.3 IMP-003 — preserve selected public mode
+
+`_resolve_join_keys` (`enrich_lookup/policy.py`) now returns a small private
+frozen dataclass `_ResolvedKeys(mode, source_keys, lookup_keys)` instead of a
+bare tuple. `mode` is `"symmetric"` for `key`/`keys`/legacy `"on"`/policy-key
+forms and `"asymmetric"` for an explicit `source_key`/`lookup_key` pair — set
+from the *selected public form*, never inferred from label equality.
+
+`_write_provenance` writes the record shape from `resolved.mode`:
+
+* symmetric → `{"on": [...]}`;
+* asymmetric → `{"source_key": <s>, "lookup_key": <l>}`, *even when the two
+  names are equal*.
+
+The asymmetric pair still owns key selection and ignores a configured
+helper-policy `key`, while all non-key policy settings remain active
+(unchanged behaviour, now covered by a tracked test).
+
+=== 3.4 IMP-004 — asymmetric formula regression coverage
+
+Tracked tests were added under FTR marker
+`FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2` in
+`tests/unit/domain/transformations/test_lookup_formula_mode.py`:
+`LookupFormulaSpec.source_key_column == "story_id"`,
+`lookup_key_column == "id"`, correct value column, source-key preservation,
+no lookup-key leakage, `before_key` helper placement, asymmetric provenance,
+both collision requests rejected before formula assignment, and one XLSX plus
+one ODS rendering assertion over the source-key cell, the lookup-key range, and
+the lookup-value range after physical sheet-name resolution.
+
+=== 3.5 MIN-001 — public documentation
+
+The helper-policy `key` interaction is now documented in the callable docstring
+(`enrich_lookup`), the registry parameter notes (`source_key`/`lookup_key`), the
+user guide (`03_supporting_steps.adoc`), and the release notes: an explicit
+asymmetric pair is authoritative for join-key selection, ignores a configured
+helper-policy `key`, still consumes the policy's non-key settings (helpers,
+allowed fields, order, missing, helper value mode), and symmetric inline keys
+retain their reconciliation/conflict behaviour against policy-derived keys.
+
+== 4. Final collision contract
+
+For a resolved asymmetric mode with `source_key != lookup_key`, every projected
+lookup-side field (requested helper or temporary sort helper) must differ from
+both key roles. A field equal to the lookup key is rejected (would leak); a
+field equal to the source key is rejected (would overwrite). The check runs
+before projection/merge/formula, raises a domain `ValueError`, and leaves no
+output frame or provenance behind. Symmetric mode and equal-name asymmetric
+mode are unaffected (the lookup-key rename is a no-op, so no collision is
+possible). Sorting on the source key remains a legitimate output-key sort and
+never projects an independent same-named lookup column.
+
+== 5. Final resolved-key / mode design
+
+[source,text]
+----
+_ResolvedKeys(frozen):
+  mode:        "symmetric" | "asymmetric"   # from selected public form
+  source_keys: tuple[str, ...]              # symmetric: shared; asymmetric: one
+  lookup_keys: tuple[str, ...]              # symmetric: shared; asymmetric: one
+  is_asymmetric / source_key / lookup_key   # convenience accessors
+----
+
+`_resolve_join_keys` produces exactly one `_ResolvedKeys`. All downstream
+operations consume it consistently: source validation, lookup validation,
+duplicate checking, helper projection, formula construction, missing checks,
+ordering, and provenance. Asymmetric mode remains exactly one key per side;
+multi-key symmetric behaviour is unchanged. No implicit tuple shapes remain.
+
+== 6. Mismatch-reader behavior
+
+`_resolve_mismatch_keys(spec)` returns `(payload_keys, lookup_keys)`:
+
+* symmetric `on` → `(on, on)`;
+* asymmetric pair → `([source_key], [lookup_key])`;
+* `on` + asymmetric key → `ValueError` (mixed form);
+* one asymmetric half missing → `ValueError` (partial);
+* neither → `([], [])` (no-op, as before).
+
+The reader value-checks against the correct lookup row, preserves symmetric
+behaviour, keeps `drop` value-blind, and reports edited helpers under
+warn/fail.
+
+== 7. Formula behavior
+
+Ordinary asymmetric formula mode is unchanged and now regression-protected:
+`LookupFormulaSpec(source_key_column=source_key,
+lookup_key_column=lookup_key, lookup_value_column=field, lookup_sheet=lookup)`.
+The source key is preserved, the lookup key never becomes an output column, and
+helper placement obeys `helper_position`. Collision requests fail before any
+formula cell is assigned. Rendered XLSX uses the source-key cell (`$A2`), the
+lookup-key range (col A on the physical lookup sheet), and the lookup-value
+range (col B); rendered ODS uses `[.A2]`, `[Entities.A2:Entities.A3]`, and
+`[Entities.B2:Entities.B3]`.
+
+== 8. Provenance shapes
+
+[cols="2,3"]
+|===
+| Selected public mode | Written record
+
+| Symmetric (`key`/`keys`/`"on"`/policy key)
+| `{"lookup": ..., "on": [...], "helper_columns": [...]}`
+
+| Asymmetric different names (`source_key=story_id`, `lookup_key=id`)
+| `{"lookup": ..., "source_key": "story_id", "lookup_key": "id", "helper_columns": [...]}`
+
+| Asymmetric equal names (`source_key=id`, `lookup_key=id`)
+| `{"lookup": ..., "source_key": "id", "lookup_key": "id", "helper_columns": [...]}`
+|===
+
+Symmetric provenance is byte-identical to the pre-correction shape.
+
+== 9. Public documentation update
+
+Callable docstring, registry `source_key`/`lookup_key` notes, user-guide
+`add_lookup_helpers` entry, and release notes now state that the explicit
+asymmetric pair is authoritative for key selection, ignores the helper-policy
+`key`, still consumes the policy's non-key settings, keeps the asymmetric
+provenance shape for equal names, and rejects helper/sort collisions in both
+value modes.
+
+== 10. Changed files
+
+[cols="3,4"]
+|===
+| File | Change
+
+| `src/.../enrich_lookup/policy.py`
+| Added `_ResolvedKeys` frozen dataclass + mode constants; `_resolve_join_keys`
+  returns it and records the selected mode explicitly.
+
+| `src/.../enrich_lookup/operation.py`
+| Consumes `_ResolvedKeys`; new `_check_key_helper_collision` guard;
+  `_write_provenance` writes from `resolved.mode`; docstring extended (MIN-001).
+
+| `src/.../derived_column_policy.py`
+| New `_resolve_mismatch_keys`; `_check_enrich_lookup_values` keys the payload
+  on `source_key` and the lookup on `lookup_key` for asymmetric provenance;
+  rejects malformed partial provenance (IMP-002).
+
+| `registries/pipeline_step_registry.json`
+| Extended `source_key`/`lookup_key` parameter notes (MIN-001).
+
+| `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+| Documented helper-policy key interaction and collision rejection (MIN-001).
+
+| `docs/release_notes/release_notes.adoc`
+| Extended the Slice-1 note with mode preservation, collision safety, and
+  asymmetric mismatch checking (MIN-001).
+
+| `tests/unit/domain/transformations/test_enrich_lookup.py`
+| Collision (values/sort) + mode-identity + policy-key-ignored tests.
+
+| `tests/unit/domain/transformations/test_lookup_formula_mode.py`
+| Asymmetric formula spec/placement/provenance/collision + XLSX/ODS rendering.
+
+| `tests/unit/domain/transformations/test_derived_column_policy.py`
+| Asymmetric warn/fail/unchanged/unmatched/malformed/mixed + drop value-blind.
+
+| `tests/unit/pipeline/test_enrich_lookup_registration.py`
+| YAML equal-name asymmetric mode-identity test.
+|===
+
+No generated artifact was hand-edited (`pipeline_step_registry.json` is a
+manually maintained review artifact). `implementation_units.json` unchanged
+(coarse descriptive record; no parameter mirror).
+
+== 11. Tests added
+
+* *Collision (IMP-001):* helper == source key (values, formula); helper ==
+  lookup key (values, formula); independent source-named lookup column is safe;
+  sort_by == source key is safe; sort_by == lookup key rejected; no output/
+  provenance on failure.
+* *Mismatch (IMP-002):* asymmetric unchanged + warn; edited + warn; unchanged +
+  fail; edited + fail; unmatched source reference; malformed partial provenance;
+  mixed `on`+asymmetric; `drop` value-blind.
+* *Mode identity (IMP-003):* explicit asymmetric equal names (direct Python and
+  YAML); policy key present but ignored; non-key policy settings still applied;
+  symmetric provenance unchanged (pre-existing test retained).
+* *Formula (IMP-004):* spec, helper placement, source-key preservation,
+  lookup-key non-leakage, provenance, collision-before-assignment, XLSX and ODS
+  rendering.
+
+== 12. Exact commands and results
+
+[source,bash]
+----
+cd ~/repos/spreadsheet-handling/core
+
+.venv/bin/pytest \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py
+# -> 110 passed (before the YAML equal-names test); with it: focused suites green
+
+.venv/bin/pytest \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py \
+  tests/architecture/semantic_invariants/test_meta_registry.py \
+  tests/unit/rendering/test_style_themes.py
+# -> 46 passed
+
+.venv/bin/pytest
+# -> 2188 passed, 1 xfailed in 10.77s
+
+make domain-contracts-check
+# -> build/domain_contracts/domain_contract_health.json status: ok, errors: []
+
+git diff --check
+# -> clean
+----
+
+Asciidoctor was run on every changed `.adoc` (this artifact, the user guide
+supporting-steps page, the release notes, and the parent FTR) with only the
+expected build-supplied missing-attribute/include warnings and no syntax errors.
+
+== 13. Compatibility evidence
+
+Legacy symmetric behaviour is unchanged and covered by retained tests:
+`key`/`keys`/quoted `"on"`/policy key resolution, values and formula modes,
+`sort_by` and helper ordering, missing behaviour, null keys, duplicate
+detection, diagnostics, provenance (`test_enrich_lookup_symmetric_provenance_unchanged`
+asserts the byte-identical `{"lookup","on","helper_columns"}` shape), YAML
+binding, and caller non-mutation. Symmetric mismatch checking is unchanged
+(`test_edited_lookup_helper_*` and `test_unchanged_lookup_helper_*` remain
+green). The full suite grew from 2165 to 2188 passing tests with the added
+regression coverage; no prior test required modification.
+
+== 14. Remaining risks
+
+* Slice-2 durable persistence binding of `apply_derived_column_policy(drop)` to
+  the workbook-view helper carrier is unchanged and remains a Slice-2 concern;
+  this correction only teaches the *in-memory* mismatch reader.
+* End-to-end asymmetric XLSX/ODS parity across the persistence boundary is a
+  parent-FTR / later-slice acceptance criterion; the added rendering tests
+  exercise the render plan directly (as the existing formula tests do), not a
+  full file roundtrip.
+
+== 15. Slice-2 readiness claim
+
+All four Important findings and the Minor finding from Review 001 are corrected
+with tracked regression coverage; the resolved-key/mode design, collision
+contract, mismatch reader, and formula path are now stable. This correction
+does not itself accept Slice 1 — it is submitted for independent Review 002.
+No Slice-2 work was started.
+
+== 16. Commits
+
+* Commit 1 (runtime + tests + registry/docs tied to findings):
+  `fix(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): correct asymmetric lookup contract`
+* Commit 2 (this correction artifact + parent-FTR progress update):
+  `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 1 corrections`
+
+== 17. Repository status
+
+* `core`: clean after both commits (see `git status --short`).
+* `worldbuilding`: untouched; `git status --short` empty; HEAD `83dc2bb`; no
+  commit made.
+* No push performed.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 1 CORRECTED — PENDING INDEPENDENT REVIEW 002
