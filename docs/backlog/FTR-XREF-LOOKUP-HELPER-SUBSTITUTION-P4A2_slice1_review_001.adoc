@@ -1,0 +1,633 @@
+= Slice 1 Review 001: Asymmetric lookup keys for `enrich_lookup` (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Review date:: 2026-08-02
+Reviewer:: ChatGPT/Codex (independent implementation review)
+Disposition:: *REQUIRES CORRECTION*
+Finding count:: 0 Blocking, 4 Important, 1 Minor
+Slice-2 gate:: *Slice 2 must not begin until the Important findings are corrected and independently re-reviewed.*
+
+== 1. Scope and baseline
+
+This review covers *Slice 1 only*: the additive `source_key` / `lookup_key`
+capability on `enrich_lookup` and its public `add_lookup_helpers` registration.
+It reviews the implementation independently against the confirmed Outcome A
+contract. Claims in the implementation artifact were treated as hypotheses and
+were checked against source, tests, runtime behavior, provenance readers, and
+the parent implementation.
+
+The review did not modify runtime code or tests, did not begin Slice 2, did not
+change inbound binding, did not migrate Worldbuilding, did not modify or remove
+`project_by_role`, did not update Project Memory, did not create or switch a
+branch, and did not push.
+
+[cols="2,4,3"]
+|===
+| Repository / commit | Expected | Verified at review start
+
+| Core HEAD
+| `5d19e2a` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 1 implementation`
+| Exact full hash `5d19e2a319d1a5692f113ec6ce96766c69d19e1a`; clean
+
+| Runtime commit
+| `c965431` `feat(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): support asymmetric lookup keys`
+| Present as the parent of Core HEAD; reviewed directly
+
+| Worldbuilding HEAD
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| Exact full hash `83dc2bb6a498c8a8ddc5a785ca7aeb0bccad4e09`; clean
+|===
+
+== 2. Files and commits reviewed
+
+Authoritative scope artifacts read in full:
+
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2.adoc`;
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_assessment_001.adoc`;
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_confirmation_001.adoc`;
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_confirmation_review_001.adoc`; and
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice1_implementation_001.adoc`.
+
+Commits inspected with full diffs:
+
+* `c9654317b06c345861195add9875ab6330e9bc67` (runtime, tests, registry,
+  user guide, and release note); and
+* `5d19e2a319d1a5692f113ec6ce96766c69d19e1a` (implementation artifact and
+  parent-FTR progress record).
+
+Primary implementation surfaces inspected directly:
+
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/operation.py`;
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/policy.py`;
+* `tests/unit/domain/transformations/test_enrich_lookup.py`;
+* `tests/unit/pipeline/test_enrich_lookup_registration.py`;
+* `tests/unit/domain/transformations/test_lookup_formula_mode.py`;
+* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py`;
+* `src/spreadsheet_handling/rendering/passes/_base.py`;
+* `src/spreadsheet_handling/domain/transformations/cell_codec/frame.py`;
+* `src/spreadsheet_handling/domain/transformations/fk_helpers/provenance.py`;
+* `src/spreadsheet_handling/domain/column_roles/resolver.py`;
+* `registries/pipeline_step_registry.json`;
+* `registries/meta_registry.yaml`;
+* `registries/domain_contracts/canonical/implementation_units.json`;
+* `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`; and
+* `docs/release_notes/release_notes.adoc`.
+
+== 3. Review methodology
+
+The review combined:
+
+. line-by-line comparison of `c965431` with its parent;
+. direct tracing of key resolution, validation, projection, merge, ordering,
+  formula construction, provenance writing, and every current runtime reader of
+  the `enrich_lookup` record;
+. execution of the requested unit, integration, registry, architecture, and
+  domain-contract checks;
+. full-suite execution;
+. temporary, untracked `/tmp`/stdin probes for asymmetric policy resolution,
+  equal key names, field/key collisions, sort helpers, null keys, aliases,
+  cardinality, formula specs, XLSX/ODS rendering, and mismatch policies; and
+. a representative A/B comparison against `c965431^` extracted with
+  `git archive` under `/tmp`, leaving the active worktree untouched.
+
+No temporary probe was added to the repository or committed.
+
+== 4. Findings ordered by severity
+
+=== 4.1 Blocking findings
+
+None.
+
+=== 4.2 Important findings
+
+==== XREF-S1-IMP-001 — key/helper collisions are not safely defined
+
+Severity:: Important
+Affected file / symbol::
+`src/spreadsheet_handling/domain/transformations/enrich_lookup/operation.py` —
+`_check_column_conflict`, `_build_helper_projection`,
+`_build_formula_enrichment`, and the call path from `enrich_lookup`.
+Evidence::
+The asymmetric conflict guard excludes `source_key` from conflicts but does not
+protect either public key role from helper projection. Direct probes using
+`source_key=story_id`, `lookup_key=id` produced all of the following:
+
+* `helpers.fields=[story_id]` in values mode renames lookup `id` to
+  `story_id` beside the independently selected lookup `story_id`, then fails
+  with pandas `ValueError: The column label 'story_id' is not unique`;
+* `helpers.fields=[id]`, `missing=empty` silently returns only
+  `[story_id, dyn]` while provenance falsely records `helper_columns=[id]`;
+* the same request with `missing=fail` raises a raw pandas `KeyError` because
+  the promised `id` helper is absent after rename;
+* formula mode with `helpers.fields=[id]` emits an `id` output column, directly
+  violating the public guarantee that the lookup-side key never leaks; and
+* formula mode with `helpers.fields=[story_id]` overwrites the authoritative
+  source key values with `LookupFormulaSpec` objects.
+
+The lookup frame containing an unselected non-key `story_id` is safe, but
+selecting that column or selecting the lookup key exposes the defect. These are
+the requested rename-collision cases, not speculative abstractions.
+Impact::
+Accepted public helper-field requests can silently omit a field, publish false
+provenance, leak the lookup key, destroy the source identity column, or fail
+with backend-library diagnostics. This violates the Slice-1 output-key and
+projection contract and makes the API unsafe for later consumer migration.
+Required correction::
+Define and enforce a deterministic asymmetric key/helper collision rule before
+projection or formula assignment. At minimum, requested helper fields and
+temporary lookup sort fields must not collapse onto the source key or expose the
+lookup key; invalid combinations must raise a clear domain `ValueError` before
+merge/formula construction. Preserve the authoritative source key and the
+no-lookup-key-output guarantee in both values and formula modes. Add regression
+tests for both key names, values/formula modes, and a lookup frame that already
+contains a non-key column named like the source key.
+Blocks Slice 2:: Yes.
+
+==== XREF-S1-IMP-002 — asymmetric provenance silently disables mismatch checking
+
+Severity:: Important
+Affected file / symbol::
+`src/spreadsheet_handling/domain/transformations/derived_column_policy.py` —
+`_check_enrich_lookup_values` (consumer of provenance written by
+`operation._write_provenance`).
+Evidence::
+The reader resolves only `spec.get("on")`. An asymmetric record contains
+`source_key` and `lookup_key`, so `on_keys` is empty and the reader returns no
+findings at lines 345–364. A direct probe enriched `story_id -> id`, edited a
+materialized `title`, and invoked both public mismatch policies with the lookup
+frame present:
+
+* `warn_on_mismatch` returned zero findings and dropped `title`; and
+* `fail_on_mismatch` did not raise and dropped `title`.
+
+This is not merely the intentionally value-blind `policy: drop` path. The
+registry and callable document the mismatch policies as value-checking
+`enrich_lookup` helpers. The implementation artifact calls the behavior a safe
+no-op, but the runtime result is silent loss of the requested check.
+Impact::
+The additive public asymmetric capability creates records that an existing
+public policy only partially understands: helper identity/drop works, while
+edited-value verification silently stops working. This is an undocumented
+behavioral degradation and could allow edited derived values to pass a
+`fail_on_mismatch` gate.
+Required correction::
+Either teach the mismatch reader to use the payload `source_key` and lookup
+frame `lookup_key`, or explicitly reject mismatch policies on asymmetric
+provenance with a clear diagnostic until support is implemented. It must not
+silently succeed without checking. Add warn/fail tests with a changed helper,
+an unchanged helper, unmatched references, and differently named keys.
+Blocks Slice 2:: Yes.
+
+==== XREF-S1-IMP-003 — explicit asymmetric mode is lost when key names are equal
+
+Severity:: Important
+Affected file / symbol::
+`src/spreadsheet_handling/domain/transformations/enrich_lookup/operation.py` —
+`_write_provenance`; `policy.py` — `_resolve_join_keys`.
+Evidence::
+The public pair accepts `source_key == lookup_key`; no confirmed contract rule
+requires different strings. Nevertheless `_write_provenance` chooses the
+record shape by comparing the resolved lists (`source_keys == lookup_keys`),
+not by the public mode selected. A direct call with
+`source_key=id, lookup_key=id` therefore writes `{"on":["id"]}` and omits both
+asymmetric fields. This loses real intent: an explicit asymmetric pair ignores
+a configured helper-policy `key`, while an inline symmetric form reconciles
+and can conflict with that policy. The resulting provenance and downstream
+mismatch behavior vary with string equality rather than selected public mode.
+Impact::
+Provenance cannot unambiguously distinguish an explicitly selected asymmetric
+contract from legacy symmetric selection. Equality of the current labels is
+not a stable substitute for mode identity, and later consumers cannot reliably
+interpret the record.
+Required correction::
+Carry the selected public mode as part of resolved key state and write
+provenance from that mode. An explicit `source_key` / `lookup_key` call must
+retain the asymmetric record shape even when the strings are equal. Add direct
+and YAML tests for equal names and a configured policy key.
+Blocks Slice 2:: Yes.
+
+==== XREF-S1-IMP-004 — changed asymmetric formula path has no tracked test
+
+Severity:: Important
+Affected file / symbol::
+`src/spreadsheet_handling/domain/transformations/enrich_lookup/operation.py` —
+`_build_formula_enrichment`; tests in
+`tests/unit/domain/transformations/test_lookup_formula_mode.py` and
+`tests/unit/domain/transformations/test_enrich_lookup.py`.
+Evidence::
+`c965431` changes formula construction from one common key to distinct
+`source_key_column` and `lookup_key_column`, but every tracked formula-mode test
+still uses a symmetric key. No Slice-1 test invokes asymmetric formula mode.
+The independent temporary probe confirms the ordinary case currently creates
+`LookupFormulaSpec(source_key_column='story_id', lookup_key_column='id')` and
+renders the expected XLSX and ODS XLOOKUP ranges. That review-time evidence does
+not provide regression protection, and the collision probe in IMP-001 shows
+formula-only failures that the values tests cannot detect.
+Impact::
+A changed public path, including the distinction Slice 1 introduces, can
+regress without any tracked test failing. Later slices may depend on the
+general `add_lookup_helpers` contract rather than values mode alone.
+Required correction::
+Add an asymmetric formula test asserting both key names in the spec, source-key
+preservation, absence of lookup-key leakage, helper placement, and provenance.
+Add or extend one rendering test to prove the source cell and distinct lookup
+key/value ranges are used after physical sheet-name resolution.
+Blocks Slice 2:: Yes.
+
+=== 4.3 Minor findings
+
+==== XREF-S1-MIN-001 — public docs omit helper-policy key interaction
+
+Severity:: Minor
+Affected file / symbol::
+`operation.enrich_lookup` docstring,
+`registries/pipeline_step_registry.json` (`add_lookup_helpers` parameters),
+`docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`, and
+`docs/release_notes/release_notes.adoc`.
+Evidence::
+The resolver intentionally ignores only a configured helper-policy `key` when
+an explicit asymmetric pair is present, while still applying policy-derived
+helpers, allowed fields, order, missing mode, and value mode. A direct probe
+with a conflicting policy key and `helpers=default` succeeded deterministically
+using `story_id -> id`. This rule appears in an internal resolver comment and
+the implementation artifact, but not in the public docstring, registry notes,
+user guide, or release note. Inline symmetric keys, by contrast, are reconciled
+with the policy key and may fail on conflict.
+Impact::
+Users cannot predict from public documentation why the same policy key is
+enforced for symmetric inline parameters but ignored for the asymmetric pair.
+Required correction::
+Document that an explicit asymmetric pair is authoritative for key selection,
+ignores the policy `key`, and continues to consume the policy's non-key helper
+settings. Keep the runtime rule deterministic.
+Blocks Slice 2:: No by itself.
+
+== 5. Public API assessment
+
+The Python signature and YAML binding accept the intended symmetric forms:
+`key`, `keys`, quoted legacy `"on"`, and a policy-derived `key`. Representative
+symmetric behavior is unchanged. The asymmetric pair is single-string per side,
+requires both halves, and is mutually exclusive with every inline symmetric
+form; there is no fallback or precedence.
+
+Direct probes confirmed consistent diagnostics for partial pairs, blanks,
+whitespace-only values, and wrong types. `None` has normal omitted-parameter
+semantics: one `None` half beside a present half is diagnosed as partial; both
+absent allow symmetric/policy resolution. YAML uses the same callable and the
+tracked YAML success test exercises the new pair.
+
+The configured helper-policy key is deliberately ignored in explicit
+asymmetric mode while all non-key policy settings remain active. That behavior
+is deterministic and suitable for an explicit key pair, subject to the public
+documentation gap in MIN-001.
+
+The registry's parameter list matches the callable signature and describes the
+pair requirement and inline mutual exclusion. It correctly keeps `keys` as a
+symmetric, potentially multi-column form and the asymmetric parameters as
+single strings. It does not encode a machine-readable one-of constraint, but
+the reviewed registry is explicitly a manual descriptive artifact, not the
+runtime binder; the notes are sufficient for that artifact.
+
+Explicit equal names are valid at the public boundary. The implementation
+*should preserve that asymmetric mode selection*, because its policy-resolution
+semantics and provenance contract are selected by parameter form, not by the
+accidental equality of resolved labels. IMP-003 records the current failure.
+
+== 6. Compatibility assessment
+
+A parent-version tree was extracted under `/tmp` from `c965431^`. The same
+representative probe was executed with the parent and current source paths. The
+serialized results were exactly equal for:
+
+* symmetric `key` and quoted `on` calls;
+* multi-key `keys` joins;
+* policy-derived key and helpers;
+* values and formula modes;
+* explicit helper ordering and temporary `sort_by` helpers;
+* no-helper mode;
+* null key values;
+* output columns, values, row/index behavior, and provenance; and
+* duplicate-key, missing-key, and mixed-symmetric-form diagnostics.
+
+The full suite also passed. Symmetric provenance remains exactly:
+
+[source,json]
+----
+{"lookup":"...","on":["..."],"helper_columns":["..."]}
+----
+
+No legacy compatibility regression was found in values, formulas, field
+resolution, order, sorting, missing handling, duplicate detection, YAML,
+policy-derived symmetric keys, diagnostics, provenance, or null handling.
+
+== 7. Join and cardinality assessment
+
+For ordinary asymmetric usage, source validation uses `source_key`, lookup
+validation and duplicate detection use `lookup_key`, and the lookup projection
+is reduced then renamed before the merge. Direct probes verified:
+
+* reversed source order is preserved when no explicit `sort_by` is configured;
+* source cardinality is preserved under a unique lookup key;
+* duplicate lookup-side keys fail before merge;
+* the differently named lookup key is absent from normal values output;
+* `missing=fail` rejects unmatched source rows and `missing=empty` fills helper
+  values with `""`;
+* a lookup frame that contains an unselected, non-key column named like the
+  source key does not affect the merge;
+* many-to-one behavior remains enforced; and
+* null/NaN key matching and subsequent blank normalization are consistent with
+  the parent symmetric behavior.
+
+Pandas merge continues to produce its established RangeIndex in values mode;
+formula mode continues to preserve the copied source index. No index regression
+was introduced.
+
+The rename strategy is not safe when a selected helper is either key or when a
+selected lookup column collapses onto the renamed source label. IMP-001 is the
+resulting correctness finding.
+
+== 8. Formula-mode assessment
+
+The ordinary asymmetric formula implementation is logically correct:
+
+* `source_key_column` is `story_id`;
+* `lookup_key_column` is `id`;
+* `lookup_value_column` is the selected helper;
+* the source/output retains `story_id`; and
+* physical sheet-name resolution remains generic.
+
+The temporary XLSX result was
+`=XLOOKUP($A2,'Entities'!$A$2:$A$3,'Entities'!$B$2:$B$3,"")`; the ODS content
+used `XLOOKUP([.A2];[Entities.A2:Entities.A3];[Entities.B2:Entities.B3];"")`.
+Thus both renderers use the source key cell, lookup-side key range, and lookup
+value range correctly in the ordinary case. Formula missing behavior and the
+single-key restriction remain unchanged.
+
+The key/helper overwrite and leakage defects are in IMP-001. The absence of a
+tracked asymmetric formula regression test is independently Important under
+IMP-004. Existing symmetric formula tests remain meaningful but cannot prove
+the new two-name path.
+
+== 9. Sort and helper-field assessment
+
+Explicit fields, policy-resolved fields, normal values mode, normal formula
+mode, no-helper mode, and allowed-field checks were traced. An asymmetric
+`sort_by` lookup helper (`rank`) is temporarily projected, sorts the result,
+and is dropped when it was not requested as an output helper. Source row order
+changes only when sorting is explicitly requested.
+
+Passing `source_keys` to `_fields_with_sort_helpers` is semantically correct for
+the output-facing join key: `sort_by=story_id` sorts the source/output key and
+does not attempt to select an independent lookup non-key `story_id`. A
+`sort_by=id` request is rejected because `id` is not an output column. No silent
+sort-helper retention was found.
+
+The remaining unsafe helper-field names are the two asymmetric key roles and
+rename collisions described in IMP-001. The tracked Slice-1 suite does not
+exercise asymmetric `sort_by` or policy-derived helper resolution; independent
+probes passed, but tracked follow-up coverage should accompany the corrections.
+
+== 10. Provenance-reader assessment
+
+[cols="3,4,3"]
+|===
+| Reader | Behavior | Assessment
+
+| `rendering/passes/_base.py`
+| Reads only `helper_columns` for styling/protection targeting.
+| Safe for asymmetric records.
+
+| `cell_codec/frame.py`
+| Reads only `helper_columns` to exclude helpers from contraction.
+| Safe for asymmetric records.
+
+| `fk_helpers/provenance.py`
+| Reads only `helper_columns` to prune consumed `enrich_lookup` provenance.
+| Safe for asymmetric records.
+
+| `derived_column_policy._resolve_derived_identity`
+| Reads `helper_columns` for drop identity.
+| `policy: drop` remains safe and intentionally value-blind.
+
+| `derived_column_policy._check_enrich_lookup_values`
+| Assumes `on`; ignores `source_key` / `lookup_key`.
+| Unsafe silent degradation; IMP-002.
+
+| `column_roles.resolver`
+| Does not read the `enrich_lookup` subrecord; it uses workbook-view helpers,
+  FK helper provenance, or explicit overrides.
+| Existing intentional behavior; no Slice-1 change. Worldbuilding's current
+  explicit override remains untouched.
+
+| Registry/domain-contract metadata
+| Declares the `derived.sheets.*.enrich_lookup` path but does not parse key
+  members at runtime.
+| Safe; no Slice-1 implementation-unit update required.
+|===
+
+No additional runtime diagnostics, role, debug/meta-tracing, or extractor
+reader that assumes `on` was found. The only key-aware consumer is the mismatch
+checker in IMP-002. The asymmetric record is otherwise additive and safely
+ignored by generic readers. Equal-name mode ambiguity remains IMP-003.
+
+== 11. Mutation and metadata assessment
+
+Tracked tests and direct probes confirm that the caller's frames mapping,
+source DataFrame, and lookup DataFrame are unchanged. Values mode returns a
+merge result; formula mode starts from `source_df.copy()`. Output aliases equal
+to the source or lookup name replace that name only in the returned shallow
+mapping, matching the established contract, while caller-owned DataFrames stay
+unchanged.
+
+The top-level `_meta` mapping is copied and the changed provenance function
+retains the pre-Slice-1 shallow nested-copy behavior. Unrelated metadata and
+sibling derived records are preserved. If a caller already owns the exact
+`derived.sheets` nested path, that established path can remain aliased; the
+implementation did not deepen or regress the framework's existing copy
+contract, so this review does not demand a new deep-copy policy.
+
+The new record writes only the `enrich_lookup` subkey and does not overwrite
+sibling derived record kinds. Reusing the same output naturally replaces a
+prior `enrich_lookup` record, as before. Output/source and output/lookup aliases
+behave the same as the parent operation. No Slice-1-specific mutation or
+metadata overwrite regression was found.
+
+== 12. Registry and documentation assessment
+
+The signature and registry parameter names agree. Types and required flags are
+accurate: the pair members are optional strings at schema level and jointly
+required by runtime mode validation. Documentation does not imply
+multi-column asymmetric joins and keeps legacy `keys` symmetric-only. The
+release note correctly bounds inbound binding, Worldbuilding migration, and
+`project_by_role` removal to later slices.
+
+`pipeline_step_registry.json` identifies itself as a manually maintained review
+artifact and was edited consistently. No generated artifact was manually
+changed. The coarse `implementation_units.json` record says only that the step
+joins a lookup and materializes helpers, so Slice 1 does not require a change.
+`make domain-contracts-check` confirms the canonical registry remains healthy.
+
+The release-note claim that the lookup key never leaks is false for the
+formula/key-helper case in IMP-001. The helper-policy interaction is omitted
+from public documentation under MIN-001.
+
+== 13. Test-quality assessment
+
+The added tests provide useful coverage for the principal values-mode path:
+asymmetric success, key absence from ordinary output, helper column placement,
+dynamic trailing columns, missing source/lookup keys, duplicate lookup keys,
+unmatched fail/empty behavior, a normal source helper conflict, mixed/partial
+parameters, blank/wrong types, provenance, caller DataFrame/mapping
+non-mutation, and YAML success. Existing symmetric tests cover values,
+multi-key joins, field/policy resolution, sort/order, diagnostics, provenance,
+missing behavior, null-related behavior through the full suite, and formulas.
+
+Contract-relevant gaps found by review:
+
+* no asymmetric formula-mode test (IMP-004);
+* no helper field equal to `source_key` or `lookup_key`, and no rename collision
+  test (IMP-001);
+* no asymmetric mismatch-policy test (IMP-002);
+* no explicit equal-name asymmetric test (IMP-003);
+* no asymmetric helper-policy-key interaction test;
+* no asymmetric `sort_by` / temporary sort-helper test;
+* no asymmetric null-key test;
+* no explicit reversed-source-order/cardinality assertion; and
+* no asymmetric output/source or output/lookup alias test.
+
+Independent probes covered the latter policy, sort, null, order/cardinality,
+and alias cases successfully. They should be converted selectively into tracked
+tests when corrections land; every theoretical combination is not required.
+
+== 14. Slice-boundary assessment
+
+The implementation stayed within Slice 1. The reviewed diff contains only the
+asymmetric lookup capability, its tests and public registry/docs, plus the
+implementation record. It contains no inbound binding, workbook mapping,
+persistence filtering, resolver, grouped-XRef, broad join redesign, Project
+Memory, Worldbuilding, or `project_by_role` change. Worldbuilding remained
+untouched and clean.
+
+The selected `source_key` / `lookup_key` API is small and appropriate for
+Outcome A, but its mode identity, provenance-reader compatibility, key/helper
+collision rules, and formula regression coverage are not yet stable enough for
+Slice 2 to depend on. Slice 2 may not begin.
+
+== 15. Exact commands and results
+
+Baseline and commit inspection:
+
+[source,bash]
+----
+git -C core status --short
+git -C core rev-parse HEAD
+git -C core log --oneline --decorate -12
+git -C worldbuilding status --short
+git -C worldbuilding rev-parse HEAD
+
+git -C core show --stat --oneline c965431
+git -C core show c965431
+git -C core show 5d19e2a
+----
+
+Results: both initial status outputs were empty; heads matched the expected full
+hashes in section 1; the commits and complete diffs were inspected.
+
+Required focused tests:
+
+[source,bash]
+----
+.venv/bin/pytest \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py \
+  -q
+# exit 0; 51 passed (count confirmed with addopts override)
+
+.venv/bin/pytest tests/integration/pipeline/test_localized_resource_matrix_roundtrip.py -q
+# exit 0; 2 passed
+----
+
+Additional focused tests:
+
+[source,bash]
+----
+.venv/bin/pytest \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/rendering/test_style_themes.py \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py \
+  tests/architecture/semantic_invariants/test_meta_registry.py \
+  -q
+# exit 0; 83 passed
+----
+
+Full validation:
+
+[source,bash]
+----
+.venv/bin/pytest
+# 2165 passed, 1 xfailed in 10.84s
+
+make domain-contracts-check
+# exit 0; build/domain_contracts/domain_contract_health.json status: ok,
+# errors: []; four pre-existing warnings reported
+
+git diff --check
+# exit 0; no output before review documentation edits
+----
+
+Parent comparison and temporary probes:
+
+[source,bash]
+----
+mkdir -p /tmp/xref_slice1_parent_001
+git archive c965431^ | tar -x -C /tmp/xref_slice1_parent_001
+# representative parent/current symmetric probe: exact_equal=true
+
+# stdin Python probes run with PYTHONPATH=src; no tracked file created
+# ordinary asymmetric XLSX formula:
+# =XLOOKUP($A2,'Entities'!$A$2:$A$3,'Entities'!$B$2:$B$3,"")
+# ordinary asymmetric ODS formula:
+# XLOOKUP([.A2];[Entities.A2:Entities.A3];[Entities.B2:Entities.B3];"")
+----
+
+All validation commands left both repositories clean before creation of the two
+review documentation changes.
+
+== 16. Required fixes
+
+. Correct asymmetric helper/key collision handling across values, formulas,
+  temporary sort projection, and provenance (IMP-001).
+. Make asymmetric mismatch policies either perform the promised distinct-key
+  check or fail explicitly instead of silently succeeding (IMP-002).
+. Preserve selected asymmetric mode in provenance even when key labels are
+  equal (IMP-003).
+. Add tracked asymmetric formula-mode regression coverage (IMP-004).
+. Document the helper-policy key interaction (MIN-001).
+. Re-run the focused, formula/derived-policy, registry/architecture, domain
+  contracts, and full suites, then obtain a new independent Slice-1 review.
+
+No runtime or test fix was made by this review.
+
+== 17. Slice-2 readiness decision
+
+*REQUIRES CORRECTION.* Acceptance requires no Blocking or Important findings.
+This review has four Important findings. Slice 2 must not begin until the
+required corrections land and Slice 1 is accepted in a subsequent independent
+review. The Outcome A architecture is not reopened; the findings concern the
+selected API's correctness, provenance compatibility, and load-bearing tests.
+
+== 18. Repository status
+
+At review start and after all runtime/test validation:
+
+* Core: clean at `5d19e2a`;
+* Worldbuilding: clean at `83dc2bb`; untouched; and
+* no push performed.
+
+The only review changes prepared for the documentation-only Core commit are
+this artifact and the parent-FTR Slice-1 progress-line update. Final status is
+rechecked after the commit; Worldbuilding receives no commit.
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 1 REQUIRES CORRECTION IN REVIEW 001
