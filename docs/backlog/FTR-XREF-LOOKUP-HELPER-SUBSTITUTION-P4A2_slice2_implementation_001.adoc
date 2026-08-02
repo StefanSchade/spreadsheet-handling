@@ -1,0 +1,431 @@
+= Slice 2 Implementation 001: Inbound durable-provenance binding (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Implementation date:: 2026-08-02
+Author:: Claude (Opus 4.8 High)
+Scope:: Slice 2 only — settle and prove the inbound durable-provenance binding.
+Slice-1 dependency:: Accepted in Independent Review 004
+(`FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice1_review_004.adoc`).
+
+== 1. Baseline
+
+[cols="2,3,3"]
+|===
+| Repository | Expected HEAD | Verified at start
+
+| Core
+| `759fce7` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): review Correction 003`
+| `759fce78d554f58a8bbaccbc9d9d79a496b9c2f9`; clean
+
+| Worldbuilding
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| `83dc2bb6a498c8a8ddc5a785ca7aeb0bccad4e09`; clean
+|===
+
+Both repositories began clean. Worldbuilding was read-only evidence for this
+slice and stayed clean at `83dc2bb`.
+
+== 2. Accepted Slice-1 dependency
+
+Slice 1 shipped the additive `source_key`/`lookup_key` asymmetric join on
+`add_lookup_helpers` (`enrich_lookup`), accepted in Review 004 (0 Blocking, 0
+Important). Slice 2 consumes that capability unchanged to materialize the
+`title` display helper before the row key on the forward path; it makes no
+change to Slice-1 runtime.
+
+== 3. Inspected identity timeline
+
+Reproduced directly from source (not only Assessment 001):
+
+----
+logical frame before export        role_matrix
+  -> visible sheet name in workbook   Matrix View     (configure_workbook_view + render)
+  -> visible frame name after read    Matrix View     (backend read_multi)
+  -> logical frame name after mapping role_matrix     (apply_workbook_view_sheet_mappings)
+----
+
+`_meta.sheets` is keyed by the *visible sheet name* from
+`configure_workbook_view` onward and is *never re-keyed* by
+`apply_workbook_view_sheet_mappings` (`domain/workbook_views.py:276` copies
+`_meta` unchanged and only re-keys frames). Therefore the durable helper carrier
+`_meta.sheets.<visible-sheet>.helper_columns` is addressable by the visible
+sheet name after readback and is *not* addressable by the logical frame name
+after mapping.
+
+Confirmed metadata keying:
+
+* `configure_workbook_view` (`workbook_views.py:55`, `_merge_sheet_options`):
+  writes `_meta.sheets[<sheet.sheet>].helper_columns` — visible sheet name.
+* `apply_derived_column_policy` (`derived_column_policy.py:244`,
+  `_safe_durable_helper_names`): reads `_meta.sheets[source].helper_columns` —
+  so the `source` argument must be the visible sheet name after readback.
+* `validate_references` `no_helper_columns` (`reference_validations.py:337,615`,
+  `_durable_helper_columns`): reads `_meta.sheets[frame].helper_columns` — same
+  visible-sheet keying.
+* Persistence boundary (`pipeline/persistence_boundary.py:112`): prunes
+  top-level `derived` (transient `enrich_lookup` provenance) but preserves
+  `sheets`.
+
+== 4. Binding-route decision
+
+*Preferred route selected: visible-sheet cleanup before mapping.* The already
+proven route (`drop by visible sheet name` before
+`apply_workbook_view_sheet_mappings`) is expressible entirely through the
+registered public pipeline. Identity ownership is explicit:
+
+* workbook boundary / durable carrier: visible sheet identity;
+* after mapping: logical frame identity;
+* canonical XRef inverse: logical frame identity.
+
+== 5. Why visible-sheet cleanup was selected (alternative rejected)
+
+The alternative provenance re-key (mutating `apply_workbook_view_sheet_mappings`
+to re-key `_meta.sheets` to logical names) was *rejected*. It is unnecessary:
+the preferred route satisfies the public configured pipeline on both backends
+without any runtime change. Existing mapping behavior and tests preserve `_meta`
+unchanged; re-keying would be a wider semantic change to a protected surface and
+is explicitly gated behind a stop/reconfirm condition that did not fire.
+
+== 6. Runtime-change decision
+
+----
+NO NEW RUNTIME CAPABILITY REQUIRED.
+Slice 2 settles composition and sequencing; existing primitives already own the
+behavior.
+----
+
+No runtime or registry code was modified. `apply_derived_column_policy` already
+reads the durable `_meta.sheets[source].helper_columns` carrier;
+`validate_references` `no_helper_columns` already reads the same carrier;
+`apply_workbook_view_sheet_mappings` already re-keys frames after cleanup. The
+slice is integration tests + current-state documentation.
+
+== 7. Exact public inbound sequence
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: Matrix View        # visible sheet name; durable carrier addressable here
+  policy: drop
+
+- step: validate_references   # postcondition guard
+  mode: fail
+  rules:
+    - { type: no_helper_columns, frame: Matrix View }
+
+- step: apply_workbook_view_sheet_mappings
+  logical_frames: [role_matrix]
+
+- step: expand_xref           # or expand_compact_multiaxis
+  matrix: role_matrix
+  row_keys: [story_id]
+  column_key: character_name
+  value: value
+  drop_empty: true
+----
+
+The inverse input is `[story_id, <dynamic matrix columns>]`, not
+`[title, story_id, <dynamic>]`.
+
+== 8. Durable versus transient provenance
+
+* *Transient* `_meta.derived.sheets.<output>.enrich_lookup.helper_columns`:
+  written in-run by `add_lookup_helpers`; *pruned at the persistence boundary*
+  (`RUNTIME_ONLY_TOP_LEVEL_META_KEYS`). Not the inbound carrier.
+* *Durable* `_meta.sheets.<visible-sheet>.helper_columns`: written by
+  `configure_workbook_view`; survives XLSX and ODS roundtrip; the carrier the
+  inbound drop and the `no_helper_columns` postcondition both bind to.
+
+Proven through the real orchestrator projection
+(`project_meta_to_persistable_contract`) plus the real XLSX/ODS backends:
+`_meta.derived` is absent after readback while
+`_meta.sheets["Matrix View"].helper_columns == ["title"]` and `title` is
+physically present in the payload.
+
+== 9. Workbook View declaration dependency
+
+The binding works only when the outbound `configure_workbook_view` sheet spec
+declares `helper_columns: [title]`. Core cannot infer that `title` is a display
+helper from its name; the removal binds only to the declared durable carrier. If
+the declaration is omitted, `_meta.sheets` carries no helper columns after
+readback, the drop is a safe no-op, and `title` survives unclassified.
+
+== 10. Declaration-guard ownership
+
+* Core verifies and documents the generic carrier behavior (this slice).
+* The configured integration test asserts the helper declaration survives the
+  roundtrip and drives removal.
+* Inbound pipelines pair cleanup with `no_helper_columns` as an observable
+  postcondition.
+* *Slice-3 handoff:* a consumer-owned static/configuration guard must prove each
+  of the five Worldbuilding matrix sheets declares `helper_columns: [title]`.
+  Core does not add a new API to infer that a consumer column should have been
+  declared a helper (a negative test makes the dependency visible instead).
+
+== 11. Postcondition validation
+
+`validate_references(mode=fail, rules=[{type: no_helper_columns, frame: Matrix
+View}])`:
+
+* passes (returns frames unchanged) after the helper is dropped;
+* fails closed (`ValueError: Helper columns must be absent after cleanup`) when
+  run while the helper is still present, without mutating caller frames or
+  `_meta` — proven by `test_no_helper_columns_postcondition_fails_when_helper_present`.
+
+== 12. Correct-order versus wrong-order evidence
+
+* *Correct order* (`drop by visible sheet` -> `apply_workbook_view_sheet_mappings`)
+  removes `title` before the inverse; the relation matches the original.
+* *Wrong order* (`apply_workbook_view_sheet_mappings` ->
+  `apply_derived_column_policy(source=<logical frame>)`) cannot find the
+  visible-sheet-keyed `_meta.sheets` provenance and leaves `title`; the inverse
+  then melts it into `column_key`. `test_wrong_order_mapping_before_cleanup_leaves_title`
+  demonstrates the concrete downstream harm (title melted) and that the correct
+  order drops it — it does not celebrate the silent failure.
+
+This is recorded as an explicit public sequencing contract in the
+supporting-steps user guide and release notes.
+
+== 13. XLSX result
+
+Real `ExcelBackend` write/read (after the boundary projection): payload keyed by
+`Matrix View`; `title` physically present; `_meta.derived` absent; durable
+`_meta.sheets["Matrix View"].helper_columns == ["title"]`; sheet mapping intact.
+Full inbound sequence drops `title`, maps to `role_matrix`, and `expand_xref`
+reproduces the original 4-row relation exactly; edited title discarded; lookup
+title unchanged.
+
+== 14. ODS result
+
+Identical assertions pass through the real `OdsBackend` write/read path
+(parametrized backend + shared `_persist_and_reload`). XLSX and ODS parity holds
+for the boundary, cleanup, mapping, and inverse.
+
+== 15. Ordinary XRef inverse result
+
+`expand_xref` (default inferred value columns; no static column list) reproduces
+`[story_id, character_name, value]` for the neutral synthetic fixture and, in the
+Worldbuilding probe, matches the `project_by_role` reference for the four
+`expand_xref` surfaces.
+
+== 16. Compact-multiaxis inverse result
+
+`test_inbound_binding_compact_multiaxis_inverse` proves the alternate inverse
+family: after visible-sheet drop + mapping, `expand_compact_multiaxis`
+(`whole_cell_code`) reproduces the expected `[story_id, group_name, code]` rows.
+The Worldbuilding probe confirms parity for the `story_group` surface.
+
+== 17. Dynamic-axis result
+
+Two differing runtime axis sets, `A: [Alpha, Beta]` and
+`B: [Beta, Gamma, Delta]`, roundtrip through XLSX. After the helper drop the
+column order is `[story_id, <axes in input order>]`; the inverse reproduces the
+canonical rows. No runtime column is enumerated in configuration
+(`value_columns` is inferred).
+
+== 18. Edited-title result
+
+A visible `title` cell edited to `EDITED-TITLE-XYZ` is discarded under
+value-blind `drop`: it is absent from the recomposed relation (`value` column
+and `column_key`), never written back to the authoritative lookup, whose titles
+remain `["First Story", "Second Story"]`. Confirmed on all five Worldbuilding
+surfaces too.
+
+== 19. Five-surface Worldbuilding read-only probe
+
+`make export-stories` produced `tmp/dino_stories.xlsx` (gitignored); Worldbuilding
+stayed clean. A temporary read-only probe compared the candidate
+(`drop by visible sheet name` -> `apply_workbook_view_sheet_mappings` ->
+current inverse) against the current `project_by_role(inbound)` reference.
+
+[cols="2,3,1,1,1,1"]
+|===
+| Visible sheet | Logical frame | Inverse | title dropped | == ref | edited discarded
+
+| Story Groups
+| story_group_matrix_view
+| compact
+| yes
+| yes (rows=0, sparse)
+| yes
+
+| Cast Roles
+| story_cast_role_matrix_view
+| xref
+| yes
+| yes (rows=105)
+| yes
+
+| Cast Notes
+| story_cast_notes_matrix_view
+| xref
+| yes
+| yes (rows=3)
+| yes
+
+| Cast Development
+| story_cast_character_development_matrix_view
+| xref
+| yes
+| yes (rows=0, sparse)
+| yes
+
+| Cast Crystals
+| story_cast_crystal_matrix_view
+| xref
+| yes
+| yes (rows=0, sparse)
+| yes
+|===
+
+All five declare durable `helper_columns: [title]`; dynamic matrix columns are
+preserved in order after the drop; the candidate inverse equals the
+`project_by_role` reference on each surface; an edited `title` is discarded. The
+`rows=0` surfaces are sparse matrices fully removed by `drop_empty` on both the
+candidate and reference paths (still equal). No Worldbuilding tracked file was
+modified; no site was migrated (that is Slice 3).
+
+== 20. Changed files
+
+* `tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py` (new).
+* `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+  (new "Removing a read-only display helper before the inverse" subsection).
+* `docs/release_notes/release_notes.adoc` (Slice-2 bullet under the unreleased
+  cycle).
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice2_implementation_001.adoc`
+  (this artifact).
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2.adoc` (Slice-2 progress
+  line only).
+
+No runtime, registry, implementation-unit, or protected-surface file changed.
+
+== 21. Tests added
+
+`test_xref_lookup_helper_inbound_binding.py` (10 tests), covering the required
+matrix:
+
+. durable helper declaration written by Workbook View
+  (`test_forward_materializes_helper_before_key_and_durable_declaration`);
+. transient lookup provenance stripped at persistence, durable restored under
+  visible sheet name, title physically present, mapping intact
+  (`test_persistence_boundary_strips_transient_keeps_durable`);
+. cleanup by visible sheet name; helper removed before mapping; visible->logical
+  mapping after cleanup; edited helper discarded; authoritative lookup unchanged;
+  ordinary XRef inverse; XLSX + ODS; postcondition success; correct-order
+  success (`test_inbound_binding_roundtrip_ordinary_xref`, parametrized backend);
+. compact-multiaxis inverse
+  (`test_inbound_binding_compact_multiaxis_inverse`);
+. two dynamic-axis column sets (`test_dynamic_axis_genericity`);
+. mapping-before-cleanup negative case with concrete melt harm
+  (`test_wrong_order_mapping_before_cleanup_leaves_title`);
+. missing `helper_columns` declaration negative case
+  (`test_missing_helper_declaration_leaves_title_unclassified`);
+. `no_helper_columns` postcondition fail-closed + caller-state safety
+  (`test_no_helper_columns_postcondition_fails_when_helper_present`).
+
+Existing Workbook View behavior (item 19) and existing FK-helper cleanup
+behavior (item 20) are covered by the unchanged existing suites re-run in
+validation (`test_workbook_views.py`, `test_configured_workbook_view_reimport_roundtrip.py`,
+`test_derived_column_policy.py`, `test_reference_validations.py`,
+`test_project_by_role_migration_parity.py`), not duplicated.
+
+== 22. Exact commands and results
+
+[source,bash]
+----
+# New module
+.venv/bin/pytest -o addopts='' \
+  tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py -q
+# 10 passed in 0.47s
+
+# Focused suites
+.venv/bin/pytest -o addopts='' \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/test_workbook_views.py \
+  tests/unit/domain/validations/test_reference_validations.py \
+  tests/integration/pipeline/test_configured_workbook_view_reimport_roundtrip.py \
+  tests/integration/pipeline/test_project_by_role_migration_parity.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_persistence_boundary.py \
+  tests/integration/io_backends/test_ods_xlsx_parity.py \
+  tests/unit/pipeline/test_step_registration.py -q
+# 282 passed in 1.23s
+
+# Full suite / contracts / whitespace
+.venv/bin/pytest
+# 2274 passed, 1 xfailed in 11.19s
+make domain-contracts-check
+# status: ok
+git diff --check
+# exit 0
+
+# Worldbuilding read-only evidence
+cd ../worldbuilding && make export-stories        # tmp/dino_stories.xlsx (gitignored)
+PYTHONPATH=. .venv/bin/python <five-surface probe> # all five: candidate == project_by_role reference
+git status --short                                 # clean at 83dc2bb
+----
+
+Asciidoctor ran clean on every changed `.adoc` (section 26 lists commits).
+
+== 23. Complexity assessment
+
+Slice 2 added *no runtime code*. Expected complexity outcome met: less runtime
+code, not more. The behavior is owned by existing primitives; the slice
+contributes one integration-test module and narrow current-state documentation.
+No cleanup wrapper, reverse-pipeline macro, inferred sheet lookup, generic
+provenance re-key utility, helper-name override, derived-column DSL, or general
+metadata validator was introduced.
+
+== 24. Slice-3 handoff requirements
+
+. Rewrite the five inbound Worldbuilding sites: replace each
+  `project_by_role(frame=<logical>, direction=inbound, helper_columns=[title])`
+  with `apply_derived_column_policy(source=<visible sheet>, policy=drop)` placed
+  *before* `apply_workbook_view_sheet_mappings` (the current pipeline maps first
+  and drops by logical name — the order must change).
+. Visible-sheet -> logical-frame map for the five surfaces: `Story Groups` ->
+  `story_group_matrix_view`; `Cast Roles` -> `story_cast_role_matrix_view`;
+  `Cast Notes` -> `story_cast_notes_matrix_view`; `Cast Development` ->
+  `story_cast_character_development_matrix_view`; `Cast Crystals` ->
+  `story_cast_crystal_matrix_view`.
+. Add a consumer-owned guard that each of the five matrix sheets declares
+  `helper_columns: [title]` in `configure_workbook_view`.
+. Optionally add the `no_helper_columns` postcondition per surface.
+. Acceptance: `make export-stories` + `make check-reimport` stay green and clean.
+
+== 25. Residual risks
+
+* The binding depends on the outbound `configure_workbook_view` declaration; a
+  dropped declaration silently leaves `title` unclassified. Mitigated by the
+  `no_helper_columns` postcondition recommendation and the Slice-3 consumer
+  guard; a negative test makes the dependency visible.
+* The focused integration test exercises the persistence boundary through the
+  orchestrator's own projection function plus the real backends rather than the
+  end-to-end CLI; the `tests/roundtrip/` layer already exercises the CLI
+  boundary for Workbook View. This is a faithful, not hand-injected, boundary
+  reproduction.
+* Sparse Worldbuilding surfaces yield `rows=0` after `drop_empty`; equality with
+  the reference still holds, but row-count is not an independent signal on those
+  three surfaces (columns-preserved and edited-title checks compensate).
+
+== 26. Commits
+
+* `test(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): prove durable inbound helper binding`
+  — integration test module + user-guide and release-notes documentation.
+* `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 2 implementation`
+  — this artifact + parent-FTR Slice-2 progress line.
+
+(Exact hashes appended after commit in the checkpoint; no push; no branch
+switch; no Worldbuilding commit.)
+
+== 27. Repository statuses
+
+* Core: clean before the two Slice-2 commits; full suite green (2274 passed, 1
+  xfailed); contracts ok; `git diff --check` clean.
+* Worldbuilding: clean and unchanged at `83dc2bb` throughout; read-only evidence
+  only.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 2 IMPLEMENTED — PENDING INDEPENDENT REVIEW 001
