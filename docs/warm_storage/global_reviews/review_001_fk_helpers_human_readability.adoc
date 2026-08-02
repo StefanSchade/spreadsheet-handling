@@ -1,0 +1,726 @@
+= FK Helpers Human Readability and Historical Sediment Review
+:toc:
+:sectnums:
+
+[cols="1,4"]
+|===
+| Status | Collecting findings; implementation explicitly deferred
+| Review type | Read-only maintainability and human-readability review
+| Proposed repository location | `docs/warm_storage/global_reviews/review_NNN_fk_helpers_human_readability/review.adoc`
+| Primary scope | `domain/transformations/fk_helpers/`, especially `enrich.py`, `policy.py`, and `formula_provider.py`
+| Baseline | Repository snapshot reviewed on 2026-08-02
+| Implementation authorization | None. This artifact is not an FTR and must not be treated as permission to modify runtime code.
+|===
+
+== Purpose
+
+This review records human-readability findings discovered while reading the FK-helper implementation during an unrelated active refactoring wave.
+
+The immediate goal is preservation of insight, not implementation. The currently active refactoring must be allowed to stabilize before any cleanup is designed or applied. Findings must be re-checked against the then-current code before they become work items.
+
+The review has four purposes:
+
+* preserve concrete observations and their evidence;
+* distinguish real readability problems from unfamiliar but legitimate Python idioms;
+* identify existing code that should be used as a positive reference pattern;
+* derive candidate human-readability rules for later project-wide review.
+
+== Scope and non-goals
+
+=== In scope
+
+* Local readability of the FK-helper domain code.
+* Naming and vocabulary consistency.
+* Visibility of function contracts and data states.
+* Width of argument passing and dependency exposure.
+* Historical migration vocabulary and compatibility sediment.
+* Type precision at internal boundaries.
+* Comments and docstrings that explain non-local domain reasoning.
+
+=== Out of scope for this review phase
+
+* Runtime changes.
+* Public YAML changes.
+* Persisted metadata migrations.
+* Removal of compatibility behavior.
+* A decision to replace `core.fk` plumbing.
+* General Python style modernization.
+* Reformatting code merely because the syntax is unfamiliar to a Java-oriented reader.
+* Final FTR slicing or acceptance criteria.
+
+== Review principle
+
+Human readability is not equivalent to verbosity and is not opposed to idiomatic Python.
+
+The relevant test is whether a reader can determine, locally and with reasonable domain context:
+
+* what the code does;
+* which inputs it actually depends on;
+* which state each object represents;
+* why exceptional or apparently permissive behavior is correct;
+* where configuration becomes validated runtime intent;
+* where the actual domain transformation occurs.
+
+A compact Python expression is acceptable when its names and data states make the operation clear. Compact syntax combined with vague names, broad dictionaries, implicit defaults, and historical vocabulary creates the real readability cost.
+
+== Current algorithmic reading of `enrich_helpers`
+
+The central flow in `enrich_helpers` is structurally plausible and mostly well organized:
+
+. optionally stop through the legacy `detect_fk` switch;
+. resolve durable FK relation policy from `_meta`;
+. resolve local execution options;
+. skip replayed relations whose target frame is absent in the current partial run;
+. derive target-side lookup structures;
+. group relations by source frame;
+. select a value-materialization or formula-materialization strategy;
+. derive concrete `FKDef` work items per source frame;
+. build target ID/value maps once;
+. process each data frame into a new `out` mapping;
+. materialize helper columns through `apply_fk_helpers`;
+. preserve the source frame's flat/non-flat column contract;
+. write helper provenance;
+. return the new frame mapping.
+
+The main materialization call is:
+
+[source,python]
+----
+enriched = apply_fk_helpers(
+    df,
+    sheet_defs,
+    id_maps,
+    levels,
+    helper_prefix="_",
+    helper_value_provider=helper_value_provider,
+)
+----
+
+`_preserve_source_flatness` performs a subsequent structural correction. `_write_helper_provenance` records the derived-column result in metadata. Therefore, `apply_fk_helpers` is the central data materialization operation, but it is not the complete semantic effect of `enrich_helpers`.
+
+== Findings
+
+=== FK-HR-001 — `detect_fk` is a historical kill switch in a policy-driven primitive
+
+Priority:: Before-low-touch maintainability item
+Disposition:: Record now; re-check after the active refactoring
+
+Observation::
+`enrich_helpers` returns immediately when `defaults.get("detect_fk", True)` is false.
+
+Evidence::
+
+[source,python]
+----
+if not bool(defaults.get("detect_fk", True)):
+    return frames
+----
+
+The same function otherwise consumes an already-declared v2 FK relation policy. It does not detect FK identity from column names.
+
+Risk::
+
+* The name describes obsolete convention-driven behavior rather than the current responsibility.
+* The switch bypasses the primitive's required-policy check and turns an explicitly configured step into a silent no-op.
+* A reader may infer that FK detection still occurs inside `add_fk_helpers`.
+
+Recommended later action::
+Determine whether this switch remains part of a public compatibility contract. If not, remove it. If an enable/disable switch is still required, give it a name that describes materialization rather than detection and define its interaction with policy validation explicitly.
+
+=== FK-HR-002 — v2 transition vocabulary remains after v1 runtime retirement
+
+Priority:: Before-low-touch maintainability item
+Disposition:: Record; do not conflate code naming with persisted schema versioning
+
+Observation::
+Current functions and comments use names such as `resolve_v2_fk_relations` and `build_v2_target_registry`, although the current primitive path consumes only the v2 relation model.
+
+Risk::
+
+* Readers search for a parallel v1 implementation that may no longer exist.
+* Historical migration state dominates current domain language.
+* Future schema evolution may trigger unnecessary version suffix propagation through ordinary implementation names.
+
+Recommended later action::
+After confirming that no v1 runtime reader remains, prefer current-contract names such as `resolve_fk_relations` and `build_target_lookup_index`. Treat the persisted `schema_version` field as a separate decision.
+
+=== FK-HR-003 — missing policy and unsupported policy version collapse into the same result
+
+Priority:: Watch-only semantic risk
+Disposition:: Requires contract decision before cleanup
+
+Observation::
+`resolve_v2_fk_relations` returns `None` both when the FK policy is absent and when `schema_version` differs from 2.
+
+Evidence::
+
+[source,python]
+----
+if fk_root.get("schema_version") != _FK_POLICY_SCHEMA_VERSION:
+    return None
+----
+
+The caller then raises the generic missing-policy error.
+
+Risk::
+A persisted policy with an unsupported or future version is reported as though no policy had been declared. This weakens diagnostics and obscures the role of `schema_version`.
+
+Recommended later action::
+Decide whether `schema_version` is a real durable evolution boundary. If it is, distinguish absent, malformed, and unsupported-version states. If it is not, reconsider whether isolated versioning inside this metadata family is useful.
+
+=== FK-HR-004 — required-policy handling is indirect at the call site
+
+Priority:: Minor maintainability item
+Disposition:: Candidate for local refactoring
+
+Observation::
+
+[source,python]
+----
+relations = resolve_v2_fk_relations(frames)
+if relations is None:
+    raise missing_fk_policy_error("add_fk_helpers")
+----
+
+The string is the consumer step name, not the error message. That intent is only visible after opening the error factory.
+
+Risk::
+The local contract is less obvious than necessary. The caller separately performs resolution and requirement enforcement.
+
+Recommended later action::
+Consider a narrow API such as `require_fk_relations(frames, consumer_step="add_fk_helpers")`, provided it does not hide meaningful distinct error states.
+
+=== FK-HR-005 — `defaults` is a raw options bag, not resolved defaults
+
+Priority:: Important maintainability item
+Disposition:: Strong candidate for a later bounded cleanup slice
+
+Observation::
+`enrich_helpers` receives `defaults: dict[str, Any]`, but the mapping contains optional raw inputs. Defaults, conversion, normalization, and validation are resolved inside the domain operation.
+
+Evidence::
+
+[source,python]
+----
+def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
+    ...
+    levels = int(defaults.get("levels", 3))
+    helper_value_mode = _helper_value_mode(defaults)
+----
+
+Risk::
+
+* The parameter name gives the wrong semantic description.
+* The actual supported API is hidden in string-key lookups throughout the body.
+* Typographical errors may be silently ignored.
+* Static type checking cannot describe the accepted configuration shape.
+* The domain function mixes configuration parsing with transformation orchestration.
+
+Recommended later action::
+Introduce one explicit configuration-resolution boundary. Possible shapes include a typed immutable options object or explicit keyword parameters. Distinguish raw configuration from resolved and validated runtime options in naming.
+
+=== FK-HR-006 — configuration resolution is distributed
+
+Priority:: Important maintainability item
+Disposition:: Combine with FK-HR-005
+
+Observation::
+Default application and validation are spread across independent expressions and helpers:
+
+[source,python]
+----
+defaults.get("detect_fk", True)
+int(defaults.get("levels", 3))
+_helper_value_mode(defaults)
+----
+
+Risk::
+A reader must inspect multiple locations to reconstruct the effective parameter contract. Future changes can create inconsistent defaults or validation behavior.
+
+Recommended later action::
+Resolve all add-FK-helper options once, near the configuration-to-domain boundary, and pass validated runtime values into the orchestration function.
+
+=== FK-HR-007 — whole-dictionary passing hides the actual dependency
+
+Priority:: Minor locally; representative pattern for a style guide
+Disposition:: Candidate for mechanical detection followed by human review
+
+Observation::
+`_helper_value_mode(defaults)` receives the complete raw options mapping but reads only `helper_value_mode`.
+
+Risk::
+The call site does not reveal the helper's actual dependency. The helper is implicitly coupled to the shape of a broader configuration bag.
+
+Recommended later action::
+Pass the narrow value required by the operation, for example:
+
+[source,python]
+----
+raw_mode = raw_options.get("helper_value_mode", "values")
+helper_value_mode = normalize_helper_value_mode(raw_mode)
+----
+
+This finding should become a general rule: argument passing should be as broad as necessary and as narrow as possible.
+
+=== FK-HR-008 — helper mode vocabulary is underspecified and accepts unnecessary aliases
+
+Priority:: Public-contract review item
+Disposition:: Do not change without checking YAML compatibility
+
+Observation::
+
+[source,python]
+----
+_VALUE_HELPER_MODES = {"value", "values"}
+_FORMULA_HELPER_MODES = {"formula", "formulas"}
+----
+
+The relevant semantic choice is closer to materialized values versus workbook lookup formula specifications.
+
+Risk::
+
+* `formula` does not identify lookup semantics or the fact that a backend-neutral formula specification is produced.
+* Singular/plural aliases expand the accepted public surface without adding domain meaning.
+* A future implementation must preserve or explicitly retire all aliases.
+
+Recommended later action::
+Review actual consumer usage before changing anything. If a public cleanup is justified, prefer one canonical value per mode and names that describe the behavior, for example `materialized_values` and `lookup_formulas`. Exact vocabulary requires a separate interface decision.
+
+=== FK-HR-009 — frame and sheet vocabulary are mixed inside the domain transformation
+
+Priority:: Important architectural readability item
+Disposition:: Re-check against the completed vocabulary sharpening work
+
+Observation::
+The domain code uses names such as:
+
+* `fields_by_target_sheet`;
+* `fk_defs_by_sheet`;
+* `sheet_name` while iterating `iter_data_frames`;
+* `target_sheet_key` in `FKDef`;
+* comments referring to a sheet where the object is a frame.
+
+Risk::
+The project's sharpened model states that a frame is a domain object and a sheet belongs to workbook representation. Mixing these terms hides the projection boundary and makes data-flow reasoning harder.
+
+Recommended later action::
+Use frame vocabulary throughout domain transformation code. Retain sheet vocabulary only where a concrete workbook formula or workbook projection requires it. Legacy types such as `FKDef.target_sheet_key` may require a staged migration rather than local renaming.
+
+=== FK-HR-010 — current relations are adapted into a legacy target-registry shape
+
+Priority:: Important historical-sediment item
+Disposition:: Architectural review required; not a mechanical cleanup
+
+Observation::
+`build_v2_target_registry` explicitly mirrors the structure produced by `core.fk.build_registry` so that legacy `apply_fk_helpers` and `build_id_value_maps` plumbing can be reused.
+
+Evidence::
+The function docstring states this compatibility purpose directly.
+
+Risk::
+
+* Current relation semantics are translated into an older target-oriented intermediate model.
+* Names and structures from the older model remain visible throughout the current code.
+* The adapter may be useful and stable, or it may merely preserve an obsolete internal API; the current structure does not answer that question.
+
+Recommended later action::
+After the active refactoring, assess whether the adapter remains the simplest stable boundary. Do not remove it merely for aesthetic reasons. If retained, name it explicitly as an adapter and type its input/output contracts. If removed, split the work from public FK-policy changes.
+
+=== FK-HR-011 — `target_registry` overstates the role of the object
+
+Priority:: Minor naming item
+Disposition:: Consider together with FK-HR-010
+
+Observation::
+The object called `target_registry` is an execution-oriented lookup structure derived from current FK relations. It is not the repository's authoritative registry artifact and not a full ER model.
+
+Risk::
+The broad term `registry` suggests greater authority, persistence, and scope than the object has.
+
+Recommended later action::
+Use a name that describes its execution purpose, such as `target_lookup_definitions`, `target_index_specs`, or another term chosen after reading the complete `core.fk` contract.
+
+=== FK-HR-012 — relation and work-item structures are weakly typed
+
+Priority:: Important maintainability item
+Disposition:: Candidate for incremental typing, not a big-bang rewrite
+
+Observation::
+The code repeatedly uses:
+
+[source,python]
+----
+list[dict[str, Any]]
+dict[str, dict[str, Any]]
+dict[str, list[Any]]
+----
+
+Relations are accessed through string keys and `FKDef` work lists are typed as `list[Any]` in `enrich.py`.
+
+Risk::
+
+* Required fields are not visible at function boundaries.
+* Misspelled keys and malformed values surface late.
+* Lifecycle state and identity semantics remain implicit.
+* Reader effort shifts from signatures to implementation archaeology.
+
+Recommended later action::
+Introduce typed value objects only at stable boundaries and in narrow slices. At minimum, type `fk_defs_by_frame` as `list[FKDef]` where the actual type is already known. A relation value object should follow, not precede, a contract review of the persisted metadata shape.
+
+=== FK-HR-013 — the formula-provider closure is legitimate but insufficiently typed
+
+Priority:: Minor readability item
+Disposition:: Preserve the pattern; improve names and contracts if touched
+
+Observation::
+`_lookup_formula_provider(registry)` returns a closure that captures the target lookup structure and conforms to the callback expected by `apply_fk_helpers`.
+
+Assessment::
+The closure itself is not a smell. It cleanly binds shared dependency state once and supplies a strategy function to the materializer.
+
+Readability risk::
+The factory has no declared return type, the captured `registry` is a nested `Any` dictionary, and the returned function is generically named `provider`.
+
+Recommended later action::
+Define a callback protocol or type alias and use names that expose the strategy, for example `build_lookup_formula_value_provider`. Do not expand the closure into repeated argument plumbing merely because nested functions are unfamiliar.
+
+=== FK-HR-014 — `raw_ids` implies a value dependency that the formula provider does not have
+
+Priority:: Minor contract-precision item
+Disposition:: Review with the common provider interface
+
+Observation::
+
+[source,python]
+----
+def provider(fk: FKDef, raw_ids: list[Any]) -> list[Any]:
+    ...
+    return [formula for _ in raw_ids]
+----
+
+The formula provider does not inspect ID values; it uses the iterable only to produce one formula specification per output row.
+
+Risk::
+The parameter name communicates a stronger semantic dependency than exists. However, the common callback interface may intentionally serve both value and formula strategies.
+
+Recommended later action::
+First document and type the common provider contract. Then decide whether preserving one shared callback signature is clearer than creating strategy-specific interfaces. A local rename such as `source_keys` may still be more accurate than `raw_ids`, but the best answer depends on the value-provider implementation.
+
+=== FK-HR-015 — internal imports use inconsistent relative and absolute styles
+
+Priority:: Minor style item
+Disposition:: Safe local cleanup only after active changes settle
+
+Observation::
+`formula_provider.py` contains both:
+
+[source,python]
+----
+from ....core.fk import FKDef
+from spreadsheet_handling.core.formulas import lookup_formula
+----
+
+Risk::
+There is no visible semantic reason for the distinction. Relative imports with several parent traversals also force readers to count dots to identify the architectural dependency.
+
+Recommended later action::
+Adopt a documented internal-import rule. One plausible rule is absolute imports across subsystem/layer boundaries and relative imports only within a cohesive feature package. Apply consistently, not file by file without a rule.
+
+=== FK-HR-016 — source-flatness preservation is a compensating postcondition
+
+Priority:: Watch-only design question
+Disposition:: Preserve current behavior; investigate ownership later
+
+Observation::
+`apply_fk_helpers` may materialize tuple/MultiIndex-style columns even when the source frame is flat. `_preserve_source_flatness` then restores a flat column structure.
+
+Risk::
+The caller must repair a structural property changed by a lower-level operation. This may be the correct compatibility boundary, but it indicates a split ownership question.
+
+Recommended later action::
+Do not remove or inline the function. Its current implementation and docstring are clear and protect a real replay-safety contract. Later assess whether source-shape preservation belongs inside `apply_fk_helpers`, in a wrapper with an explicit contract, or exactly where it is today.
+
+=== FK-HR-017 — local variable names preserve legacy sheet terminology
+
+Priority:: Minor but pervasive readability item
+Disposition:: Candidate for internal rename after rebase
+
+Observation::
+Inside `enrich_helpers`, variables such as `sheet_name`, `sheet_relations`, `sheet_defs`, and `fk_defs_by_sheet` refer to data frames returned by `iter_data_frames`.
+
+Risk::
+The local algorithm is otherwise clear, but the names repeatedly pull the reader toward workbook semantics.
+
+Recommended later action::
+Where no legacy public type prevents it, rename locally to `frame_name`, `frame_relations`, `frame_fk_defs`, and `fk_defs_by_frame`. This is a low-risk cleanup only if performed after current branch work and guarded by tests.
+
+== Positive reference patterns
+
+=== FK-HR-POS-001 — replay-safe target filtering comment
+
+The following block is a strong reference pattern:
+
+[source,python]
+----
+# Skip relations whose target frame is not present in the current run.
+# Fresh configuration always validates that the target frame exists
+# (configure_fk_helpers / infer_fk_relations), so an absent target can only
+# come from a durable relation replayed in a run that did not load that
+# frame. Enriching it would crash in build_id_value_maps. Skipping is the
+# safe no-op the functional model prescribes ("target frame essential; no
+# enrichment without it") and is part of the Slice 2 replay-safety control.
+known_names = known_data_frame_names(frames)
+relations = [
+    relation
+    for relation in relations
+    if str(relation.get("target_frame")) in known_names
+]
+----
+
+Why it works:
+
+* the code itself is compact and semantically named;
+* the comment does not paraphrase the list comprehension;
+* the comment supplies the non-local lifecycle reasoning needed to distinguish a safe replay no-op from swallowed invalid configuration;
+* it identifies the failure prevented and the contract that justifies the behavior.
+
+This should be preserved as a style-guide example: comments explain why an apparently surprising behavior is correct.
+
+=== FK-HR-POS-002 — phased orchestration in `enrich_helpers`
+
+The body separates preparation from application:
+
+* relation filtering;
+* target lookup preparation;
+* source grouping;
+* strategy selection;
+* per-frame work-item derivation;
+* shared ID-map construction;
+* frame processing;
+* provenance writing.
+
+This is more readable than embedding all lookups, policy interpretation, and mutations in one nested loop. A later cleanup should preserve this high-level phased structure even if names and types change.
+
+=== FK-HR-POS-003 — `_preserve_source_flatness` documents a non-obvious structural contract
+
+The function name describes the postcondition accurately. Its docstring explains:
+
+* what `apply_fk_helpers` changes;
+* why the change is dangerous for flat-only downstream steps;
+* which historical replay failure established the need;
+* why genuinely multi-level frames remain untouched.
+
+The function is a positive example even though its existence raises a later ownership question.
+
+=== FK-HR-POS-004 — backend-neutral formula intent
+
+`lookup_formula` produces a formula specification rather than embedding XLSX- or ODS-specific syntax directly in the domain transformation. This keeps workbook-carrier rendering separate from domain intent.
+
+The surrounding naming and typing can improve, but the architecture should not be flattened into direct Excel formula string generation.
+
+== Non-findings: idiomatic Python that should not be mechanically rewritten
+
+A later AI-assisted cleanup must not treat unfamiliar syntax as evidence of poor readability by itself.
+
+=== Tuple unpacking
+
+[source,python]
+----
+target_registry, fields_by_target_sheet = build_v2_target_registry(relations)
+----
+
+This is the Python equivalent of JavaScript array/tuple destructuring and is locally readable when both return values are well named.
+
+=== `dict.setdefault` for grouping
+
+[source,python]
+----
+relations_by_source.setdefault(source_frame, []).append(relation)
+----
+
+This is a conventional grouping operation. It may be explained in learning material but does not require production-code expansion unless the expression becomes semantically denser.
+
+=== List comprehensions
+
+The replay filter is concise and readable because the collection, element, predicate, and names align. Replacing it with a longer loop would not inherently improve clarity.
+
+=== Conditional expression for strategy selection
+
+[source,python]
+----
+helper_value_provider = (
+    _lookup_formula_provider(target_registry)
+    if helper_value_mode in _FORMULA_HELPER_MODES
+    else None
+)
+----
+
+This remains readable because it represents one bounded value choice. The mode names and callback types are the weaker parts, not the conditional syntax.
+
+=== Closure-based provider construction
+
+A function factory that captures a stable dependency is a legitimate strategy-injection pattern. The review recommends typing and naming it more clearly, not eliminating it merely to resemble Java.
+
+== Candidate Human Readability Style Guide
+
+The following rules are hypotheses derived from this review. They are not yet repository policy.
+
+=== HR-01 — Pass dependencies narrowly
+
+Pass arguments as broadly as necessary and as narrowly as possible. A function call should reveal the data on which the callee actually depends.
+
+=== HR-02 — Names describe current semantics
+
+Names should describe the current responsibility and state, not the historical migration that produced the code. Examples requiring scrutiny include `detect_fk`, `v2`, and broad `registry` terminology.
+
+=== HR-03 — Distinguish lifecycle states in names
+
+Raw, authored, resolved, validated, persisted, replayed, derived, and rendered values are different states. Do not reuse a vague name such as `config`, `defaults`, or `data` across those boundaries.
+
+=== HR-04 — Expose the real contract in signatures
+
+A reader should be able to identify supported inputs and dependencies from function signatures and typed value objects rather than searching for dictionary keys throughout the implementation.
+
+=== HR-05 — Resolve configuration once
+
+Default application, normalization, conversion, and validation should occur at one visible boundary. Domain orchestration should receive resolved runtime values.
+
+=== HR-06 — Comments explain non-local reasons
+
+Comments should explain why behavior is correct, which contract it protects, or which lifecycle case makes it necessary. Do not comment syntax that is already visible.
+
+=== HR-07 — Preserve layer vocabulary
+
+Use `frame` for domain tabular objects and `sheet` for workbook representation. Cross-boundary adapters should make the translation explicit.
+
+=== HR-08 — Keep version labels only where versions are operationally meaningful
+
+Persisted schema markers may be justified even when old code paths are retired. Internal function names should not carry historical version suffixes unless multiple versions are actively handled or the suffix prevents real ambiguity.
+
+=== HR-09 — Prefer typed domain values over repeated `Any` interpretation
+
+Introduce typing incrementally at stable boundaries. Avoid a big-bang conversion, but do not leave known concrete values typed as `Any` without reason.
+
+=== HR-10 — Make exceptional no-ops explicit
+
+A silent skip is acceptable only when the lifecycle contract makes it a valid no-op. The code or its local documentation must distinguish it from swallowed invalid configuration.
+
+=== HR-11 — Use one internal import rule
+
+Internal imports should communicate package and layer boundaries consistently. Style must be deliberate rather than an artifact of file moves.
+
+=== HR-12 — Preserve good algorithmic structure during cleanup
+
+Readability refactoring must not collapse phased orchestration, backend-neutral formula intent, replay-safety controls, or explicit postcondition protection into superficially shorter code.
+
+=== HR-13 — Optimize for local explainability, not maximum explicitness
+
+Idiomatic Python is acceptable when it remains locally understandable. The goal is not Java-shaped Python. The goal is code whose names, signatures, and comments let a human reconstruct the relevant contract without unnecessary archaeology.
+
+== Questions requiring later investigation
+
+The current review does not yet establish answers to the following questions:
+
+. Is `detect_fk` still used by supported consumer configurations or only by historical examples/tests?
+. Is `schema_version: 2` part of a deliberate metadata evolution strategy, or an isolated migration marker?
+. Are the singular/plural helper-mode aliases used outside tests?
+. Does any supported API import `resolve_v2_fk_relations` or `build_v2_target_registry` directly?
+. Can `FKDef` be renamed or replaced without affecting public imports or other transformation families?
+. Is the target-registry adapter still required for formula rendering, or only for reuse of `core.fk` materialization?
+. Should flatness preservation become a formal postcondition of `apply_fk_helpers`?
+. What exact callable contract does `apply_fk_helpers` impose on `helper_value_provider`?
+. Are value-mode and formula-mode providers sufficiently similar to justify one callback signature?
+. Which existing tests specifically protect partial-frame durable-relation replay?
+
+== Deferred implementation strategy
+
+No implementation should start from this document while the current refactoring is active.
+
+After stabilization:
+
+. Rebase this review against the current code and close findings that disappeared.
+. Separate internal readability changes from public-contract changes.
+. Check all public YAML, persisted metadata, documented imports, registry entries, demo usage, and tests before changing names or accepted values.
+. Prefer narrow, independently reviewable slices.
+. Preserve behavior with focused tests before renaming or restructuring.
+. Update this review with final dispositions.
+
+Likely internal/local cleanup candidates, subject to re-check:
+
+* local `sheet_*` to `frame_*` variable renames;
+* precise `FKDef` list typing;
+* consistent import style;
+* narrower input to helper-mode normalization;
+* typed callback aliases and factory return types.
+
+Likely FTR-level or explicit interface-decision candidates:
+
+* removal or renaming of `detect_fk`;
+* changing `helper_value_mode` values or aliases;
+* changing persisted FK policy version semantics;
+* replacing the relation-to-legacy-registry adapter;
+* changing public or documented FK-helper types and imports.
+
+== Suggested later AI review prompt
+
+The following prompt can be adapted after the active refactoring has stabilized:
+
+[source,text]
+----
+Review the current FK-helper implementation against
+`docs/warm_storage/global_reviews/review_NNN_fk_helpers_human_readability/review.adoc`.
+
+This is initially read-only. Revalidate every finding against current runtime,
+tests, public YAML, persisted metadata, registries, and documented imports.
+Do not treat unfamiliar Python idioms as defects. Preserve the positive patterns
+and non-findings recorded by the review. Produce:
+
+1. findings that remain valid, with current evidence;
+2. findings already resolved or invalidated;
+3. internal local refactor candidates;
+4. public-contract or architecture changes requiring an FTR;
+5. a proposed narrow implementation sequence with test gates.
+----
+
+== Current disposition summary
+
+[cols="1,3,2"]
+|===
+| Group | Findings | Current disposition
+
+| Historical sediment
+| FK-HR-001, FK-HR-002, FK-HR-003, FK-HR-010
+| Preserve evidence; require contract review
+
+| Configuration contract
+| FK-HR-004, FK-HR-005, FK-HR-006, FK-HR-007, FK-HR-008
+| Strong future cleanup candidate; public surface must be checked
+
+| Vocabulary and naming
+| FK-HR-009, FK-HR-011, FK-HR-017
+| Re-check after vocabulary/refactoring work stabilizes
+
+| Typing and callback contracts
+| FK-HR-012, FK-HR-013, FK-HR-014
+| Incremental improvement only
+
+| Local consistency
+| FK-HR-015
+| Minor deferred cleanup
+
+| Structural postcondition
+| FK-HR-016
+| Preserve behavior; investigate ownership
+
+| Positive patterns
+| FK-HR-POS-001 through FK-HR-POS-004
+| Preserve and reuse as examples
+|===
+
+== Final review status
+
+This review is intentionally incomplete and remains in warm storage.
+
+It records a coherent maintainability concern: human readability is reduced not by Python syntax alone, but by the cumulative interaction of historical vocabulary, weakly typed intermediate structures, broad configuration dictionaries, distributed default resolution, and layer-inconsistent naming.
+
+At the same time, the reviewed code contains strong local examples of clear phased orchestration, contract-explaining comments, replay-safety reasoning, structural postcondition protection, and carrier-neutral formula intent. A later cleanup should sharpen contracts and names without destroying those strengths.
