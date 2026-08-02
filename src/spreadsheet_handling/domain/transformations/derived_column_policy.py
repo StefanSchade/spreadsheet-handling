@@ -436,43 +436,56 @@ def _validated_mismatch_keys(
 ) -> tuple[list[str], list[str]]:
     """Resolve and *validate* ``(payload_keys, lookup_keys)`` from a spec.
 
-    Supports both provenance shapes written by ``enrich_lookup`` and validates
-    each shape strictly before any coercion (review R002-IMP-002):
+    The join-key form is selected from mapping-member *presence*, not from the
+    truthiness or non-null value of a member (review R003-IMP-001). This keeps
+    an absent member, a present ``None`` member, and a present record with no
+    key form distinct — the earlier value-based detection conflated all three
+    and let a degraded record fail open.
 
-    * *symmetric* — ``{"on": [...]}``: ``on`` must be a non-empty list/tuple of
-      non-empty strings (the writer's multi-key shape). The payload and lookup
-      share the key name(s); ``payload_keys == lookup_keys``.
-    * *asymmetric* — ``{"source_key": <s>, "lookup_key": <l>}``: each half must
-      be a single non-empty string. The payload is keyed by ``source_key`` and
-      the lookup frame by ``lookup_key``.
+    Supports both provenance shapes written by ``enrich_lookup`` and validates
+    the selected shape strictly before any coercion:
+
+    * *symmetric* — a present ``on`` member selects the symmetric form and is
+      always validated: ``on`` must be a non-empty list/tuple of non-empty
+      strings (the writer's multi-key shape), so ``{"on": None}`` is rejected.
+      The payload and lookup share the key name(s); ``payload_keys == lookup_keys``.
+    * *asymmetric* — the presence of either ``source_key`` or ``lookup_key``
+      selects the asymmetric form; both members must be present and each must be
+      a single non-empty string, so a null half is rejected. The payload is
+      keyed by ``source_key`` and the lookup frame by ``lookup_key``.
 
     Malformed provenance is rejected with a clear ``ValueError`` naming the
-    ``_meta.derived`` path rather than silently coercing values with ``str(...)``
-    or skipping the value check: a record must not mix ``on`` with an asymmetric
-    key, an asymmetric record must carry both non-empty halves, and no key value
-    may be blank or a non-string. A record with *no* join-key form yields empty
-    key lists (a value-check no-op).
+    ``_meta.derived`` path: a record must not carry ``on`` together with an
+    asymmetric member (even when a value is ``None``), an asymmetric record must
+    carry both non-empty halves, and no key value may be blank or a non-string.
+    A *present* record with no join-key form at all is likewise malformed for a
+    value-checking policy and is rejected (distinct from the absence of the
+    whole ``enrich_lookup`` record, which the caller never routes here and which
+    stays a safe no-op).
     """
     path = f"_meta.derived.sheets[{frame_name!r}].enrich_lookup"
-    on = spec.get("on")
-    source_key = spec.get("source_key")
-    lookup_key = spec.get("lookup_key")
-    has_asymmetric = source_key is not None or lookup_key is not None
+    has_on = "on" in spec
+    has_source_key = "source_key" in spec
+    has_lookup_key = "lookup_key" in spec
 
-    if on is not None:
-        if has_asymmetric:
-            raise ValueError(
-                f"{path} mixes symmetric `on` with asymmetric "
-                f"`source_key`/`lookup_key`; provide exactly one join-key form"
-            )
-        on_keys = _validated_symmetric_on(on, path=path)
+    if has_on and (has_source_key or has_lookup_key):
+        raise ValueError(
+            f"{path} mixes symmetric `on` with asymmetric "
+            f"`source_key`/`lookup_key`; provide exactly one join-key form"
+        )
+
+    if has_on:
+        on_keys = _validated_symmetric_on(spec.get("on"), path=path)
         return on_keys, on_keys
 
-    if has_asymmetric:
+    if has_source_key or has_lookup_key:
         missing = [
             name
-            for name, value in (("source_key", source_key), ("lookup_key", lookup_key))
-            if value is None
+            for name, present in (
+                ("source_key", has_source_key),
+                ("lookup_key", has_lookup_key),
+            )
+            if not present
         ]
         if missing:
             raise ValueError(
@@ -480,11 +493,15 @@ def _validated_mismatch_keys(
                 f"`lookup_key`; missing {missing}"
             )
         return (
-            [_validated_single_key(source_key, path=path, field="source_key")],
-            [_validated_single_key(lookup_key, path=path, field="lookup_key")],
+            [_validated_single_key(spec.get("source_key"), path=path, field="source_key")],
+            [_validated_single_key(spec.get("lookup_key"), path=path, field="lookup_key")],
         )
 
-    return [], []
+    raise ValueError(
+        f"{path} has no join-key form; a value-checked enrich_lookup record must "
+        f"declare either a symmetric `on` list or an asymmetric "
+        f"`source_key`/`lookup_key` pair"
+    )
 
 
 def _validated_symmetric_on(on: Any, *, path: str) -> list[str]:

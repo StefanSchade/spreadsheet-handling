@@ -653,3 +653,51 @@ class TestEqualNameAsymmetricFormulaCollision:
                 helper_value_mode="formula",
             )
         assert "matrix" not in frames
+
+
+class TestFormulaDuplicateHelperRejection:
+    """Duplicate-helper rejection in formula mode (review R003-MIN-001).
+
+    The common ``_check_duplicate_helper_fields`` guard runs before value-mode
+    or placement branching, so it is mode- and position-independent. These
+    tracked cases prove it for formula/default and formula/`before_key` in both
+    symmetric and asymmetric modes; a later placement- or mode-specific refactor
+    would fail here. The runtime rule itself is unchanged.
+    """
+
+    @pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+    @pytest.mark.parametrize("helper_position", ["after_data", "before_key"])
+    def test_symmetric_formula_duplicate_helper_rejected(self, helper_position) -> None:
+        frames = _frames()  # symmetric key=variable_id, lookup=variables
+        with pytest.raises(ValueError, match="Duplicate helper field"):
+            enrich_lookup(
+                frames,
+                source="matrix_raw",
+                lookup="variables",
+                output="matrix",
+                key="variable_id",
+                helpers={"fields": ["label_de", "label_de"]},
+                order={"helper_position": helper_position},
+                missing="empty",
+                helper_value_mode="formula",
+            )
+        assert "matrix" not in frames
+
+    @_asymmetric
+    @pytest.mark.parametrize("helper_position", ["after_data", "before_key"])
+    def test_asymmetric_formula_duplicate_helper_rejected(self, helper_position) -> None:
+        frames = _asymmetric_frames()  # source_key=story_id, lookup_key=id
+        with pytest.raises(ValueError, match="Duplicate helper field"):
+            enrich_lookup(
+                frames,
+                source="matrix_raw",
+                lookup="stories",
+                output="matrix",
+                source_key="story_id",
+                lookup_key="id",
+                helpers={"fields": ["title", "title"]},
+                order={"helper_position": helper_position},
+                missing="empty",
+                helper_value_mode="formula",
+            )
+        assert "matrix" not in frames

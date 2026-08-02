@@ -728,3 +728,122 @@ def test_asymmetric_duplicate_lookup_keys_first_occurrence_wins() -> None:
     out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
     # First occurrence (First) wins deterministically -> unchanged row passes.
     assert len(out["derived_column_findings"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Review 003 R003-IMP-001: absent / explicitly null key forms must fail closed
+# ---------------------------------------------------------------------------
+
+
+def _frames_with_key_form(key_form: dict):
+    """Edited-helper payload whose proper provenance would fail under
+    ``fail_on_mismatch``; ``key_form`` supplies the (possibly malformed)
+    join-key members of the enrich_lookup record.
+    """
+    stories = pd.DataFrame([
+        {"id": "s1", "title": "First"},
+        {"id": "s2", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([
+        {"story_id": "s1", "title": "EDITED", "dyn": "a"},
+        {"story_id": "s2", "title": "Second", "dyn": "b"},
+    ])
+    spec = {"lookup": "stories", "helper_columns": ["title"]}
+    spec.update(key_form)
+    meta = {"derived": {"sheets": {"matrix": {"enrich_lookup": spec}}}}
+    return {"_meta": meta, "stories": stories, "matrix": matrix}
+
+
+# Each malformed key form together with the ValueError message fragment it must
+# raise. These are the exact shapes reproduced by Review 003.
+_MALFORMED_KEY_FORMS = [
+    pytest.param({}, "has no join-key form", id="no_key_form"),
+    pytest.param({"on": None}, r"on must be a non-empty list", id="on_null"),
+    pytest.param({"source_key": None}, r"requires both `source_key` and `lookup_key`", id="source_key_null_only"),
+    pytest.param({"lookup_key": None}, r"requires both `source_key` and `lookup_key`", id="lookup_key_null_only"),
+    pytest.param({"source_key": None, "lookup_key": None}, r"source_key must be a single non-empty string", id="both_null"),
+    pytest.param({"source_key": "story_id", "lookup_key": None}, r"lookup_key must be a single non-empty string", id="valid_source_null_lookup"),
+    pytest.param({"source_key": None, "lookup_key": "id"}, r"source_key must be a single non-empty string", id="null_source_valid_lookup"),
+    pytest.param({"on": None, "source_key": "story_id"}, r"mixes symmetric `on` with asymmetric", id="mixed_on_null_plus_asym"),
+    pytest.param({"on": ["story_id"], "lookup_key": None}, r"mixes symmetric `on` with asymmetric", id="mixed_valid_on_plus_null_asym"),
+]
+
+
+@_asym
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+@pytest.mark.parametrize("key_form, match", _MALFORMED_KEY_FORMS)
+def test_malformed_or_absent_key_form_fails_closed(policy, key_form, match) -> None:
+    frames = _frames_with_key_form(key_form)
+    with pytest.raises(ValueError, match=match):
+        apply_derived_column_policy(frames, source="matrix", policy=policy)
+    # The path is always named in the diagnostic.
+    with pytest.raises(ValueError, match=r"_meta\.derived\.sheets\['matrix'\]\.enrich_lookup"):
+        apply_derived_column_policy(frames, source="matrix", policy=policy)
+
+
+@_asym
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+def test_malformed_key_form_leaves_caller_state_and_provenance_unchanged(policy) -> None:
+    frames = _frames_with_key_form({"source_key": None})
+    matrix_before = frames["matrix"].copy(deep=True)
+    stories_before = frames["stories"].copy(deep=True)
+    prov_before = dict(frames["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"])
+
+    with pytest.raises(ValueError):
+        apply_derived_column_policy(frames, source="matrix", policy=policy)
+
+    pd.testing.assert_frame_equal(frames["matrix"], matrix_before)
+    pd.testing.assert_frame_equal(frames["stories"], stories_before)
+    # Helper column and provenance are not consumed on failure.
+    assert "title" in frames["matrix"].columns
+    assert frames["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"] == prov_before
+
+
+@_asym
+@pytest.mark.parametrize(
+    "key_form",
+    [{}, {"on": None}, {"source_key": None}, {"source_key": None, "lookup_key": None}],
+)
+def test_malformed_key_form_drop_is_value_blind(key_form) -> None:
+    # policy: drop must never invoke key-form validation; it drops by identity.
+    frames = _frames_with_key_form(key_form)
+    out = apply_derived_column_policy(frames, source="matrix", policy="drop")
+    assert "title" not in out["matrix"].columns
+    assert "derived_column_findings" not in out
+
+
+@_asym
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+def test_valid_asymmetric_record_still_detects_edit(policy) -> None:
+    frames = _frames_with_key_form({"source_key": "story_id", "lookup_key": "id"})
+    if policy == "fail_on_mismatch":
+        with pytest.raises(ValueError, match="derived_value_mismatch"):
+            apply_derived_column_policy(frames, source="matrix", policy=policy)
+    else:
+        out = apply_derived_column_policy(frames, source="matrix", policy=policy)
+        assert len(out["derived_column_findings"]) == 1
+
+
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+def test_valid_symmetric_record_still_detects_edit(policy) -> None:
+    frames = _frames_with_fk_and_lookup_helpers(edited_lookup=True)  # symmetric on: [customer_id]
+    if policy == "fail_on_mismatch":
+        with pytest.raises(ValueError, match="derived_value_mismatch"):
+            apply_derived_column_policy(frames, source="orders", policy=policy)
+    else:
+        out = apply_derived_column_policy(frames, source="orders", policy=policy)
+        assert len(out["derived_column_findings"]) == 1
+
+
+@_asym
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+def test_absent_enrich_lookup_record_is_still_a_safe_noop(policy) -> None:
+    # Absence of the entire enrich_lookup record (not merely its key form) is the
+    # established safe no-op, distinct from a present record with no key form.
+    orders = pd.DataFrame([{"order_id": "o1", "amount": 100}])
+    frames = {"orders": orders}
+    out = apply_derived_column_policy(frames, source="orders", policy=policy)
+    assert list(out["orders"].columns) == ["order_id", "amount"]
+    if policy == "warn_on_mismatch":
+        assert len(out["derived_column_findings"]) == 0
