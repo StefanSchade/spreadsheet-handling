@@ -265,6 +265,61 @@ For the conceptual boundary and its separation from domain transformations,
 see the
 link:{project-url}/blob/main/docs/functional_model/ch05_problem_space_overview/04_workbook_view_boundary.adoc[Functional Model's Workbook View Boundary].
 
+===== Removing a read-only display helper before the inverse
+
+When a Workbook View sheet carries a read-only display helper (for example a
+`title` column materialized before the row key by `add_lookup_helpers`), remove
+that helper on reimport *by the visible sheet name, before*
+`apply_workbook_view_sheet_mappings`. This ordering is a public sequencing
+contract, not an implementation detail:
+
+* The durable helper identity after workbook readback comes from
+  `_meta.sheets.<visible-sheet>.helper_columns`, written by
+  `configure_workbook_view` and preserved across the persistence boundary.
+* The transient `_meta.derived` lookup provenance that `add_lookup_helpers`
+  writes in-run is *not* the carrier across persistence; it is pruned at the
+  boundary, so inbound cleanup cannot rely on it.
+* `apply_workbook_view_sheet_mappings` re-keys frames from the visible sheet
+  name to the logical frame name but does *not* re-key `_meta.sheets`. After
+  mapping, `apply_derived_column_policy` addressed by the logical frame name no
+  longer finds the visible-sheet-keyed declaration and leaves the helper in
+  place, where the XRef inverse (`expand_xref` / `expand_compact_multiaxis`)
+  would melt it into the relation. Logical-frame cleanup after mapping is
+  therefore *not* equivalent under the current metadata-key contract.
+
+The settled inbound sequence is:
+
+[source,yaml]
+----
+pipeline:
+  - step: apply_derived_column_policy
+    source: Matrix View        # the visible sheet name
+    policy: drop
+
+  - step: validate_references   # recommended cleanup postcondition
+    mode: fail
+    rules:
+      - { type: no_helper_columns, frame: Matrix View }
+
+  - step: apply_workbook_view_sheet_mappings
+    logical_frames: [matrix_view]
+
+  - step: expand_xref           # or expand_compact_multiaxis
+    matrix: matrix_view
+    # ...
+----
+
+Core cannot infer that a particular consumer column is a display helper from
+its name: the removal binds only to the declared
+`_meta.sheets.<visible-sheet>.helper_columns`. If the outbound
+`configure_workbook_view` sheet spec omits `helper_columns: [title]`, the helper
+stays unclassified after readback and is unsafe for the inverse. Pair the drop
+with a `no_helper_columns` rule so a missing declaration surfaces as an
+observable postcondition failure rather than silent melting. An edited
+read-only helper value is discarded under `policy: drop` (the drop is
+value-blind); it is never melted into the relation or written back to the
+authoritative lookup.
+
 ==== Final Domain Cleanup
 
 Pipelines that project relational data into editable views often accumulate
