@@ -1,0 +1,383 @@
+= Slice 1 Correction 002: Asymmetric lookup keys for `enrich_lookup` (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Correction date:: 2026-08-02
+Author:: Claude (Opus 4.8)
+Scope:: *Slice 1 Correction 002 only* — close the four Important findings raised
+by independent Slice 1 Review 002 against the additive `source_key`/`lookup_key`
+capability on `enrich_lookup` / `add_lookup_helpers` and its in-memory mismatch
+verification. No Slice-2 persistence binding, no worldbuilding migration, no
+`project_by_role`/`resolve_column_roles` change, no Project Memory update. The
+Outcome A architecture and the selected two-parameter API are not reopened.
+Authority:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice1_review_002.adoc`.
+
+== 1. Baseline
+
+[cols="2,3,3"]
+|===
+| Repo | HEAD at start | Working tree at start
+
+| `core`
+| `be36815` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): re-review Slice 1 corrections`
+| clean
+
+| `worldbuilding`
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| clean (read-only; untouched)
+|===
+
+Relevant history: `c965431` (Slice-1 runtime) → `a1c834b` (Correction 001
+runtime) → `9875eed` (Correction 001 docs) → `be36815` (Review 002 docs).
+
+== 2. Review-002 findings
+
+[cols="1,4,1"]
+|===
+| ID | Summary | Blocks Slice 2
+
+| XREF-S1-R002-IMP-001
+| Equal-name asymmetric helpers bypass collision safety: `_check_key_helper_collision`
+  returned early when `source_key == lookup_key`, so values mode published false
+  helper provenance and formula mode overwrote the authoritative source key.
+| Yes
+
+| XREF-S1-R002-IMP-002
+| Mismatch verification still accepted invalid key contracts: present key values
+  were coerced with `str(...)` without validation, and the named key columns were
+  not required, so `fail_on_mismatch` could silently certify and drop an edited
+  helper.
+| Yes
+
+| XREF-S1-R002-IMP-003
+| Duplicate helper requests created ambiguous output and provenance (duplicate
+  labels under `before_key`; duplicate `helper_columns`).
+| Yes
+
+| XREF-S1-R002-IMP-004
+| Renderer regression tests used trivial positional layouts and unordered
+  substring assertions that could not detect swapped XLOOKUP key/value arguments.
+| Yes
+|===
+
+== 3. Exact correction per finding
+
+=== 3.1 R002-IMP-001 — equal-name asymmetric helper collisions
+
+`_check_key_helper_collision` (`enrich_lookup/operation.py`) no longer exits
+early on label equality. It now gates only on the *selected* mode
+(`resolved.is_asymmetric`) and handles two cases:
+
+* *equal key names* (`source_key == lookup_key`): a projected field equal to
+  that single key is rejected as one collision spanning both roles — in explicit
+  asymmetric mode the key is the authoritative source key and cannot also be an
+  independent derived helper;
+* *distinct key names*: unchanged — a field equal to the lookup key is rejected
+  (leak) and a field equal to the source key is rejected (overwrite).
+
+Because the guard runs over `projection_fields` (which excludes a source/output
+key sort — that field equals the join key and is therefore filtered out by
+`_fields_with_sort_helpers` before it can become a temporary projection), a
+plain `sort_by=[<key>]` remains a valid source-key sort. Policy-derived helpers
+flow through `_resolve_fields` into the same check, and a mixed list such as
+`[id, title]` fails atomically on the first offending entry, before
+`out`/provenance is built, so caller frames are never mutated. Legacy symmetric
+mode is untouched (the guard returns immediately for symmetric mode).
+
+=== 3.2 R002-IMP-002 — mismatch verification fails closed
+
+`derived_column_policy._check_enrich_lookup_values` now validates provenance
+*before* coercion via `_validated_mismatch_keys`, and requires the named key
+columns to exist before comparing:
+
+* *symmetric `on`* must be a non-empty list/tuple of non-empty strings
+  (`_validated_symmetric_on`); a bare string, integer, mapping, empty list,
+  blank element, or non-string element raises a clear `ValueError` naming the
+  `_meta.derived` path — no more character-by-character or key iteration;
+* *asymmetric* keys must each be a single non-empty string
+  (`_validated_single_key`); blank/whitespace, list/object/integer values, a
+  partial pair, or an `on`+asymmetric mix raise a clear `ValueError`;
+* before building the canonical map, every resolved payload key column must
+  exist in the payload and every lookup key column in the lookup frame. If one
+  is absent, verification is impossible, so the reader emits a
+  severity-appropriate `unverifiable_enrich_lookup` finding (naming the missing
+  columns, frames, and provenance path) instead of an empty comparison.
+
+Deterministic settled behavior:
+
+* invalid provenance *shape* (types/blank/partial/mixed/bad `on`) raises a
+  `ValueError` in both warn and fail modes — a broken contract, not a data
+  mismatch;
+* a *missing key column* on well-formed provenance produces the inability-to-
+  verify finding: under `warn_on_mismatch` it is a warning; under
+  `fail_on_mismatch` it is a failure finding, so `apply_derived_column_policy`
+  raises before consuming provenance or removing the helper;
+* `policy: drop` never calls the checker and stays value-blind.
+
+Preserved unchanged: valid symmetric records, valid different-name and
+equal-name asymmetric records, unchanged/edited warn/fail, unmatched-reference
+skipping, null-key normalization, duplicate-lookup first-occurrence rule,
+missing-lookup-frame findings, and stale absent-helper-column no-op.
+
+=== 3.3 R002-IMP-003 — duplicate helper requests
+
+A new `_check_duplicate_helper_fields` guard rejects a duplicate entry in the
+resolved helper `fields` (inline `helpers.fields` *or* policy `default_helpers`)
+with a clear domain `ValueError` before projection, formula construction,
+ordering, output, or provenance. This is applied consistently to values and
+formula modes and to both `after_data` and `before_key`. A helper that is also
+named in `sort_by` is *not* a duplicate helper and remains valid.
+
+*Decision — generic guard (symmetric and asymmetric).* The same silent
+duplicate-label / duplicate-provenance defect already existed in symmetric mode
+via the retained `fields` list (`_reorder_helpers_before_key` and
+`_write_provenance` consume the raw list). Rejecting literal duplicates is a
+safe, backward-compatible tightening: no valid pipeline requests the same helper
+twice, the full suite stays green, and the parent/current symmetric probe is
+`exact_equal` for every non-duplicate input (section 13). A symmetric
+`[label, label]` request now raises rather than silently producing duplicate
+columns/provenance.
+
+=== 3.4 R002-IMP-004 — load-bearing formula-renderer tests
+
+`TestAsymmetricFormulaRendering` was rebuilt on a nontrivial layout: the source
+key `story_id` is not the first source column (column B by default, column C
+after `before_key`); the lookup key `id` is at column D and the lookup value
+`title` at column B, separated by unrelated columns (`misc1`, `misc2`); and the
+lookup frame is mapped to a physical sheet named `Entity Lookup` (with a space).
+Each test asserts the *exact* rendered formula string, so a swap of the key and
+value ranges — or a positional renderer — fails. Both `after_data` and
+`before_key` are covered for XLSX and ODS, plus an equal-name explicit
+asymmetric formula collision test from R002-IMP-001.
+
+== 4. Equal-name asymmetric helper/key contract
+
+For an explicit `source_key`/`lookup_key` pair with equal names, the single key
+is the authoritative source key. A requested helper (inline or policy-derived)
+equal to that key is rejected before projection/formula/provenance in both value
+modes; a mixed list containing it fails atomically; and no output frame or
+provenance is produced on failure. This mirrors the distinct-name contract and
+follows the selected public mode, not label equality.
+
+== 5. Source-key sorting distinction
+
+`sort_by=[<key>]` is a source/output-key sort, not a helper projection: the key
+equals a join key, so `_fields_with_sort_helpers` never adds it as a temporary
+lookup projection and it never enters `projection_fields`. The collision guard
+therefore never sees it, and the sort remains valid in both equal-name and
+distinct-name asymmetric modes. Requesting the key as a *helper* is invalid;
+sorting the output by it is valid — the two are explicitly distinguished.
+
+== 6. Mismatch-provenance validation contract
+
+`_validated_mismatch_keys` accepts exactly:
+
+* symmetric `{"on": [<non-empty str>, ...]}` (non-empty list/tuple); or
+* asymmetric `{"source_key": <non-empty str>, "lookup_key": <non-empty str>}`.
+
+Everything else (bare-string `on`, integer/mapping `on`, empty list, blank/
+non-string element, blank/whitespace key, list/object/integer key, partial
+pair, `on`+asymmetric mix) raises a `ValueError` naming the `_meta.derived`
+path. A record with no join-key form yields empty key lists (value-check no-op).
+
+== 7. Missing-column failure behavior
+
+When provenance is well-formed but a named key column is absent from the payload
+(source key) or the lookup frame (lookup key), the reader returns an
+`unverifiable_enrich_lookup` finding carrying the missing column(s), the frame
+names, and the provenance path. Under `fail_on_mismatch` the finding is a
+failure and `apply_derived_column_policy` raises before dropping the helper or
+consuming provenance; under `warn_on_mismatch` it is an emitted warning. This
+closes the fail-open path where verification was impossible but zero mismatches
+were certified.
+
+== 8. Duplicate-helper rule
+
+Each helper column may be requested at most once. A duplicate in the resolved
+`fields` list raises `ValueError` before any projection/output/provenance. The
+rule is generic (symmetric and asymmetric), deterministic across value modes and
+helper positions, and does not affect a helper that is also used as a `sort_by`
+criterion. Valid calls therefore always carry each materialized helper exactly
+once in output and provenance.
+
+== 9. Formula-renderer fixture and exact assertions
+
+Fixture (rows `s1`,`s2`):
+
+* lookup `entities` columns `[misc1(A), title(B), misc2(C), id(D)]`;
+* source `matrix_raw` columns `[P_lead(A), story_id(B), extra(C)]`;
+* physical sheets `entities -> "Entity Lookup"`, `matrix -> "Matrix"`.
+
+Exact asserted formulas (row 2):
+
+[cols="1,3"]
+|===
+| Case | Formula
+
+| XLSX `after_data` (title col D)
+| `=XLOOKUP($B2,'Entity Lookup'!$D$2:$D$3,'Entity Lookup'!$B$2:$B$3,"")`
+
+| XLSX `before_key` (title col B; source key at C)
+| `=XLOOKUP($C2,'Entity Lookup'!$D$2:$D$3,'Entity Lookup'!$B$2:$B$3,"")`
+
+| ODS `after_data`
+| `of:=XLOOKUP([.B2];['Entity Lookup'.D2:'Entity Lookup'.D3];['Entity Lookup'.B2:'Entity Lookup'.B3];"")`
+
+| ODS `before_key`
+| `of:=XLOOKUP([.C2];['Entity Lookup'.D2:'Entity Lookup'.D3];['Entity Lookup'.B2:'Entity Lookup'.B3];"")`
+|===
+
+The lookup key range is `$D$..` and the value range is `$B$..`; swapping them
+changes the exact string and fails the assertion.
+
+== 10. Changed files
+
+[cols="3,4"]
+|===
+| File | Change
+
+| `src/.../enrich_lookup/operation.py`
+| `_check_key_helper_collision` gates on selected asymmetric mode and handles
+  the equal-name collision; new `_check_duplicate_helper_fields` guard;
+  docstring extended for equal-name collision and duplicate rejection.
+
+| `src/.../derived_column_policy.py`
+| `_resolve_mismatch_keys` replaced by strict `_validated_mismatch_keys` (+
+  `_validated_symmetric_on`, `_validated_single_key`); `_check_enrich_lookup_values`
+  requires payload/lookup key columns and emits `unverifiable_enrich_lookup`
+  when absent.
+
+| `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+| Documented equal-name collision safety and duplicate-helper rejection.
+
+| `docs/release_notes/release_notes.adoc`
+| Extended the Slice-1 note with equal-name collision, duplicate rejection, and
+  fail-closed mismatch validation.
+
+| `tests/unit/domain/transformations/test_enrich_lookup.py`
+| Equal-name collision (values/mixed/policy/sort-valid/normal), symmetric
+  legacy-unchanged, and duplicate-helper (values/before_key/policy/sort-valid/
+  symmetric) tests.
+
+| `tests/unit/domain/transformations/test_lookup_formula_mode.py`
+| Nontrivial exact XLSX/ODS ordered-formula tests (default + before_key) and an
+  equal-name formula collision test.
+
+| `tests/unit/domain/transformations/test_derived_column_policy.py`
+| Malformed/blank/wrong-type key metadata, malformed symmetric `on`, missing
+  payload/lookup key column (warn+fail), null-key, and duplicate-lookup tests.
+
+| `tests/unit/pipeline/test_enrich_lookup_registration.py`
+| YAML equal-name helper-collision rejection test.
+|===
+
+No registry parameter change was needed; no generated artifact was hand-edited;
+`implementation_units.json` unchanged.
+
+== 11. Tests added / changed
+
+* *R002-IMP-001:* equal-name helper `[id]` values and formula; mixed `[id,title]`
+  atomic (values); policy `default_helpers=[id]`; YAML `[id]`; `sort_by=[id]`
+  with helper `[title]` succeeds; source key unchanged; no output/provenance on
+  failure; legacy symmetric `key:id, helpers:[id]` unchanged.
+* *R002-IMP-002:* blank `source_key`/`lookup_key`; list/integer key metadata;
+  missing payload/lookup key column (warn finding + fail raise); malformed
+  symmetric `on` (string/int/object/empty/blank/non-string element); valid null
+  key; valid duplicate-lookup first-occurrence; value-blind drop (existing);
+  valid symmetric/equal-name/different-name (existing + new).
+* *R002-IMP-003:* `[title,title]` values/default, values/before_key,
+  formula/default, formula/before_key; policy-derived duplicate; no output/
+  provenance on failure; `[title]`+`sort_by:[title]` valid with single
+  provenance entry; symmetric duplicate rejected.
+* *R002-IMP-004:* exact XLSX and ODS ordered-formula assertions for
+  `after_data` and `before_key` on the nontrivial layout; equal-name formula
+  collision.
+
+== 12. Exact commands and results
+
+[source,bash]
+----
+cd ~/repos/spreadsheet-handling/core
+
+.venv/bin/pytest \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py
+# -> 153 passed
+
+.venv/bin/pytest \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py \
+  tests/architecture/semantic_invariants/test_meta_registry.py \
+  tests/unit/rendering/test_style_themes.py \
+  tests/integration/pipeline/test_localized_resource_matrix_roundtrip.py
+# -> 48 passed
+
+.venv/bin/pytest
+# -> 2230 passed, 1 xfailed in 10.86s
+
+make domain-contracts-check
+# -> build/domain_contracts/domain_contract_health.json status: ok, errors: []
+
+git diff --check
+# -> clean
+----
+
+Asciidoctor was run on every changed `.adoc` (this artifact, the user guide, the
+release notes, and the parent FTR) with only the expected build-supplied
+missing-attribute/include warnings and no syntax errors.
+
+== 13. Symmetric compatibility evidence
+
+A clean parent tree was extracted at `a1c834b^` (`b46ba9e`, the original Slice-1
+runtime `c965431`) under `/tmp/xref_parent_c002`. The same serialized probe was
+run against parent and current code and compared:
+
+[source,bash]
+----
+git archive a1c834b^ | tar -x -C /tmp/xref_parent_c002
+PYTHONPATH=src            .venv/bin/python probe_symmetric.py > cur.json
+PYTHONPATH=/tmp/.../src   .venv/bin/python probe_symmetric.py > par.json
+diff cur.json par.json   # -> EXACT_EQUAL
+----
+
+`exact_equal` held for: `key`; multi-`keys`; quoted `on`; policy-derived key;
+values and formula spec; `sort_by`+`before_key` ordering; no-helper mode; null
+keys; duplicate-lookup and missing-`fail` error text; and symmetric
+`warn_on_mismatch` / `fail_on_mismatch` / `drop` behavior. The only intended
+symmetric change — rejecting literal duplicate helper fields — is deliberately
+out of that probe and separately covered by a test.
+
+== 14. Remaining risks
+
+* Slice-2 durable persistence binding of `apply_derived_column_policy(drop)` to
+  the workbook-view carrier is unchanged and remains a Slice-2 concern; this
+  correction only validates the in-memory mismatch contract.
+* End-to-end asymmetric XLSX/ODS parity across the persistence boundary remains a
+  parent-FTR/later-slice criterion; the renderer tests exercise the render plan
+  directly (now with load-bearing exact ordered assertions).
+
+== 15. Review-003 readiness
+
+All four Important findings from Review 002 are closed with tracked regression
+coverage and load-bearing renderer assertions; symmetric compatibility is
+proven by parent comparison. This correction does not accept Slice 1 — it is
+submitted for independent Review 003. No Slice-2 work was started.
+
+== 16. Commits
+
+* Commit 1 (runtime + tests + directly related docs):
+  `fix(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): complete Slice 1 safety contract`
+* Commit 2 (this correction artifact + parent-FTR progress update):
+  `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Correction 002`
+
+== 17. Final repository statuses
+
+* `core`: clean after both commits (see `git status --short`).
+* `worldbuilding`: untouched; `git status --short` empty; HEAD `83dc2bb`; no
+  commit made.
+* No push performed.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 1 CORRECTION 002 COMPLETE — PENDING INDEPENDENT REVIEW 003
