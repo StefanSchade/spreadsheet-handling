@@ -1,0 +1,322 @@
+= Slice 1 Correction 003: Asymmetric lookup keys for `enrich_lookup` (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Correction date:: 2026-08-02
+Author:: Claude (Opus 4.8)
+Scope:: *Slice 1 Correction 003 only* — close the one Important finding
+(`XREF-S1-R003-IMP-001`) and the non-blocking record/test discrepancy
+(`XREF-S1-R003-MIN-001`) raised by independent Slice 1 Review 003 against the
+in-memory mismatch verification of the `source_key`/`lookup_key` capability. No
+Slice-2 persistence binding, no worldbuilding migration, no
+`project_by_role`/`resolve_column_roles` change, no Project Memory update, no
+new public API. The Outcome A architecture and the asymmetric-key API are not
+reopened, and malformed-provenance validation is not broadened beyond the
+existing `enrich_lookup` mismatch contract.
+Authority:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice1_review_003.adoc`.
+
+== 1. Baseline
+
+[cols="2,3,3"]
+|===
+| Repo | HEAD at start | Working tree at start
+
+| `core`
+| `179ee37` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): review Correction 002`
+| clean
+
+| `worldbuilding`
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| clean (read-only; untouched)
+|===
+
+Relevant history: `7b4f1e9` (Correction 002 runtime) → `4f5d591` (Correction 002
+docs) → `179ee37` (Review 003 docs).
+
+== 2. Review-003 findings
+
+[cols="1,4,1"]
+|===
+| ID | Summary | Blocks Slice 2
+
+| XREF-S1-R003-IMP-001
+| Mismatch validation still failed open for absent or explicitly null key
+  forms: `_validated_mismatch_keys` inferred form presence from
+  `spec.get(...) is not None`, so a present record with no key member, `on:
+  null`, a single null asymmetric member, or both null members resolved to
+  empty key lists and let both mismatch policies silently return zero findings,
+  drop the edited helper, and consume the provenance record.
+| Yes
+
+| XREF-S1-R003-MIN-001
+| The tracked duplicate-helper matrix was narrower than Correction-002 claimed:
+  no duplicate-helper request existed in the formula-mode test module although
+  the record listed tracked `formula/default` and `formula/before_key` cases
+  (runtime behavior was already correct via the common guard).
+| No
+|===
+
+== 3. Reproduced absent/null behavior
+
+An untracked probe used an edited `title`, an available lookup frame, and the
+five degraded key payloads. *Before* the fix, every case failed open:
+
+[cols="3,2,2"]
+|===
+| Key payload | `warn_on_mismatch` | `fail_on_mismatch`
+
+| `{}` (no key form) | 0 findings, `title` dropped | no raise, `title` dropped
+| `{"on": null}` | 0 findings, `title` dropped | no raise, `title` dropped
+| `{"source_key": null}` | 0 findings, `title` dropped | no raise, `title` dropped
+| `{"lookup_key": null}` | 0 findings, `title` dropped | no raise, `title` dropped
+| `{"source_key": null, "lookup_key": null}` | 0 findings, `title` dropped | no raise, `title` dropped
+|===
+
+The same edited payload with a proper `{"source_key":"story_id","lookup_key":"id"}`
+raised under `fail_on_mismatch`, proving the pass was caused by malformed
+key-form resolution, not by matching values.
+
+*After* the fix, every degraded payload raises a clear `ValueError` naming the
+`_meta.derived.sheets['matrix'].enrich_lookup` path and the invalid/missing
+member, under both policies; the valid asymmetric control still detects the
+edit (warn: one finding; fail: raises).
+
+== 4. Presence-based form-selection rule
+
+`_validated_mismatch_keys` now selects the join-key form from mapping-member
+*presence*, not from value truthiness:
+
+[source,python]
+----
+has_on         = "on" in spec
+has_source_key = "source_key" in spec
+has_lookup_key = "lookup_key" in spec
+----
+
+Selection and validation:
+
+* `has_on and (has_source_key or has_lookup_key)` → *mixed* form → `ValueError`
+  (regardless of whether any value is `null`);
+* `has_on` → *symmetric* form → validate `spec.get("on")` via
+  `_validated_symmetric_on` (which rejects `None`, non-list, empty, blank, and
+  non-string elements);
+* `has_source_key or has_lookup_key` → *asymmetric* form → *both* members must
+  be present (else `ValueError` "requires both …"), then each is validated via
+  `_validated_single_key` (which rejects `None`, blank, and non-string);
+* otherwise → a present record with *no join-key form* → `ValueError`.
+
+Absent/present/null are now distinct: an absent member no longer masquerades as
+a chosen form, a present `null` member is validated (and rejected) by its
+selected form, and a present record with no key form is malformed rather than a
+silent no-op.
+
+== 5. Accepted symmetric shape
+
+Only a present `on` member whose value is a non-empty list/tuple of non-empty
+strings is accepted, e.g. `{"on": ["id"]}` or `{"on": ["k1", "k2"]}`. Rejected:
+`{"on": null}`, `{"on": "id"}`, `{"on": 123}`, `{"on": {}}`, `{"on": []}`,
+`{"on": [""]}`, `{"on": [null]}`. `payload_keys == lookup_keys` for symmetric
+records; the writer's multi-key shape is preserved.
+
+== 6. Accepted asymmetric shape
+
+Presence of either asymmetric member selects the asymmetric form; both must be
+present and each a single non-empty string, e.g.
+`{"source_key":"story_id","lookup_key":"id"}`. Rejected: `{"source_key": null}`,
+`{"lookup_key": null}`, `{"source_key": null,"lookup_key": null}`,
+`{"source_key":"story_id"}`, `{"lookup_key":"id"}`,
+`{"source_key":[],"lookup_key":"id"}`, `{"source_key":"story_id","lookup_key":{}}`.
+
+== 7. Mixed / no-form rejection
+
+Any record containing `on` together with either asymmetric member is rejected as
+mixed, including `{"on": null,"source_key":"story_id"}`,
+`{"on":["story_id"],"lookup_key": null}`, and
+`{"on": null,"source_key": null,"lookup_key": null}`. A present helper-bearing
+`enrich_lookup` record with none of `on`/`source_key`/`lookup_key` (e.g.
+`{"lookup":"stories","helper_columns":["title"]}`) is malformed for a
+value-checking policy and raises. This is distinct from the *absence of the
+entire* `enrich_lookup` record: the caller only routes a *present* record into
+`_check_enrich_lookup_values`, so a missing record retains its established safe
+no-op.
+
+== 8. Warn/fail behavior
+
+* Malformed provenance *shape* (mixed, no-form, `null`/blank/wrong-typed key
+  values, partial pair, malformed `on`) raises a clear `ValueError` under both
+  `warn_on_mismatch` and `fail_on_mismatch` — a broken contract, not a data
+  mismatch.
+* A missing required payload/lookup key column on a well-formed record continues
+  to use the existing severity-appropriate `unverifiable_enrich_lookup` finding
+  (warn: warning; fail: failure → raise).
+* Valid-but-unmatched reference values retain their existing skip behavior.
+* `policy: drop` never calls key-form validation and stays value-blind.
+
+== 9. Caller-state and provenance safety
+
+The validation raises inside `_check_enrich_lookup_values`, which runs in
+`enforce_derived_column_policy_frame` *before* the drop columns are computed and
+before `apply_derived_column_policy` builds any output. On a malformed-provenance
+raise: the source DataFrame, lookup DataFrame, and caller `frames` mapping are
+unchanged; the helper column remains present in caller data; the provenance
+record remains present in caller metadata; and no findings/output mutation is
+committed. This was verified by probe and by a tracked test asserting frame
+equality and provenance identity after the raise.
+
+== 10. Value-blind drop preservation
+
+`enforce_derived_column_policy_frame` invokes `_check_enrich_lookup_values` only
+for `warn_on_mismatch`/`fail_on_mismatch`. For `policy: drop` the key-form
+validator is never reached, so every malformed shape (`{}`, `{"on": null}`,
+`{"source_key": null}`, `{"source_key": null,"lookup_key": null}`) drops the
+helper by identity, emits no findings frame, and never raises — verified by a
+parameterized tracked test.
+
+== 11. Minor duplicate-test closure (R003-MIN-001)
+
+No runtime change. The common `_check_duplicate_helper_fields` guard runs before
+value-mode or placement branching, so it is mode- and position-independent.
+Parameterized formula-mode duplicate-helper tests were added to make the tracked
+matrix match reality: `symmetric formula/after_data`, `symmetric
+formula/before_key`, `asymmetric formula/after_data`, and `asymmetric
+formula/before_key`, each asserting a clear `Duplicate helper field` domain
+failure with no output/provenance produced. Combined with the pre-existing
+values-mode duplicate tests (default/`before_key`, inline and policy-derived,
+symmetric and asymmetric) and the helper-plus-sort validity test, the tracked
+duplicate-helper matrix is now truthful and complete.
+
+== 12. Changed files
+
+[cols="3,4"]
+|===
+| File | Change
+
+| `src/.../derived_column_policy.py`
+| `_validated_mismatch_keys` selects the join-key form from mapping-member
+  presence (`in spec`) instead of `spec.get(...) is not None`, and rejects a
+  present record with no join-key form. Only local change; docstring updated.
+
+| `docs/release_notes/release_notes.adoc`
+| Precision: the mismatch form is selected from member presence; a present
+  record with no key form or an explicit `null` member raises.
+
+| `tests/unit/domain/transformations/test_derived_column_policy.py`
+| Parameterized absent/null/mixed key-form warn+fail tests, path-in-message
+  assertion, caller-state/provenance preservation, value-blind drop, valid
+  asymmetric/symmetric edit-detection regressions, and absent-record no-op.
+
+| `tests/unit/domain/transformations/test_lookup_formula_mode.py`
+| Parameterized formula/`after_data` and formula/`before_key` duplicate-helper
+  rejection for symmetric and asymmetric modes (R003-MIN-001).
+|===
+
+No runtime module other than `derived_column_policy.py` changed. No registry,
+renderer, projection, join, persistence, or Worldbuilding change. No generated
+artifact was hand-edited.
+
+== 13. Runtime-complexity assessment
+
+The runtime diff is confined to one function, `_validated_mismatch_keys`:
+
+* three `"<member>" in spec` presence checks replace three
+  `spec.get(...) is not None` value tests;
+* the asymmetric "both present" check is computed from presence flags;
+* the trailing `return [], []` no-op is replaced by a single explicit `raise`
+  for a present record with no key form.
+
+No new abstraction, class, module, or public API was introduced; the two
+existing validation helpers (`_validated_symmetric_on`, `_validated_single_key`)
+are unchanged. Branch structure is essentially the same shape (mixed →
+symmetric → asymmetric → no-form); cyclomatic branching and helper count did not
+materially increase. The change is proportionate to the finding: it corrects
+form *detection* to use presence, which is the minimal root-cause fix, and does
+not harden unrelated code or introduce a general metadata-validation framework.
+
+== 14. Tests added
+
+* *R003-IMP-001:* `test_malformed_or_absent_key_form_fails_closed`
+  (parameterized over the 9 malformed/absent/null/mixed shapes × warn/fail, plus
+  a path-named-in-message assertion);
+  `test_malformed_key_form_leaves_caller_state_and_provenance_unchanged`
+  (warn/fail); `test_malformed_key_form_drop_is_value_blind` (4 shapes);
+  `test_valid_asymmetric_record_still_detects_edit` (warn/fail);
+  `test_valid_symmetric_record_still_detects_edit` (warn/fail);
+  `test_absent_enrich_lookup_record_is_still_a_safe_noop` (warn/fail).
+* *R003-MIN-001:* `TestFormulaDuplicateHelperRejection` with symmetric and
+  asymmetric formula duplicate cases across `after_data` and `before_key`.
+
+== 15. Exact commands and results
+
+[source,bash]
+----
+cd ~/repos/spreadsheet-handling/core
+
+.venv/bin/pytest \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py
+# -> 187 passed
+
+.venv/bin/pytest
+# -> 2264 passed, 1 xfailed in 10.92s
+
+make domain-contracts-check
+# -> build/domain_contracts/domain_contract_health.json status: ok, errors: []
+
+git diff --check
+# -> clean
+----
+
+Asciidoctor was run on every changed `.adoc` (this artifact, the release notes,
+and the parent FTR) with only the expected build-supplied missing-attribute/
+include warnings and no syntax errors.
+
+== 16. Compatibility evidence
+
+A clean parent tree was extracted at `a1c834b^` (`b46ba9e`, original Slice-1
+runtime `c965431`) under `/tmp/xref_parent_c003`. A symmetric probe covering
+single-key and multi-key `enrich_lookup` plus the symmetric mismatch-policy path
+(valid `on` records: unchanged/edited `warn`, `fail` raise, `drop`, and a
+multi-key edited `warn`) was run against parent and current source; `diff`
+produced no output (`exact_equal`). The only intended change is that malformed
+or degraded mismatch provenance now fails closed; no valid symmetric or
+asymmetric record behavior changed. Full suite and domain-contract checks pass
+with no import cycle, private return-shape consumer, or mutation/copy regression.
+
+== 17. Remaining risks
+
+* Slice-2 durable persistence binding of `apply_derived_column_policy(drop)` to
+  the workbook-view carrier is unchanged and remains a Slice-2 concern; this
+  correction only tightens the in-memory mismatch contract.
+* End-to-end asymmetric XLSX/ODS parity across the persistence boundary remains a
+  parent-FTR/later-slice acceptance criterion.
+
+== 18. Review-004 readiness
+
+The one Important finding (R003-IMP-001) is closed at the root cause
+(presence-based form selection with fail-closed no-form handling) with
+parameterized warn/fail regression tests, caller-state/provenance safety, and
+preserved value-blind `drop`; the Minor duplicate-test discrepancy
+(R003-MIN-001) is closed by adding the missing formula-mode duplicate tests so
+the tracked matrix is truthful. Symmetric compatibility is proven by parent
+comparison. This correction does not accept Slice 1 — it is submitted for
+independent Review 004. No Slice-2 work was started.
+
+== 19. Commits
+
+* Commit 1 (runtime + tests + doc precision):
+  `fix(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): fail closed on malformed helper provenance`
+* Commit 2 (this correction artifact + parent-FTR progress update):
+  `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Correction 003`
+
+== 20. Final repository statuses
+
+* `core`: clean after both commits (see `git status --short`).
+* `worldbuilding`: untouched; `git status --short` empty; HEAD `83dc2bb`; no
+  commit made.
+* No push performed.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 1 CORRECTION 003 COMPLETE — PENDING INDEPENDENT REVIEW 004
