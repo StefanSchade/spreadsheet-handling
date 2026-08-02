@@ -578,3 +578,153 @@ def test_asymmetric_drop_mode_is_value_blind() -> None:
 
     assert "title" not in out["matrix"].columns
     assert "derived_column_findings" not in out
+
+
+# ---------------------------------------------------------------------------
+# Review 002 R002-IMP-002: mismatch verification must fail closed
+# ---------------------------------------------------------------------------
+
+
+def _enrich_spec(frames):
+    return frames["_meta"]["derived"]["sheets"]["matrix"]["enrich_lookup"]
+
+
+@_asym
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda s: s.__setitem__("source_key", "   "), r"source_key must be a single non-empty string"),
+        (lambda s: s.__setitem__("lookup_key", ""), r"lookup_key must be a single non-empty string"),
+        (lambda s: s.__setitem__("source_key", ["story_id"]), r"source_key must be a single non-empty string.*list"),
+        (lambda s: s.__setitem__("lookup_key", 123), r"lookup_key must be a single non-empty string.*int"),
+    ],
+)
+def test_asymmetric_malformed_key_metadata_raises(policy, mutate, match) -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+    mutate(_enrich_spec(frames))
+    with pytest.raises(ValueError, match=match):
+        apply_derived_column_policy(frames, source="matrix", policy=policy)
+
+
+@_asym
+def test_asymmetric_missing_payload_key_column_fail_raises() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+    # Drop the source key column from the payload -> cannot verify.
+    frames["matrix"] = frames["matrix"].drop(columns=["story_id"])
+    with pytest.raises(ValueError, match="Derived column policy failed"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+@_asym
+def test_asymmetric_missing_payload_key_column_warn_emits_unverifiable_finding() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+    frames["matrix"] = frames["matrix"].drop(columns=["story_id"])
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "unverifiable_enrich_lookup"
+    assert "story_id" in row["message"]
+
+
+@_asym
+def test_asymmetric_missing_lookup_key_column_fail_raises() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+    frames["stories"] = frames["stories"].drop(columns=["id"])
+    with pytest.raises(ValueError, match="Derived column policy failed"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+@_asym
+def test_asymmetric_missing_lookup_key_column_warn_emits_unverifiable_finding() -> None:
+    frames = _frames_with_asymmetric_lookup_helper(edited=True)
+    frames["stories"] = frames["stories"].drop(columns=["id"])
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    assert findings.iloc[0]["rule_type"] == "unverifiable_enrich_lookup"
+    assert "id" in findings.iloc[0]["message"]
+
+
+# --- Symmetric `on` shape validation ---------------------------------------
+
+
+def _symmetric_enrich_spec(frames):
+    return frames["_meta"]["derived"]["sheets"]["orders"]["enrich_lookup"]
+
+
+@pytest.mark.parametrize("policy", ["warn_on_mismatch", "fail_on_mismatch"])
+@pytest.mark.parametrize(
+    "on_value, match",
+    [
+        ("customer_id", r"on must be a non-empty list.*str"),
+        (123, r"on must be a non-empty list.*int"),
+        ({"customer_id": 1}, r"on must be a non-empty list.*dict"),
+        ([], r"on must be a non-empty list.*empty list"),
+        ([""], r"on\[0\] must be a non-empty string.*blank"),
+        ([123], r"on\[0\] must be a non-empty string.*int"),
+    ],
+)
+def test_symmetric_malformed_on_raises(policy, on_value, match) -> None:
+    frames = _frames_with_fk_and_lookup_helpers(edited_lookup=True)
+    _symmetric_enrich_spec(frames)["on"] = on_value
+    with pytest.raises(ValueError, match=match):
+        apply_derived_column_policy(frames, source="orders", policy=policy)
+
+
+def test_symmetric_valid_on_still_passes_and_detects_edit() -> None:
+    # Regression: a valid symmetric on list still value-checks correctly.
+    frames = _frames_with_fk_and_lookup_helpers(edited_lookup=True)
+    with pytest.raises(ValueError, match="derived_value_mismatch"):
+        apply_derived_column_policy(frames, source="orders", policy="fail_on_mismatch")
+
+
+# --- Valid records remain verifiable (regression guards) --------------------
+
+
+@_asym
+def test_asymmetric_null_key_valid_and_edit_detected() -> None:
+    stories = pd.DataFrame([
+        {"id": None, "title": "NullKey"},
+        {"id": "s2", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([
+        {"story_id": None, "title": "EDITED", "dyn": "a"},
+        {"story_id": "s2", "title": "Second", "dyn": "b"},
+    ])
+    meta = {
+        "derived": {"sheets": {"matrix": {"enrich_lookup": {
+            "lookup": "stories", "source_key": "story_id", "lookup_key": "id",
+            "helper_columns": ["title"],
+        }}}}
+    }
+    frames = {"_meta": meta, "stories": stories, "matrix": matrix}
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    # The null-keyed edited row is detected against the null-keyed canonical row.
+    assert len(findings) == 1
+    assert findings.iloc[0]["rule_type"] == "derived_value_mismatch"
+
+
+@_asym
+def test_asymmetric_duplicate_lookup_keys_first_occurrence_wins() -> None:
+    stories = pd.DataFrame([
+        {"id": "s1", "title": "First"},
+        {"id": "s1", "title": "Dup"},
+        {"id": "s2", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([
+        {"story_id": "s1", "title": "First", "dyn": "a"},
+        {"story_id": "s2", "title": "Second", "dyn": "b"},
+    ])
+    meta = {
+        "derived": {"sheets": {"matrix": {"enrich_lookup": {
+            "lookup": "stories", "source_key": "story_id", "lookup_key": "id",
+            "helper_columns": ["title"],
+        }}}}
+    }
+    frames = {"_meta": meta, "stories": stories, "matrix": matrix}
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    # First occurrence (First) wins deterministically -> unchanged row passes.
+    assert len(out["derived_column_findings"]) == 0

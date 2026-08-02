@@ -215,6 +215,38 @@ def test_add_lookup_helpers_yaml_asymmetric_equal_names_keeps_mode(tmp_path: Pat
     assert "on" not in prov
 
 
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_add_lookup_helpers_yaml_equal_name_helper_equals_key_rejected(tmp_path: Path) -> None:
+    """Equal-name explicit asymmetric mode rejects a helper equal to the key,
+    including through the YAML binding (review R002-IMP-001)."""
+    cfg_path = tmp_path / "pipeline.yaml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            pipeline:
+              - step: add_lookup_helpers
+                source: matrix_raw
+                lookup: stories
+                output: matrix
+                source_key: id
+                lookup_key: id
+                helpers:
+                  fields: [id]
+                missing: empty
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    frames = {
+        "stories": pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]}),
+        "matrix_raw": pd.DataFrame({"id": ["s1", "s2"], "dyn": ["x", "y"]}),
+    }
+
+    with pytest.raises(ValueError, match="authoritative source key"):
+        run_pipeline(frames, build_steps_from_yaml(str(cfg_path)))
+    assert "matrix" not in frames
+
+
 @pytest.mark.ftr("FTR-YAML-SAFE-STEP-KEYS-P4")
 def test_add_lookup_helpers_yaml_diagnoses_unquoted_legacy_on(tmp_path: Path) -> None:
     cfg_path = tmp_path / "pipeline.yaml"

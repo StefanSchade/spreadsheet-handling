@@ -1074,3 +1074,248 @@ def test_enrich_lookup_asymmetric_pair_ignores_policy_key_applies_non_key_settin
     assert prov["source_key"] == "story_id"
     assert prov["lookup_key"] == "id"
     assert prov["helper_columns"] == ["title"]
+
+
+# ---------------------------------------------------------------------------
+# Review 002 R002-IMP-001: equal-name asymmetric helper collision safety
+# ---------------------------------------------------------------------------
+
+
+def _matrix_id() -> pd.DataFrame:
+    """Source keyed by ``id`` (equal-name explicit asymmetric scenario)."""
+    return pd.DataFrame({
+        "id": ["s1", "s2"],
+        "dynamic_1": ["a", "b"],
+    })
+
+
+def _stories_id() -> pd.DataFrame:
+    return pd.DataFrame({
+        "id": ["s1", "s2"],
+        "title": ["First", "Second"],
+    })
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_equal_name_helper_equals_key_rejected_values() -> None:
+    frames = {"matrix": _matrix_id(), "stories": _stories_id()}
+    with pytest.raises(ValueError, match="authoritative source key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="id",
+            lookup_key="id",
+            helpers={"fields": ["id"]},
+            missing="empty",
+        )
+    # No output/provenance produced; caller frames unchanged.
+    assert "result" not in frames
+    assert "_meta" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_equal_name_mixed_helper_list_fails_atomically() -> None:
+    frames = {"matrix": _matrix_id(), "stories": _stories_id()}
+    with pytest.raises(ValueError, match="authoritative source key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="id",
+            lookup_key="id",
+            helpers={"fields": ["id", "title"]},  # mixed list must fail atomically
+            missing="empty",
+        )
+    assert "result" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_equal_name_policy_default_helper_equals_key_rejected() -> None:
+    frames = {
+        "matrix": _matrix_id(),
+        "stories": _stories_id(),
+        "_meta": {
+            "helper_policies": {
+                "lookup": {
+                    "stories": {"default_helpers": ["id"]},
+                }
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="authoritative source key"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="id",
+            lookup_key="id",
+            helpers="default",  # policy-derived helper equal to the key
+        )
+    assert "result" not in frames
+    assert "derived" not in frames.get("_meta", {})
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_equal_name_sort_by_key_with_title_helper_succeeds() -> None:
+    """sort_by on the (equal) key sorts the output key; it is not a helper."""
+    matrix = pd.DataFrame({"id": ["s2", "s1"], "dynamic_1": ["b", "a"]})
+    frames = {"matrix": matrix, "stories": _stories_id()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"sort_by": ["id"]},
+        missing="empty",
+    )
+    result = out["result"]
+    assert list(result["id"]) == ["s1", "s2"]
+    assert list(result["title"]) == ["First", "Second"]
+    # Source key preserved as authoritative values, not overwritten.
+    assert "title" in result.columns
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_equal_name_normal_helper_still_works() -> None:
+    frames = {"matrix": _matrix_id(), "stories": _stories_id()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        missing="empty",
+    )
+    assert list(out["result"]["title"]) == ["First", "Second"]
+
+
+def test_enrich_lookup_symmetric_helper_equals_key_unchanged_legacy() -> None:
+    """Legacy symmetric behaviour is NOT tightened: helper == key does not raise."""
+    frames = {"matrix": _matrix_id(), "stories": _stories_id()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        key="id",
+        helpers={"fields": ["id"]},
+        missing="empty",
+    )
+    # Symmetric mode still accepts this (unchanged); the key remains present.
+    assert list(out["result"]["id"]) == ["s1", "s2"]
+
+
+# ---------------------------------------------------------------------------
+# Review 002 R002-IMP-003: duplicate helper requests
+# ---------------------------------------------------------------------------
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_duplicate_helper_values_default_rejected() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="Duplicate helper field"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title", "title"]},
+            missing="empty",
+        )
+    assert "result" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_duplicate_helper_values_before_key_rejected() -> None:
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    with pytest.raises(ValueError, match="Duplicate helper field"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers={"fields": ["title", "title"]},
+            order={"helper_position": "before_key"},
+            missing="empty",
+        )
+    assert "result" not in frames
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_duplicate_policy_default_helpers_rejected() -> None:
+    frames = {
+        "matrix": _matrix_story(),
+        "stories": _stories(),
+        "_meta": {
+            "helper_policies": {
+                "lookup": {"stories": {"default_helpers": ["title", "title"]}}
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="Duplicate helper field"):
+        enrich_lookup(
+            frames,
+            source="matrix",
+            lookup="stories",
+            output="result",
+            source_key="story_id",
+            lookup_key="id",
+            helpers="default",
+        )
+    assert "result" not in frames
+    assert "derived" not in frames.get("_meta", {})
+
+
+@pytestmark_asymmetric
+def test_enrich_lookup_helper_also_used_as_sort_by_is_valid() -> None:
+    """A single helper that is also the sort key is not a duplicate helper."""
+    frames = {"matrix": _matrix_story(), "stories": _stories()}
+    out = enrich_lookup(
+        frames,
+        source="matrix",
+        lookup="stories",
+        output="result",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"sort_by": ["title"]},
+        missing="empty",
+    )
+    result = out["result"]
+    # Sorted by title; helper present exactly once; provenance lists it once.
+    assert list(result["title"]) == ["First", "Second"]
+    assert list(result.columns).count("title") == 1
+    prov = out["_meta"]["derived"]["sheets"]["result"]["enrich_lookup"]
+    assert prov["helper_columns"] == ["title"]
+
+
+def test_enrich_lookup_duplicate_helper_symmetric_also_rejected() -> None:
+    """The duplicate-helper guard is generic: symmetric duplicates also fail.
+
+    The same duplicate-label/duplicate-provenance defect existed in symmetric
+    mode via the retained ``fields`` list; rejecting literal duplicates is a
+    safe, backward-compatible tightening.
+    """
+    frames = _frames()
+    with pytest.raises(ValueError, match="Duplicate helper field"):
+        enrich_lookup(
+            frames,
+            source="variable_usage_matrix_raw",
+            lookup="variables",
+            output="result",
+            on="ID",
+            helpers={"fields": ["value_label_de", "value_label_de"]},
+        )

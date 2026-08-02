@@ -78,7 +78,12 @@ def enrich_lookup(
         reconciled against the policy ``key`` and fails on conflict. A requested
         helper or temporary lookup sort field that equals either the source key
         or the lookup key is rejected with a ``ValueError`` before projection,
-        because it would leak the lookup key or overwrite the source key.
+        because it would leak the lookup key or overwrite the source key. This
+        safety follows the selected asymmetric mode even when the two key names
+        are *equal*: the single key is the authoritative source key and cannot
+        also be requested as a helper (sorting the output by that key stays
+        valid). A duplicate requested helper name is likewise rejected before
+        projection.
     lookup_key:
         Lookup-side join key for the asymmetric mode; the companion of
         ``source_key``.
@@ -143,6 +148,7 @@ def enrich_lookup(
     _check_duplicate_lookup_keys(lookup_df, lookup_keys, lookup)
 
     fields = _resolve_fields(helpers, lookup, frames)
+    _check_duplicate_helper_fields(fields, lookup)
     sort_by = order_cfg.get("sort_by")
     projection_fields = _fields_with_sort_helpers(fields, source_keys, sort_by, lookup_df)
     if projection_fields is not None:
@@ -242,6 +248,37 @@ def _check_column_conflict(
         )
 
 
+def _check_duplicate_helper_fields(fields: list[str] | None, lookup: str) -> None:
+    """Reject duplicate requested helper names before any projection/output.
+
+    A duplicate entry in the resolved helper ``fields`` (whether spelled inline
+    in ``helpers.fields`` or supplied by a helper policy's ``default_helpers``)
+    would otherwise produce duplicate output labels under ``before_key`` and
+    duplicate ``helper_columns`` provenance in both values and formula modes
+    (review R002-IMP-003). The rule is deterministic and identical across value
+    modes and helper positions: each helper column may be requested at most
+    once. This is intentionally a generic guard — the same silent
+    duplicate-label/duplicate-provenance defect existed in symmetric mode via
+    the retained ``fields`` list, and rejecting literal duplicates is a safe,
+    backward-compatible tightening (no valid pipeline requests the same helper
+    twice). A helper that is *also* named in ``sort_by`` is not a duplicate
+    helper and stays valid.
+    """
+    if fields is None:
+        return
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for field in fields:
+        if field in seen and field not in duplicates:
+            duplicates.append(field)
+        seen.add(field)
+    if duplicates:
+        raise ValueError(
+            f"Duplicate helper field(s) {duplicates} requested for lookup {lookup!r}; "
+            f"each helper column may be requested at most once."
+        )
+
+
 def _check_key_helper_collision(
     resolved: _ResolvedKeys,
     projection_fields: list[str],
@@ -250,11 +287,10 @@ def _check_key_helper_collision(
 ) -> None:
     """Reject helper/sort fields that collide with an asymmetric key role.
 
-    In asymmetric mode with distinct key names, ``_build_helper_projection``
-    renames the lookup key to the source key before the merge, and formula
-    mode assigns cells by field name. A projected field (a requested helper or
-    a temporary lookup sort helper) that equals either key role would therefore
-    silently:
+    In asymmetric mode ``_build_helper_projection`` renames the lookup key to
+    the source key before the merge, and formula mode assigns cells by field
+    name. A projected field (a requested helper or a temporary lookup sort
+    helper) that equals either key role would therefore silently:
 
     * expose the lookup key as an output column (field == lookup key);
     * overwrite the authoritative source key (field == source key); or
@@ -264,16 +300,32 @@ def _check_key_helper_collision(
     Rather than surfacing as a pandas duplicate-label or ``KeyError`` after the
     merge (or, in formula mode, silently corrupting the output), these requests
     fail here with a clear domain ``ValueError`` before any projection, merge,
-    or formula assignment. Symmetric mode and the equal-name asymmetric case
-    (where the rename is a no-op) keep their established behaviour.
+    or formula assignment.
+
+    Safety follows the *selected public mode*, not label inequality (review
+    R002-IMP-001). In explicit asymmetric mode with *equal* key names, the
+    single key is the authoritative source key and cannot simultaneously be an
+    independent derived helper; a requested helper equal to it is rejected as
+    one collision spanning both roles. A source/output-key sort
+    (``sort_by=[<key>]``) is *not* a projected helper — it never enters
+    ``projection_fields`` because it equals the join key — so it stays valid.
+    Symmetric mode keeps its established behaviour.
     """
     if not resolved.is_asymmetric:
         return
     source_key = resolved.source_key
     lookup_key = resolved.lookup_key
-    if source_key == lookup_key:
-        return
     for field in projection_fields:
+        if source_key == lookup_key:
+            if field == source_key:
+                raise ValueError(
+                    f"Helper/sort field {field!r} collides with the asymmetric join key "
+                    f"for source {source!r} / lookup {lookup!r}; in explicit asymmetric "
+                    f"mode {field!r} is the authoritative source key and cannot also be "
+                    f"requested as an independent derived helper. Use a different lookup "
+                    f"value column, or sort by the key without requesting it as a helper."
+                )
+            continue
         if field == lookup_key:
             raise ValueError(
                 f"Helper/sort field {field!r} collides with the asymmetric lookup key "

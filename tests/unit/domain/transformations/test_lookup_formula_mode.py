@@ -491,93 +491,165 @@ class TestAsymmetricFormulaMode:
         assert "matrix" not in frames
 
 
+def _nontrivial_asymmetric_frames() -> dict[str, Any]:
+    """Nontrivial layout that makes lookup argument order load-bearing (IMP-004).
+
+    * source key ``story_id`` is *not* the first source column (col B by
+      default; col C after ``before_key`` reordering);
+    * the lookup key ``id`` is *not* the first lookup column (col D) and the
+      lookup value ``title`` is at a *different, non-adjacent* position (col B),
+      separated by unrelated columns.
+
+    A renderer that emitted positional columns, or swapped the XLOOKUP key and
+    value ranges, would produce a different exact formula and fail the tests.
+    """
+    entities = pd.DataFrame({
+        "misc1": ["m1", "m2"],   # col A (unrelated)
+        "title": ["First", "Second"],  # col B (lookup value)
+        "misc2": ["x", "y"],     # col C (unrelated)
+        "id": ["s1", "s2"],      # col D (lookup key)
+    })
+    matrix = pd.DataFrame({
+        "P_lead": ["p1", "p2"],  # col A (leading non-key column)
+        "story_id": ["s1", "s2"],  # col B (source key, not first)
+        "extra": ["e1", "e2"],   # col C
+    })
+    return {"entities": entities, "matrix_raw": matrix, "_meta": {}}
+
+
+def _render_asymmetric_matrix(helper_position: str):
+    """Enrich + view + return a render plan for the nontrivial layout.
+
+    Physical sheet name ``"Entity Lookup"`` intentionally contains a space to
+    exercise sheet-name quoting in both backends.
+    """
+    from spreadsheet_handling.domain.workbook_views import configure_workbook_view
+    from spreadsheet_handling.io_backends.spreadsheet_contract import (
+        build_spreadsheet_render_plan,
+    )
+
+    enriched = enrich_lookup(
+        _nontrivial_asymmetric_frames(),
+        source="matrix_raw",
+        lookup="entities",
+        output="matrix",
+        source_key="story_id",
+        lookup_key="id",
+        helpers={"fields": ["title"]},
+        order={"helper_position": helper_position},
+        missing="empty",
+        helper_value_mode="formula",
+    )
+    viewed = configure_workbook_view(
+        enriched,
+        sheets=[
+            {"frame": "entities", "sheet": "Entity Lookup"},
+            {"frame": "matrix", "sheet": "Matrix"},
+        ],
+    )
+    return build_spreadsheet_render_plan(viewed, viewed.get("_meta"))
+
+
 class TestAsymmetricFormulaRendering:
+    """Load-bearing ordered-argument assertions (review R002-IMP-004).
+
+    Exact formula text is asserted so a swap of the XLOOKUP key and value
+    ranges — or a positional renderer — fails. The lookup key ``id`` lives at
+    column D and the value ``title`` at column B, so the correct order is
+    ``key range = $D$..``, ``value range = $B$..``.
+    """
 
     @_asymmetric
-    def test_xlsx_renders_asymmetric_lookup_formula(self, tmp_path: Path) -> None:
-        from spreadsheet_handling.domain.workbook_views import configure_workbook_view
-        from spreadsheet_handling.io_backends.spreadsheet_contract import (
-            build_spreadsheet_render_plan,
-        )
+    def test_xlsx_default_after_data_exact_ordered_formula(self, tmp_path: Path) -> None:
         from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
         from openpyxl import load_workbook
 
-        enriched = enrich_lookup(
-            _asymmetric_frames(),
-            source="matrix_raw",
-            lookup="stories",
-            output="matrix",
-            source_key="story_id",
-            lookup_key="id",
-            helpers={"fields": ["title"]},
-            missing="empty",
-            helper_value_mode="formula",
-        )
-        viewed = configure_workbook_view(
-            enriched,
-            sheets=[
-                {"frame": "stories", "sheet": "Entities"},
-                {"frame": "matrix", "sheet": "Matrix"},
-            ],
-        )
-        plan = build_spreadsheet_render_plan(viewed, viewed.get("_meta"))
         out = tmp_path / "asym.xlsx"
-        render_workbook(plan, out)
+        render_workbook(_render_asymmetric_matrix("after_data"), out)
 
-        wb = load_workbook(out)
-        ws = wb["Matrix"]
-        # Matrix columns: story_id (1, source key), P-001 (2), title helper (3).
-        formula_text = str(ws.cell(row=2, column=3).value)
-        assert "XLOOKUP" in formula_text
-        # Source key cell ($A2), lookup key range (Entities col A), lookup value
-        # range (Entities col B) after physical sheet-name resolution.
-        assert "$A2" in formula_text
-        assert "Entities" in formula_text
-        assert "$A$2:$A$3" in formula_text  # lookup key (id) range
-        assert "$B$2:$B$3" in formula_text  # lookup value (title) range
+        ws = load_workbook(out)["Matrix"]
+        # Matrix cols: P_lead(A), story_id(B, source key), extra(C), title(D helper).
+        formula = str(ws.cell(row=2, column=4).value)
+        assert formula == (
+            "=XLOOKUP($B2,'Entity Lookup'!$D$2:$D$3,'Entity Lookup'!$B$2:$B$3,\"\")"
+        )
 
     @_asymmetric
-    def test_ods_renders_asymmetric_lookup_formula(self, tmp_path: Path) -> None:
-        from spreadsheet_handling.domain.workbook_views import configure_workbook_view
-        from spreadsheet_handling.io_backends.spreadsheet_contract import (
-            build_spreadsheet_render_plan,
+    def test_xlsx_before_key_exact_ordered_formula(self, tmp_path: Path) -> None:
+        from spreadsheet_handling.io_backends.xlsx.openpyxl_renderer import render_workbook
+        from openpyxl import load_workbook
+
+        out = tmp_path / "asym.xlsx"
+        render_workbook(_render_asymmetric_matrix("before_key"), out)
+
+        ws = load_workbook(out)["Matrix"]
+        # Matrix cols: P_lead(A), title(B helper), story_id(C, source key), extra(D).
+        formula = str(ws.cell(row=2, column=2).value)
+        assert formula == (
+            "=XLOOKUP($C2,'Entity Lookup'!$D$2:$D$3,'Entity Lookup'!$B$2:$B$3,\"\")"
         )
+
+    @_asymmetric
+    def test_ods_default_after_data_exact_ordered_formula(self, tmp_path: Path) -> None:
         from spreadsheet_handling.io_backends.ods.odf_renderer import render_workbook
         from odf.opendocument import load as load_ods
         from odf.table import TableCell
 
-        enriched = enrich_lookup(
-            _asymmetric_frames(),
-            source="matrix_raw",
-            lookup="stories",
-            output="matrix",
-            source_key="story_id",
-            lookup_key="id",
-            helpers={"fields": ["title"]},
-            missing="empty",
-            helper_value_mode="formula",
-        )
-        viewed = configure_workbook_view(
-            enriched,
-            sheets=[
-                {"frame": "stories", "sheet": "Entities"},
-                {"frame": "matrix", "sheet": "Matrix"},
-            ],
-        )
-        plan = build_spreadsheet_render_plan(viewed, viewed.get("_meta"))
         out = tmp_path / "asym.ods"
-        render_workbook(plan, out)
-        assert out.exists()
+        render_workbook(_render_asymmetric_matrix("after_data"), out)
 
         doc = load_ods(str(out))
         formulas = [
-            cell.getAttribute("formula")
-            for cell in doc.getElementsByType(TableCell)
-            if cell.getAttribute("formula")
+            c.getAttribute("formula")
+            for c in doc.getElementsByType(TableCell)
+            if c.getAttribute("formula")
         ]
-        joined = " ".join(f for f in formulas if f)
-        assert "XLOOKUP" in joined
-        # Source key cell, lookup key range, and lookup value range on Entities.
-        assert "[.A2]" in joined
-        assert "[Entities.A2:Entities.A3]" in joined  # lookup key (id) range
-        assert "[Entities.B2:Entities.B3]" in joined  # lookup value (title) range
+        assert formulas[0] == (
+            "of:=XLOOKUP([.B2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
+            "['Entity Lookup'.B2:'Entity Lookup'.B3];\"\")"
+        )
+
+    @_asymmetric
+    def test_ods_before_key_exact_ordered_formula(self, tmp_path: Path) -> None:
+        from spreadsheet_handling.io_backends.ods.odf_renderer import render_workbook
+        from odf.opendocument import load as load_ods
+        from odf.table import TableCell
+
+        out = tmp_path / "asym.ods"
+        render_workbook(_render_asymmetric_matrix("before_key"), out)
+
+        doc = load_ods(str(out))
+        formulas = [
+            c.getAttribute("formula")
+            for c in doc.getElementsByType(TableCell)
+            if c.getAttribute("formula")
+        ]
+        assert formulas[0] == (
+            "of:=XLOOKUP([.C2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
+            "['Entity Lookup'.B2:'Entity Lookup'.B3];\"\")"
+        )
+
+
+class TestEqualNameAsymmetricFormulaCollision:
+    """Equal-name explicit asymmetric formula collision coverage (R002-IMP-001)."""
+
+    @_asymmetric
+    def test_equal_name_helper_equals_key_rejected_formula(self) -> None:
+        frames = {
+            "stories": pd.DataFrame({"id": ["s1", "s2"], "title": ["First", "Second"]}),
+            "matrix_raw": pd.DataFrame({"id": ["s1", "s2"], "P-001": ["E", "A"]}),
+            "_meta": {},
+        }
+        with pytest.raises(ValueError, match="authoritative source key"):
+            enrich_lookup(
+                frames,
+                source="matrix_raw",
+                lookup="stories",
+                output="matrix",
+                source_key="id",
+                lookup_key="id",
+                helpers={"fields": ["id"]},
+                missing="empty",
+                helper_value_mode="formula",
+            )
+        assert "matrix" not in frames
