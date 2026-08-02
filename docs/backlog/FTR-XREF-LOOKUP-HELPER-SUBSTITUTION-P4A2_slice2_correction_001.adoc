@@ -1,0 +1,434 @@
+= Slice 2 Correction 001: declaration-bound guard + maintained orchestration proof (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Correction date:: 2026-08-02
+Author:: Claude (Opus 4.8 High)
+Scope:: Slice 2 only. Closes Slice 2 Review 001 findings XREF-S2-R001-IMP-001,
+XREF-S2-R001-IMP-002, and (opportunistically) XREF-S2-R001-MIN-001.
+Authority:: `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice2_review_001.adoc`.
+Runtime change:: *NONE.*
+
+== 1. Baseline (including unrelated `7448902`)
+
+[cols="2,4,4"]
+|===
+| Repository / commit | Expected | Verified at start
+
+| Core HEAD
+| `7448902` `docs(human_readability_review): document findings for fk helper`
+| `7448902c47b844d790f817a36ae7c858e34fcce3`; clean
+
+| Slice-2 review commit
+| `4e8f7ec` `docs(...): review Slice 2 implementation`
+| present immediately before HEAD
+
+| Slice-2 implementation record
+| `be9d196`
+| present
+
+| Slice-2 proof/test commit
+| `83dfcab`
+| present
+
+| Worldbuilding HEAD
+| `83dc2bb`
+| `83dc2bb6a498c8a8ddc5a785ca7aeb0bccad4e09`; clean
+|===
+
+`7448902` is an *unrelated* human-readability review commit that adds only
+`docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc`
+(726 insertions, one file). It is a protected baseline commit that happens to
+follow the Slice-2 review commit. It was not amended, reverted, squashed, edited,
+moved, or included in any correction commit. `git diff 7448902 -- <that file>`
+produced no output at the end of this correction (section 25).
+
+Both repositories began clean.
+
+== 2. Review-001 finding table
+
+[cols="2,1,5"]
+|===
+| Finding | Severity | Disposition in this correction
+
+| XREF-S2-R001-IMP-001 — the documented postcondition cannot detect the missing
+  declaration it is said to expose
+| Important
+| *Closed.* Corrected user guide, release note, and implementation-artifact
+  wording to state the declaration-bound limitation; strengthened the tracked
+  negative to run drop-plus-guard and assert the guard passes while `title`
+  survives; added a declaration-present control. No name inference; Slice-3
+  static check preserved.
+
+| XREF-S2-R001-IMP-002 — no maintained end-to-end public orchestration test
+  covers the exact selected route
+| Important
+| *Closed.* Added one maintained end-to-end test through the `orchestrate()`
+  application entry point across a real XLSX carrier, exercising the exact
+  reverse sequence in a single configured pipeline, with a physical
+  workbook-cell edit and canonical-equality + edited-title-discard assertions.
+
+| XREF-S2-R001-MIN-001 — dynamic-axis prose overstates what the fixture
+  configuration omits
+| Minor
+| *Closed.* Narrowed the implementation-artifact statement to the fact proven:
+  the inbound cleanup/inverse omit `value_columns`; the forward fixture supplies
+  the runtime axes to `contract_xref.column_keys`.
+|===
+
+== 3. Exact declaration-bound guard contract
+
+`apply_derived_column_policy` and `validate_references`'s `no_helper_columns`
+rule read the *same* durable declaration,
+`_meta.sheets.<visible-sheet>.helper_columns`. The guard is therefore a
+*declaration-bound cleanup postcondition, not a declaration-completeness check*.
+
+Declaration present (`helper_columns: [title]`):
+
+* cleanup removes `title`;
+* the guard *fails* before cleanup while the declared helper remains and *passes*
+  after successful cleanup;
+* the guard catches an omitted or ineffective cleanup that leaves a *declared*
+  helper behind.
+
+Declaration absent or mistyped:
+
+* Core does not infer `title` by name; cleanup obtains an empty helper set and
+  does nothing;
+* the guard *also* obtains an empty helper set, reports no finding, and *passes*;
+* `title` survives and the state is unsafe for the inverse though the guard
+  passed.
+
+Because both steps bind to the same declaration, pairing the drop with
+`no_helper_columns` cannot detect a missing declaration.
+
+== 4. Missing-declaration drop-plus-guard result
+
+`test_no_helper_columns_guard_cannot_detect_omitted_declaration` runs the exact
+documented sequence with the declaration omitted, through public config-built
+steps and a real XLSX roundtrip:
+
+* durable helper list absent/empty after readback;
+* transient `_meta.derived` absent (and not recreated by cleanup);
+* `apply_derived_column_policy(source="Matrix View", policy=drop)` is a no-op —
+  `title` survives (no name inference);
+* `validate_references(mode=fail, no_helper_columns on "Matrix View")` *passes*
+  (does not raise) while `title` is still present;
+* the same rule under `mode=warn` emits an empty findings frame;
+* the surviving unclassified `title` is then melted into `character_name` by
+  `expand_xref`, proving the unguarded state is genuinely unsafe.
+
+This is recorded as a negative contract test of the current limitation, not a
+desired safety outcome.
+
+== 5. Slice-3 declaration-check ownership
+
+Unchanged and reaffirmed: a consumer-owned static/configuration check must verify
+`helper_columns: [title]` on all five Worldbuilding matrix sheets. The inbound
+`no_helper_columns` rule remains defense in depth for *declaration-present*
+cleanup failures, not declaration completeness. Core adds no name inference and
+no declaration auto-repair.
+
+== 6. Selected orchestration entry point
+
+`spreadsheet_handling.application.orchestrator.orchestrate(input=, output=,
+steps=)` — the maintained application entry point used by `sheets-run` and the
+existing orchestrator persistence-boundary integration tests. It loads frames
+from the input backend, runs the configured steps, applies the orchestrator-owned
+persistence-boundary projection, and writes the output backend. Because
+`orchestrate()` owns one configured direction per invocation, the forward and
+reverse directions are two invocations connected by a real XLSX carrier — an
+arrangement the review explicitly permits. No test-only orchestration wrapper was
+invented; the convention mirrors
+`tests/integration/pipeline/test_orchestrator_persistence_boundary.py`.
+
+== 7. Forward public configuration
+
+`orchestrate(input={kind: json_dir, path: canonical}, output={kind: xlsx, path:
+workbook.xlsx}, steps=...)` with the configured steps:
+
+[source,yaml]
+----
+- step: contract_xref
+  relation: role_relation
+  output: role_matrix
+  row_keys: [story_id]
+  column_key: character_name
+  value: value
+  column_keys: [Alice, Bob, Carol]
+  name: role
+- step: add_lookup_helpers
+  source: role_matrix
+  lookup: stories
+  output: role_matrix
+  source_key: story_id      # asymmetric join (Slice 1)
+  lookup_key: id
+  helpers: { fields: [title] }
+  order: { helper_position: before_key }
+  missing: empty
+- step: configure_workbook_view
+  sheets:
+    - { frame: role_matrix, sheet: Matrix View, helper_columns: [title] }
+    - { frame: stories, sheet: Story Lookup }
+----
+
+Logical frame `role_matrix` renders as the distinct visible sheet `Matrix View`
+(name containing a space).
+
+== 8. Carrier / edit method
+
+Carrier: a real XLSX file written and read by the maintained orchestrator saver
+/ loader routing (`ExcelBackend`). One backend is sufficient for the macro-flow
+proof; direct Slice-2 tests already prove XLSX and ODS parity.
+
+Edit: a *physical workbook-cell edit* between export and import — `openpyxl`
+loads `workbook.xlsx`, locates the `title` column in the `Matrix View` sheet
+header, sets the first data cell to `EDITED-TITLE-XYZ`, and saves. This is a
+genuine spreadsheet-file mutation, not a post-readback DataFrame mutation. The
+carrier read-in state is then independently inspected (public backend read)
+before the reverse orchestration runs.
+
+== 9. Reverse public configuration
+
+`orchestrate(input={kind: xlsx, path: workbook.xlsx}, output={kind: json_dir,
+path: reimported}, steps=...)` with a single configured reverse pipeline:
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: Matrix View
+  policy: drop
+- step: validate_references
+  mode: fail
+  rules:
+    - { type: no_helper_columns, frame: Matrix View }
+- step: apply_workbook_view_sheet_mappings
+  logical_frames: [role_matrix, stories]
+- step: expand_xref
+  matrix: role_matrix
+  output: role_relation
+  row_keys: [story_id]
+  column_key: character_name
+  value: value
+  drop_empty: true
+  name: role
+----
+
+One reverse configuration, one orchestration invocation. The reverse sequence is
+not split into separate `run_pipeline` fragments.
+
+== 10. Exact macro-flow ordering
+
+----
+json_dir canonical
+  -> orchestrate(forward: contract_xref -> add_lookup_helpers -> configure_workbook_view)
+  -> XLSX carrier (persistence boundary projects _meta)
+  -> physical title cell edit
+  -> orchestrate(reverse:
+       apply_derived_column_policy(source="Matrix View", drop)
+       -> validate_references(no_helper_columns on "Matrix View", fail)
+       -> apply_workbook_view_sheet_mappings(Matrix View -> role_matrix)
+       -> expand_xref(role_matrix))
+  -> json_dir canonical
+----
+
+== 11. Metadata identity and carrier assertions
+
+At the independently inspected carrier read-in state:
+
+* the actual physical sheet is `Matrix View`; `role_matrix` is not a workbook
+  key;
+* the imported payload contains the edited `title` (`EDITED-TITLE-XYZ`);
+* transient `_meta.derived` is absent;
+* durable `_meta.sheets["Matrix View"].helper_columns == ["title"]`;
+* the `sheet_mappings` entry maps `Matrix View -> role_matrix`.
+
+After the reverse orchestration:
+
+* mapping produced logical `role_matrix`; the visible `Matrix View` key is gone;
+* the inverse received no `title` column;
+* no Python `.drop(...)` performed the cleanup and no manual re-key performed the
+  mapping (all steps are config-built registered names); no static inbound
+  `value_columns` list is used.
+
+== 12. Canonical equality result
+
+The reverse-produced `role_relation` equals the original normalized canonical
+relation (`pd.testing.assert_frame_equal` after stable sort on
+`[story_id, character_name]`, `check_dtype=False`): the four rows
+`(s1,Alice,hero) (s1,Bob,sidekick) (s2,Alice,villain) (s2,Carol,extra)`.
+
+== 13. Edited-title result
+
+The physically edited `EDITED-TITLE-XYZ` is discarded under value-blind `drop`:
+`title` is absent from the relation columns, absent from `character_name`, and
+`EDITED-TITLE-XYZ` is absent from the `value` column.
+
+== 14. Authoritative lookup result
+
+The authoritative lookup `stories.title` is unchanged after the roundtrip:
+`["First Story", "Second Story"]`. The read-only helper is never written back.
+
+== 15. Direct XLSX/ODS evidence retained
+
+The existing direct tests are unchanged and still pass, preserving backend
+parity and the identity timeline:
+
+* `test_persistence_boundary_strips_transient_keeps_durable` (XLSX+ODS);
+* `test_inbound_binding_roundtrip_ordinary_xref` (parametrized XLSX+ODS);
+* `test_inbound_binding_compact_multiaxis_inverse`;
+* `test_dynamic_axis_genericity` (two axis shapes);
+* `test_wrong_order_mapping_before_cleanup_leaves_title`;
+* `test_forward_materializes_helper_before_key_and_durable_declaration`;
+* `test_no_helper_columns_postcondition_fails_when_helper_present`.
+
+The new orchestrator test supplements these; it does not replace them. The
+five-surface Worldbuilding read-only probe from the implementation slice is
+unaffected (no shared fixture or documentation claim about it changed), so it was
+not re-run for this pure macro-flow/docs correction.
+
+== 16. Dynamic-axis wording correction (MIN-001)
+
+Implementation-artifact section 17 no longer says "No runtime column is
+enumerated in configuration." It now states: the inbound cleanup and inverse do
+not enumerate `value_columns`; cleanup preserves whichever dynamic matrix columns
+are present, and the forward fixture supplies each parametrized runtime axis set
+to `contract_xref.column_keys`.
+
+== 17. Changed files
+
+* `tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py`
+  — strengthened missing-declaration negative
+  (`test_no_helper_columns_guard_cannot_detect_omitted_declaration`), added
+  `test_declaration_present_guard_fails_before_and_passes_after_cleanup`, added
+  `test_orchestrated_public_roundtrip_edited_title_discarded`; new imports
+  (`orchestrate`, `write_json_dir`, `openpyxl`) and updated module docstring.
+* `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+  — replaced the false "observable failure" claim with the declaration-bound
+  guard IMPORTANT admonition.
+* `docs/release_notes/release_notes.adoc` — corrected the Slice-2 bullet's guard
+  wording.
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice2_implementation_001.adoc`
+  — sections 10/11 guard wording, section 17 MIN-001, section 25 residual risks.
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice2_correction_001.adoc`
+  — this artifact.
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2.adoc` — Slice-2 progress
+  line.
+
+No runtime source, registry, persistence-projection, workbook-mapping, XRef
+inverse, `project_by_role`, `resolve_column_roles`, or Project-Memory file was
+changed. The unrelated `7448902` review file was not touched.
+
+== 18. Runtime-change assessment
+
+*NONE.* No orchestrator defect was found; the maintained public route runs
+without any runtime modification. The correction is tests and documentation only.
+No stop condition fired: the orchestrator ran the exact reverse ordering, public
+entry points addressed the visible sheet name with a space, application
+persistence retained the durable helper declaration, and no manual metadata
+injection after readback was required (the read-in inspection is a public backend
+read, not an injection).
+
+== 19. Test infrastructure / complexity assessment
+
+The orchestrator test reuses existing repository infrastructure: `orchestrate()`,
+`write_json_dir`, `build_steps_from_config`, and the same real backends already
+used by Slice 2. The only added machinery is a small
+`_edit_physical_title_cell` helper using `openpyxl` (already a project
+dependency) to perform the physical workbook edit — minimal, single-purpose, no
+new runtime callable. The strengthened negative and the control test reuse the
+existing fixtures and step builders. Net test delta: two additional tests (12
+total in the module).
+
+== 20. Tests and exact commands/results
+
+[source,bash]
+----
+# Corrected module
+.venv/bin/pytest -o addopts='' \
+  tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py -q
+# 12 passed
+
+# Focused suites (module + orchestrator boundary + WV + policy + validation +
+# enrich + persistence + ods/xlsx parity + step registration)
+.venv/bin/pytest -o addopts='' \
+  tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/test_workbook_views.py \
+  tests/unit/domain/validations/test_reference_validations.py \
+  tests/integration/pipeline/test_configured_workbook_view_reimport_roundtrip.py \
+  tests/integration/pipeline/test_orchestrator_persistence_boundary.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/pipeline/test_persistence_boundary.py \
+  tests/integration/io_backends/test_ods_xlsx_parity.py \
+  tests/unit/pipeline/test_step_registration.py -q
+# 270 passed
+
+# Full suite / contracts / whitespace
+.venv/bin/pytest
+# 2276 passed, 1 xfailed
+
+make domain-contracts-check
+# status: ok
+
+git diff --check
+# exit 0
+
+# Unrelated review file untouched
+git diff 7448902 -- \
+  docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc
+# no output
+----
+
+Asciidoctor ran clean on every changed `.adoc` (section 23 lists commits).
+
+== 21. Remaining risks
+
+* The declaration-completeness gap is real and now *truthfully documented and
+  tracked*; it is closed only by the Slice-3 consumer-owned static declaration
+  check. Until Slice 3 lands, a consumer that omits `helper_columns: [title]`
+  gets a passing guard and an unsafe inverse — the negative test makes this
+  explicit.
+* The macro-flow proof uses one carrier (XLSX). ODS parity remains covered by
+  the retained direct parametrized test, not by the orchestrator test; a
+  regression specific to ODS *through the orchestrator saver/loader* for this
+  exact route would not be caught by the new test alone. Judged acceptable per
+  the review (duplicating every carrier through the orchestrator is unnecessary).
+
+== 22. Independent Review-002 readiness
+
+Both Important findings are closed with tracked evidence and both Minor wording
+issues corrected; no runtime changed; protected surfaces and the unrelated
+`7448902` file are untouched; the full suite, contracts, and whitespace checks
+are green. Slice 2 is ready for independent Review 002. This artifact does not
+claim acceptance.
+
+== 23. Commits
+
+* `test(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): close Slice 2 orchestration proof`
+  — corrected/added tests + user-guide and release-note corrections + dynamic-axis
+  wording precision.
+* `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 2 correction`
+  — this correction artifact + implementation-artifact wording fixes +
+  parent-FTR Slice-2 progress line.
+
+(Exact hashes recorded in the untracked checkpoint after commit; no push; no
+branch switch; no Worldbuilding commit.)
+
+== 24. Repository statuses
+
+* Core: clean at `7448902` before the two correction commits; full suite green
+  (2276 passed, 1 xfailed); contracts ok; `git diff --check` clean.
+* Worldbuilding: clean and unchanged at `83dc2bb` throughout; no read-only probe
+  needed to be re-run for this macro-flow/docs correction.
+
+== 25. Unrelated `7448902` content untouched
+
+`git diff 7448902 -- docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc`
+produced no output; `git show --stat --oneline 7448902` shows the single 726-line
+review file. The commit was not amended, reverted, squashed, edited, moved, or
+included in any correction commit.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 2 CORRECTED — PENDING INDEPENDENT REVIEW 002
