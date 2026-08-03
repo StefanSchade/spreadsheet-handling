@@ -41,6 +41,15 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
     is absent so the pipeline author runs ``configure_fk_helpers`` or
     ``infer_fk_relations`` first.
     """
+    # ``defaults`` is the raw authored step-config bag. This operation consumes
+    # exactly three keys from it: ``detect_fk`` (enable gate), ``levels``, and
+    # ``helper_value_mode``. They are resolved at two deliberate points: the
+    # enable gate must run before policy resolution, and the two execution
+    # options stay lazy so they are never evaluated on the disabled path or the
+    # missing-policy path.
+
+    # Enable gate (legacy compatibility switch): when disabled, return the input
+    # frames unchanged before any policy is resolved.
     if not bool(defaults.get("detect_fk", True)):
         return frames
 
@@ -48,8 +57,11 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
     if relations is None:
         raise missing_fk_policy_error("add_fk_helpers")
 
+    # Resolved execution options (active path only).
     levels = int(defaults.get("levels", 3))
-    helper_value_mode = _helper_value_mode(defaults)
+    helper_value_mode = _normalize_helper_value_mode(
+        defaults.get("helper_value_mode", "values")
+    )
 
     # Skip relations whose target frame is not present in the current run.
     # Fresh configuration always validates that the target frame exists
@@ -65,9 +77,9 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         if str(relation.get("target_frame")) in known_names
     ]
 
-    target_registry, fields_by_target_sheet = build_v2_target_registry(relations)
+    target_lookup_index, fields_by_target_sheet = build_v2_target_registry(relations)
 
-    # Group relations by source frame so a sheet without configured FKs is
+    # Group relations by source frame so a frame without configured FKs is
     # passed through untouched without inspecting its headers.
     relations_by_source: dict[str, list[dict[str, Any]]] = {}
     for relation in relations:
@@ -75,48 +87,48 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         relations_by_source.setdefault(source_frame, []).append(relation)
 
     helper_value_provider = (
-        _lookup_formula_provider(target_registry)
+        _lookup_formula_provider(target_lookup_index)
         if helper_value_mode in _FORMULA_HELPER_MODES
         else None
     )
 
-    fk_defs_by_sheet: dict[str, list[Any]] = {}
-    for sheet_name, df in iter_data_frames(frames):
-        sheet_relations = relations_by_source.get(sheet_name, [])
-        sheet_defs: list[Any] = []
-        for relation in sheet_relations:
+    fk_defs_by_frame: dict[str, list[Any]] = {}
+    for frame_name, df in iter_data_frames(frames):
+        frame_relations = relations_by_source.get(frame_name, [])
+        frame_fk_defs: list[Any] = []
+        for relation in frame_relations:
             if not source_frame_has_column(df, str(relation["source_column"])):
                 # The configured source frame does not currently carry the
                 # FK header. Skip silently: configuration may legitimately
                 # cover frame snapshots that have not been built yet.
                 continue
-            sheet_defs.extend(iter_relation_fk_defs(relation))
-        fk_defs_by_sheet[sheet_name] = sheet_defs
+            frame_fk_defs.extend(iter_relation_fk_defs(relation))
+        fk_defs_by_frame[frame_name] = frame_fk_defs
 
     id_maps = build_id_value_maps(
         frames,
-        target_registry,
+        target_lookup_index,
         fields_by_sheet=fields_by_target_sheet,
     )
 
     out: dict[str, Any] = {}
     copy_reserved_frames(frames, out)
-    for sheet_name, df in iter_data_frames(frames):
-        sheet_defs = fk_defs_by_sheet[sheet_name]
-        if not sheet_defs:
-            out[sheet_name] = df
+    for frame_name, df in iter_data_frames(frames):
+        frame_fk_defs = fk_defs_by_frame[frame_name]
+        if not frame_fk_defs:
+            out[frame_name] = df
             continue
         enriched = apply_fk_helpers(
             df,
-            sheet_defs,
+            frame_fk_defs,
             id_maps,
             levels,
             helper_prefix="_",
             helper_value_provider=helper_value_provider,
         )
-        out[sheet_name] = _preserve_source_flatness(df, enriched)
+        out[frame_name] = _preserve_source_flatness(df, enriched)
 
-    _write_helper_provenance(out, fk_defs_by_sheet)
+    _write_helper_provenance(out, fk_defs_by_frame)
     return out
 
 
@@ -160,8 +172,8 @@ def _preserve_source_flatness(
     return result
 
 
-def _helper_value_mode(defaults: dict[str, Any]) -> str:
-    mode = str(defaults.get("helper_value_mode", "values")).lower()
+def _normalize_helper_value_mode(raw_mode: str) -> str:
+    mode = str(raw_mode).lower()
     if mode not in _VALUE_HELPER_MODES and mode not in _FORMULA_HELPER_MODES:
         raise ValueError(
             "helper_value_mode must be one of "

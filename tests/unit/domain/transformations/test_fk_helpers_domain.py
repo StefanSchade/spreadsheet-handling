@@ -170,6 +170,29 @@ class TestEnrichHelpers:
         with pytest.raises(ValueError, match="helper_value_mode"):
             enrich_helpers(_frames(), {**DEFAULTS, "helper_value_mode": "backend_formula"})
 
+    @pytest.mark.ftr("FTR-FK-HELPERS-ENRICH-READABILITY-PILOT-P5")
+    def test_singular_value_alias_matches_canonical_value_mode(self):
+        # ``value`` is an accepted alias of the canonical ``values`` mode and
+        # must materialize the same looked-up values.
+        out = enrich_helpers(_frames(), {**DEFAULTS, "helper_value_mode": "value"})
+        helper_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        assert out["A"][helper_col].tolist() == ["alpha", "beta"]
+
+    @pytest.mark.ftr("FTR-FK-HELPERS-ENRICH-READABILITY-PILOT-P5")
+    def test_plural_formulas_alias_matches_canonical_formula_mode(self):
+        # ``formulas`` is an accepted alias of the canonical ``formula`` mode and
+        # must produce backend-neutral lookup formula specs, not values.
+        out = enrich_helpers(_frames(), {**DEFAULTS, "helper_value_mode": "formulas"})
+        helper_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        values = out["A"][helper_col].tolist()
+        assert all(isinstance(v, LookupFormulaSpec) for v in values)
+
 
 # ---------------------------------------------------------------------------
 # drop_helpers
