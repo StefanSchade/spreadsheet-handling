@@ -207,13 +207,21 @@ def test_retired_project_by_role_step_is_not_registered() -> None:
 
 @pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
 def test_retired_project_by_role_runtime_module_is_absent() -> None:
-    """The retired runtime module no longer exists or resolves."""
+    """The retired runtime module no longer exists or resolves.
+
+    This is the source-layer guard; the installed-layer guard lives in
+    ``test_installed_package_freshness.py`` (it cannot be masked by pytest's
+    ``pythonpath = ["src"]``).
+    """
     import importlib
 
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(
-            "spreadsheet_handling.domain.transformations.project_by_role"
-        )
+    module = "spreadsheet_handling.domain.transformations.project_by_role"
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        importlib.import_module(module)
+    # Pin the exact missing module: the parent package still imports, so this is
+    # a genuine leaf removal, not a missing parent or dependency.
+    assert excinfo.value.name == module
+    importlib.import_module("spreadsheet_handling.domain.transformations")
 
 
 def test_xref_crosstable_steps_are_config_addressable() -> None:

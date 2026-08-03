@@ -365,7 +365,11 @@ memory-promote-reimport-checked: memory-check memory-promote ## Reimport, compar
 $(DOMAIN_CONTRACTS_STAMP): $(DOMAIN_CONTRACTS_INPUTS) | $(DEV_STAMP)
 	@mkdir -p "$(STAMP_DIR)"
 	@echo "Installing domain_contracts tooling deps..."
-	@tools/pip_install_spec.sh -p "$(PYTHON)" -s . $(PIP_VERBOSE_FLAG)
+	# Editable, matching $(DEV_STAMP) / memory-setup. A non-editable `-s .`
+	# here reinstalls a copied package tree over the editable dev install,
+	# which can resurrect source files deleted since the last build (see
+	# FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2 Slice 4 Correction 001).
+	@tools/pip_install_spec.sh -p "$(PYTHON)" -s '.[dev]' -E $(PIP_VERBOSE_FLAG)
 	@touch "$(DOMAIN_CONTRACTS_STAMP)"
 
 domain-contracts-setup: $(DOMAIN_CONTRACTS_STAMP) ## Install domain_contracts tooling in the shared local dev venv
