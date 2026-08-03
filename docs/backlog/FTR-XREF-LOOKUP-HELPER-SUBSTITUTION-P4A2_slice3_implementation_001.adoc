@@ -1,0 +1,481 @@
+= Slice 3 Implementation 001: Worldbuilding matrix helper migration (FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2)
+:toc:
+:toclevels: 3
+
+Implementation date:: 2026-08-03
+Author:: Claude (Opus 4.8 High)
+Scope:: Slice 3 only — migrate the ten Worldbuilding matrix runtime sites from
+`project_by_role` to the accepted lookup-helper composition and prove
+export/reimport parity. No Core runtime change. `project_by_role` and its
+registration are retained for Slice 4.
+
+== 1. Baseline
+
+[cols="2,4,4"]
+|===
+| Repository / commit | Expected | Verified at start
+
+| Core HEAD
+| `ef8605d` `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): review Slice 2 correction`
+| `ef8605db680e44624eb8298148255a00ca7d32a1`; clean
+
+| Worldbuilding HEAD
+| `83dc2bb` `chore(snapshot): add directories plugin and pipelines to snapshots`
+| `83dc2bb6a498c8a8ddc5a785ca7aeb0bccad4e09`; clean
+
+| Unrelated protected Core baseline
+| `7448902` `docs(human_readability_review): document findings for fk helper`
+| `7448902c47b844d790f817a36ae7c858e34fcce3`; adds only the one 726-line review file
+|===
+
+Both repositories began clean. `git -C core show --stat --oneline 7448902` shows
+exactly one file,
+`docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc`.
+
+== 2. Accepted Slice-1/2 dependencies
+
+* *Slice 1* (accepted Review 004): `add_lookup_helpers` (`enrich_lookup`)
+  additive `source_key`/`lookup_key` asymmetric join. Consumed unchanged
+  outbound (`matrix.story_id -> stories.id`).
+* *Slice 2* (accepted Review 002): the inbound composition
+  `apply_derived_column_policy(source=<visible sheet>, drop)` ->
+  `validate_references(no_helper_columns on <visible sheet>, fail)` ->
+  `apply_workbook_view_sheet_mappings` -> existing inverse. Cleanup and the
+  postcondition are *declaration-bound* to the durable
+  `_meta.sheets.<visible sheet>.helper_columns` carrier and must precede the
+  mapping. Slice 2 explicitly handed Slice 3 the mandatory five-sheet
+  declaration-completeness guard because `no_helper_columns` cannot detect a
+  *missing* declaration.
+
+No Slice-1 or Slice-2 Core runtime was reopened or changed.
+
+== 3. Ten-site inventory (pre-migration)
+
+Confirmed by direct inspection of the two pipeline files at `83dc2bb`.
+
+*Outbound* `pipelines/dino_insel/json_to_spreadsheet.yaml` — each surface used a
+`join_frames(left=<matrix>, right=stories, left_key=story_id, right_key=id,
+right_columns=[title])` producing `<matrix>_view`, then
+`project_by_role(direction=outbound, helper_columns=[title],
+key_columns=[story_id])`:
+
+[cols="1,4"]
+|===
+| Line | Outbound `project_by_role` frame
+| 94 | `story_group_matrix_view`
+| 240 | `story_cast_role_matrix_view`
+| 246 | `story_cast_notes_matrix_view`
+| 252 | `story_cast_character_development_matrix_view`
+| 258 | `story_cast_crystal_matrix_view`
+|===
+
+*Inbound* `pipelines/dino_insel/spreadsheet_to_json.yaml` —
+`project_by_role(direction=inbound, helper_columns=[title],
+key_columns=[story_id])` on the mapped logical frame, before the inverse:
+
+[cols="1,4"]
+|===
+| Line | Inbound `project_by_role` frame
+| 49 | `story_group_matrix_view`
+| 77 | `story_cast_role_matrix_view`
+| 83 | `story_cast_notes_matrix_view`
+| 89 | `story_cast_character_development_matrix_view`
+| 95 | `story_cast_crystal_matrix_view`
+|===
+
+Accounting: 5 outbound + 5 inbound = *10 runtime sites*, matching the FTR.
+
+Non-runtime `project_by_role` matches, distinguished and left untouched:
+
+* `plugins/story_cast_views.py:19,48` — historical comments in a *dormant*
+  plugin (not referenced by either pipeline), accurately describing its own
+  pre-`project_by_role` lineage under FTR-DYNAMIC-FRAME-PROJECTION-IMPL-P5.
+* Core `project_by_role` runtime, registry, and tests — retained for Slice 4.
+
+== 4. Five-surface mapping table
+
+[cols="2,3,3,2"]
+|===
+| Visible sheet | Logical matrix frame | Pre-view relation (`contract_xref` output) | Inverse family
+
+| `Story Groups`
+| `story_group_matrix_view`
+| `story_group_matrix`
+| compact multiaxis (`expand_compact_multiaxis`)
+
+| `Cast Roles`
+| `story_cast_role_matrix_view`
+| `story_cast_role_matrix`
+| XRef (`expand_xref`)
+
+| `Cast Notes`
+| `story_cast_notes_matrix_view`
+| `story_cast_notes_matrix`
+| XRef (`expand_xref`)
+
+| `Cast Development`
+| `story_cast_character_development_matrix_view`
+| `story_cast_character_development_matrix`
+| XRef (`expand_xref`)
+
+| `Cast Crystals`
+| `story_cast_crystal_matrix_view`
+| `story_cast_crystal_matrix`
+| XRef (`expand_xref`)
+|===
+
+All five join `matrix.story_id -> stories.id` and want exactly the helper
+`title`. All five already declared `helper_columns: [title]` in
+`configure_workbook_view` (lines 300–304). No surface diverges, so no stop
+condition fired.
+
+== 5. Declaration-completeness guard
+
+`tests/test_dino_insel_matrix_helper_migration.py` adds the mandatory
+consumer-owned static guard (`DeclarationCompletenessGuardTest`). It parses the
+forward pipeline through the same `yaml.safe_load` on the `pipeline` key that
+`build_steps_from_yaml` uses (no re-implemented parser), locates the single
+`configure_workbook_view` step, and for each of the five surfaces asserts:
+
+* the expected visible sheet is declared;
+* it maps to the expected logical frame;
+* its `helper_columns` is exactly `[title]`.
+
+`test_guard_fails_when_a_declaration_is_omitted` proves the guard fails on an
+omitted declaration, a misspelled helper (`titel`), and a missing visible sheet
+(hard `KeyError`, not a silent empty list). Helper identity is read from
+configuration, never inferred from runtime DataFrame columns.
+
+== 6. Outbound migration per surface
+
+Each `join_frames(+title)` + `project_by_role(outbound)` pair was replaced by a
+single `add_lookup_helpers` writing the same `<matrix>_view` output frame:
+
+[source,yaml]
+----
+- step: add_lookup_helpers
+  source: <pre-view matrix>
+  lookup: stories
+  output: <matrix>_view
+  source_key: story_id
+  lookup_key: id
+  helpers:
+    fields: [title]
+  order:
+    helper_position: before_key
+  missing: empty
+----
+
+Value mode defaults to `values` (literal), matching the former `join_frames`
+literal title. Verified per surface (section 14):
+
+* `title` placed before `story_id`;
+* `story_id` remains authoritative; lookup key `id` does not leak;
+* dynamic columns keep their `contract_xref` order; no static list introduced;
+* `missing: empty` matches the former left-join-with-blank-fill;
+* `stories.title` unchanged;
+* the generated Workbook View sheet still declares `helper_columns: [title]`.
+
+Exactly one owner (`add_lookup_helpers`) performs helper insertion per surface;
+no `project_by_role` remains adjacent as a fallback.
+
+== 7. Inbound migration per surface
+
+The five inbound `project_by_role` steps were removed. Cleanup + postcondition
+were inserted at the top of the reverse pipeline, *before*
+`apply_workbook_view_sheet_mappings`, addressing the *visible* sheet name:
+
+[source,yaml]
+----
+- step: apply_derived_column_policy
+  source: <visible sheet name>
+  policy: drop
+# ... five drops (Story Groups, Cast Roles, Cast Notes, Cast Development, Cast Crystals) ...
+
+- step: validate_references
+  mode: fail
+  rules:
+    - { type: no_helper_columns, frame: Story Groups }
+    - { type: no_helper_columns, frame: Cast Roles }
+    - { type: no_helper_columns, frame: Cast Notes }
+    - { type: no_helper_columns, frame: Cast Development }
+    - { type: no_helper_columns, frame: Cast Crystals }
+----
+
+Cleanup addresses the visible sheet name (durable carrier addressable there),
+occurs before mapping, and the five explicit `no_helper_columns` rules give
+per-surface diagnostics. The existing inverses (four `expand_xref`, one
+`expand_compact_multiaxis`) run unchanged on the mapped logical frames and
+receive `[story_id, <dynamic>]` — no `title`.
+
+== 8. Exact operation ordering
+
+----
+read workbook (frames keyed by VISIBLE sheet name; _meta.sheets keyed by visible name)
+  -> apply_derived_column_policy(source="Story Groups"|"Cast Roles"|... , drop)   x5   (visible identity)
+  -> validate_references(no_helper_columns on each visible sheet, fail)                (visible identity)
+  -> apply_workbook_view_sheet_mappings(visible -> logical)                           (frame re-key)
+  -> [existing pre-existing FK cleanup for characters/groups/places by logical name]
+  -> expand_compact_multiaxis(story_group_matrix_view) / expand_xref(4 cast views)    (logical identity)
+----
+
+Verified against the pipeline file, not only tests: `test_visible_sheet_cleanup
+_precedes_mapping` and `test_no_helper_columns_postcondition_per_surface_before_
+mapping` assert the drop and guard positions precede the mapping index.
+
+== 9. XRef inverse results (four surfaces)
+
+For `Cast Roles`, `Cast Notes`, `Cast Development`, `Cast Crystals` the inverse
+input after cleanup is `[story_id, <dynamic character columns>]` (30 dynamic
+columns each). `expand_xref` reproduces the canonical `story_cast_*_named`
+relations. Normalized canonical equality holds: the pre-migration
+(`project_by_role`) reimport equals the migrated reimport (section 14). No
+`expand_xref` runtime, registry, or test was modified.
+
+== 10. Compact-multiaxis result (Story Groups)
+
+`story_group_matrix_view` remains a genuine compact-multiaxis matrix (13 dynamic
+columns plus the legend block). Helper removal happens before the inverse; axis
+and header meaning are unchanged; `expand_compact_multiaxis` reproduces the
+canonical `story_group_named` relation identically to the pre-migration pipeline.
+`expand_compact_multiaxis` was not modified.
+
+== 11. Dynamic-column results
+
+No static dynamic-column list was introduced on either path. Outbound,
+`add_lookup_helpers` preserves the `contract_xref` column order after placing
+`title` before `story_id`. Inbound, `apply_derived_column_policy(drop)` removes
+only the declared `title` and preserves whichever dynamic columns are present;
+the inverses infer value columns. Per-surface dynamic counts (identical old vs
+new): Story Groups 13, each cast surface 30. Sparse surfaces (Cast Notes and
+others with few populated cells) retain exact matrix columns and unchanged
+dynamic order; the edited-title and column-preservation checks compensate for
+`drop_empty` collapsing empty rows.
+
+== 12. Edited-title proof
+
+`PhysicalEditParityTest.test_edited_title_discarded_and_canonical_parity`
+exports the real workbook, physically edits the first `Cast Roles` data-row
+`title` cell to `EDITED-TITLE-SLICE3-XYZ` with `openpyxl` (header-resolved
+column, genuine file mutation), then runs the maintained reverse route. It
+asserts the sentinel appears in *no* reimported JSON file, `stories.title` is
+unchanged, and full canonical parity still holds (`compare_reimport.py` exits 0).
+The value-blind `drop` discards the edit; it never enters a canonical relation
+and never writes back to the authoritative lookup. This is one genuine physical
+edit on one ordinary XRef surface; the other four surfaces share the identical
+carrier and cleanup primitives and are covered by configured tests plus the
+five-surface read-only parity probe.
+
+== 13. Authoritative lookup proof
+
+`stories.title` is never mutated by the roundtrip. The edited-title test asserts
+the reimported `stories.json` titles equal the canonical source titles, and the
+sentinel is absent from all reimported files. `stories.id` remains the
+authoritative key; `title` is a read-only display helper only.
+
+== 14. Pre/post migration parity
+
+A temporary reference execution (`/tmp/xref_slice3_parity`) extracted the
+pre-migration configs from `83dc2bb` via `git show`, ran the *old*
+`project_by_role` pipeline (export + reimport) and the *new* pipeline to
+separate outputs, and diffed:
+
+* `diff -rq old_reimport new_reimport` -> *no output*: the old `project_by_role`
+  reimport equals the new `add_lookup_helpers` reimport for every canonical file.
+* Per-surface exported matrix comparison: for all five sheets `same=True`,
+  `title` before `story_id`, no `id` leak.
+
+Independently, the initial pre-edit baseline snapshot (captured before any edit)
+compared byte-for-byte identical to the migrated export matrix sheets and
+migrated reimport directory. The migrated result equals the previous
+`project_by_role` reference on all five surfaces.
+
+== 15. Physical workbook edit result
+
+See section 12. One physical XLSX cell edit on `Cast Roles`; edit discarded;
+canonical parity preserved; authoritative lookup unchanged. Maintained as
+`test_dino_insel_matrix_helper_migration.PhysicalEditParityTest`.
+
+== 16. Export result
+
+`make export-stories` (XLSX) and `make export-stories-ods` (ODS) succeed. Visible
+sheet names and non-lexical order are unchanged (`test-workbook-view` green).
+Expected matrix columns `[title, story_id, <dynamic>]` remain. No tracked
+generated files (all under gitignored `tmp/`).
+
+== 17. Reimport result
+
+`make check-reimport` (XLSX) and `make check-reimport-ods` (ODS) both print
+"Reimport matches canonical data after normalization." `make check-reimport`
+exercises the just-migrated inbound pipeline end to end.
+
+== 18. Remaining `project_by_role` search / accounting
+
+`rg -n "project_by_role" worldbuilding` after migration:
+
+* *0 active runtime sites* (no `step: project_by_role` in either pipeline).
+* Comments only in the two migrated pipeline files describing what was replaced.
+* Two dormant historical comments in `plugins/story_cast_views.py` (unrelated
+  FTR, plugin not used by the pipelines).
+* The new migration test naming `project_by_role` in its accounting assertions.
+
+`test_zero_runtime_project_by_role_sites` and per-direction assertions enforce
+zero active sites. No migrated site carries both old and new behavior.
+
+== 19. Changed Core files
+
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2_slice3_implementation_001.adoc`
+  (this artifact).
+* `docs/backlog/FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2.adoc` (Slice-3 progress
+  line only).
+
+No Core runtime, registry, implementation-unit, or protected-surface file
+changed. `project_by_role` is intact.
+
+== 20. Changed Worldbuilding files
+
+* `pipelines/dino_insel/json_to_spreadsheet.yaml` — five `join_frames(+title)` +
+  five `project_by_role(outbound)` replaced by five `add_lookup_helpers`.
+* `pipelines/dino_insel/spreadsheet_to_json.yaml` — five `project_by_role
+  (inbound)` removed; five `apply_derived_column_policy(drop)` by visible sheet
+  name + five `no_helper_columns` rules added before mapping.
+* `pipelines/dino_insel/README.adoc` — "Matrix display helpers" subsection.
+* `tests/test_dino_insel_matrix_helper_migration.py` — new maintained guard +
+  migration + physical-edit test module.
+
+No generated export artifacts are tracked (all under gitignored `tmp/`).
+
+== 21. Tests added/changed
+
+New `tests/test_dino_insel_matrix_helper_migration.py` (9 tests):
+
+. `test_five_matrix_sheets_declare_title_helper` — five declarations, correct
+  visible->logical mapping, `helper_columns == [title]`.
+. `test_guard_fails_when_a_declaration_is_omitted` — omitted/misspelled/missing.
+. `test_five_add_lookup_helpers_configured` — source/lookup/output/source_key/
+  lookup_key/helper/placement + no lookup-key leakage.
+. `test_outbound_has_no_project_by_role`.
+. `test_visible_sheet_cleanup_precedes_mapping` — five drops by visible name
+  before mapping.
+. `test_no_helper_columns_postcondition_per_surface_before_mapping` — five rules
+  before mapping.
+. `test_inbound_has_no_project_by_role`.
+. `test_zero_runtime_project_by_role_sites`.
+. `test_edited_title_discarded_and_canonical_parity` — physical XLSX edit,
+  discard, `stories.title` unchanged, canonical parity.
+
+Existing `tests/test_dino_insel_workbook_view.py` unchanged and still green.
+
+== 22. Exact commands and results
+
+[source,bash]
+----
+# Worldbuilding
+PYTHONPATH=. .venv/bin/python -m unittest tests.test_dino_insel_matrix_helper_migration
+# Ran 9 tests ... OK
+make test-workbook-view          # Ran 2 tests ... OK
+make export-stories              # exit 0
+make check-reimport              # "Reimport matches canonical data after normalization."
+make export-stories-ods          # exit 0
+make check-reimport-ods          # "Reimport matches canonical data after normalization."
+git diff --check                 # clean
+git status --short               # only the four intended source/test/doc changes
+
+# Temporary parity probe (implementation evidence, not committed)
+git show 83dc2bb:pipelines/dino_insel/json_to_spreadsheet.yaml > /tmp/.../old_forward.yaml
+git show 83dc2bb:pipelines/dino_insel/spreadsheet_to_json.yaml > /tmp/.../old_reverse.yaml
+# run old + new export/reimport; diff -rq old_reimport new_reimport -> no output
+
+# Core
+.venv/bin/pytest -o addopts='' \
+  tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/validations/test_reference_validations.py \
+  tests/unit/domain/test_workbook_views.py \
+  tests/unit/domain/transformations/test_xref_crosstable.py \
+  tests/unit/domain/transformations/test_compact_multiaxis.py -q
+# 337 passed
+.venv/bin/pytest                 # 2276 passed, 1 xfailed
+make domain-contracts-check      # status: ok; errors: 0; warnings: 4 (pre-existing)
+git diff --check                 # clean
+git diff 7448902 -- docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc
+# no output
+----
+
+Asciidoctor ran clean on the changed `README.adoc` and on this artifact and the
+parent FTR.
+
+== 23. Complexity / readability assessment
+
+Before, `project_by_role` implicitly combined helper identification, placement/
+removal, role interpretation, and dynamic ordering. After, each concern has one
+explicit owner: `add_lookup_helpers` (outbound insertion + placement),
+`apply_derived_column_policy` (declaration-driven removal), `validate_references`
+(`no_helper_columns` postcondition), `apply_workbook_view_sheet_mappings`
+(identity), and the existing inverses (recomposition).
+
+Line delta: forward config net roughly balanced (one `add_lookup_helpers`
+replaces one `join_frames` + one `project_by_role`; added lines are mostly
+explanatory comments). Reverse config grows by the five explicit drops and the
+five-rule postcondition, which is the intended defense-in-depth and the reason
+ownership and sequencing are now legible. Behavior ownership is clearer;
+sequencing (cleanup by visible name before mapping) is explicit and documented.
+Declarations are not excessively duplicated — the five surfaces are genuinely
+distinct visible identities, and per-surface `no_helper_columns` rules improve
+diagnostics. No macro/abstraction was introduced: explicit repetition across
+five sheets is preferable here because the visible identities and per-surface
+diagnostics matter.
+
+== 24. Slice-4 handoff
+
+Slice 4 (removal) may now proceed: all ten Worldbuilding runtime consumers are
+migrated and green. Slice 4 should delete `project_by_role.py`, its
+`registry.py` registration, its `pipeline_step_registry.json` /
+`implementation_units.json` records, its documentation references, and the four
+`project_by_role` tests; then rebuild generated domain-contract tables. Keep
+`resolve_column_roles` (second consumer `validate_columns`). The dormant
+`plugins/story_cast_views.py` comments may optionally be updated when Slice 4
+touches lineage docs.
+
+== 25. Residual risks
+
+* The inbound binding depends on the outbound `configure_workbook_view`
+  declaration; a dropped/mistyped `helper_columns: [title]` would silently leave
+  `title` unclassified. Mitigated by the maintained
+  `DeclarationCompletenessGuardTest`; the `no_helper_columns` postcondition is
+  declaration-bound defense in depth, not a completeness check.
+* Sparse surfaces collapse to few rows after `drop_empty`; parity still holds and
+  the column-preservation + edited-title checks are the independent signals.
+* One physical edit was performed (Cast Roles); the other four surfaces rely on
+  shared-carrier configured tests and the read-only parity probe.
+
+== 26. Commits
+
+* Worldbuilding: `refactor(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): migrate
+  matrix helper pipelines` — five outbound + five inbound migrations,
+  declaration-completeness guard, migration/physical-edit tests, README.
+* Core: `docs(FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2): record Slice 3
+  implementation` — this artifact + parent-FTR Slice-3 progress line.
+
+(Exact hashes recorded in the untracked checkpoint after commit. No push. No
+branch switch or creation.)
+
+== 27. Repository statuses
+
+* Core: clean at `ef8605d` before the documentation commit; full suite green
+  (2276 passed, 1 xfailed); contracts ok; `git diff --check` clean; no runtime
+  change.
+* Worldbuilding: clean at `83dc2bb` before the migration commit; migration
+  tests, workbook-view test, and export/reimport (XLSX + ODS) all green; only
+  the four intended source/test/doc files changed; no tracked generated residue.
+
+== 28. Unrelated `7448902` content untouched
+
+`git -C core diff 7448902 -- docs/warm_storage/global_reviews/review_001_fk_helpers_human_readability.adoc`
+produced no output. The commit was not amended, reverted, squashed, edited,
+moved, or included in this FTR's commits.
+
+'''
+
+XREF LOOKUP HELPER SUBSTITUTION SLICE 3 IMPLEMENTED — PENDING INDEPENDENT REVIEW 001
