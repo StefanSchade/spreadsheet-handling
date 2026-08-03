@@ -8,6 +8,7 @@ from spreadsheet_handling.pipeline import (
     build_steps_from_config,
     run_pipeline,
 )
+from spreadsheet_handling.pipeline.registry import resolve_registration
 from spreadsheet_handling.pipeline.types import StepRegistration
 
 RENAMED_PIPELINE_STEPS = {
@@ -174,6 +175,45 @@ def test_replaced_pipeline_step_names_fail_clearly() -> None:
     for old_name in RENAMED_PIPELINE_STEPS:
         with pytest.raises(KeyError, match=f"Unknown step '{old_name}'"):
             build_steps_from_config([{"step": old_name}])
+
+
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_retired_project_by_role_step_is_not_registered() -> None:
+    """`project_by_role` was retired after the lookup/helper substitution.
+
+    The public step, its registration, and its runtime module are gone;
+    the replacement composition primitives remain registered. See
+    `FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2` Slice 4.
+    """
+    assert "project_by_role" not in REGISTRY
+    assert resolve_registration("project_by_role") is None
+
+    # A config still referencing the retired step fails through the normal
+    # unknown-step diagnostic — no bespoke retirement message.
+    with pytest.raises(KeyError, match="Unknown step 'project_by_role'"):
+        build_steps_from_config([{"step": "project_by_role"}])
+
+    # The accepted replacement composition and neighbouring steps remain.
+    for surviving in (
+        "add_lookup_helpers",
+        "apply_derived_column_policy",
+        "validate_references",
+        "apply_workbook_view_sheet_mappings",
+        "expand_xref",
+        "expand_compact_multiaxis",
+    ):
+        assert isinstance(REGISTRY[surviving], StepRegistration)
+
+
+@pytest.mark.ftr("FTR-XREF-LOOKUP-HELPER-SUBSTITUTION-P4A2")
+def test_retired_project_by_role_runtime_module_is_absent() -> None:
+    """The retired runtime module no longer exists or resolves."""
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(
+            "spreadsheet_handling.domain.transformations.project_by_role"
+        )
 
 
 def test_xref_crosstable_steps_are_config_addressable() -> None:
