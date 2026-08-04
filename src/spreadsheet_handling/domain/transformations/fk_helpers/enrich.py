@@ -16,7 +16,7 @@ import pandas as pd
 from ....core.fk import apply_fk_helpers, build_id_value_maps
 from ....frame_keys import copy_reserved_frames, iter_data_frames
 
-from .formula_provider import _lookup_formula_provider
+from .formula_provider import build_lookup_formula_value_provider
 from .policy import (
     build_v2_target_registry,
     iter_relation_fk_defs,
@@ -87,7 +87,7 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         relations_by_source.setdefault(source_frame, []).append(relation)
 
     helper_value_provider = (
-        _lookup_formula_provider(target_lookup_index)
+        build_lookup_formula_value_provider(target_lookup_index)
         if helper_value_mode in _FORMULA_HELPER_MODES
         else None
     )
