@@ -1,8 +1,7 @@
-"""Shared leaf primitives for the ``xref_crosstable`` package.
+"""Package-private leaf primitives for the ``xref_crosstable`` package.
 
-Decouples ``operation`` and ``dense_axes`` so the package no longer has a
-load-time import cycle. Bodies are verbatim moves out of the original flat
-module; only their location has changed.
+Owns narrow guards, metadata selection and ambiguity handling, carrier-stable
+identity validation, and private aliases to shared tabular validators.
 """
 from __future__ import annotations
 
