@@ -1,0 +1,434 @@
+===== FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A -- Nested `_meta.derived` mutation-ownership contract
+
+*Status:* New (drafted; awaiting independent acceptance)
+*Priority:* P4A
+*Area:* Domain transformations / `_meta.derived` provenance lifecycle
+*Supersedes:* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` (see section 3 and 16)
+*Baseline HEAD:* `8cf8673` (parent FTR + Revalidation 001, corrected)
+*Primary current-state authority:* `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A_revalidation_001.adoc`
+
+== 1. Status
+
+New, drafted and self-checked as a definition only. This artifact authorizes *no
+runtime change*, *no test change*, and *no Project Memory change*. It defines an
+implementation-ready contract and its acceptance conditions; a later, separately
+approved implementation FTR/slice performs the code work.
+
+Revalidation 001 is treated as the primary current-state assessment. Its central
+runtime findings were *independently re-verified* for this draft (section 2);
+they are not accepted on say-so.
+
+== 2. Motivation and concrete reproduced problem
+
+`_meta.derived` is a transient, workbook-level namespace for current-run
+helper-column provenance, keyed per source frame under `derived.sheets.<sheet>`
+(`registries/meta_registry.yaml`, `derived` entry, `lifecycle: transient`). Its
+documented `merge_behavior` is that "each producer updates only its own sub-key
+within the sheet entry and must not overwrite another producer's sub-key."
+
+The problem is *not* about persisted output. `_meta.derived` is stripped for
+every backend at the orchestrator-owned persistence boundary
+(`RUNTIME_ONLY_TOP_LEVEL_META_KEYS`, `pipeline/persistence_boundary.py`), so the
+defect never leaks to a file. The problem is an *in-process transformation
+ownership* defect: several Frames transformations that write, replace, or prune
+`_meta.derived` state *mutate caller-owned nested mapping objects in place*,
+because the aliasing runs one level deeper than the shallow copy they take.
+
+*Mechanism (verified in code).* `frame_keys.copy_reserved_frames` copies the
+reserved `_meta` frame *by reference* (`out[name] = value`,
+`frame_keys.py:24`); `enrich_lookup` similarly does `out = dict(frames)`
+(`enrich_lookup/operation.py:210`). Producers/cleaners then take a *shallow*
+`dict(meta)` and reach the nested containers with `setdefault`
+(`meta.setdefault("derived", {})` then `derived.setdefault("sheets", {})`),
+which returns the *caller's own* nested `derived` and `sheets` objects whenever
+they pre-exist. In-place `setdefault` / `pop` / `del` on those objects mutates
+the caller's input. Only `_strip_consumed_provenance` rebuilds each level with
+`dict(...)`.
+
+*Independent reproduction (throwaway probe, repository untouched).* Against
+frames whose input `_meta` already carries `derived.sheets` with an unrelated
+sibling sheet:
+
+* `enrich_lookup(..., output="src", source_key=..., lookup_key=..., helpers=...)`
+  returned a payload whose top-level `_meta` is a *new* dict, yet
+  `out["_meta"]["derived"]` and `out["_meta"]["derived"]["sheets"]` are the
+  *same object identities* as the caller's input, and the caller's retained
+  input `sheets` gained the new `"src"` key. Top-level non-mutation masks the
+  recursive mutation. This reproduces *EL-HR-002* independently.
+* `drop_helpers(...)` emptied the caller's retained input `derived.sheets` in
+  place.
+* Unrelated top-level metadata (`_meta["keepme"]`) survived, confirming the
+  blast radius is confined to the touched nested path.
+
+*Malformed-input asymmetry (verified).* With `_meta.derived` set to a
+non-mapping, the producer path raises a raw `AttributeError` (`'str' object has
+no attribute 'setdefault'`), while the consumer path raises a clear, path-named
+`ValueError` (`_meta.derived must be a mapping, got str`). This is an adjacent
+concern (section 10), not the core contract.
+
+== 3. Relation to the superseded parent
+
+The parent, `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A`, was an operational
+*documentation* FTR ("document and tighten an existing contract; no code
+behavior change required"). Revalidation 001 established that the broad problem
+is largely resolved by later work: the persistence question is decided (an
+orchestrator-owned persistence-boundary projection/exclusion, not serializer-
+owned behavior), the durable-versus-transient carrier split is settled, the
+`drop_helpers` prefix-fallback anti-pattern is removed, and the
+produced/consumed/pruned lifecycle is documented in the meta registry. What
+survives is a *different, code-level* problem of narrower purpose: nested
+`_meta.derived` mutation ownership (parent scope items 8 and 10;
+Revalidation 001 finding RV-001), plus an adjacent malformed-input asymmetry
+(RV-002).
+
+Because the remaining work no longer shares "substantially the same purpose" as
+the parent, the parent is *superseded* (not retain-and-recut, not
+close-as-satisfied). This FTR is that replacement. Lifecycle/archival actions are
+in section 16 and are *not* performed by the drafting task.
+
+== 4. Current mutation-site inventory (verified)
+
+All three sites share the shallow-copy-then-nested-`setdefault` mechanism above.
+
+[cols="1,2,2", options="header"]
+|===
+| # | Site | Nested mutation observed
+
+| 1 (FK provenance write)
+| `domain.transformations.fk_helpers.provenance._write_helper_provenance`
+(`provenance.py:26-64`)
+| `meta = dict(existing_meta)` (shallow); `derived = meta.setdefault("derived",
+{})` and `derived_sheets = derived.setdefault("sheets", {})` alias the caller's
+nested objects; per-sheet `setdefault(...)["helper_columns"] = entries`, stale
+`pop`/`del`, and container pruning all mutate them in place.
+
+| 2 (FK provenance cleanup / drop)
+| `domain.transformations.fk_helpers.drop.drop_helpers` (`drop.py:55-56,69`) via
+`provenance._clean_helper_provenance` (`provenance.py:78-115`)
+| `derived_sheets = (meta.get("derived") or {}).get("sheets") or {}` aliases the
+caller's nested `sheets`; `_clean_helper_provenance` `pop`s `helper_columns` /
+`enrich_lookup`, `del`s emptied sheet entries, and prunes `derived["sheets"]` in
+place on the caller's objects.
+
+| 3 (Enrich Lookup provenance write)
+| `domain.transformations.enrich_lookup.operation._write_provenance`
+(`operation.py:495-520`)
+| `meta = dict(out.get("_meta") or {})` (shallow); `derived`/`derived_sheets`
+`setdefault` alias the caller's nested objects; `derived_sheets.setdefault(output,
+{})["enrich_lookup"] = record` mutates them in place. This is *EL-HR-002*.
+|===
+
+*Positive evidence (not automatically the implementation to copy).*
+`domain.transformations.derived_column_policy._strip_consumed_provenance`
+(`derived_column_policy.py:298-334`) is the *only* site that copies along the
+mutated path: it rebuilds `meta`, `derived`, `sheets`, and the touched
+`sheet_entry` with `dict(...)`, prunes empty containers, and leaves sibling
+sheets and the caller's input untouched. It is a *model* of the target
+semantics, evaluated in section 9 rather than presumed to be the shared
+implementation.
+
+*Consumers* (must remain behavior-preserving): `rendering.passes._base.
+_derived_helper_column_names`; `fk_helpers.drop.drop_helpers` via
+`policy.derived_helper_columns_by_sheet`; `helpers.reorder_helpers_next_to_fk`;
+`validations.fk_helpers.validate_fk_helpers`;
+`derived_column_policy.apply_derived_column_policy`.
+
+== 5. Contract and ownership decision
+
+*Core contract (observable, bounded).*
+
+[quote]
+____
+A Frames transformation that writes, replaces, or prunes nested `_meta.derived`
+state must not mutate caller-owned nested mapping objects reachable from the
+input payload.
+____
+
+* The *returned* payload may contain updated derived provenance (added,
+  replaced, or removed sub-keys).
+* The *input* payload and every caller-retained nested `_meta.derived` mapping
+  (`_meta`, `_meta.derived`, `_meta.derived.sheets`, and each per-sheet record)
+  must remain structurally unchanged after the call.
+* This is an *in-process transformation ownership* contract. It is *not* a
+  persistence contract (the boundary already strips `derived`).
+
+*Ownership decision (narrow).*
+
+* Transformation *outputs* own any newly changed `_meta.derived` path.
+* Caller *input* retains ownership of all nested objects reachable from the
+  input.
+* Copy occurs *only along paths that are actually changed*
+  (copy-along-the-mutated-path); untouched frames and untouched metadata are
+  *not* deep-copied, and pandas DataFrames are never copied for this contract.
+
+*Scope of the architecture claim (evidence-based).* This is a *family-spanning
+contract limited to `_meta.derived` writers and cleaners* -- FK provenance,
+FK drop/clean, and Enrich Lookup provenance. It is *not* declared as, and does
+not establish, a repository-wide immutable-Frames rule. Evidence: there is no
+codified repo-wide Frames non-mutation guard (no architecture guard asserts it);
+the existing non-mutation expectation is a *family-local, unevenly applied test
+convention* (e.g. `test_enrich_lookup_preserves_original_frames`, which asserts
+only top-level frame presence and does *not* catch the nested mutation);
+`_strip_consumed_provenance` already realizes the target semantics locally in one
+family. The contract *aligns with* that convention and tightens it for the
+`_meta.derived` writers/cleaners only.
+
+== 6. Scope
+
+In scope -- bring the three evidenced mutation sites (section 4) into compliance
+with the section 5 contract:
+
+* FK provenance write (`_write_helper_provenance`);
+* FK provenance cleanup/drop (`drop_helpers` / `_clean_helper_provenance`);
+* Enrich Lookup provenance write (`_write_provenance`).
+
+For each site, the returned payload must carry the intended provenance
+update/removal while the caller's retained nested `_meta.derived` objects are
+untouched, following copy-along-the-mutated-path semantics and preserving all
+current record shapes, prune behavior, consumer behavior, and persistence
+stripping.
+
+Out of scope: everything in section 12 (non-goals). Malformed-input hardening is
+adjacent and dispositioned in section 10.
+
+== 7. Invariants (must be preserved)
+
+* all current visible frame results (payload columns, ordering, values, formula
+  specs);
+* all current derived-provenance record shapes (FK `helper_columns` entries
+  `{column, fk_column, target, target_key, value_field}`; Enrich Lookup
+  symmetric `{lookup, on, helper_columns}` and asymmetric `{lookup, source_key,
+  lookup_key, helper_columns}`);
+* FK stale-removal behavior (producer-side stale-clean of its own sheet entries
+  and sheets no longer in frames);
+* Enrich Lookup's accepted consumer-owned cleanup asymmetry (no new producer-side
+  stale-removal for `enrich_lookup` without fresh defect evidence);
+* presence-checked pruning (`pop`/`del` guarded by presence; empty per-sheet and
+  container mappings pruned exactly as today);
+* current validation and diagnostic precedence (the path-named `ValueError`s and
+  fail-closed value checks in `derived_column_policy` and the FK primitives);
+* durable/transient carrier separation (durable FK identity in
+  `_meta.helper_policies.fk.relations` and canonical
+  `_meta.sheets.<sheet>.helper_columns`; rich transient provenance in
+  `_meta.derived`);
+* unconditional persistence-boundary stripping of `_meta.derived`;
+* existing durable fallback behavior through canonical helper declarations and
+  FK v2 relations (`apply_derived_column_policy` `_safe_durable_helper_names` /
+  `_safe_policy_helper_names`);
+* no public Python, YAML, CLI, workbook, sidecar, or registry shape change.
+
+No new persistence behavior is authorized.
+
+== 8. Characterization requirements (specify now; create during implementation)
+
+The implementation must add tests proving the following. These are
+*specifications*, not files to create in the drafting task.
+
+=== 8.1 Caller non-mutation (per affected operation)
+
+For each of FK provenance write, FK drop/clean, and Enrich Lookup provenance
+write:
+
+* retain references to the original `_meta`, original `_meta.derived`, and
+  original `_meta.derived.sheets` before the call;
+* invoke the transformation on input whose `_meta.derived.sheets` pre-exists;
+* assert every retained input object is structurally unchanged (identity-level:
+  the retained `sheets`/`derived` mappings have the same keys/values as before,
+  and gained/lost no sub-key); and
+* assert the *returned* payload contains the intended provenance update (write)
+  or removal (drop), i.e. non-mutation did not come at the cost of the effect.
+
+Note: an assertion on top-level `_meta` identity alone is insufficient -- it is
+exactly what masks the current defect. Tests must reach the nested objects.
+
+=== 8.2 Sibling preservation
+
+Prove that unrelated state survives exactly: other top-level `_meta` keys;
+unrelated `derived` subtrees; unrelated `derived.sheets` entries for other
+sheets; and producer-owned sub-keys the operation does not own (e.g. an Enrich
+Lookup write must not disturb an FK `helper_columns` sub-key on the same sheet,
+and vice versa), per the registry `merge_behavior`.
+
+=== 8.3 Record parity
+
+Prove no shape change for FK helper provenance, Enrich Lookup symmetric joins
+(`on`), and Enrich Lookup asymmetric joins (`source_key`/`lookup_key`).
+
+=== 8.4 Cleanup behavior
+
+Prove presence-checked removal remains safe; empty per-sheet and container
+mappings are pruned exactly as before; and repeated execution does not accumulate
+stale state (idempotence across a second identical invocation).
+
+=== 8.5 Behavior when containers are absent
+
+Prove correct behavior when `_meta`, `derived`, or `sheets` is absent
+(no-op/creation as today, no spurious containers, no error).
+
+=== 8.6 Persistence non-regression (reuse existing tests)
+
+Use existing persistence-boundary tests
+(`tests/unit/pipeline/test_persistence_boundary.py`,
+`tests/integration/pipeline/test_orchestrator_persistence_boundary.py`,
+`tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`)
+to confirm `_meta.derived` remains absent from every persisted backend output. Do
+*not* create duplicate backend matrices; these tests already establish the
+invariant.
+
+== 9. Implementation alternatives (not preselected)
+
+A shared helper is *not* mandated merely because several sites need the same
+contract. The implementation slice must evaluate and justify one of:
+
+. *Neutral common copy/prune helper* -- one small utility (e.g.
+  `copy_derived_path` / prune) shared by all three sites.
+. *Family-local copy-along-path implementations* -- each of `fk_helpers.
+  provenance`, `fk_helpers.drop`, and `enrich_lookup.operation` gains its own
+  copy-along-path handling, mirroring `_strip_consumed_provenance` in place.
+. *Small owned nested-meta mutation utility at an established boundary* -- a
+  copy-on-write helper owned at an existing architectural boundary (e.g. near
+  `frame_keys`/a meta module) that all sites call.
+
+Selection must weigh: dependency direction (FK, Enrich, and policy families must
+not acquire an unwanted cross-family or upward dependency); cross-family
+coupling; diagnostic preservation (path-named errors and stale-clean semantics
+must survive); local explainability; duplicated-looking versus genuinely shared
+semantics; and whether the abstraction expresses a *real common contract* rather
+than incidental similarity. A shared helper is allowed *only if the
+implementation slice demonstrates that common contract*; absent that
+demonstration, prefer family-local implementations. `_strip_consumed_provenance`
+is positive evidence of the shape, not automatically the code to extract.
+
+== 10. Malformed-input disposition
+
+*Verified asymmetry.* Consumers fail safely or clearly on a non-mapping
+`_meta.derived` (path-named `ValueError`, or safe no-op in
+`derived_helper_columns_by_sheet`); producers/cleaners raise a raw
+`AttributeError`.
+
+*Disposition: define malformed-input hardening as an optional, separately
+reviewed Slice 2 -- not a Slice 1 acceptance condition.* Rationale: the ownership
+fix (copy-along-the-mutated-path) does not *require* broad malformed-input
+normalization to be correct; making uniform producer/cleaner hardening a Slice 1
+gate would exceed the ownership contract and risks obscuring an internal-only
+contract (malformed `derived` can only arise from hand-authored input `_meta` or
+a producer bug; it never round-trips through a carrier).
+
+*Narrow exception (the only malformed handling permitted in Slice 1):* if
+establishing safe copy-on-write inherently requires a *minimal common
+path-shape check* (each copied level is a mapping or absent), that minimal,
+copy-scoped check may be included -- but only to the extent it is inseparable
+from the copy semantics, and it must not grow into general normalization. Broad
+uniform hardening, if pursued, is Slice 2 and separately reviewed.
+
+No support for arbitrary hostile in-process Python objects is implied.
+
+== 11. Acceptance criteria
+
+Slice 1 is accepted when:
+
+. Each of the three mutation sites (section 4) satisfies the section 5 contract:
+  the returned payload carries the intended provenance write/removal while every
+  caller-retained nested `_meta.derived` object (`_meta`, `derived`, `sheets`,
+  per-sheet records) is structurally unchanged.
+. Copy occurs only along the mutated path; untouched frames/metadata are not
+  deep-copied and no pandas DataFrame is copied for this contract.
+. All section 7 invariants hold, demonstrated by the existing suite staying green
+  plus the new characterization tests (section 8).
+. New characterization tests exist for groups 8.1--8.5 and reach nested objects
+  (not merely top-level `_meta`); group 8.6 reuses existing persistence-boundary
+  tests without duplication.
+. The chosen implementation alternative (section 9) is justified in the slice
+  against the listed selection criteria; a shared helper appears only if its
+  common contract is demonstrated.
+. No public Python/YAML/CLI/workbook/sidecar/registry shape changed; no new
+  persistence behavior introduced.
+. Malformed-input hardening beyond the section 10 narrow exception is *not*
+  present in Slice 1 (it is Slice 2, if pursued).
+
+== 12. Non-goals (explicit)
+
+* durable persistence of `_meta.derived`;
+* reconciliation of provenance across a roundtrip;
+* automatic rename reconciliation;
+* changes to canonical `_meta.sheets`;
+* changes to FK v2 relation policy;
+* changes to Workbook View mappings;
+* new public pipeline steps;
+* a generic metadata-governance framework;
+* broad deep-copying of Frames;
+* copying pandas DataFrames;
+* global immutability of every nested value in Frames;
+* Enrich Lookup producer-side stale cleanup without fresh defect evidence;
+* refactoring merely for code uniformity;
+* reopening completed Human Readability work.
+
+== 13. Risks and stop conditions
+
+*Risks.*
+
+* *Over-copying* -- an implementation that deep-copies `_meta` or frames would
+  violate the "copy only the mutated path" decision and could mask real aliasing
+  elsewhere. Guard with the "no DataFrame copy / untouched-metadata-not-copied"
+  acceptance bullets.
+* *Diagnostic regression* -- flattening the sites into a shared helper could drop
+  a path-named error or the FK producer's stale-clean nuance. Guard with record
+  parity + cleanup characterization and the invariant on validation/diagnostic
+  precedence.
+* *Cross-family coupling* -- a shared helper placed in the wrong module could
+  introduce an unwanted dependency direction. Guard with section 9 selection
+  criteria and existing dependency guards.
+* *Scope creep into malformed normalization* -- guard with section 10 and the
+  Slice 1 acceptance bullet excluding it.
+
+*Stop conditions.* Stop and escalate if: characterization shows the ownership fix
+*cannot* be established without broad malformed-input normalization (revisit
+section 10); any change forces a public Python/YAML/CLI/workbook/sidecar/registry
+shape change (out of scope); or a shared-helper extraction cannot demonstrate a
+real common contract (fall back to family-local implementations rather than force
+the abstraction).
+
+== 14. Review plan
+
+* Implementation lands in one narrow *Slice 1* (section 6), unless
+  characterization proves malformed-input hardening is inseparable, in which case
+  the separately reviewed *Slice 2* is opened (section 10).
+* Per the repository review-completion contract, the slice produces a matching
+  `*_review.adoc` artifact, committed separately from any follow-up fixes, with
+  validation commands and findings/disposition/residual risks recorded.
+* Review lens includes: EL-HR-002's "Preserve" list (record shape, write timing,
+  consumer behavior, persistence stripping); the section 9 selection justification;
+  and confirmation that nested-object non-mutation is actually asserted (not just
+  top-level `_meta`).
+* Validation commands for the slice: the full unit/integration suite for the
+  affected transformations plus the persistence-boundary and architecture-guard
+  suites; `git diff --check`; Asciidoctor render of touched backlog/review docs.
+
+== 15. Project Memory implications (after acceptance; not performed here)
+
+For a later curator (this artifact edits no Project Memory):
+
+* Transfer *EL-HR-002* tracking from the broad derived-provenance lifecycle FTR
+  to `FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A`, recording the independent
+  reproduction (section 2) as evidence.
+* Record that persistence of `_meta.derived` is settled/stripped
+  (orchestrator-owned persistence-boundary projection/exclusion) and the
+  JSON-sidecar asymmetry is obsolete; keep it out of "open risks."
+* Record that the durable/transient carrier split is settled.
+* Record the parent FTR outcome as *superseded* by this FTR.
+
+== 16. Lifecycle / archival plan for the parent and revalidation
+
+After *this* FTR is independently accepted (not during the drafting task):
+
+. Mark `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A` `*Status:* Superseded by
+  <<FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A>>` and archive it together with
+  `FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A_revalidation_001.adoc` to
+  `docs/cold_storage/backlog/wont_do/` per the FTR status lifecycle.
+. Transfer EL-HR-002 tracking to this FTR (section 15).
+. Implement in one narrow Slice 1 (sections 6, 11), opening a separately reviewed
+  Slice 2 only if characterization proves malformed-input hardening is
+  inseparable from safe copy-on-write (section 10).
+
+This FTR is implementation-ready and deliberately does not prescribe a helper
+shape; the implementation slice selects and justifies one under section 9.
