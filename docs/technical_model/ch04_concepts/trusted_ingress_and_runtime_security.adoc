@@ -1,0 +1,1007 @@
+[[concept-trusted-ingress-and-runtime-security]]
+== Trusted Ingress, Internal Value Model, and Runtime Security Profiles
+
+_A domain boundary is proportionately robust, not a hostile-code sandbox; this
+concept asks what "proportionate" means once payload trust, pipeline trust,
+and runtime/operator trust are allowed to vary independently, and what a
+closed internal value model would need to look like to make that answerable._
+
+Status: *provisional, explanatory, non-implementation-authorizing*. This is
+Technical Concept 001 in this area, drafted as a current-state investigation
+and concept draft. It is not an accepted architectural decision, not an ADR,
+and it does not authorize any runtime change, CLI flag, configuration key,
+registry entry, parser limit, or new type. It is awaiting independent
+*Concept Review 001*. Until reviewed and at least partially promoted, nothing
+in this document overrides
+link:../ch03_architecture_decisions/ADR-DOMAIN-BOUNDARY-ROBUSTNESS.adoc[ADR-DOMAIN-BOUNDARY-ROBUSTNESS]
+or the
+link:domain_boundary_robustness.adoc[Domain Boundary Robustness] concept, both
+of which remain the accepted authority.
+
+This concept does not claim that the framework provides a Python sandbox, a
+process-isolation mechanism, or containment of arbitrary hostile executable
+Python already running in the process. See <<tirs-non-guarantees>>.
+
+=== 1. Relationship to existing authority
+
+link:../ch03_architecture_decisions/ADR-DOMAIN-BOUNDARY-ROBUSTNESS.adoc[ADR-DOMAIN-BOUNDARY-ROBUSTNESS]
+and link:domain_boundary_robustness.adoc[Domain Boundary Robustness] are
+authoritative and unchanged by this concept. Their decision, restated:
+
+* domain boundaries robustly handle malformed and unusual values reasonably
+  implied by their documented pandas, NumPy, configuration, metadata, and
+  artifact contracts;
+* in-process validation is not a security sandbox: the framework does not
+  promise to contain arbitrary hostile executable Python already admitted
+  into the process;
+* framework and workflow-builder responsibility are both load-bearing and
+  neither excuses the other;
+* runtime hardening beyond that decision needs concrete evidence and a
+  bounded, separately authorized FTR.
+
+This concept *specializes* that decision along two axes the ADR left open:
+
+. it distinguishes *payload trust*, *pipeline-description trust*, and
+  *runtime/operator trust* as independent axes, rather than one boundary
+  level, so a workflow builder can reason about "which of these three is
+  untrusted here" instead of one generic threat level; and
+. it sketches the *smallest plausible internal value model* a boundary would
+  need in order to state, precisely, which value shapes it accepts and which
+  it rejects -- because "handles malformed and unusual values reasonably
+  implied by contract" is only checkable against a stated contract.
+
+It does not reopen boundary levels 1-4 from the Domain Boundary Robustness
+concept; the trust axes in <<tirs-trust-model>> are a specialization of
+level 2 (competent-user workflow input) and level 3 (external
+application-boundary artifacts), read together with the toolkit/workflow-
+builder responsibility split from
+link:../../cold_storage/working_context/functional_model_inquiry/metadata_foundations/app_boundary_meta_authority.adoc[the
+application-boundary inquiry]. Level 4 (arbitrary hostile in-process objects)
+is out of scope here exactly as it is out of scope for the ADR.
+
+This concept also relates to, and must not duplicate,
+`docs/backlog/roadmap_domain_hardening_sequence.adoc` (active planning note,
+2026-08-01), whose *Phase E: establish mandatory trusted ingress* already
+sketches a boundary shape (bounded parser -> structural validation -> value
+normalization -> trusted internal Frames -> domain pipeline) and an "inert
+strings" principle (a string that resembles SQL, shell, or HTML is not
+thereby dangerous; injection risk is a sink responsibility). This concept
+gives that roadmap phase a fuller current-state inventory and a trust-profile
+vocabulary; it does not supersede the roadmap's sequencing, which places the
+unresolved/missing/error-value decision (<<tirs-nan>>) and the internal type
+model *before* mandatory ingress. Where this concept and the roadmap note
+differ in emphasis, the roadmap note's sequencing is treated as authoritative
+planning context, and any conflict is an open question for Concept Review 001
+(<<tirs-open-questions>>), not a decision made silently here.
+
+Finally, this concept must not preempt
+`docs/backlog/FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A.adoc` -- an open,
+unstarted architecture-assessment FTR that owns the full per-surface trust and
+compatibility contract for every dotted/callable pipeline extension form. Its
+own non-goals state plainly: "make plugin/factory execution safe for
+untrusted Python" and "create a Python sandbox ... or dependency isolation
+mechanism" are both out of scope for that FTR too. <<tirs-pipeline-addressability>>
+below describes only the *current mechanical shape* of that surface and how
+it interacts with the trust-profile sketch; it defers the audience/stability/
+compatibility decisions entirely to that FTR.
+
+=== 2. Problem and motivation
+
+The Domain Boundary Robustness decision answers "how hard must a domain
+transformation defend against a malformed value" for one generic caller. It
+does not yet give a workflow builder or a framework maintainer a vocabulary
+for a question that keeps recurring in practice:
+
+* A pipeline author trusts their own YAML but receives payload data from an
+  external Git branch, a partner export, or a public upload -- how much of
+  the framework's behavior can they truthfully claim as protection?
+* A hosting application wants to run a pipeline written by someone else
+  against its own trusted data -- what, if anything, changes about the
+  framework's guarantees?
+* A reviewer asked "is this safe" has no shared vocabulary for "safe against
+  what, assuming which of these three inputs is hostile."
+
+Today the honest answer to all three is: the framework normalizes some
+external `_meta` shapes at a small number of boundaries
+(<<tirs-current-ingress>>), enforces spreadsheet parser size limits
+(<<tirs-parser-boundary>>), and blocks one specific dotted-callable namespace
+from configuration addressing (<<tirs-pipeline-addressability>>) -- and
+nothing more. There is no stated trust model, no closed internal value
+vocabulary, and no operator-facing way to declare "run this pipeline as if
+the payload (or the pipeline description) were untrusted." This concept
+inventories the current state, proposes a compact three-axis trust model and
+three illustrative profile shapes, sketches the smallest plausible internal
+value model, and produces a dependency-ordered map of the narrow FTRs that
+would be needed to make any of this a runtime contract -- without
+authorizing any of them yet.
+
+=== 3. Current-state inventory
+
+==== 3.1 Payload ingress
+
+[cols="2,2,2,2,2,3",options="header"]
+|===
+| Form | Parser / adapter owner | Size / resource bound today | Scalar normalization today | Arbitrary Python objects possible? | Treated as trusted after load?
+
+| XLSX
+| `io_backends/xlsx/openpyxl_parser.py` via `xlsx_backend.py`
+| `io_backends/parser_limits.py` (`ParserLimits`, default
+  1,048,576 rows x 16,384 cols x 10,000,000 cells; raises
+  `SpreadsheetTooLargeError`)
+| Cell values pass through `openpyxl`'s own type coercion; no
+  framework-level closed scalar set is enforced after parsing
+| No -- openpyxl produces plain scalars/strings, not arbitrary objects
+| Yes, implicitly -- no explicit "this came from an untrusted workbook"
+  marker exists once `Frames` are returned
+
+| ODS
+| `io_backends/ods/odf_parser.py` via `ods_backend.py`
+| Same `ParserLimits` module; the architecture primer specifically calls
+  out ODS `number-columns-repeated` / `number-rows-repeated` fillers as
+  the motivating pathological case
+| Same as XLSX: `odfpy` scalar coercion, no closed set enforced afterward
+| No
+| Yes, implicitly
+
+| CSV
+| `io_backends/csv_backend.py` (`pandas.read_csv`)
+| None -- no row/column/byte ceiling in the backend itself; relies on
+  whatever `pandas.read_csv` and available memory allow
+| `pandas.read_csv` dtype inference; not normalized to a closed set
+| No
+| Yes, implicitly
+
+| JSON
+| `io_backends/json_backend.py` (stdlib `json` + `pandas.read_json`)
+| None -- no document-size or nesting-depth ceiling
+| `pd.read_json(..., dtype=str)`; missing values coerced to `""`
+| No -- stdlib `json.load`/`json.dump` never construct arbitrary Python
+  objects
+| Yes, implicitly
+
+| YAML
+| `io_backends/yaml_backend.py`, plus every `_meta.yaml` sidecar read by
+  the JSON/XML backends and `domain/yaml_overrides.py`
+| None
+| Missing values coerced to `""`; no closed scalar set enforced for
+  `_meta`
+| No -- every read path uses `yaml.safe_load`, which cannot construct
+  arbitrary Python objects (confirmed by inspection; this is a positive
+  current guarantee worth stating explicitly, see <<tirs-guarantees>>)
+| Yes, implicitly
+
+| XML
+| `io_backends/xml_backend.py` (stdlib `xml.etree.ElementTree`)
+| None -- no explicit entity-expansion or nesting-depth guard
+| Element text coerced to Python `str`
+| No arbitrary object construction, but stdlib `ElementTree` has no
+  explicit internal-entity-expansion ("billion laughs") guard the way
+  `defusedxml` provides; this is a current gap, not a claimed guarantee
+| Yes, implicitly
+
+| Direct Python `Frames` input
+| Caller-constructed `dict[str, DataFrame]` passed to the public
+  `pipeline.run_pipeline(frames, steps)` (re-exported from
+  `pipeline/__init__.py`)
+| None -- whatever the caller constructs
+| None -- this path does not pass through `domain.ingress` at all (see
+  <<tirs-current-ingress>>)
+| Yes -- a DataFrame column can hold any Python object a caller puts
+  there
+| Fully trusted by construction: this is a programmatic composition path,
+  not a parsed-payload path
+
+| Direct `_meta` input
+| Caller-constructed `dict` passed as `cli_overrides` / `profile_defaults`
+  to `domain/meta_bootstrap.py:bootstrap_meta`, or as `overrides` to
+  `domain/yaml_overrides.py:apply_overrides`
+| None
+| `domain.ingress` *does* run after both of these merges (see
+  <<tirs-current-ingress>>), so the one currently-normalized shape
+  (`legend_blocks`) is canonicalized; nothing else is
+| Yes, in principle, for any `_meta` key ingress does not yet cover
+| Trusted after the ingress rules that exist run; everything ingress does
+  not cover is trusted by omission, not by decision
+
+| Workbook readback (roundtrip)
+| `rendering/workbook_projection.py:workbookir_to_frames`, fed by the
+  XLSX/ODS parsers above
+| Same `ParserLimits` as the originating parser
+| Same as XLSX/ODS above, plus workbook-view / legend-block specific
+  reconstruction logic
+| No
+| Yes, implicitly, after the same ingress rule set as any other
+  `orchestrate()` load
+
+| Structured sidecars (`_meta.yaml`)
+| Read by `json_backend.py`, `xml_backend.py`, and `yaml_overrides.py`
+  via `yaml.safe_load`
+| None
+| None beyond `legend_blocks` shape normalization
+| No (see YAML row above)
+| Yes, implicitly
+
+| CLI payload paths
+| `cli/apps/run.py` resolves `--in-path` / `--config` to a loader kind and
+  delegates entirely to the backends above
+| Whatever the selected backend enforces
+| Whatever the selected backend enforces
+| No new surface beyond the backends
+| Same as the selected backend
+
+| Application API payload paths
+| `application/orchestrator.py:orchestrate()` -- the one function every
+  CLI and most documented consumer code paths funnel through
+| Whatever the selected backend enforces
+| Whatever the selected backend enforces, plus `domain.ingress` runs once,
+  immediately after load and before the first configured step
+  (<<tirs-current-ingress>>)
+| No new surface beyond the backends
+| Trusted after ingress runs; this is the one payload path that always
+  gets the current ingress rule set
+|===
+
+Known contract gaps, stated plainly rather than fixed here:
+
+* No payload ingress path enforces a closed scalar type set. "Scalar
+  normalization" above means the ad hoc missing-value-to-`""` coercion each
+  backend happens to do, not a stated contract.
+* `pipeline.run_pipeline` bypasses `domain.ingress`, the persistence
+  boundary, and the final-cleanup executor entirely -- all three run only
+  inside `orchestrate()`. A caller who builds `Frames` directly and calls
+  `run_pipeline` gets none of the three. This is a real current asymmetry
+  between the "casual consumer" path (`orchestrate`) and the "expert
+  programmatic" path (`run_pipeline`), not a security defect -- the direct
+  path is documented as a trusted programmatic composition path -- but it
+  means "ingress always runs" is not yet true of the framework as a whole.
+* CSV, JSON, YAML, and XML backends have no resource ceiling comparable to
+  `ParserLimits`. A pathological CSV or JSON payload has no framework-level
+  circuit breaker before it reaches pandas/the OS.
+
+==== 3.2 Pipeline ingress and addressability [[tirs-pipeline-addressability]]
+
+The current mechanics (see `pipeline/dotted_paths.py`, `pipeline/registry.py`,
+`pipeline/steps.py`, `pipeline/build.py`):
+
+* every dotted-string resolution used by pipeline configuration --
+  registered step targets, `step: plugin` + `dotted:`, direct colon-style
+  `step: module:function` factories, and nested `target:` strings passed to
+  generic binders -- funnels through the single function
+  `resolve_configuration_callable` in `pipeline/dotted_paths.py`;
+* that function's only ownership check,
+  `ensure_configuration_addressable`, rejects references into
+  `spreadsheet_handling.domain.ingress` (and its submodules) with a
+  `ValueError`; it does not otherwise restrict which importable Python
+  callable a pipeline description may name;
+* `tests/architecture/test_domain_ingress_boundary.py` pins this one
+  ownership boundary (ingress cannot be reached as a step, a plugin target,
+  or a nested target, through any of the checked routes);
+* declarative intent (the `step:`/`dotted:`/`target:` string in YAML) is
+  therefore separated from the resolved runtime object (the imported
+  Python callable) by exactly one checked chokepoint, and that chokepoint
+  currently encodes one namespace exclusion, not a general trust policy.
+
+`docs/backlog/FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A.adoc` is the open,
+unstarted assessment that owns the full trust/audience/compatibility
+decision for this surface. It already states, independently of this
+concept, that dotted-path syntax checks and namespace ownership rules "do
+not make [this] a sandbox" and that making plugin/factory execution safe
+for untrusted Python is an explicit non-goal. This concept's trust-profile
+sketch (<<tirs-profiles>>) is written to be consistent with that framing:
+an `untrusted_pipeline` profile, if ever implemented, would need a
+fundamentally different mechanism (an allowlist of host-approved
+declarative steps and parameters, not a deny-list on top of the current
+resolver) -- which is exactly the kind of decision that FTR, not this
+concept, is scoped to make.
+
+==== 3.3 Runtime policy inputs
+
+CLI arguments (`cli/apps/run.py`), application-API parameters
+(`orchestrate(input=..., output=..., steps=...)`), environment-derived
+behavior, pipeline YAML (`io`, `pipelines`, `profiles`), and plugin
+configuration are all *caller-supplied* today; none of them currently carry
+a security-policy concept at all -- there is no `trust_profile` field, no
+`--security-profile` flag, and no operator-policy object anywhere in the
+runtime. This is consistent with this concept being pre-implementation: the
+question "which layer can truthfully own a security policy" has one
+uncontroversial answer given the standing assumption below, and no code yet
+acts on it.
+
+The framework-wide standing assumption, unchanged by anything in this
+concept:
+
+[IMPORTANT]
+====
+The operator controlling the Python runtime, process, CLI arguments,
+environment, installation, and import path is trusted. The framework does
+not protect that runtime from its own operator.
+====
+
+=== 4. Trust actors and the trust model [[tirs-trust-model]]
+
+Four independent axes, not a single threat level:
+
+[cols="1,4",options="header"]
+|===
+| Axis | What varies
+
+| 1. Runtime / operator trust
+| Always trusted in this model (see above). Not a variable axis in practice
+  -- stated for completeness, because the other three axes are meaningless
+  without fixing this one.
+
+| 2. Pipeline-description trust
+| Whether the YAML/step configuration (which steps run, in what order, with
+  what dotted targets and parameters) was authored by someone the operator
+  trusts to choose arbitrary Python extensions, or by someone the operator
+  trusts only to choose from a host-approved declarative vocabulary.
+
+| 3. Payload trust
+| Whether the data and `_meta` entering through a loader originated inside
+  the operator's own application scope, or crossed the application boundary
+  (foreign spreadsheet, partner export, stale Git-tracked `_meta`, public
+  upload).
+
+| 4. Output-sink exposure
+| Whether a given output artifact (formula, filesystem path, generated
+  YAML/JSON/XML/CSV, or a plugin invocation triggered by output) is
+  consumed by something that could be affected by injected content --
+  independent of how trusted the *input* to that sink was.
+|===
+
+Axes 2-4 are not totally ordered against each other. A pipeline can be fully
+trusted while its payload is not (the common "our pipeline, someone else's
+data" case); a payload can be fully trusted while an output sink is exposed
+to an external consumer regardless (writing to a spreadsheet that will later
+be opened with macros enabled, for instance, is an output-sink concern
+independent of input trust). Any later profile representation must not
+collapse these into one scalar "security level."
+
+=== 5. Trust-profile sketch [[tirs-profiles]]
+
+The following three profiles are illustrative combinations of the axes
+above, written to test whether the vocabulary is useful -- not implemented
+profiles, not a public API surface, and not a claim that these are the only
+useful combinations or the right public names. Naming, exact boundaries, and
+whether a total three-profile taxonomy is even the right shape are open
+questions for Concept Review 001.
+
+==== `trusted`
+
+* runtime/operator trusted (always); pipeline trusted; payload trusted.
+* dynamic trusted Python extensions (plugins, direct factories) may be
+  used freely.
+* canonical normalization (whatever `domain.ingress` and the persistence
+  boundary already do) still applies -- this profile does not mean "skip
+  validation," it means "no additional restriction beyond what already
+  exists."
+* no claim of protection against the operator, ever.
+
+==== `untrusted_payload`
+
+* runtime/operator trusted; pipeline trusted (the operator wrote or
+  reviewed it, including any plugins it uses).
+* payload untrusted: it must pass whatever structural, scalar, metadata,
+  and resource boundaries exist (<<tirs-boundary-architecture>>) before
+  the pipeline's trusted steps touch it.
+* the payload must not be able to supply a runtime Resolution object, a
+  trusted internal carrier, or anything else that claims trusted-internal
+  identity by shape alone (this restates the Domain Boundary Robustness
+  ownership principle for the payload axis specifically).
+* the pipeline may still use operator-approved plugins and Python
+  extensions -- untrusted payload does not imply untrusted pipeline.
+
+==== `untrusted_pipeline`
+
+* runtime/operator trusted; pipeline *and* payload untrusted.
+* only host-approved declarative steps and parameters are permitted; no
+  pipeline-controlled arbitrary Python addressing (no `plugin`, no direct
+  colon factory, no nested `target:` string resolved from the untrusted
+  document).
+* this is a fundamentally different enforcement shape than
+  `untrusted_payload` -- an allowlist of declarative surface, not a
+  deny-list layered on the current resolver -- and is exactly the shape
+  `FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A` would need to define if this
+  profile is ever pursued.
+
+These three profiles are independent-axis combinations, not steps on a
+ladder: `untrusted_pipeline` is not "more restrictive `untrusted_payload`,"
+it restricts a different axis. A later profile combining "trusted payload,
+untrusted pipeline" is conceivable and not covered by name here, precisely
+because this sketch is illustrative, not exhaustive.
+
+=== 6. Operator-owned policy authority
+
+The architectural rule this concept proposes, again as a concept-level
+statement rather than a runtime commitment:
+
+[source,text]
+----
+Runtime security policy is operator-owned and supplied out-of-band from the
+untrusted pipeline description.
+
+effective policy = operator policy restricted by any additional pipeline limits
+----
+
+That is: whatever profile or limits the operator selects (however that
+selection is eventually represented -- CLI arguments, `orchestrate(...)`
+parameters, deployment-owned configuration, or environment/service
+configuration the operator controls are all plausible adapters; this
+concept does not require CLI-only transport) is the ceiling. A pipeline
+description may request additional restriction (narrower limits, a smaller
+declared functional surface) but can never widen what the operator already
+restricted. The policy may be fully visible and documented in the pipeline
+or its logs; secrecy is not, and must never be treated as, its protection
+mechanism. No concrete API or configuration schema is proposed here beyond
+the illustrative shape above; that is implementation work for a later FTR.
+
+=== 7. Internal value categories [[tirs-value-model]]
+
+The Domain Boundary Robustness concept's boundary levels describe what code
+*may assume*; they do not yet give a name to the *shapes* a boundary would
+check against. This section sketches the smallest plausible vocabulary,
+grounded in what the codebase actually does today -- it is explicitly not a
+proposal to introduce a large class hierarchy, and several rows below
+conclude "stays `Any`, and that is currently correct."
+
+[cols="2,4",options="header"]
+|===
+| Category | Current state and where it actually shows up
+
+| 1. External raw scalar
+| Whatever a parser hands back before any normalization: an `openpyxl` /
+  `odfpy` cell value, a `pandas.read_csv` / `read_json` inferred value, a
+  `yaml.safe_load` scalar. No closed set today.
+
+| 2. Canonical internal cell scalar
+| The closest existing thing is each backend's ad hoc "missing becomes
+  `''`" coercion (`df.where(pd.notnull(df), "")`, repeated near-identically
+  in `json_backend.py`, `yaml_backend.py`, and implicitly by `pd.read_csv`
+  dtype handling). There is no single named function or type for this --
+  it is currently *behavior*, duplicated per backend, not a *contract*.
+  This is the category `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+  (<<tirs-nan>>) shows is not yet well-defined even for the one case that
+  has been investigated.
+
+| 3. Missing value
+| Represented today as `""` (most backends), pandas `NaN`/`NA` internally
+  before that coercion runs, and occasionally as an absent key. No single
+  canonical missing-value token is chosen across the codebase.
+
+| 4. Unresolved reference
+| Not currently a distinct category anywhere. An FK helper that cannot
+  resolve currently collapses into category 2/3 territory and, per the
+  open bug, sometimes into the literal string `"nan"` -- a fourth,
+  accidental state.
+
+| 5. Spreadsheet or carrier error
+| Not currently modeled. LibreOffice/Excel error tokens (`#NAME?`,
+  `#N/A`) are read back as whatever the parser library produces (usually a
+  string); nothing in the framework distinguishes "this cell holds the
+  domain string `#N/A`" from "this cell holds a spreadsheet error token."
+
+| 6. Structured external metadata value
+| `_meta` as read from a sidecar or workbook before `domain.ingress` runs.
+  Currently `Any`-shaped except for the one root (`legend_blocks`) ingress
+  normalizes.
+
+| 7. Trusted internal metadata value
+| `_meta` after `domain.ingress` + the persistence-boundary projection.
+  Still `Any`-shaped in the type system; "trusted" here means "passed
+  through the rules that exist," which is a narrower claim than "validated
+  against a closed contract."
+
+| 8. Authored Intent
+| Already a named, load-bearing concept per `agent_rules.adoc`'s
+  persistence-boundary rule: a declarative, backend-neutral value that
+  survives a clean re-run unchanged (`legend_blocks[*].placement`,
+  `xref_crosstable[*].dense_axes.columns_from`, `workbook_view`). This
+  category already exists in practice; it is not new here.
+
+| 9. Runtime Resolution
+| Also already named and load-bearing: a value materialized from current
+  data/layout/pipeline state on every run
+  (`legend_blocks[*].resolved`, `xref_crosstable[*].dense_axes.resolved`,
+  `xref_crosstable[*].column_keys`). Never persisted; the persistence
+  boundary (`pipeline/persistence_boundary.py`) exists specifically to
+  drop this category before any saver runs.
+
+| 10. Executable/runtime-owned object
+| `core/formulas.py`'s `FormulaSpec` dataclasses are the one clear existing
+  example of a narrow, frozen, `__post_init__`-coercing value object at
+  exactly this boundary -- backend-neutral *intent* for a formula, never a
+  live callable or a backend-specific formula string, constructed only
+  through the module's own factory functions. `ExactTable` and
+  `GroupedMatrix` (named in `roadmap_domain_hardening_sequence.adoc` as
+  candidate "trusted internal carriers") are the pattern this category
+  would generalize to if the internal type model in that roadmap's Phase D
+  is ever pursued; this concept does not pursue it.
+|===
+
+What actual current use shows about the primitives named in the task brief:
+
+* `None`, `bool`, `int`, `float`, `str`, `date`, `datetime` all appear as
+  ordinary Python values inside `Frames`/`DataFrame` cells with no framework
+  wrapper -- pandas' own dtype machinery is the only thing standing between
+  a cell and an arbitrary object today.
+* `Decimal` does not currently appear anywhere in the read/write paths
+  inspected for this concept; if a future scalar contract needs exact
+  decimal arithmetic, that is new scope, not a codification of existing
+  behavior.
+* pandas `NA`/`NaN`/`NaT` and NumPy scalar values are the actual carriers
+  behind category 2/3 above, coerced inconsistently per backend -- this is
+  precisely the ambiguity `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+  surfaces.
+* pandas `Timestamp` appears wherever a date-like column round-trips
+  through pandas without an explicit cast; no canonical decision exists for
+  whether the internal scalar contract should retain `Timestamp` or
+  normalize to `datetime.date`/`datetime.datetime`.
+* Formula specifications are the one category with a clean existing
+  contract (`core/formulas.py`, item 10 above).
+* Mappings and lists *do* legitimately appear in cells and metadata today
+  (`_meta.legend_blocks` entries, `_meta.helper_policies.fk` relation
+  lists, nested JSON produced from `MultiIndex` columns) -- these are
+  places where domain code truthfully requires structured, not scalar,
+  values, and a future contract must keep them as structured values rather
+  than forcing scalarization.
+* Arbitrary object values, callables, providers, resolvers, adapters, and
+  handles do not currently appear inside `Frames` cell data on any
+  documented path; they *do* appear, deliberately, as the resolved targets
+  of pipeline steps (a `BoundStep.fn` is a callable by design). The
+  distinction this concept draws is exactly the one
+  `FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A` already draws: "importable
+  and callable" (true of these) is not "found inside untrusted payload
+  data" (not currently true of anything inspected here, and category 10's
+  narrow-value-object pattern is how it should stay that way).
+* Where existing domain code truthfully requires opaque or heterogeneous
+  values (a DataFrame cell that must round-trip whatever the source
+  spreadsheet contained, or `_meta` roots not yet covered by
+  `domain.ingress`), `Any` currently hides a boundary that has not been
+  designed yet, not a stable owned shape it would be safe to type
+  immediately. The honest statement is "not yet decided," not "correctly
+  left open forever."
+
+This sketch deliberately stops here. It does not propose a scalar type
+union, a `CellValue` class, or a migration plan -- that is exactly the scope
+`roadmap_domain_hardening_sequence.adoc` Phase D reserves for a later,
+dedicated slice, and Phase C (next section) is a stated prerequisite for it.
+
+=== 8. The unresolved/missing/error blocker [[tirs-nan]]
+
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` (open, P4A, not a `0.2.0`
+release blocker) is read in full for this concept. Summary of its current
+state, not re-litigated here:
+
+* Symptom: an FK helper whose source key is empty serializes to the literal
+  string `"nan"` in canonical JSON, because `core/fk.py:_norm_id` returns
+  `None` for an empty/NaN key, the subsequent join produces a pandas `NaN`
+  in the joined column, and nothing on the write path distinguishes that
+  from an in-domain string value before stringification.
+* Three contract options are already recorded in the bug (empty/null;
+  structured finding via the existing `derived_column_findings` mechanism;
+  spreadsheet-error preservation as a partial complement) -- this concept
+  does not choose among them.
+* The bug's own scope is deliberately narrow: FK-helper-produced values on
+  the canonical persistence path, not a framework-wide NaN/null audit.
+
+Classification for this concept's purposes: *prerequisite*, not an
+independent concern and not something this concept's own FTR decomposition
+should re-absorb. `roadmap_domain_hardening_sequence.adoc` already places
+its resolution in Phase C, immediately before Phase D's internal type model
+and Phase E's mandatory ingress -- and the ordering is sound independent of
+that roadmap: category 2/3/4 of <<tirs-value-model>> (canonical scalar,
+missing value, unresolved reference) cannot be given a stable ingress
+contract while one concrete, currently-open instance of exactly that
+ambiguity remains undecided. A boundary that validated against a
+missing-value contract today would have to guess which of the three
+recorded options is "the" contract; any guess made inside this concept would
+either duplicate or contradict the bug's own decision process. The FTR
+decomposition (<<tirs-ftr-map>>) therefore lists the NaN bug's resolution as
+a hard prerequisite for the internal-value-model FTR, not as a sibling
+item.
+
+=== 9. Boundary architecture [[tirs-boundary-architecture]]
+
+Five separate boundaries, each with a distinct owner, rather than one
+`sanitize_everything()` helper -- this separation already exists in the
+codebase in fragments; this section names the fragments as boundaries so
+their ownership and ordering are explicit.
+
+==== 9.1 Parser/resource boundary [[tirs-parser-boundary]]
+
+Owner: format-specific parser + `io_backends/parser_limits.py`.
+
+Current shape: `ParserLimits` bounds rows/cols/cells for XLSX and ODS only,
+specifically to defend against sheet-wide formatting-filler expansion
+(`number-columns-repeated` / `number-rows-repeated`), per the architecture
+primer's documented rationale. CSV/JSON/YAML/XML have no analogous ceiling.
+External links, embedded macros, and OLE objects in XLSX/ODS are read by
+`openpyxl`/`odfpy` according to those libraries' own defaults; this concept
+did not find framework-level policy layered on top (no macro-stripping, no
+external-link rejection). That is a gap this concept surfaces, not one it
+closes.
+
+==== 9.2 Structural/scalar ingress boundary
+
+Owner: `domain/ingress/` (today), plus each backend's ad hoc missing-value
+coercion.
+
+Current shape: exactly one rule (`normalize_legend_blocks_shape`), run at
+three of the several payload-entry points inventoried in <<tirs-current-ingress>>.
+It canonicalizes list-vs-mapping shape for one `_meta` root and strips a
+Resolution facet; it does not check Frames structure generally, does not
+enforce a closed scalar set, does not bound `_meta` depth/size, and does not
+reject runtime objects from untrusted payloads as a general rule (it happens
+to reject non-mapping/non-list values for the one root it owns).
+
+==== 9.3 Pipeline addressability boundary
+
+Owner: `pipeline/dotted_paths.py` (see <<tirs-pipeline-addressability>>).
+
+Current shape: one ownership exclusion (the `domain.ingress` namespace) on
+top of otherwise-unrestricted dotted-callable resolution. The
+Intent-to-Resolution transition here is: a YAML `step:`/`dotted:`/`target:`
+string is declarative Intent; `resolve_configuration_callable` performs the
+one-time resolution to a runtime Python callable (Resolution), after which
+the pipeline holds a `BoundStep` closure, not a re-resolvable reference.
+
+==== 9.4 Domain execution boundary
+
+Owner: each transformation family, per Domain Boundary Robustness.
+
+What downstream families may currently assume after "trusted ingress": very
+little beyond what pandas/NumPy itself guarantees, because the ingress
+boundary above does so little today. Domain code that defends against
+malformed values is, in the current codebase, mostly defending against gaps
+in boundaries 9.1-9.3, not against genuinely domain-specific concerns --
+which is exactly the situation `roadmap_domain_hardening_sequence.adoc`'s
+Family Cycle 2 ("remove redundant security defensive logic") anticipates,
+and explicitly gates on the ingress boundary being established first. No
+family-level duplicated check is identified as removable *by this concept*;
+that classification is Family Cycle 2's job, per family, after ingress
+exists.
+
+==== 9.5 Output-sink boundary
+
+Owner: each sink-specific writer.
+
+Current shape: `core/formulas.py`'s `FormulaSpec` is the one boundary that
+has a clean, narrow, dataclass-based Intent representation. Filesystem
+output paths, generated YAML/JSON/XML/CSV content, and named ranges/
+validations have no equivalent narrow-value contract inspected here; this
+concept does not audit every sink exhaustively (see non-goals in
+<<tirs-ftr-map>>). The recent ODS XLOOKUP interop fix (commit `5397d9d`) is
+a useful boundary example precisely because it is *not* a security fix: it
+corrects which OpenFormula-vocabulary spelling LibreOffice accepts, a
+carrier-interoperability concern, distinct from whether formula content
+could be attacker-influenced. Conflating the two would be a mistake this
+concept explicitly warns against (see <<tirs-non-guarantees>>: "a dotted
+path passed a syntax check" and, symmetrically here, "a formula serializes
+correctly" are not security properties).
+
+Ordering among the five: 9.1 must run before 9.2 (there is no scalar to
+normalize before the parser produces one); 9.2 and 9.3 are independent of
+each other (payload structure and pipeline addressability are different
+inputs entering at different times); 9.4 depends on both 9.2 and 9.3 having
+run for whatever guarantees it wants to rely on; 9.5 is independent of
+9.1-9.4 and depends only on what the domain layer hands it.
+
+=== 10. Existing `domain.ingress` assessment [[tirs-current-ingress]]
+
+Read in full for this concept (`src/spreadsheet_handling/domain/ingress/`,
+its architecture guard, and its integration test):
+
+* *Current exact responsibility*: normalize `_meta.legend_blocks` from
+  external list-or-mapping authoring sugar into one canonical mapping form,
+  and strip a stale `resolved` Resolution facet. Nothing else.
+* *Framework-owned and non-addressable*: yes, confirmed by
+  `tests/architecture/test_domain_ingress_boundary.py` across five distinct
+  addressing routes (registry key, descriptive registry, YAML step build,
+  plugin dotted target, nested target string) plus a reexport check.
+* *External forms already canonicalized*: exactly one -- `_meta.legend_blocks`
+  list form. Every other `_meta` root and every Frames/DataFrame structural
+  question is untouched.
+* *Suitable for extension*: yes, by design -- `INGRESS_RULES` is an
+  explicit, ordered, module-level tuple specifically so "append a new
+  `IngressRule` here" is the intended growth path (per the coordinator's own
+  docstring). The mechanism does not need to change shape to grow; only new
+  rules need to be added, each its own reviewed FTR.
+* *Responsibilities that must remain in adapters or application code*:
+  parser-level resource bounding (9.1) is explicitly a different module
+  (`parser_limits.py`) and should stay there -- ingress operates on already-
+  parsed `Frames`, not on raw bytes/archives. Sink-specific injection
+  concerns (9.5) are equally out of scope for ingress, which only ever runs
+  on the read side.
+* *Risk of becoming an unjustified central god-sanitizer*: real if a future
+  slice tried to fold parser limits, scalar typing, `_meta` schema
+  validation, and pipeline addressability all into one `run_domain_ingress`
+  call. The current design resists this somewhat by keeping `INGRESS_RULES`
+  as a flat list of small, named, independently testable rules rather than
+  one monolithic function -- but nothing currently stops a future rule from
+  being written far too broadly. Any new rule proposed under this concept's
+  FTR map (<<tirs-ftr-map>>) should be evaluated against exactly this risk
+  before it is written.
+
+This concept does not modify `domain/ingress/` in any way.
+
+=== 11. Output-sink boundary — summary
+
+See <<tirs-boundary-architecture>> § 9.5 for the detailed current-state
+finding. Restated as the concept's guiding principle: input normalization
+(what a value is allowed to look like) and sink-specific injection
+protection (what a sink does with a value it already accepted) are different
+concerns with different owners. A string that looks like a SQL statement, a
+shell command, a template expression, or HTML is not thereby invalid cell
+content -- current framework behavior already treats such strings as inert
+data (nothing inspected for this concept executes, evaluates, or shells out
+based on cell content), and this concept explicitly does not propose
+changing that. Where a sink is genuinely code-sensitive (a future SQL,
+shell, or template output backend, none of which currently exist in this
+codebase), the protection belongs at that sink (parameterization, escaping,
+avoiding string concatenation into an executed context) -- never as a
+global content filter applied to all cell values regardless of destination.
+
+=== 12. Supported guarantees and explicit non-guarantees [[tirs-guarantees]]
+
+==== Guarantees this concept believes are already true today, given current code
+
+* `yaml.safe_load` is used on every YAML read path this concept inspected
+  (`yaml_backend.py`, `json_backend.py`'s `_meta.yaml` sidecar, and
+  `yaml_overrides.py`) -- no YAML input path can construct an arbitrary
+  Python object.
+* JSON parsing uses the stdlib `json` module exclusively -- same guarantee
+  for JSON.
+* XLSX/ODS parsing is bounded against pathological dimension declarations
+  by `ParserLimits`, independent of which sheet-formatting trick produced
+  the declaration.
+* The one `_meta.legend_blocks` shape ingress normalizes is deterministically
+  rejected (a clear `ValueError`) when malformed, and rejection is atomic:
+  the integration tests confirm no partial mutation of the caller's object
+  graph on ingress failure, and no output is written when `orchestrate()`'s
+  ingress call raises.
+* `core/formulas.py` output intent is a closed, frozen, coercing value
+  object, not a free-form string assembled ad hoc at the point of backend
+  serialization.
+
+==== Explicit non-guarantees [[tirs-non-guarantees]]
+
+* No protection from a runtime operator controlling the CLI, the Python
+  process, the environment, or the import path. This is the standing
+  assumption, not a gap.
+* No containment of arbitrary Python plugins or dotted-callable targets
+  running in the same process -- `pipeline/dotted_paths.py`'s one namespace
+  exclusion is an ownership/architecture guard, explicitly not a security
+  boundary, exactly as `FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A` already
+  states for that surface.
+* No general process, container, OS, or network sandboxing of any kind.
+* No claim that every current or future parser or sink is protected --
+  CSV/JSON/YAML/XML resource bounds and XML entity-expansion guards do not
+  currently exist (<<tirs-parser-boundary>>).
+* No security-by-obscurity: a profile name or a CLI flag being undocumented
+  or hard to find is never, itself, a protection.
+* No claim that a dotted path passing `resolve_configuration_callable`'s
+  syntax check, or a formula serializing without error, is itself a safety
+  property -- both are correctness/interoperability properties, not
+  security properties (see <<tirs-boundary-architecture>> § 9.5).
+* No claim that the trust-profile sketch in <<tirs-profiles>> is
+  implemented, load-bearing, or safe to reference as though it were a
+  runtime contract.
+
+This concept requires honest use-case assessment by whoever operates the
+framework: nothing above should be read as reassurance that a use case
+handling genuinely hostile payload or pipeline input is already safe.
+
+=== 13. Current gaps (consolidated)
+
+* No resource ceiling on CSV/JSON/YAML/XML input comparable to
+  `ParserLimits`.
+* No closed internal scalar contract; `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+  is the concrete evidence that this gap already causes an observable
+  defect, not merely a theoretical one.
+* `pipeline.run_pipeline` bypasses ingress, persistence-boundary projection,
+  and final cleanup -- a documented programmatic path today, but worth
+  making explicit as a gap relative to "ingress always runs."
+* No operator-facing security-policy representation of any kind (no field,
+  flag, or object) -- expected, since no profile is implemented, but stated
+  for completeness.
+* No XML entity-expansion guard.
+* Technical Model `ch01_structure` / `ch02_contracts` remain TBD placeholder
+  chapters (confirmed present in the current tree as `_chapter.adoc` shells
+  under both directories). This concept does not attempt to fill that
+  backbone gap; it is named here only because a fuller "which chapter should
+  eventually own which durable piece of this concept" answer is blocked on
+  it, and Concept Review 001 should not read the absence of ch01/ch02
+  content as this concept's oversight.
+
+=== 14. FTR dependency map [[tirs-ftr-map]]
+
+No FTR listed here is created by this concept. Each entry is a candidate for
+independent authorization after Concept Review 001.
+
+[cols="1,3,2,3",options="header"]
+|===
+| # | Candidate | Purpose | Prerequisites
+
+| 1
+| Resolve `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+| Choose and implement one of the bug's three recorded contract options for
+  unresolved FK-helper values.
+| None beyond what the bug itself already states. This is a *hard*
+  prerequisite for candidate 2, per <<tirs-nan>>.
+
+| 2
+| Internal trusted value model (minimal slice)
+| Name and, where a stable owned shape already exists in practice (Intent,
+  Resolution, `FormulaSpec`), document it; decide the canonical
+  missing/unresolved/error representation building on candidate 1's
+  outcome.
+| Candidate 1. Should stay a *documentation and narrow-typing* slice per
+  <<tirs-value-model>>, not a class-hierarchy rewrite.
+
+| 3
+| Trusted payload ingress (structural/scalar extension of `domain.ingress`)
+| Extend `INGRESS_RULES` with rules for Frames structural shape and the
+  scalar contract candidate 2 defines; keep the existing flat-rule
+  architecture (<<tirs-current-ingress>>) rather than centralizing into one
+  large function.
+| Candidate 2. Must explicitly decide whether/how `pipeline.run_pipeline`
+  callers opt in, given the current bypass gap in <<tirs-current-ingress>>.
+
+| 4
+| Runtime security-policy API/profile representation
+| Give the `trusted` / `untrusted_payload` / `untrusted_pipeline` sketch (or
+  whatever profile shape review settles on) an actual operator-facing
+  representation and the monotonic-restriction combination rule from
+  section 6.
+| Candidate 3 for the `untrusted_payload` profile's enforcement point to
+  exist at all. Independent of candidate 5 for `untrusted_pipeline`
+  specifically -- see the next row.
+
+| 5
+| Untrusted pipeline addressability
+| Define the host-approved declarative allowlist shape an
+  `untrusted_pipeline` profile would need, per
+  `FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A`'s own scope.
+| That FTR's own architecture assessment must complete first; this
+  concept's candidate 5 is downstream of it, not a substitute for it.
+
+| 6
+| Parser/resource constraints for CSV/JSON/YAML/XML
+| Give CSV/JSON/YAML/XML backends a `ParserLimits`-equivalent, and add an
+  XML entity-expansion guard.
+| None of the above -- independent, could proceed at any time, but is
+  explicitly *not* pre-authorized by this concept.
+
+| 7
+| Sink-specific protections
+| Case-by-case, per sink, only where a concrete injection-capable consumer
+  is identified (see <<tirs-boundary-architecture>> § 9.5's warning against
+  a global content filter).
+| None of the above structurally, but should follow candidate 2 so "what is
+  a valid cell value" and "what does a sink do with it" stay separated.
+
+| 8
+| First family pilot after ingress
+| `roadmap_domain_hardening_sequence.adoc`'s own Family Cycle 0-7,
+  applied to whichever transformation family is selected as the pilot.
+| Candidate 3 (mandatory trusted ingress must exist before Family Cycle 2
+  "remove redundant security defensive logic" is meaningful). This
+  candidate is that roadmap's responsibility to sequence, not a new FTR
+  this concept introduces.
+|===
+
+Assessment of merge/split/defer/reject:
+
+* Candidates 1 and 2 must not merge -- the bug has its own recorded
+  acceptance criteria and release-relevance note; folding it into a larger
+  value-model FTR would lose that.
+* Candidates 4 and 5 must not merge -- they enforce different axes
+  (payload vs. pipeline) with structurally different mechanisms (a rule
+  added to an existing ingress list vs. a new declarative allowlist), and
+  candidate 5 has an external prerequisite (the dotted-extension-surface
+  FTR) that candidate 4 does not share.
+* No "general security umbrella FTR" is proposed. Candidates 6 and 7 are
+  deliberately left as independent, narrow, adapter/sink-local work items
+  precisely so no single FTR accumulates permanent ownership of unrelated
+  parser and sink concerns -- consistent with the task constraint this
+  concept was drafted under.
+* Candidate 8 is explicitly not this concept's FTR to create; it already
+  belongs to the hardening roadmap.
+
+=== 15. Adoption and review plan
+
+Distinguishing the artifact layers this concept touches versus the layers
+it explicitly defers to:
+
+[cols="2,3",options="header"]
+|===
+| Layer | This concept's relationship to it
+
+| Concept explanation (this document)
+| Drafted now. Provisional until Concept Review 001.
+
+| Accepted architectural decision
+| Not made here. Would require a narrow ADR after review, extending (not
+  replacing) ADR-DOMAIN-BOUNDARY-ROBUSTNESS, covering at most the trust-axis
+  vocabulary and the operator-policy-authority rule (section 6) -- the parts
+  of this concept closest to a durable, generalizable statement.
+
+| Technical Model contract
+| Not extracted here. Candidate material: the boundary-ownership table in
+  section 9, once at least one of the FTR candidates in section 14 gives it
+  runtime grounding.
+
+| ADR
+| See "Accepted architectural decision" above.
+
+| FTR implementation authority
+| None granted by this document, per this task's explicit constraint. Only
+  candidate 1 (the already-open NaN bug) has any existing implementation
+  authority, and that authority predates and is independent of this
+  concept.
+
+| Developer Guide operator guidance
+| Not written here. Candidate follow-up once (if) an accepted ADR exists:
+  a short operator-facing "what trust means here" section, likely adjacent
+  to the existing domain-boundary-patterns catalogue.
+
+| Semantic Model vocabulary
+| Not touched here. If the trust-axis terms (payload trust, pipeline trust,
+  runtime/operator trust) prove durable after review, they are candidates
+  for Semantic Model vocabulary entries -- not decided here.
+
+| Project Memory durable decisions
+| Not touched here, per this task's explicit constraint. If Concept Review
+  001 accepts any part of this concept, a curated Project Memory entry
+  (likely linked to `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`) is appropriate
+  follow-up, not a byproduct of drafting.
+|===
+
+Recommended sequence after this draft, evaluated and not executed here:
+
+. Independent Concept Review 001.
+. Narrow concept correction, if review finds material gaps or
+  contradictions with the roadmap note or the open dotted-extension-surface
+  FTR.
+. If review accepts the trust-axis vocabulary and operator-policy-authority
+  rule as durable: adopt them through a narrow ADR extending
+  ADR-DOMAIN-BOUNDARY-ROBUSTNESS.
+. Technical Model contract extraction for the boundary-ownership table,
+  once grounded by at least one implemented FTR candidate.
+. Project Memory curation of the review outcome (a coarse event, per the
+  bounded-growth rules in `project_memory_workflow.adoc`), linked to the
+  existing `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` concern.
+. Creation of exactly one first dependency-ready FTR -- almost certainly
+  candidate 1 (the NaN bug), which already exists and already blocks
+  candidate 2.
+. Later FTR candidates created just in time, each independently authorized,
+  never as a batch.
+
+=== 16. Open questions and stop conditions [[tirs-open-questions]]
+
+* Are `trusted` / `untrusted_payload` / `untrusted_pipeline` the right
+  public names, or does review prefer different vocabulary? This concept
+  takes no position beyond noting the names should not imply a total
+  ordering (section 5).
+* Does the three-profile sketch actually cover the combinations operators
+  need, or is a fourth ("trusted payload, untrusted pipeline") missing
+  because it did not arise naturally from the axes as drafted?
+* Where exactly should `roadmap_domain_hardening_sequence.adoc`'s Phase E
+  and this concept's boundary architecture (<<tirs-boundary-architecture>>)
+  be merged, once both have more concrete grounding -- should the roadmap
+  note eventually retire in favor of Technical Model contract content, per
+  its own stated retirement conditions?
+* Should `pipeline.run_pipeline`'s bypass of ingress/persistence-boundary/
+  final-cleanup be treated as an accepted trusted-programmatic-path
+  distinction (as this concept currently frames it) or as a gap requiring
+  its own FTR? This concept deliberately does not decide that.
+* Is a `Decimal`-carrying scalar contract actually needed by any current
+  consumer, or is its absence from <<tirs-value-model>> simply because no
+  current path produces one?
+
+Stop conditions for this concept's own scope, restated from the task
+constraints it was drafted under: this document authorizes no runtime code,
+no test change, no CLI flag, no configuration key, no registry entry, no
+parser limit, and no new type. Any reader treating a section above as
+already-accepted architecture, rather than provisional and
+review-pending, is reading it incorrectly.
