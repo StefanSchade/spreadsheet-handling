@@ -1,0 +1,243 @@
+===== BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A -- Generated ODS XLOOKUP helpers open as `#NAME?` in LibreOffice
+
+*Status:* New
+*Priority:* P4A
+*Area:* ODS formula-mode FK helpers / `LookupFormulaSpec` ODS translation / LibreOffice interoperability
+*Release relevance:* Affects only `helper_value_mode: formula` on the ODS
+backend. XLSX formula mode and `helper_value_mode: values` on either backend
+are unaffected.
+
+==== Summary
+
+ODS workbooks generated with FK helpers in formula mode
+(`step: add_fk_helpers`, `defaults: {helper_value_mode: formula}`) contain
+lookup formulas that are structurally valid but display `#NAME?` when the
+workbook is first opened in LibreOffice Calc, with LibreOffice reporting
+"Error: Invalid name". Opening the affected cell's Function Wizard and
+confirming with `OK`, without changing any argument, makes that individual
+cell work and LibreOffice then displays the formula in normalized uppercase.
+The generated workbook must render working helper formulas immediately;
+users must not have to confirm every formula cell manually.
+`helper_value_mode: values` remains a functional fallback but does not update
+helper values live while the workbook is edited, so it is not an equivalent
+replacement for formula mode.
+
+==== Reproduction
+
+Environment: generated Dino-Insel ODS workbook; LibreOffice Calc 25.x; FK
+helper columns generated from `LookupFormulaSpec`; source and lookup
+references are present and valid.
+
+. Generate the ODS workbook with `helper_value_mode: formula`.
+. Open the workbook in LibreOffice Calc and navigate to the `Places` sheet.
+. Helper cells such as `_regions_name` and `_regions_kind` show `#NAME?`.
+. Select an affected cell; the formula bar shows, e.g.:
++
+[source,text]
+----
+=xlookup(C10,Regions.A2:Regions.A12,Regions.B2:Regions.B12,"")
+----
+. Open the Function Wizard (`fx`). LibreOffice recognizes `XLOOKUP`, accepts
+  all arguments, and the wizard preview shows the correct lookup result.
+. Confirm with `OK` without editing any argument. The cell now evaluates
+  correctly and the formula bar subsequently shows the function name in
+  normalized uppercase.
+
+This isolates the failure to formula serialization/import interpretation:
+the lookup key, ranges, and workbook data are all valid, and LibreOffice
+supports `XLOOKUP` -- the defect is not in FK resolution or lookup data.
+
+==== Verified Facts vs. Hypothesis
+
+Verified (maintainer-observed):
+
+* formula-mode FK helpers in generated ODS files initially show `#NAME?`;
+* LibreOffice reports an invalid name;
+* the formula arguments and ranges are correct;
+* LibreOffice 25.x supports `XLOOKUP`;
+* confirming the unedited formula through the Function Wizard makes that
+  cell work, and LibreOffice then displays the function name in normalized
+  uppercase;
+* `helper_value_mode: values` works as a fallback but loses live updates.
+
+Hypothesis, not yet accepted implementation truth: the ODS renderer emits
+the function in an unqualified form, approximately `of:=XLOOKUP(...)`.
+`XLOOKUP` is not part of the standard OpenFormula vocabulary; LibreOffice may
+require its extension-qualified name, approximately
+`of:=COM.MICROSOFT.XLOOKUP(...)`. This is consistent with the observed
+symptom (unqualified name treated as unknown -> `#NAME?`; Function Wizard
+confirmation reparses it as LibreOffice's supported function -> evaluates),
+but it is unproven until Phase 2 inspects the actual `table:formula` value in
+a generated `content.xml` and confirms which representation LibreOffice
+evaluates without manual intervention.
+
+Do not treat this hypothesis as already proven, and do not treat the
+uppercase/lowercase display change alone as the root cause -- the case
+change may simply be a visible side effect of LibreOffice normalizing a
+successfully recognized function. Any fix must not assume or promise
+support against an unpublished future ODF version.
+
+==== Scope and Non-Goals
+
+In scope:
+
+* reproduce the failure with a minimal lookup formula;
+* verify the correct ODF/LibreOffice formula representation;
+* correct ODS serialization of `LookupFormulaSpec`;
+* preserve backend-neutral formula intent and live recalculation after the
+  source FK value changes;
+* add regression coverage at the formula translator and generated-ODS
+  levels;
+* validate the fix with a supported LibreOffice version;
+* document the supported LibreOffice compatibility boundary and
+  `helper_value_mode: values` as the fallback;
+* update release notes and add concise Project Memory evidence.
+
+Non-goals: redesign of FK helper policy; changes to `configure_fk_helpers`
+or FK reference resolution; changes to the canonical data model; changes to
+XLSX formula syntax unless a shared defect is proven; switching the global
+default away from formula mode, or removing `helper_value_mode: formula`; a
+generic formula-expression language or a broad ODS renderer rewrite; a
+formula-result caching framework unless investigation proves it necessary;
+implementation against an unpublished future ODF specification; a general
+spreadsheet formula compatibility matrix.
+
+==== Implementation Investigation
+
+The defect is expected in the ODS-specific translation of the
+backend-neutral lookup formula intent. The domain-level `LookupFormulaSpec`
+(`src/spreadsheet_handling/core/formulas.py`) is not currently suspected of
+incorrect lookup semantics, and XLSX translation
+(`src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py`) must stay
+unchanged unless investigation proves a shared defect. Relevant areas:
+
+[source,text]
+----
+src/spreadsheet_handling/core/formulas.py
+src/spreadsheet_handling/io_backends/ods/odf_renderer.py
+src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py
+tests/unit/io_backends/ods/test_ods_formula_translation.py
+tests/integration/io_backends/ods/
+tests/unit/domain/transformations/test_lookup_formula_mode.py
+----
+
+Before changing production code:
+
+. Generate a minimal ODS workbook from one `LookupFormulaSpec` and inspect
+  the stored formula in `content.xml`; record the exact LibreOffice version
+  used and confirm the workbook reproduces `#NAME?`.
+. Create a controlled variant using the candidate qualified function name
+  (`of:=COM.MICROSOFT.XLOOKUP(...)`) and open/recalculate it in LibreOffice.
+. Confirm whether the candidate representation resolves immediately, and
+  where possible, save the manually repaired workbook from LibreOffice and
+  compare its stored formula with the generated input.
+. Determine whether a cached result is also required or whether correcting
+  the function identifier alone resolves the defect.
+
+The final implementation evidence must distinguish verified cause,
+contributing behavior, and discarded hypotheses. Do not place
+LibreOffice-specific function names into the domain-level
+`LookupFormulaSpec` -- the domain model continues to express lookup intent;
+the ODS adapter owns translation into its own carrier vocabulary. A
+possible result, subject to verification and not an instruction to skip
+reproduction:
+
+[source,python]
+----
+return (
+    "of:=COM.MICROSOFT.XLOOKUP("
+    f"{source_ref};{key_range};{value_range};{missing})"
+)
+----
+
+==== Acceptance Criteria and Test Requirements
+
+A minimal ODS workbook generated from `LookupFormulaSpec` must open in a
+supported LibreOffice version with the helper value visible immediately --
+no `#NAME?`, no Function Wizard interaction or cell edit required. Changing
+the source FK value must recalculate the helper to the new lookup value; a
+missing lookup key must produce the configured missing result rather than
+an invalid-name error. The stored `content.xml` formula must use the
+verified LibreOffice-compatible representation. Formula translation stays
+adapter-local and `LookupFormulaSpec` stays backend-neutral. XLSX lookup
+formulas and `helper_value_mode: values` remain behaviorally unchanged, and
+existing ODS/XLSX export and reimport tests remain green. Formula-mode
+tests cover both lookup result fields used by the Dino-Insel example
+(region name and region kind). Generated formulas remain deterministic and
+the fix must not require a future ODF version. The supported minimum
+LibreOffice version/capability is documented, release notes describe the
+previously broken behavior and the correction, and Project Memory records
+the discovered interoperability failure, verified root cause, fix,
+fallback, and validation evidence.
+
+*Unit tests* -- the ODS translator emits the verified function identifier
+with source-cell reference, lookup-key range, result range, and configured
+missing value preserved; output is deterministic; the XLSX translator is
+unaffected; values mode still returns materialized values rather than
+formula specs. A test that only asserts the newly implemented string is
+necessary but not sufficient.
+
+*ODS archive integration* -- generate a real ODS archive and inspect
+`content.xml`: the formula is stored in `table:formula` with the verified
+identifier present and the obsolete/invalid representation absent; the
+document remains a valid ODS archive; unrelated cells and metadata are
+unchanged.
+
+*LibreOffice interoperability* -- using a real supported LibreOffice
+installation, prove the formula is accepted and evaluated, not only that
+LibreOffice can open the ZIP archive. If normal CI does not provide
+LibreOffice, keep the unit/archive tests in the normal suite and provide an
+opt-in integration test or reproducible validation script; record the exact
+manual or headless command and LibreOffice version used. Do not represent
+XML-string tests alone as end-user interoperability proof.
+
+*Consumer regression* -- in Worldbuilding, run `make export-stories-ods` and
+`make check-reimport-ods`, then verify `_regions_name` and `_regions_kind`
+evaluate immediately, changing one `region_id` updates both helper cells,
+and no affected helper cell shows `#NAME?`. Rerun the corresponding XLSX
+targets to detect backend cross-impact.
+
+==== Documentation, Release Notes, and Project Memory
+
+Update the relevant user-facing FK-helper/formula documentation (not the
+full BUG narrative) to state: formula mode creates live spreadsheet
+formulas; ODS formula mode requires a LibreOffice version with `XLOOKUP`
+support; generated files must evaluate without manual confirmation;
+`helper_value_mode: values` is the fallback for broader compatibility and
+does not update helper display values live after FK edits. Do not present
+manual Function Wizard confirmation as an accepted workaround.
+
+Add a release-notes bug-fix entry stating that ODS formula-mode FK helpers
+previously opened as `#NAME?`, that ODS lookup formulas now use the
+verified LibreOffice-compatible representation and evaluate immediately
+without manual confirmation, the supported LibreOffice capability/version
+boundary, and that `helper_value_mode: values` remains the
+broader-compatibility fallback. Do not claim support for LibreOffice
+versions without `XLOOKUP`.
+
+Record the discovery and resolution in Project Memory per
+`docs/ai_info/project_memory_workflow.adoc`, preserving: Worldbuilding as
+the discovery context; the initial `#NAME?` symptom; the Function Wizard
+confirmation behavior; the verified pre-fix and final serialized formulas;
+the verified root cause; the LibreOffice version used; the values-mode
+fallback; test and consumer validation evidence; the fixing commit and
+release-note reference. Reuse an existing adapter/spreadsheet-boundary or
+consumer-adoption concern where suitable; do not create a new concern
+solely for this isolated bug when an existing one already covers it.
+
+==== Completion Evidence and Done Condition
+
+The implementation artifact must record: the exact Core baseline commit;
+the exact LibreOffice version; the generated pre-fix and post-fix formulas
+from `content.xml`; reproduction result before the fix and evaluation
+result after; the source-FK edit/recalculation result; focused test
+commands and results; the full relevant ODS test result; the XLSX
+non-regression result; the Worldbuilding ODS export/reimport result;
+documentation and release-note paths; Project Memory entries or curation
+evidence; the final Core commit; clean repository status; and confirmation
+that no unrelated changes were introduced.
+
+This bug is complete only when a newly generated ODS workbook evaluates
+formula-mode FK helpers immediately in a supported LibreOffice version
+without manual cell confirmation. Passing string-level unit tests without
+real LibreOffice validation does not close the bug.
