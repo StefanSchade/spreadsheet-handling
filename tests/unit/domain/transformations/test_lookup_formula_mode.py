@@ -605,7 +605,7 @@ class TestAsymmetricFormulaRendering:
             if c.getAttribute("formula")
         ]
         assert formulas[0] == (
-            "of:=XLOOKUP([.B2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
+            "of:=COM.MICROSOFT.XLOOKUP([.B2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
             "['Entity Lookup'.B2:'Entity Lookup'.B3];\"\")"
         )
 
@@ -625,7 +625,7 @@ class TestAsymmetricFormulaRendering:
             if c.getAttribute("formula")
         ]
         assert formulas[0] == (
-            "of:=XLOOKUP([.C2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
+            "of:=COM.MICROSOFT.XLOOKUP([.C2];['Entity Lookup'.D2:'Entity Lookup'.D3];"
             "['Entity Lookup'.B2:'Entity Lookup'.B3];\"\")"
         )
 

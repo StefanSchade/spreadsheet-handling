@@ -313,7 +313,13 @@ def _ods_lookup_formula(
         f"[{_range_address(formula.lookup_sheet, lookup_start, lookup_value_col, lookup_end, lookup_value_col)}]"
     )
     missing = _ods_string_literal(formula.missing)
-    return f"of:=XLOOKUP({source_ref};{key_range};{value_range};{missing})"
+    # `XLOOKUP` is not part of the standard OpenFormula vocabulary; LibreOffice
+    # only recognizes it under its Microsoft-extension-qualified identifier.
+    # An unqualified `of:=XLOOKUP(...)` is treated as an unknown name and
+    # shows `#NAME?` until the user reparses it via the Function Wizard.
+    # Verified against LibreOffice 25.2.3.2 -- see
+    # docs/backlog/BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A.adoc.
+    return f"of:=COM.MICROSOFT.XLOOKUP({source_ref};{key_range};{value_range};{missing})"
 
 
 def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
