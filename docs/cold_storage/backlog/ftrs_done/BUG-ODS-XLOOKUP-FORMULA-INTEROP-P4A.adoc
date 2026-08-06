@@ -1,6 +1,6 @@
 ===== BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A -- Generated ODS XLOOKUP helpers open as `#NAME?` in LibreOffice
 
-*Status:* New
+*Status:* Fixed
 *Priority:* P4A
 *Area:* ODS formula-mode FK helpers / `LookupFormulaSpec` ODS translation / LibreOffice interoperability
 *Release relevance:* Affects only `helper_value_mode: formula` on the ODS
@@ -241,3 +241,80 @@ This bug is complete only when a newly generated ODS workbook evaluates
 formula-mode FK helpers immediately in a supported LibreOffice version
 without manual cell confirmation. Passing string-level unit tests without
 real LibreOffice validation does not close the bug.
+
+==== Resolution
+
+*Verified root cause:* the ODS renderer's `_ods_lookup_formula`
+(`src/spreadsheet_handling/io_backends/ods/odf_renderer.py`) emitted the
+unqualified `of:=XLOOKUP(...)`. `XLOOKUP` is not part of the standard
+OpenFormula vocabulary; LibreOffice 25.2.3.2 only recognizes it under its
+Microsoft-extension-qualified identifier, `of:=COM.MICROSOFT.XLOOKUP(...)`.
+The hypothesis in this BUG's original "Root-Cause Hypothesis" section is
+confirmed as the complete cause -- no cached-value framework was needed, and
+the uppercase display normalization was, as suspected, a side effect of
+LibreOffice recognizing the function, not the defect itself.
+
+*Discarded hypotheses:* none of the alternative explanations considered
+during investigation (a caching requirement, a lowercase/uppercase parsing
+defect, a range/argument error) held up; the missing `COM.MICROSOFT.`
+qualification was sufficient by itself.
+
+*Verified via a real headless LibreOffice 25.2.3.2 process* over the UNO
+bridge (`tests/utils/libreoffice_uno_probe.py`, exercised standalone before
+any production change and again by the opt-in
+`tests/integration/io_backends/ods/test_ods_libreoffice_interop.py`), not
+only by XML inspection:
+
+* pre-fix minimal reproduction formula:
++
+[source,text]
+----
+of:=XLOOKUP([.B2];[Customers.A2:Customers.A3];[Customers.B2:Customers.B3];"")
+----
+  opened with `cell.getString() == "#NAME?"` and `cell.getError() == 525`.
+* post-fix formula:
++
+[source,text]
+----
+of:=COM.MICROSOFT.XLOOKUP([.B2];[Customers.A2:Customers.A3];[Customers.B2:Customers.B3];"")
+----
+  opened with `cell.getString() == "Ada"` and `cell.getError() == 0` on a
+  cold `calculateAll()` -- no cached result was involved or required.
+* editing the source FK cell to an unresolvable key recalculated the helper
+  to the configured missing result (`""`) with `getError() == 0`, not an
+  invalid-name error; editing it to a different valid key recalculated the
+  helper live to the new lookup value.
+* the real Worldbuilding `Places`/`Regions` export (`make export-stories-ods`)
+  produced 48 formula-mode helper cells, all using
+  `of:=COM.MICROSOFT.XLOOKUP(...)`, zero using the unqualified form; 24
+  checked helper rows showed no `#NAME?`/error, and editing one `region_id`
+  live-recalculated both `_regions_name` and `_regions_kind`.
+
+*Fix:* `_ods_lookup_formula` now emits `of:=COM.MICROSOFT.XLOOKUP(...)`
+instead of `of:=XLOOKUP(...)`; no other renderer, parser, or domain code
+changed. `LookupFormulaSpec` remains backend-neutral; the qualification is
+adapter-local to the ODS renderer.
+
+*Test evidence:*
+
+* focused (ODS formula translation, domain lookup-formula-mode, formula
+  specs, ODS adapter roundtrip, XLSX formula translation, XLSX
+  integration): `100 passed in 1.01s`.
+* opt-in real-LibreOffice interoperability test
+  (`pytest tests/integration/io_backends/ods/test_ods_libreoffice_interop.py -m libreoffice`):
+  `1 passed`.
+* full suite (`pytest tests/unit tests/integration tests/roundtrip tests/architecture`):
+  `2242 passed, 1 xfailed` (the pre-existing, unrelated
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` xfail).
+* `make source-style-guards`: `0 error(s)`.
+
+*Worldbuilding consumer validation:* `make export-stories-ods` +
+`make check-reimport-ods` -- "Reimport matches canonical data after
+normalization."; `make export-stories` + `make check-reimport` (XLSX) --
+same result, confirming no cross-backend regression. Worldbuilding repo
+state was not modified (only its gitignored `tmp/` output changed).
+
+*Fixing commit:* `5397d9d399159d58b95dd23fdd97efa78b8263a2`
+(`fix(BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A): serialize XLOOKUP for
+LibreOffice`), on top of Core baseline `2ee955562f0c5de887ba99ef030acd1e418aa456`
+(the commit that added this BUG document).
