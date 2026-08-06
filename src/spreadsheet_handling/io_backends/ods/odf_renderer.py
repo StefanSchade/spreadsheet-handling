@@ -317,8 +317,8 @@ def _ods_lookup_formula(
     # only recognizes it under its Microsoft-extension-qualified identifier.
     # An unqualified `of:=XLOOKUP(...)` is treated as an unknown name and
     # shows `#NAME?` until the user reparses it via the Function Wizard.
-    # Verified against LibreOffice 25.2.3.2 -- see
-    # docs/backlog/BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A.adoc.
+    # Verified against LibreOffice 25.2.3.2 under
+    # BUG-ODS-XLOOKUP-FORMULA-INTEROP-P4A.
     return f"of:=COM.MICROSOFT.XLOOKUP({source_ref};{key_range};{value_range};{missing})"
 
 
