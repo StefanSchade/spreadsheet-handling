@@ -24,8 +24,20 @@ def _write_helper_provenance(
         return
 
     meta: dict[str, Any] = dict(existing_meta or {})
-    derived: dict[str, Any] = meta.setdefault("derived", {})
-    derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
+    derived: dict[str, Any] = meta.get("derived", {})
+    derived_sheets: dict[str, Any] = derived.get("sheets", {})
+    path_copied = False
+
+    def copy_derived_path() -> None:
+        """Detach the FK-owned provenance path before its first mutation."""
+        nonlocal derived, derived_sheets, path_copied
+        if path_copied:
+            return
+        derived = dict(derived)
+        derived_sheets = dict(derived_sheets)
+        derived["sheets"] = derived_sheets
+        meta["derived"] = derived
+        path_copied = True
 
     for sheet_name, fk_defs in fk_defs_by_sheet.items():
         if fk_defs:
@@ -41,23 +53,42 @@ def _write_helper_provenance(
             ]
             # Key-selective merge: only replace helper_columns, preserve
             # other derived keys that may exist for this sheet.
-            derived_sheets.setdefault(sheet_name, {})["helper_columns"] = entries
+            copy_derived_path()
+            sheet_entry = dict(derived_sheets.get(sheet_name, {}))
+            sheet_entry["helper_columns"] = entries
+            derived_sheets[sheet_name] = sheet_entry
         else:
             # Remove stale provenance for sheets without current FK defs.
             if sheet_name in derived_sheets:
-                derived_sheets[sheet_name].pop("helper_columns", None)
-                if not derived_sheets[sheet_name]:
+                sheet_entry = derived_sheets[sheet_name]
+                if "helper_columns" not in sheet_entry and sheet_entry:
+                    continue
+                copy_derived_path()
+                sheet_entry = dict(derived_sheets[sheet_name])
+                sheet_entry.pop("helper_columns", None)
+                if sheet_entry:
+                    derived_sheets[sheet_name] = sheet_entry
+                else:
                     del derived_sheets[sheet_name]
 
     # Also clean provenance for sheets no longer in frames at all.
     current_sheets = set(fk_defs_by_sheet)
     for stale in [k for k in derived_sheets if k not in current_sheets]:
-        derived_sheets[stale].pop("helper_columns", None)
-        if not derived_sheets[stale]:
+        sheet_entry = derived_sheets[stale]
+        if "helper_columns" not in sheet_entry and sheet_entry:
+            continue
+        copy_derived_path()
+        sheet_entry = dict(derived_sheets[stale])
+        sheet_entry.pop("helper_columns", None)
+        if sheet_entry:
+            derived_sheets[stale] = sheet_entry
+        else:
             del derived_sheets[stale]
 
     # Prune empty derived namespace.
     if not derived_sheets:
+        if "sheets" in derived and not path_copied:
+            copy_derived_path()
         derived.pop("sheets", None)
     if not derived:
         meta.pop("derived", None)
@@ -84,14 +115,28 @@ def _clean_helper_provenance(
     if not derived_sheets:
         return
 
+    derived: dict[str, Any] = meta.get("derived") or {}
+    path_copied = False
+
+    def copy_derived_path() -> None:
+        """Detach the FK-cleanup path before its first mutation."""
+        nonlocal derived, derived_sheets, path_copied
+        if path_copied:
+            return
+        derived = dict(derived)
+        derived_sheets = dict(derived_sheets)
+        derived["sheets"] = derived_sheets
+        meta["derived"] = derived
+        path_copied = True
+
     for sheet_name in list(derived_sheets.keys()):
         sheet_entry = derived_sheets.get(sheet_name) or {}
-        if "helper_columns" in sheet_entry:
-            sheet_entry.pop("helper_columns")
+        remove_helper_columns = "helper_columns" in sheet_entry
         # Narrow enrich_lookup cleanup: drop the subkey only when none of its
         # helper columns remain in the cleaned frame, so still-present lookup
         # helper columns are never left without provenance.
         enrich = sheet_entry.get("enrich_lookup")
+        remove_enrich_lookup = False
         if isinstance(enrich, dict):
             enrich_cols = {str(c) for c in (enrich.get("helper_columns") or [])}
             frame = out.get(sheet_name)
@@ -102,12 +147,23 @@ def _clean_helper_provenance(
                 else set()
             )
             if not (enrich_cols & present):
-                sheet_entry.pop("enrich_lookup")
+                remove_enrich_lookup = True
+
+        if not (remove_helper_columns or remove_enrich_lookup or not sheet_entry):
+            continue
+
+        copy_derived_path()
+        sheet_entry = dict(derived_sheets.get(sheet_name) or {})
+        if remove_helper_columns:
+            sheet_entry.pop("helper_columns")
+        if remove_enrich_lookup:
+            sheet_entry.pop("enrich_lookup")
         if not sheet_entry:
             del derived_sheets[sheet_name]
+        else:
+            derived_sheets[sheet_name] = sheet_entry
 
     # Write cleaned meta back
-    derived = meta.get("derived") or {}
     if derived.get("sheets") is not None and not derived["sheets"]:
         del derived["sheets"]
     if not derived:

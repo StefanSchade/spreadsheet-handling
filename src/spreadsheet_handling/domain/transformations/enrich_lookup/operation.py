@@ -502,8 +502,8 @@ def _write_provenance(
     if fields is None:
         return
     meta: dict[str, Any] = dict(out.get("_meta") or {})
-    derived: dict[str, Any] = meta.setdefault("derived", {})
-    derived_sheets: dict[str, Any] = derived.setdefault("sheets", {})
+    derived: dict[str, Any] = dict(meta.get("derived", {}))
+    derived_sheets: dict[str, Any] = dict(derived.get("sheets", {}))
     record: dict[str, Any] = {"lookup": lookup}
     if resolved.is_asymmetric:
         # Asymmetric mode: record the distinct source/lookup keys additively
@@ -516,5 +516,9 @@ def _write_provenance(
         # Symmetric mode: preserve the original observable provenance shape.
         record["on"] = list(resolved.source_keys)
     record["helper_columns"] = list(fields)
-    derived_sheets.setdefault(output, {})["enrich_lookup"] = record
+    sheet_entry = dict(derived_sheets.get(output, {}))
+    sheet_entry["enrich_lookup"] = record
+    derived_sheets[output] = sheet_entry
+    derived["sheets"] = derived_sheets
+    meta["derived"] = derived
     out["_meta"] = meta
