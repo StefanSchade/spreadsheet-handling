@@ -1,0 +1,360 @@
+= Derived Provenance Nested Ownership — Slice 1 Implementation 001
+:toc:
+:toclevels: 3
+:sectnums:
+
+[cols="1,4"]
+|===
+| Status | Slice 1 implemented; awaiting independent implementation review
+| Type | Bounded caller-ownership correction for transient `_meta.derived`
+| Authoritative FTR | `docs/backlog/FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A.adoc`
+| Definition review | Accepted in Independent Definition Review 001
+| Baseline | `854c9057c5b2b8c21172504d7f073471ea5e6eb5`
+| Runtime/test commit | `454aa66553ce88eb79657cee596ea87748c80dc6`
+| Public or persisted shape change | None
+|===
+
+== 1. Status
+
+Slice 1 is implemented in runtime and executable characterization. It is not
+independently accepted, does not complete the FTR, and does not claim that the
+optional malformed-input Slice 2 is authorized or implemented. The definition
+remains independently accepted; this evidence is ready for a separate,
+falsification-oriented implementation review.
+
+The implementation changes only the three authorized mutation paths: FK
+provenance write, FK provenance cleanup/drop, and Enrich Lookup provenance
+write. Project Memory, registries, archive lifecycle, Worldbuilding, demos,
+generated context, public configuration, and persistence code are unchanged.
+
+== 2. Accepted authority
+
+The following authority was read completely before editing:
+
+* `FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A.adoc`;
+* `FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A_definition_review_001.adoc`;
+* `docs/cold_storage/backlog/wont_do/FTR-DERIVED-PROVENANCE-LIFECYCLE-P4A_revalidation_001.adoc`.
+
+The governing accepted conclusion is:
+
+[quote]
+____
+FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A ACCEPTED IN INDEPENDENT DEFINITION REVIEW 001 — SLICE 1 DEFINITION AUTHORIZED, RUNTIME NOT YET IMPLEMENTED
+____
+
+All five Minor interpretations govern this slice: retained references are
+checked against structural snapshots rather than identity alone; all maintained
+read consumers are included in the impact analysis; the Enrich repetition and
+output/source matrix is characterized without adding cleanup; the common defect
+mechanism is shallow copy followed by mutation through a nested alias, not only
+`setdefault`; and lifecycle/Project Memory work remains separate and already
+completed outside this implementation.
+
+The baseline was clean at exact HEAD
+`854c9057c5b2b8c21172504d7f073471ea5e6eb5`. Expected history was present in
+order: `8cf8673`, `dad2446`, `b0a9751`, `73502b1`, `854c905`. No overlapping
+change existed in an affected runtime, test, FTR, or artifact path.
+
+== 3. Reproduced pre-fix behavior
+
+The accepted authority's reproduction was rechecked against current source
+before editing. `copy_reserved_frames` preserves the reserved `_meta` object by
+reference and Enrich Lookup begins with `dict(frames)`. Each defective writer or
+cleaner then made only a shallow top-level `_meta` copy and mutated an existing
+`derived`, `sheets`, or sheet-entry mapping through the retained alias.
+
+The observable pre-fix result was a new returned `_meta` mapping paired with a
+caller-owned nested mapping that had gained, lost, or replaced provenance:
+
+* FK write added/replaced `helper_columns` and stale-cleaned through the input;
+* FK drop removed `helper_columns`, conditionally removed `enrich_lookup`, and
+  pruned input containers;
+* Enrich Lookup added/replaced the output's `enrich_lookup` record through the
+  input mapping, reproducing `EL-HR-002`.
+
+The input's final structure could even be restored after temporary
+`setdefault`/prune work, which is why final equality without retained-reference
+and changed-node assertions was insufficient. No persistence defect was
+reproduced: the orchestrator boundary already removes `derived` for every
+backend.
+
+== 4. Implementation choice
+
+*Selected alternative: family-local copy-along-path implementations.*
+
+FK provenance owns one local lazy-detachment convention in `provenance.py` for
+its writer and cleaner. Enrich Lookup performs the corresponding explicit path
+copy in its own `_write_provenance`. This is the smallest coherent choice:
+
+* it expresses the accepted family-spanning ownership contract without adding a
+  new cross-family runtime dependency;
+* it keeps FK stale-clean and presence-sensitive pruning next to their current
+  owner;
+* it keeps Enrich record construction and selected symmetric/asymmetric mode in
+  the Enrich family;
+* it exposes precisely which path nodes detach and allows identity assertions;
+* it introduces no `frame_keys` responsibility, public helper, or metadata
+  framework.
+
+FK detachment is lazy so sheets whose producer-owned sub-key does not change
+remain shared. On the first actual FK write/removal, `_meta.derived.sheets` is
+copied and only each touched sheet entry is copied. Enrich always replaces the
+named output record when fields are present, so `_meta`, `derived`, `sheets`,
+and that output sheet entry are the changed path and are copied directly.
+
+== 5. Alternatives considered
+
+[cols="2,4"]
+|===
+| Alternative | Decision
+
+| Neutral common copy/prune helper
+| Rejected. Ownership is common, but FK cleanup/pruning and Enrich record
+replacement are not one mutation algorithm. A neutral utility would add a new
+boundary and coupling without reducing the load-bearing local distinctions.
+
+| Family-local implementations
+| Selected. Dependency direction stays unchanged; diagnostics, call order, FK
+stale nuance, Enrich key-mode nuance, and local testability remain visible.
+
+| Owned utility near `frame_keys` or a new meta module
+| Rejected. `frame_keys` owns reserved-frame copying, not mutation policy for a
+registered nested namespace. A new generic meta boundary would be larger than
+the three-site contract and risk implying repository-wide immutable Frames.
+|===
+
+`derived_column_policy._strip_consumed_provenance` remained positive semantic
+evidence and unchanged code; extracting it would have enlarged the slice.
+
+== 6. Exact runtime changes
+
+`fk_helpers/provenance.py::_write_helper_provenance` now:
+
+* reads existing `derived` and `sheets` without mutating them;
+* lazily copies `derived` and `sheets` before the first real change;
+* copies a sheet entry only when FK-owned `helper_columns` is written, removed,
+  or an empty stale entry is pruned;
+* preserves untouched sheet-entry and unrelated subtree objects;
+* retains current FK entry creation, stale-sheet scan, and empty-container
+  pruning.
+
+`fk_helpers/provenance.py::_clean_helper_provenance` now computes the existing
+presence decisions first, detaches the path only if removal/pruning is required,
+copies each touched sheet entry, and then performs the same guarded removal and
+pruning. `drop.py` and its diagnostics/order remain unchanged.
+
+`enrich_lookup/operation.py::_write_provenance` now copies `_meta`, `derived`,
+`sheets`, and the named output sheet entry before assigning the fresh record.
+Record construction and write timing remain unchanged.
+
+No pandas DataFrame, whole Frames mapping, unrelated metadata subtree, or
+untouched sheet entry is deep-copied for this contract.
+
+== 7. Test additions and changes
+
+New file
+`tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py`
+adds 14 collected characterization cases covering:
+
+* retained input Frames, `_meta`, `derived`, `sheets`, and touched sheet-entry
+  references plus independent structural snapshots;
+* output changed-node identity and intended write/removal effects;
+* FK exact record shape, producer stale-clean, key-selective merge, cleanup,
+  conditional Enrich removal, empty pruning, presence-checked preservation,
+  repeat/no-op behavior, and absent containers;
+* Enrich symmetric, asymmetric, and explicit equal-key asymmetric exact record
+  shapes;
+* Enrich same-output repetition, changed helpers, source replacement, output
+  name change with old frame retained, and output change after caller removal;
+* same-sheet cross-producer siblings, other sheets, other derived subtrees, and
+  top-level metadata siblings.
+
+Existing FK, Enrich, derived-column-policy, persistence, rendering, Cell Codec,
+column-role, helper-reorder, FK-validation, integration, and architecture tests
+were reused. No duplicate persistence-backend matrix was added.
+
+== 8. Contract demonstration
+
+For each affected operation, tests retain the caller's exact nested objects,
+snapshot their structure before the call, and prove afterward that:
+
+* the input Frames mapping still has the same keys and value objects;
+* input DataFrames remain equal to deep snapshots;
+* retained `_meta`, `derived`, `sheets`, and touched sheet mappings equal their
+  independent pre-call snapshots;
+* the returned payload contains the expected new record or removal;
+* every changed output path node is distinct from its corresponding input node.
+
+The FK no-op repetition additionally proves that after helper provenance is
+already gone and a surviving Enrich record remains valid, `derived`, `sheets`,
+and the sheet entry remain shared because none is changed. This distinguishes
+copy-along-the-mutated-path from broad recursive copying.
+
+== 9. Sibling and record-shape preservation
+
+The tests preserve by value and, where untouched, by identity:
+
+* unrelated top-level `_meta` values;
+* unrelated `derived` namespaces;
+* unrelated `derived.sheets` entries;
+* FK `helper_columns` beside Enrich `enrich_lookup` on the same sheet;
+* Enrich `enrich_lookup` beside FK `helper_columns` on the same sheet.
+
+Exact shapes remain:
+
+* FK: `{column, fk_column, target, target_key, value_field}`;
+* Enrich symmetric: `{lookup, on, helper_columns}`;
+* Enrich asymmetric: `{lookup, source_key, lookup_key, helper_columns}`;
+* explicit asymmetric with equal source/lookup names: the asymmetric shape,
+  never a synthesized `on` record.
+
+Existing suites keep frame columns, order, values, formula specs, validation
+precedence, durable policy fallback, and consumer behavior green.
+
+== 10. Enrich repetition characterization
+
+The complete required matrix preserves current results:
+
+[cols="2,4"]
+|===
+| Case | Characterized result
+
+| Same output, same helpers
+| A fresh equal record replaces the owned output sub-key; no accumulation.
+
+| Same output, changed helpers
+| `helper_columns` is replaced by the new list; stale members are not merged.
+
+| `output == source`
+| The source frame and its named provenance record are replaced; caller source
+and metadata remain unchanged.
+
+| Changed output while old output remains
+| Both frames and both descriptive records remain.
+
+| Changed output after caller removed the old frame
+| The pre-existing old record remains and the new record is added. This is the
+already-authorized no-producer-stale-cleanup behavior; Slice 1 adds no scan or
+cleanup and observed no new consumer or persistence harm.
+|===
+
+The last case is explicit evidence, not silent authorization to widen producer
+ownership. It remains a within-run residue when a caller manually removes an
+output mapping; persistence still strips the whole channel.
+
+== 11. Malformed-input boundary
+
+No mapping validator, normalization, exception translation, or broad hardening
+was added. The implementation assumes the same valid/absent mapping levels as
+the pre-existing mutation code and uses ordinary local `dict(...)` path copies.
+Malformed producer/cleaner inputs remain outside Slice 1; optional Slice 2 is
+unimplemented and unauthorized.
+
+The maintained derived-column-policy cleaner and its path-named malformed-input
+diagnostics are unchanged. No consumer diagnostic or validation precedence was
+altered.
+
+== 12. Persistence non-regression
+
+Persistence ownership remains at
+`pipeline.persistence_boundary.project_meta_to_persistable_contract`, called by
+the orchestrator immediately before every saver. `derived` remains in
+`RUNTIME_ONLY_TOP_LEVEL_META_KEYS`; no saver, registry, or carrier behavior was
+changed.
+
+The existing persistence matrices were reused:
+
+* `tests/unit/pipeline/test_persistence_boundary.py`;
+* `tests/integration/pipeline/test_orchestrator_persistence_boundary.py`;
+* `tests/architecture/semantic_invariants/test_meta_carrier_boundary_guards.py`.
+
+They remain green and continue to prove unconditional removal for the maintained
+backends. Durable FK identity in v2 relations and canonical
+`sheets.*.helper_columns` remains available after transient stripping.
+
+== 13. Validation
+
+[cols="3,1,2"]
+|===
+| Selection | Result | Purpose
+
+| Six directly affected unit files, including the new characterization
+| 205 passed | FK write/drop, Enrich, policy, ownership
+
+| Pipeline/integration/persistence selection
+| 54 passed | FK pipeline metadata, lookup inbound binding, persistence boundary
+
+| Consumer unit selection
+| 160 passed | reorder, FK validation, Cell Codec, column roles, rendering
+
+| Architecture selection
+| 84 passed | dependency direction, FK package/API, meta registry/carrier,
+pipeline semantics
+
+| `make test`
+| 2240 passed, 1 xfailed | normal active unit/integration/roundtrip/architecture suite
+
+| Ruff on the two runtime paths and new test file
+| pass | lint/style
+
+| `git diff --check` / staged diff check
+| pass | whitespace and patch integrity
+
+| Strict Asciidoctor render of active FTR, this artifact, `_ftrs_open.adoc`
+| pass | documentation integrity
+|===
+
+The focused commands used `.venv/bin/python -m pytest` with the named affected
+files. `make test` ran the repository's normal active marker selection
+(`not legacy and not prehex and not slow`). The strict render used
+`asciidoctor --failure-level=ERROR` with output only under `/tmp`.
+
+No unrelated pre-existing validation failure occurred. The aggregate
+`_ftrs_open.adoc` render emitted its pre-existing warning that
+`FTR-META-CONTRACT-VERSIONING-P4A.adoc` starts at a section level out of
+sequence; the command exited zero, and the two changed documents rendered
+without diagnostics.
+
+== 14. Residual risks
+
+* Caller-driven removal of a prior Enrich output can leave its transient record
+  until a current consumer removes it or persistence strips the namespace. This
+  accepted repetition result has no newly observed harm and does not authorize
+  producer stale cleanup.
+* Producer/cleaner malformed-input diagnostics remain uneven with hardened
+  consumers. That is the explicitly optional, unauthorized Slice 2 concern.
+* The contract remains limited to maintained `_meta.derived` writers/cleaners;
+  it does not establish global Frames immutability.
+* Future producers must continue respecting sheet-local sub-key ownership and
+  copy their changed path, but no generic governance framework is introduced.
+
+No residual Slice 1 correctness issue is known. Independent review must still
+try to falsify path identity, sibling preservation, stale-clean nuance,
+diagnostic parity, and persistence separation.
+
+== 15. Review handoff
+
+Independent implementation review should begin from runtime/test commit
+`454aa66553ce88eb79657cee596ea87748c80dc6` and the following documentation
+commit. It should independently inspect all three mutation sites, run the
+focused and full validations, probe retained nested references, and verify that
+untouched sheet entries/DataFrames are not copied.
+
+The maintained inventory reviewed for impact was:
+
+* writers: FK `_write_helper_provenance`, Enrich `_write_provenance`;
+* cleaner: FK `_clean_helper_provenance` through `drop_helpers`;
+* already-compliant cleaner: derived-column policy
+  `_strip_consumed_provenance`;
+* readers: rendering, helper reorder, FK validation, Cell Codec, column-role
+  resolution, derived-column policy, and FK drop policy resolution;
+* persistence: boundary projection plus orchestrator call;
+* contract surfaces: meta registry, pipeline step registry, tests, and guards.
+
+Only the two runtime files, one new test file, this implementation artifact,
+and the active FTR's narrow status paragraph are intended. Path-specific staging
+was used; no branch switch or push occurred. The external checkpoint is
+`/tmp/FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A_slice1_implementation_001_2026-08-06.md`
+and is not part of the repository.
+
+FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A SLICE 1 IMPLEMENTED — AWAITING INDEPENDENT IMPLEMENTATION REVIEW
