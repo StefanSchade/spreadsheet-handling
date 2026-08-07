@@ -1,29 +1,42 @@
-===== BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A -- Unresolved helper values become the literal string `nan` in canonical JSON
+===== BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A -- Unresolved FK-helper values collapse into backend-divergent, domain-colliding representations (literal `nan` on ODS, empty string on XLSX)
 
-*Status:* New
+*Status:* Revalidated / decision-ready
 *Priority:* P4A
 *Area:* FK helper materialization / unresolved-value contract / canonical persistence
-*Release relevance:* Post-`0.2.0`. Not a runtime blocker. Honest documentation is required for `0.2.0`; the contract decision itself can land after.
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker. This is the next
+dependency-ready item in the domain-hardening sequence
+(`roadmap_domain_hardening_sequence.adoc` Phase C) and is named as the
+next action by `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` and as the sole named
+non-goal exception of `DEC-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` /
+`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`.
 
-==== Summary
+*Revalidated:* 2026-08-07, at core HEAD `3a8d96f5716ca429c9e1c67b9cdad8d7b759e2d1`
+(clean worktree). This revalidation reconciles the historical narrative with
+current maintained code and the current xfail sentinel, pins the exact
+current root cause, and rewrites the contract question into a decision-ready
+shape. It does not implement a fix and does not choose among the recorded
+options; see "Recommended direction" below for the boundary between
+*recommended* and *accepted / implementation-authorized*.
 
-When the source FK column of a configured FK helper is empty
-(`home_place_id: ""`), the materialized helper value reaches canonical JSON
-as the literal string `"nan"`. The framework currently has no documented
-contract for *unresolved helper values*: it normalizes FK *keys* but does
-not define the persisted representation of "no resolved helper value".
+==== Title note
 
-This BUG asks the project to define and enforce that contract. It is
-distinct from `BUG-HELPER-CLEANUP-CONTRACT-P4A`, which addresses *whether*
-helper columns reach canonical JSON. Even when cleanup works, helpers can
-legitimately appear in upstream views, and the contract for unresolved
-values still needs to be defined.
+The original title ("Unresolved helper values become the literal string
+`nan` in canonical JSON") is *not* retired -- current evidence
+(section "Current reproduction" below) shows the literal `"nan"` collapse is
+still live today on the ODS backend, for both the empty-source and the
+non-empty-unresolved-key case. The title is broadened, not corrected, because
+current evidence also shows a *second*, backend-divergent collapse (plain
+empty string on XLSX) that the original title did not name and that is
+equally a defect. Both symptoms are current facts, not merely historical
+ones.
 
-==== Reproduced symptom
+==== Historical discovery (preserved)
 
-From `worldbuilding/tmp/dino_stories_reimported/characters.json` after
-`make export-stories-ods` + `make import-stories-ods` at core HEAD
-`8f8b519` (see `BUG-HELPER-CLEANUP-CONTRACT-P4A` for the full recipe):
+Reproduced at historical core HEAD `8f8b519` (2026-06-03 era), via the
+worldbuilding consumer's `make export-stories-ods` + `make import-stories-ods`
+recipe (recipe still present in the sibling `worldbuilding` repository's
+`Makefile`; not re-run here, as this task is scoped to `core`). From
+`worldbuilding/tmp/dino_stories_reimported/characters.json`:
 
 [source,json]
 ----
@@ -35,179 +48,534 @@ From `worldbuilding/tmp/dino_stories_reimported/characters.json` after
 }
 ----
 
-Six rows in `characters.json` carry `"_places_name": "nan"` -- one per row
-whose `home_place_id` is empty. The literal string `"nan"` originates from
-the pandas/NumPy stringification of a NaN cell, and reaches canonical
-storage unchanged because no normalization layer treats "unresolved helper
-value" as a separate case.
+Six rows carried `"_places_name": "nan"`, one per row whose `home_place_id`
+was the empty string. The historical BUG text explicitly left the root cause
+"still to be pinned" and recorded three plausible carriers: FK helper
+materialization producing a pandas NaN; a downstream stringification
+artifact; or replay of already-`"nan"`-contaminated canonical data (the last
+one was already ruled out for that specific reproduction by the historical
+text itself, since the seed canonical JSON contained no `"nan"` strings).
 
-==== Why this is wrong
+This revalidation confirms carrier (1) -- FK helper materialization producing
+a pandas NaN -- is the real cause, and additionally pins exactly *where* that
+NaN turns into the literal string `"nan"` on the write path, which the
+historical text did not reach (see "Root cause -- pinned" below).
 
-A canonical JSON consumer cannot distinguish between:
+==== Current reproduction (evidence, HEAD `3a8d96f5716c`)
 
-* a helper that resolved to the actual string `"nan"` (an in-domain value);
-* a helper that failed to resolve because the FK source was empty;
-* a helper that failed to resolve because the FK target was missing;
-* a helper that failed to resolve for some other reason (e.g. type coercion).
+Reproduced independently of the worldbuilding recipe, using only maintained
+current APIs: the `tests/roundtrip/` fixture shape (`minimal_fk_workdir` in
+`tests/roundtrip/conftest.py`) driven through the public CLI entry point
+(`spreadsheet_handling.cli.apps.run.main`), via small read-only probe scripts
+(no production code modified). Full matrix in the checkpoint file.
 
-Collapsing all of these into the ordinary string `nan` changes a
-missing/error state into domain data. This is a silent contract failure.
+[cols="3,2,2",options="header"]
+|===
+| Source `entity_id` | XLSX no-cleanup reimport `_entities_name` | ODS no-cleanup reimport `_entities_name`
 
-==== Three options for the contract
+| `"ENT-001"` (valid) | `"Alpha"` (resolved) | `"Alpha"` (resolved)
+| `""` (empty source) | `""` | *`"nan"`*
+| `"ENT-MISSING"` (non-empty, unresolvable) | `""` | *`"nan"`*
+| `"nan"` (literal domain string as source key, itself unresolvable) | `""` | *`"nan"`*
+|===
 
-Recorded so the decision is explicit, not implicit:
+Two further probes prove the collapse is not merely cosmetic but actively
+*colliding with legitimate domain data* today, on both backends:
 
-1. *Empty / null.* Unresolved helper values become the empty string `""`
-   (parallel to how empty FK source values are represented) or JSON
-   `null`. Cheapest to implement, simplest contract, but loses the
-   "unresolved" distinction.
+* A row whose FK *resolves successfully* to a target whose own field value is
+  the literal domain string `"nan"` reimports as `"_entities_name": "nan"` on
+  *both* XLSX and ODS -- on ODS this is byte-identical to the corrupted
+  unresolved-case output above; there is no way for a canonical JSON consumer
+  to tell them apart today.
+* A row whose FK *resolves successfully* to a target whose own field value is
+  a legitimate empty string reimports as `"_entities_name": ""` on both
+  backends -- on XLSX this is byte-identical to the collapsed unresolved-case
+  output; again, no way to tell them apart.
 
-2. *Structured finding.* Unresolved helper values do not appear inline;
-   they are surfaced through a findings frame (compatible with the
-   existing `derived_column_findings` mechanism used by the
-   `warn_on_mismatch` / `fail_on_mismatch` policies). The cell either
-   stays empty or carries a stable marker. Preserves the distinction at
-   the cost of a separate carrier.
+The `cleanup=drop` reimport path (`apply_derived_column_policy ...
+policy: drop`) is unaffected either way on both backends: the helper column
+is removed entirely before it can leak either representation. This matches
+the BUG's original framing -- the twin `BUG-HELPER-CLEANUP-CONTRACT-P4A` (now
+*Done*, archived to `docs/cold_storage/backlog/ftrs_done/`) governs *whether*
+helpers reach canonical JSON; this BUG governs *what value they carry when
+they legitimately do* (upstream/editable views, or any no-cleanup reimport
+path).
 
-3. *Spreadsheet error preservation.* If LibreOffice Calc or Excel
-   produced a real error value (`#NAME?`, `#N/A`), preserve it as a
-   typed error token rather than stringifying it as `"nan"`. This is
-   only a partial answer -- it does not cover the empty-FK case, where
-   no spreadsheet error exists in the first place. Likely a useful
-   complement to option 1 or 2, not a standalone answer.
+==== Changed behavior since discovery
 
-The maintainer's intuition (from project notes) leans toward option 1 for
-`0.2.0` simplicity, with option 2 as a later refinement once the FK
-helper policy lifecycle clarifies what counts as a "finding".
+* The reproduction path changed. The historical recipe used the worldbuilding
+  ODS consumer end to end; the current maintained regression sentinel
+  (`tests/roundtrip/test_pathological_cell_contracts.py`) uses a synthetic
+  fixture and, critically, *only exercises the XLSX backend*. That is a real
+  coverage gap: the current xfail is blind to the still-live ODS `"nan"`
+  collapse this revalidation reproduces.
+* XLSX behavior changed (or was never the same as ODS to begin with -- the
+  historical text did not distinguish backends). XLSX today collapses
+  unresolved helper values to `""`, not `"nan"`. This is not a deliberate
+  contract; see "Root cause -- pinned".
+* `domain/fk_relations.py` has been restructured since the BUG was written
+  and is now the v2 relation *policy* producer module
+  (`infer_fk_relations`, `apply_v2_relations`, `build_v2_relation`) -- it is
+  no longer where helper *values* are materialized. The old BUG's reference
+  to `domain/fk_relations.py:160-285` as "the FK helper provenance and
+  materialization shape" is stale. See "Relevant code path" below for the
+  corrected pointer.
+* `domain/transformations/derived_column_policy.py`'s `_norm` helper moved
+  from line 386 (as the old BUG recorded) to line 605; its behavior is
+  unchanged.
+* The twin `BUG-HELPER-CLEANUP-CONTRACT-P4A` shipped and is archived. The
+  FK-helper v1-to-v2 policy migration (`FTR-FK-HELPERS-POLICY-DRIVEN-
+  PRIMITIVES-P5` and siblings) landed. Neither changed the value-
+  materialization path this BUG concerns.
+* `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` was accepted (Independent
+  Architecture Review 002, 2026-08-07) and explicitly names this BUG as the
+  one thing it does *not* decide ("the missing/unresolved/spreadsheet-error
+  representation"), confirming this BUG remains the correct and only current
+  owner of that question.
+* `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` was drafted (exploratory, still *New*)
+  using this BUG as its motivating case. It proposes a general
+  classify/recover/pin registry contract and states a *recovery preference*
+  (favors representations that surface meaning into data over a
+  metadata-only finding) without deciding this BUG's outcome. It remains
+  evidence, not authority, until it is itself accepted.
 
-==== Root cause sketch (still to be pinned)
+==== Exact current unresolved contract (the xfail, verbatim facts)
 
-The path that produces `"nan"` is not yet fully traced. Three plausible
-carriers exist; the BUG asks the implementer to confirm which one is in
-play before choosing a fix:
+`tests/roundtrip/test_pathological_cell_contracts.py::
+test_missing_fk_key_helper_representation_without_cleanup`:
 
-1. *FK helper materialization.* `configure_fk_helpers` + `add_fk_helpers`
-   join helper values from the target frame. When the source FK is empty,
-   `_norm_id` returns `None` (see `src/spreadsheet_handling/core/fk.py:26`),
-   which produces a pandas NaN in the joined column. NaN serializes as
-   `"nan"` via `str()` if not caught by a normalization layer.
-2. *Pandas / object stringification artifact.* If a downstream step
-   coerces a NaN-bearing object column to string before writing JSON, the
-   stringification yields `"nan"` even when the upstream cell was a true
-   missing value.
-3. *Replay of already-contaminated canonical data.* If a prior reimport
-   wrote `"nan"` into canonical JSON, a subsequent export + reimport
-   round trip would echo that value back without any new NaN ever being
-   produced. This is unlikely here (canonical
-   `worldbuilding/daten/dino_insel/characters.json` does not currently
-   contain `"nan"`) but worth ruling out explicitly.
+* *Input key used:* `entity_id` on `ITEM-003` is rewritten from the fixture's
+  default `""` to the non-empty, unresolvable identifier `"ENT-MISSING"`
+  before export. The fixture's own default seed row (unmodified) already
+  covers the empty-string case, which this revalidation probed separately
+  (table above).
+* *Helper configuration:* `configure_fk_helpers` (v2, explicit) on `items` ->
+  `entities`, `fk_column: entity_id`, `allowed_helpers`/`default_helpers:
+  ["name"]`, `helper_prefix: "_"`; `add_fk_helpers` with `levels: 2,
+  helper_value_mode: "values"` (not formula mode).
+* *Backend/path exercised:* XLSX only, no-cleanup reimport
+  (`apply_workbook_view_sheet_mappings` only; `apply_derived_column_policy`
+  is deliberately *not* in the reverse pipeline so the helper column stays
+  observable).
+* *Cleanup behavior:* deliberately bypassed by test design, to keep the value
+  contract observable at all.
+* *Currently observed helper value:* the empty string `""` (confirmed by
+  running the test individually below and by the direct probe matrix above).
+* *Currently expected future contract:* explicitly left undecided by the
+  test's own `reason=` text -- "null, a structured finding, a typed
+  unresolved token, or another documented shape."
+* *Exact xfail reason:* `"BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A: the
+  framework currently has no defined contract for unresolved helper values.
+  In the no-cleanup sentinel path used here, a missing FK key currently
+  reimports with an ordinary empty-string helper value; the final
+  representation may be null, a structured finding, a typed unresolved token,
+  or another documented shape once the contract decision lands."`
+* *Strict or non-strict:* `strict=False`. The assertion only checks
+  `helper_value not in ("nan", "")`; it does not assert a specific target
+  shape.
 
-The reproduction recipe in `BUG-HELPER-CLEANUP-CONTRACT-P4A` produces a
-deterministic fresh case from canonical data with no `"nan"` strings, so
-the cause is in the export-or-import code path, not in stale canonical
-data. That eliminates option 3 for this reproduction.
+Individual run at HEAD `3a8d96f`:
 
-==== Scope
+[source,console]
+----
+$ .venv/bin/pytest -q tests/roundtrip/test_pathological_cell_contracts.py -rA
+x                                                                        [100%]
+XFAIL ...test_missing_fk_key_helper_representation_without_cleanup - BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A: ...
+----
 
-* Define an explicit contract for unresolved helper values on the
-  canonical persistence path.
-* Implement the contract in the FK helper materialization /
-  serialization path so the literal string `"nan"` no longer appears in
-  canonical JSON by accident.
-* Document the contract in the FK helper concept docs and the user
-  guide where helper materialization is described.
-* Add regression coverage using a representative empty-FK source.
-* Coordinate with `BUG-HELPER-CLEANUP-CONTRACT-P4A`: when both fixes
-  land, the worldbuilding reproduction must produce zero leaked helper
-  columns *and* zero `"nan"` strings.
+Where the current `""` is introduced: not at the FK-key normalization layer
+(`core/fk.py:_norm_id`), which correctly returns `None` for a missing/NaN key
+and the literal string `"ENT-MISSING"` or `""` unchanged for a present key.
+It is introduced at the *write/read boundary of the XLSX backend*, where a
+missing helper *value* (see "Root cause -- pinned") round-trips through
+openpyxl as a blank cell and the XLSX parser's `str(val) if val is not None
+else ""` (the accepted visible-cell string-substrate contract, per
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`) turns the blank cell into `""`.
+This is *not* an accepted semantic contract for "unresolved" -- it is an
+accidental byproduct of one specific library's (openpyxl's) NaN-to-`None`
+write behavior, which happens to compose with the string-substrate ADR to
+produce `""`. The ODS backend, going through the same in-memory NaN, produces
+`"nan"` instead, via an unrelated accidental defect (below). Neither backend's
+current output is a deliberate representation of "unresolved."
 
-==== Non-goals
+==== Root cause -- pinned
 
-* Do not block on this BUG before `0.2.0` ships. The
-  helper-cleanup contract fix (separate BUG) alone is enough to make
-  the worldbuilding canonical JSON clean for the documented round trip
-  pattern. A 0.2.0 release notes entry under *Known limitations* naming
-  the unresolved-helper-value contract as undefined is acceptable as
-  the pre-decision posture.
-* Do not extend this BUG to cover all NaN / null normalization across
-  the framework. The scope is *helper values produced by the FK helper
-  family* on the canonical persistence path.
-* Do not address the LibreOffice Calc `#NAME?` formula-evaluation
-  symptom (UI error that resolves on re-confirm). That is a Calc runtime
-  issue; the on-disk ODS does not carry `#NAME?` for the reproduction
-  used here. If a separate BUG for formula-error mapping is needed,
-  open it independently.
+Distinguishing *observed current fact* from *historical explanation* from
+*hypothesis*, per the full trace (probes in the checkpoint file; all read via
+`.venv/bin/python`, no production code modified):
+
+. *observed current fact* -- `domain/transformations/fk_helpers/enrich.py`'s
+  `enrich_helpers` calls `core/fk.py:apply_fk_helpers`
+  (`src/spreadsheet_handling/core/fk.py:~327-333`). For each unresolved row,
+  `value_map.get(_norm_id(rid))` returns Python `None` (dict-default
+  behavior; `_norm_id` itself is correct and unchanged since the historical
+  BUG -- `core/fk.py:26`).
+. *observed current fact* -- assigning a Python list containing `None`
+  (mixed with resolved `str` values) into a new DataFrame column
+  (`core/fk.py:337`, `new_df[col_tuple] = values`) does not preserve the
+  `None`. Under the project's currently active pandas string dtype, the
+  column reports `dtype == "str"` but the unresolved cells are stored as an
+  actual Python `float('nan')`, confirmed by direct inspection
+  (`type(value) is float`, `repr(value) == 'nan'`). This is the FK-helper
+  value materialization step turning "no match" into a *pandas/NumPy carrier
+  missing value* -- not yet a string, and not yet `"nan"` as text.
+. *observed current fact* -- `rendering/composer/layout_composer.py:353`
+  (`compose_workbook`) copies `df.values.tolist()` directly into
+  `TableBlock.data` with *no* NaN/None normalization at the render-IR
+  boundary. The raw float NaN reaches both backend renderers unchanged.
+. *observed current fact, XLSX* -- `io_backends/xlsx/openpyxl_renderer.py`
+  passes the raw value straight to `ws.cell(..., value=val)`
+  (`_xlsx_cell_value`/`_write_data_block`, ~line 218-235) with no NaN
+  handling. A minimal openpyxl-only probe (write `float('nan')`, save,
+  reload) confirms openpyxl itself silently converts a NaN-valued cell to
+  `None` on save/reload -- this is accidental library behavior, not a
+  decision made anywhere in this codebase. The XLSX parser then applies its
+  documented, ADR-compliant `str(val) if val is not None else ""`
+  (`io_backends/xlsx/parser_interpretation.py`), producing `""`.
+. *observed current fact, ODS* -- `io_backends/ods/odf_renderer.py:563`
+  contains the cell-emptiness check `if value in (None, ""):`. Python's `in`
+  operator uses `==` comparisons, and `float('nan') == float('nan')` is
+  `False` by IEEE-754 definition, so `nan in (None, "")` evaluates to
+  `False`. The NaN therefore *fails* the emptiness check and falls through to
+  the numeric branch (`isinstance(value, (int, float))`, line 573-579),
+  which writes `valuetype="float"` with a paragraph text of `str(value)` --
+  literally `"nan"` -- into the cell. This is a genuine, narrow correctness
+  defect in this one emptiness check: the project already has at least three
+  independent, *correct* implementations of "carrier-missing vs literal
+  string" elsewhere (`core/fk.py:_norm_id`,
+  `derived_column_policy.py:_norm` at line 605, and
+  `domain/_cell_primitives.py:_is_empty_cell`, all of which use
+  `pd.isna(...)` rather than `in (None, "")`), none of which is applied at
+  this write boundary.
+. *observed current fact, ODS read* -- `io_backends/ods/odf_parser.py:86`'s
+  `_cell_value` reads the cell's paragraph text (`_cell_text`) *first*, before
+  consulting `office:value-type`/`office:value`. Since the renderer wrote a
+  non-empty paragraph text of `"nan"`, the parser returns the literal string
+  `"nan"` without ever reaching the float-attribute branch.
+. *hypothesis, explicitly not claimed as fact* -- whether the *historical*
+  8f8b519-era reproduction went through exactly this same ODS code path is
+  plausible (same architecture family, same string-substrate contract) but
+  not re-verified against that historical commit; this revalidation verifies
+  the *current* HEAD path only, which independently reproduces the same
+  symptom via the mechanism traced above.
+. *historical explanation, superseded* -- the historical BUG's "Root cause
+  sketch" left open whether a downstream stringification artifact or
+  contaminated replay was responsible. This revalidation rules out
+  contaminated replay for the current reproduction (fresh synthetic fixture,
+  no `"nan"` in seed data) and identifies the "stringification artifact" as,
+  specifically, the ODS renderer's NaN-blind emptiness check -- not a generic
+  or diffuse stringification problem.
+
+==== Semantic distinctions (grounded in the current trace, not assumed)
+
+The trace above shows the *in-memory* value materialization step already
+distinguishes more than the persisted representation preserves: a
+successfully resolved helper whose target value happens to be a legitimate
+empty string is represented in-memory as the Python string `''`, genuinely
+different from the unresolved case's `float('nan')`. The information loss is
+introduced entirely at the render-write / string-substrate boundary, not in
+FK resolution itself. This bounds the fix: normalization at or before the
+write boundary can recover the distinction; no change to FK resolution logic
+is implied.
+
+Applying the task's six-way split to what actually happens today:
+
+* *Missing source* -- source FK column value itself is empty/absent.
+  `_norm_id("")` returns `''` (a real, distinct key, not `None`) so an empty
+  source string is technically a *key that fails to match* rather than a
+  `None` key -- but in practice it behaves identically to "unresolved
+  reference" below because no target row has an empty-string ID. Direct-Frame
+  probing shows a *programmatic* `None` or NumPy `NaN` source value
+  normalizes to `_norm_id(...) -> None`, which is a genuinely distinct case
+  from the empty-string source at the key level, though it collapses to the
+  same downstream `nan` value carrier once the lookup misses.
+* *Unresolved reference* -- a non-empty, well-formed key
+  (`_norm_id` succeeds) with no matching target row (`"ENT-MISSING"`).
+  Currently indistinguishable from "missing source" once the lookup misses;
+  both produce the same `value_map.get(...) -> None` outcome and the same
+  downstream `nan` carrier.
+* *Carrier missing value* (pandas `NaN`/`NA`/`NaT`) -- confirmed as the
+  actual in-memory carrier for every unresolved case today (step 2 above),
+  regardless of which of the above caused the lookup miss.
+* *Domain empty string* -- a legitimate resolved value of `''`. Proven
+  distinct from "unresolved" *in memory* (step 2), but currently collapses to
+  the *same* `""` output as an unresolved value on the XLSX no-cleanup path
+  (proven collision, see reproduction table).
+* *Literal domain `"nan"`* -- a legitimate resolved value that is textually
+  `"nan"`. `_norm_id`/`_norm` both correctly keep this distinct from a
+  carrier-missing value when acting on *keys* or *comparison values*. But as
+  a resolved *helper value* it currently collapses to the *same* `"nan"`
+  output as an unresolved value on the ODS no-cleanup path (proven collision,
+  see reproduction table).
+* *Spreadsheet/carrier error* -- not currently modeled or producible by any
+  maintained automated path. Formula-mode helpers (`helper_value_mode:
+  formula`) emit a generic per-row lookup formula
+  (`core/formulas.py:lookup_formula`, consumed by
+  `fk_helpers/formula_provider.py`) whose `missing=""` fallback is baked into
+  the formula text itself, identical for every row regardless of whether that
+  row's key is present, missing, or unresolved -- the actual
+  resolved/unresolved distinction is deferred entirely to spreadsheet-app
+  formula evaluation (Excel/LibreOffice), which no test in this repository
+  executes. This is genuinely untested territory for the nan-semantics
+  question, not merely unexercised by the current xfail.
+
+The evidence does *not* support minting six separate persisted
+representations. It supports: (a) a normalization step that treats
+"carrier-missing" uniformly regardless of which upstream cause produced it
+(missing source vs. unresolved reference collapse naturally and do not need
+separate persisted tokens, since neither `_norm_id` nor any consumer
+currently distinguishes them operationally); and (b) that the resulting
+uniform "unresolved" representation must not equal either `""` or `"nan"`,
+because both already collide with proven legitimate domain data.
+
+==== Evaluated contract options
+
+===== Option A -- collapse unresolved helper value to empty/missing
+
+A bare `""` is evidenced-insufficient: this revalidation proves it already
+collides with a legitimate resolved empty-string helper value on the XLSX
+no-cleanup path today. JSON `null` does not have this collision (`null !=
+""`) but cannot be spelled as a distinct value inside a plain string
+spreadsheet cell without a reserved-token convention -- the visible-cell
+typing ADR fixes the substrate as plain string and this BUG does not reopen
+it. So: `null` is viable wherever the value never has to pass through an
+actual visible cell (a pure in-memory or forward-only canonical view); a
+plain `""` alone is not viable wherever it does, because it already loses a
+real distinction. Diagnostics can be preserved separately (see Option B) but
+that is additive, not a substitute for choosing a non-colliding cell value.
+Compatible with the visible-cell string substrate as long as the eventual
+in-cell token is still an ordinary string.
+
+===== Option B -- visible/payload fallback plus structured diagnostic
+
+`domain/finding_frame.py` (`Finding`, `findings_to_frame`, the shared
+seven-column schema) and `derived_column_policy.py`'s
+`derived_column_findings` output are an *owned, existing, reusable*
+mechanism -- no new diagnostics mechanism is needed structurally. However,
+today that mechanism is wired *only* for the `enrich_lookup` family's value-
+mismatch checks, and it *explicitly skips* unresolved references
+(`derived_column_policy.py:555`, `# unresolved reference is a separate
+concern`). FK helpers are "dropped but not value-checked" in the current
+slice (module docstring). Extending it to cover FK-helper unresolved
+references is real, bounded, new wiring (new `rule_type`, a new value-check
+entry point for the FK-helper family, which currently has none) -- not a
+reuse-only change. This makes Option B a credible *complement* once
+implemented, not a currently-available shortcut.
+
+===== Option C -- spreadsheet/carrier error representation
+
+Not viable as the sole or primary answer. It cannot cover the missing-source
+or unresolved-reference case at all (no spreadsheet error token exists
+without a formula being evaluated), and this project's automated tests
+cannot exercise real LibreOffice/Excel evaluation to validate formula-mode
+behavior. Adopting a spreadsheet error token as the *canonical* domain
+representation would also cut against the spirit of
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` (no native typed substrate is
+authorized here) and the task's own guidance against making spreadsheet error
+syntax the canonical representation merely because spreadsheets support it.
+A reserved ordinary *string* sentinel (still plain text, not a spreadsheet
+error type) remains compatible with the string substrate and is a different,
+viable idea from adopting `#N/A`-style tokens as canonical.
+
+===== Other option considered
+
+A dedicated reserved string sentinel, distinct from both `""` and `"nan"`,
+used uniformly wherever the value must pass through a visible cell; JSON
+`null` used wherever it does not. This is not one of the original three
+options as literally written (the original Option 1 conflated `""` and
+`null` as interchangeable) but follows directly from the current evidence:
+neither `""` nor `"nan"` is safe alone, and the in-memory materialization
+step already has the information needed to know "this is unresolved" before
+it is ever forced through the string substrate.
+
+==== Recommended direction
+
+*Recommended* (not accepted / implementation-authorized):
+
+. *Prerequisite, independent of the final token choice:* fix the ODS
+  renderer's NaN-blind emptiness check
+  (`io_backends/ods/odf_renderer.py:563`) so both backends behave
+  *identically* for the same unresolved-helper case. This was already the
+  BUG's own original acceptance criterion ("XLSX path behaves identically")
+  and is currently false. Whatever the eventual sentinel is, both backends
+  must produce it, not two different accidental tokens.
+. *Value representation:* normalize unresolved helper values (regardless of
+  whether the cause was a missing source key or an unresolved reference --
+  the evidence does not support persisting that distinction as a separate
+  value shape) to a reserved representation that does not collide with
+  `""` or `"nan"`. Use JSON `null` on any path where the value never
+  passes through a visible spreadsheet cell; use a reserved, documented
+  string sentinel (exact spelling *not* decided here) wherever it does.
+. *Diagnostics:* extend the existing `derived_column_findings` /
+  `Finding`/`findings_to_frame` mechanism to cover FK-helper unresolved
+  references as an *additive* complement (Option B), not as the primary value
+  carrier. This is consistent with `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`'s
+  stated recovery preference (favor surfacing meaning into data; accept a
+  structured finding as a fallback/complement) even though that FTR itself
+  remains unaccepted and does not authorize this BUG's decision.
+. *Not recommended:* Option C as sole/primary representation, for the
+  reasons above.
+
+*Remaining open question this evidence does not settle:* the exact spelling
+of the reserved string sentinel, and whether the project accepts two
+different representations for "value never touches a spreadsheet cell"
+(`null`) versus "value passes through a spreadsheet cell" (reserved string),
+or prefers one uniform representation everywhere at the cost of an unusual-
+looking canonical JSON value even on cell-free paths. That is a naming/
+uniformity decision for the maintainer, not something derivable from current
+code or architecture.
+
+==== Implementation scope (for the eventual fix; not performed here)
+
+* `io_backends/ods/odf_renderer.py` -- replace the NaN-blind `value in (None,
+  "")` emptiness check with a NaN-aware one (the project already has three
+  correct precedents to draw from; picking the layer-appropriate one, given
+  `io_backends` must not depend on `domain`, is part of the implementation
+  work, not decided here).
+* `domain/transformations/fk_helpers/enrich.py` / `core/fk.py:apply_fk_helpers`
+  -- normalize the unresolved-value carrier before it reaches
+  `rendering/composer/layout_composer.py`, per whatever sentinel is chosen.
+* Optionally, `derived_column_policy.py` -- new `rule_type` and value-check
+  entry point for FK-helper unresolved references, if Option B's diagnostic
+  complement is authorized alongside the value-representation change.
+* `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` and
+  `docs/ai_info/concepts_fk_helpers.adoc` -- document the chosen contract.
+* `tests/roundtrip/test_pathological_cell_contracts.py` -- flip the existing
+  xfail to a real (non-xfail) assertion once the contract lands, and add a
+  parallel ODS-backend case (currently absent -- the existing sentinel is
+  XLSX-only and blind to the ODS defect this revalidation found).
+
+==== Explicit non-goals
+
+* Do not implement the fix in this task (revalidation only).
+* Do not decide the exact sentinel string spelling here.
+* Do not extend this BUG to cover all NaN/null normalization across the
+  framework -- scope stays FK-helper-family value materialization.
+* Do not attach security-policy, ingress, or sanitization work to this BUG
+  (`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` explicitly separates this
+  question from its own scope and authorizes nothing here).
+* Do not persist runtime Resolution as canonical `_meta` metadata to explain
+  an unresolved helper -- the helper *cell value itself* is not a `_meta`
+  root and is not constrained by the persistence-boundary rule the same way;
+  any diagnostic frame (Option B) must stay a derived/transient artifact, not
+  a new canonical `_meta` root.
+* Do not reopen `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` -- any in-cell
+  sentinel remains an ordinary string.
+* Do not resolve the formula-mode evaluation question (untested territory
+  requiring actual spreadsheet-app execution); note it as a known gap only.
+* Do not create a new FTR. Current evidence shows one narrow, coherent
+  defect (a backend-write-boundary NaN-handling bug) plus one narrow,
+  coherent contract decision (the sentinel choice), both scoped to the
+  FK-helper family and two renderer modules. This BUG can and should own the
+  eventual implementation directly.
 
 ==== Acceptance
 
-* The project records an explicit contract for unresolved helper values
-  (which of the three options above, or another) and that contract is
-  documented in the FK helper concept doc.
-* The chosen representation is enforced in the helper materialization
-  / serialization path. The literal string `"nan"` no longer appears in
-  canonical JSON for the worldbuilding reproduction or for any
-  representative empty-FK source.
-* Tests cover the empty-FK source case in
-  `tests/roundtrip/test_pathological_cell_contracts.py` (new home
-  introduced by `FTR-ROUNDTRIP-TEST-LAYER-P4A`):
-** `test_empty_fk_source_helper_representation` -- runs as `xfail`
-   before this BUG's contract decision lands (capturing the current
-   `"nan"` symptom with a documented reason naming this BUG);
-   transitions to green when the chosen representation is implemented.
-* Release-notes checkpoint: the relevant 0.x release notes record either
-  the chosen contract (under *User-facing changes* or *Bug fixes*) or
-  -- for the interim period before the decision lands -- a *Known
-  limitation* naming this case.
+* The project records an explicit, accepted contract for unresolved helper
+  values (informed by, but not necessarily identical to, the recommended
+  direction above), documented in the FK helper concept docs
+  (`docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` and/or
+  `docs/ai_info/concepts_fk_helpers.adoc`).
+* The chosen representation is enforced in the FK-helper materialization /
+  write path and produces *identical* behavior on XLSX and ODS.
+* Neither `""` nor the literal string `"nan"` is produced for an unresolved
+  helper value on any representative reproduction (empty source, non-empty
+  unresolved key, on either backend), *and* neither collides with the
+  reproduction matrix's proven legitimate-data cases (resolved empty string;
+  resolved literal `"nan"`).
+* `tests/roundtrip/test_pathological_cell_contracts.py`'s existing xfail
+  transitions to a real passing assertion, and a parallel ODS-backend
+  regression case is added (closing the current XLSX-only coverage gap).
 
-==== Validation
+==== Focused test requirements
 
-Pre-fix evidence (already collected at HEAD `8f8b519`):
+* `test_missing_fk_key_helper_representation_without_cleanup` (existing,
+  XLSX) -- de-xfail once the contract lands.
+* A new ODS-backend equivalent, since the current sentinel does not exercise
+  ODS and this revalidation shows ODS's current behavior is a live defect,
+  not a passing case that merely needs de-xfailing.
+* A resolved-value collision guard: a target whose field value is literally
+  `"nan"` must round-trip unchanged and stay distinguishable from an
+  unresolved cell under the new contract (regression guard for the collision
+  this revalidation proved).
+* A resolved-empty-string collision guard: symmetric case for `""`.
+* Unit-level coverage for the write-boundary normalization
+  (`core/fk.py`/`fk_helpers/enrich.py`) independent of the roundtrip layer,
+  per the project's "test contracts once, not every format" convention.
 
-* `make export-stories-ods` + `make import-stories-ods` from worldbuilding
-  HEAD produces 6 rows with `"_places_name": "nan"` in
-  `characters.json` whose `home_place_id` is the empty string.
-* No `"nan"` strings appear in the historical
-  `core/tmp/dino_stories.ods` reimport (control case), so the cause is
-  in the fresh export-or-import path, not in stale data.
-* The canonical input data
-  `worldbuilding/daten/dino_insel/characters.json` does not contain
-  `"nan"` strings, ruling out replay of contaminated input.
+==== Downstream dependency relationship to the internal-value-model work
 
-Post-fix verification:
+`roadmap_domain_hardening_sequence.adoc` Phase C names this BUG as the
+"known blocking contract" that must close before Phase D (the internal type
+model) can finalize its missing/unresolved/error categories (5-7 in the
+internal-value-model sketch, `trusted_ingress_and_runtime_security.adoc`
+section 7). `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`'s non-goals list
+names this BUG by ID as the explicit owner of "the missing/unresolved/
+spreadsheet-error representation," and `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`'s
+`next_action` field names it as the concern's next dependency-ready step,
+explicitly scoped to *not* include security-policy representation, parser/
+resource limits, sink-local work, or the `run_pipeline` boundary decision --
+those remain independently authorizable and must not be merged into this
+BUG. Resolving this BUG unblocks only the missing/unresolved/error portion of
+the later internal type model; it does not itself perform that typing work.
 
-* `make export-stories-ods` + `make import-stories-ods` produces zero
-  `"nan"` strings in any canonical JSON file.
-* Empty-FK source values produce the chosen contracted representation
-  (empty string, JSON null, structured finding, or other).
-* XLSX path behaves identically.
+==== Reference: where unresolved values are produced (corrected pointers)
+
+* `src/spreadsheet_handling/core/fk.py:26` -- `_norm_id`, FK key
+  normalization. Returns `None` for `None`, NaN, or unrecognized. Correct and
+  unchanged since the historical BUG; operates on keys, not helper values.
+* `src/spreadsheet_handling/core/fk.py:~327-337` -- `apply_fk_helpers`, the
+  actual helper-*value* materialization point. `value_map.get(_norm_id(rid))`
+  returns `None` on a lookup miss; the subsequent DataFrame column
+  assignment is where `None` becomes a pandas-carrier NaN.
+* `src/spreadsheet_handling/domain/transformations/fk_helpers/enrich.py` --
+  `enrich_helpers`, the pipeline-facing entry point that calls
+  `apply_fk_helpers`. (Old BUG text pointed at `domain/fk_relations.py:160-
+  285`, which is now the v2 relation *policy* producer module, not the value
+  materialization path -- stale, corrected here.)
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py:353` --
+  `compose_workbook`, copies `df.values.tolist()` into `TableBlock.data`
+  with no NaN normalization.
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py` --
+  `_write_data_block`/`_xlsx_cell_value`, passes raw NaN to openpyxl, which
+  silently drops it to a blank cell on save/reload.
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py:563` -- the
+  NaN-blind `if value in (None, ""):` emptiness check; the pinned defect.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:86` -- `_cell_value`,
+  reads paragraph text before `office:value`, so the renderer's mistaken
+  `"nan"` text is what round-trips.
+* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:605`
+  -- `_norm`, a correct NaN-vs-literal-string normalizer, but scoped to
+  `enrich_lookup` mismatch checking only (line number corrected from the
+  stale 386 in the original BUG text).
+* `src/spreadsheet_handling/domain/_cell_primitives.py:_is_empty_cell` --
+  a third correct precedent, currently unused at the defect site.
+* `src/spreadsheet_handling/domain/finding_frame.py` -- the existing,
+  reusable `Finding`/`findings_to_frame` diagnostics mechanism (Option B's
+  carrier, if authorized).
 
 ==== Related backlog items
 
-* `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- the helper-leak twin. Co-observed
-  with this BUG but independently triggered. Fix order: cleanup first
-  (it is the `0.2.0` blocker); unresolved-value contract follows.
-* `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` (Cutline 0.2) -- the
-  visible-cell typing decision. Adjacent: both touch the question of
-  how missing / unresolved / typed values are represented across the
-  spreadsheet round trip. The cutline FTR governs the *general*
-  visible-cell contract; this BUG narrows to the helper-value subset.
-* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- the FK-helper lifecycle work
-  that will likely host the durable contract documentation.
-* `FTR-ROUNDTRIP-TEST-LAYER-P4A` -- the new home for this BUG's
-  regression test
-  (`tests/roundtrip/test_pathological_cell_contracts.py`). The empty-FK
-  helper-representation test runs as `xfail` until this BUG's contract
-  decision lands.
-
-==== Reference: where unresolved values are produced
-
-* `src/spreadsheet_handling/core/fk.py:26` -- `_norm_id`, FK key
-  normalization. Returns `None` for `None`, NaN, or unrecognized.
-  Operates on *keys*, not values.
-* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py:386`
-  -- `_norm`, a separate helper-value normalization used by the
-  policy-check path. Returns `None` for None/NaN. Not currently applied
-  to written-out values.
-* `src/spreadsheet_handling/domain/fk_relations.py:160-285` -- the FK
-  helper provenance and materialization shape produced by
-  `configure_fk_helpers`. The value-producing path lives downstream.
+* `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- the helper-leak twin. *Done*, archived
+  to `docs/cold_storage/backlog/ftrs_done/`. Governs whether helpers reach
+  canonical JSON at all; this BUG governs their value when they legitimately
+  do.
+* `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` -- closed by
+  `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` (accepted); the visible-cell
+  string substrate this BUG's eventual sentinel must respect.
+* `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- still *New*; the likely eventual
+  host for durable contract documentation of the `helper_policies.fk`
+  surface.
+* `FTR-ROUNDTRIP-TEST-LAYER-P4A` -- owns the regression-test home
+  (`tests/roundtrip/test_pathological_cell_contracts.py`).
+* `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` -- exploratory/New; provides the
+  general classify/recover/pin framing this BUG's decision would be an
+  instance of, and states a recovery preference consistent with the
+  recommended direction above. Does not decide this BUG.
+* `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` / `DEC-TRUSTED-RUNTIME-AND-
+  POLICY-AUTHORITY` -- names this BUG as its explicit non-goal / next
+  dependency step.
+* `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` -- project-memory concern whose
+  `next_action` names this BUG.
+* `roadmap_domain_hardening_sequence.adoc` Phase C -- sequencing context;
+  this BUG is the named "known blocking contract."
