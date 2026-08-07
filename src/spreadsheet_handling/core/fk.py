@@ -327,7 +327,23 @@ def apply_fk_helpers(
         if helper_value_provider is None:
             values = []
             for rid in raw_ids:
-                lbl = value_map.get(_norm_id(rid))
+                # An unresolved lookup (missing source key or a non-empty
+                # key with no matching target row) must produce a plain
+                # Python string, never the implicit dict-lookup ``None``.
+                # ``None`` mixed into a column assignment is silently
+                # coerced by pandas into a real ``float('nan')`` carrier,
+                # which is what let the two backend renderers diverge on
+                # how to serialize "no value" (BUG-UNRESOLVED-HELPER-VALUE-
+                # NAN-SEMANTICS-P4A): OpenPyXL happens to drop a NaN cell to
+                # blank on save, while the ODS renderer's emptiness check is
+                # NaN-blind and wrote the literal text "nan" instead. This
+                # is carrier normalization only -- it does not decide the
+                # final unresolved-reference contract (still open; the
+                # empty string collides with a legitimately resolved helper
+                # whose target value is itself ""), it only guarantees no
+                # pandas missing carrier ever reaches a renderer for an FK
+                # helper column.
+                lbl = value_map.get(_norm_id(rid), "")
                 values.append(lbl)
         else:
             values = helper_value_provider(fk, raw_ids)

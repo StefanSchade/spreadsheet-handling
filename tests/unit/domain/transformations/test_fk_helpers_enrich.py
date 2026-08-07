@@ -115,6 +115,108 @@ class TestApplyFkHelpers:
         assert level0_series(result, "_B_name").tolist() == ["alpha", "beta"]
 
 
+class TestApplyFkHelpersUnresolvedCarrier:
+    """BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A: unresolved-lookup carrier.
+
+    Unit-level guard for the write-boundary normalization in
+    ``apply_fk_helpers``, independent of the roundtrip layer. Before the
+    fix, an unresolved lookup produced Python ``None``, which pandas column
+    assignment silently coerced into a real ``float('nan')`` carrier -- the
+    root cause of the backend-divergent "nan"/"" corruption on write.
+    ``apply_fk_helpers`` now supplies an explicit ``""`` default for a
+    lookup miss, so no pandas missing carrier is ever constructed for a
+    helper column.
+    """
+
+    def test_unresolved_non_empty_key_produces_plain_empty_string(self):
+        """A well-formed but unmatched FK key normalizes to a plain str ''.
+
+        Not ``None``, not ``float('nan')`` -- an ordinary Python string, so
+        no backend renderer can ever see a pandas missing carrier for this
+        column.
+        """
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 99]}),
+            "B": pd.DataFrame({"id": [1, 2], "name": ["alpha", "beta"]}),
+        }
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
+        helper_col = [c for c in result.columns if (c[0] if isinstance(c, tuple) else c) == "_B_name"][0]
+        values = result[helper_col].tolist()
+
+        assert values == ["alpha", ""]
+        unresolved = values[1]
+        assert unresolved == ""
+        assert isinstance(unresolved, str)
+        assert not (isinstance(unresolved, float) and pd.isna(unresolved))
+
+    def test_missing_source_key_produces_plain_empty_string(self):
+        """A missing/None FK source key (carrier-missing, not merely unmatched)
+        normalizes to the same plain str '' -- covered separately from the
+        non-empty unresolved-key case above, per the family contract's
+        distinction between the two upstream causes.
+        """
+        # String-typed ids avoid pandas' int-to-float upcast that a mixed
+        # ``[int, None]`` column would otherwise trigger for *all* rows
+        # (turning a resolvable ``1`` into ``1.0``, which would no longer
+        # match a target id of ``"1"``) -- that upcast is an unrelated
+        # pandas dtype artifact of this test's own column construction, not
+        # the carrier defect under test here.
+        frames = {
+            "A": pd.DataFrame({"id": ["10", "20"], "id_(B)": ["b1", None]}),
+            "B": pd.DataFrame({"id": ["b1", "b2"], "name": ["alpha", "beta"]}),
+        }
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
+        helper_col = [c for c in result.columns if (c[0] if isinstance(c, tuple) else c) == "_B_name"][0]
+        values = result[helper_col].tolist()
+
+        assert values == ["alpha", ""]
+        assert isinstance(values[1], str)
+
+    def test_literal_domain_nan_target_value_preserved(self):
+        """A resolved match whose target value is literally 'nan' stays 'nan'.
+
+        The fix detects the missing *carrier*; it must not censor the
+        spelling "nan" for a legitimate resolved dict hit.
+        """
+        frames = {
+            "A": pd.DataFrame({"id": [10], "id_(B)": [1]}),
+            "B": pd.DataFrame({"id": [1], "name": ["nan"]}),
+        }
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
+        helper_col = [c for c in result.columns if (c[0] if isinstance(c, tuple) else c) == "_B_name"][0]
+        assert result[helper_col].tolist() == ["nan"]
+
+    def test_legitimate_empty_string_target_value_preserved(self):
+        """A resolved match whose target value is a legitimate '' stays ''.
+
+        A dict hit, not the unresolved-lookup default -- the resolved path
+        must keep returning the real stored value.
+        """
+        frames = {
+            "A": pd.DataFrame({"id": [10], "id_(B)": [1]}),
+            "B": pd.DataFrame({"id": [1], "name": [""]}),
+        }
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = apply_fk_helpers(frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_")
+        helper_col = [c for c in result.columns if (c[0] if isinstance(c, tuple) else c) == "_B_name"][0]
+        assert result[helper_col].tolist() == [""]
+
+
 class TestApplyFksStepProvenance:
     """FTR-FK-HELPER-PROVENANCE-CLEANUP: apply_fks writes derived provenance."""
 

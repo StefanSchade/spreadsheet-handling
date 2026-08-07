@@ -38,12 +38,20 @@ def _copy_canonical(target: Path) -> Path:
     return canonical
 
 
-def _forward_pipeline(canonical_dir: Path, sheet_path: Path) -> dict[str, Any]:
-    """Build the canonical -> workbook pipeline config dict."""
+def _forward_pipeline(
+    canonical_dir: Path, sheet_path: Path, kind: str = "xlsx"
+) -> dict[str, Any]:
+    """Build the canonical -> workbook pipeline config dict.
+
+    ``kind`` selects the spreadsheet output backend (``"xlsx"`` or
+    ``"ods"``); it defaults to ``"xlsx"`` so existing callers (and the
+    ``minimal_fk_workdir`` fixture, which always writes ``workbook.xlsx``)
+    are unaffected.
+    """
     return {
         "io": {
             "input": {"kind": "json_dir", "path": str(canonical_dir)},
-            "output": {"kind": "xlsx", "path": str(sheet_path)},
+            "output": {"kind": kind, "path": str(sheet_path)},
         },
         "pipeline": [
             {
