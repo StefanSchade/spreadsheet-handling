@@ -1,0 +1,362 @@
+===== BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A -- Implementation Review 001
+
+*Reviewed bug:* `docs/backlog/BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A.adoc`
+*Review date:* 2026-08-07
+*Review type:* independent implementation, regression, and lifecycle review
+*Reviewed baseline:* `1cecb5c7523dc29c5e9f451847f12a050b0ceb40`
+*Implementation commit:* `646d3523aab051b1e407fdc0041d2b2de30e8e5e`
+*Documentation commit:* `c0d010f90e50c629084f58873bd07b0b5798bc33`
+*Reviewed HEAD:* `c0d010f90e50c629084f58873bd07b0b5798bc33`
+*Initial repository status:* clean
+
+==== Verdict
+
+*ACCEPTED WITH MINOR DOCUMENTATION-PRECISION FOLLOW-UP*
+
+* Blocking findings: 0.
+* Important findings: 0.
+* Minor findings: 1.
+* The acceptance threshold of zero Blocking and zero Important findings is
+  met.
+* The first runtime slice correctly fixes the lookup-miss carrier defect and
+  the observed XLSX/ODS divergence without deciding the final unresolved-value
+  contract.
+
+The one Minor finding is a wording-width issue, not an implementation defect:
+some comments and BUG statements say that no FK-helper missing carrier can
+reach a renderer at all. The maintained behavior is narrower and correct for
+this slice: lookup *misses* no longer create a missing carrier, while a
+successful lookup still returns its stored payload verbatim, including a
+stored `None`/pandas-or-NumPy missing value.
+
+==== Baseline and reviewed scope
+
+The review resolved and inspected the exact three-commit slice:
+
+* `1cecb5c7523dc29c5e9f451847f12a050b0ceb40` --
+  `docs(BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A): revalidate current contract`
+* `646d3523aab051b1e407fdc0041d2b2de30e8e5e` --
+  `fix(BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A): normalize missing helper carrier`
+* `c0d010f90e50c629084f58873bd07b0b5798bc33` --
+  `docs(BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A): record carrier-normalization fix`
+
+The implementation slice changes only:
+
+* `src/spreadsheet_handling/core/fk.py`;
+* `tests/unit/domain/transformations/test_fk_helpers_enrich.py`;
+* `tests/roundtrip/test_pathological_cell_contracts.py`; and
+* the optional, backward-compatible `kind="xlsx"` parameter in
+  `tests/roundtrip/conftest.py`.
+
+The follow-up commit changes only the still-open BUG record. No renderer,
+parser, formula model, persistence-boundary, diagnostic, security, ADR,
+concept, FTR, roadmap, or Project Memory file is changed by this slice.
+
+==== Normalization ownership
+
+`apply_fk_helpers` is the correct owner for the narrow correction. In value
+mode it is the FK-helper value-materialization boundary, and
+`domain/transformations/fk_helpers/enrich.py` is its sole production caller.
+The changed expression is exactly:
+
+[source,python]
+----
+value_map.get(_norm_id(rid), "")
+----
+
+This prevents Python's implicit `dict.get` miss value, `None`, from being
+mixed into the new pandas helper column and silently becoming a pandas NaN.
+The correction is family-local and miss-local:
+
+* it does not normalize a complete DataFrame;
+* it does not alter unrelated object-column values;
+* it does not make the workbook/TableBlock composer an FK owner;
+* it does not duplicate FK semantics in XLSX and ODS renderers; and
+* it does not censor any payload string based on spelling.
+
+The renderers remain carrier adapters. Their pre-existing behavior is not the
+semantic owner of an unresolved FK lookup, and neither renderer was changed.
+
+==== Lookup miss versus successful target value
+
+The exact value-mode behavior is determined first by key normalization and
+then by Python dictionary hit/miss semantics:
+
+[cols="3,3,4",options="header"]
+|===
+| Case | Lookup result | Materialized result / review conclusion
+
+| `None`, pandas missing, or NumPy missing source key
+| `_norm_id(...)` returns `None`; maps built by `build_id_value_maps` do not
+  contain `None` keys, so the owned path misses
+| Explicit miss default `""`; no missing carrier is introduced by the miss
+
+| Empty-string source key `""`
+| `_norm_id("")` is the real key `""`, not `None`
+| It produces `""` only when that key is absent, as in the regression
+  fixture. If a target legitimately has an empty-string ID, this can be a
+  successful lookup and must not be described as intrinsically absent.
+
+| Non-empty unresolved key such as `ENT-MISSING`
+| Key is absent from the target map
+| Explicit miss default `""`; fixed behavior
+
+| Successful lookup with stored payload `""`
+| Dictionary hit
+| The real empty string is returned unchanged. It currently collides with the
+  unresolved miss carrier; this remains open.
+
+| Successful lookup with stored payload `"nan"`
+| Dictionary hit
+| Literal string `"nan"` is returned unchanged. There is no value-spelling
+  censorship.
+
+| Successful lookup with stored payload `None`, `numpy.nan`, `pandas.NA`, or
+  another pandas-recognized missing carrier
+| Dictionary hit
+| The stored payload is returned verbatim; pandas column construction can
+  therefore still materialize a missing helper carrier.
+|===
+
+The answer to the explicit review question is therefore *yes*: a successful
+lookup can introduce a missing carrier when the stored target payload itself
+is missing. This is not an impossible state. The maintained
+`TestMissingLabelField::test_missing_label_field_results_in_none_helper`
+constructs a resolved target `name: None` and asserts that the helper is
+pandas-missing. JSON-directory ingress currently normalizes JSON `null` to
+`""`, but the lower-level runtime accepts programmatic frames and the
+maintained test preserves that behavior.
+
+That successful-hit payload behavior is outside this slice's owned contract.
+The slice fixes the previously implicit value of a dictionary *miss*; it does
+not define or normalize legitimate target payloads. No additional production
+normalization or test requirement should be inferred for `None`/NaN target
+payloads under this BUG slice.
+
+==== Absent/empty source and non-empty unresolved reference
+
+The passing regressions correctly keep the two upstream causes observable as
+separate test cases:
+
+* empty source `""` in the fixture, whose real empty key is absent from the
+  target map; and
+* non-empty `ENT-MISSING`, whose normalized key is also absent.
+
+Both lookup misses now temporarily materialize as `""`. This equality is
+deliberate carrier consistency, not a claim that an absent/empty source and a
+non-empty unresolved reference have the same final semantic identity. The BUG
+retains the broader representation decision as open.
+
+==== Backend consistency and literal preservation
+
+The public roundtrip regressions drive both real backends through the CLI and
+confirm:
+
+* unresolved `ENT-MISSING`: XLSX -> `""`, ODS -> `""`;
+* empty source in the maintained fixture: XLSX -> `""`, ODS -> `""`;
+* resolved literal target value `"nan"`: XLSX -> `"nan"`, ODS -> `"nan"`;
+* resolved legitimate empty target value `""`: XLSX -> `""`, ODS -> `""`.
+
+The post-fix XLSX/ODS `""` result is a deliberate carrier-level consistency
+for the two tested miss shapes. It is not elevated to a canonical semantic
+contract. The BUG remains `Partially implemented / semantic contract still
+open`, and it explicitly records the unresolved-versus-real-empty collision.
+
+The literal `"nan"` regression is important: the implementation detects a
+dictionary miss rather than examining output text. It therefore removes the
+ODS corruption without censoring a legitimate domain string.
+
+==== Formula/value mode interaction
+
+The new default executes only when `helper_value_provider is None`, which is
+the value/value(s) mode. Formula/formulas mode still supplies
+`build_lookup_formula_value_provider(...)`; `apply_fk_helpers` delegates to
+that provider and never executes the changed `dict.get` expression.
+
+Formula mode continues to materialize backend-neutral `LookupFormulaSpec`
+instances with `missing=""`. XLSX and ODS renderers translate that intent into
+their existing backend syntax. No formula policy, formula fallback, formula
+evaluation, `FormulaSpec` shape, conversion, or readback behavior changed.
+The focused formula suite and the real LibreOffice interoperability test both
+pass.
+
+==== Xfail assessment
+
+The retired
+`test_missing_fk_key_helper_representation_without_cleanup` asserted only
+that the old carrier was not `"nan"` or `""`. Once lookup misses deliberately
+became `""`, that assertion no longer represented the remaining open question
+and was correctly removed.
+
+Historical ODS coverage is not lost: ordinary passing regressions now exercise
+both XLSX and ODS for unresolved, empty-source, literal-`"nan"`, and real-empty
+cases.
+
+The replacement
+`test_unresolved_helper_value_distinguishable_from_legitimate_empty_string`:
+
+* is intentionally `strict=False`;
+* runs the same public CLI lifecycle while omitting cleanup only so that the
+  helper value remains observable;
+* constructs one non-empty unresolved reference and one successfully resolved
+  empty target payload in the same workbook; and
+* asserts only that their reimported helper values differ.
+
+The actual future assertion is representation-neutral: it requires
+distinguishability but does not choose null, a reserved string, a finding, or
+another representation. Its XLSX-only execution is adequate as the semantic
+sentinel because backend equality and the ODS historical regression are
+separately enforced by normal passing tests.
+
+==== Test quality
+
+The added tests are clear and proportionate:
+
+* Unit tests exercise `apply_fk_helpers` directly for lookup misses and the two
+  legitimate string payloads.
+* Roundtrip tests use the public CLI and real XLSX/ODS renderer-parser cycles.
+* `_forward_pipeline(..., kind="xlsx")` preserves every existing caller and
+  fixture by default while enabling ODS without duplicating pipeline policy.
+* Helper configuration, materialization, workbook-view mapping, rendering,
+  parsing, and canonical writeback remain in the lifecycle; only cleanup is
+  deliberately omitted where observation of the helper is the subject.
+* Fixture mutations name the relevant IDs and payloads directly. They add no
+  irrelevant backend-specific workbook construction detail.
+
+The maintained missing-label edge test also prevents this review from
+mistaking lookup-miss normalization for whole-column normalization.
+
+==== BUG lifecycle and scope
+
+The lifecycle record is accurate at the intended slice boundary:
+
+* the root cause of the unresolved-lookup divergence is pinned;
+* ODS literal `"nan"` and XLSX/ODS divergence are fixed for the empty-source
+  and non-empty unresolved lookup reproductions;
+* `""` is recorded as a temporary carrier;
+* collision with a successfully resolved real empty string remains open;
+* no final canonical contract is claimed;
+* status remains partial rather than Done; and
+* no FTR was created.
+
+The historical reproduction and pre-fix trace remain explicitly historical.
+Current acceptance and focused-test sections distinguish the completed carrier
+slice from the open semantic-contract work.
+
+The implementation is narrow. It introduces no internal value model, classes,
+ADR, security or diagnostics mechanism, persisted Resolution metadata,
+formula-policy change, concept-doc update, or FTR. It does not change generic
+rendering or either backend adapter.
+
+==== Findings
+
+===== NAN-SEMANTICS-REVIEW-F1 -- Whole-helper-column wording is broader than the fix
+
+*Classification:* Minor / documentation and comment precision.
+
+*Evidence:*
+
+* `src/spreadsheet_handling/core/fk.py:343-345` says the change guarantees that
+  no pandas missing carrier reaches a renderer for an FK-helper column.
+* The BUG at lines 460-466 and 647-662 says `apply_fk_helpers` no longer
+  produces any FK-helper NaN and neither renderer can receive one.
+* New unit/roundtrip explanatory comments make the same whole-column claim.
+* In contrast, maintained
+  `tests/unit/domain/transformations/test_fk_edge_cases.py:173-191` resolves a
+  target whose `name` payload is `None` and requires the helper result to be
+  pandas-missing.
+* `value_map.get(_norm_id(rid), "")` returns the stored value on a successful
+  hit. It cannot and should not replace a stored `None`/NaN with its miss
+  default.
+
+*Assessment:* the production behavior is correct for this runtime slice. The
+overbroad sentences should be read as “no pandas missing carrier is introduced
+by an FK lookup miss.” They do not invalidate the regressions, backend result,
+or partial BUG lifecycle status. The distinction is recorded in this review so
+future work does not infer a generic helper-payload or DataFrame-wide
+normalization contract.
+
+*Disposition:* non-blocking. A future documentation/comment-only cleanup may
+narrow those sentences if the BUG is edited again. No implementation or test
+change is required by this review, and the successful-hit missing-payload
+contract remains outside this slice.
+
+==== Validation
+
+Baseline and diff inspection:
+
+[source,bash]
+----
+git rev-parse --show-toplevel
+git status --short
+git rev-parse HEAD
+git log --oneline --decorate -20
+git show --stat 646d352
+git show --stat c0d010f
+git diff 1cecb5c..HEAD
+git diff --check 1cecb5c..HEAD
+----
+
+Result: initial tree clean at
+`c0d010f90e50c629084f58873bd07b0b5798bc33`; complete diff inspected; no
+whitespace errors.
+
+Focused FK, formula, pipeline-configuration, and pathological-cell run:
+
+[source,bash]
+----
+.venv/bin/pytest -q \
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py \
+  tests/unit/domain/transformations/test_fk_edge_cases.py \
+  tests/unit/domain/transformations/test_lookup_formula_mode.py \
+  tests/unit/pipeline/test_fk_helper_configuration.py \
+  tests/roundtrip/test_pathological_cell_contracts.py -rA
+----
+
+Result: `66 passed, 1 xfailed`; the xfail is exactly
+`test_unresolved_helper_value_distinguishable_from_legitimate_empty_string`.
+
+Roundtrip and backend suites were also exercised together. Their only initial
+failure was the real-LibreOffice test being unable to create its localhost UNO
+socket inside the filesystem/network sandbox. The same test was rerun with
+that capability and passed:
+
+[source,bash]
+----
+.venv/bin/pytest -q \
+  tests/integration/io_backends/ods/test_ods_libreoffice_interop.py \
+  -m libreoffice -rA
+----
+
+Result: `1 passed` against real LibreOffice.
+
+Full active-suite validation was split only around that sandbox-sensitive
+test:
+
+[source,bash]
+----
+.venv/bin/pytest -o addopts='' --tb=no \
+  tests/unit tests/integration tests/roundtrip tests/architecture \
+  -m 'not libreoffice'
+----
+
+Result: `2253 passed, 1 deselected, 1 xfailed`. Together with the separately
+passing real-LibreOffice test: `2254 passed, 1 xfailed`, with exactly the one
+expected open-contract sentinel.
+
+[source,bash]
+----
+make source-style-guards
+----
+
+Result: `0 error(s), 82 warning(s), 2 allowlisted finding(s)`; no new blocking
+style result.
+
+==== Conclusion
+
+The first runtime slice is accepted. It places lookup-miss normalization at
+the correct FK-helper boundary, fixes the reproduced ODS corruption and
+backend divergence, preserves literal `"nan"` and legitimate `""` payloads,
+does not affect formula intent, and leaves the final unresolved-value contract
+explicitly open. The one Minor wording observation does not block the slice or
+require implementation changes.
