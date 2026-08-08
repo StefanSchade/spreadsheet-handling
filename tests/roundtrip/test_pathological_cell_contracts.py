@@ -26,6 +26,16 @@ Unresolved FK-helper values: this module covers two distinct problems under
   below, which proves this on both backends through a real roundtrip. No
   distinct unresolved-value carrier, sentinel, or internal type is
   required.
+
+`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A` closed the separate,
+more general residual left open by the fix above: the ODS renderer's
+per-cell emptiness check itself was NaN-blind (``value in (None, "")`` is
+``False`` for a real ``float('nan')``), so *any* raw pandas/NumPy missing
+carrier reaching the renderer -- not only an unresolved FK-helper lookup --
+was at risk of the same literal-``"nan"`` corruption. See
+`test_csv_dir_blank_cell_carrier_is_backend_consistent` below for the
+FK-independent, ordinary-column reproduction (an empty ``csv_dir`` CSV cell
+becomes a real pandas NaN with no FK-helper machinery involved at all).
 """
 
 from __future__ import annotations
@@ -356,3 +366,85 @@ def test_unresolved_reference_remains_distinguishable_via_authoritative_resoluti
         f"value) and must not be reported as unresolved on backend "
         f"{kind!r}; got {unresolvable!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A -- general, FK-independent
+# reproduction: an ordinary csv_dir-sourced column with no FK helpers involved
+# at all. `CSVBackend.read_multi` (backing the `csv_dir` loader) calls
+# `pd.read_csv(p, header=0, encoding="utf-8")` without `dtype=str` or
+# `keep_default_na=False` (unlike the single-file `CSVBackend.read` path), so
+# a blank CSV cell becomes a genuine pandas NaN before any FK machinery runs.
+# Proves the fix is owned at the general ODS render/carrier boundary, not
+# specific to the FK-helper successful-hit case covered elsewhere.
+# ---------------------------------------------------------------------------
+
+
+def _write_csv_dir(path: Path, data: dict[str, list[dict]]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for name, records in data.items():
+        columns = list(records[0])
+        lines = [",".join(columns)]
+        for record in records:
+            lines.append(
+                ",".join("" if record[c] is None else str(record[c]) for c in columns)
+            )
+        (path / f"{name}.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", _BACKENDS)
+def test_csv_dir_blank_cell_carrier_is_backend_consistent(kind, tmp_path) -> None:
+    """A blank csv_dir cell (real pandas NaN, no FK helpers) must not become "nan".
+
+    Reproduction 2 from BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A:
+    no `configure_fk_helpers`/`add_fk_helpers` step runs here at all -- the
+    NaN carrier comes straight from `csv_dir`'s CSV parsing and reaches the
+    renderer through an empty pipeline, proving the defect (and its fix) are
+    general to the ODS render boundary rather than FK-helper-specific.
+    """
+    from tests.roundtrip.conftest import _run_cli, _write_yaml
+
+    csv_dir = tmp_path / "csv_in"
+    _write_csv_dir(csv_dir, {"notes": [{"id": "1", "note": None}, {"id": "2", "note": "hello"}]})
+
+    sheet = tmp_path / f"workbook.{kind}"
+    forward_yaml = tmp_path / "forward.yaml"
+    _write_yaml(
+        forward_yaml,
+        {
+            "io": {
+                "input": {"kind": "csv_dir", "path": str(csv_dir)},
+                "output": {"kind": kind, "path": str(sheet)},
+            },
+            "pipeline": [],
+        },
+    )
+    assert _run_cli(forward_yaml) == 0
+
+    reimport = tmp_path / "reimport"
+    reverse_yaml = tmp_path / "reverse.yaml"
+    _write_yaml(
+        reverse_yaml,
+        {
+            "io": {
+                "input": {"kind": kind, "path": str(sheet)},
+                "output": {"kind": "json_dir", "path": str(reimport)},
+            },
+            "pipeline": [],
+        },
+    )
+    assert _run_cli(reverse_yaml) == 0
+
+    rows = json.loads((reimport / "notes.json").read_text(encoding="utf-8"))
+    row0 = next(r for r in rows if r.get("id") == "1")
+    row1 = next(r for r in rows if r.get("id") == "2")
+
+    assert row0["note"] != "nan", (
+        f"blank csv_dir cell must not serialize as the literal string 'nan' on "
+        f"backend {kind!r}; got {row0['note']!r}"
+    )
+    assert row0["note"] == "", (
+        f"blank csv_dir cell should reload as an empty string on backend "
+        f"{kind!r}; got {row0['note']!r}"
+    )
+    assert row1["note"] == "hello", "non-empty sibling cell must be unaffected"

@@ -29,6 +29,7 @@ from odf.table import (
     TableRow,
 )
 from odf.text import P
+import pandas as pd
 
 from spreadsheet_handling.core.formulas import FormulaSpec, ListLiteralFormulaSpec
 from spreadsheet_handling.core.formulas import LookupFormulaSpec
@@ -439,6 +440,27 @@ def _collect_sheets(plan: RenderPlan) -> list[_BufferedSheet]:
     return [sheets[name] for name in ordered_names]
 
 
+def _is_missing_carrier(value: Any) -> bool:
+    """True for a real missing carrier: ``None``, ``""``, or a NaN/NA scalar.
+
+    Mirrors the shape of ``domain._cell_primitives._is_empty_cell`` but is
+    kept as a local, self-contained copy rather than an import: ``io_backends``
+    does not otherwise depend on ``domain``, and this renderer boundary is the
+    owner of its own carrier-missing check (see
+    BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A). This detects the
+    *carrier*, not the spelling -- a legitimate string that happens to equal
+    "nan" is a plain string and is deliberately not recognized as missing.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_table(
     doc: OpenDocumentSpreadsheet,
     sheet: _BufferedSheet,
@@ -560,7 +582,7 @@ def _build_table(
                 )
                 row.addElement(table_cell)
                 continue
-            if value in (None, ""):
+            if _is_missing_carrier(value):
                 table_cell = TableCell(attributes=attributes)
             elif isinstance(value, bool):
                 display = "TRUE" if value else "FALSE"

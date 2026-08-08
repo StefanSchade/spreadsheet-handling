@@ -10,6 +10,8 @@ the cell-level FK convention are run through ``infer_fk_relations`` (or
 """
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import pytest
 
@@ -19,6 +21,8 @@ from spreadsheet_handling.core.fk import (
 from spreadsheet_handling.core.indexing import level0_series
 from spreadsheet_handling.domain.fk_relations import infer_fk_relations
 from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
+from spreadsheet_handling.io_backends.ods.ods_backend import load_ods, save_ods
+from spreadsheet_handling.io_backends.xlsx.xlsx_backend import load_xlsx, save_xlsx
 from spreadsheet_handling.pipeline import run_pipeline
 from spreadsheet_handling.pipeline.steps import (
     make_apply_fks_step,
@@ -189,6 +193,73 @@ class TestMissingLabelField:
         assert helper_cols, f"expected helper column, got {lvl0}"
         s = level0_series(dfq, helper_cols[0])
         assert pd.isna(s.iloc[0])
+
+    @pytest.mark.ftr("BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A")
+    def test_successful_fk_hit_with_nan_target_payload_survives_real_ods_and_xlsx_roundtrip(
+        self, tmp_path
+    ):
+        """A successful FK hit whose target payload is a real NaN carrier.
+
+        Unlike the lookup-*miss* case pinned by
+        ``test_missing_label_field_results_in_none_helper`` above (where
+        ``apply_fk_helpers`` supplies an explicit ``""`` default),
+        ``core/fk.py:apply_fk_helpers`` returns a dictionary *hit*'s stored
+        target payload verbatim. If that payload is itself a real pandas/
+        NumPy missing carrier, the helper column materializes a raw NaN --
+        this is BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A's
+        reproduction 1. Renders through the real ODS and XLSX writers
+        (``save_ods``/``save_xlsx``) and reloads through the real parsers
+        (``load_ods``/``load_xlsx``) -- independent of the CLI roundtrip
+        layer, but exercising the identical render/parse code path -- to
+        confirm the carrier no longer surfaces as the literal text "nan" on
+        ODS, matching XLSX's existing (accidental but harmless) blank
+        behavior.
+        """
+        frames = {
+            "Ziel": pd.DataFrame([{"id": 1, "name": math.nan}, {"id": 2, "name": "Alpha"}]),
+            "Quelle": pd.DataFrame([{"fk": "x", "id_(Ziel)": 1}]),
+        }
+        frames = infer_fk_relations(frames)
+        defaults = {"id_field": "id", "label_field": "name",
+                     "helper_prefix": "_", "detect_fk": True, "levels": 3}
+        step = make_apply_fks_step(defaults=defaults)
+        out = run_pipeline(frames, [step])
+
+        dfq = out["Quelle"]
+        lvl0 = [c[0] if isinstance(c, tuple) else c for c in dfq.columns]
+        helper_cols = [c for c in lvl0 if str(c).startswith("_")]
+        assert helper_cols, f"expected helper column, got {lvl0}"
+        helper_col = helper_cols[0]
+        s = level0_series(dfq, helper_col)
+        assert pd.isna(s.iloc[0]), "fixture invariant: the helper cell must carry a raw NaN"
+
+        # Flatten the MultiIndex header to plain columns before rendering,
+        # mirroring what the `flatten_headers` pipeline step does upstream
+        # of a real spreadsheet write.
+        flat = pd.DataFrame(
+            {c[0] if isinstance(c, tuple) else c: level0_series(dfq, c) for c in dfq.columns}
+        )
+        render_frames = {"Quelle": flat, "Ziel": out["Ziel"]}
+
+        ods_path = tmp_path / "missing_carrier.ods"
+        save_ods(render_frames, str(ods_path))
+        reloaded_ods = load_ods(str(ods_path))
+        ods_value = reloaded_ods["Quelle"][helper_col].tolist()[0]
+
+        xlsx_path = tmp_path / "missing_carrier.xlsx"
+        save_xlsx(render_frames, str(xlsx_path))
+        reloaded_xlsx = load_xlsx(str(xlsx_path))
+        xlsx_value = reloaded_xlsx["Quelle"][helper_col].tolist()[0]
+
+        assert ods_value != "nan", (
+            f"successful-hit helper {helper_col!r} with a NaN target payload must not "
+            f"serialize as the literal string 'nan' on ODS; got {ods_value!r}"
+        )
+        assert ods_value == "", f"expected normalized empty-string carrier on ODS; got {ods_value!r}"
+        assert xlsx_value == "", (
+            f"XLSX non-regression: expected the existing blank-on-NaN behavior; "
+            f"got {xlsx_value!r}"
+        )
 
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")
