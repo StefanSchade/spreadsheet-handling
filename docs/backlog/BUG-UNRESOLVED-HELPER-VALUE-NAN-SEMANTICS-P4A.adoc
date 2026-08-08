@@ -1,6 +1,6 @@
 ===== BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A -- Unresolved FK-helper values collapse into backend-divergent, domain-colliding representations (literal `nan` on ODS, empty string on XLSX)
 
-*Status:* Partially implemented / semantic contract still open
+*Status:* Semantic contract decision recommended / not yet accepted
 *Priority:* P4A
 *Area:* FK helper materialization / unresolved-value contract / canonical persistence
 *Release relevance:* Post-`0.2.0`. Not a runtime blocker. This is the next
@@ -26,6 +26,21 @@ XLSX/ODS divergence). Does *not* finalize the broader unresolved-reference
 semantic contract -- see "Implementation slice 1 -- carrier defect fixed"
 below, which does not replace "Recommended direction" but narrows what is
 now fixed versus what remains open.
+
+*Semantic-contract investigation:* 2026-08-08, decision-only follow-up at
+core HEAD `cdee1a4b352a380cdef0c9107859a8457acec131`. Investigates and
+answers the central open question left by Implementation slice 1: must an
+unresolved FK-helper value be distinguishable from a legitimately resolved
+empty helper value at the helper-cell level, or is that distinction
+correctly owned elsewhere? See "Semantic-contract decision (2026-08-08)"
+below. This section *supersedes* the "Evaluated contract options" /
+"Recommended direction" sections above for the specific question of
+whether a distinct unresolved-value representation is needed at all --
+those sections are retained as historical evidence of the revalidation's
+reasoning at the time, not as the current recommendation. No code was
+changed by this investigation; nothing here is *accepted* or
+*implementation-authorized* -- see the decision section's own
+recommended-vs-accepted framing.
 
 ==== Title note
 
@@ -347,6 +362,16 @@ uniform "unresolved" representation must not equal either `""` or `"nan"`,
 because both already collide with proven legitimate domain data.
 
 ==== Evaluated contract options
+
+CAUTION: Superseded for the "is a distinct unresolved-value representation
+needed at all" question by "Semantic-contract decision (2026-08-08)" below.
+This section and "Recommended direction" reflect the revalidation's
+reasoning *before* the semantic-ownership investigation; retained as
+historical evidence, not current recommendation. In particular, the
+revalidation's assumption that *some* non-`""`/non-`"nan"` carrier
+representation would be needed is not supported once the authoritative
+source reference and the maintained `validate_fk_helpers` diagnostic are
+taken into account -- see the decision section for why.
 
 ===== Option A -- collapse unresolved helper value to empty/missing
 
@@ -757,6 +782,405 @@ this slice) remains the next step, to be finalized within this same BUG.
   `kind` parameter (default `"xlsx"`, fully backward compatible) so the new
   tests can drive the ODS backend without duplicating pipeline plumbing.
 
+==== Semantic-contract decision (2026-08-08)
+
+*Scope of this investigation:* decision-only. No production code, tests,
+types, or FTR were created or changed. This section records the central
+question, the evidence trace, the evaluated options, and a *recommended*
+(not accepted, not implementation-authorized) contract.
+
+===== Central question, restated
+
+> Must an unresolved derived FK-helper value itself be distinguishable from
+> a legitimately resolved empty helper value, or is the semantic
+> distinction correctly owned by the authoritative source reference plus
+> its resolution state/diagnostics?
+
+The existing xfail
+(`test_unresolved_helper_value_distinguishable_from_legitimate_empty_string`)
+was evidence that this question was open, not evidence that the framework
+must answer it by making the two helper-cell values differ. This
+investigation does not start from the assumption that the xfail's own
+assertion shape is correct.
+
+===== Semantic ownership, traced through the current codebase
+
+. *Authoritative source value.* The FK column on the source frame (e.g.
+  `items.entity_id`) is ordinary domain payload: an FK-bearing table's own
+  reference to a row in the target table. It is never dropped, never
+  helper-prefixed, always round-trips as plain text per the visible-cell
+  string substrate, and is the sole input `core/fk.py:_norm_id` normalizes
+  for lookup.
+. *Target lookup/resolution state.* Computed fresh, on demand, by joining
+  the source FK value against the *current* target frame's key column.
+  `domain/validations/fk_helpers.py:check_unresolvable_fks` (line 196) does
+  exactly this: `missing = {... for v in fk_series ... if _norm(v) not in
+  target_ids}` -- comparing the authoritative source column directly
+  against a live target-id set, with *no reference to the helper column at
+  all*. Resolution state is therefore a pure function of
+  `(source_frame, target_frame)` at read time, not a stored fact.
+. *Derived helper payload.* `core/fk.py:apply_fk_helpers` materializes a
+  copy of the resolved target field next to the FK column, purely for
+  spreadsheet display/editing convenience. Per
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` ("First
+  conservative policy"): "manual edits to helper *values* are not treated
+  as source truth; helper values may be ignored or overwritten on
+  re-enrichment." The helper column is explicitly *not* authoritative.
+. *Diagnostics.* `domain/validations/fk_helpers.py:validate_fk_helpers`
+  (line 284, registered pipeline step `validate_fk_helpers`,
+  `pipeline/steps.py:make_check_fk_helpers_step`) runs
+  `check_unresolvable_fks` (source-vs-target, described above) and
+  `check_helper_values` (line 131: recomputes the *expected* helper value
+  from a fresh target lookup and reports a `value_mismatch` finding when
+  the materialized helper cell disagrees). Both are opt-in (a pipeline
+  author includes the step; default severity `warn`), pure, and
+  independent of any special helper-cell spelling.
+. *Workbook-visible helper projection.* Per Implementation slice 1, always
+  `""` today for an unresolved lookup, on both backends, in `values` mode.
+  In `formula` mode, a backend-neutral `LookupFormulaSpec` with
+  `missing=""`, evaluated live by the spreadsheet application -- the
+  framework never even chooses a static unresolved value in that mode.
+. *Canonical persisted payload.* Under the recommended/normal lifecycle
+  (`apply_derived_column_policy: drop` + `validate_references:
+  no_helper_columns`, per the same concept doc's "Cleanup direction"), the
+  helper column never reaches canonical persistence at all. The
+  unresolved-vs-resolved-empty ambiguity is therefore a non-issue on the
+  recommended path; it exists only when a helper is *deliberately* retained
+  (an upstream/editable view, or a no-cleanup reimport used to inspect
+  workbook state, as the BUG's own reproduction and regression tests do).
+. *Reconstruction/replay behavior.* Verified directly (probes below): after
+  a full `sheets-run` export -> real XLSX/ODS file -> reimport cycle on
+  *both* backends, the authoritative source FK column round-trips
+  unchanged, and `validate_fk_helpers` run against the reimported frames
+  still correctly and exclusively flags the unresolved row -- even though
+  the helper cell shows the identical `""` for both the unresolved and the
+  legitimately-resolved-empty row.
+
+*Empirical evidence (read-only probes, no production/test files changed):*
+
+[source,python]
+----
+items    = {"id": "ITEM-001..003", "entity_id": ["ENT-001", "ENT-002", "ENT-MISSING"]}
+entities = {"id": ["ENT-001", "ENT-002"], "name": ["Alpha", ""]}   # ENT-002 legitimately ""
+----
+
+In-memory, immediately after `add_fk_helpers`:
+
+[source,text]
+----
+ITEM-001  ENT-001       _entities_name = "Alpha"
+ITEM-002  ENT-002       _entities_name = ""      (legitimately resolved empty)
+ITEM-003  ENT-MISSING   _entities_name = ""      (unresolved)
+
+validate_fk_helpers findings:
+  unresolvable_fk : entity_id values not found in 'entities': ['ENT-MISSING']
+  value_mismatch  : _entities_name, 1 row(s) differ from canonical lookup (row 2)
+----
+
+Identical result after a full `sheets-run` forward export to a real file and
+back, on *both* backends:
+
+[source,text]
+----
+backend=xlsx: ITEM-002 -> "", ITEM-003 -> ""; validate_fk_helpers flags only ITEM-003
+backend=ods:  ITEM-002 -> "", ITEM-003 -> ""; validate_fk_helpers flags only ITEM-003
+----
+
+The two rows are byte-identical in the helper cell on both backends, and
+`validate_fk_helpers` -- using only the reimported `entity_id` column and
+the reimported `entities` frame -- still tells them apart correctly, with no
+knowledge of, or special-casing on, the helper cell's spelling.
+
+===== Direct answers to the lifecycle questions
+
+* *Is the helper column authoritative data or a derived projection?*
+  Derived projection. Explicitly documented as such; manual edits are not
+  source truth; values may be silently overwritten on re-enrichment.
+* *Can unresolved state always be recomputed from the authoritative source
+  FK?* Yes, whenever the target frame is also available -- which holds for
+  every currently maintained materialization path (`add_fk_helpers`,
+  in-process) and every currently maintained reimport path that loads both
+  the FK-bearing and target sheets (as the roundtrip fixtures and the
+  probes above do; a pipeline that reimports only the FK-bearing frame and
+  never loads the target cannot check any cross-frame reference, which is
+  a general property of cross-frame validation, not specific to this BUG).
+* *Are helper columns persisted canonically, or dropped/reconstructed by
+  the normal lifecycle?* Dropped, under the recommended/documented
+  lifecycle. `BUG-HELPER-CLEANUP-CONTRACT-P4A` (Done) exists specifically
+  to keep this drop working.
+* *Which workflows intentionally retain helpers?* Only "upstream/editable"
+  workbook views meant for human editing (per the concept doc's "for
+  display" framing and the catalog's `formula` vs. `values` mode
+  discussion), and diagnostic/no-cleanup reimports used to inspect
+  workbook state (as this BUG's own regression tests do). No documented,
+  maintained workflow treats a retained helper's *value* as a
+  machine-authoritative signal.
+* *Does any maintained consumer depend on the helper cell alone to
+  distinguish unresolved from resolved-empty?* No. Every FK-helper
+  consumer inspected (`drop.py`, `provenance.py`, `policy.py`,
+  `validations/fk_helpers.py`, `derived_column_policy.py`,
+  `workbook_views.py`, the rendering passes) identifies or drops helper
+  columns by *name/provenance declaration*, never by value; the one
+  consumer that does inspect the value
+  (`check_helper_values`) does so specifically to *detect disagreement*
+  with a fresh lookup, which presumes the helper cell is *not* trusted as
+  ground truth.
+* *Does formula mode change the answer?* No -- it reinforces it. In
+  `formula` mode the framework never chooses a static cell value at all;
+  it emits `LookupFormulaSpec` Intent (`missing=""`) and the spreadsheet
+  application recomputes the displayed value live from the *same*
+  authoritative source + target relationship at open/recalc time. Formula
+  mode is architecturally the clearest existing proof that the helper's
+  displayed value is already treated as ephemeral, never authoritative.
+* *Does cleanup/replay make cell-level preservation unnecessary?* Yes, in
+  two ways: cleanup removes the ambiguity from canonical persistence
+  entirely on the recommended path, and replay (reimport) preserves the
+  authoritative source FK column, from which resolution state is always
+  recomputable, as demonstrated above.
+
+===== Option A -- distinct helper carrier (conceptual only; not designed here)
+
+Contract: `resolved empty -> ""`, `unresolved -> distinct carrier`.
+
+* *Reserved string sentinel.* Does not remove ambiguity, it relocates it:
+  any sentinel is itself an ordinary string that could collide with real
+  domain data (lower probability than `""`/`"nan"`, not zero), and -- more
+  importantly -- since the semantic information is *already* fully
+  recoverable from the source reference (proven above), a sentinel would
+  duplicate information the framework does not need duplicated. It would
+  also leak into canonical JSON on any retained-helper path, presenting a
+  confusing framework-internal token as if it were domain data to any
+  downstream consumer that does not know the convention -- arguably worse
+  than a plain `""`, which at least reads as "nothing" rather than "some
+  unexplained text." It would need write/read plumbing in both renderers
+  and would need to survive spreadsheet-application autocorrect/spellcheck
+  without justification, since nothing currently needs it to survive.
+* *Spreadsheet error token.* Not viable as a `values`-mode representation
+  at all -- error tokens are formula-evaluation results, not literal
+  written values, and no maintained writer path emits them outside actual
+  formula evaluation. Already rejected in the "Evaluated contract options"
+  section above for the same reason; this investigation finds no new
+  reason to revisit that.
+* *Another projected representation* (e.g. conditional styling on the
+  unresolved row). This is a presentation-layer idea, not a value
+  representation, and does not touch canonical JSON/YAML/CSV/CSV output at
+  all. It is conceptually orthogonal to this BUG (it would be a `StylePass`
+  feature, parallel to the existing `helper_fill_rgb`/protection styling)
+  and is not evaluated further here.
+* *ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE impact:* a sentinel would
+  remain an ordinary string, so it would not *require* reopening the ADR
+  on its face -- but it works against the ADR's rationale ("domain
+  semantics live in opt-in metadata families, separate from substrate
+  semantics") by encoding framework state directly into what looks like
+  ordinary payload text. No form of Option A is recommended, so this
+  investigation does not require or propose reopening that ADR.
+* *Verdict:* not supported by evidence. No maintained consumer needs it;
+  every concrete form either duplicates already-recoverable information,
+  degrades spreadsheet ergonomics for a redundant display column, or both.
+
+===== Option B -- helper is presentation only (recommended)
+
+Contract: `resolved empty -> ""`, `unresolved -> ""`; the semantic
+distinction lives in the authoritative source reference plus resolution
+state/diagnostics, exactly as already implemented today.
+
+* *Information loss under maintained lifecycle paths:* none found. The
+  empirical probes above show the distinction survives a full real
+  export/reimport cycle on both backends without any helper-cell-level
+  marker, because it was never actually carried by the helper cell -- it
+  is recomputed from the source FK and the target frame.
+* `ENT-42 -> target exists, target label ""` vs. `ENT-MISSING -> target
+  absent`: after normal write/read/replay, the framework *can* reliably
+  distinguish them without inspecting the helper value -- demonstrated
+  directly, not assumed.
+* *Consequence:* the current xfail requires information duplication in a
+  derived column that the framework does not otherwise need duplicated.
+  Its assertion (comparing two helper-cell values for inequality) tests an
+  implementation detail of a presentational column, not the actual
+  invariant that matters (row-level resolution state remains determinable).
+* *Diagnostics assessment:* `validate_fk_helpers` (specifically
+  `check_unresolvable_fks`, and redundantly `check_helper_values`) already
+  exists, is already tested
+  (`tests/unit/domain/validations/test_fk_check.py`), and already answers
+  this need with zero new code. It is *not* required for semantic
+  correctness -- the information is preserved regardless of whether a
+  pipeline runs it, because it lives in the persisted source FK column, not
+  in the diagnostic's output. It is useful, optional, opt-in *feedback* for
+  a pipeline author who wants it surfaced as a `Finding` rather than
+  recomputing it themselves. This corrects a gap in the revalidation's
+  earlier Option B framing, which proposed *extending*
+  `derived_column_findings` (`domain/finding_frame.py`, the family used by
+  `apply_derived_column_policy`'s `enrich_lookup` mismatch checks) to cover
+  FK helpers -- that extension is unnecessary: a *different*, already-wired
+  finding family (`domain/validations/findings.py` via
+  `validate_fk_helpers`) already covers exactly this case for FK helpers
+  specifically. Adding new diagnostics work is not required; a possible
+  *optional* future polish (not required, not designed here) would be
+  deduplicating the redundant `value_mismatch` finding that fires
+  alongside `unresolvable_fk` for the same row.
+* *Verdict:* supported by direct evidence, on both backends, through a
+  real roundtrip. Recommended.
+
+===== Option C -- explicit internal unresolved state, lossy visible projection
+
+Conceptual contract: an internal resolution-state distinction, projected
+losslessly to `""` on the visible surface, reconstructed from the
+authoritative source reference on replay.
+
+* Evaluated conceptually only; no `UnresolvedReference`, `Missing`, or
+  other class was created or is proposed.
+* Tracing the current control flow shows this already exists, informally,
+  exactly where it is needed and nowhere else: `apply_fk_helpers`'s
+  per-row loop already "knows" hit-vs-miss for the single instant it
+  matters (an ordinary `dict.get` branch), and `check_unresolvable_fks` /
+  `check_helper_values` independently *recompute* the same fact on demand
+  from two DataFrames, with no stored intermediate value passed between
+  the two computations.
+* No maintained consumer needs a *named, persisted* unresolved-state value
+  or type: it would have nowhere correct to live (not the helper column --
+  Option A already rejected embedding framework state there; not the
+  source FK column -- that must stay a plain domain value used for joins,
+  display, and the `id_(<target>)` wire format). Introducing one now would
+  preempt `roadmap_domain_hardening_sequence.adoc` Phase D (the internal
+  type model), which explicitly reserves this kind of decision for its own
+  evidence-gated slice -- and there is no evidence here of a maintained
+  need, only a hypothetical future one.
+* *Verdict:* Option C's *intent* is already substantially realized by
+  existing control flow plus the existing diagnostic recomputation. A
+  first-class internal type is not evidenced as necessary and is not
+  recommended; doing so now would be exactly the kind of premature typing
+  the roadmap warns against ("New infrastructure is justified only when it
+  removes repeated complexity from supported paths").
+
+===== Missing target payload (separate concern, unaffected)
+
+Kept distinct throughout, per the task framing:
+
+* *source key unresolved* -- this BUG's question, addressed above.
+* *source key resolves, target payload itself missing* -- proven still
+  maintained behavior by the prior implementation review
+  (`TestMissingLabelField::test_missing_label_field_results_in_none_helper`
+  in `tests/unit/domain/transformations/test_fk_edge_cases.py`) and
+  reconfirmed here by a read-only probe: a genuine `numpy.nan` target
+  payload, reached via direct Frame construction (not the JSON loader,
+  which already coerces `null` to `""` on load), still produces `""` on
+  XLSX and *still* produces the literal string `"nan"` on ODS -- because
+  Implementation slice 1's fix only supplies a default for a `dict.get`
+  *miss*; a *hit* whose stored value is itself a missing carrier is
+  returned verbatim, unchanged, and is not caught by the ODS renderer's
+  still-unfixed NaN-blind `value in (None, "")` check
+  (`io_backends/ods/odf_renderer.py:563`).
+* *Does this affect the unresolved-helper contract?* No. It is a
+  same-shaped but distinct residual defect: it is about a *resolved*
+  reference whose target data quality is itself poor, not about
+  distinguishing unresolved from resolved-empty. `check_unresolvable_fks`
+  correctly does *not* flag such a row (the key does resolve);
+  `check_helper_values` correctly does *not* flag it either (both sides of
+  its comparison normalize a missing carrier to the same `None` via its
+  own `pd.isna`-based `_norm`). This BUG's semantic-ownership conclusion is
+  unaffected. This residual ODS-renderer gap is noted for completeness and
+  is explicitly *not* addressed here -- normalizing successful-hit missing
+  payload was out of scope for Implementation slice 1 and remains out of
+  scope for this decision-only investigation; if pursued, it is a narrow,
+  separate follow-up to the *carrier* question, not the semantic-contract
+  question this section decides.
+
+===== Formula-mode / read-policy non-goal
+
+Formula mode does not create any reason for an unresolved helper *cell
+value* to carry semantic identity -- see "Does formula mode change the
+answer?" above. Consistent with the constraint that a formula observed in
+an input spreadsheet is not automatically authored Formula Intent: this
+BUG's `values`-mode conclusion does not depend on, and does not decide,
+future default read semantics for observed formulas, any pre-load/read
+policy for formula preservation, or any change to `FormulaSpec` (which
+remains authored output Intent, untouched). Explicitly out of scope.
+
+===== Recommended contract
+
+*Recommended* (not accepted, not implementation-authorized):
+
+. Keep the current, already-implemented carrier behavior: an unresolved
+  FK-helper lookup materializes as the plain string `""` in `values` mode
+  (Implementation slice 1), identically on XLSX and ODS. Do not introduce a
+  distinct visible or internal unresolved-value representation (Option A
+  and the reserved-sentinel/`null` idea from the earlier revalidation's
+  "Recommended direction" are superseded).
+. Record explicitly, as the durable contract, that the *derived helper
+  cell* is not, and is not required to be, the authority for
+  resolved-vs-unresolved state. The authority is the source FK reference
+  plus a resolution check against the live target frame -- available today
+  via `validate_fk_helpers` (`check_unresolvable_fks`), or equivalently
+  recomputable by any consumer with access to both frames.
+. Treat this as closing the semantic-contract question this BUG opened.
+  What remains is small, mechanical follow-up (below), not a further
+  design decision.
+
+===== Consequences for the current xfail
+
+`test_unresolved_helper_value_distinguishable_from_legitimate_empty_string`
+tests an incorrect requirement: that the *derived* helper cell alone be
+sufficient to distinguish unresolved from resolved-empty. That requirement
+is not architecturally correct once the authoritative source reference and
+the maintained `validate_fk_helpers` diagnostic are taken into account,
+both of which already provide the real, evidenced distinguishing signal.
+
+Of the three dispositions posed:
+
+. *Become a passing contract test as currently written* -- rejected. Making
+  it pass would require implementing the rejected Option A.
+. *Be replaced by a semantic/replay test that verifies unresolved and
+  resolved-empty remain distinguishable through authoritative source +
+  resolution* -- *recommended*. This is exactly what the probes in this
+  investigation demonstrate ad hoc; a maintained regression does not yet
+  exist for it (this investigation only proves it with throwaway scripts,
+  per its own read-only/decision-only constraint) and would be a
+  reasonable, small follow-up.
+. *Be retired outright because helper-cell distinction is not a required
+  contract* -- the premise is correct (helper-cell-alone distinction is not
+  required), but bare retirement without a replacement would be a coverage
+  regression: no maintained test currently proves that
+  source-plus-resolution distinguishability survives a real roundtrip.
+  Retire-and-replace (option 2) is preferred over retire-only (option 3).
+
+===== Exact remaining implementation scope, if this recommendation is accepted
+
+Small and mechanical, not a further design decision:
+
+* Replace the retired-in-spirit xfail with a real regression test
+  asserting that, after a full export/reimport cycle on both backends, an
+  unresolved reference and a legitimately resolved empty target value
+  remain distinguishable via the reimported source FK column plus a
+  target-frame lookup (e.g. by calling `validate_fk_helpers` against the
+  reimported frames, mirroring the probe above) -- *not* by comparing the
+  two helper-cell values.
+* Document the contract in
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` and/or
+  `docs/ai_info/concepts_fk_helpers.adoc`: the helper cell is presentation
+  only; resolution state is owned by the source reference plus
+  `validate_fk_helpers` (or equivalent recomputation), not by the helper
+  cell's spelling.
+* No change to `apply_fk_helpers`, no new sentinel, no renderer change, no
+  new `_meta` root, no new type or class, no ADR reopening.
+* Optional, not required: a small `validate_fk_helpers` polish to
+  deduplicate the redundant `value_mismatch` finding on a row already
+  covered by `unresolvable_fk`. Purely a diagnostic-quality nicety, not a
+  correctness gap; may be deferred indefinitely.
+
+===== Relationship to future Internal Value Model work
+
+This decision does not introduce, and does not require,
+`roadmap_domain_hardening_sequence.adoc` Phase D's internal type model. It
+resolves the "known blocking contract" Phase C names for this BUG by
+finding that no new missing/unresolved/error *type* is needed for the
+FK-helper case specifically -- the existing DataFrame/dict control flow and
+the existing `validate_fk_helpers` diagnostic already carry the necessary
+distinction. This is evidence *for* the roadmap's own stated principle
+("New infrastructure is justified only when it removes repeated complexity
+from supported paths") rather than a preemption of Phase D: Phase D may
+still introduce a general internal value model for other reasons, but this
+BUG's resolution does not manufacture a demonstrated need for one.
+
 ==== Related backlog items
 
 * `BUG-HELPER-CLEANUP-CONTRACT-P4A` -- the helper-leak twin. *Done*, archived
@@ -765,16 +1189,22 @@ this slice) remains the next step, to be finalized within this same BUG.
   do.
 * `FTR-VISIBLE-CELL-TYPING-STRATEGY-P5` -- closed by
   `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` (accepted); the visible-cell
-  string substrate this BUG's eventual sentinel must respect.
+  string substrate the recommended contract (Semantic-contract decision,
+  2026-08-08) respects unchanged -- no sentinel or typed carrier is
+  recommended, so no reopening is proposed.
 * `FTR-FK-HELPER-POLICY-LIFECYCLE-P4A` -- still *New*; the likely eventual
   host for durable contract documentation of the `helper_policies.fk`
   surface.
 * `FTR-ROUNDTRIP-TEST-LAYER-P4A` -- owns the regression-test home
   (`tests/roundtrip/test_pathological_cell_contracts.py`).
 * `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` -- exploratory/New; provides the
-  general classify/recover/pin framing this BUG's decision would be an
-  instance of, and states a recovery preference consistent with the
-  recommended direction above. Does not decide this BUG.
+  general classify/recover/pin framing this BUG's decision is an instance
+  of. Its stated recovery preference (favoring a data-layer representation
+  over a metadata-only finding) informed the revalidation's now-superseded
+  "Recommended direction"; the Semantic-contract decision (2026-08-08)
+  reaches a different, more specific conclusion for FK helpers -- no
+  recovery representation is needed because the source reference already
+  carries the meaning. Does not decide this BUG.
 * `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` / `DEC-TRUSTED-RUNTIME-AND-
   POLICY-AUTHORITY` -- names this BUG as its explicit non-goal / next
   dependency step.
