@@ -1,0 +1,425 @@
+===== BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A -- ODS renderer's NaN-blind emptiness check can serialize a real missing carrier as literal text "nan"
+
+*Status:* New
+*Priority:* P4A
+*Area:* ODS render/write boundary / carrier-missing-value handling
+(`io_backends/ods/odf_renderer.py`)
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker by itself. A
+concrete, evidenced carrier leak at the ODS write boundary, discovered and
+independently reproduced during Semantic Contract Review 001 of
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+(commit `c32bbb3ecb9659324bb98dc769dafdeaddd78564`). Preferably closed before
+the future Minimal Internal Value Model (`roadmap_domain_hardening_sequence.adoc`
+Phase D) begins, since it is an existing, reproducible `Missing`-adjacent
+carrier defect that model will otherwise have to route around or rediscover.
+
+==== Summary
+
+`io_backends/ods/odf_renderer.py`'s per-cell write branch tests cell
+emptiness with:
+
+[source,python]
+----
+if value in (None, ""):
+    table_cell = TableCell(attributes=attributes)
+----
+
+Python's `in` uses `==` comparisons, and by IEEE-754 definition
+`float('nan') == float('nan')` is `False`, so `nan in (None, "")` is
+`False`. A raw pandas/NumPy missing carrier therefore *fails* this
+emptiness check and falls through to the next branch,
+`isinstance(value, (int, float)) and not isinstance(value, bool)` -- which
+is `True` for a Python/NumPy `float('nan')` -- and is written as
+`valuetype="float"` with paragraph text `str(value)`, i.e. the literal text
+`"nan"`, into the cell. On reload, `odf_parser.py`'s `_cell_value` reads
+that paragraph text first and returns the literal string `"nan"`, silently
+turning framework/carrier missing state into legitimate-looking domain
+text.
+
+This is the same underlying mechanism `BUG-UNRESOLVED-HELPER-VALUE-NAN-
+SEMANTICS-P4A` originally pinned and fixed *one* trigger of (an FK-helper
+*lookup miss*). This BUG is the residual: the renderer branch itself is
+still unfixed and is reachable by *any* real missing carrier that gets as
+far as the renderer, not only by the now-fixed lookup-miss path.
+
+==== Scope boundary: this is not the unresolved-FK lookup-miss defect
+
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s Implementation slice 1
+already closed the lookup-miss cause:
+
+[source,text]
+----
+lookup miss -> apply_fk_helpers supplies "" -> no pandas missing carrier
+introduced by the miss
+----
+
+That fix, and the accepted semantic contract reviewed and accepted in
+Semantic Contract Review 001 (helper value is derived presentation;
+resolution authority is the source FK reference plus a live target lookup;
+unresolved and resolved-empty helper cells may both legitimately be `""`),
+are both unaffected by this BUG and are explicitly *not* reopened here.
+
+The defect this BUG owns is the separate, still-open residual case that
+review confirmed and re-verified end to end:
+
+[source,text]
+----
+lookup succeeds
+-> target payload itself is None / NaN / another maintained missing carrier
+-> successful dictionary hit in apply_fk_helpers returns that payload verbatim
+-> pandas helper column contains a real missing carrier
+-> layout_composer.compose_workbook copies df.values.tolist() with no
+   NaN/None normalization
+-> ODS renderer's `value in (None, "")` check is NaN-blind and misses it
+-> literal text "nan" is written
+----
+
+`apply_fk_helpers` (`core/fk.py:~327-352`) is correct and unaffected: its
+`value_map.get(_norm_id(rid), "")` default only ever fires on a dictionary
+*miss*. A dictionary *hit* -- a successful FK resolution -- returns its
+stored target payload unchanged, by design; that is not a bug in
+`apply_fk_helpers`, it is the renderer boundary mishandling a legitimate
+carrier value it receives.
+
+==== Confirmed generality: not FK-helper-specific
+
+The task framing that motivated this BUG treats the FK-helper successful-hit
+case as the *proven trigger*, not necessarily the *only* trigger, and asks
+for the narrowest evidenced generality rather than an assumed one. Two
+independent, real end-to-end reproductions were run for this BUG (read-only
+probes, no production/test file modified; full transcripts in "Validation"
+below):
+
+. *FK-helper successful hit with a missing target payload* (the originally
+  suspected trigger, now re-confirmed on real files rather than only
+  in-memory): a target row's `name` field is `None` (or, separately,
+  `math.nan`); the FK resolves successfully; `apply_fk_helpers` returns the
+  stored missing carrier verbatim; after a real render+reload cycle,
+  XLSX reloads the cell as `''` (OpenPyXL's own accidental NaN-to-blank
+  write behavior), ODS reloads it as the literal string `'nan'`. True for
+  *both* a Python `None`-derived carrier and a genuine `numpy.nan`.
+. *An ordinary, non-FK, non-helper column sourced from `csv_dir`* --
+  `io_backends/csv_backend.py`'s `CSVBackend.read_multi` (used by
+  `load_csv_dir`, the `csv_dir` loader) calls
+  `pd.read_csv(p, header=0, encoding="utf-8")` *without* `dtype=str` or
+  `keep_default_na=False` (unlike the single-file `CSVBackend.read` path,
+  which deliberately sets both). A blank CSV cell in this path becomes a
+  genuine pandas `NaN` with no FK-helper machinery, no `apply_fk_helpers`
+  call, and no helper column involved at all. Rendering that frame directly
+  to XLSX and ODS reproduces the identical pattern: XLSX reloads `''`, ODS
+  reloads the literal string `'nan'`.
+
+Reproduction 2 has no dependency on FK helpers whatsoever, so this is
+correctly scoped as a general *ODS render/carrier-boundary* defect --
+*any* raw pandas/NumPy missing carrier that reaches
+`io_backends/ods/odf_renderer.py`'s per-cell write branch is at risk of
+this corruption -- with the FK-helper successful-hit case and the
+`csv_dir` ordinary-column case both serving as proven, independently
+reproduced triggers. No claim broader than what these two reproductions
+show is made; other potential carriers of a raw missing value into the
+same renderer branch were not enumerated or tested here.
+
+==== Root cause -- pinned
+
+Distinguishing observed fact from prior BUG's already-recorded trace
+(re-verified current, not re-derived from scratch, since the code has not
+changed since `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` originally
+pinned it):
+
+. `rendering/composer/layout_composer.py:353` (`compose_workbook`) copies
+  `df.values.tolist()` directly into `TableBlock.data` with no NaN/None
+  normalization at the render-IR boundary. Confirmed unchanged.
+. `io_backends/ods/odf_renderer.py:546-563` (inside the per-row/per-cell
+  write loop): `value = "" if cell is None else cell.value`, then
+  `if value in (None, ""):`. Confirmed still present, unmodified, at these
+  exact lines.
+. `nan in (None, "")` is `False` because `nan == nan` is `False`
+  (IEEE-754). The check therefore does not recognize a missing carrier.
+. The value falls through to
+  `elif isinstance(value, (int, float)) and not isinstance(value, bool):`
+  (line 573) -- `True` for a Python `float('nan')` and for
+  `numpy.float64('nan')` alike (both are real `float` instances) -- and is
+  written as `valuetype="float", value=value` plus
+  `table_cell.addElement(P(text=str(value)))`, i.e. the literal paragraph
+  text `"nan"`.
+. `io_backends/ods/odf_parser.py`'s `_cell_value` reads the cell's
+  paragraph text first, before consulting `office:value-type`/
+  `office:value`, so the mistaken `"nan"` text is exactly what round-trips
+  back out.
+. *XLSX comparison, confirmed unchanged:* `io_backends/xlsx/
+  openpyxl_renderer.py`'s `_xlsx_cell_value` (`~line 182-198`) passes the
+  raw value straight to `ws.cell(..., value=val)` with no NaN handling at
+  all; OpenPyXL itself silently converts a NaN-valued cell to blank/`None`
+  on save (accidental library behavior, not a decision made anywhere in
+  this codebase, exactly as the original BUG already established). XLSX
+  therefore does not corrupt to `"nan"` text, but this is luck, not a
+  correct or owned carrier-missing check either -- it has simply never
+  been observed to misfire the way the ODS check does.
+
+This is the identical mechanism `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-
+P4A`'s "Root cause -- pinned" section already traced for the lookup-miss
+case; that BUG's Implementation slice 1 fixed the *miss* by never
+introducing the carrier in the first place, while leaving this renderer
+branch itself untouched (explicitly recorded there as "still open" and
+"outside this slice's owned contract"). This BUG owns fixing the branch
+itself, since a lookup miss is not the only way a real missing carrier can
+reach it.
+
+==== Existing NaN-aware precedents in this codebase
+
+The project already has multiple correct, `pd.isna`-based "is this a
+missing carrier" predicates; none is applied at the ODS renderer's write
+boundary:
+
+* `core/fk.py:_norm_id` -- returns `None` for a value that fails
+  `pd.isna(v)`-based recognition; used for FK key normalization. Lives in
+  `core`, a layer `io_backends` already depends on (both ODS and XLSX
+  renderer/parser modules already import from `spreadsheet_handling.core.
+  formulas`).
+* `domain/transformations/derived_column_policy.py:_norm` (line ~605) --
+  `bool(pd.isna(value))`-guarded, used for `enrich_lookup` mismatch
+  comparison.
+* `domain/validations/fk_helpers.py:_norm` / `_norm_key` -- same pattern,
+  used for FK-helper diagnostics.
+* `domain/_cell_primitives.py:_is_empty_cell` -- the closest match in
+  *shape* to what the renderer needs (a boolean "is this cell empty"
+  predicate: `None`, `""`, or `pd.isna(value)`), and is already reused
+  across many `domain` consumers (`tabular_views.py`, `cell_codec/*.py`,
+  `join_views.py`, `resource_overrides.py`, `xref_crosstable/*.py`,
+  `discriminator_split/values.py`, `_legend_blocks.py`,
+  `_where_predicates.py`, `validations/reference_validations.py`,
+  `validations/graph_validations.py`, `structured_yaml.py`). It is,
+  however, in `domain`, a layer `io_backends` does not currently import
+  from at all (confirmed: no `io_backends/**/*.py` file imports anything
+  from `spreadsheet_handling.domain`); reusing it directly at the renderer
+  boundary would be a new, currently-absent dependency direction, not a
+  drop-in reuse.
+
+No fix is chosen here. This section is evidence for "a fix belongs to a
+recognized, already-established pattern, not a novel one," not a decision
+about where the concrete predicate should live.
+
+==== Recommended narrow direction (not implemented, not authorized)
+
+*Recommended, non-binding:* replace the ODS renderer's hand-written
+`value in (None, "")` test with an owned, `pd.isna`-aware carrier-missing
+predicate at the ODS render boundary, applied *before* the
+`isinstance(value, (int, float))` branch is reached, so a real missing
+carrier is recognized regardless of which upstream path produced it. Two
+concrete shapes are plausible and neither is chosen here:
+
+* a small local predicate inside `io_backends/ods/odf_renderer.py` (no new
+  cross-layer dependency, mirrors how the ODS/XLSX adapters are otherwise
+  self-contained); or
+* a shared predicate hosted in `core` (a layer both renderers already
+  depend on), so XLSX's currently-accidental-but-harmless pass-through
+  could optionally adopt the same explicit check for symmetry, without
+  requiring it to change behavior.
+
+Whether the XLSX renderer should also gain an explicit (currently merely
+accidental) missing-carrier handling path is an open question this BUG
+does not decide; XLSX's current behavior is not evidenced as broken, only
+as undocumented luck.
+
+==== Non-goals
+
+* Do not implement the fix in this task; this BUG is decision/evidence
+  recording only.
+* Do not modify runtime or test code.
+* Do not reopen or modify the accepted semantic contract of
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` (Option B: helper value
+  is derived presentation; resolution authority is the source FK plus a
+  live target lookup; unresolved and resolved-empty helper cells may both
+  legitimately be `""`; no special unresolved type/sentinel is required).
+  That contract is unaffected by this BUG and is not revisited here.
+* Do not define `Missing` as a first-class internal type or value here.
+* Do not authorize or design the Minimal Internal Value Model
+  (`roadmap_domain_hardening_sequence.adoc` Phase D).
+* Do not reopen `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`. Any fix
+  remains within the accepted string-substrate contract -- this is a
+  carrier-recognition defect (the renderer fails to detect an already-
+  agreed "empty" state), not a request for a new typed cell representation.
+* Do not touch formula-mode rendering (`LookupFormulaSpec` handling is a
+  separate branch, unaffected and not evidenced as broken).
+* Do not create an FTR. The evidenced defect is narrow and localized to one
+  renderer's one emptiness check plus its regression coverage; this BUG can
+  own the eventual fix directly.
+* Do not update Project Memory from this task.
+
+==== Required future regression evidence (not implemented here)
+
+Once a fix is authorized, focused tests should cover at minimum:
+
+. A real pandas/NumPy missing carrier reaching the ODS renderer must not be
+  serialized as the literal text `"nan"`.
+. Python `None` reaching the same boundary behaves identically to (1).
+. A genuine `numpy.nan` / pandas `NA` (or whichever carriers the project's
+  active pandas string dtype can actually produce) reaching the same
+  boundary behaves identically to (1) and (2).
+. A legitimate resolved/domain string that is literally `"nan"` must still
+  round-trip unchanged as `"nan"` -- the fix must detect the *carrier*, not
+  censor the spelling, exactly as Implementation slice 1 already did for
+  the lookup-miss case.
+. A legitimate empty string `""` must still round-trip unchanged as `""`.
+. The corresponding XLSX behavior for all of the above must not regress
+  (XLSX's current blank-on-missing-carrier behavior should remain observed
+  and asserted, whether or not XLSX gains an explicit check).
+
+A renderer/carrier-level unit test (direct construction of a DataFrame or
+render-IR `TableBlock` carrying a real missing value, independent of the
+roundtrip layer) is preferred for (1)-(5), per the project's "test
+contracts once, not every format" convention, plus at least one maintained
+end-to-end reproduction of the successful-FK-hit case (extending or
+mirroring `TestMissingLabelField::test_missing_label_field_results_in_
+none_helper` in `tests/unit/domain/transformations/test_fk_edge_cases.py`,
+or a new roundtrip-layer test alongside
+`tests/roundtrip/test_pathological_cell_contracts.py`) to keep the
+originally-motivating, proportionate case covered end to end. Not
+implemented by this BUG.
+
+==== Relationship to `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`
+
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` does *not* own this defect.
+Its accepted semantic contract (Semantic Contract Review 001, verdict
+ACCEPTED, 0 Blocking / 0 Important / 2 Minor) remains exactly as decided:
+
+* the derived FK-helper value is presentation only, not authoritative;
+* resolution authority is the source FK reference plus a live lookup
+  against the current target frame;
+* an unresolved reference and a legitimately resolved empty helper value
+  may both display `""`, and remain distinguishable through the
+  authoritative source state, not through the helper cell's spelling;
+* no distinct unresolved-value carrier, sentinel, or internal type is
+  required.
+
+That BUG's own text already anticipated this residual and explicitly
+declined to own it (its "What remains open" / Implementation Review 001
+finding `NAN-SEMANTICS-REVIEW-F1`, and Semantic Contract Review 001's own
+finding `SEM-REVIEW-F2`) rather than silently absorbing it. This BUG is the
+promised transfer target for that residual scope. When
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` reaches its own Done
+disposition (after its small retire-and-replace test follow-up and
+concept-doc update land), it should reference this BUG by ID as the owner
+of the separately transferred renderer-level residual, rather than leaving
+that residual undiscoverable once the original BUG is archived.
+
+==== Relationship to future Internal Value Model work (Phase D)
+
+This defect is a concrete, already-reproducible carrier leak relevant to
+whatever future `Missing` semantics
+`roadmap_domain_hardening_sequence.adoc` Phase D eventually defines: a real
+missing carrier silently becoming legitimate-looking domain text (`"nan"`)
+is exactly the kind of "accidental pandas or spreadsheet representation"
+Phase C's own exit criteria warn a future type model must not merely
+encode. Fixing this renderer boundary before Phase D begins removes one
+concrete, evidenced pre-existing leak that model would otherwise have to
+route around or rediscover independently.
+
+This BUG explicitly does not, however:
+
+* define `Missing` as a first-class value or type;
+* authorize, scope, or design the Internal Value Model itself;
+* reopen `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`;
+* involve formulas or formula-mode rendering in any way;
+* block or delay acceptance of
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s already-decided
+  FK-helper semantic contract, which is complete and independent of this
+  BUG's resolution.
+
+==== Reference: where the defect lives
+
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py:546-587` --
+  the per-cell write loop; the pinned defect is the emptiness check at
+  line ~563 (`if value in (None, ""):`) and its fallthrough into the
+  numeric branch at line ~573.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` -- `_cell_value`,
+  reads paragraph text before `office:value`, so the renderer's mistaken
+  `"nan"` text is what round-trips back out (unchanged since the original
+  BUG's trace).
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py:182-198`
+  -- `_xlsx_cell_value`, the comparison point: passes raw values straight
+  through with no NaN handling; OpenPyXL's own accidental behavior is what
+  currently prevents XLSX from exhibiting the same textual corruption.
+* `src/spreadsheet_handling/rendering/composer/layout_composer.py:353` --
+  `compose_workbook`, copies `df.values.tolist()` into `TableBlock.data`
+  with no NaN normalization; the raw missing carrier reaches both backend
+  renderers unchanged from here.
+* `src/spreadsheet_handling/core/fk.py:~279-360` -- `apply_fk_helpers`,
+  confirmed correct and unaffected; a dictionary hit (successful FK
+  resolution) returns its stored payload verbatim by design, which is one
+  of (at least) two proven ways a real missing carrier reaches the
+  renderer.
+* `src/spreadsheet_handling/io_backends/csv_backend.py:67-83` --
+  `CSVBackend.read_multi` (backing `load_csv_dir`, the `csv_dir` loader),
+  confirmed as a second, FK-independent, currently-reachable way a real
+  pandas `NaN` enters a frame (`pd.read_csv(p, header=0,
+  encoding="utf-8")`, no `dtype=str` / `keep_default_na=False`, unlike the
+  sibling single-file `CSVBackend.read` path at line ~50-65, which sets
+  both).
+* `src/spreadsheet_handling/domain/_cell_primitives.py:_is_empty_cell` --
+  the closest existing precedent in predicate shape; not currently
+  reachable from `io_backends` without a new cross-layer dependency (see
+  "Existing NaN-aware precedents" above).
+* `tests/unit/domain/transformations/test_fk_edge_cases.py:175` --
+  `TestMissingLabelField::test_missing_label_field_results_in_none_helper`,
+  the maintained in-memory regression that already proves and pins the
+  successful-hit-missing-payload case at the domain/pipeline level (it
+  does not render to a real ODS file, so it does not by itself cover this
+  BUG's renderer-level defect).
+
+==== Validation (evidence gathered for this BUG; nothing implemented)
+
+Both reproductions below are read-only probes, run against a clean
+checkout; no production or test file was modified to produce them.
+
+Reproduction 1 -- FK-helper successful hit, missing target payload,
+real render+reload on both backends:
+
+[source,text]
+----
+[python-None] in-memory helper column: [nan, 'Alpha'], row0 is missing carrier: True
+  backend=xlsx: reloaded row0 helper value = ''    (type=str)
+  backend=ods:  reloaded row0 helper value = 'nan' (type=str)
+[numpy-nan]   in-memory helper column: [nan, 'Alpha'], row0 is missing carrier: True
+  backend=xlsx: reloaded row0 helper value = ''    (type=str)
+  backend=ods:  reloaded row0 helper value = 'nan' (type=str)
+----
+
+Reproduction 2 -- ordinary `csv_dir`-sourced column, no FK helpers
+involved, real render+reload on both backends:
+
+[source,text]
+----
+loaded columns: ['id', 'note']
+in-memory 'note' column: [nan, 'hello'], row0 is missing carrier: True
+backend=xlsx: reloaded 'note' column = ['', 'hello']
+backend=ods:  reloaded 'note' column = ['nan', 'hello']
+----
+
+Both reproductions independently confirm the ODS-specific `"nan"`
+corruption and the XLSX/ODS divergence on real files, and reproduction 2
+independently confirms the defect is not FK-helper-specific.
+
+Full-suite check (unmodified; confirms this BUG creation touched no
+runtime/test file):
+
+[source,bash]
+----
+git status --short
+git diff --check
+----
+
+Result: only this new BUG file and the backlog index change (below) are
+new/modified; no runtime, test, ADR, concept, Project Memory, or
+existing-BUG decision-text file changed.
+
+==== Related backlog items
+
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- the sibling BUG whose
+  Semantic Contract Review 001 discovered and independently reproduced
+  this residual defect; see "Relationship to
+  BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A" above. Not reopened,
+  not modified, by this BUG.
+* `roadmap_domain_hardening_sequence.adoc` Phase C / Phase D -- sequencing
+  context; see "Relationship to future Internal Value Model work" above.
+* `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` -- unaffected; not reopened.
