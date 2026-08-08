@@ -1,6 +1,6 @@
 ===== BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A -- ODS renderer's NaN-blind emptiness check can serialize a real missing carrier as literal text "nan"
 
-*Status:* New
+*Status:* Fixed
 *Priority:* P4A
 *Area:* ODS render/write boundary / carrier-missing-value handling
 (`io_backends/ods/odf_renderer.py`)
@@ -423,3 +423,122 @@ existing-BUG decision-text file changed.
 * `roadmap_domain_hardening_sequence.adoc` Phase C / Phase D -- sequencing
   context; see "Relationship to future Internal Value Model work" above.
 * `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` -- unaffected; not reopened.
+
+==== Resolution
+
+*Chosen boundary:* a local `_is_missing_carrier` predicate defined directly
+in `src/spreadsheet_handling/io_backends/ods/odf_renderer.py`, applied in
+the per-cell write loop (`_build_table`) immediately before the
+`isinstance(value, bool)` / numeric / string branches. This is the first of
+the two "plausible shapes" this BUG's "Recommended narrow direction" left
+open -- a small local predicate, no new cross-layer dependency -- chosen
+over hosting it in `core` because the defect and its fix are both owned
+entirely by the ODS renderer's own write boundary; nothing about the XLSX
+renderer's currently-accidental-but-harmless pass-through needed to change
+to close this BUG, so no shared module was introduced. `io_backends` does
+not import `domain._cell_primitives._is_empty_cell`; the predicate is a
+self-contained copy of that established shape (`None` -> `True`; `str` ->
+`value == ""`; else `bool(pd.isna(value))` guarded by
+`try/except (TypeError, ValueError)`), not an import.
+
+*Root cause, confirmed as pinned:* `value in (None, "")` uses `==`, and
+`float('nan') == float('nan')` is `False` (IEEE-754), so a real
+pandas/NumPy missing carrier fell through into
+`elif isinstance(value, (int, float)) and not isinstance(value, bool):` and
+was written as `valuetype="float"` with paragraph text `str(value)`, i.e.
+the literal text `"nan"`. Confirmed via a pre-fix reproduction script
+(`RenderPlan` + `WriteDataBlock` carrying `math.nan` / `numpy.float64('nan')`
+directly, `render_workbook`, then parsing `content.xml`): both produced
+`office:value-type="float"` with paragraph text `"nan"`. A genuine
+`pandas.NA` reaching the same branch pre-fix did not even reach the
+`"nan"` text -- it raised `TypeError: boolean value of NA is ambiguous`
+inside `value in (None, "")` itself, an additional pre-existing defect this
+fix also incidentally closes since `pd.isna(pd.NA)` is a safe, unambiguous
+`True`.
+
+*Fix:* replace `if value in (None, ""):` with
+`if _is_missing_carrier(value):`. `None`, `""`, `math.nan`,
+`numpy.float64('nan')`, and `pandas.NA` all now take the existing blank-cell
+branch (`TableCell(attributes=attributes)`, no `office:value-type`, no
+paragraph text) instead of falling into the numeric branch.
+
+*Literal `"nan"` preservation:* the predicate detects the carrier, not the
+spelling -- `isinstance(value, str)` is checked before `pd.isna`, so a
+legitimate domain string equal to `"nan"` returns `False` (not the empty
+string) and still takes the existing string branch
+(`valuetype="string"`, paragraph text `"nan"`), unchanged.
+
+*Missing-carrier / non-regression behavior (renderer-level unit
+evidence):*
+
+[cols="2,2,2"]
+|===
+| Case | Pre-fix `office:value-type` / text | Post-fix `office:value-type` / text
+
+| `None`                        | (blank) / `""`      | (blank) / `""` (unchanged)
+| `math.nan`                    | `float` / `"nan"`   | (blank) / `""` (fixed)
+| `numpy.float64('nan')`        | `float` / `"nan"`   | (blank) / `""` (fixed)
+| `pandas.NA`                   | raises `TypeError`  | (blank) / `""` (fixed)
+| `""`                          | (blank) / `""`      | (blank) / `""` (unchanged)
+| literal string `"nan"`        | `string` / `"nan"`  | `string` / `"nan"` (unchanged)
+| `42`                          | `float` / `"42"`    | `float` / `"42"` (unchanged)
+| `3.14`                        | `float` / `"3.14"`  | `float` / `"3.14"` (unchanged)
+| `True`                        | `boolean` / `"TRUE"`| `boolean` / `"TRUE"` (unchanged)
+| `False`                       | `boolean` / `"FALSE"`| `boolean` / `"FALSE"` (unchanged)
+|===
+
+*XLSX / ODS real end-to-end results (both reproductions from this BUG's
+"Validation" section, re-run pre-fix and post-fix):*
+
+* Reproduction 1 (successful FK hit, `math.nan` target payload, real
+  `save_ods`/`load_ods` and `save_xlsx`/`load_xlsx` roundtrip): pre-fix
+  ODS reloaded `'nan'`, XLSX reloaded `''`; post-fix both backends reload
+  `''`.
+* Reproduction 2 (ordinary `csv_dir` column, blank cell, no FK helpers, real
+  CLI roundtrip via `spreadsheet_handling.cli.apps.run.main`): pre-fix ODS
+  reloaded `'nan'`, XLSX reloaded `''`; post-fix both backends reload `''`.
+
+XLSX was not modified; its existing blank-on-NaN behavior (an OpenPyXL
+accident, not a decision made in this codebase) is asserted as a
+non-regression in all three new/extended tests, not re-implemented as an
+explicit check -- unchanged, per this BUG's non-goals.
+
+*Test evidence:*
+
+* `pytest tests/unit/io_backends/ods/test_odf_renderer_missing_carrier.py -q`
+  -- new renderer-level unit test, direct `WriteDataBlock` construction,
+  10 cases (`None`, `math.nan`, `numpy.float64('nan')`, `pandas.NA`, `""`,
+  literal `"nan"`, `int`, `float`, `True`, `False`): `1 passed`. Confirmed
+  red pre-fix (`TypeError: boolean value of NA is ambiguous`).
+* `pytest tests/unit/domain/transformations/test_fk_edge_cases.py -q`
+  -- extends `TestMissingLabelField` with
+  `test_successful_fk_hit_with_nan_target_payload_survives_real_ods_and_xlsx_roundtrip`,
+  a real `save_ods`/`load_ods` + `save_xlsx`/`load_xlsx` roundtrip of
+  reproduction 1: `10 passed`. Confirmed red pre-fix
+  (`AssertionError: ... got 'nan'`).
+* `pytest tests/roundtrip/test_pathological_cell_contracts.py -q` -- adds
+  `test_csv_dir_blank_cell_carrier_is_backend_consistent`, a real CLI
+  roundtrip of reproduction 2 (parametrized `xlsx`/`ods`): `12 passed`.
+  Confirmed red pre-fix on the `ods` case
+  (`AssertionError: ... got 'nan'`).
+* Focused ODS/XLSX/roundtrip/FK-edge-case slice
+  (`pytest tests/unit/io_backends/ods tests/unit/io_backends/xlsx tests/roundtrip tests/unit/domain/transformations/test_fk_edge_cases.py -q`):
+  `125 passed`.
+* Full active suite (`make test`, i.e.
+  `pytest -m 'not legacy and not prehex and not slow' tests/unit
+  tests/integration tests/roundtrip tests/architecture`): `2259 passed,
+  1 deselected`.
+* `make source-style-guards`: `0 error(s)` (pre-existing warnings only,
+  none introduced by this change).
+
+*Fixing commit:* `31f8d7f`
+(`fix(BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A): recognize
+NaN-family carriers before ODS numeric render branch`).
+
+This BUG is Done. `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s
+accepted semantic contract (Option B: helper value is derived presentation;
+no distinct unresolved-value carrier or sentinel) is unaffected and was not
+revisited. `roadmap_domain_hardening_sequence.adoc` Phase D remains
+unauthorized and undesigned by this BUG; closing this residual removes one
+concrete, evidenced carrier leak that model would otherwise have had to
+route around or rediscover.
