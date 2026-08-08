@@ -141,9 +141,13 @@ def _reimport_items_row(
 # while the ODS renderer's `value in (None, "")` emptiness check is
 # NaN-blind (`nan != nan`) and fell through to the numeric branch, writing
 # the literal text "nan". `apply_fk_helpers` (core/fk.py) now supplies an
-# explicit `""` default for an unresolved lookup, so no pandas missing
-# carrier is ever constructed for a helper column, and neither renderer
-# ever sees a NaN to mishandle.
+# explicit `""` default for an unresolved *lookup miss*, so a lookup miss
+# no longer introduces a pandas missing carrier, and neither renderer sees
+# a NaN to mishandle for that row. A successful lookup still returns its
+# stored target payload verbatim -- if that payload is itself a missing
+# carrier, the helper column can still carry one for that row; that case
+# is outside this fix (see test_fk_edge_cases.py's
+# TestMissingLabelField::test_missing_label_field_results_in_none_helper).
 # ---------------------------------------------------------------------------
 
 

@@ -124,16 +124,23 @@ class TestApplyFkHelpersUnresolvedCarrier:
     assignment silently coerced into a real ``float('nan')`` carrier -- the
     root cause of the backend-divergent "nan"/"" corruption on write.
     ``apply_fk_helpers`` now supplies an explicit ``""`` default for a
-    lookup miss, so no pandas missing carrier is ever constructed for a
-    helper column.
+    lookup *miss*, so a lookup miss no longer introduces a pandas missing
+    carrier. A successful lookup still returns its stored target payload
+    verbatim: if that payload is itself ``None``/NaN/pandas-``NA``, the
+    helper column can still carry a missing value for that row -- that
+    case is outside this slice (see
+    ``TestMissingLabelField::test_missing_label_field_results_in_none_helper``
+    in ``test_fk_edge_cases.py``).
     """
 
     def test_unresolved_non_empty_key_produces_plain_empty_string(self):
         """A well-formed but unmatched FK key normalizes to a plain str ''.
 
         Not ``None``, not ``float('nan')`` -- an ordinary Python string, so
-        no backend renderer can ever see a pandas missing carrier for this
-        column.
+        no backend renderer sees a pandas missing carrier for this row's
+        lookup miss. (A different, successfully resolved row in the same
+        column could still carry a missing carrier if its stored target
+        payload is itself missing -- outside this test's scope.)
         """
         frames = {
             "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 99]}),

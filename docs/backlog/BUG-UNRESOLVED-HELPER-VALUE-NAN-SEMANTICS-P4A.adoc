@@ -459,11 +459,16 @@ code or architecture.
 
 * The io_backends renderers were *not* touched. `io_backends/ods/odf_renderer.py`'s
   NaN-blind `value in (None, "")` emptiness check (line 563) is still
-  present as written -- it is simply never exercised by an FK-helper NaN
-  anymore, because `apply_fk_helpers` no longer produces one. Whether that
-  renderer-level predicate itself deserves an independent correctness fix
-  (for any *other*, non-FK-helper NaN that might reach it) is out of this
-  BUG's scope; not evaluated here.
+  present as written -- it is simply never exercised by a *lookup-miss*
+  FK-helper NaN anymore, because a lookup miss in `apply_fk_helpers` no
+  longer produces one. A successful lookup whose stored target payload is
+  itself `None`, pandas/NumPy missing, or another maintained missing
+  carrier is returned verbatim and can still reach this same renderer
+  check unchanged; that case is outside this slice (see "Implementation
+  slice 1" below). Whether the renderer-level predicate itself deserves an
+  independent correctness fix (for that case, or for any other,
+  non-FK-helper NaN that might reach it) is out of this BUG's scope; not
+  evaluated here.
 * Choosing and implementing the final value-representation sentinel (JSON
   `null` off the spreadsheet-cell path, a reserved string sentinel on it,
   or another shape) once the maintainer decides the open naming/uniformity
@@ -645,8 +650,12 @@ Rejected alternatives, and why:
   correct on its own terms.
 
 Fixing at `apply_fk_helpers` means neither renderer ever receives a raw NaN
-for an FK-helper column in the first place -- both backends consume an
-already-decided, ordinary Python string. No renderer code was changed.
+for an FK-helper *lookup miss* -- both backends consume an already-decided,
+ordinary Python string for that case. A successful lookup is unaffected by
+this fix and still returns its stored target payload verbatim; if that
+payload is itself a missing carrier, the column can still carry a raw NaN
+into a renderer for that row (outside this slice; see "What remains open"
+below). No renderer code was changed.
 
 *Fix:* an unresolved lookup (missing source key, or a non-empty key with no
 matching target row) now supplies an explicit `""` default to the
@@ -657,9 +666,14 @@ during revalidation (`type(value) is float`, `repr(value) == 'nan'`) -- and
 that NaN was what let the two backend renderers diverge: OpenPyXL silently
 drops a NaN-valued cell to blank on save (accidental library behavior);
 the ODS renderer's NaN-blind `value in (None, "")` check falls through to
-its numeric branch and writes the literal text `"nan"`. No pandas missing
-carrier is constructed for a helper column anymore, so neither renderer
-has anything to mishandle.
+its numeric branch and writes the literal text `"nan"`. A lookup *miss* no
+longer introduces a pandas missing carrier for a helper column, so neither
+renderer has anything to mishandle for that miss. A successful lookup
+(a dict hit) still returns its stored payload verbatim, including a stored
+`None`, NumPy NaN, pandas `NA`, or another maintained missing carrier --
+that case can still materialize a missing helper carrier and is outside
+this slice's owned contract (precision correction per Implementation
+Review 001, finding NAN-SEMANTICS-REVIEW-F1).
 
 *Regression tests added:*
 
@@ -712,6 +726,19 @@ this revalidation separately proved is *no longer live*: since every
 unresolved case now uniformly produces `""` rather than sometimes
 producing `"nan"` (on ODS), a legitimate resolved `"nan"` target value no
 longer collides with anything.
+
+A separate, narrower precision (Implementation Review 001, finding
+NAN-SEMANTICS-REVIEW-F1): this slice normalizes only a *lookup miss*. A
+*successful* lookup still returns its stored target payload verbatim --
+if that stored payload is itself `None`, NumPy NaN, pandas `NA`, or another
+maintained missing carrier, the helper column can still materialize a
+missing helper carrier for that row, on either backend. That is not a
+defect in this slice; it is simply outside the slice's owned contract (the
+slice fixes the previously implicit value of a *miss*, it does not define
+or normalize legitimate target payloads). The maintained
+`TestMissingLabelField::test_missing_label_field_results_in_none_helper`
+(`tests/unit/domain/transformations/test_fk_edge_cases.py`) exercises and
+preserves exactly this successful-hit case.
 
 The final representation decision (JSON `null` off the spreadsheet-cell
 path, a reserved sentinel string on it, a `derived_column_findings`

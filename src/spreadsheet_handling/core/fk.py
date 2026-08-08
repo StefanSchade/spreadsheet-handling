@@ -327,22 +327,27 @@ def apply_fk_helpers(
         if helper_value_provider is None:
             values = []
             for rid in raw_ids:
-                # An unresolved lookup (missing source key or a non-empty
-                # key with no matching target row) must produce a plain
-                # Python string, never the implicit dict-lookup ``None``.
-                # ``None`` mixed into a column assignment is silently
-                # coerced by pandas into a real ``float('nan')`` carrier,
-                # which is what let the two backend renderers diverge on
-                # how to serialize "no value" (BUG-UNRESOLVED-HELPER-VALUE-
-                # NAN-SEMANTICS-P4A): OpenPyXL happens to drop a NaN cell to
-                # blank on save, while the ODS renderer's emptiness check is
-                # NaN-blind and wrote the literal text "nan" instead. This
-                # is carrier normalization only -- it does not decide the
-                # final unresolved-reference contract (still open; the
-                # empty string collides with a legitimately resolved helper
-                # whose target value is itself ""), it only guarantees no
-                # pandas missing carrier ever reaches a renderer for an FK
-                # helper column.
+                # A lookup *miss* (missing source key or a non-empty key
+                # with no matching target row) must produce a plain Python
+                # string, never the implicit dict-lookup ``None``. ``None``
+                # mixed into a column assignment is silently coerced by
+                # pandas into a real ``float('nan')`` carrier, which is what
+                # let the two backend renderers diverge on how to serialize
+                # "no value" (BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A):
+                # OpenPyXL happens to drop a NaN cell to blank on save, while
+                # the ODS renderer's emptiness check is NaN-blind and wrote
+                # the literal text "nan" instead. This is miss-local carrier
+                # normalization only -- it does not decide the final
+                # unresolved-reference contract (still open; the empty
+                # string collides with a legitimately resolved helper whose
+                # target value is itself ""), and it only guarantees that an
+                # FK lookup *miss* no longer introduces a pandas missing
+                # carrier. A successful lookup (a dict hit) still returns
+                # its stored target payload verbatim -- if that stored
+                # payload is itself ``None``, NumPy NaN, pandas ``NA``, or
+                # another maintained missing carrier, the helper column can
+                # still materialize a missing carrier for that row. Handling
+                # that successful-hit case is outside this slice.
                 lbl = value_map.get(_norm_id(rid), "")
                 values.append(lbl)
         else:
