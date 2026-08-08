@@ -4,22 +4,28 @@ Assert defined behavior when a cell carries non-domain content: empty FK
 source values, unresolved FK references, NaN-valued numeric cells,
 spreadsheet error tokens (``#NAME?``, ``#N/A``, ``#REF!``), etc.
 
-Unresolved FK-helper values: this module covers two distinct, separately
-tracked problems under `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`:
+Unresolved FK-helper values: this module covers two distinct problems under
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, both now resolved:
 
 * the *carrier* problem -- an unresolved helper's pandas missing-value
   carrier used to serialize as backend-divergent, accidental text (the
   literal string ``"nan"`` on ODS, `""` on XLSX only by luck of an
-  unrelated OpenPyXL quirk). This is now fixed: both backends
-  consistently normalize an unresolved helper to the empty string `""`
-  before it ever reaches a renderer. See the passing regression tests
-  below.
-* the *semantic* problem -- `""` is only a *temporary carrier*
-  representation, not an accepted final contract for "unresolved". It is
-  known to collide with a legitimately resolved helper whose target value
-  is itself an empty string, and the project has not yet decided the final
-  representation (null, a reserved sentinel, a structured finding, etc.).
-  This remains open; see the xfail sentinel at the bottom of this module.
+  unrelated OpenPyXL quirk). Fixed: both backends consistently normalize an
+  unresolved helper to the empty string `""` before it ever reaches a
+  renderer. See the passing regression tests below.
+* the *semantic* problem -- whether an unresolved reference must be
+  distinguishable from a legitimately resolved empty helper value *at the
+  helper-cell level*. Accepted answer (Semantic Contract Review 001,
+  ACCEPTED): no. The derived helper cell is presentation only; resolution
+  authority is the authoritative source FK reference plus a lookup against
+  the current target frame. An unresolved reference and a legitimately
+  resolved empty target value may both legitimately display `""` in the
+  helper cell while remaining fully distinguishable through the source FK
+  column plus `validate_fk_helpers` (or equivalent resolution). See
+  `test_unresolved_reference_remains_distinguishable_via_authoritative_resolution`
+  below, which proves this on both backends through a real roundtrip. No
+  distinct unresolved-value carrier, sentinel, or internal type is
+  required.
 """
 
 from __future__ import annotations
@@ -28,6 +34,9 @@ import json
 from pathlib import Path
 
 import pytest
+
+from spreadsheet_handling.domain.validations.fk_helpers import validate_fk_helpers
+from spreadsheet_handling.io_backends.router import get_loader
 
 
 pytestmark = [
@@ -168,8 +177,10 @@ def test_unresolved_fk_helper_carrier_is_backend_consistent(kind, tmp_path) -> N
         f"unresolved helper {helper_column!r} must not serialize as the literal "
         f"string 'nan' on backend {kind!r}; got {row[helper_column]!r}"
     )
-    # Current (temporary) carrier behavior, not the final semantic contract --
-    # see the xfail sentinel below for the still-open representation question.
+    # Accepted carrier value (Semantic Contract Review 001): the helper cell
+    # is presentation only, so "" is the accepted representation here -- see
+    # test_unresolved_reference_remains_distinguishable_via_authoritative_resolution
+    # below for how resolution state is nonetheless never actually lost.
     assert row[helper_column] == "", (
         f"unresolved helper {helper_column!r} should carry the current normalized "
         f"empty-string representation on backend {kind!r}; got {row[helper_column]!r}"
@@ -228,10 +239,12 @@ def test_legitimate_empty_helper_value_survives_roundtrip(kind, tmp_path) -> Non
     Not every "" is unresolved: a successful FK resolution whose target
     field happens to be a legitimate empty string is a dict hit, not a
     lookup miss, and must round-trip as "" on both backends. (This value is
-    currently indistinguishable from the unresolved-carrier case -- that
-    collision is the still-open semantic question the xfail sentinel below
-    tracks; this test only guards that the *resolved* path keeps returning
-    the real dict value rather than regressing to something else.)
+    byte-identical to the unresolved-carrier case at the helper-cell level --
+    accepted as intentional, since the two remain distinguishable through the
+    source FK plus resolution, per
+    test_unresolved_reference_remains_distinguishable_via_authoritative_resolution
+    below; this test only guards that the *resolved* path keeps returning the
+    real dict value rather than regressing to something else.)
     """
     row = _reimport_items_row(
         tmp_path,
@@ -248,39 +261,32 @@ def test_legitimate_empty_helper_value_survives_roundtrip(kind, tmp_path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Still open: the unresolved-reference semantic contract.
-#
-# Fixing the carrier defect above makes the *current* representation of an
-# unresolved helper value a consistent "" on both backends -- but "" is only
-# accepted as temporary carrier behavior, not as the final framework
-# contract. It is known to collide with a legitimately resolved helper whose
-# target value is itself an empty string: the two cases are indistinguishable
-# in canonical JSON today. That representation decision remains open in
-# BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A.
+# Accepted semantic contract (Semantic Contract Review 001, ACCEPTED):
+# the derived helper cell is presentation only, not resolution authority.
+# An unresolved reference and a legitimately resolved empty target value may
+# both legitimately display "" in the helper cell -- that is not a defect.
+# What must hold is that the two situations remain distinguishable through
+# the authoritative source FK reference plus a live resolution check
+# (`validate_fk_helpers` / `check_unresolvable_fks`), not through the helper
+# cell's spelling. This is proven below on both backends through a real
+# export/reimport roundtrip.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A: the framework has "
-    "fixed the backend-divergent carrier defect (an unresolved helper no "
-    "longer corrupts to the literal string 'nan' on any backend), but has "
-    "not yet decided the final unresolved-reference representation. '' is "
-    "only the current normalized carrier value, and it is not distinguishable "
-    "from a legitimately resolved helper whose target value is itself an "
-    "empty string. The final representation may be null, a structured "
-    "finding, a reserved sentinel token, or another documented shape once "
-    "that contract decision lands.",
-    strict=False,
-)
-def test_unresolved_helper_value_distinguishable_from_legitimate_empty_string(tmp_path) -> None:
-    """An unresolved helper and a legitimately-empty resolved helper collide.
+@pytest.mark.parametrize("kind", _BACKENDS)
+def test_unresolved_reference_remains_distinguishable_via_authoritative_resolution(
+    kind, tmp_path
+) -> None:
+    """Unresolved and resolved-empty stay distinguishable, not via the helper cell.
 
     ``ITEM-003`` references the unresolvable ``ENT-MISSING``; a new
     ``ITEM-004`` resolves successfully to ``ENT-003``, whose ``name`` is
-    legitimately the empty string. Both currently reimport with the same
-    ``""`` helper value -- the still-open semantic question this sentinel
-    tracks, distinct from the now-fixed backend-corruption defect covered by
-    the passing tests above.
+    legitimately the empty string. Both reimport with the byte-identical
+    ``""`` helper value on both backends -- accepted, since the helper cell
+    is not the authority. `validate_fk_helpers`, run against the reimported
+    frames using only the reimported source FK column and target frame
+    (never the helper cell's value), must still correctly and exclusively
+    flag ``ENT-MISSING`` as unresolved and must not flag ``ENT-003``.
     """
     from tests.roundtrip.conftest import _FIXTURE_ROOT, _forward_pipeline, _run_cli, _write_yaml
 
@@ -303,14 +309,14 @@ def test_unresolved_helper_value_distinguishable_from_legitimate_empty_string(tm
     entities.append({"id": "ENT-003", "name": ""})
     entities_path.write_text(json.dumps(entities, indent=2), encoding="utf-8")
 
-    sheet = tmp_path / "workbook.xlsx"
+    sheet = tmp_path / f"workbook.{kind}"
     forward_yaml = tmp_path / "forward.yaml"
-    _write_yaml(forward_yaml, _forward_pipeline(canonical, sheet))
+    _write_yaml(forward_yaml, _forward_pipeline(canonical, sheet, kind=kind))
     assert _run_cli(forward_yaml) == 0
 
     reimport = tmp_path / "reimport"
     reverse_yaml = tmp_path / "reverse.yaml"
-    _write_yaml(reverse_yaml, _reverse_no_cleanup_pipeline(sheet, reimport, "xlsx"))
+    _write_yaml(reverse_yaml, _reverse_no_cleanup_pipeline(sheet, reimport, kind))
     assert _run_cli(reverse_yaml) == 0
 
     items_out = json.loads((reimport / "items.json").read_text(encoding="utf-8"))
@@ -318,8 +324,35 @@ def test_unresolved_helper_value_distinguishable_from_legitimate_empty_string(tm
     resolved_empty = next(r for r in items_out if r.get("id") == "ITEM-004")
 
     helper_column = "_entities_name"
-    assert unresolved[helper_column] != resolved_empty[helper_column], (
-        "an unresolved FK reference and a legitimately resolved empty-string "
-        f"helper value must remain distinguishable; both reimported as "
-        f"{unresolved[helper_column]!r}"
+    # Confirm the premise: the helper cell alone gives no signal -- both rows
+    # are byte-identical. The test must not, and does not, use this value as
+    # the distinguishing signal below.
+    assert unresolved[helper_column] == resolved_empty[helper_column] == "", (
+        f"fixture premise: both rows must share the identical helper-cell "
+        f"value '' on backend {kind!r} for this test to prove anything; got "
+        f"unresolved={unresolved[helper_column]!r} "
+        f"resolved_empty={resolved_empty[helper_column]!r}"
+    )
+
+    # Authoritative resolution: load the reimported frames the same way the
+    # pipeline itself does, and ask the maintained FK-helper validation
+    # primitive -- not this test -- to recompute resolution state from the
+    # reimported source FK column plus the reimported target frame.
+    loader = get_loader("json_dir")
+    frames = loader(str(reimport))
+    findings = validate_fk_helpers(frames, defaults={})
+
+    unresolvable = [f for f in findings if f.category == "unresolvable_fk"]
+    assert unresolvable, (
+        f"validate_fk_helpers must report the unresolved reference on "
+        f"backend {kind!r}; findings were {findings!r}"
+    )
+    assert any("ENT-MISSING" in f.detail for f in unresolvable), (
+        f"the unresolvable_fk finding must name ENT-MISSING on backend "
+        f"{kind!r}; got {unresolvable!r}"
+    )
+    assert not any("ENT-003" in f.detail for f in unresolvable), (
+        f"ENT-003 resolves successfully (to a legitimate empty target "
+        f"value) and must not be reported as unresolved on backend "
+        f"{kind!r}; got {unresolvable!r}"
     )
