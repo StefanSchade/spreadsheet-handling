@@ -1,0 +1,233 @@
+===== BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A -- `numpy.timedelta64` silently classifies as `"number"` instead of being rejected as an unsupported Duration carrier
+
+*Status:* New
+*Priority:* P4A
+*Area:* Internal value model / scalar classification
+(`core/scalar_values.py`)
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker. Nothing in this
+codebase is currently wired to call `scalar_category` at a real ingress
+point (Slice 1's own accepted scope), so today's blast radius is zero; the
+defect is fixed now because it is evidenced, cheap to fix, and would
+otherwise be silently inherited by Phase E once ingress wiring begins.
+*Relationship:* Discovered during Independent Architecture Review 001 of
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A`
+(`docs/backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc`,
+finding *DTVM-REVIEW-F1*). Pre-existing in Phase D Slice 1
+(`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`, independently accepted,
+`core/scalar_values.py`), not introduced by the Date/Time FTR itself -- that
+FTR's own section 3 inventory table and section 10 both *claimed* (twice,
+"confirmed by probe") that non-`NaT` `numpy.timedelta64` already correctly
+raises `UnsupportedScalarError`; this claim is factually incorrect, which is
+exactly what this BUG independently reproduces and fixes. This BUG is a
+narrow runtime correctness fix to the already-accepted scalar classifier. It
+does *not* implement Date/Time, does not add Duration support, and does not
+authorize or begin `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A`'s own D-T1..D-T5
+slices -- Date/Time/Duration feature design remains entirely owned by that
+FTR.
+
+==== Summary
+
+`core/scalar_values.py:scalar_category` classifies `value` in this order:
+
+[source,python]
+----
+if is_missing_carrier(value):
+    return "missing"
+if isinstance(value, (bool, np.bool_)):
+    return "boolean"
+if isinstance(value, str):
+    return "string"
+if isinstance(value, (int, float, np.integer, np.floating)):
+    return "number"
+raise UnsupportedScalarError(value)
+----
+
+`numpy.timedelta64` is not a supported category anywhere in the accepted
+Slice-1/Date-Time-FTR vocabulary (String/Boolean/Number/Missing, with
+Date/DateTime proposed and Duration explicitly deferred). It is expected to
+raise `UnsupportedScalarError`, exactly like `numpy.datetime64`.
+
+It does not. `numpy.timedelta64` subclasses `numpy.signedinteger` ->
+`numpy.integer` -> `numpy.number` -> `numpy.generic` (confirmed by direct
+`__mro__` inspection; `numpy.datetime64` does *not* subclass either
+`numpy.integer` or `numpy.floating` -- its own `__mro__` is only
+`(numpy.datetime64, numpy.generic, object)`). The Number branch's
+`isinstance(value, (int, float, np.integer, np.floating))` check therefore
+matches a non-`NaT` `numpy.timedelta64` value *before* the function ever
+reaches its trailing `raise`, and the value is silently accepted as an
+ordinary `"number"` -- its integer unit count (nanoseconds, days, whichever
+unit the carrier holds), stripped of the unit itself and of any indication
+it was ever a duration rather than a plain count.
+
+This is exactly the "carrier silently becoming domain semantics" defect
+class Phase D Slice 1 exists to close -- and it is currently live in the
+already-independently-accepted `scalar_category` function.
+
+==== Independently reproduced pre-fix behavior
+
+[source,pycon]
+----
+>>> import numpy as np
+>>> from spreadsheet_handling.core.scalar_values import scalar_category, is_missing_carrier
+>>> v = np.timedelta64(1, "D")
+>>> type(v).__mro__
+(<class 'numpy.timedelta64'>, <class 'numpy.signedinteger'>,
+ <class 'numpy.integer'>, <class 'numpy.number'>, <class 'numpy.generic'>,
+ <class 'object'>)
+>>> isinstance(v, np.integer)
+True
+>>> scalar_category(v)
+'number'                                   # BUG: should raise UnsupportedScalarError
+>>> is_missing_carrier(v)
+False                                      # correct: a real (non-NaT) value is not missing
+
+>>> vnat = np.timedelta64("NaT")
+>>> scalar_category(vnat)
+'missing'                                  # separate, already-identified side effect
+                                            # (IVM-REVIEW-F7): recognized as Missing only
+                                            # via the broad np.generic bounded-dispatch
+                                            # branch inside is_missing_carrier, not via an
+                                            # explicit, category-specific decision
+
+>>> type(np.datetime64("2026-08-09")).__mro__
+(<class 'numpy.datetime64'>, <class 'numpy.generic'>, <class 'object'>)
+                                            # confirms datetime64 does NOT subclass
+                                            # np.integer/np.floating -- it correctly falls
+                                            # through to the trailing raise today, unaffected
+                                            # by this BUG
+----
+
+`tests/unit/core/test_scalar_values.py` independently confirmed to contain
+zero `timedelta64` test cases (neither `NaT` nor non-`NaT`) before this BUG's
+fix -- nothing in the existing, already-accepted test suite would have
+caught this.
+
+==== Two distinct, independently confirmed defects in the same carrier family
+
+. *Non-`NaT` `numpy.timedelta64` silently misclassifies as `"number"`.*
+  This is the primary defect this BUG fixes. It is strictly worse than a
+  missing-feature gap: it is silent semantic corruption of an accepted
+  Number carrier, not merely an unsupported carrier being rejected too
+  narrowly.
+. *`numpy.timedelta64('NaT')` classifies as `"missing"` purely as a side
+  effect of the same broad `np.generic` bounded-dispatch branch already
+  identified for `numpy.datetime64('NaT')`/`numpy.complex128` NaN
+  (Independent Review 001, finding *IVM-REVIEW-F7*, and restated for
+  Date/Time by `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 6).
+  `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 6, decision point 3,
+  already recorded the correct target behavior for this specific case:
+  "`numpy.timedelta64('NaT')` should raise `UnsupportedScalarError`, not
+  classify as Missing, for as long as Duration remains an unsupported
+  category... an unsupported category rejects all its instances, NaT-valued
+  or not" -- deferring only the *implementation* to a future slice (D-T1),
+  not the decision itself.
+
+Both defects share one root cause (numpy's temporal-scalar family sharing a
+common, overly broad ancestor that a bounded-dispatch guard was never
+narrowed against) and one correct resolution: `numpy.timedelta64` -- every
+instance, `NaT` or not -- is not a supported carrier for any accepted
+category (String/Boolean/Number/Missing) and must uniformly raise
+`UnsupportedScalarError`. This BUG fixes both defects together, in one
+change, rather than only the previously-identified NaT-Missing side effect,
+because leaving the non-`NaT` case unfixed would still allow silent Number
+misclassification for the (more common) non-`NaT` case.
+
+==== Reconciling with accepted Missing semantics and prior findings
+
+* *Does this reopen IVM-REVIEW-F7?* No. IVM-REVIEW-F7 identified the
+  `numpy.timedelta64('NaT')`-classifies-as-Missing side effect as one
+  instance of a shared `np.generic`-breadth problem (alongside
+  `numpy.datetime64('NaT')` and `numpy.complex128` NaN) and explicitly
+  deferred its resolution "into this Date/Time discussion."
+  `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 6 is that discussion, and
+  its decision for the `numpy.timedelta64` half (point 3) is adopted here
+  unchanged: `numpy.timedelta64('NaT')` becomes uniformly unsupported, not
+  Missing. This BUG implements exactly that already-recorded decision for
+  `numpy.timedelta64` specifically; it does not implement point 2
+  (`numpy.datetime64('NaT')`), which stays deferred to Date/Time's own D-T1
+  slice, since `numpy.datetime64`'s eventual Missing semantics are entangled
+  with whether/when Date/DateTime itself becomes a supported category --
+  a decision this BUG does not make and is explicitly instructed not to
+  touch.
+* *Does this reopen `numpy.complex128`'s accepted precedent?* No. `complex`
+  is already, and remains, uniformly rejected (both NaN and non-NaN forms) --
+  independently reconfirmed unaffected by this fix.
+* *Why is `numpy.datetime64('NaT')` left as Missing while
+  `numpy.timedelta64('NaT')` becomes uniformly unsupported?* Because the two
+  carriers are not symmetric today. `numpy.datetime64` (non-`NaT`) already,
+  correctly, raises `UnsupportedScalarError` -- it does not subclass
+  `np.integer`/`np.floating`, so its NaT-shaped form is the *only* current
+  inconsistency in that family, and fixing it requires deciding how it
+  interacts with the not-yet-implemented Date/DateTime category (explicitly
+  out of this BUG's scope; owned by `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A`
+  D-T1). `numpy.timedelta64`, by contrast, has *two* inconsistent forms today
+  (`NaT` misclassifies as Missing; non-`NaT` misclassifies as Number), and
+  fixing either one without the other would leave an internally inconsistent
+  family (part Missing, part Number, part correctly-unsupported). Since
+  Duration is not, and is not becoming, a supported category as part of this
+  BUG, there is no future-category entanglement blocking a full, uniform fix
+  for `numpy.timedelta64` specifically -- unlike `numpy.datetime64`, whose
+  NaT-side fix is entangled with Date/DateTime's own not-yet-decided D-T1
+  scope.
+* *Is the desired invariant "unsupported scalar family -> all instances
+  uniformly unsupported"?* Yes, confirmed against repository authority
+  (`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`'s "cheap, simplifying, local hardening...
+  when it narrows the accepted vocabulary" guidance; the already-accepted
+  `complex`/`complex128` precedent; `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A`
+  section 6's own stated principle), not merely assumed by this BUG.
+
+==== Non-goals
+
+* Does not add Duration, `datetime.timedelta`, or `pandas.Timedelta` support.
+  Both remain unsupported, unchanged -- confirmed unaffected by this fix
+  (neither subclasses `np.integer`/`np.floating`/`np.generic`; both already,
+  correctly, raise `UnsupportedScalarError` via the trailing `raise`).
+* Does not change `numpy.datetime64` behavior in any form (NaT or non-NaT).
+  `numpy.datetime64('NaT')` remains classified as `"missing"`, unchanged --
+  that decision is owned by `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` D-T1,
+  not this BUG.
+* Does not implement, authorize, or begin any Date/Time/Duration slice
+  (D-T1..D-T5). `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` remains the sole
+  owner of that feature design.
+* Does not change generic Number, Boolean, String, or Missing semantics for
+  any other carrier.
+* Does not touch Formula/`FormulaSpec` handling.
+* Does not reopen `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`,
+  `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, or
+  `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`.
+* Does not update Project Memory. Project Memory curation is deferred until
+  this BUG has passed independent review, consistent with the project's
+  review-before-curation practice.
+
+==== Required regression evidence (implemented alongside this BUG; see "Resolution")
+
+* `scalar_category(np.timedelta64(1, "D"))` -> `UnsupportedScalarError`.
+* `is_supported_scalar(np.timedelta64(1, "D"))` -> `False`.
+* `scalar_category(np.timedelta64("NaT"))` -> `UnsupportedScalarError`
+  (changed from `"missing"`).
+* `is_missing_carrier(np.timedelta64("NaT"))` -> `False` (changed from
+  `True`).
+* Ordinary accepted Number carriers (`int`, `float`, `np.integer` other than
+  `np.timedelta64`, `np.floating`) remain classified as `"number"`,
+  unaffected.
+* Existing Missing carriers (`None`, `""`, NaN family, `pandas.NA`,
+  `pandas.NaT`, `numpy.datetime64('NaT')`) remain unaffected.
+* `numpy.datetime64` (non-`NaT`) remains `UnsupportedScalarError`, unaffected.
+
+==== Reference: where the defect lives
+
+* `src/spreadsheet_handling/core/scalar_values.py:170-175`
+  (`is_missing_carrier`'s bounded-dispatch `isinstance(value, (int, float,
+  np.generic))` branch) -- the source of the `numpy.timedelta64('NaT')`
+  side effect.
+* `src/spreadsheet_handling/core/scalar_values.py:206`
+  (`scalar_category`'s Number branch,
+  `isinstance(value, (int, float, np.integer, np.floating))`) -- the source
+  of the non-`NaT` misclassification, via `numpy.timedelta64`'s
+  `numpy.integer` ancestry.
+* `tests/unit/core/test_scalar_values.py` -- no existing coverage for
+  `numpy.timedelta64` in any form.
+
+==== Resolution
+
+See "Implementation evidence" below, added once the fix lands.
