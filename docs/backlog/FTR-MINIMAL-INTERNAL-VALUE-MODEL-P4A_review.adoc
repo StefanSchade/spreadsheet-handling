@@ -1,0 +1,527 @@
+===== FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A -- Implementation Review 001 (Phase D Slice 1)
+
+*Reviewed FTR:* `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc`
+*Review date:* 2026-08-09
+*Review type:* independent implementation and architecture review, read-only
+*Reviewed baseline:* `6ebde2bcb08c6c2e1e5761c098fd18204ca0837f`
+("docs(project_memory): record deferred formula policy boundary")
+*Implementation commit:* `4d2b434` --
+`feat(FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A): add minimal internal value
+model and close csv_dir ingress gap`
+*Documentation commit:* `b5c2c9a` --
+`docs(FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A): record slice 1 implementation
+evidence`
+*Reviewed HEAD:* `b5c2c9afa32ca7feaca4235e5f8d1c1d5be6097a`
+*Initial repository status:* clean
+*Final repository status:* clean -- no file changed, no history changed,
+nothing pushed, remained on `main` for the entire review.
+
+==== Verdict
+
+*ACCEPTED WITH MINOR FOLLOW-UP*
+
+* Blocking findings: 0.
+* Important findings: 3.
+* Minor findings: 3.
+* The two-commit slice is architecturally sound, correctly scoped to D1/D2/D3
+  as the FTR's own section 12 defines them, and does not blur the Phase
+  D/Phase E boundary. None of the findings below invalidates the slice as
+  committed or requires reverting anything; all are addressable as prompt,
+  narrowly scoped follow-ups.
+
+==== Baseline and reviewed scope
+
+The review inspected the full diff `6ebde2b..HEAD` (six files, 957
+insertions, 10 deletions):
+
+* `src/spreadsheet_handling/core/scalar_values.py` (new)
+* `src/spreadsheet_handling/io_backends/csv_backend.py` (modified,
+  `read_multi` only)
+* `tests/unit/core/test_scalar_values.py` (new)
+* `tests/unit/io_backends/test_csv_backend.py` (modified)
+* `tests/roundtrip/test_pathological_cell_contracts.py` (modified)
+* `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc` (section 17 added)
+
+The two immediately preceding docs commits (`a431182`, `0f07368`) and the
+Project-Memory commit at the baseline (`6ebde2b`) were read as architectural
+context, not as this slice's own scope. `docs/ai_info/review_instructions.adoc`,
+`docs/ai_info/git_and_workflow.adoc`, the roadmap's Phase D/E sections,
+`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`,
+the Trusted Ingress concept's internal-value-category table (`tirs-value-model`)
+and unresolved/missing/error section (`tirs-nan`), `FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`,
+both closed BUGs referenced by this FTR, and the current Project Memory
+`CONC-DOMAIN-BOUNDARY-ROBUSTNESS` record were read in full or targeted grep
+before evaluating the diff, per this document's own claimed evidence trail.
+
+==== Primary architecture question -- what is the internal value space?
+
+This is the central question this review was asked to resolve without taking
+the implementation report's framing on faith.
+
+*Finding:* Model C is the accurate description -- `scalar_category` is a
+classifier that tells a future Phase E boundary what a value looks like; it
+is not yet the actual internal value boundary -- but the module's own naming
+occasionally speaks in Model-A language ("Minimal Internal Value Model",
+`ScalarValue` documented as "Native Python representation") that Slice 1 does
+not actually deliver.
+
+Evidence for Model C:
+
+* `scalar_category`/`is_supported_scalar`'s own docstrings are explicit and
+  correct about their own limits: "Pure classification, not conversion...
+  unexamined in content and unchanged in identity"; "it classifies, it does
+  not enforce."
+* D3's own acceptance criterion (FTR section 12) scopes itself to "type
+  aliases and docstrings... not new runtime classes."
+* The accepted Trusted Ingress concept's own category table (`tirs-value-model`,
+  section 7) already distinguishes category 3 ("pandas/NumPy carrier value in
+  structured/programmatic Frames") from category 4 ("Canonical domain
+  scalar... No framework-wide instance exists today"). Slice 1 classifies
+  over category 3's existing, unnormalized shape; it does not create
+  category 4.
+* Roadmap Phase D's "Required distinctions" separately names "externally
+  parsed raw values" and "normalized scalar cell values" as two required
+  categories. Slice 1 delivers a classification vocabulary over the raw/
+  carrier space; it does not deliver a "normalized scalar cell values"
+  primitive.
+
+Evidence of Model-A-flavored overclaim in the naming layer:
+
+* `ScalarValue: TypeAlias = str | bool | int | float | None` is documented as
+  "Native Python representation of the MVP internal scalar vocabulary." But
+  `scalar_category` accepts and successfully classifies `numpy.int64`,
+  `numpy.bool_`, and `numpy.float32` as `"number"`/`"boolean"` without
+  narrowing them to that union -- independently verified none of the three
+  subclass their Python equivalents (only `numpy.float64`/`numpy.str_` do).
+  A value classified as `"number"` is therefore not guaranteed to actually
+  *be* a `ScalarValue` member.
+* No runtime type-checking violation results today, because `scalar_category`
+  returns only a category label, never a re-typed value -- so nothing
+  currently declares a variable `ScalarValue`-typed after classification.
+  This keeps the gap a documentation/naming precision issue rather than a
+  central contract defect, but it will mislead the first Phase E author who
+  reads `ScalarValue` as "what actually flows through the system after
+  classification."
+
+See finding IVM-REVIEW-F2 below for the concrete correction recommended.
+
+Answers to the six sub-questions this review was asked to resolve explicitly:
+
+. *Canonical internal representation after Slice 1:* none is established
+  yet. What exists is a semantic-category vocabulary (`ScalarCategory`) plus
+  a recognition predicate (`is_missing_carrier`), layered over the
+  pre-existing, unnormalized carrier space.
+. *Are NumPy scalars valid internal values, or only accepted ingress
+  carriers?* They classify successfully (functionally "accepted"), but
+  nothing normalizes them into `ScalarValue`'s declared native types -- they
+  remain accepted-but-unnormalized carriers.
+. *Is `ScalarValue` consistent with accepting NumPy scalars?* Not strictly --
+  a documentation/naming precision gap, not a runtime contract violation,
+  because nothing currently enforces the alias as an actual type boundary.
+. *Does Phase E need a normalization primitive not provided here?* Yes.
+. *Is a missing `normalize_scalar()` a defect, deferral, or unnecessary?* A
+  reasonable, legitimate deferral -- D3's own acceptance bullet never
+  promised one, and Phase E's own "value normalization and type resolution"
+  boundary stage is explicitly where it belongs -- but it should be named as
+  required future work more clearly than section 17.9 currently does.
+. *Can Phase E use this API without redesigning it?* Yes for the
+  classification/recognition primitives as far as they go; Phase E will
+  still need to add its own normalization step on top of them, which is not
+  a redesign of what exists, only an addition.
+
+==== Missing semantics and robustness
+
+`is_missing_carrier` matches the accepted five-way-convergent predicate shape
+byte-for-byte (independently confirmed against `core/fk.py:_norm_id`,
+`domain/_cell_primitives.py:_is_empty_cell`,
+`io_backends/ods/odf_renderer.py:_is_missing_carrier`, and the two `_norm`
+implementations in `derived_column_policy.py`/`validations/fk_helpers.py`).
+`is_missing_carrier(pd.NaT)` correctly wins as Missing rather than
+accidentally implying Date/Time support -- verified: `date`/`datetime`/
+`Timestamp` remain separately, explicitly rejected by `scalar_category`.
+
+The claimed safety on "arbitrary/pathological Python objects" holds for
+every case this slice's own tests exercise (plain object, callable, module,
+generator, a `__repr__`/`__str__`/`__eq__`/hash-raising "bomb" object) but
+overclaims relative to one case the tests do not exercise -- see finding
+IVM-REVIEW-F1.
+
+==== Number model
+
+The single `Number` category is genuinely sufficient for Slice 1's evidenced
+scope. No inventoried consumer requires an Integer/Float distinction, and the
+FTR's Stage E bounded-defer is not reopened here, correctly. Boolean-before-
+Number ordering correctly handles `bool ⊂ int` in Python and separately
+handles `numpy.bool_` (confirmed non-subclassing). `numpy.float64`/
+`numpy.str_` subclass assumptions are stable, longstanding NumPy scalar-type-
+hierarchy properties for the declared floor (`numpy>=1.23.2`), not
+version-fragile. `scalar_category(float("inf"))` and
+`scalar_category(10**30)` both correctly classify as `"number"`, consistent
+with the MVP's single loose Number category (not separately tested -- see
+finding IVM-REVIEW-F5).
+
+==== UnsupportedScalarError
+
+Correctly placed and scoped. Type-name-only diagnostics are appropriate for
+this classification-rejection use, and independently confirmed never to call
+`repr`/`str`/`__eq__`/hash on the rejected value in every case the tests
+cover (the one exception is finding IVM-REVIEW-F1's upstream gap in
+`is_missing_carrier`, which `scalar_category` calls before reaching its own
+diagnostic path). A `TypeError` subclass is the idiomatic choice; no more
+elaborate hierarchy is currently justified by any concrete Phase E consumer
+need.
+
+==== Formula and Date/Time boundaries
+
+Both are cleanly and explicitly rejected, not silently coerced --
+`ListLiteralFormulaSpec` instances and `date`/`datetime`/`Timestamp` values
+all raise `UnsupportedScalarError`, confirmed by dedicated tests and by
+independent probing. `FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`'s deferred
+status is undisturbed. The implementation report's own recommendation that
+Date/Time land before a primitive-only Phase E slice (section 17.9) is
+correctly labeled a recommendation, not a decision, and nothing in the
+committed code acts on it.
+
+==== CSV D2 change
+
+`CSVBackend.read_multi`'s new `pd.read_csv(..., dtype=str,
+keep_default_na=False, na_values=[])` call exactly matches
+`CSVBackend.read()`'s pre-existing single-file parameter set (confirmed
+byte-for-byte identical in source). Independently reproduced both pre-fix
+symptoms against a blank-cell + `"007"`/`"042"` fixture (`NaN`, `int64` `7`/
+`42`) and confirmed both are gone post-fix (`""`, `"007"`/`"042"` exactly).
+No surprising `na_values=[]`/`keep_default_na=False` interaction was found:
+literal `"NA"`, `"nan"`, `"NULL"`, and whitespace all independently verified
+to survive as exact text; quoted-empty behaves identically to unquoted
+blank. Headers are unaffected (`dtype` only governs data values). Scope is
+correctly narrow -- `read()`, `write()`, and `save_csv_dir` are untouched,
+confirmed by diff. This is a bug fix explicitly pre-authorized by the FTR's
+own D2 slice (section 12), not an accidental Phase-E ingress policy
+decision. The one gap found here is a release-notes checkpoint gap, not a
+correctness gap -- see finding IVM-REVIEW-F3.
+
+==== Layering and public API
+
+`core` already imports `pandas` in four existing modules
+(`df_build.py`, `fk.py`, `indexing.py`, `unflatten.py`); `numpy>=1.23.2` is
+already a direct declared dependency in `pyproject.toml`, not merely
+transitive via pandas. `tests/architecture/dependency_guards/
+test_spreadsheet_boundary_guards.py::test_core_modules_remain_leaf_only`
+(the actual layering guard) forbids `core -> domain/pipeline/rendering/
+io_backends`, not third-party imports, and passes unmodified. `core.formulas`
+is confirmed precedent for the same non-re-exported-but-directly-importable
+pattern -- already imported the same way from four `io_backends` modules
+(`odf_parser.py`, `odf_renderer.py`, `openpyxl_parser.py`,
+`openpyxl_renderer.py`). `scalar_values.py` follows the identical,
+already-established convention. No layering inversion, no public-API
+overreach.
+
+==== Phase D / Phase E boundary coherence
+
+Coherent, not blurred. D1/D3 (`scalar_values.py`) are genuinely unwired --
+confirmed by grep: no caller anywhere outside the module's own tests. D2
+(`csv_backend.py`) is a distinct, narrow, pre-authorized convergence fix that
+deliberately does not import or call `scalar_values.py` -- it operates before
+any Python scalar exists to classify -- and does not touch
+`domain/ingress/coordinator.py`. Both facts hold simultaneously without
+contradiction.
+
+==== Test quality
+
+59 new/modified tests genuinely exercise the stated contract; every count
+and pytest result claimed in FTR section 17.6 was independently reproduced
+(see Validation below), including the pre-fix-failure verification for the
+two new CSV tests. Test-suite observations that do not rise to Important are
+recorded as Minor findings below (IVM-REVIEW-F4/F5/F6).
+
+==== Findings
+
+===== IVM-REVIEW-F1 -- `is_missing_carrier`/`is_supported_scalar` overclaim safety against the NumPy array-conversion protocol
+
+*Classification:* Important.
+
+*File/symbol:* `src/spreadsheet_handling/core/scalar_values.py:102-124`
+(`is_missing_carrier`), `:160-171` (`is_supported_scalar`).
+
+*Evidence:* `is_missing_carrier`'s docstring states that `pandas.isna` on a
+"non-scalar or otherwise incompatible object raises `TypeError`/`ValueError`,
+which is caught." `is_supported_scalar`'s docstring states "Never raises."
+Independently verified both claims are falsifiable: `pandas.isna()` invokes
+`value.__array__()` for any object implementing NumPy's documented
+array-conversion protocol (confirmed with a probe object printing from
+inside `__array__`). An object whose `__array__` raises anything other than
+`TypeError`/`ValueError` -- plausible for a real, non-hostile array-like
+object, e.g. a domain-specific conversion-failure exception -- propagates
+*uncaught* through `is_missing_carrier`, `scalar_category`, and
+`is_supported_scalar`. Confirmed by direct probe:
+
+[source,python]
+----
+class WeirdArrayLike:
+    class ConversionError(Exception):
+        pass
+    def __array__(self, dtype=None):
+        raise self.ConversionError("cannot convert to array right now")
+
+is_supported_scalar(WeirdArrayLike())
+# raises WeirdArrayLike.ConversionError -- not False, contradicting the
+# function's own "Never raises" docstring
+----
+
+*Why it matters:* `__array__` is a *documented* NumPy protocol, so hardening
+against its ordinary failure modes is exactly the "cheap, simplifying, local
+hardening... reasonably implied by documented pandas, NumPy... contracts"
+`ADR-DOMAIN-BOUNDARY-ROBUSTNESS` calls desirable -- this is not "arbitrary
+hostile executable Python" the ADR explicitly excludes from scope. No current
+call site is wired to this module, so today's blast radius is zero. FTR
+section 17.9 lists these three functions as primitives "Phase E can now call
+without redesigning them," implicitly relying on the safety claims in their
+docstrings; a Phase E ingress boundary trusting "never raises" to safely
+probe an unknown value would crash on such an object instead of cleanly
+rejecting it with `UnsupportedScalarError`.
+
+*Smallest correction:* either widen the `except` clause in
+`is_missing_carrier` to also bound array-conversion failures (the function
+is six lines and single-purpose, so this is not the "over-broad defensive
+introspection" `ADR-DOMAIN-BOUNDARY-ROBUSTNESS` warns against), or narrow the
+docstring claims to the guarantee actually delivered.
+
+*Disposition:* non-blocking for Slice 1 as committed (nothing calls this
+module yet). Should be fixed before Phase E wiring begins.
+
+===== IVM-REVIEW-F2 -- `ScalarValue`'s "Native Python representation" framing is narrower than what `scalar_category` actually accepts
+
+*Classification:* Important -- documentation/naming precision, not a runtime
+defect.
+
+*File/symbol:* `src/spreadsheet_handling/core/scalar_values.py:69-77`
+(`ScalarValue`), `:127-157` (`scalar_category`).
+
+*Evidence:* see "Primary architecture question" above for the full
+derivation. In short: `ScalarValue = str | bool | int | float | None`,
+documented as "Native Python representation of the MVP internal scalar
+vocabulary," but `scalar_category` classifies `numpy.int64`, `numpy.bool_`,
+and `numpy.float32` into `"number"`/`"boolean"` without narrowing them to
+that union, and no `normalize_scalar()`-shaped primitive exists anywhere in
+the module to close the gap.
+
+*Why it matters:* the Trusted Ingress concept's own category table already
+distinguishes "pandas/NumPy carrier value" (category 3) from "canonical
+domain scalar" (category 4, "no framework-wide instance exists today").
+`ScalarValue`'s docstring implicitly claims to be category 4; it is
+actually documenting category 3's classification target, not a normalized
+category-4 representation. A future Phase E author reading `ScalarValue` in
+isolation would reasonably but incorrectly assume it is what flows through
+the system after classification.
+
+*Smallest correction:* tighten `ScalarValue`'s docstring to state plainly
+that `scalar_category`'s accepted domain is a strict superset of
+`ScalarValue` (NumPy scalar carrier variants included), and that no
+`normalize_scalar()`-style primitive currently narrows an accepted value
+down to `ScalarValue`'s literal members -- naming this explicitly as what
+Phase E's "value normalization and type resolution" boundary stage still
+needs to add. Section 17.9's Phase-E handoff map should say so explicitly
+rather than listing the three functions as reusable primitives without this
+caveat.
+
+*Disposition:* non-blocking. No test failure or runtime defect results;
+correct before Phase E authors start relying on the alias's literal wording.
+
+===== IVM-REVIEW-F3 -- CSV D2's observable behavior change has no release-note entry
+
+*Classification:* Important.
+
+*File/symbol:* `docs/release_notes/release_notes.adoc`; FTR section 17.7.
+
+*Evidence:* FTR section 17.7 states "No release-notes entry... internal-only
+module, guard-only ingress fix, tests." That characterization fits D1/D3
+(`scalar_values.py` -- genuinely internal, unwired, no observable effect) but
+not D2. D2 changes two independently observable `csv_dir` ingestion
+behaviors:
+
+[source,text]
+----
+before: "007" -> 7   (int64, leading zero lost); blank -> NaN
+after:  "007" -> "007"; blank -> ""
+----
+
+This is the same *kind* of behavior change as
+`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A`'s renderer-side fix,
+which *did* receive a release-note bullet (release_notes.adoc lines
+347-355, active `== unknown -- planned` section) -- the implementation
+report itself calls D2 "the matching ingress-side fix" for that same BUG's
+reproduction 2. No existing "Known limitations" entry anywhere in the
+release notes covers CSV directory dtype inference or numeric-column
+promotion, so this is not already-documented behavior being silently
+corrected.
+
+*Why it matters:* `git_and_workflow.adoc`'s release-notes checkpoint applies
+to any change affecting "public behavior or release positioning"; CSV
+directory ingestion behavior is public, adapter-observable behavior, not an
+internal refactor.
+
+*Smallest correction:* add one release-note bullet under the current active
+`== unknown -- planned` section, sibling to the existing
+`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A` bullet, naming the
+`csv_dir` ingress-side fix (blank cell -> `""`, no numeric-looking-column
+dtype promotion), per the `git_and_workflow.adoc` placement rule.
+
+*Disposition:* non-blocking for accepting the implementation as
+architecturally sound; should be fixed before this lands in a tagged
+release.
+
+===== IVM-REVIEW-F4 -- `_write_csv()` test helper manually joins fields with `,` instead of `csv.writer`
+
+*Classification:* Minor.
+
+*File/symbol:* `tests/unit/io_backends/test_csv_backend.py:48-51`.
+
+*Evidence:* the helper is only exercised with plain alphanumeric fixture
+values (`"1"`, `"007"`, `"hello"`), so it does not currently hide any CSV
+quoting-interaction behavior relevant to what these two tests assert.
+
+*Disposition:* not a defect as written. Would become a real gap only if a
+future test in this file needed a value containing a comma, quote, or
+newline.
+
+===== IVM-REVIEW-F5 -- "Idempotence" tests are effectively determinism tests for pure functions
+
+*Classification:* Minor.
+
+*File/symbol:*
+`test_is_missing_carrier_idempotent_on_every_supported_case`,
+`test_scalar_category_deterministic_and_idempotent_for_every_supported_case`
+in `tests/unit/core/test_scalar_values.py`.
+
+*Evidence:* for a stateless classification function with no mutation,
+"idempotent" and "deterministic" collapse to the same guarantee, which is
+close to automatic given the implementation (no hidden state, no caching).
+
+*Disposition:* not wrong, just narrower proof than the "idempotence" label
+implies. Guards against an accidental future stateful regression, which is a
+legitimate if modest purpose. No change required.
+
+===== IVM-REVIEW-F6 -- Number-category edge cases (`inf`, arbitrary-precision `int`) are not covered by the test suite
+
+*Classification:* Minor.
+
+*File/symbol:* `tests/unit/core/test_scalar_values.py` (no `inf`/large-`int`
+cases present).
+
+*Evidence:* independently verified `scalar_category(float("inf"))` and
+`scalar_category(10**30)` both correctly classify as `"number"`, consistent
+with the MVP's single loose Number category -- not a defect, since
+finiteness/Integer-vs-Float are explicitly bounded-deferred by the FTR
+(Stage E).
+
+*Disposition:* worth a follow-up test case only if a future slice narrows
+the Number contract. No change required now.
+
+==== Lifecycle cleanup check
+
+This review does not declare the FTR workstream complete.
+
+* FTR status should *not* change to `Done` -- it stays `Open`, exactly as
+  currently recorded. D4 (compatibility follow-through for a Family Cycle
+  pilot) remains explicitly, correctly unauthorized and unselected per the
+  FTR's own section 12 scope; that is residual scope by the FTR's own
+  design, not an incomplete Slice 1.
+* No removal from `docs/backlog/_ftrs_open.adoc` is appropriate yet --
+  confirmed the FTR is still correctly included there.
+* No companion-artifact move to `docs/cold_storage/backlog/ftrs_done/` is
+  appropriate yet.
+* Residual scope: D4, pending Family Cycle pilot selection. No new
+  follow-up FTR is needed beyond what already exists
+  (`FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5` already anchors the durable
+  Formula constraints; Date/Time remains explicitly deferred within this
+  same FTR).
+* This review's own findings (IVM-REVIEW-F1/F2/F3) are, per
+  `project_memory_workflow.adoc`'s bounded-growth rule, plausibly worth a
+  coarse Concern-event record on `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` at the
+  next maintenance pass -- recorded here as a handoff note, not performed by
+  this review.
+
+==== Validation
+
+Baseline and diff inspection:
+
+[source,console]
+----
+git status --short
+git rev-parse HEAD
+git log --oneline -30
+git diff --stat 6ebde2b..HEAD
+git diff --check 6ebde2b..HEAD
+----
+
+Result: clean tree at `b5c2c9a`; six files changed (957 insertions, 10
+deletions); no whitespace errors.
+
+Focused and full-suite runs:
+
+[source,console]
+----
+.venv/bin/pytest tests/unit/core/test_scalar_values.py -v
+.venv/bin/pytest tests/unit/io_backends/test_csv_backend.py -v
+.venv/bin/pytest tests/roundtrip/test_pathological_cell_contracts.py -v
+.venv/bin/pytest tests/architecture -q
+make test
+make source-style-guards
+----
+
+Results: `56 passed` / `3 passed` / `14 passed` / `156 passed` (architecture)
+/ `2319 passed, 1 deselected` (full active slice) / `0 error(s), 83
+warning(s), 2 allowlisted finding(s)` (none referencing the new/modified
+files) -- all exactly matching the counts claimed in FTR section 17.6, none
+merely trusted.
+
+Empirical probes (scratch-only, nothing left in the repository):
+
+* `numpy.float64`/`numpy.str_` subclass `float`/`str`; `numpy.float32`,
+  `numpy.bool_`, `numpy.integer`, `numpy.int64` do not -- confirms the
+  premise behind the module's explicit NumPy `isinstance` branches.
+* `df.iloc[0]["b"/"i"/"f"]` on native-Python-constructed columns yields
+  `numpy.bool_`/`numpy.int64`/`numpy.float64` -- confirms the empirical
+  claim behind the NumPy-acceptance decision (section 17.2).
+* Pre-fix `pd.read_csv(p, header=0, encoding="utf-8")` on a blank +
+  `"007"`/`"042"` fixture reproduces exactly the claimed defects; post-fix
+  parameters produce exactly `""`/`"007"`/`"042"`.
+* `keep_default_na=False, na_values=[]` preserves literal `"NA"`, `"nan"`,
+  `"NULL"`, whitespace, and quoted-empty as exact text; no surprising
+  interaction found.
+* `pandas.isna()` invokes `__array__()` on an array-protocol object;
+  `is_supported_scalar` raises (not `False`) when that object's `__array__`
+  raises a non-`(TypeError, ValueError)` exception -- see IVM-REVIEW-F1.
+* `core` already imports `pandas` in four other modules; `numpy>=1.23.2` is
+  a direct declared dependency; `core.formulas` is already imported the same
+  unre-exported way from four `io_backends` modules.
+* `CONC-DOMAIN-BOUNDARY-ROBUSTNESS.next_action` at baseline `6ebde2b`
+  verbatim authorizes "Phase D's Minimal Internal Value Model implementation
+  slices (D1-D3)... may begin" -- confirmed.
+
+No production or test file was modified by this review. No probe artifact
+was left in the repository.
+
+==== Conclusion
+
+Phase D Slice 1 is accepted. It correctly implements D1 (shared carrier-
+missing recognition predicate), D2 (the `csv_dir` ingress gap, matching the
+already-converged JSON/YAML/single-file-CSV contract exactly), and D3
+(a documentation-level scalar-category vocabulary, not new runtime classes),
+strictly within the boundaries its own inventory (sections 1-16) already
+authorized. It introduces no wrapper hierarchy, no ADR change, no Formula or
+Date/Time solving, and does not blur the Phase D/Phase E boundary. Three
+Important findings are recorded -- an exception-safety gap in
+`is_missing_carrier`/`is_supported_scalar` against the NumPy array-conversion
+protocol (IVM-REVIEW-F1), a naming/documentation precision gap between the
+`ScalarValue` alias and what `scalar_category` actually accepts
+(IVM-REVIEW-F2), and a missing release-note entry for the CSV D2 behavior
+change (IVM-REVIEW-F3) -- plus three Minor test-assurance notes. None blocks
+accepting Slice 1 as committed; IVM-REVIEW-F3 should be resolved before this
+lands in a tagged release, and IVM-REVIEW-F1/F2 should be resolved before
+Phase E begins relying on this module's primitives.
+
+[source,text]
+----
+ACCEPTED WITH MINOR FOLLOW-UP -- Phase D Slice 1 may proceed.
+----
