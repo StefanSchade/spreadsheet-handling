@@ -52,6 +52,7 @@ from spreadsheet_handling.io_backends.router import get_loader
 pytestmark = [
     pytest.mark.roundtrip,
     pytest.mark.ftr("FTR-ROUNDTRIP-TEST-LAYER-P4A"),
+    pytest.mark.ftr("FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A"),
 ]
 
 _BACKENDS = ("xlsx", "ods")
@@ -448,3 +449,71 @@ def test_csv_dir_blank_cell_carrier_is_backend_consistent(kind, tmp_path) -> Non
         f"{kind!r}; got {row0['note']!r}"
     )
     assert row1["note"] == "hello", "non-empty sibling cell must be unaffected"
+
+
+@pytest.mark.parametrize("kind", _BACKENDS)
+def test_csv_dir_numeric_looking_cell_carrier_is_backend_consistent(kind, tmp_path) -> None:
+    """A numeric-looking csv_dir column must not be dtype-promoted before export.
+
+    FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A slice D2: the matching *ingress*-side
+    regression for `test_csv_dir_blank_cell_carrier_is_backend_consistent`
+    above. That test's blank-cell defect could, in principle, have been
+    masked by the render-boundary's own `_is_missing_carrier` fix (a real NaN
+    carrier reaching the renderer is caught there too). Dtype promotion is a
+    distinct failure mode the render fix cannot catch at all: before D2,
+    `read_multi` had no `dtype=str`, so pandas' own dtype inference could
+    silently turn a numeric-looking column (e.g. a zero-padded code) into a
+    real `int64` column ahead of any renderer ever seeing it -- by the time a
+    renderer runs, the value is already a wrong number, not a missing
+    carrier. This proves the fix at the one place that can actually own it:
+    `csv_dir` ingress itself, through the full CLI export/reimport cycle.
+    """
+    from tests.roundtrip.conftest import _run_cli, _write_yaml
+
+    csv_dir = tmp_path / "csv_in"
+    _write_csv_dir(
+        csv_dir,
+        {"items": [{"id": "1", "code": "007"}, {"id": "2", "code": "042"}]},
+    )
+
+    sheet = tmp_path / f"workbook.{kind}"
+    forward_yaml = tmp_path / "forward.yaml"
+    _write_yaml(
+        forward_yaml,
+        {
+            "io": {
+                "input": {"kind": "csv_dir", "path": str(csv_dir)},
+                "output": {"kind": kind, "path": str(sheet)},
+            },
+            "pipeline": [],
+        },
+    )
+    assert _run_cli(forward_yaml) == 0
+
+    reimport = tmp_path / "reimport"
+    reverse_yaml = tmp_path / "reverse.yaml"
+    _write_yaml(
+        reverse_yaml,
+        {
+            "io": {
+                "input": {"kind": kind, "path": str(sheet)},
+                "output": {"kind": "json_dir", "path": str(reimport)},
+            },
+            "pipeline": [],
+        },
+    )
+    assert _run_cli(reverse_yaml) == 0
+
+    rows = json.loads((reimport / "items.json").read_text(encoding="utf-8"))
+    row0 = next(r for r in rows if r.get("id") == "1")
+    row1 = next(r for r in rows if r.get("id") == "2")
+
+    assert row0["code"] == "007", (
+        f"numeric-looking csv_dir cell must survive as the exact string '007' "
+        f"on backend {kind!r}, not be dtype-promoted to a number; got "
+        f"{row0['code']!r}"
+    )
+    assert row1["code"] == "042", (
+        f"numeric-looking csv_dir cell must survive as the exact string '042' "
+        f"on backend {kind!r}; got {row1['code']!r}"
+    )

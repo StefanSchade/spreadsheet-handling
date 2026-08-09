@@ -73,7 +73,21 @@ class CSVBackend(BackendBase):
         folder = Path(path)
         out: dict[str, pd.DataFrame] = {}
         for p in sorted(folder.glob("*.csv")):
-            df = pd.read_csv(p, header=0, encoding="utf-8")
+            # dtype=str + keep_default_na=False + na_values=[] matches this
+            # backend's own single-file `read()` path and the JSON/YAML
+            # backends' already-converged ingress contract: a blank cell
+            # reads as "" directly (never a pandas NaN), and a numeric-
+            # looking column is never dtype-inferred to int64/float64.
+            # FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A slice D2 closes this
+            # directory-read path's confirmed gap versus that contract.
+            df = pd.read_csv(
+                p,
+                header=0,
+                encoding="utf-8",
+                dtype=str,
+                keep_default_na=False,
+                na_values=[],
+            )
             tuples = [(c,) + ("",) * (header_levels - 1) for c in list(df.columns)]
             df = df.copy()
             df.columns = pd.MultiIndex.from_tuples(tuples)
