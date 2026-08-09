@@ -1,0 +1,1372 @@
+===== FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A -- Current-state inventory and contract design for the Date/Time Internal Value Model
+
+*Status:* New -- decision-ready inventory and contract design. No runtime,
+ADR, or Project Memory change of its own. Implementation is not authorized by
+this document; see section 20 for the proposed slice sequence and section 24
+for the decisions a human maintainer must accept before any slice begins.
+*Priority:* P4A
+*Area:* Internal value model / carrier-boundary normalization / domain-hardening roadmap Phase D
+*Type:* Inventory and contract-design FTR (mirrors
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`'s own task shape for its Slice 1
+current-state inventory)
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker. `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`'s
+`next_action` names Date/Time as the expected next Phase-D slice now that
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A` Slice 1 (String/Boolean/Number/Missing)
+has independent final acceptance.
+*Relationship:* Sibling and direct successor to
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`, split into its own document per that
+FTR's own explicit deferral (section 4, "Explicitly undecided ... Date / Time
+/ DateTime") and per this task's own instruction not to overload the parent
+document with another large design section. Formula remains entirely out of
+scope here, tracked separately and durably by
+`FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`; this FTR does not restate that
+FTR's constraints, it only confirms none of them are touched.
+
+==== Status legend used throughout this document
+
+Same convention as `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`, reused verbatim so
+the two documents read consistently:
+
+* *[FACT]* -- directly observed in current maintained code or via a read-only
+  probe run for this FTR (see "Validation").
+* *[RECOMMENDATION]* -- this FTR's proposed contract; not yet accepted
+  architecture.
+* *[ACCEPTED]* -- already durable, accepted architecture this FTR must not
+  contradict.
+* *[OPEN]* -- a decision this FTR deliberately leaves for the maintainer or a
+  successor artifact (collected in section 24).
+
+==== 1. Purpose and scope
+
+*Central design question:*
+
+____
+What is the smallest Date/Time scalar contract the framework needs so that
+ordinary structured/programmatic date values can safely cross a future
+Trusted Ingress boundary without being silently stringified, numerically
+reinterpreted, or made backend-specific?
+____
+
+This is not a request to design a full spreadsheet date/time system, to
+mirror every Python/pandas/NumPy temporal class into a domain class, or to
+start from a wrapper hierarchy. The working hypothesis this FTR tests --
+stated as a hypothesis, not assumed -- is that a small canonical distinction
+between *Date* and *DateTime* is sufficient. Section 7-8 evaluate that
+hypothesis against current-repository evidence rather than accepting it by
+default.
+
+*In scope:* a current-state temporal-carrier inventory across every
+maintained ingress/egress path; pandas/NumPy coercion findings; a Missing/NaT
+interaction decision (including resolution of Independent Review 001's
+deferred finding IVM-REVIEW-F7); a Date, DateTime, Time, Duration, and
+timezone decision, each separately; a native-Python-vs-pandas-vs-wrapper
+recommendation; comparison semantics; serialization, workbook-ingress, and
+workbook-egress implications; the relationship to
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` and to future Trusted Ingress; a
+compatibility matrix; dependency-ordered implementation slices; acceptance
+criteria; required executable tests; explicit non-goals; and open decisions
+requiring human acceptance.
+
+*Out of scope (this FTR does not do these; they are later, separately
+authorized work):* any Python value-class implementation; any parser or
+renderer change; any change to domain transformations; any CLI/runtime-policy
+wiring; any registry or `_meta` schema change; Project Memory updates; a
+successor/amendment ADR (this FTR only determines *whether* one will
+eventually be needed -- section 17's finding is that none is required yet);
+Trusted Ingress (Phase E) implementation; any Formula work of any kind.
+
+==== 2. Relation to Phase D Slice 1
+
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A` Slice 1 (D1-D3) has final,
+independently reviewed acceptance (Review Pass 002, `e2a33b0`). Its accepted
+semantic categories are *String, Boolean, Number, Missing* -- confirmed
+current in `src/spreadsheet_handling/core/scalar_values.py`, re-read for this
+FTR. Slice 1 deliberately did *not* establish a canonical normalized scalar
+representation: `scalar_category` classifies a value's existing carrier
+(including NumPy scalar variants) into one of the four categories without
+narrowing it to a native-Python member; producing an actual normalized value
+is explicitly left to Phase E's own "value normalization and type resolution"
+boundary stage. This FTR inherits that same posture for Date/Time -- it does
+not invent a `normalize_scalar()`-shaped primitive either (see section 12).
+
+Slice 1's own docstring and FTR text (`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`
+section 4, "Explicitly undecided") already anticipated this FTR:
+`date`/`datetime`/`Timestamp` are explicitly rejected by `scalar_category`
+today (`UnsupportedScalarError`), never silently coerced into String or
+Number, and Date/Time was named there as "a genuine scalar-value-model
+candidate ... expected to be an *early* Phase-D follow-up slice." This FTR is
+that follow-up. Formula remains a completely different kind of exclusion (not
+a scalar-value candidate at all, ever) and is not reopened here.
+
+This FTR does not modify `scalar_values.py`. All classifier behavior recorded
+below (section 3's inventory table, section 6's Missing/NaT findings) was
+independently re-confirmed by direct probe against the current, unmodified
+module -- not assumed from the parent FTR's own review history.
+
+==== 3. Temporal carrier inventory [FACT]
+
+Every temporal carrier the task asked this FTR to trace, with its actual
+reachability confirmed by direct probe (see "Validation" for the exact
+scripts):
+
+[cols="2,2,4",options="header"]
+|===
+| Carrier | Reachable today via | Current `scalar_category` outcome
+
+| `datetime.date`
+| Direct-Frames/programmatic construction; YAML ingress (`yaml.safe_load` on
+  an unquoted `YYYY-MM-DD` scalar produces a real `datetime.date` directly,
+  confirmed by probe); a genuine ODS `date`-typed cell's fallback
+  `date-value` attribute, before the framework's own `str(...)` collapse
+| `UnsupportedScalarError('date')` -- rejected, never coerced
+
+| `datetime.datetime`
+| Direct-Frames/programmatic construction; YAML ingress (`yaml.safe_load` on
+  a full `YYYY-MM-DDTHH:MM:SS` scalar); openpyxl's own in-memory
+  representation for a native XLSX date/datetime cell, before the
+  framework's own `str(...)` collapse
+| `UnsupportedScalarError('datetime')` -- rejected, never coerced
+
+| `datetime.time`
+| Direct-Frames/programmatic construction only. No maintained parser
+  produces a bare `time` object -- ODS's `time-value` fallback attribute is
+  immediately stringified by `odf_parser._cell_value`, and XLSX has no
+  time-specific handling at all
+| `UnsupportedScalarError('time')` -- rejected, never coerced
+
+| `datetime.timedelta`
+| Direct-Frames/programmatic construction only. No maintained parser or
+  domain transformation was found to construct one (see section 10)
+| `UnsupportedScalarError('timedelta')` -- rejected, never coerced
+
+| `pandas.Timestamp`
+| Direct-Frames/programmatic construction; the natural scalar pandas returns
+  for any `datetime64`-dtype column cell, which YAML ingress produces for
+  every full-timestamp YAML scalar (confirmed by probe, not merely a
+  theoretical `pd.to_datetime` call site)
+| `UnsupportedScalarError('Timestamp')` -- rejected. `Timestamp` subclasses
+  `datetime.datetime` (confirmed: `isinstance(pd.Timestamp(...),
+  datetime.datetime) is True`), but `scalar_category`'s `isinstance` checks
+  never reach a `datetime`-family branch at all today -- there is none --
+  so the subclass relationship has no effect on the current outcome. It
+  *will* matter for a future classifier (section 8).
+
+| `pandas.NaT`
+| The missing-value scalar pandas substitutes for `None`/`NaN` in any
+  `datetime64`-dtype column, and the value `pandas.to_datetime(None)`
+  returns; a stable singleton (`pandas.Timestamp("NaT") is pandas.NaT`,
+  confirmed by probe)
+| `is_missing_carrier(pandas.NaT) is True` -- recognized by identity, per
+  the Independent Review 001 (IVM-REVIEW-F1) fix. *[ACCEPTED, unchanged by
+  this FTR]* -- see section 6.
+
+| `numpy.datetime64` (non-`NaT`)
+| Direct-Frames/programmatic construction (e.g. any `numpy`-backed pipeline
+  building a `datetime64[ns]`/`[D]`/etc. array); not observed reachable via
+  any maintained backend's read path independent of pandas' own `Timestamp`
+  promotion
+| `UnsupportedScalarError('datetime64')` -- rejected, via the same
+  `isinstance(value, (int, float, np.generic))` -> `pandas.isna` -> `False`
+  -> falls through to `scalar_category`'s trailing `raise` path.
+
+| `numpy.datetime64('NaT')`
+| Same reachability as above, missing-value form
+| *[FACT, re-confirmed independently]* `is_missing_carrier(...) is True`,
+  `scalar_category(...) -> "missing"` -- this is exactly Independent Review
+  001's deferred finding *IVM-REVIEW-F7*. See section 6 for this FTR's
+  normative resolution.
+
+| `numpy.timedelta64` (non-`NaT`)
+| Direct-Frames/programmatic construction only
+| `UnsupportedScalarError('timedelta64')` -- rejected, same path as
+  `datetime64` above.
+
+| `numpy.timedelta64('NaT')`
+| Same reachability as above, missing-value form
+| *[FACT, re-confirmed independently]* `is_missing_carrier(...) is True`,
+  `scalar_category(...) -> "missing"` -- the second half of IVM-REVIEW-F7.
+  See section 6.
+|===
+
+Every "current outcome" cell above was independently re-executed against
+`src/spreadsheet_handling/core/scalar_values.py` for this FTR, not copied
+from the Independent Review 001/002 artifacts (see "Validation").
+
+==== 4. Value-flow matrix by ingress/backend [FACT]
+
+[cols="1,4,3",options="header"]
+|===
+| Ingress/backend | Native temporal scalar reachable through this path today? | Notes
+
+| XLSX (read)
+| No -- `parser_interpretation.py`'s `str(val) if val is not None else ""`
+  (8 call sites, re-grepped for this FTR) stringifies every cell,
+  independent of type, per `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`
+| A genuine XLSX date cell round-trips through openpyxl *internally* as a
+  native `datetime.datetime` (confirmed by probe: even a pure `date` value
+  written via `ws.cell(value=date(...))` reads back from openpyxl as
+  `datetime.datetime(2026, 8, 9, 0, 0)`, `cell.data_type == "d"` -- openpyxl
+  itself has no separate "date-only" scalar). The framework's own parser
+  boundary then stringifies that `datetime.datetime` (`str(val)` ->
+  `"2026-08-09 00:00:00"`), losing the "this was originally date-only, not a
+  midnight timestamp" distinction *before* the framework ever sees a
+  temporal object. No `cell.data_type`/`number_format` inspection exists in
+  the maintained parser today.
+
+| ODS (read)
+| No -- `odf_parser.py:_cell_value` reads paragraph text first (present for
+  ordinary LibreOffice/Excel-authored date cells, confirmed by probe:
+  `"08/09/26"` for a genuine date cell with paragraph text), falling back to
+  the raw `date-value`/`time-value` attribute only when paragraph text is
+  absent (confirmed by probe: `"2026-08-09"` for a date cell with no
+  paragraph text) -- either way, immediately returned as `str(...)`
+| `office:value-type == "date"` distinguishes real date cells from ordinary
+  text at the ODF layer, but the parser discards that distinction after
+  resolving the fallback value, per the accepted ADR (restated, not
+  reopened, from the parent FTR's section 1).
+
+| CSV (single + `csv_dir`)
+| No -- both paths now force `dtype=str, keep_default_na=False,
+  na_values=[]` (the `csv_dir` gap that `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`
+  D2 closed), so no numeric/temporal type inference can occur at all; a date
+  string stays exactly the text the file contained
+| CSV has no native temporal cell type to begin with; this row exists only
+  to confirm the D2 fix does not create a new date-specific gap.
+
+| JSON directory
+| No -- `pandas.read_json(p, dtype=str, convert_dates=False)` forces every
+  scalar to string, and explicitly disables pandas' own opportunistic
+  date-string-to-`Timestamp` conversion (`convert_dates=False`) that
+  `pandas.read_json` would otherwise apply to columns whose name or content
+  looks date-like
+| `convert_dates=False` is a deliberate, already-present guard against
+  exactly the "accidental heuristic string parsing" this task's own
+  instructions (section 4) warn against -- confirmed unchanged, not
+  something this FTR needs to add.
+
+| YAML directory
+| *Yes -- the one confirmed reachable maintained path.* `yaml.safe_load`
+  resolves unquoted `YYYY-MM-DD` to `datetime.date` and unquoted
+  `YYYY-MM-DDTHH:MM:SS[+HH:MM]` to `datetime.datetime` (aware if an offset is
+  present) *before* any framework code runs -- this is PyYAML's own
+  `SafeLoader` timestamp resolver, not framework behavior, and it is not
+  something the framework currently disables the way `json_backend` disables
+  `convert_dates`
+| `df.where(pd.notnull(df), "")` (the same missing-value coercion JSON also
+  applies) does *not* disturb non-missing date/datetime values -- confirmed
+  by probe: a real `datetime.date`/`Timestamp` cell survives that call
+  unchanged. A pure `datetime.date` column stays pandas dtype `object` with
+  real `datetime.date` scalars (pandas does *not* auto-promote it); a
+  full-datetime column becomes `datetime64[us]` dtype with `pandas.Timestamp`
+  scalars. See section 5 for the full coercion picture.
+
+| XML directory
+| Not independently re-probed for this FTR (unchanged from the parent FTR's
+  own treatment: stdlib `ElementTree`, element text coerced to `str`,
+  low priority, no round-trip metadata concern)
+| No evidence contradicts the parent FTR's finding that this backend
+  produces text unconditionally.
+
+| Direct Python `Frames`
+| Yes, unconditionally -- `pipeline.run_pipeline(frames, steps)` accepts
+  whatever a caller constructs, exactly as the parent FTR's inventory
+  already established for every scalar family. Not a defect; the framework's
+  own documented trusted-programmatic-composition surface
+| This is the same "no ingress, no persistence boundary, no cleanup
+  executor" surface the parent FTR already named; nothing about temporal
+  values changes that classification.
+|===
+
+*Key finding, restated for emphasis:* Date/Time is not a hypothetical future
+carrier the framework might someday need to support -- it already flows,
+unblocked, through the YAML ingress path into ordinary DataFrame cells today.
+Only Slice 1's classifier boundary (`scalar_category`, not wired to any real
+ingress point yet, per its own non-goals) stands between that fact and a
+future Trusted Ingress silently rejecting or mishandling it.
+
+==== 5. Pandas coercion findings [FACT]
+
+Representative DataFrames were constructed and inspected directly (see
+"Validation"). Findings, addressing the task's own central question ("can the
+framework realistically promise a canonical Python carrier at every cell
+while retaining normal pandas ergonomics?"):
+
+[cols="3,3,3",options="header"]
+|===
+| Construction | Resulting column dtype | Scalar type at `.iloc[i]`
+
+| Pure `datetime.date` list
+| `object` (pandas does *not* promote this to `datetime64`)
+| `datetime.date` (unchanged identity)
+
+| Pure `datetime.datetime` list
+| `datetime64[us]`
+| `pandas.Timestamp`
+
+| Mixed `date` + `datetime` in one column
+| `object`
+| Whatever each row actually was (`date` for the date row, `datetime` --
+  not `Timestamp` -- for the plain-`datetime` row, confirmed by probe;
+  pandas does not unify a mixed object column)
+
+| `date` + `None`
+| `object`
+| `date` row unchanged; the `None` row stays a plain `None` (not `NaT`)
+
+| `datetime` + `None`
+| `datetime64[us]`
+| The `None` row is silently promoted by pandas itself, at column
+  construction time, to `pandas.NaT` -- *before* any framework code runs
+
+| `pandas.to_datetime([...])` (direct construction)
+| `datetime64[us]`
+| `pandas.Timestamp`
+
+| Timezone-aware `pandas.Timestamp` list
+| `datetime64[us, <tz>]` (a genuinely distinct pandas extension dtype per
+  timezone)
+| `pandas.Timestamp` (aware, `tzinfo` preserved)
+|===
+
+*This directly answers the task's central pandas question, and confirms the
+lesson the parent FTR already drew from Slice 1 must be repeated, not
+re-litigated:* `ScalarCategory != canonical normalized representation`. A
+"Date" payload value is not one pandas carrier shape -- it is at minimum
+`datetime.date` (object dtype) *and* `pandas.Timestamp`/`datetime64[us]`
+(whenever pandas' own dtype inference promotes it, including via a mixed
+column or an explicit `pd.to_datetime` call). Demanding a single canonical
+in-memory carrier at every cell, always, would require either fighting
+pandas' own promotion behavior (rejected -- exactly the ergonomics cost
+Slice 1's section 6 already rejected for the String/Boolean/Number/Missing
+MVP) or accepting that classification is a *carrier-recognition* contract,
+not a value-representation contract, restated below in sections 6-8.
+
+An unexpected, concretely reproduced consequence of this asymmetry: *`date`
+and `datetime`+`Missing` behave differently by construction, not by design.*
+A missing value in a pure-date object column stays a plain `None`; a missing
+value in a real `datetime64`-dtype column is silently rewritten to
+`pandas.NaT` by pandas itself. Both are already correctly recognized as
+Missing by `is_missing_carrier` today (`None` via its first branch, `NaT` via
+identity) -- this is not a defect, it is evidence that the *recognition*
+contract (Slice 1's own approach) already generalizes correctly across this
+asymmetry without needing to know which pandas construction path produced the
+missing value.
+
+==== 6. Missing / NaT decision [RECOMMENDATION -- resolves IVM-REVIEW-F7]
+
+*[FACT, re-confirmed independently for this FTR, see section 3's table]*
+Today, `is_missing_carrier`/`scalar_category` classify `numpy.datetime64('NaT')`
+and `numpy.timedelta64('NaT')` as `"missing"`, purely as a side effect of the
+`isinstance(value, (int, float, np.generic))` bounded-dispatch guard added by
+the IVM-REVIEW-F1 fix: `np.generic` is the base class for NumPy's *entire*
+scalar hierarchy, not only the numeric kinds the guard was written for, so
+any NaT-valued NumPy temporal scalar reaches `pandas.isna` and is recognized
+as missing, while a non-NaT NumPy temporal scalar of the same type correctly
+falls through to `UnsupportedScalarError`. Independent Review 001 recorded
+this as Minor finding *IVM-REVIEW-F7*, explicitly deferred "into this
+Date/Time discussion" -- this section is that discussion.
+
+*The relevant precedent already exists in the accepted contract, for a
+different NumPy scalar family.* The same IVM-REVIEW-F1 fix independently
+resolved an analogous case for `complex`: before the fix, a NaN-valued
+`complex` misclassified as `"missing"`; after the fix, *every* `complex`
+value -- NaN-valued or not -- correctly raises `UnsupportedScalarError`,
+because `complex` is not one of the bounded-dispatch types
+(`int`/`float`/`np.generic`)... except that `numpy.complex128` *is* a
+`np.generic` subclass and was separately confirmed (Review Pass 002) to
+still misclassify its NaN form as missing, for the identical reason as
+`datetime64`/`timedelta64`. The review's own resolution note states the
+governing principle plainly: an unsupported *category* should reject *all*
+its instances uniformly, "depending only on its NaN-ness" is "an
+inconsistency within the same rejected type family." That principle,
+already applied to `complex128`, answers this FTR's own question by direct
+analogy.
+
+*Decision:*
+
+. *`pandas.NaT` remains Missing, unconditionally, unchanged.* It is
+  pandas' own canonical temporal-missing sentinel; there is no non-missing
+  value it could otherwise represent, and it is recognized by identity, not
+  by dispatching to any type-specific classification logic. No further
+  action needed; this is not part of IVM-REVIEW-F7's scope and this FTR does
+  not touch it.
+. *`numpy.datetime64('NaT')` should classify as Missing only once
+  Date/DateTime is a supported category, through an explicit,
+  `datetime64`-specific branch -- not through the generic `np.generic`
+  bounded dispatch.* Until that implementation slice lands, per the
+  `complex128` precedent, it should raise `UnsupportedScalarError` exactly
+  like every other `datetime64` value, consistent, not "missing" as a
+  side-effect of an unrelated guard's breadth. This *is* IVM-REVIEW-F7's
+  required fix; this FTR records the decision, the implementation is
+  deferred to slice D-T1 (section 20), not performed here.
+. *`numpy.timedelta64('NaT')` should raise `UnsupportedScalarError`, not
+  classify as Missing, for as long as Duration remains an unsupported
+  category (section 10).* The same reasoning applies unchanged: an
+  unsupported category rejects all its instances, NaT-valued or not. If a
+  future slice ever adds Duration support, that slice decides Duration's own
+  Missing semantics at that time: this FTR does not pre-decide it, per the
+  task's own instruction not to let NumPy's shared temporal-scalar hierarchy
+  force Duration into the Date/Time MVP.
+. *Complex NaN remains unrelated and correctly rejected, unchanged.* Already
+  independently re-confirmed for this FTR (section 3): `complex` (the
+  built-in, non-NumPy type) is not `np.generic`, never reaches the bounded
+  dispatch, and `numpy.complex128` already receives the fix described above
+  as an unrelated, already-resolved case. Nothing here reopens it.
+
+*Why this is the correct place to decide it, not a premature narrowing:*
+IVM-REVIEW-F7's own disposition already named the trigger condition for
+resolving it -- "a future slice begins wiring `is_missing_carrier` to real
+ingress, *or extends the module to explicitly consider Date/Time*." This FTR
+is that second trigger. Recording the decision now, ahead of the
+implementation slice that applies it, keeps the fix from being invented ad
+hoc mid-implementation and keeps it consistent with the already-decided
+`complex128` case rather than treated as a fresh question.
+
+==== 7. Date decision [RECOMMENDATION]
+
+*Adopt `Date` as a supported MVP scalar category*, with native
+`datetime.date` as its conceptual canonical carrier.
+
+Evidence:
+
+* *[FACT]* `datetime.date` is already reachable through a maintained,
+  non-programmatic ingress path (YAML, section 3-4) -- this is not a
+  theoretical candidate invented for symmetry with DateTime.
+* *[FACT]* Pandas does not auto-promote a pure `datetime.date` column to any
+  other dtype/scalar type (section 5) -- `Date` survives ordinary DataFrame
+  construction as exactly the native Python type this FTR recommends
+  canonical, with zero coercion cost.
+* *[FACT]* Normalizing `date -> midnight datetime` is not free of semantic
+  loss: it cannot be undone (a `datetime` at exactly midnight is
+  indistinguishable from "this was originally date-only" once normalized),
+  and the openpyxl round-trip probe (section 4) shows this loss already
+  happens *silently* today, one layer below the framework's own parser, for
+  any date value that reaches a spreadsheet backend by any path -- evidence
+  this FTR treats as a reason to keep Date distinct at the domain-value
+  level, not a reason to accept the same collapse internally too.
+* *[FACT]* The roadmap's own Phase D candidate scalar list
+  (`roadmap_domain_hardening_sequence.adoc`) already names `date` as a
+  candidate distinct from `datetime`, independent of this FTR's own
+  analysis.
+
+*Recommendation:* `datetime.date` is Date's canonical native-Python
+carrier. `pandas.Timestamp`/`datetime64`-backed values are *not* Date
+carriers, even when their time-of-day happens to be midnight -- see section
+8's classification-order note; a midnight `Timestamp` is a DateTime value
+that happens to fall at midnight, not evidence it should be reclassified as
+Date. This FTR does not invent a Date/DateTime disambiguation heuristic based
+on time-of-day.
+
+==== 8. DateTime decision [RECOMMENDATION]
+
+*Adopt `DateTime` as a second, distinct supported MVP scalar category*, with
+native `datetime.datetime` as its conceptual canonical carrier, and
+`pandas.Timestamp`/`numpy.datetime64` accepted as carrier variants that
+classify into it (per the same "classify without narrowing" contract Slice 1
+already established for Number/Boolean's NumPy variants).
+
+Evidence:
+
+* *[FACT]* `datetime.datetime` and `pandas.Timestamp` are both already
+  reachable through the same maintained YAML ingress path that produces
+  `datetime.date` (section 3-4) -- confirmed for both the naive and the
+  timezone-aware case.
+* *[FACT]* Pandas *does* promote a `datetime`-bearing column to a dedicated
+  `datetime64[...]` dtype with `Timestamp` scalars (section 5) -- the
+  opposite of Date's behavior. This asymmetry is concrete evidence the two
+  categories are not interchangeable at the pandas-ergonomics level, not
+  merely at the conceptual level.
+* *[FACT]* `date -> datetime` and `datetime -> date` comparisons both raise
+  `TypeError` today (`'<' not supported between instances of 'datetime.date'
+  and 'datetime.datetime'`, confirmed by direct probe) -- Python's own
+  runtime already refuses to treat them as freely comparable. Collapsing
+  them into one category would paper over a distinction the language itself
+  enforces.
+* *[FACT, correctness-critical for implementation]* `pandas.Timestamp`
+  subclasses `datetime.datetime` (confirmed:
+  `isinstance(pandas.Timestamp(...), datetime.datetime) is True`), and
+  `datetime.datetime` subclasses `datetime.date` (stdlib). A future
+  classifier *must* check DateTime (`datetime.datetime`/`Timestamp`) before
+  Date (`datetime.date`), exactly mirroring Slice 1's existing
+  Boolean-before-Number ordering rule (`bool` subclasses `int`) -- this is
+  not a new kind of problem, it is the same subclass-ordering hazard Slice 1
+  already solved once, applied to a second pair.
+
+*Recommendation:* `datetime.datetime` is DateTime's canonical native-Python
+carrier; `pandas.Timestamp` and `numpy.datetime64` are accepted DateTime
+carrier variants, classified without being narrowed to `datetime.datetime`
+(same non-normalizing posture Slice 1 already uses for NumPy numeric/boolean
+variants -- see section 12). `numpy.datetime64`'s internal unit/precision
+(`'D'`, `'us'`, etc.) is *not* used to infer Date-vs-DateTime intent -- doing
+so would be exactly the kind of "guess a richer type from carrier internals"
+heuristic the accepted contract already rejects for strings (parent FTR,
+Stage C), applied instead to a NumPy dtype flag. *[OPEN]* whether a future
+slice needs a narrower `numpy.datetime64[D]`-aware Date recognition is left
+unresolved -- no current evidence requires it (see section 24).
+
+Normalization loss, evaluated both directions per the task's instruction:
+
+* *`date -> datetime` (implicit midnight):* lossy in the sense described in
+  section 7 -- irreversible, and already an observed silent side effect of
+  the XLSX carrier round trip (section 4), not a hypothetical risk.
+* *`datetime -> date` (drop time-of-day):* lossy whenever the time component
+  is not exactly midnight -- an ordinary, expected form of information loss,
+  acceptable only as an explicit, opt-in projection a future codec/slice
+  chooses deliberately, never as an implicit default coercion.
+
+Neither direction is free; this FTR does not recommend a default automatic
+normalization between the two categories in either direction.
+
+==== 9. Time-only decision [RECOMMENDATION -- deferred]
+
+*[FACT]* No maintained producer or consumer of a bare `datetime.time` value
+was found anywhere in the repository: no parser ever constructs one (ODS's
+`time-value` fallback attribute is read and immediately stringified, exactly
+like every other ODS fallback attribute; XLSX has no time-specific handling
+at all), and no domain transformation was found to construct or expect one.
+
+*[FACT]* `scalar_category(datetime.time(...))` already raises
+`UnsupportedScalarError` today, correctly -- not silently absorbed into
+String. This is Slice 1's existing behavior, unchanged and unaffected by this
+FTR.
+
+*[FACT, new finding for this FTR]* Even independent of the internal value
+model, no current serialization path can represent a bare `datetime.time` at
+all: both `yaml.safe_dump` and `json.dumps` raise directly on a native
+`datetime.time` object (confirmed by probe -- PyYAML's `SafeDumper` has no
+`time`-only representer, unlike its `date`/`datetime` representers, which
+both succeed). Adding Time support would therefore require *inventing* a
+serialization contract from nothing, unlike Date/DateTime, which already have
+a working YAML round trip today (modulo the DateTime-specific gap recorded in
+section 14) and merely lack a JSON contract. Time is strictly more expensive
+to support than Date/DateTime, not merely equally deferred by symmetry.
+
+*Recommendation:* defer Time explicitly, not silently. If a `datetime.time`
+value reaches a future Trusted Ingress boundary before Time support exists,
+it must be *explicitly rejected* with a diagnostic -- which is already
+`scalar_category`'s current behavior, so Phase E inherits correct behavior
+for free the moment it starts calling the classifier, without needing its
+own special case for Time. No maintained consumer currently needs this
+changed.
+
+==== 10. Duration / Timedelta decision [RECOMMENDATION -- deferred]
+
+*[FACT]* No maintained producer of `datetime.timedelta`, `pandas.Timedelta`,
+or `numpy.timedelta64` was found anywhere in domain transformations. The
+parent FTR's Stage E already established that arithmetic reaching payload
+cells (as opposed to framework-internal row/column counters) is not a
+current pattern; this generalizes directly to duration arithmetic, which is
+strictly a narrower case.
+
+*[FACT]* `scalar_category` already correctly rejects `datetime.timedelta`,
+`pandas.Timedelta`, and non-`NaT` `numpy.timedelta64`
+(`UnsupportedScalarError`, confirmed by probe) -- unaffected by this FTR.
+
+*Recommendation:* defer Duration entirely, and keep it *conceptually*
+distinct from Date/Time even though NumPy happens to implement both temporal
+scalar families under one shared `np.generic` ancestor. A duration is a
+difference between two points in time, not a point in time itself --
+different arithmetic (durations sum meaningfully; dates do not), different
+comparison semantics, and a different eventual category boundary. IVM-REVIEW-F7
+(section 6) is the concrete evidence of what happens when an implementation
+detail shared between two NumPy scalar families (`np.generic`) is allowed to
+blur a semantic boundary the domain model should keep separate; this FTR's
+recommendation explicitly guards against repeating that shape for
+Date/Time-vs-Duration specifically. NaT-shaped duration carriers are Missing
+only once Duration itself is a supported category (section 6, decision 3);
+until then they are simply unsupported, like every other `timedelta64` value.
+
+==== 11. Timezone decision [RECOMMENDATION -- bounded, not silently normalized]
+
+*[FACT]* Timezone-aware datetime values are already reachable today, through
+the same maintained YAML ingress path as naive ones: `yaml.safe_load` on
+`2026-08-09T10:30:00+02:00` produces an aware `datetime.datetime` directly,
+and the resulting pandas column becomes a genuinely distinct extension dtype
+(`datetime64[us, UTC+02:00]`) with aware `Timestamp` scalars (confirmed by
+probe). This is not a hypothetical edge case reserved for a distant future
+slice -- it is exactly as reachable as the naive case this FTR otherwise
+recommends supporting.
+
+*[FACT]* XLSX and ODS date cells carry no timezone concept at all, by format
+design -- confirmed by probe (no `tzinfo` anywhere in either backend's native
+date-cell round trip). Timezone-aware values can therefore only ever
+originate from YAML or direct-Frames construction, never from a spreadsheet
+backend.
+
+*[FACT]* Naive-vs-aware comparison raises `TypeError` today
+(`"can't compare offset-naive and offset-aware datetimes"`, confirmed by
+probe) -- Python's own runtime already refuses to silently compare across
+the naive/aware boundary. Sorting a column containing both would fail the
+same way.
+
+*[FACT]* Serialization does not introduce a *new* failure mode for
+timezone-awareness specifically: the general DateTime-write gap recorded in
+section 14 (a `pandas.Timestamp`-backed column crashes `yaml.safe_dump`)
+reproduces identically whether the `Timestamp` is naive or aware -- the
+crash is caused by `Timestamp` itself lacking a `SafeDumper` representer, not
+by its timezone. A plain (non-pandas) aware `datetime.datetime` does
+round-trip correctly through `yaml.safe_dump`/`safe_load` with its offset
+preserved exactly (confirmed by probe) -- but every YAML-backend read/write
+path in this repository goes through a `pandas.DataFrame`, which converts
+that plain aware `datetime.datetime` into a `Timestamp` before any write
+occurs, so the working plain-object case is not actually reachable through
+the maintained backend path today.
+
+*Recommendation:* timezone-aware DateTime is *reachable and evidenced*, not
+purely theoretical, so this FTR does not recommend rejecting it outright.
+At the same time, no current evidence shows a maintained consumer performing
+cross-timezone arithmetic, conversion, or comparison -- there is no basis yet
+to decide a canonicalization policy (normalize to UTC, preserve the original
+offset, or reject mixed naive/aware columns). *[OPEN, see section 24]*: a
+future implementation slice must decide whether aware DateTime is accepted
+as-is (offset preserved, naive/aware comparison left to raise, matching
+today's Python-level behavior) or bounded further (e.g. rejected until a
+policy exists). This FTR explicitly does *not* recommend silently converting
+aware values to naive, and does not recommend silently assuming UTC --
+either would discard information no current evidence says is safe to
+discard.
+
+==== 12. Native Python versus pandas versus wrapper recommendation
+
+Evaluated against the same dimensions the parent FTR used for
+String/Boolean/Number/Missing (its section 6), because nothing in this
+FTR's own evidence changes the underlying argument:
+
+[cols="2,3,3",options="header"]
+|===
+| Dimension | Native-value contract (Candidate A) | Wrapper contract (Candidate C)
+
+| pandas compatibility
+| No change -- `date`/`datetime`/`Timestamp` are already what pandas columns
+  hold today (section 5)
+| Every wrapper instance sits in an `object`-dtype column even for a column
+  pandas would otherwise natively type as `datetime64`, discarding real
+  dtype benefits (vectorized comparison, `.dt` accessor) for no evidenced
+  gain
+
+| DataFrame ergonomics / vectorized ops
+| Unaffected; `.dt` accessor, vectorized comparison, and `datetime64`
+  dtype all continue to work exactly as today for any column pandas
+  promotes
+| Lost or requires per-operation unwrapping -- defeats the same ergonomics
+  concern the task explicitly asks this FTR to preserve, restated from the
+  parent FTR's own finding
+
+| Equality / comparison
+| Unaffected for same-category comparisons (`date == date`,
+  `Timestamp == datetime`, confirmed by probe); cross-category comparison
+  already raises `TypeError` at the Python level, which this FTR treats as
+  correct behavior to preserve, not a gap a wrapper needs to paper over
+| A wrapper would need to *reimplement* Python's own comparison semantics
+  (including the naive/aware `TypeError`) to avoid silently permitting a
+  comparison the underlying types themselves refuse
+
+| Serialization
+| Native `date`/`datetime` already round-trip through YAML with identity
+  preserved (section 4, 14); JSON needs a custom encoder either way,
+  wrapper or not
+| A wrapper needs its own encoder/decoder pair *in addition to* whatever
+  JSON custom-encoding work is needed regardless -- strictly more work, no
+  reduction in the JSON gap
+
+| Backend adapters
+| Unaffected; adapters already read/write native scalars, and a future
+  read-path-hint migration (section 15, discussed but not adopted) would
+  naturally produce native `date`/`datetime` objects, not a wrapper
+| Every adapter needs wrapper-aware read/write logic on top of whatever
+  native-value handling it would need anyway
+
+| Prevents an evidenced current defect?
+| Yes -- explicit rejection (already true, Slice 1) instead of silent
+  stringification/miscoercion is the concrete, evidenced problem this FTR's
+  eventual implementation slice closes for Date/Time, exactly as Slice 1
+  closed it for String/Boolean/Number/Missing
+| No additional defect prevention beyond what native classification already
+  provides
+|===
+
+*Recommendation, matching the parent FTR's own conclusion and finding no new
+evidence to depart from it:* native Python `datetime.date`/`datetime.datetime`
+as the conceptual canonical carriers, with `pandas.Timestamp` and
+`numpy.datetime64` accepted as classifiable carrier *variants*, not narrowed
+to the native type by the classification step itself -- exactly Slice 1's
+existing "classify without normalizing" contract (`scalar_category` does not
+convert a `numpy.int64` to `int` either). Producing an actual canonical value
+from an accepted carrier variant remains Phase E's future "value
+normalization and type resolution" stage, per Slice 1's own precedent (IVM-
+REVIEW-F2's resolution) -- this FTR does not build that primitive either. No
+wrapper class is justified by any evidence gathered for this FTR.
+
+==== 13. Comparison semantics [RECOMMENDATION]
+
+What a future Domain operation may safely assume, stated explicitly per the
+task's own instruction not to define cross-type ordering merely because
+Python/pandas happens to do something today:
+
+[cols="3,2,4",options="header"]
+|===
+| Comparison | Legitimate without normalization? | Basis
+
+| `Date` vs `Date`
+| Yes
+| Native `datetime.date` ordering; unaffected by anything in this FTR
+
+| `DateTime` vs `DateTime` (both naive, or both aware with compatible offset
+  handling)
+| Yes
+| Native `datetime.datetime`/`Timestamp` ordering; `Timestamp` and
+  `datetime.datetime` already compare correctly against each other
+  (confirmed by probe: `Timestamp(...) < datetime(...)` and
+  `Timestamp(...) == datetime(...)` both work), because `Timestamp`
+  subclasses `datetime.datetime`
+
+| `Date` vs `DateTime`
+| *No, without an explicit, chosen normalization.* Confirmed by probe:
+  Python itself raises `TypeError`. This FTR does not recommend defining an
+  implicit cross-category ordering; a future consumer that needs to compare
+  the two must explicitly choose and apply one of section 8's two lossy
+  normalization directions first.
+
+| Naive `DateTime` vs aware `DateTime`
+| No. Confirmed by probe: Python itself raises `TypeError`. This FTR
+  recommends preserving that rejection rather than silently assuming a
+  timezone for the naive side.
+
+| Missing vs `Date`/`DateTime`
+| Not an ordering question -- `is_missing_carrier` recognition already
+  answers "is this cell missing" independent of category (section 6);
+  ordering a column containing Missing values is a sorting-null-handling
+  question for whatever future transformation performs the sort, not a
+  value-model question this FTR needs to answer.
+
+| Sorting a column containing both `Date` and `DateTime` values
+| *No, not without normalization first.*
+| Confirmed by probe: `sort_values()` on a mixed object-dtype `Series`
+  containing both raises the same `TypeError` as the pairwise comparison
+  above -- pandas does not paper over the underlying Python-level
+  incomparability.
+|===
+
+*Recommendation:* Domain operations may assume same-category ordering is
+safe (`Date`-`Date`, `DateTime`-`DateTime` with compatible
+awareness/timezone), and must not assume cross-category ordering
+(`Date`-`DateTime`, naive-aware) is safe without an explicit, chosen
+normalization performed by the caller. No current maintained transformation
+was found to perform date-based sorting or range filtering at all (the
+`where:` predicate engine in `domain/_where_predicates.py` supports only
+`equals`/`in`/`non_empty`/`is_null`/`not_null` -- no ordering predicate
+exists today), so this FTR is not constrained by an existing consumer's
+behavior; it is free to recommend the safer, non-silent default.
+
+==== 14. Serialization implications [FACT / RECOMMENDATION]
+
+[cols="2,4",options="header"]
+|===
+| Format | Current state and implication
+
+| JSON
+| *[FACT]* `json.dumps` raises `TypeError` directly on a native `date` or
+  `datetime` -- no custom encoder exists anywhere in this framework's JSON
+  path today (confirmed by probe and by re-reading `json_backend.py`, which
+  only ever reads/writes already-stringified DataFrame content). *This is
+  not currently an observed defect*, because `json_backend`'s
+  `dtype=str, convert_dates=False` read-side contract (section 4) means no
+  native date/datetime scalar reaches a DataFrame via the JSON path in the
+  first place, and the JSON write side (`to_dict` + `json.dump`, not
+  independently re-read for this FTR beyond confirming the stdlib
+  limitation) would only encounter one if some *other* path (YAML,
+  direct-Frames) populated a Frame with a real temporal object and the
+  pipeline then routed it to a JSON writer. *[RECOMMENDATION]* -- a future
+  implementation slice introducing Date/DateTime as accepted internal values
+  must design a JSON encoder/decoder pair before Date/DateTime can safely
+  reach JSON output; this FTR does not design that encoder's exact wire
+  format now, per the task's instruction not to invent one global textual
+  date format prematurely.
+
+| YAML
+| *[FACT, new finding for this FTR]* `datetime.date` and (naive)
+  `datetime.datetime` already round-trip through `yaml.safe_dump`/
+  `safe_load` with full identity preservation (confirmed by probe, including
+  a directly-executed `save_yaml_dir`/`load_yaml_dir` round trip using the
+  real backend functions, not merely stdlib `yaml`) -- Date already has a
+  *complete, working* YAML serialization contract today, with zero
+  implementation needed for that half. *[FACT, concrete currently-latent
+  defect]* `pandas.Timestamp` -- the scalar every full-datetime YAML column
+  actually holds once read into a DataFrame (section 5) -- has *no*
+  `SafeDumper` representer and crashes `save_yaml_dir` with
+  `yaml.representer.RepresenterError` when written back (confirmed by
+  directly executing `save_yaml_dir` on a `Timestamp`-backed DataFrame, not
+  merely a synthetic `yaml.safe_dump` call). This reproduces identically for
+  naive and timezone-aware `Timestamp` values (section 11). *This is a real,
+  currently reachable, currently broken maintained round trip* -- read a
+  full-timestamp YAML file, do nothing else, write it back -- not a
+  hypothetical risk invented for this FTR. It is recorded here as an
+  observed fact this FTR's own inventory surfaced; fixing it is out of this
+  FTR's scope (no runtime change is authorized here) and is named as an
+  input to slice D-T3 (section 20), not filed as a separate BUG by this
+  document, since it is inseparable from deciding Date/Time's own
+  serialization contract in the first place.
+
+| CSV
+| *[FACT]* Necessarily textual; both CSV paths already force
+  `dtype=str, keep_default_na=False, na_values=[]` (section 4), so no
+  native temporal scalar ever reaches or leaves a DataFrame through CSV. No
+  format is specified anywhere for a date column's text, and this FTR does
+  not recommend inventing one -- CSV date handling remains whatever the
+  owning consumer's schema says it is, consistent with the accepted
+  string-substrate posture.
+|===
+
+*Answering the task's specific question directly:* yes, adding Date/DateTime
+to the internal value space before JSON persistence can represent them would
+create an incomplete contract -- but that incompleteness already exists
+*today*, independent of this FTR, for the YAML write side specifically
+(the `Timestamp` crash above), because YAML ingress already produces
+Date/DateTime values that Slice 1's own classifier already recognizes and
+rejects rather than silently mishandles. This FTR's recommendation is that a
+future Date/DateTime *acceptance* slice (D-T1/D-T2) should land together
+with, or immediately followed by, the persistence-completeness work (D-T3)
+that closes this gap -- accepting Date/DateTime as internal values without
+a working write-side contract for at least the already-reachable YAML case
+would trade a loud, explicit rejection today for a confusing runtime crash
+later.
+
+==== 15. Workbook ingress implications [FACT]
+
+Restated and extended from section 4's matrix, focused specifically on what
+a future ingress-side Date/Time acceptance slice would and would not change:
+
+* *[ACCEPTED, unchanged]* `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` remains
+  authoritative. This FTR's own inventory (section 4) confirms both
+  spreadsheet parsers still stringify every cell unconditionally today,
+  independent of `office:value-type`/`cell.data_type` -- nothing in this
+  FTR's evidence weakens that finding or that ADR.
+* *[FACT]* Both parsers already read the underlying type signal
+  (`office:value-type` for ODS, `cell.data_type` for XLSX) before discarding
+  it -- confirmed unchanged, exactly as the parent FTR and the ADR's own
+  "Migration strategy" section already recorded. A future *read-path-hint*
+  migration (the ADR's own already-recorded, non-disruptive option) is the
+  natural mechanism *if* the ADR is ever reopened to let a genuine
+  spreadsheet date cell enter the domain as `Date`/`DateTime` rather than
+  text -- this FTR does not activate that option and does not recommend
+  activating it now (see section 17).
+* *[FACT]* Even without any ADR change, a genuine XLSX date cell already
+  silently loses its Date-vs-DateTime distinction one layer *below* the
+  framework's own parser, inside openpyxl itself (section 4's probe: a pure
+  `date` value written and reread through openpyxl comes back as
+  `datetime.datetime` at midnight, not `date`). This means that *even if* a
+  future slice activated the ADR's read-path-hint option for XLSX, it would
+  need its own additional logic (inspecting `number_format`, not merely
+  `cell.data_type`) to recover the Date-vs-DateTime distinction that
+  openpyxl's own in-memory model has already erased -- a fact worth
+  recording now so that future slice does not have to rediscover it from
+  scratch.
+* *[FACT]* ODS's own `office:value-type == "date"` does not have this
+  particular problem -- the ODF format itself distinguishes `date` from
+  `time` from `float`/`string` at the attribute level, and does not conflate
+  a date-only value with a datetime the way openpyxl's in-memory model does.
+  A future read-path-hint migration would therefore be simpler and less
+  lossy for ODS than for XLSX on this specific point -- an asymmetry worth
+  recording, not resolving, here.
+* *[RECOMMENDATION]* This FTR's own recommended internal value model
+  (sections 7-8) does not require any parser change to be useful. Direct-
+  Frames and YAML ingress already produce genuine `date`/`datetime` values
+  today without any spreadsheet-adapter involvement at all -- the internal
+  value model can be accepted and enforced by a future Trusted Ingress
+  boundary for those paths while the spreadsheet-read question (activate the
+  ADR's read-path-hint option, or not) remains entirely independent and
+  separately authorizable, exactly the separation the task's own section 6
+  asked this FTR to preserve.
+
+==== 16. Workbook egress implications [FACT]
+
+* *[FACT]* A native `datetime.date`/`datetime.datetime` reaching the *XLSX*
+  renderer today is written as a genuine native Excel date cell -- confirmed
+  by probe at the raw XML level (`t="n"` numeric cell type, Excel serial-date
+  value `46243` for 2026-08-09, a style reference applying a date
+  `number_format`). This happens through OpenPyXL's own default handling of
+  `ws.cell(value=<date-like>)`; `openpyxl_renderer.py:_xlsx_cell_value`
+  contains no date-specific branch of its own -- it only special-cases
+  `LookupFormulaSpec` and otherwise passes the value through unchanged. The
+  *outcome* (native date cell) is real and reachable today, but it is
+  OpenPyXL's own accidental default behavior, not an owned framework
+  decision -- exactly the same shape of asymmetry the parent FTR already
+  documented for native-boolean writing (XLSX accidental via OpenPyXL
+  defaults; ODS explicit and owned).
+* *[FACT]* The identical native `date`/`datetime` value reaching the *ODS*
+  renderer today falls through `odf_renderer.py`'s existing
+  missing/bool/`(int, float)` branches into the trailing `else` (plain
+  string) branch, producing `str(value)` as an ordinary text cell -- *not* a
+  native ODS `date`-typed cell. Confirmed by direct probe against the live
+  `_is_missing_carrier`/`isinstance` checks in the current renderer.
+* *This is a genuine, currently reachable cross-backend divergence for the
+  exact same programmatic input*: a native Python date written through the
+  direct-Frames/programmatic path becomes a real Excel date cell on XLSX and
+  an ordinary text cell on ODS, today, with no framework decision ever made
+  about it either way.
+* *[RECOMMENDATION]* No Excel-serial-number abstraction should enter the
+  domain value model, per the task's explicit instruction -- confirmed
+  compatible with this FTR's own recommendation (sections 7-8, 12), since
+  neither recommends anything numeric-carrier-shaped for Date/DateTime.
+  Whether a future egress policy should (a) make ODS match XLSX's native-cell
+  behavior, (b) make XLSX match ODS's string behavior for consistency with
+  the accepted visible-cell substrate ADR, or (c) leave both as
+  backend-local, adapter-owned decisions, is *not* decided by this FTR --
+  each option has a legitimate rationale (native fidelity vs. substrate
+  consistency vs. backend autonomy) and none is forced by any evidence
+  gathered here. *[OPEN, see section 24]*.
+
+==== 17. Relationship to the visible-cell string ADR
+
+Same three questions the parent FTR kept separate, answered for Date/Time
+specifically:
+
+[cols="2,4",options="header"]
+|===
+| Question | This FTR's answer
+
+| Can internal/domain Frames hold meaningful Date/DateTime scalar values?
+| *Yes, already true today* (section 4), unaffected by the ADR -- the ADR
+  governs the spreadsheet-carrier boundary specifically, not what a
+  DataFrame column constructed from YAML or direct Python may contain before
+  or after that boundary. This FTR's recommended MVP categories describe
+  that same ADR-unconstrained space the parent FTR already identified for
+  String/Boolean/Number/Missing.
+
+| Should XLSX/ODS preserve native date/datetime identity on parse?
+| *Not decided by this FTR; would require reopening the ADR if adopted.*
+  Section 15 records that both parsers already read the relevant type
+  signal before discarding it (the ADR's own recorded "read-path-hint"
+  migration option), and that XLSX's own in-memory model (openpyxl) already
+  loses the Date-vs-DateTime distinction independent of any framework
+  decision -- new evidence *for future consideration*, not evidence that
+  meets any of the ADR's own stated revisit criteria today (no second
+  independent adopter pain report naming this; no roadmap item currently
+  depends on typed visible dates beyond this FTR's own inventory work).
+
+| Should XLSX/ODS render native typed date cells or continue the visible
+  string substrate initially?
+| *Continue the existing string substrate.* This FTR's recommended MVP does
+  not require, and does not recommend, any renderer change. Section 16's own
+  finding (XLSX already accidentally writes native date cells for
+  programmatic input; ODS does not) is recorded as a compatibility fact for
+  a future egress-policy decision, not activated or resolved by this FTR.
+|===
+
+*[RECOMMENDATION -- this FTR's own determination]* Does adopting this FTR's
+recommended Date/DateTime contract require a successor/amendment ADR? *No.*
+Every recommendation here (native `date`/`datetime` as conceptual canonical
+carriers, `Timestamp`/`numpy.datetime64` as classifiable variants, no
+wrapper, the Missing/NaT resolution in section 6, deferred Time/Duration,
+bounded-open timezone handling) operates entirely within the space the ADR
+already leaves open (structured/programmatic Frames) or reinforces the ADR's
+existing contract (the spreadsheet-visible substrate stays string,
+unconditionally, exactly as today). If a *future* slice activates the ADR's
+own recorded read-path-hint migration option for dates specifically, *that*
+slice -- not this one -- would need to evaluate whether the ADR's revisit
+criteria are met and whether a successor/amendment ADR is warranted at that
+time.
+
+==== 18. Relationship to future Trusted Ingress (Phase E)
+
+*Should Date/Time runtime support land before mandatory Trusted Ingress?*
+This FTR's evidence *confirms*, rather than merely repeats, the parent FTR's
+own tentative recommendation (its section 17.9, itself explicitly flagged
+there as "a recommendation, not a decision"): *yes, preferably, for adoption
+continuity, but not because Phase E is technically incapable of rejecting
+Date/Time.*
+
+The confirming evidence this FTR adds: Date/Time is not a hypothetical
+adoption risk -- section 4 shows it is *already reachable today* through the
+maintained YAML ingress path, unconditionally, for any adopter using YAML
+timestamp syntax. A primitive-only Phase E slice wired ahead of this FTR's
+Date/Time acceptance work would correctly reject every such value today
+(`scalar_category` already raises `UnsupportedScalarError` for it, per
+Slice 1) -- technically sound, per the parent FTR's own point -- but would
+regress any current adopter whose YAML files already contain ordinary
+calendar dates, the moment Trusted Ingress became mandatory rather than
+opt-in. This FTR's own value-flow matrix (section 4) is the concrete
+evidence the parent FTR's recommendation predicted but had not yet gathered.
+
+*What Phase E still owns after Date/Time lands (unchanged in kind from the
+parent FTR's own section 16/17.9 handoff, restated here for Date/Time
+specifically):*
+
+* canonical normalization application -- turning an accepted `Timestamp`/
+  `numpy.datetime64` carrier into whatever the eventual
+  `normalize_scalar()`-shaped primitive decides (this FTR does not build
+  that primitive, per section 12);
+* frame-level traversal -- calling the classifier at every real cell across
+  a whole Frame, not a per-scalar concern;
+* rejection policy -- what happens to a `datetime.time`/`timedelta`/
+  timezone-mixed value at a real ingress point (reject with diagnostic vs.
+  another bounded behavior) remains Phase E's decision, not this FTR's;
+* runtime/trust policy and boundary wiring -- the ingress *mechanism*
+  question (extend `INGRESS_RULES`, subphases, delegated schemas, or another
+  coordinator design) remains entirely open, exactly as the parent FTR left
+  it for the String/Boolean/Number/Missing case; this FTR takes no position
+  for Date/Time either.
+
+This FTR does not implement any of the above; it only sharpens the parent
+FTR's already-recorded recommendation with concrete reachability evidence.
+
+==== 19. Compatibility matrix [FACT]
+
+Representative survey, matching the families the parent FTR's own Stage K
+inventoried, evaluated specifically for Date/DateTime compatibility (not a
+refactor):
+
+[cols="2,2,4",options="header"]
+|===
+| Surface | Classification | Evidence
+
+| FK helpers (`core/fk.py`)
+| Already compatible
+| `_norm_id` calls `str(v)` unconditionally for any non-missing value
+  (confirmed by re-reading `core/fk.py`); a `Date`/`DateTime` value used as
+  an FK key would already stringify safely today, exactly like any other
+  non-string key -- no special handling needed or missing.
+
+| Cell Codec (`domain/transformations/cell_codec/`)
+| Intentionally string-only, unaffected
+| Unchanged from the parent FTR's own finding -- string-oriented by
+  contract, per the visible-cell substrate ADR.
+
+| Predicates/filtering (`domain/_where_predicates.py`)
+| Compatible for the predicates that exist; no ordering predicate exists to
+  evaluate
+| Confirmed by direct re-read: only `equals`/`in`/`non_empty`/`is_null`/
+  `not_null` are supported -- `equals`/`in` would already work correctly on
+  same-category Date/DateTime values via native equality; no `>`/`<`/
+  `between` predicate exists today for this FTR to evaluate cross-category
+  ordering risk against.
+
+| Validation (`domain/validations/`)
+| Already type-neutral / compatible
+| Unchanged from the parent FTR's own finding; no validation family was
+  found to assume string-only payload in a way a Date/DateTime value would
+  break.
+
+| Projection / joins / xrefs (general `domain/` `isinstance(str)` sites)
+| Mixed, not independently re-classified for this FTR
+| Same representative-sample caveat as the parent FTR's own Stage K; a full
+  classification remains a future Family Cycle 3 concern, not this FTR's
+  scope.
+
+| Persistence/writers (backend renderers)
+| *Requires adaptation, evidenced concretely by this FTR* (sections 14, 16)
+| JSON has no encoder for native date/datetime at all; YAML's write path
+  crashes for any `Timestamp`-backed column; ODS's renderer silently
+  stringifies rather than erroring. None of these are compatible with
+  accepting Date/DateTime as an internal value today without further work.
+
+| Rendering (`rendering/composer/layout_composer.py`)
+| Compatible with native typed values, unaffected
+| `compose_workbook` copies `df.values.tolist()` verbatim (confirmed
+  unchanged from the parent FTR's own finding); the renderer-level
+  divergence recorded in section 16 happens downstream of this call, in the
+  backend-specific cell-value functions, not in the shared composition step.
+
+| Schema maintenance / registries
+| Outside MVP, unaffected
+| Governs `_meta`, not payload scalar values; unchanged from the parent
+  FTR's own finding.
+|===
+
+==== 20. Proposed implementation slices [RECOMMENDATION]
+
+Derived from this inventory's dependency evidence, not copied from the
+task's own illustrative example, and explicitly *not* authorized for
+implementation by this FTR:
+
+[source,text]
+----
+D-T1 -- Bounded temporal carrier classification + Missing/NaT semantics
+D-T2 -- Canonical Date / DateTime normalization primitive
+D-T3 -- Structured persistence compatibility (JSON encoder; YAML write-side
+        Timestamp gap closure)
+D-T4 -- Selected transformation compatibility pilot
+D-T5 -- Spreadsheet-adapter adoption, only if/when the visible-cell ADR
+        changes
+----
+
+*D-T1 -- bounded temporal carrier classification + Missing/NaT semantics.*
+
+* Extends `scalar_values.py`'s `ScalarCategory` with `"date"`/`"datetime"`;
+  classifies `datetime.date` as `"date"`, and `datetime.datetime`/
+  `pandas.Timestamp`/`numpy.datetime64` (non-`NaT`) as `"datetime"`, with
+  DateTime checked before Date per section 8's subclass-ordering note.
+* Fixes IVM-REVIEW-F7 as decided in section 6: `numpy.datetime64('NaT')`
+  becomes Missing through an explicit, `datetime64`-specific branch (not the
+  generic `np.generic` dispatch); `numpy.timedelta64('NaT')` continues to
+  raise `UnsupportedScalarError`, unchanged, since Duration is not part of
+  this slice.
+* `datetime.time`, `datetime.timedelta`, `pandas.Timedelta`, non-`NaT`
+  `numpy.timedelta64` continue to raise `UnsupportedScalarError`, unchanged
+  -- this slice does not widen the vocabulary beyond Date/DateTime.
+* Narrow, testable invariant: every case in section 3's inventory table
+  classifies exactly as that table's "Recommended future outcome" would
+  require (to be stated precisely in the slice's own acceptance criteria,
+  not pre-written here).
+
+*D-T2 -- canonical Date/DateTime normalization primitive.*
+
+* Adds the `normalize_scalar()`-shaped primitive Slice 1 and this FTR both
+  deliberately did not build (section 12) -- narrowing an accepted carrier
+  variant (`Timestamp`, `numpy.datetime64`) to its native-Python canonical
+  form (`datetime.date`/`datetime.datetime`) for whichever future consumer
+  needs one canonical representation rather than mere classification.
+* Resolves section 11's open timezone-handling question as part of its own
+  acceptance criteria -- this FTR does not pre-decide it.
+
+*D-T3 -- structured persistence compatibility.*
+
+* Closes the concrete, currently-latent YAML write-side gap this FTR's own
+  inventory surfaced (section 14): a `Timestamp`-backed column crashes
+  `save_yaml_dir` today, independent of whether Date/DateTime becomes an
+  accepted internal category. This slice decides whether the fix is a
+  YAML-write-side `Timestamp` -> native-`datetime` conversion, a
+  `normalize_scalar()` call from D-T2, or another bounded mechanism -- not
+  decided here.
+* Designs a JSON encoder/decoder pair for Date/DateTime, per section 14 --
+  the exact wire format is this slice's own decision, not this FTR's.
+
+*D-T4 -- compatibility pilot.*
+
+* Scoped to whichever transformation family the roadmap's "Selecting the
+  first family" pilot chooses, exactly mirroring the parent FTR's own D4 --
+  this FTR does not select that family and does not authorize this slice.
+
+*D-T5 -- spreadsheet-adapter adoption.*
+
+* Only authorized if/when a future slice reopens
+  `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`'s read-path-hint migration
+  option (section 15, 17) -- this FTR does not activate that option and does
+  not authorize this slice.
+
+==== 21. Acceptance criteria (for this FTR's own inventory/design scope)
+
+* [ ] This FTR document exists at
+  `docs/backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc` and is
+  registered in `docs/backlog/_ftrs_open.adoc`.
+* [ ] The temporal-carrier inventory (section 3) and value-flow matrix
+  (section 4) are independently re-verified against current source and live
+  probes for this FTR, not merely copied from the parent FTR or the
+  Independent Review artifacts.
+* [ ] Pandas coercion findings (section 5) are backed by direct probe
+  evidence, not assumption.
+* [ ] IVM-REVIEW-F7 is explicitly resolved with a normative decision
+  (section 6), citing the `complex128` precedent already established in the
+  accepted review history.
+* [ ] Date, DateTime, Time, Duration, and timezone are each decided
+  separately (sections 7-11), none silently folded into another.
+* [ ] A native-Python-vs-pandas-vs-wrapper recommendation is stated with an
+  explicit per-dimension comparison (section 12).
+* [ ] Comparison semantics state which comparisons are legitimate and which
+  require normalization or rejection (section 13), backed by probe evidence.
+* [ ] Serialization, workbook-ingress, and workbook-egress implications are
+  each stated separately (sections 14-16), distinguishing observed fact from
+  recommendation.
+* [ ] The relationship to `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` is
+  stated for internal/ingress/egress typing separately (section 17), with an
+  explicit determination of whether a successor/amendment ADR is required
+  (it is not, per this FTR's finding).
+* [ ] The relationship to future Trusted Ingress (Phase E) is stated,
+  including whether Date/Time should land first (section 18).
+* [ ] A compatibility matrix exists (section 19).
+* [ ] Implementation slices are given in dependency order (section 20),
+  none authorized for implementation by this document.
+* [ ] Explicit non-goals are listed (section 23).
+* [ ] Open decisions requiring human acceptance are collected in one place
+  (section 24), not scattered without a pointer.
+* [ ] `git diff --check` and `git status --short` show only
+  documentation/backlog changes.
+* [ ] No Project Memory file changed. No ADR created. No Python source
+  changed. No test changed.
+
+==== 22. Executable test requirements (for the slices this FTR authorizes -- not run by this FTR itself)
+
+This FTR authorizes no implementation and adds no tests itself. For whichever
+future task implements the slices in section 20, the following are the
+minimum required regressions, stated here so that work does not have to
+rediscover them:
+
+* *D-T1:* a focused unit test suite mirroring
+  `tests/unit/core/test_scalar_values.py`'s existing shape, covering every
+  case in section 3's inventory table (`date`, `datetime`, `Timestamp`,
+  `numpy.datetime64` non-`NaT`, `numpy.datetime64('NaT')`,
+  `numpy.timedelta64('NaT')`, `datetime.time`, `datetime.timedelta`,
+  `pandas.Timedelta`), including an explicit regression for the corrected
+  IVM-REVIEW-F7 behavior (`numpy.datetime64('NaT')` -> `"missing"` via an
+  explicit branch; `numpy.timedelta64('NaT')` -> still
+  `UnsupportedScalarError`).
+* *D-T2:* round-trip tests proving `normalize_scalar()` (or equivalent)
+  produces the same canonical value for every accepted carrier variant of
+  a given logical Date/DateTime value (e.g. a naive `Timestamp` and the
+  `datetime.datetime` it is equal to normalize identically).
+* *D-T3:* a regression reproducing this FTR's own discovered YAML write-side
+  gap (a `Timestamp`-backed column no longer crashes `save_yaml_dir`) and a
+  JSON encode/decode round-trip test for both Date and DateTime.
+* *D-T4/D-T5:* deferred to their own slice's own test design, not
+  pre-specified here.
+
+==== 23. Explicit non-goals
+
+* Any Python value-class, wrapper, or new runtime type -- per section 12,
+  none is authorized or needed.
+* Any parser or renderer change of any kind.
+* Any change to `core/scalar_values.py` or any other runtime/test file --
+  this FTR is documentation-only.
+* Any CLI, YAML configuration key, or runtime-policy wiring.
+* Any Trusted Ingress (Phase E) implementation.
+* Any Formula work of any kind, direct or incidental -- restated, not
+  re-derived, from `FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`, which
+  remains the sole durable anchor for that scope.
+* Time and Duration/Timedelta support -- explicitly deferred (sections 9-10),
+  not designed here beyond stating their current rejection behavior must
+  remain explicit, not silent.
+* A general timezone canonicalization policy (UTC normalization or
+  otherwise) -- left open (section 11, 24).
+* Any successor/amendment ADR -- per section 17's finding, none is currently
+  required.
+* Any change to `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`,
+  `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, or
+  `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` -- all three remain
+  authoritative and unreopened.
+* Project Memory updates -- per this task's own instructions, not performed
+  by this document (see "Final report" for whether the concern's
+  `next_action` should change once this FTR is reviewed).
+* Filing a separate BUG for the YAML `Timestamp` write-side crash (section
+  14) -- recorded as an inventory finding feeding slice D-T3 instead, since
+  it is inseparable from deciding Date/Time's own serialization contract.
+
+==== 24. Open decisions requiring human acceptance [OPEN]
+
+Collected here from sections 8, 11, and 16 so a reviewer does not have to
+extract them individually:
+
+. *(section 8)* Whether a future classifier needs `numpy.datetime64`
+  unit/precision-aware Date-vs-DateTime disambiguation, or whether treating
+  every `numpy.datetime64` uniformly as DateTime (this FTR's recommendation)
+  is sufficient. No current evidence forces the narrower design.
+. *(section 11)* Whether timezone-aware DateTime should be accepted as-is
+  (offset preserved, naive/aware comparison left to raise) or bounded
+  further (e.g. rejected until a canonicalization policy exists). This FTR
+  recommends *not* silently normalizing to naive or assuming UTC, but does
+  not itself choose between "accept as-is" and "reject pending policy."
+. *(section 16)* Whether a future ODS/XLSX egress policy should make ODS
+  match XLSX's (accidental) native-date-cell behavior, make XLSX match ODS's
+  string behavior, or leave both as independent, backend-local decisions.
+  Each option has a legitimate rationale; none is forced by this FTR's
+  evidence.
+. *(section 20)* Confirmation that the D-T1..D-T5 slice sequence and
+  dependency ordering is the right shape before any slice begins
+  implementation -- this FTR proposes it, it does not self-authorize it.
+
+None of these four decisions blocks accepting this FTR's *inventory and
+recommended MVP category set* (Date, DateTime as supported; Time, Duration,
+and timezone-canonicalization policy deferred) -- they are implementation-
+slice-level refinements the maintainer should weigh in when D-T1/D-T2/D-T5
+are actually scheduled, not preconditions for accepting this document itself.
+
+==== Validation
+
+Commands and probes run for this FTR (read-only; no production/test file
+modified; nothing written inside the repository):
+
+[source,console]
+----
+git status --short
+git rev-parse HEAD
+git log --oneline --decorate -35
+git rev-list --left-right --count origin/main...HEAD
+----
+
+Source re-reads performed directly against current `core` HEAD (not assumed
+from the parent FTR or Independent Review artifacts):
+
+* `src/spreadsheet_handling/core/scalar_values.py` -- full module, current
+  classification logic and docstrings.
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py` --
+  all `str(val)`-shaped call sites (8, re-grepped for this FTR).
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py:_cell_value` --
+  `office:value-type` fallback branches, including the `date`/`time` cases.
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` --
+  `_is_missing_carrier` and the bool/`(int, float)`/else branch structure a
+  native date value falls through.
+* `src/spreadsheet_handling/io_backends/xlsx/openpyxl_renderer.py` --
+  `_xlsx_cell_value`, confirming no date-specific branch exists.
+* `src/spreadsheet_handling/io_backends/json_backend.py`,
+  `src/spreadsheet_handling/io_backends/yaml_backend.py` -- read/write
+  functions, `dtype=str`/`convert_dates=False`/`df.where(...)` behavior.
+* `src/spreadsheet_handling/core/fk.py:_norm_id` -- FK-key stringification
+  behavior for a non-string value.
+* `src/spreadsheet_handling/domain/_where_predicates.py` -- the full set of
+  supported `where:` predicates.
+* `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc`,
+  `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A_review.adoc`,
+  `docs/backlog/FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5.adoc`,
+  `docs/backlog/roadmap_domain_hardening_sequence.adoc`,
+  `docs/technical_model/ch03_architecture_decisions/ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE.adoc`,
+  `docs/technical_model/ch03_architecture_decisions/ADR-DOMAIN-BOUNDARY-ROBUSTNESS.adoc`,
+  `docs/technical_model/ch03_architecture_decisions/ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY.adoc`,
+  `docs_generated/project_memory/current_context.adoc` (regenerated context,
+  `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` entry) -- read in full for this FTR.
+
+Live probes (read-only, scratchpad-only, no file left in the repository):
+
+* YAML native timestamp resolution (`yaml.safe_load` on unquoted date/
+  datetime/timezone-offset scalars) and its effect once assembled into a
+  `pandas.DataFrame`, mirroring `yaml_backend.load_yaml_dir`'s own
+  construction shape exactly.
+* `yaml.safe_dump`/`json.dumps` behavior on native `date`, `datetime`,
+  `time`, `pandas.Timestamp`, and `numpy.datetime64`.
+* Direct execution of the repository's own `save_yaml_dir`/`load_yaml_dir`
+  functions against a `Timestamp`-backed and a pure-`date` DataFrame, to
+  confirm the write-side crash and the read-side round trip are real, not
+  merely a synthetic `yaml.safe_dump` artifact.
+* `pandas.DataFrame` construction and dtype/scalar-type inspection for pure
+  date, pure datetime, mixed date+datetime, date+`None`, datetime+`None`,
+  `pd.to_datetime`, and timezone-aware columns.
+* Direct execution of `scalar_values.is_missing_carrier`/`scalar_category`
+  against `pd.NaT`, `numpy.datetime64('NaT')`, `numpy.timedelta64('NaT')`,
+  non-`NaT` `numpy.datetime64`, `datetime.date`, `datetime.datetime`,
+  `pandas.Timestamp`, `datetime.timedelta`, `pandas.Timedelta`, and
+  `datetime.time` -- independently reproducing, not merely trusting, the
+  Independent Review 001/002 findings including IVM-REVIEW-F7.
+* Comparison-semantics probes: `date < date`, `date < datetime`,
+  `Timestamp < datetime`, `Timestamp == datetime`, naive-vs-aware
+  comparison, and `Series.sort_values()` on a mixed date/datetime/`None`
+  object column.
+* OpenPyXL round-trip probe: write a native `date`/`datetime`/plain string
+  via `ws.cell(value=...)`, reload with `data_only=True`, inspect
+  `cell.value`/`cell.data_type`/`cell.number_format`; separately inspect the
+  raw `xl/worksheets/sheet1.xml` to confirm native Excel serial-date storage.
+* odfpy round-trip probe: write a genuine ODS date cell both with and
+  without paragraph text via raw `odf.table.TableCell(valuetype="date",
+  datevalue=...)`, reread through the repository's own
+  `odf_parser._cell_value` function directly (not a reimplementation).
+* Direct execution of `odf_renderer._is_missing_carrier` and the renderer's
+  own `isinstance` branch order against a native `date` value, confirming it
+  falls through to the trailing string branch.
+
+No production or test file was modified by any probe. `git diff --check` and
+`git status --short` show only this new FTR file and the
+`docs/backlog/_ftrs_open.adoc`/`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc`
+registration/pointer edits described below.
+
+==== Commit
+
+One documentation-only commit:
+
+[source,text]
+----
+docs(backlog): define Date/Time internal value model scope
+----
+
+Stages this new FTR file, its `docs/backlog/_ftrs_open.adoc` registration,
+and the small discoverability pointer added to
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc`'s own "Explicitly undecided"
+section, by explicit path (not `git add -A`/`git add .`). Does not update
+Project Memory. Does not push (remote sync is a developer action per
+`agent_rules.adoc`).
