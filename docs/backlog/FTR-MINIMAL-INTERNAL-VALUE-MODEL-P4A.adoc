@@ -1,0 +1,1251 @@
+===== FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A -- Current-state inventory and contract design for the Minimal Internal Value Model
+
+*Status:* New (decision-ready; no implementation authorized by this document)
+*Priority:* P4A
+*Area:* Internal value model / carrier-boundary normalization / domain-hardening roadmap Phase D
+*Release relevance:* Post-`0.2.0`. Not a runtime blocker. This is
+`roadmap_domain_hardening_sequence.adoc` Phase D's current/next action, named
+by `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`'s `next_action` field now that both
+dependency BUGs (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`,
+`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A`) are Done.
+
+*Task scope note:* this FTR is the Phase-D *current-state inventory and
+contract design* deliverable. It does *not* implement runtime typing, does
+*not* create Python value classes, does *not* modify parsers/renderers/domain
+transformations, does *not* update Project Memory, does *not* create an ADR,
+and does *not* begin Trusted Ingress. Those are follow-up work, gated on the
+open decisions this FTR records (see "Still-open decisions" throughout, and
+"Handoff to Trusted Ingress" at the end).
+
+==== Status legend used throughout this document
+
+To keep recommendation and authority distinct, every substantive claim below
+is tagged:
+
+* *[FACT]* -- directly observed in current maintained code, tests, or an
+  accepted ADR/BUG, re-verified for this FTR (see "Validation" for probes/
+  commands run).
+* *[RECOMMENDATION]* -- this FTR's proposed contract; not yet accepted
+  architecture.
+* *[ACCEPTED]* -- already durable, accepted architecture this FTR must not
+  contradict (an ADR, or a BUG's adopted semantic contract).
+* *[OPEN]* -- a decision this FTR deliberately leaves for the maintainer or a
+  successor artifact.
+
+==== Purpose and scope
+
+*Central design question:*
+
+____
+What is the smallest closed internal payload-value contract that prevents
+pandas/backend carrier artifacts from silently becoming domain semantics,
+while preserving ordinary DataFrame ergonomics and avoiding a complete
+spreadsheet cell-type system?
+____
+
+This FTR answers that question with a current-state inventory (Stages A-B
+below), an evaluation of the candidate category set `String / Boolean /
+Number / Missing / Error` against that evidence (Stages C-G), and a
+recommended contract shape, boundary, and implementation slicing (the
+numbered sections after the inventory). It does not start from a `CellValue`
+wrapper hierarchy and does not assume every physical spreadsheet or Python
+type needs a corresponding domain type, per the task brief and per
+`roadmap_domain_hardening_sequence.adoc`'s own "types describe supported
+values, not arbitrary Python" guiding principle.
+
+*In scope:* the inventory itself; the category evaluation; a recommended
+Missing/carrier-boundary contract; a native-scalar-vs-wrapper recommendation;
+a contract-boundary-ownership recommendation; the relationship to
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` and whether it must be reopened;
+formula non-goals (restated from the BUG that deferred them); a compatibility
+inventory; the relationship to `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`;
+dependency-ordered implementation slices; acceptance criteria; required
+executable tests; explicit non-goals; and the handoff shape for Trusted
+Ingress (Phase E).
+
+*Out of scope (this FTR does not do these; they are later, separately
+authorized work):* any Python value-class implementation; any parser or
+renderer change; any change to domain transformations; any registry or
+`_meta` schema change; Project Memory updates; a successor/amendment ADR
+(this FTR only determines *whether* one will eventually be needed); Trusted
+Ingress (Phase E) implementation.
+
+==== Orientation performed
+
+Read in full for this FTR: `roadmap_domain_hardening_sequence.adoc`;
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`; `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`;
+`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`; Technical Concept 001
+(`trusted_ingress_and_runtime_security.adoc`, treated as explanatory
+evidence, not adopted architecture, per its own status note);
+`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` (archived, Done);
+`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A` (archived, Done);
+`FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` (exploratory, New). The generated
+Project Memory context report (`make memory-context` ->
+`docs_generated/project_memory/current_context.adoc`) was regenerated and
+read; `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`'s `next_action` field names this work
+verbatim.
+
+Repository baseline for this task: core HEAD `17f08ffe182148111d683ce9c3e596c74aa05c4e`
+("docs(project_memory): record BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A
+closure, hand off to Phase D"), clean worktree, verified at task start and
+re-verified before this FTR's own commit.
+
+Current runtime code was spot-checked against every claim Technical Concept
+001 makes about it (the concept's own evidence is very recent -- accepted
+2026-08-07, the ODS BUG fixed 2026-08-08, one commit before this FTR's HEAD)
+to confirm no drift; see "Validation" for the exact greps/reads/probes run.
+No drift was found: every inventory claim below that originates in the
+concept document was independently re-confirmed against current source in
+this task, not merely copied.
+
+==== 1. Current-state value-flow matrix [FACT]
+
+This condenses and re-verifies Technical Concept 001 section 3.1's ingress
+table (`trusted_ingress_and_runtime_security.adoc`) plus this FTR's own
+re-reads. Full per-backend detail (resource bounds, exact call sites) lives
+in that concept document and is not duplicated verbatim here; only the
+value-flow-relevant facts are restated.
+
+[cols="1,3,3",options="header"]
+|===
+| Ingress form | Scalar/structural behavior (re-verified) | Missing-value handling (re-verified)
+
+| XLSX
+| `io_backends/xlsx/openpyxl_parser.py` loads with `data_only=True`
+  (formula cells read as last cached value, not formula text -- a hardcoded
+  parser choice, not a documented cross-backend policy). Every visible cell
+  is force-collapsed to `str(val) if val is not None else ""` at
+  `parser_interpretation.py` (confirmed at lines 156, 164, 175, 195, 237,
+  391 -- multiple call sites, same pattern, not one shared helper). No date/
+  boolean/error-specific handling exists in the parser at all -- a
+  `datetime` value becomes `str(datetime_obj)`; a native OpenPyXL boolean
+  becomes `"True"`/`"False"` via plain `str()`, not the ODS-style
+  `"TRUE"`/`"FALSE"` convention (asymmetry noted, not fixed, here)
+| No dedicated missing-value normalization at the XLSX parser boundary --
+  `str(val) if val is not None else ""` is itself the normalization: a
+  `None` cell becomes `""`
+
+| ODS
+| `io_backends/ods/odf_parser.py:_cell_value` reads paragraph text first,
+  then falls back to `office:value-type`-typed attributes (`string-value`,
+  `value`, `boolean-value` normalized to `"TRUE"`/`"FALSE"`, `date-value`,
+  `time-value`), each immediately returned as `str(...)`. Confirmed:
+  `office:value-type` carries real type information (float/boolean/date/
+  time distinguishable) that the parser deliberately discards after
+  resolving the fallback value, per `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`
+| Falls back to `""` when both paragraph text and every typed attribute are
+  absent; `ParserLimits` bounds dimensions but not missing-value shape
+
+| CSV directory (`csv_dir`)
+| `io_backends/csv_backend.py:CSVBackend.read_multi` (the path `csv_dir`
+  actually uses) calls `pd.read_csv(p, header=0, encoding="utf-8")` with
+  *no* `dtype=str`, *no* `keep_default_na=False`, *no* `na_values=[]` --
+  confirmed at lines 76-83. The single-file `CSVBackend.read` (lines
+  ~50-65) sets all three; the directory path does not
+  | *Confirmed gap, re-verified*: pandas' default dtype inference and NaN
+  survival apply. A numeric-looking column can become `int64`/`float64`;
+  a blank cell becomes a real pandas `NaN`, not `""`. This is the
+  independently reproduced second trigger for
+  `BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A` (an ordinary,
+  non-FK `csv_dir` column, no FK helpers involved at all)
+
+| JSON directory
+| `io_backends/json_backend.py`: `pandas.read_json(p, dtype=str,
+  convert_dates=False)` -- confirmed at line 92; `dtype=str` forces every
+  scalar to string on read, so JSON payload cannot expose a native
+  bool/int/float distinction to the DataFrame layer at all
+| `df.where(pd.notnull(df), "")` immediately after read (line 93) --
+  confirmed: every pandas-recognized missing value normalizes to `""`
+  before the frame reaches domain code
+
+| YAML directory
+| `io_backends/yaml_backend.py`: `yaml.safe_load` per file (blocks
+  PyYAML's custom-object constructors, but still resolves anchors/aliases
+  to shared identity and `!!binary` to `bytes` -- not re-probed in this
+  FTR, taken from the concept document's own probe, unchanged code path).
+  A file literally named `_meta.yaml` is *not* treated as structured
+  metadata by this backend -- loaded like any other file, and a typical
+  heterogeneous mapping falls into the "wrap as one row" branch, producing
+  a `_meta` **DataFrame**, not a `dict`
+| `df.where(pd.notnull(df), "")` -- confirmed at line 60, same pattern as
+  JSON. Applies only to already-DataFrame-constructed cells; nested,
+  non-missing YAML values (lists, mappings, dates) are untouched by this
+  call and remain whatever `pd.DataFrame(...)`/YAML produced
+
+| XML directory
+| `io_backends/xml_backend.py`, stdlib `ElementTree`; element text coerced
+  to `str`. No `_meta.yaml`-equivalent sidecar exists for this backend at
+  all (not re-probed further in this FTR; low priority, no `_meta` round
+  trip means no missing-value-in-metadata question for this backend)
+| Not independently re-probed for this FTR; concept document's claim (no
+  framework-owned normalization) is taken as current absent contrary
+  evidence, since the backend has not changed
+
+| Direct Python `Frames`
+| `pipeline.run_pipeline(frames, steps)` -- no ingress, no persistence
+  boundary, no cleanup executor. A DataFrame column may hold any Python
+  object a caller constructs. This is the framework's own documented
+  trusted-programmatic-composition surface (`pipeline/__init__.py`
+  re-export), not a defect
+| None -- whatever the caller constructed
+|===
+
+Additional re-verified facts, not backend-specific:
+
+* *ODS boolean write* [FACT, re-verified this task] -- `io_backends/ods/odf_renderer.py`
+  has an explicit `isinstance(value, bool)` branch (line ~587) that writes a
+  native `valuetype="boolean"` ODS cell with `"TRUE"`/`"FALSE"` text. This
+  branch can only fire for a real Python `bool` reaching the renderer, which
+  -- because every spreadsheet ingress path stringifies before reaching
+  Frames -- only happens via the direct-Frames/programmatic path (or a
+  future non-spreadsheet backend that preserves native bool). *XLSX has no
+  equivalent explicit branch*; `openpyxl_renderer.py:_xlsx_cell_value`
+  passes a Python `bool` straight to `ws.cell(..., value=val)`, and OpenPyXL
+  itself natively supports Python `bool` as a boolean cell value -- the
+  *outcome* (native boolean cell) is the same on both backends for this
+  input, but ODS's mechanism is an explicit, owned branch while XLSX's is an
+  accidental library behavior, mirroring exactly the asymmetry already
+  documented for missing-carrier handling.
+* *Formula-vs-value read policy* [FACT] -- XLSX's `data_only=True` is a
+  hardcoded loader default, not a documented, cross-backend, deliberate
+  policy. This is restated, not newly discovered -- see "Formula hard
+  non-goals" below, which is binding evidence this FTR must respect, not
+  re-derive.
+* *Spreadsheet error cells* [FACT, probed this task] -- a live probe (Python
+  script writing `=1/0` via OpenPyXL and reloading with `data_only=True`
+  and `data_only=False`) confirms: without an actual spreadsheet
+  application evaluating the formula, OpenPyXL has no cached value to
+  return (`None`, `data_type == "n"`); `data_only=False` returns the
+  formula text (`"=1/0"`, `data_type == "f"`). No maintained automated path
+  in this repository produces or reads a genuine spreadsheet error token
+  (`#N/A`, `#VALUE!`, `#REF!`) as a distinguishable carrier -- confirmed by
+  grepping both backend packages for any error-type/error-token handling:
+  none exists. A `#N/A`-looking string, wherever it appears in payload, is
+  therefore always an ordinary domain string to every current maintained
+  code path, never a recognized carrier error.
+* *Cell Codec is string-oriented* [FACT, re-verified this task] --
+  `domain/transformations/cell_codec/frame.py`'s own module docstring
+  confirms: "The codec is string-oriented ... position-based participating
+  values must be strings (or empty); decoded values are strings." No
+  `_meta.cell_codecs` metadata is produced or read by any maintained code
+  (confirmed absence of any reader by grep); it is retired, inert
+  pass-through sediment where it survives in old artifacts.
+* *`domain.ingress` current shape* [FACT, re-verified this task] --
+  `domain/ingress/coordinator.py`: `INGRESS_RULES` is a flat tuple with
+  exactly one entry (`legend_blocks.py:normalize_legend_blocks_shape`).
+  Confirmed: no scalar/type normalization rule exists in `domain.ingress`
+  today. This is the *only* framework-owned, non-addressable normalization
+  point in the entire read path.
+* *Controlled internal carriers already exist* [FACT, re-verified this
+  task] -- `core/exact_table.py:ExactTable` and
+  `domain/transformations/grouped_xref/matrix.py:GroupedMatrix` are real,
+  implemented, tested Frames-boundary carriers today. A future controlled-
+  carrier pattern extends an existing one; it does not invent the first
+  instance.
+* *Authored Intent already exists* [FACT, re-verified this task] --
+  `core/formulas.py`: `ListLiteralFormulaSpec` and `LookupFormulaSpec` are
+  `@dataclass(frozen=True)`, directly constructible, exported. This is the
+  framework's only current "authored backend-neutral Intent" scalar-like
+  category, and it is unrelated to the payload-value MVP this FTR scopes
+  (see "Formula hard non-goals").
+
+==== 2. Observed semantic-loss/collision inventory [FACT / ACCEPTED]
+
+Concrete, evidenced defects and their disposition, not hypothetical risk:
+
+[cols="3,2,4",options="header"]
+|===
+| Case | Status | What actually happened, and what it teaches this FTR
+
+| FK-helper lookup miss producing a pandas NaN carrier, corrupted to literal
+  `"nan"` on ODS, silently blank on XLSX
+| *Done* (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`, Implementation
+  slice 1)
+| A Python `None` mixed into a DataFrame column assignment silently became
+  a real `float('nan')` carrier under the project's active string dtype.
+  Fixed at the single value-materialization point
+  (`core/fk.py:apply_fk_helpers`), not at either renderer -- normalizing at
+  the *narrowest correct owner* (the point that decided "no match") was
+  preferred over normalizing broadly at the render/`TableBlock` boundary
+  (rejected explicitly, as too broad -- it would silently touch every
+  DataFrame cell reaching every table) or independently in each renderer
+  (rejected explicitly, as duplicating the same predicate twice, which is
+  how the divergence happened in the first place). *Teaches this FTR:*
+  normalize at the narrowest correct owner, not at a shared choke point
+  that does not actually own the decision.
+
+| A resolved helper whose target payload is itself a missing carrier
+  (successful lookup, poor-quality target data) still reaching the ODS
+  renderer's NaN-blind emptiness check and corrupting to literal `"nan"`;
+  independently re-reproduced via an ordinary non-FK `csv_dir` column with
+  no helper machinery at all
+| *Done* (`BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A`)
+| Fixed with a local, `pd.isna`-aware `_is_missing_carrier` predicate at
+  the ODS renderer's own write boundary (`odf_renderer.py:443`), a
+  self-contained copy of `domain._cell_primitives._is_empty_cell`'s shape
+  rather than a cross-layer import, because `io_backends` does not
+  currently depend on `domain`. *Teaches this FTR:* this exact predicate
+  shape (`None` -> missing; `str` -> `value == ""`; else
+  `bool(pd.isna(value))` guarded against `TypeError`/`ValueError`) has now
+  been independently, convergently reimplemented at least five times
+  (`core/fk.py:_norm_id`, `derived_column_policy.py:_norm`,
+  `validations/fk_helpers.py:_norm`, `domain/_cell_primitives.py:_is_empty_cell`,
+  `io_backends/ods/odf_renderer.py:_is_missing_carrier`) -- strong,
+  concrete evidence of "a framework has no stable internal value contract"
+  (per this task's own Stage B framing), not merely a hypothetical repeat.
+
+| Unresolved FK reference indistinguishable from a legitimately resolved
+  empty target value at the helper-cell level (both `""`)
+| *Done, accepted contract* (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`,
+  Semantic Contract Review 001)
+| *[ACCEPTED]* The derived helper cell is presentation only, never
+  resolution authority; both cases legitimately display `""`; resolution
+  state remains fully recoverable from the authoritative source FK column
+  plus a live target-frame lookup (`validate_fk_helpers`). No distinct
+  unresolved-value representation (sentinel, `null`, error token, new
+  type) was introduced or is required. *Teaches this FTR directly:* a
+  derived/presentational value does not need to duplicate information the
+  framework can already recompute from an authoritative source plus
+  resolution. This is the single strongest piece of evidence against
+  minting a distinct `Missing`/`Unresolved` sentinel type for the MVP (see
+  Stage F below).
+|===
+
+No other current, evidenced (as opposed to hypothetical) semantic-loss case
+was found during this FTR's inventory beyond the `csv_dir` missing-value gap
+already named in the value-flow matrix above (row 1, still open -- see
+"Implementation slices").
+
+==== 3. Normalization-pattern inventory (Stage B) [FACT]
+
+Classified by responsibility, per the task's own taxonomy:
+
+[cols="2,3,2",options="header"]
+|===
+| Pattern | Where, and what it actually normalizes | Classification
+
+| `_is_empty_cell(value)` (`domain/_cell_primitives.py`) and its five
+  independently-reimplemented siblings (see table above)
+| "Is this a carrier-missing value, for the purpose of this local
+  decision" -- key normalization (`_norm_id`), lookup-mismatch comparison
+  (`_norm` in `derived_column_policy.py` and `validations/fk_helpers.py`),
+  a generic empty-cell predicate (`_is_empty_cell`), and render-boundary
+  carrier recognition (`_is_missing_carrier`)
+| *Carrier normalization.* All five recognize the same underlying carrier
+  shape (`None` / `""` / NaN-family) for a locally-owned purpose. This is
+  the pattern most directly relevant to a shared Missing/carrier-boundary
+  contract (Stage F).
+
+| `df.where(pd.notnull(df), "")` (JSON backend line 93, YAML backend line
+  60)
+| Post-construction missing-value coercion to `""`, applied identically by
+  two independent backends via the same call shape
+| *Carrier normalization*, already convergent across two backends. CSV's
+  directory path (`csv_dir`) does *not* apply this -- the one confirmed gap
+  in an otherwise-converged pattern.
+
+| XLSX/ODS parser `str(val) if val is not None else ""` (multiple call
+  sites, same shape, not one shared helper -- confirmed 6 distinct call
+  sites in `xlsx/parser_interpretation.py` alone)
+| Visible-cell substrate collapse, per `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`
+| *Persistence/carrier normalization*, already an accepted architectural
+  decision, not an accident to fix. Repeated across call sites within one
+  file, not across files -- a narrower duplication than the cross-module
+  missing-carrier pattern above, and lower priority to consolidate.
+
+| `cell_codec/scalar.py` parse/serialize, `discriminator_split/naming.py`,
+  `tabular_views.py`, `helpers.py` -- separator/`str.split` based
+  compact-representation codecs
+| Domain-specific compact <-> expanded string transformation, each family
+  owning its own separator convention
+| *Persistence normalization*, intentionally family-local. Per Stage K
+  below, these are correctly string-only by contract (the accepted
+  visible-cell substrate), not evidence of a missing shared value type.
+
+| `core/fk.py:_norm_id` on FK *keys* specifically (distinct from the
+  general `_is_empty_cell` family above, though structurally similar)
+| Normalizes an FK key to `str` or `None` for join/lookup purposes
+| *Domain semantic normalization*, correctly family-owned: FK identity
+  comparison has its own contract (a key that fails `pd.isna` recognition
+  normalizes to `None`, a real, distinct join-miss signal, not merely a
+  missing-carrier recognition).
+
+| `isinstance(value, str)` guards across ~32 files in `domain/` (grep
+  count, not individually inventoried here -- representative sample only,
+  per the task's "do not refactor them" instruction)
+| Mixed -- some are validation-only ("reject a non-string label"), some are
+  comparison-normalization ("coerce for equality"), some are family-local
+  wire-format assumptions (compact codec participation)
+| Mixed across all six of the task's classification buckets; not one
+  pattern. This is Stage K's compatibility inventory, not Stage B's
+  duplication inventory -- kept separate here per the task's own
+  distinction between "repeated because no stable contract exists" and
+  "correct because the owner has a genuinely different contract."
+|===
+
+*Where local normalization is correct because the owner has a genuinely
+different contract* [FACT]: `core/fk.py:_norm_id` (FK-key identity, not
+generic missing-value recognition); `cell_codec`'s compact/expanded string
+transform (an explicit, opt-in, string-oriented wire format, not a value
+model); `derived_column_policy.py:_norm`'s use inside `enrich_lookup`
+mismatch comparison (a specific two-sided comparison contract, not a
+general predicate). None of these should be collapsed into a shared
+`Missing` predicate merely because their code *looks* similar to
+`_is_empty_cell` -- per the task's explicit instruction not to call two
+helpers duplicates merely on that basis.
+
+*Where local normalization is repeated because no stable contract exists*
+[FACT]: the `_is_empty_cell`/`_norm`/`_is_missing_carrier` family (five
+independent implementations of the identical `None -> True; str -> == ""`;
+else `pd.isna`-guarded` shape) is the concrete, evidenced case. This is not
+a hypothetical -- it is the direct, traceable cause of two now-closed BUGs.
+
+==== 4. Candidate-category evaluation (Stages C-G)
+
+===== Stage C -- String [RECOMMENDATION]
+
+Native `str` is sufficient. No wrapper is evidenced as necessary:
+
+* Ordinary strings are already stable as native Python `str` on every
+  ingress path re-verified in section 1 -- no maintained code treats a
+  plain string as ambiguous.
+* `""` must remain a legitimate payload value -- directly required by the
+  accepted `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` contract, which
+  depends on `""` being able to mean *both* "legitimately empty" and
+  "unresolved," disambiguated elsewhere (source FK + resolution), not by
+  the string's own shape.
+* Strings resembling `"nan"`, `"true"`, numbers, spreadsheet errors, or
+  formulas are always literal text unless an owning parser/schema
+  explicitly identifies another carrier -- directly confirmed: the ODS
+  fix's own literal-`"nan"`-preservation test proves the framework already
+  treats a domain string equal to `"nan"` as ordinary text, distinct from a
+  missing carrier, by checking `isinstance(value, str)` *before*
+  `pd.isna`.
+* No evidence anywhere in this inventory shows a missing invariant that a
+  `StringValue` wrapper would close. *Recommendation:* keep `str` native;
+  do not introduce a wrapper.
+
+===== Stage D -- Boolean [RECOMMENDATION, with an open compatibility note]
+
+* JSON/YAML backends force `dtype=str` (JSON) or apply missing-only
+  coercion after DataFrame construction (YAML) -- neither currently
+  preserves a native Python bool as a *distinguishable* type through to
+  Frames on the read side; a YAML `true`/`false` scalar in a non-missing
+  cell is whatever `pd.DataFrame(...)` inferred (frequently, but not
+  guaranteed, a real Python `bool`, since `yaml.safe_load` does produce
+  real `bool` objects for non-missing YAML booleans).
+* XLSX/ODS native boolean cells are stringified at the parser boundary
+  exactly like every other visible payload, per the accepted ADR --
+  `"TRUE"`/`"FALSE"` (ODS convention) or Python's own `str(True)` ->
+  `"True"` (XLSX, confirmed no dedicated boolean handling in the XLSX
+  parser at all -- an unaddressed cross-backend spelling asymmetry,
+  recorded here, not fixed).
+* CSV textual `"true"`/`"false"` is never interpreted as boolean by any
+  maintained parser -- confirmed: no maintained backend reads a CSV or
+  spreadsheet string and promotes it to a Python `bool` without an
+  explicit owning schema. This directly satisfies the task's instruction:
+  "do not treat the strings `\"true\"` / `\"false\"` as Boolean without an
+  explicit owning parser/schema rule."
+* On the write side, both renderers *do* special-case a real Python `bool`
+  (ODS explicitly, XLSX via OpenPyXL's own native handling) -- but this
+  path is only reachable from non-spreadsheet-ingress sources (direct
+  Frames, or a future backend that preserves native types), because every
+  spreadsheet ingress path already collapsed booleans to strings before
+  Frames exist.
+
+*Recommendation:* `bool` remains a legitimate, distinguishable in-memory
+scalar for structured/programmatic Frames (JSON/YAML/direct construction),
+consistent with current renderer behavior; the visible-spreadsheet-cell
+boolean spelling stays a string, per the accepted ADR, exactly as it is
+today. Preserving Boolean distinctly from String/Number removes real
+ambiguity *only* for structured payload; it removes no ambiguity on the
+spreadsheet-cell path, because that path never carries a native bool
+through to Frames in the first place. *[OPEN]* whether the XLSX/ODS
+boolean-text spelling asymmetry (`"True"`/`"False"` vs `"TRUE"`/`"FALSE"`)
+should be reconciled is a separate, narrow, sink-local decision -- not part
+of this FTR's scope, and not evidenced as causing any current defect (no
+BUG or test failure traces to it).
+
+===== Stage E -- Number; Integer versus Float [BOUNDED DEFER, per task instruction]
+
+* JSON/YAML canonical serialization: the historical motivating pain point
+  for `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` was exactly `1` vs `"1"`
+  round-tripping incorrectly through a workbook -- that ADR already decided
+  the *visible-cell* side of this question (string substrate; opt-in
+  typing only). This FTR does not reopen that.
+* pandas does not reliably preserve `int` vs `float` across the maintained
+  ingress paths inventoried in section 1: JSON forces `dtype=str`
+  (no native numeric survives ingestion at all); CSV's directory path
+  applies ordinary pandas dtype inference, which can silently promote an
+  integer column to `float64` in the presence of any missing value (a
+  well-known pandas behavior, not independently reproduced for this FTR
+  since it does not change any conclusion already evidenced above); YAML
+  is whatever `pd.DataFrame(...)` infers from parsed scalars.
+* XLSX/ODS numeric-cell behavior is fully subject to the accepted string
+  substrate -- no numeric type distinction survives spreadsheet ingress at
+  all today.
+* Actual domain families using sequence/order/count/index-like values were
+  not found to depend on a canonical `int`/`float` distinction anywhere
+  inventoried in this FTR's compatibility scan (Stage K, below) -- IDs
+  remain strings by existing contract (confirmed: FK keys are normalized
+  to `str` by `_norm_id`, never treated as numeric).
+* Arithmetic/comparison behavior: no maintained transformation family was
+  found, in this inventory's scope, to perform numeric arithmetic on
+  payload cell values as a primary responsibility (arithmetic that exists
+  -- e.g. row/column indices, dimension bounds -- operates on framework-
+  internal counters, not on payload scalars).
+
+*Recommendation, per the task's explicit permission to defer:* the MVP
+adopts a single `Number` category for now, without committing to
+`Integer | Float` as two separate MVP categories. This is *not* "collapse
+because spreadsheets expose one numeric cell class" (the task's own
+rejected reasoning) -- it is because no current evidenced consumer requires
+the distinction to be typed, and pandas does not reliably preserve it
+across every maintained ingress path regardless of what the MVP decides.
+*[OPEN]* the exact eventual `Number` representation (a bounded `float`, a
+tagged `int | float` union, or a `Decimal`-based contract) is left for the
+implementation slice that actually needs it (see "Implementation slices");
+this FTR does not choose one. `Decimal` is confirmed, per Technical Concept
+001's own inventory (re-verified: no `Decimal` usage found anywhere in the
+read/write paths inspected for this FTR either), to have no current
+evidenced need.
+
+===== Stage F -- Missing [RECOMMENDATION -- central]
+
+This is the section the task explicitly names as central, and the
+inventory above (sections 2-3) already supplies the evidence.
+
+*[FACT]* Distinguishing the five listed manifestations against current
+code:
+
+* *`None`* -- a carrier manifestation. Never itself legitimate domain
+  payload on any maintained path; always either normalized away (JSON/YAML
+  post-construction coercion) or, where unnormalized (CSV directory read),
+  a confirmed gap.
+* *`numpy.nan` / `pandas.NA` / `NaT`* -- carrier manifestations, identical
+  in kind to `None` for this purpose. The whole `_is_empty_cell` family
+  already treats all three uniformly via `pd.isna(...)`, confirmed by
+  reading the five implementations directly.
+* *`""`* -- *[ACCEPTED]*, per `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s
+  adopted contract, legitimate domain payload *and* the accepted carrier
+  for an unresolved reference simultaneously, disambiguated by
+  authoritative-source-plus-resolution, not by the string's own value.
+  This FTR must not, and does not, propose collapsing `""` into a
+  carrier-missing category at the domain-semantic level -- only the five
+  *local* predicates above are entitled to treat `""` as "blank" for their
+  own narrow, already-justified purposes (rendering emptiness, FK-key
+  lookup-miss equivalence).
+* *FK unresolved state* -- *[ACCEPTED]*, does not require an
+  `UnresolvedReference` type; resolution state is a pure function of
+  `(source_frame, target_frame)` recomputable on demand
+  (`validate_fk_helpers`), not a stored value shape.
+* *A successful lookup whose target payload is itself missing* -- *[FACT]*,
+  distinct from an unresolved lookup (the BUG's own "Missing target
+  payload" section proves this explicitly): the FK *resolves*; the
+  *resolved value itself* is a missing carrier. This is exactly the
+  carrier-boundary leak class both BUGs closed, not a reference-resolution
+  question.
+
+*Recommended contract:*
+
+. *No new `Missing` type, class, or sentinel value.* The evidence
+  (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s Option A rejection,
+  reasoned through in detail there and not re-litigated here) shows a
+  distinct in-band sentinel would relocate ambiguity rather than remove
+  it, and duplicate information the framework does not need duplicated.
+  This FTR adopts that reasoning as general, not FK-helper-specific: it
+  generalizes because the underlying argument ("a derived/presentational
+  value need not carry information recoverable from an authoritative
+  source") does not depend on FK helpers specifically.
+. *A shared carrier-missing recognition predicate is the correct
+  mechanism*, not a value type. The five convergent implementations
+  already agree on its shape:
++
+[source,python]
+----
+def is_missing_carrier(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+----
++
+This is *recognition*, not *representation* -- it answers "is this cell's
+current carrier a missing one," it does not mint a new value that flows
+through the system. The MVP's job is to make this recognition available
+at every carrier-boundary write/normalize point that currently lacks it
+(the confirmed `csv_dir` gap), and to stop it from being silently
+reinvented a sixth time.
+. *On the spreadsheet-payload side*, the canonical missing representation
+  stays `""` -- an ordinary string, per the accepted substrate ADR, exactly
+  as already implemented by every closed BUG's fix. This FTR does not
+  propose a spreadsheet-visible token distinct from `""`.
+. *On the structured/programmatic side* (CSV directory, direct Frames), a
+  real pandas/NumPy missing carrier may still legitimately exist in
+  memory between ingress and any boundary that normalizes it -- the MVP
+  does not need to eliminate pandas `NaN` from DataFrame internals (that
+  would fight ordinary DataFrame ergonomics, which the task explicitly
+  asks this FTR to preserve); it needs the *boundary* crossings
+  (persistence, spreadsheet write, cross-format normalization) to
+  recognize and normalize it consistently, using the shared predicate
+  above, rather than each boundary reinventing its own detection.
+
+*DataFrame ergonomics assessment* [FACT]: a recognition-predicate-only
+contract imposes zero cost on ordinary pandas operations -- no column dtype
+changes, no wrapper unwrapping before arithmetic/comparison/grouping, no
+new object-column overhead. This is the direct reason this FTR prefers it
+over any sentinel-object approach (which would either need to be a real
+NaN-compatible float subclass, with the attendant IEEE-754 equality
+problems the ODS BUG's root cause already demonstrates, or an object that
+breaks numeric dtype columns).
+
+===== Stage G -- Error [RECOMMENDATION -- deferred, not rejected outright]
+
+*[FACT]* No current maintained path can actually observe a distinct
+spreadsheet error carrier:
+
+* XLSX: confirmed by direct probe this task (see section 1) -- without
+  real spreadsheet-application evaluation, OpenPyXL has no cached error
+  value to surface; `data_only=True` returns `None` for an unevaluated
+  formula, not an error token.
+* ODS: no maintained parser code path reads an ODS error `value-type` or
+  error-specific attribute (grep-confirmed: no error-handling code exists
+  in either backend package).
+* A literal string such as `"#N/A"` appearing anywhere in payload is,
+  to every current maintained code path, always an ordinary domain string
+  -- confirmed, not merely asserted, by the absence of any distinguishing
+  code.
+
+*Recommendation:* Error is *justified in principle but currently blocked on
+parser preservation*, not rejected and not adopted into the first MVP
+slice. No maintained ingress path can currently produce the input an Error
+category would need to distinguish, so typing it now would define a
+category with no reachable instance -- exactly the "invent an Error class
+merely because spreadsheets have error cells" outcome the task explicitly
+warns against. *[OPEN]* if a future FTR adds real spreadsheet-application-
+evaluated error-cell preservation to either parser, Error becomes
+immediately actionable using the same recognition-not-representation
+pattern as Missing; this FTR does not design that parser work and does not
+block it, but the internal value model does not need to anticipate it with
+an empty category today.
+
+===== Explicitly undecided (per task brief, left undecided here as directed)
+
+* *Integer vs Float* -- bounded-defer, per Stage E above.
+* *Date / Time / DateTime* -- *[FACT]*: no maintained parser currently
+  preserves a distinguishable date/time carrier through to canonical
+  payload. ODS reads `date-value`/`time-value` attributes only as a
+  fallback when paragraph text is empty (uncommon for LibreOffice/Excel-
+  authored date cells, which normally do carry formatted paragraph text),
+  and immediately stringifies whatever it finds; XLSX has no date-specific
+  handling at all (`str(datetime_obj)` if a `datetime` object is present).
+  No canonical parse-back exists anywhere. *[OPEN, explicitly deferred per
+  task instruction]* -- this FTR records the current-state fact and takes
+  no position on a future Date/Time/DateTime category; there is
+  insufficient current evidence of a maintained consumer that needs it
+  typed, and the visible-cell substrate ADR governs the spreadsheet side of
+  any future answer regardless.
+
+==== 5. Recommended MVP categories [RECOMMENDATION]
+
+[source,text]
+----
+String   -- native str; no wrapper (Stage C)
+Boolean  -- native bool for structured/programmatic Frames; spreadsheet
+            payload stays string, per the accepted substrate ADR (Stage D)
+Number   -- single category for the MVP; Integer/Float bounded-defer (Stage E)
+Missing  -- a shared recognition predicate over carriers (None / "" / NaN-
+            family), not a new type or sentinel; canonical spreadsheet
+            representation remains "" (Stage F)
+Error    -- deferred; no MVP category yet, blocked on parser preservation,
+            not rejected in principle (Stage G)
+----
+
+Date/Time/DateTime remain explicitly out of the MVP category set, per the
+task's own framing and the current-state evidence above.
+
+==== 6. Native scalars versus wrappers (Stage I) [RECOMMENDATION]
+
+[cols="2,3,3",options="header"]
+|===
+| Dimension | Native-value contract | Wrapper/value-object contract
+
+| pandas compatibility
+| No change -- `str`/`bool`/numeric/carrier-NaN are already what pandas
+  columns hold today
+| Every wrapper instance sits in an `object`-dtype column; loses
+  vectorized dtype benefits pandas already provides for `str`/`bool`/
+  numeric columns today
+
+| DataFrame assignment/coercion
+| Unaffected
+| A wrapper assigned into a numeric-inferred column risks silent
+  `object`-dtype demotion of the whole column, or requires per-column
+  `dtype=object` pinning everywhere a wrapper might appear
+
+| Vectorized operations
+| Unaffected -- pandas' native numeric/string/bool vectorization applies
+  normally
+| Lost or requires per-operation unwrapping; defeats the DataFrame
+  ergonomics the task explicitly asks this FTR to preserve
+
+| Joins/grouping/filtering
+| Unaffected -- FK joins, `groupby`, boolean filtering all already work on
+  native scalars today (confirmed: `_norm_id`-based FK joins operate on
+  plain `str`/`None`)
+| Every join/group/filter key becomes a wrapper-equality question;
+  `Missing`'s IEEE-754-adjacent equality problem (the exact root cause the
+  ODS BUG traced) recurs unless the wrapper carefully reimplements
+  `pd.isna`-compatible comparison itself
+
+| Serialization / JSON / YAML ergonomics
+| Unaffected -- native scalars serialize with stdlib `json`/`yaml.safe_dump`
+  with no custom encoder
+| Every wrapper needs a custom encoder/decoder pair, maintained in
+  parallel with the native serializers already in use
+
+| Backend adapters
+| Unaffected -- adapters already read/write native scalars
+| Every adapter (XLSX, ODS, CSV, JSON, YAML, XML) needs wrapper-aware
+  read/write logic, multiplying the exact per-format duplication this FTR
+  is trying to reduce
+
+| Debugging
+| A `repr()` of a DataFrame cell is already meaningful
+| An extra unwrap step at every debugging/`print()`/log site
+
+| Type annotations
+| `str \| bool \| int \| float \| None` (or a `Number` alias per Stage E)
+  is already expressible without new classes
+| Requires a new union/protocol *and* still needs a native-value escape
+  hatch wherever pandas vectorization is required, so the wrapper does not
+  actually replace native typing, it adds a layer in front of it
+
+| Amount of code "infected" by wrappers
+| None -- every existing consumer keeps working unchanged
+| Every domain transformation, every adapter, every test fixture that
+  touches a payload cell needs wrapper-awareness -- a far larger blast
+  radius than this FTR's evidenced need justifies
+
+| Prevents any evidenced current defect?
+| Yes -- the shared recognition predicate (Stage F) directly targets the
+  exact evidenced defect class (a carrier silently becoming domain text)
+| No additional defect prevention beyond what the native-value recognition
+  predicate already provides; both closed BUGs were fixed with a
+  *predicate*, not a wrapper, and neither fix needed one
+|===
+
+*Recommendation:* native scalars plus a shared recognition predicate for
+Missing. No wrapper hierarchy is justified by current evidence. This
+directly follows the task's own instruction to prefer the smallest
+mechanism that establishes an enforceable contract, and not to favor
+wrappers for theoretical purity -- every dimension compared above either
+favors native values or is neutral; none favors wrappers.
+
+==== 7. Contract boundary ownership (Stage J) [RECOMMENDATION]
+
+Distinguishing raw loader/parser output from trusted domain Frames, per the
+task's framing, and per the existing boundary-ownership table already
+established in Technical Concept 001 section 9 (re-verified current in this
+task, restated here only where it bears on this FTR's own decision):
+
+[source,text]
+----
+raw loader/parser output
+    -> [D1 -- this FTR's slice] carrier-missing recognition available
+       at every boundary that currently lacks it
+    -> [future, Trusted Ingress / Phase E] structural/scalar ingress
+       enforcing a closed type set
+    -> trusted domain Frames
+----
+
+*[RECOMMENDATION]* This FTR's own slice (D1, below) does *not* create a new
+ingress mechanism, phase, or coordinator. It targets the one confirmed gap
+(the `csv_dir` directory-read path) by extending that path to match the
+already-converged JSON/YAML pattern (`dtype=str`-equivalent normalization
+plus `df.where(pd.notnull(df), "")`-equivalent missing-value coercion),
+using the shared recognition predicate where a boolean check is needed.
+This is *local convergence*, not a new boundary -- it does not touch
+`domain/ingress/coordinator.py`'s `INGRESS_RULES` tuple, and it does not
+decide the ingress *mechanism* question Technical Concept 001 section 10
+explicitly leaves open for a later Trusted Ingress FTR.
+
+*[OPEN]* Whether the eventual Trusted Ingress boundary (Phase E) becomes an
+extension of the current flat `INGRESS_RULES` tuple, explicit subphases,
+feature-owned schema delegates, or another bounded coordinator design is
+*not* decided by this FTR, consistent with Technical Concept 001's own
+explicit withdrawal of any claim that the current tuple shape is
+pre-selected. This FTR's contribution is narrower: it specifies *what*
+future Trusted Ingress must be able to guarantee about scalar/missing
+values (see "Handoff to Trusted Ingress" below), not *how* it is
+mechanically built.
+
+Avoiding "every transformation permanently reinterprets pandas carrier
+values independently" [RECOMMENDATION, directly responsive to the task's
+own warning]: the shared recognition predicate, once available at a stable
+location (see Implementation Slices, D1), removes the *need* for
+transformation-local reinvention going forward -- new code has a documented
+predicate to import instead of writing a sixth copy. This FTR does not
+mandate retrofitting the five existing copies (that is a Family Cycle 2/3
+"remove redundant defensive logic" / "review supported types" concern per
+the roadmap, not this FTR's scope), but it does recommend that the D1 slice
+place the predicate somewhere all five *could* eventually import from
+without crossing an unwanted layering boundary (see D1's exact scope
+below).
+
+==== 8. Relationship to the visible-cell string ADR (Stage H) [RECOMMENDATION / OPEN]
+
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` is authoritative and is *not*
+reopened by this FTR. Separating the three questions the task asks this
+FTR to keep distinct:
+
+[cols="2,4",options="header"]
+|===
+| Question | This FTR's answer
+
+| Can internal/domain Frames hold meaningful typed scalar values?
+| *Yes, already true today*, and unaffected by the ADR: the ADR governs the
+  *spreadsheet-carrier* boundary specifically (what a cell looks like once
+  it crosses the XLSX/ODS parser), not what a DataFrame column may contain
+  before or after that crossing. JSON/YAML/direct-Frames payload already
+  legitimately carries typed scalars (bool, numeric-inferred columns) with
+  no ADR conflict. This FTR's recommended MVP categories describe this
+  existing, ADR-unconstrained space -- they do not propose typing the
+  spreadsheet substrate itself.
+
+| Should XLSX/ODS preserve native bool/number/error identity on parse?
+| *Not decided by this FTR; would require reopening the ADR if adopted.*
+  The ADR's own "Migration strategy" section already names "carrier-type
+  preservation as read-path hint" as a recorded, non-disruptive future
+  option (both parsers already read `cell.data_type`/`office:value-type`
+  before discarding it) -- this FTR does not activate that option, and does
+  not recommend activating it now: no revisit criterion from the ADR's own
+  list is currently met (no second independent adopter pain report, no
+  roadmap item depending on typed visible values beyond this FTR's own
+  Missing-carrier recognition work, which the ADR's own status note
+  already treats as compatible/additive, not a typing escape hatch).
+
+| Should XLSX/ODS render native typed cells or continue the existing
+  visible string substrate initially?
+| *Continue the existing string substrate.* This FTR's MVP does not
+  require, and does not recommend, any renderer change to emit native
+  typed cells for ordinary payload. The two closed BUGs' fixes are both
+  fully compatible with the unchanged substrate (they detect and normalize
+  a *carrier*, they do not introduce a new *visible* representation).
+|===
+
+*[OPEN, per this FTR's own determination]* -- does adopting this FTR's
+recommended MVP require a successor/amendment ADR? *No.* Every
+recommendation in this FTR (native scalars, no wrapper, a shared
+Missing-recognition predicate, deferred Error, deferred Integer/Float,
+deferred Date/Time) operates entirely within the space
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` already leaves open (structured/
+programmatic Frames, not the spreadsheet-visible substrate) or reinforces
+the ADR's own existing contract (the spreadsheet-side Missing
+representation stays the ordinary string `""`, exactly as the ADR already
+implies). If a *future* slice activates one of the ADR's own recorded
+migration options (read-path-hint preservation, frame-level type hints,
+or the fully typed IR substrate), *that* slice would need to open a
+successor/amendment ADR at that time -- not this one, and not now.
+
+==== 9. Formula hard non-goals [ACCEPTED -- restated, not re-derived]
+
+Restated verbatim in substance from `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s
+"Deferred formula / typing constraint" section, which this FTR is required
+to treat as binding evidence, not re-open:
+
+* *Formula is outside the MVP.* A formula is carrier/workbook behavior
+  layered on top of whatever value it evaluates to, not a scalar payload
+  value. It is not part of this FTR's recommended MVP category set.
+* *Observed formula != authored `FormulaSpec`.* `core/formulas.py`'s
+  `ListLiteralFormulaSpec`/`LookupFormulaSpec` are authored, backend-
+  neutral, output Intent the framework itself constructs. A formula merely
+  observed while reading an existing workbook is carrier/workbook state,
+  not automatically that Intent. Confirmed unchanged this task
+  (`core/formulas.py` re-read; both dataclasses `frozen=True`, directly
+  constructible, unrelated to any read-path behavior).
+* *Default read direction (deferred design direction, not implemented
+  here)*: existing spreadsheet formulas should normally be consumable as
+  their materialized/cached values; preservation requires explicit read
+  policy. This FTR does not turn that direction into an implementation
+  contract, consistent with the constraint that produced it.
+* *Projection/use-case ownership.* Formula preservation must not become
+  immutable column typing. The same canonical field may legitimately need
+  both an editable-workbook-roundtrip (formula-preserving) projection and
+  an external-extraction (materialized-value) projection. This FTR's
+  recommended Number/Boolean/String/Missing categories describe *payload
+  values*, not *projection policy*, and do not conflict with this
+  constraint.
+* *Timing.* Any future formula-preservation read policy must be available
+  at or before the parser boundary (`router.get_loader(kind)`), not as a
+  mid-pipeline step such as `bootstrap_meta` -- confirmed still true this
+  task (pipeline execution order unchanged; `bootstrap_meta` still runs
+  inside `run_pipeline`, strictly after the loader has already parsed the
+  file). This FTR does not design that policy or its API/DSL, per the
+  task's explicit instruction.
+
+==== 10. Compatibility / adoption matrix (Stage K) [FACT]
+
+Representative survey (not exhaustive; the task explicitly does not
+require refactoring these surfaces now, only classifying them to shape
+future slicing):
+
+[cols="2,2,4",options="header"]
+|===
+| Surface | Classification | Evidence
+
+| FK helpers (`core/fk.py`, `domain/transformations/fk_helpers/`)
+| Already type-neutral / compatible with native typed values
+| `_norm_id` already normalizes via `pd.isna`, not string-only assumptions;
+  the accepted contract (section 2) already generalizes past FK helpers.
+
+| Cell Codec (`domain/transformations/cell_codec/`)
+| Intentionally string-only
+| Own module docstring states the codec is string-oriented by contract,
+  per the visible-cell substrate ADR; not a gap, a deliberate boundary.
+
+| Discriminator split, tabular views, compact-multiaxis-adjacent helpers
+  (`discriminator_split/naming.py`, `tabular_views.py`, `helpers.py`)
+| Intentionally string-only (separator-based wire formats)
+| Confirmed via grep: `.split()`/separator-based compact representations,
+  each family-owned, matching the same string-substrate contract as Cell
+  Codec.
+
+| Projection / joins / xrefs (general `domain/` `isinstance(str)` sites,
+  ~32 files by grep count)
+| Mixed -- requires per-site classification, not evidenced as one pattern
+| Representative sample only, per task instruction not to refactor here;
+  a full classification belongs to a future Family Cycle 3 ("review
+  supported types") pass for whichever family is hardened first, not to
+  this FTR.
+
+| Schema maintenance / registries (`registries/meta_registry.yaml` and
+  friends)
+| Outside MVP
+| Governs `_meta`, not payload scalar values; this FTR's category set is
+  payload-scoped, per its own stated purpose.
+
+| Predicates/filtering (`_where_predicates.py` and similar)
+| Compatible with native typed values
+| Already operates on native pandas comparison semantics; no wrapper
+  dependency found.
+
+| Persistence/writers (backend renderers)
+| Requires adaptation for the one confirmed gap (`csv_dir`); otherwise
+  already compatible
+| See section 1's value-flow matrix; JSON/YAML/XLSX/ODS write paths already
+  match the recommended contract's expectations, `csv_dir`'s read path
+  does not.
+
+| Rendering (`rendering/composer/layout_composer.py` and backend
+  renderers)
+| Compatible with native typed values; already the site of both accepted
+  BUG fixes
+| `compose_workbook` copies `df.values.tolist()` verbatim; both renderer
+  fixes operate downstream of it, confirming the recognition-predicate
+  approach composes with the existing render pipeline without requiring a
+  `TableBlock`-level change.
+
+| Validation (`domain/validations/`)
+| Already type-neutral / compatible
+| `validate_fk_helpers`/`check_unresolvable_fks` already operate on
+  native comparison semantics, confirmed by the accepted BUG contract
+  itself.
+|===
+
+==== 11. Relationship to Payload Semantics Recovery (Stage L) [RECOMMENDATION]
+
+`FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` (exploratory, New) proposes a general
+registry-level *classify / recover / pin* contract for `_meta` entries on
+which visible-payload *meaning* depends (e.g. `cell_codecs`,
+`sparse_defaults`, `xref_crosstable`). This FTR is about a different, lower
+layer: the *scalar carrier* contract for payload cells themselves,
+independent of which `_meta` entries interpret them.
+
+*[RECOMMENDATION]* This FTR is *independent* of, not a superset,
+prerequisite, or partial absorption of, `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`:
+
+* This FTR does not supersede any part of it -- the metadata-recovery
+  contract's scope (registry attributes on `_meta` entries) is entirely
+  outside this FTR's payload-scalar scope.
+* This FTR is not a prerequisite for it -- `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`'s
+  own scope statement lists "resolution of
+  `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`" as explicitly out of its
+  scope, and that BUG is independently closed now; nothing in this FTR is
+  named as that FTR's blocking dependency.
+* This FTR does not absorb any narrow part of it -- the closest point of
+  contact is `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`'s own stated "recovery
+  preference" (favor surfacing meaning into data over a metadata-only
+  finding), which the accepted BUG contract already resolved differently
+  for the FK-helper case specifically (no recovery representation needed,
+  because the source reference already carries the meaning) -- that
+  FTR's own text already records this outcome and does not re-decide it.
+* No duplicate future work is created: `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5`'s
+  scope is `_meta` registry classification; this FTR's scope is payload
+  scalar carriers. Their motivating cases overlap (both cite the same BUG
+  as evidence) without their solution spaces overlapping.
+
+==== 12. Implementation slices (dependency order) [RECOMMENDATION]
+
+Derived from this inventory, not copied from the task's own illustrative
+example:
+
+[source,text]
+----
+D1 -- Shared carrier-missing recognition predicate, made importable
+D2 -- csv_dir missing-value/dtype normalization (close the one confirmed gap)
+D3 -- Documented MVP scalar-category contract (String/Boolean/Number/
+      Missing; Error/Integer-Float/Date-Time deferred), as a type-alias-
+      level description, not new classes
+D4 -- Compatibility-inventory follow-through for the "mixed" surfaces
+      Stage K left unclassified, scoped to whichever family Phase F's
+      pilot selects (not this FTR's own scope to execute)
+----
+
+*D1 -- shared carrier-missing recognition predicate.*
+
+* Narrow, testable invariant: `is_missing_carrier(None) is True`,
+  `is_missing_carrier("") is True`, `is_missing_carrier(float("nan")) is True`,
+  `is_missing_carrier(pd.NA) is True`, `is_missing_carrier("nan") is False`
+  (a literal domain string), `is_missing_carrier(0) is False`,
+  `is_missing_carrier(False) is False`.
+* Placement: `core/` is the recommended location (not `domain/`), because
+  `io_backends` already depends on `core` (confirmed:
+  `io_backends/ods/odf_renderer.py`'s own docstring on `_is_missing_carrier`
+  names the *absence* of an `io_backends -> domain` dependency as the
+  reason it stayed a local copy; `core` does not have that restriction).
+  This FTR does not mandate immediately migrating the five existing
+  implementations to import it -- that is optional follow-up, explicitly
+  not required for D1's own acceptance.
+* Does not change any renderer, parser, or domain transformation's
+  *behavior* -- it only makes an already-converged predicate importable
+  from a location every current implementer could reach.
+
+*D2 -- `csv_dir` missing-value/dtype normalization.*
+
+* Narrow, testable invariant: `load_csv_dir` on a directory containing a
+  blank cell produces `""` in the resulting Frame, not a pandas `NaN`,
+  matching the JSON/YAML backends' already-converged behavior; a
+  numeric-looking column does not silently promote to `int64`/`float64`
+  ahead of the accepted string-substrate expectations downstream.
+* This closes the last open trigger path named in
+  `BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A`'s own evidence
+  (reproduction 2 used exactly this gap) -- the renderer-side fix is
+  already done; this slice is the matching ingress-side fix.
+
+*D3 -- documented MVP scalar-category contract.*
+
+* Narrow, testable invariant: a short, explicit, reviewable statement
+  (type aliases and docstrings, not new runtime classes) of the supported
+  scalar categories this FTR recommends (String/Boolean/Number/Missing),
+  their native Python representation, and the explicit non-goals (Error,
+  Integer/Float split, Date/Time), placed where the roadmap's own staged
+  typing strategy expects it (`docs/technical_model/` concept-doc tier, or
+  equivalent) -- *not authorized by this FTR to be written yet*; this slice
+  is named here only to complete the dependency-ordered map, per the
+  task's own instruction that this FTR is inventory and contract design,
+  not the typing work itself.
+
+*D4 -- compatibility follow-through.*
+
+* Scoped entirely to whichever transformation family
+  `roadmap_domain_hardening_sequence.adoc`'s "Selecting the first family"
+  pilot chooses; this FTR does not select that family and does not
+  authorize this slice's execution now.
+
+==== 13. Acceptance criteria (for this FTR's own inventory/design scope)
+
+* [ ] This FTR document exists at
+  `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc` and is
+  registered in `docs/backlog/_ftrs_open.adoc`.
+* [ ] The current-state value-flow matrix (section 1) is independently
+  re-verified against current source for every backend named, not merely
+  copied from Technical Concept 001.
+* [ ] The observed semantic-loss/collision inventory (section 2) names
+  every currently-closed BUG relevant to this FTR's scope and states its
+  disposition accurately.
+* [ ] The normalization-pattern inventory (section 3) identifies the
+  convergent `is_missing_carrier`-shaped duplication as the primary
+  evidenced repetition, distinct from intentionally-local patterns.
+* [ ] Each of String/Boolean/Number/Missing/Error is evaluated against
+  current evidence, not accepted or rejected by default (section 4).
+* [ ] A recommended MVP category set is stated (section 5), with
+  Integer/Float and Date/Time explicitly and separately marked deferred,
+  not silently included or excluded.
+* [ ] A native-scalar-vs-wrapper recommendation is stated with an explicit
+  per-dimension comparison (section 6), not an unsupported assertion.
+* [ ] A contract-boundary-ownership recommendation is stated (section 7)
+  that does not pre-select a Trusted Ingress mechanism.
+* [ ] The relationship to `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` is
+  stated for all three of internal typing / ingress typing / egress typing
+  separately (section 8), with an explicit determination of whether a
+  successor/amendment ADR is required (it is not, per this FTR's finding).
+* [ ] Formula non-goals are restated as binding, not re-derived (section 9).
+* [ ] A compatibility/adoption matrix exists (section 10) covering at
+  least the eight families the task names.
+* [ ] The relationship to `FTR-PAYLOAD-SEMANTICS-RECOVERY-P5` is stated
+  explicitly (section 11), not left implicit.
+* [ ] Implementation slices are given in dependency order with a narrow
+  testable invariant per slice (section 12).
+* [ ] Explicit non-goals are listed (section 14).
+* [ ] A handoff shape for Trusted Ingress is recorded (section 15).
+* [ ] `git diff --check` and `git status --short` show only
+  documentation/backlog changes.
+* [ ] No Project Memory file changed. No ADR created. No Python source
+  changed. No test changed.
+
+==== 14. Required executable tests (for the slices this FTR authorizes -- not run by this FTR itself)
+
+This FTR authorizes no implementation and therefore adds no tests itself.
+For whichever future task implements the slices above, the following are
+the minimum required regressions, stated here so implementation work does
+not have to rediscover them:
+
+* *D1:* a focused unit test for `is_missing_carrier` covering the seven
+  cases enumerated in D1's own acceptance bullet above, at minimum.
+* *D2:* a `tests/roundtrip/` case (per the project's roundtrip-invariant
+  test-layer convention) proving a blank `csv_dir` cell survives a full
+  export/reimport cycle as `""`, on both backends, mirroring the pattern
+  already established by `test_csv_dir_blank_cell_carrier_is_backend_consistent`
+  in `tests/roundtrip/test_pathological_cell_contracts.py` (which already
+  exists for the *render* side per the ODS BUG's closure -- D2 is the
+  matching *ingress*-side regression, currently absent).
+* *D3:* none -- a documentation-only slice; validated by rendering, not by
+  pytest.
+
+==== 15. Explicit non-goals
+
+* Formulas; formula-preservation DSL or API; formula evaluation.
+* Formatting/presentation metadata (column widths, fills, alignment,
+  orientation) -- orthogonal to payload value semantics, per the existing
+  presentation-metadata families' own established boundary.
+* Provenance redesign.
+* Resolution typing (an explicit `Resolved`/`Unresolved` internal state) --
+  evidenced-unnecessary by the accepted BUG contract.
+* FK `UnresolvedReference` or any other new reference-state type.
+* Structural carriers such as `ExactTable`/`GroupedMatrix` -- already
+  implemented, already out of this FTR's payload-scalar scope.
+* General spreadsheet schema/type declarations (a per-column typing DSL).
+* Resurrecting `_meta.cell_codecs` as an active mechanism.
+* Trusted Ingress implementation (Phase E) -- this FTR only states what a
+  future Trusted Ingress must eventually guarantee about scalar/missing
+  values (section 16), it does not build it.
+* Security policy, parser/resource limits, or any content this FTR's
+  reading confirmed belongs to `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`'s
+  own explicit non-goals list instead.
+* Broad family refactoring (Family Cycles 0-7) -- this FTR is Phase D of
+  the roadmap, strictly before Phase F's family-by-family work begins.
+* Any Python value-class, wrapper, or new runtime type. Per section 6's
+  recommendation, none is authorized or needed for the MVP.
+* Any ADR creation or amendment -- per section 8's finding, none is
+  currently required.
+* Project Memory updates -- deferred to a separate follow-up task, per
+  this task's own instructions.
+
+==== 16. Handoff to Trusted Ingress (Phase E) [RECOMMENDATION]
+
+This FTR does not build Trusted Ingress, but records what this inventory
+implies a future Trusted Ingress slice will eventually need to guarantee
+about scalar and missing values, so that work does not have to rediscover
+this FTR's findings:
+
+* A future Trusted Ingress boundary should be able to assume the shared
+  `is_missing_carrier` recognition predicate (D1) already exists and is
+  importable from a stable location, rather than needing to define its own.
+* A future Trusted Ingress boundary should enforce that every ingress path
+  reaches the same missing-value normalization JSON/YAML already converge
+  on today (`""` for a missing scalar) -- D2 closes the one currently
+  confirmed gap (`csv_dir`) ahead of Trusted Ingress needing to route
+  around it, consistent with the same "remove one concrete pre-existing
+  leak before the next phase begins" pattern both closed BUGs already
+  established for the renderer side.
+* A future Trusted Ingress boundary's closed scalar type set, when it is
+  designed, has this FTR's recommended MVP category set
+  (String/Boolean/Number/Missing, Error deferred, Integer/Float and
+  Date/Time explicitly undecided) as its evidenced starting point -- not a
+  requirement to adopt it unchanged, but a documented baseline so the
+  ingress FTR is not starting from zero.
+* This FTR's finding that no wrapper hierarchy is justified (section 6)
+  applies equally to however Trusted Ingress represents its own
+  normalized values -- a future ingress FTR proposing a wrapper-based
+  "trusted value" representation would need fresh evidence beyond what
+  this inventory found, not merely inherit this FTR's authorization.
+* The ingress *mechanism* question (flat tuple vs. subphases vs. delegated
+  schemas vs. another coordinator design) remains entirely open, per
+  section 7 -- this FTR takes no position and this handoff does not imply
+  one.
+
+==== Validation
+
+Commands and probes run for this FTR (read-only; no production/test file
+modified):
+
+[source,console]
+----
+git rev-parse --show-toplevel
+git status --short
+git rev-parse HEAD
+git log --oneline --decorate -30
+make memory-context
+----
+
+Source re-reads confirming no drift from Technical Concept 001's evidence
+(all performed directly against current `core` HEAD `17f08ff`, not assumed
+from the concept document):
+
+* `src/spreadsheet_handling/io_backends/xlsx/parser_interpretation.py` --
+  `str(val) if val is not None else ""` call sites.
+* `src/spreadsheet_handling/io_backends/ods/odf_parser.py` -- `_cell_value`,
+  `office:value-type` fallback branches.
+* `src/spreadsheet_handling/io_backends/csv_backend.py` -- `read_multi` vs
+  `read` dtype/na-handling asymmetry.
+* `src/spreadsheet_handling/io_backends/json_backend.py`,
+  `src/spreadsheet_handling/io_backends/yaml_backend.py` -- `dtype=str` /
+  `df.where(pd.notnull(df), "")`.
+* `src/spreadsheet_handling/io_backends/ods/odf_renderer.py` --
+  `_is_missing_carrier`, the boolean-write branch.
+* `src/spreadsheet_handling/domain/_cell_primitives.py`,
+  `src/spreadsheet_handling/core/fk.py` (`_norm_id`) -- the convergent
+  predicate family.
+* `src/spreadsheet_handling/domain/ingress/coordinator.py`,
+  `src/spreadsheet_handling/domain/ingress/legend_blocks.py` -- current
+  `INGRESS_RULES` shape.
+* `src/spreadsheet_handling/core/exact_table.py`,
+  `src/spreadsheet_handling/domain/transformations/grouped_xref/matrix.py`
+  -- controlled-carrier precedent.
+* `src/spreadsheet_handling/core/formulas.py` -- `FormulaSpec` dataclasses.
+* `src/spreadsheet_handling/domain/transformations/cell_codec/frame.py` --
+  string-oriented codec docstring, no `_meta.cell_codecs` reader.
+
+Live probes (read-only, no file left behind in the repository -- written to
+and executed from the session scratchpad):
+
+* OpenPyXL formula/error-cell probe: wrote `=1/0` to a workbook, reloaded
+  with `data_only=True` (`None`, `data_type="n"`) and `data_only=False`
+  (`"=1/0"`, `data_type="f"`) -- confirms no error-token carrier is
+  observable via any maintained automated path.
+* Representative grep counts for Stage K's compatibility survey
+  (`isinstance(..., str)` sites in `domain/`, `str(value)`-shaped
+  coercions, separator/`split`-based compact codecs).
+
+No production or test file was modified. `git diff --check` and
+`git status --short` show only this new FTR file and the backlog-index
+registration described below.
+
+==== Commit
+
+One documentation-only commit:
+
+[source,text]
+----
+docs(backlog): define minimal internal value model scope
+----
+
+Stages the new FTR file and the `docs/backlog/_ftrs_open.adoc` registration
+by explicit path (not `git add -A`/`git add .`). Does not update Project
+Memory. Does not push (remote sync is a developer action per
+`agent_rules.adoc`).
