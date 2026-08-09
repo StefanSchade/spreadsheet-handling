@@ -21,11 +21,14 @@ instead of drifting this docstring out of sync with it):
   `numpy.floating`). Integer-vs-Float is a bounded MVP deferral, not a
   decision this module makes.
 * *Missing* -- not a value or a type; a *recognition* over already-accepted
-  carriers (`None`, `""`, and the NaN/`pandas.NA`/`NaT` family via
-  `pandas.isna`). `is_missing_carrier` is the shared predicate that five
-  independent local implementations had already converged on before this
-  module existed (see the FTR's normalization-pattern inventory); this is
-  the first shared, importable copy, not a new semantic.
+  carriers (`None`, `""`, and the NaN/`pandas.NA`/`NaT` family, recognized
+  through a bounded dispatch -- `pandas.isna` for known numeric/NumPy-scalar
+  carriers, identity for the `pandas.NA`/`NaT` singletons -- that never
+  invokes `pandas.isna` on an arbitrary unrecognized object; see
+  `is_missing_carrier`). `is_missing_carrier` is the shared predicate that
+  five independent local implementations had already converged on before
+  this module existed (see the FTR's normalization-pattern inventory); this
+  is the first shared, importable copy, not a new semantic.
 * *Error* -- deferred. No current maintained parser can produce a
   distinguishable spreadsheet error carrier, so there is no reachable input
   to classify; `scalar_category` correctly rejects an error-*looking* string
@@ -67,13 +70,36 @@ import numpy as np
 import pandas as pd
 
 ScalarValue: TypeAlias = str | bool | int | float | None
-"""Native Python representation of the MVP internal scalar vocabulary.
+"""Candidate native-Python value shape for the MVP scalar vocabulary -- not
+the complete accepted carrier domain, and not a canonical normalized
+representation. Do not read this alias as "what `scalar_category` narrows an
+accepted value down to."
+
+`ScalarCategory` (below) is the actual Slice-1 semantic vocabulary --
+String/Boolean/Number/Missing. `scalar_category` *classifies* a value into
+one of those categories; its accepted carrier domain is broader than this
+alias states on its own, because it also accepts the NumPy scalar variants
+named in the module docstring above (`numpy.integer`, `numpy.floating`,
+`numpy.bool_`, `numpy.str_`) without narrowing them to a `ScalarValue`
+member -- a `numpy.int64` classifies as `"number"` while remaining a
+`numpy.int64`, not becoming a Python `int`.
+
+Slice 1 (`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`) does *not* establish a
+canonical normalized scalar representation. `scalar_category` is pure
+classification, not conversion (see its own docstring): it never narrows an
+accepted value down to this alias's literal members. No
+`normalize_scalar()`-shaped primitive exists anywhere in this module.
+Producing an actual normalized value from an accepted carrier (NumPy scalar
+variants included) remains Phase E's "value normalization and type
+resolution" boundary-shape stage (`roadmap_domain_hardening_sequence.adoc`
+Phase E) -- a follow-on this slice deliberately does not provide, per
+Independent Review 001, finding IVM-REVIEW-F2.
 
 `None` is the most common Missing carrier, but it is not the only one
 `is_missing_carrier` recognizes (`""` and the NaN/`pandas.NA`/`NaT` family
 are also accepted carriers) -- Missing is a recognition predicate over
-carriers already in this union or already in a pandas/NumPy column, not a
-distinct member of it. See `is_missing_carrier`.
+carriers already accepted by `scalar_category`, not a distinct member of
+this union. See `is_missing_carrier`.
 """
 
 ScalarCategory: TypeAlias = Literal["string", "boolean", "number", "missing"]
@@ -110,18 +136,43 @@ def is_missing_carrier(value: Any) -> bool:
     shape (`domain._cell_primitives._is_empty_cell`,
     `io_backends.ods.odf_renderer._is_missing_carrier`, and others).
 
-    Safe on arbitrary objects: `pandas.isna` on a non-scalar or otherwise
-    incompatible object raises `TypeError`/`ValueError`, which is caught and
-    treated as "not a missing carrier" rather than propagated.
+    Bounded, not universally dispatched to `pandas.isna`: calling
+    `pandas.isna` on an arbitrary object can invoke that object's own
+    `__array__` (NumPy's documented array-conversion protocol) while pandas
+    decides whether the object is array-like -- which both runs foreign code
+    and can raise an exception of any type, not only `TypeError`/`ValueError`
+    (confirmed empirically; see Independent Review 001, finding
+    IVM-REVIEW-F1). To stay safe on arbitrary/unsupported objects without
+    silently widening the accepted Missing carrier set, `pandas.isna` is only
+    ever called on a value already known to be one of the accepted
+    scalar-carrier shapes -- `int`, `float` (covers `float("nan")`), or a
+    NumPy scalar (`numpy.generic`, covering `numpy.floating`/`numpy.integer`/
+    `numpy.bool_` and the rest of the NumPy scalar hierarchy). Any other
+    object -- including one implementing `__array__`, a
+    `pandas.Series`/`DataFrame`, or any opaque object -- never reaches
+    `pandas.isna` at all and is recognized as "not missing" directly, without
+    invoking any special method on it. `pandas.NA` and `pandas.NaT` are
+    recognized by identity rather than through `pandas.isna`, since both are
+    stable singletons (confirmed: `pandas.Timestamp("NaT") is pandas.NaT`,
+    `pandas.to_datetime(None) is pandas.NaT`) and identity comparison cannot
+    invoke any special method on an unrelated object.
+
+    Safe on arbitrary/unsupported objects: nothing here calls `repr`, `str`,
+    `==`, hashing, iteration, or NumPy's `__array__` conversion protocol on a
+    value outside the bounded carrier shapes above.
     """
     if value is None:
         return True
     if isinstance(value, str):
         return value == ""
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
+    if value is pd.NA or value is pd.NaT:
+        return True
+    if isinstance(value, (int, float, np.generic)):
+        try:
+            return bool(pd.isna(value))
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def scalar_category(value: Any) -> ScalarCategory:
@@ -162,7 +213,9 @@ def is_supported_scalar(value: Any) -> bool:
 
     Convenience predicate for a caller that only needs a yes/no answer.
     Never raises: unsupported values return `False`, without triggering
-    `repr`/comparison/iteration on `value` for the check itself.
+    `repr`/comparison/iteration/NumPy-array-conversion on `value` for the
+    check itself -- including an object whose own `__array__` would raise
+    (see `is_missing_carrier`'s bounded-dispatch note).
     """
     try:
         scalar_category(value)

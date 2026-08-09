@@ -85,6 +85,58 @@ def test_is_missing_carrier_safe_on_pathological_objects() -> None:
     assert is_missing_carrier(_generator()) is False
 
 
+class _CustomConversionError(Exception):
+    """A domain-specific exception type, deliberately not TypeError/ValueError."""
+
+
+class _ArrayLikeBomb:
+    """A non-hostile object implementing NumPy's documented `__array__`
+    array-conversion protocol whose conversion fails with an exception type
+    the old `except (TypeError, ValueError)` guard around `pandas.isna` did
+    not catch (Independent Review 001, finding IVM-REVIEW-F1). Tracks
+    whether `__array__` was actually invoked so the test can assert the
+    bounded-dispatch fix never reaches it at all, not merely that it
+    survives being reached.
+    """
+
+    def __init__(self) -> None:
+        self.array_called = False
+
+    def __array__(self, dtype=None):  # pragma: no cover - must never run
+        self.array_called = True
+        raise _CustomConversionError("must never be called")
+
+
+def test_is_missing_carrier_never_invokes_array_protocol_on_unrecognized_object() -> None:
+    # Regression for IVM-REVIEW-F1: pandas.isna on an arbitrary object can
+    # invoke that object's own __array__ and propagate whatever it raises.
+    # The bounded-dispatch fix must never call pandas.isna on an object
+    # outside the accepted scalar-carrier shapes (int/float/numpy.generic),
+    # so __array__ must never even be invoked.
+    bomb = _ArrayLikeBomb()
+    assert is_missing_carrier(bomb) is False
+    assert bomb.array_called is False
+
+
+def test_is_supported_scalar_never_propagates_array_conversion_exception() -> None:
+    # is_supported_scalar's own docstring promises "Never raises" -- this
+    # must hold for the array-protocol case, not only for the cases the
+    # original test suite exercised.
+    bomb = _ArrayLikeBomb()
+    assert is_supported_scalar(bomb) is False
+    assert bomb.array_called is False
+
+
+def test_scalar_category_rejects_array_like_bomb_with_unsupported_scalar_error() -> None:
+    # scalar_category must still produce its own documented diagnostic
+    # (UnsupportedScalarError), not let the object's __array__ exception
+    # leak through.
+    bomb = _ArrayLikeBomb()
+    with pytest.raises(UnsupportedScalarError):
+        scalar_category(bomb)
+    assert bomb.array_called is False
+
+
 # ---------------------------------------------------------------------------
 # scalar_category / is_supported_scalar -- classification, not conversion
 # ---------------------------------------------------------------------------
