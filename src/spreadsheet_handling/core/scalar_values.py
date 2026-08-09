@@ -39,6 +39,13 @@ Explicitly out of this vocabulary, on purpose, not by omission:
 * `date` / `datetime` / `pandas.Timestamp` -- a real date/time scalar is
   rejected (`UnsupportedScalarError`), never silently coerced to String or
   Number. Date/Time is the expected next Phase-D slice, not this one.
+* `datetime.timedelta` / `pandas.Timedelta` / `numpy.timedelta64` (Duration)
+  -- rejected (`UnsupportedScalarError`), uniformly, `NaT`-valued or not.
+  `numpy.timedelta64` requires an explicit exclusion (both here and in
+  `is_missing_carrier`) because it subclasses `numpy.integer`, which would
+  otherwise silently accept it as Number
+  (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`); Duration is not a
+  category candidate this module supports, deferred or otherwise.
 * `core.formulas.FormulaSpec` (`ListLiteralFormulaSpec`, `LookupFormulaSpec`)
   -- authored backend-neutral output Intent, not a payload scalar. Formula
   is not a category candidate at all, deferred or otherwise; see
@@ -160,6 +167,17 @@ def is_missing_carrier(value: Any) -> bool:
     Safe on arbitrary/unsupported objects: nothing here calls `repr`, `str`,
     `==`, hashing, iteration, or NumPy's `__array__` conversion protocol on a
     value outside the bounded carrier shapes above.
+
+    `numpy.timedelta64` is explicitly excluded from the bounded dispatch
+    below, even though it is a `numpy.generic` instance: it subclasses
+    `numpy.signedinteger`/`numpy.integer`, so without this exclusion its
+    `NaT` form would be recognized as Missing purely as a side effect of the
+    broad `np.generic` bucket, exactly the `np.generic`-breadth problem this
+    bounded dispatch exists to avoid (see Independent Review 001, finding
+    IVM-REVIEW-F7, and `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 6).
+    Duration is not a supported category (see `scalar_category`), so no
+    `numpy.timedelta64` value -- `NaT` or not -- is Missing; it is uniformly
+    unsupported (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`).
     """
     if value is None:
         return True
@@ -167,6 +185,8 @@ def is_missing_carrier(value: Any) -> bool:
         return value == ""
     if value is pd.NA or value is pd.NaT:
         return True
+    if isinstance(value, np.timedelta64):
+        return False
     if isinstance(value, (int, float, np.generic)):
         try:
             return bool(pd.isna(value))
@@ -196,6 +216,13 @@ def scalar_category(value: Any) -> ScalarCategory:
     2. Boolean before Number, because Python's `bool` is a subclass of
        `int` (and because `numpy.bool_` is checked explicitly, as it does
        not subclass `bool`).
+    3. `numpy.timedelta64` before Number, because it subclasses
+       `numpy.signedinteger`/`numpy.integer` (unlike `numpy.datetime64`,
+       which subclasses neither `np.integer` nor `np.floating`). Duration is
+       not a supported category, so every `numpy.timedelta64` value must be
+       rejected explicitly rather than silently accepted as an ordinary
+       Number stripped of its unit
+       (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`).
     """
     if is_missing_carrier(value):
         return "missing"
@@ -203,6 +230,8 @@ def scalar_category(value: Any) -> ScalarCategory:
         return "boolean"
     if isinstance(value, str):
         return "string"
+    if isinstance(value, np.timedelta64):
+        raise UnsupportedScalarError(value)
     if isinstance(value, (int, float, np.integer, np.floating)):
         return "number"
     raise UnsupportedScalarError(value)

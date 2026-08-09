@@ -58,11 +58,18 @@ def _generator():
         ("x", False),
         ([], False),  # pd.isna raises on array-likes; caught, not missing
         ({}, False),
+        # BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A: numpy.timedelta64
+        # is explicitly excluded from the bounded np.generic dispatch, so its
+        # NaT form must not be recognized as Missing (Duration is unsupported,
+        # not a Missing-adjacent category).
+        (np.timedelta64("NaT"), False),
+        (np.timedelta64(1, "D"), False),
     ],
     ids=[
         "none", "empty-string", "float-nan", "numpy-nan", "pd-NA", "pd-NaT",
         "literal-nan-string", "literal-none-string", "int-zero", "float-zero",
         "false", "true", "plain-string", "empty-list", "empty-dict",
+        "numpy-timedelta64-nat", "numpy-timedelta64-days",
     ],
 )
 def test_is_missing_carrier_matches_accepted_contract(value: Any, expected: bool) -> None:
@@ -216,6 +223,66 @@ def test_scalar_category_rejects_date_time_without_silent_coercion(value: Any) -
     with pytest.raises(UnsupportedScalarError):
         scalar_category(value)
     assert is_supported_scalar(value) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.timedelta64(1, "D"),
+        np.timedelta64(500, "ns"),
+        np.timedelta64("NaT"),
+    ],
+    ids=["timedelta64-days", "timedelta64-nanoseconds", "timedelta64-nat"],
+)
+def test_scalar_category_rejects_numpy_timedelta64_without_number_misclassification(
+    value: Any,
+) -> None:
+    # Regression for BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A
+    # (independently discovered as DTVM-REVIEW-F1): numpy.timedelta64
+    # subclasses numpy.signedinteger/numpy.integer, so without an explicit
+    # exclusion it silently classifies as "number" -- a real accepted
+    # carrier silently becoming domain Number semantics, stripped of its
+    # unit. Duration is not a supported category; every numpy.timedelta64
+    # value, NaT or not, must raise UnsupportedScalarError uniformly rather
+    # than partially "number" and partially "missing".
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+    assert excinfo.value.value_type_name == "timedelta64"
+    assert is_supported_scalar(value) is False
+    # The NaT form must not be recognized as Missing either -- an unsupported
+    # category rejects all its instances, it does not partially fold its
+    # missing-shaped instances into a different, unrelated category.
+    assert is_missing_carrier(value) is False
+
+
+def test_scalar_category_still_accepts_numpy_datetime64_nat_as_missing() -> None:
+    # Non-regression: numpy.datetime64('NaT')'s own Missing classification
+    # is unaffected by this fix -- its eventual correction is owned by
+    # FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A's own D-T1 slice, not this BUG,
+    # since it is entangled with whether/when Date/DateTime itself becomes a
+    # supported category. Only the numpy.timedelta64 family is uniformly
+    # unsupported by this fix.
+    assert is_missing_carrier(np.datetime64("NaT")) is True
+    assert scalar_category(np.datetime64("NaT")) == "missing"
+
+
+def test_scalar_category_still_rejects_numpy_datetime64_non_nat_unchanged() -> None:
+    # Non-regression: numpy.datetime64 (non-NaT) already correctly raised
+    # UnsupportedScalarError before this fix (it does not subclass
+    # np.integer/np.floating); confirm it still does.
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(np.datetime64("2026-08-09"))
+    assert excinfo.value.value_type_name == "datetime64"
+
+
+def test_scalar_category_still_rejects_datetime_timedelta_and_pandas_timedelta() -> None:
+    # Non-regression: these Duration carriers were already, correctly,
+    # unsupported and are unaffected by this fix -- Duration is not added as
+    # a supported category by this BUG.
+    for value in (datetime.timedelta(days=1), pd.Timedelta(days=1)):
+        with pytest.raises(UnsupportedScalarError):
+            scalar_category(value)
+        assert is_supported_scalar(value) is False
 
 
 def test_scalar_category_rejects_formula_spec_intent() -> None:
