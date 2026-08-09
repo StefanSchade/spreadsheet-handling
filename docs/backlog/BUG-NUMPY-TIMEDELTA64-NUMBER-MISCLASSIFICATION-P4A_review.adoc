@@ -1,0 +1,599 @@
+===== BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A -- Independent Review (BUG fix + List[Scalar]/Trusted-Ingress knowledge anchor)
+
+*Reviewed BUG:* `docs/backlog/BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A.adoc`
+*Review date:* 2026-08-09
+*Review type:* independent implementation/regression review (Part A) plus a
+separate, non-conflated knowledge-consistency review (Part B), fresh context,
+read-only except for this artifact and the Part A lifecycle cleanup performed
+after acceptance below.
+*Repository:* `~/repos/spreadsheet-handling/core`, branch `main`.
+*Initial repository status:* clean, `HEAD` = `56c59be`.
+*Final repository status:* clean except this review artifact and the Part A
+lifecycle cleanup (BUG status/archive) described in "Lifecycle cleanup
+check" below; no runtime or test file touched; nothing pushed; remained on
+`main` for the entire review.
+
+*Reviewed ranges (independently reconstructed from local history, not
+assumed):*
+
+[source,text]
+----
+BUG range (Part A):
+  17e4dd7 (parent of 9d3b55d) .. 6cc8b94
+    9d3b55d docs(backlog): track numpy timedelta64 scalar misclassification
+    022f651 fix(BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A): reject
+             numpy timedelta64 as unsupported Duration carrier
+    6cc8b94 docs(BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A): record
+             implementation evidence
+
+Knowledge-anchor range (Part B):
+  6cc8b94 .. 56c59be (HEAD)
+    09f8cb8 docs(backlog): preserve scalar-array ingress extension point
+    56c59be docs(project_memory): record scalar-array ingress boundary
+             learning
+----
+
+Both ranges match the task's expected history exactly; no interleaving.
+
+==== Verdicts
+
+*BUG verdict:* *ACCEPTED.*
+
+* Blocking findings: 0.
+* Important findings: 0.
+* Minor findings: 1 (TD64-REVIEW-F1, documentation-only, does not affect the
+  runtime fix's correctness or scope).
+
+*Knowledge-anchor verdict:* *ACCEPTED.*
+
+* Blocking findings: 0.
+* Important findings: 0.
+* Minor findings: 0.
+
+These are two independent dispositions. TD64-REVIEW-F1 (a wording overclaim
+in the BUG's own reasoning text) does not touch the knowledge-anchor slice,
+and the knowledge-anchor's clean result does not retroactively strengthen or
+weaken the BUG's own runtime evidence -- each was verified from repository
+state independently, per the task's instruction not to conflate them.
+
+==============================================================================
+PART A -- BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A
+==============================================================================
+
+==== 1. Independent defect reproduction
+
+Independently reproduced the pre-fix defect by loading the *parent* commit's
+`scalar_values.py` (`git show 022f651^:...`) as an isolated module (stdlib +
+NumPy + pandas only; no package-relative imports), separately from the
+current package, and probing it directly:
+
+[source,pycon]
+----
+>>> type(np.timedelta64(1, "D")).__mro__
+(numpy.timedelta64, numpy.signedinteger, numpy.integer, numpy.number,
+ numpy.generic, object)
+>>> type(np.datetime64("2026-08-09")).__mro__
+(numpy.datetime64, numpy.generic, object)          # no np.integer/np.floating
+
+# pre-fix module (022f651^), loaded standalone:
+>>> mod.scalar_category(np.timedelta64(1, "D"))
+'number'                                            # BUG, independently confirmed
+>>> mod.scalar_category(np.timedelta64("NaT"))
+'missing'                                            # IVM-REVIEW-F7 side effect, confirmed
+>>> mod.is_missing_carrier(np.timedelta64("NaT"))
+True
+>>> mod.scalar_category(np.datetime64("2026-08-09"))
+UnsupportedScalarError('datetime64')                # correctly unaffected, confirmed
+----
+
+The MRO asymmetry and both defect instances match the BUG document's claims
+exactly, independently re-derived rather than trusted. `numpy.datetime64`
+correctly falls through to the trailing raise because it does not subclass
+`numpy.integer`/`numpy.floating`; `numpy.timedelta64` does, which is the sole
+root cause of the Number-branch misclassification.
+
+==== 2. Runtime fix review
+
+`src/spreadsheet_handling/core/scalar_values.py` diff (`022f651`) adds:
+
+* an `isinstance(value, np.timedelta64): return False` guard in
+  `is_missing_carrier`, placed *before* the broad
+  `isinstance(value, (int, float, np.generic))` bounded-dispatch branch;
+* an `isinstance(value, np.timedelta64): raise UnsupportedScalarError(value)`
+  guard in `scalar_category`, placed *after* `is_missing_carrier`/Boolean/
+  String and *before* the Number branch.
+
+Both guards are minimal, mirror the module's existing Boolean-before-Number
+subclass-ordering idiom, and touch nothing outside `np.timedelta64`.
+Independently probed the fixed module directly against every claimed case
+(non-`NaT` day/nanosecond units, `NaT`, `np.datetime64` NaT/non-NaT,
+`datetime.timedelta`, `pandas.Timedelta`, ordinary `int`/`float`/
+`np.integer`/`np.floating`, `bool`/`np.bool_`, the full Missing-carrier
+family, `np.complex128` NaN/non-NaN, plain `complex`): every case matches the
+BUG's own non-regression table exactly (see command transcript below); no
+discrepancy found.
+
+==== 3. Two-guard necessity -- independently challenged, confirmed required
+
+Directly tested whether `scalar_category`'s own guard alone would suffice,
+using the *original* (pre-fix) `is_missing_carrier` unmodified:
+
+[source,pycon]
+----
+>>> # is_missing_carrier left at its ORIGINAL (022f651^) breadth,
+>>> # scalar_category given ONLY the new np.timedelta64 guard
+>>> scalar_category_single_guard(np.timedelta64("NaT"))
+'missing'                          # still wrong -- is_missing_carrier is
+                                    # checked FIRST inside scalar_category,
+                                    # so it short-circuits before the new
+                                    # guard is ever reached
+----
+
+This independently confirms the BUG's own reasoning: because
+`scalar_category`'s classification order runs `is_missing_carrier` first,
+`np.timedelta64("NaT")` would still resolve to `"missing"` through the
+unmodified broad `np.generic` dispatch even with `scalar_category`'s own
+guard in place. Both guards are necessary, and the ordering in the actual
+diff (the `is_missing_carrier` exclusion placed *before* its own broad
+`np.generic` branch; the `scalar_category` exclusion placed *before* the
+Number branch) is correct and sufficient. No surprising subtype/scalar-
+protocol consequence was found for `isinstance(value, np.timedelta64)`
+(`numpy.timedelta64` is not further subclassed in the accepted producer set).
+
+==== 4. Regression tests -- independently verified
+
+[source,console]
+----
+.venv/bin/pytest tests/unit/core/test_scalar_values.py -v
+----
+Result: *67 passed* (matches claim exactly). Independently confirmed the
+pre-fix test-file count is *59* (collected the current test file against the
+pre-fix runtime module standalone), matching the claimed "8 new/extended
+cases" delta exactly.
+
+Independently reproduced red-before/green-after by temporarily restoring the
+pre-fix runtime file (`git show 022f651^:...`) over the current one, running
+the *current* test suite against it, and restoring the fix afterward (working
+tree confirmed clean before and after):
+
+[source,console]
+----
+FAILED test_is_missing_carrier_matches_accepted_contract[numpy-timedelta64-nat]
+FAILED test_scalar_category_rejects_numpy_timedelta64_without_number_misclassification[timedelta64-days]
+FAILED test_scalar_category_rejects_numpy_timedelta64_without_number_misclassification[timedelta64-nanoseconds]
+FAILED test_scalar_category_rejects_numpy_timedelta64_without_number_misclassification[timedelta64-nat]
+----
+*4 failures*, exactly matching the claim. `git status --short` clean after
+restoring the fix.
+
+Focused Missing/value-model regression slice:
+[source,console]
+----
+.venv/bin/pytest tests/unit/io_backends/ods/test_odf_renderer_missing_carrier.py \
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py \
+  tests/unit/domain/transformations/test_fk_edge_cases.py \
+  tests/unit/io_backends/test_csv_backend.py \
+  tests/roundtrip/test_pathological_cell_contracts.py tests/architecture
+----
+Result: *200 passed* (matches claim exactly).
+
+Full active suite:
+[source,console]
+----
+make test
+----
+Result: *2330 passed, 1 deselected* (matches claim exactly).
+
+[source,console]
+----
+git diff --check 9d3b55d^..6cc8b94   # clean
+make source-style-guards             # 0 error(s), 83 warning(s),
+                                      # 2 allowlisted finding(s); none
+                                      # referencing scalar_values.py or
+                                      # test_scalar_values.py
+----
+Both match the BUG's claims exactly.
+
+==== 5. Scope/architecture justification
+
+`core/scalar_values.py`'s `is_missing_carrier`/`scalar_category` were
+independently accepted as part of `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`
+Slice 1 (commit `4d2b434` and its follow-up acceptance, `e2a33b0`) before
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` existed. The `numpy.timedelta64`
+Number-branch misclassification is a defect in that already-accepted,
+Date/Time-independent classifier: it depends only on `numpy.timedelta64`'s
+NumPy ancestry, not on any Date/DateTime category decision, and Duration
+remains explicitly out of scope both before and after this fix. Filing it as
+a narrow, standalone BUG rather than folding it into D-T1 (as the Date/Time
+review's DTVM-REVIEW-F1 disposition allowed as one legitimate option) is
+architecturally justified: it lets the pre-existing Slice-1 defect close on
+its own evidence without waiting on or being entangled with D-T1's own
+Date/DateTime NaT-Missing decision, which remains genuinely coupled to
+Date/Time category authorization. Independently confirmed this fix does not
+begin, authorize, or touch any D-T1..D-T5 slice: `numpy.datetime64` behavior
+(NaT and non-NaT) is byte-for-byte unchanged, and no Date/Time semantics are
+introduced.
+
+==== 6. BUG documentation quality
+
+Factual reproduction, root cause, and non-regression table are all
+independently confirmed accurate (see sections 1-4 above). The relationship
+to DTVM-REVIEW-F1 and IVM-REVIEW-F7 is stated correctly and independently
+verified against both source review documents
+(`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc` and
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A_review.adoc`). One overclaim was found
+and is recorded as TD64-REVIEW-F1 below.
+
+===== TD64-REVIEW-F1 -- "complex is already, and remains, uniformly rejected (both NaN and non-NaN forms)" is true for plain Python `complex` but false for `numpy.complex128`
+
+*Classification:* Minor. Documentation-only; does not affect the runtime
+fix's correctness, scope, or the BUG's core reasoning (which rests on the
+Duration-unsupported contract and `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, not on
+this analogy alone).
+
+*File/symbol:* BUG doc, "Reconciling with accepted Missing semantics and
+prior findings" section, "Does this reopen `numpy.complex128`'s accepted
+precedent?"; echoed in commit `022f651`'s message ("matching the
+already-accepted complex128 precedent").
+
+*Evidence, independently reproduced against current `HEAD`:*
+[source,pycon]
+----
+>>> scalar_category(complex(float("nan"), 0))
+UnsupportedScalarError('complex')                   # plain complex: uniform
+>>> scalar_category(np.complex128(complex(float("nan"), 0)))
+'missing'                                            # numpy.complex128: NOT uniform
+>>> scalar_category(np.complex128(complex(1, 2)))
+UnsupportedScalarError('complex128')
+----
+`numpy.complex128` NaN classifies as `"missing"`, not
+`UnsupportedScalarError`, while non-NaN `numpy.complex128` is correctly
+rejected -- an internally split family, exactly the pattern this BUG
+describes as defective for pre-fix `numpy.timedelta64`. This is not a new
+discovery: it is precisely the already-accepted, non-blocking
+IVM-REVIEW-F7 gap (`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A_review.adoc`,
+independently re-confirmed still open and correctly not reopened by this
+BUG). The BUG's own "uniformly rejected (both NaN and non-NaN forms)"
+sentence is accurate only for plain Python `complex`, not for
+`numpy.complex128`, and should not be read as claiming
+`numpy.complex128` sets the uniform-rejection precedent it invokes.
+
+*Why it matters:* a future reader could believe `numpy.complex128` is fully
+consistent today and be surprised to find its NaN form still classifies as
+Missing (IVM-REVIEW-F7, deliberately left open, unaffected by this BUG).
+
+*Smallest correction:* narrow the sentence to name plain Python `complex`
+specifically (`"plain Python complex is already, and remains, uniformly
+rejected"`), and/or add one clause noting `numpy.complex128` NaN remains a
+separate, already-accepted, non-blocking gap (IVM-REVIEW-F7), not silently
+reopened or claimed as precedent here. Documentation-only; no runtime or
+test change implied.
+
+*Disposition:* non-blocking. Does not require reopening IVM-REVIEW-F7 or any
+runtime change; recorded for a future documentation-precision pass, per this
+review's read-only default (fix not applied here, consistent with
+`review_instructions.adoc`'s "record a finding, not fix it" default).
+
+==== 7. Lifecycle cleanup check
+
+The BUG is accepted with 0 Blocking / 0 Important findings; the acceptance
+threshold is met.
+
+* *Status change:* `Fixed` -> `Done`, per this BUG's own gating text ("Do
+  not treat as `Done` until an independent review accepts it" -- that
+  independent review is this one).
+* *`_ftrs_open.adoc`:* the `include::BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A.adoc[leveloffset=-2]`
+  entry should be removed; this BUG leaves the active planning surface.
+* *Archive:* the BUG document and this review artifact move together to
+  `docs/cold_storage/backlog/ftrs_done/`, matching the established sibling-
+  archival pattern used for comparable recent BUGs
+  (`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` and its
+  `_review_001.adoc`).
+* *Cold-storage index:* register a short entry in
+  `docs/cold_storage/backlog/_backlog.adoc`, matching the existing entries'
+  format.
+* *Residual scope:* the FTR text corrections DTVM-REVIEW-F1 and
+  DTVM-REVIEW-F2 identify in `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc`
+  (section 3's inventory table and section 10's now-superseded factual claim
+  about `numpy.timedelta64`; D-T2's scope-ownership ambiguity) remain open
+  and are explicitly *not* performed by this review, per this task's own
+  instruction. They are a separate, already-identified follow-up owned by
+  that FTR's own maintainers, not this BUG's residual scope.
+* *Release notes:* not required. This fix changes an internal classifier
+  (`core.scalar_values`) that no production code path currently imports or
+  calls (independently confirmed by grep: the only other
+  `is_missing_carrier`-named symbol in `src/` is ODS renderer's own,
+  unrelated, pre-existing local predicate). Nothing user-facing, no public
+  CLI/YAML/configuration surface, and no adopter-visible behavior changes.
+  Matches the BUG's own "Release relevance: ... today's blast radius is
+  zero" statement, independently confirmed.
+* *Project Memory:* *not* updated by this review's lifecycle cleanup. Per
+  this task's explicit instruction and the BUG's own text ("Project Memory
+  curation is deferred until this BUG has passed independent review"), and
+  per `project_memory_workflow.adoc`'s bounded-growth guidance (routine
+  acceptance closures do not automatically need a canonical record), this
+  narrow, zero-blast-radius classifier fix does not clearly call for its own
+  concern-event entry beyond what the concern's `current_summary` already
+  says about Slice 1. The knowledge-anchor slice's own, separately curated
+  Project Memory update (`56c59be`) is left untouched, as instructed.
+
+Lifecycle cleanup (status change, archival, index registration,
+`_ftrs_open.adoc` removal) is performed as part of this review's commit,
+since the task grants that authority explicitly for an accepted BUG.
+
+==============================================================================
+PART B -- LIST[SCALAR] / TRUSTED-INGRESS KNOWLEDGE ANCHOR
+==============================================================================
+
+==== 8. What the anchoring slice actually changed
+
+Two commits, no runtime/test/ADR files touched (independently confirmed via
+`git show --stat` on both):
+
+* `09f8cb8` -- edits exactly three files:
+  `docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc` (section 16,
+  "Handoff to Trusted Ingress"), `docs/backlog/FTR-NESTED-LISTS.adoc` (new
+  "Relationship to primitive scalar arrays" subsection), and
+  `docs/backlog/roadmap_domain_hardening_sequence.adoc` (Phase E, "Semantic
+  ingress validation" section only -- Phase D's own section, lines 254-332,
+  is untouched, independently confirmed via `git diff --stat`).
+* `56c59be` -- edits exactly three `project_memory/canonical/*.json` files:
+  one new `manual_note` concern event
+  (`SIG-ACT-SCALAR-ARRAY-INGRESS-BOUNDARY-LEARNING`), its concern
+  cross-reference to the reused `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` concern
+  (no new concern created), and one appended sentence to that concern's
+  `current_summary` plus `last_assessed_date`/`last_assessed_commit`.
+  `next_action` is byte-for-byte unchanged (still names Date/Time as the
+  active Phase-D slice), independently confirmed via diff.
+
+==== 9. Core knowledge-consistency check -- List[Scalar] as an MVP boundary, not a decision
+
+Independently read all three edited passages in full (not excerpted from the
+implementer's own commit message). All three state the same, correctly
+bounded claim:
+
+* the scalar-only MVP (String/Boolean/Number/Missing) is a *current-phase
+  scope decision*, explicitly not read as a permanent ban on bounded
+  composite payload values;
+* `List[Scalar]` is named as a *deferred, undecided extension candidate* --
+  not accepted architecture, not implementation-ready, and not a promise
+  that it will ever be adopted;
+* the roadmap's Phase E "no arbitrary Python objects" line is explicitly
+  clarified as not meaning "every list is forever rejected," while equally
+  not asserting that arbitrary Python lists become trusted;
+* every list of open questions (container type, homogeneity, per-element
+  Missing, escaping, size/depth limits, API shape) is explicitly left
+  undecided, not silently pre-answered.
+
+No wording found anywhere in the diff that reads as "List[Scalar] is already
+accepted" or "no list will ever be admitted." The distinction the task asked
+this review to verify carefully is drawn correctly in all three edited
+files.
+
+==== 10. List[Scalar] versus List[Object] -- the most important check, independently confirmed correct
+
+Read `FTR-NESTED-LISTS.adoc` in full (94 lines, not only the diff hunk).
+Before this slice, `normalize_nested_lists` was scoped to "lists of objects
+or primitives" -- silently pre-deciding that a bare scalar list uses the same
+child-frame representation as a list of records. The edit narrows this to
+"lists of *objects*" and adds an explicit "Relationship to primitive scalar
+arrays (`List[Scalar]`)" subsection stating: this FTR owns only the
+structural case (a list of objects/records, each with its own multi-field
+identity); it does *not* pre-decide that a list of bare scalars uses the
+same representation; `List[Scalar]` "overlaps three other, currently
+unimplemented boundaries" (Trusted Ingress/Internal Value Model,
+`TRANS-MERGE-LIST-TO-SEPARATED`/`TRANS-SPLIT-SEPARATED-TO-LIST`, Cell
+Codec's deferred token-list capability) that must reconcile before
+primitive-list handling is implemented "here" (i.e., inside this FTR).
+Confirmed the rest of the document (Solution/Acceptance/Notes sections) is
+unchanged and does not contradict this addition anywhere.
+
+This is exactly the open, non-prejudged framing the task asked this review
+to verify. Neither representation (child-frame vs. compact-cell projection)
+is chosen; both remain named candidates pending future reconciliation.
+
+==== 11. Explicit separated-cell projection semantics -- consistency verified
+
+Independently checked every cross-reference the anchoring text makes:
+
+* `TRANS-MERGE-LIST-TO-SEPARATED` / `TRANS-SPLIT-SEPARATED-TO-LIST`
+  (`registries/domain_contracts/canonical/transformations.json`, lines
+  602-641): both entries independently confirmed present with
+  `source_status: "candidate"` and
+  `notes: "Not MVP / not implemented (nested-list strategies are future
+  concepts). Overlaps cell-codec / cell-embedded-list boundary."` -- exactly
+  matching the anchoring text's "candidate, not implemented" characterization,
+  not overstated.
+* Cell Codec's "Composition Boundary" section
+  (`docs/warm_storage/domain_reformation/slices/cell-codec-frames-meta-bridge/slice.adoc:97-122`),
+  independently read in full: confirms verbatim "missing codec intent means
+  no decode" and "no delimiter, column-name, or neighboring-workbook-content
+  heuristic may create codec intent" as an already-established rule (not
+  invented by this slice), and confirms "A later feature may allow repeated
+  values of the same type inside a compact cell, for example token-list
+  disassembly and reassembly. That is a different capability from the MVP
+  slot contract and is explicitly out of scope here" -- matching the
+  anchoring text's characterization exactly.
+* `docs/cold_storage/working_context/functional_model_inquiry/future_concepts/nested_structures.adoc`,
+  "Representation Strategy 0: Cell-Embedded List" -- independently confirmed
+  present and correctly characterized as an existing candidate concept, not
+  current behavior.
+
+Independently tested the "no delimiter heuristic" invariant against the
+anchoring text's own named examples on the live, current `scalar_category`:
+plain strings such as `"a,b,c"`, `"Munich, Bavaria"` are not, and have never
+been, given any list-inference behavior anywhere in the current runtime
+(`scalar_category` classifies any `str` as `"string"` unconditionally,
+independently reconfirmed at `scalar_values.py:231-232` -- no content
+parsing exists in this module by design, per its own docstring). The
+anchoring text's forbidding of delimiter heuristics restates existing,
+already-enforced runtime behavior; it does not merely assert a future
+promise.
+
+==== 12. Interaction with normalize_scalar / Phase E -- no premature API design found
+
+Independently read the full inserted text in all three files. No API
+(`normalize_value()`, `ListValue`, `CompositeValue`, or any concrete
+signature) is proposed anywhere. The `List[Scalar]` guidance is placed in
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc` section 16 ("Handoff to Trusted
+Ingress"), *after* and separate from the FTR's own existing statement (same
+section, unedited) that the ingress *mechanism* question remains entirely
+open and that Phase E's `normalize_scalar()`-shaped primitive is not built
+here. Nothing in the diff moves List handling into that primitive or
+contradicts Slice 1's established Phase-E-owns-normalization precedent
+(`IVM-REVIEW-F2`'s resolution, independently re-checked unchanged elsewhere
+in the same file). The roadmap edit is placed under Phase E's "Semantic
+ingress validation" subsection, not Phase D's own section -- independently
+confirmed Phase D's section (lines 254-332) has zero diff lines.
+
+==== 13. Project Memory quality
+
+The new concern event is a single, coarse `manual_note` (not a miniature
+FTR): one paragraph identifying the relationship, cross-referenced to the
+existing `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` concern rather than creating a new
+one, consistent with `project_memory_workflow.adoc`'s "represent completion
+coarsely" and "every new event... must state the navigation or steering
+purpose it serves" rules. Regenerated the context report independently
+(`make memory-query && make memory-context`) and confirmed:
+
+* the event renders correctly under `CONC-DOMAIN-BOUNDARY-ROBUSTNESS` in
+  `docs_generated/project_memory/current_context.adoc`, discoverable in the
+  concern's "Recent linked events" table with its full summary text;
+* the concern's `Next action` field is unchanged text, still naming
+  Date/Time as the active Phase-D slice -- independently confirmed the
+  `List[Scalar]` learning is *not* presented as the current task;
+* `make memory-health-report` produces no new diagnostic (`unknown_ids`,
+  `ambiguous`, `recent_unlinked`, `events_no_refs`, `no_evidence`) that
+  references `SCALAR-ARRAY`, `LEARNING-SCALAR-ARRAY`, or the new event/xref
+  IDs (independently grepped the regenerated
+  `project_memory/derived/memory_health_report.json`/`.adoc`: no match).
+
+A future Phase-E agent reading the generated context report would correctly
+learn: scalar-only is the current MVP; `List[Scalar]` is a known deferred
+extension point; `FTR-NESTED-LISTS`/separated-list/Cell Codec are the
+relevant cross-references; delimiter heuristics are forbidden;
+`List[Object]` remains structural; and no implementation decision exists
+yet. All six of those are present in the rendered event text, independently
+verified.
+
+==== 14. Duplicated or contradictory ownership -- none found
+
+Checked all five failure-mode readings the task named:
+
+[cols="4,1,6"]
+|===
+| Possible wrong conclusion | Supported? | Evidence
+
+| A. Every primitive list MUST become a child frame
+| No
+| `FTR-NESTED-LISTS`'s own new text explicitly says a bare scalar list is
+  *not* automatically routed through the child-frame path.
+
+| B. Arbitrary Python list is already an accepted scalar/composite value
+| No
+| `scalar_values.py`'s own docstring (unedited, independently re-read)
+  still lists "Any collection (`list`/`dict`/`set`/`tuple`)... -- rejected
+  with a type-only diagnostic" as explicitly out of vocabulary; the
+  anchoring text nowhere contradicts this, it only reserves room for a
+  *future*, *explicitly bounded* contract.
+
+| C. Separated strings are automatically decoded by delimiter
+| No
+| Independently re-confirmed `scalar_category` performs no string content
+  inspection at all (section 11 above); Cell Codec's own established
+  "no codec intent -> no decode" rule is restated accurately, not
+  loosened.
+
+| D. Phase E must permanently reject every list
+| No
+| The roadmap edit explicitly warns against reading "no arbitrary Python
+  objects" this way.
+
+| E. List[Scalar] is already implementation-ready
+| No
+| All three edited passages explicitly enumerate open, undecided questions
+  (container type, homogeneity, escaping, limits, API shape) rather than
+  answering them.
+|===
+
+No fresh agent reading only the current repository state could reasonably
+land on any of A-E from this diff.
+
+==== 15. Validation
+
+[source,console]
+----
+asciidoctor -o /dev/null docs/backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc \
+  docs/backlog/FTR-NESTED-LISTS.adoc docs/backlog/roadmap_domain_hardening_sequence.adoc
+----
+Result: exit 0. One pre-existing warning (`roadmap_domain_hardening_sequence.adoc:51`,
+"unterminated listing block") independently confirmed present identically in
+the pre-anchor baseline (`6cc8b94`), i.e. not introduced by this slice.
+
+[source,console]
+----
+make memory-query
+make memory-context
+make memory-health-report
+----
+All three ran cleanly; regenerated `current_context.adoc` and health-report
+outputs inspected as described in section 13.
+
+[source,console]
+----
+git diff --check 6cc8b94..HEAD   # clean
+----
+No runtime or test file appears anywhere in `git show --stat` for either
+`09f8cb8` or `56c59be`, independently confirmed twice (sections 8 and this
+command).
+
+==== 16. Findings
+
+No findings recorded for Part B. Every check requested by the task (sections
+9-14 above) independently confirmed correct; no correction is needed.
+
+==============================================================================
+PART C -- REPOSITORY / SESSION SUMMARY
+==============================================================================
+
+* Initial status: clean, `HEAD` `56c59be`.
+* Final status (before this review's own commits): clean except this review
+  artifact.
+* Changed by this review: this file (new); as part of accepted-BUG lifecycle
+  cleanup (see section 7): `BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A.adoc`
+  and this review artifact moved to `docs/cold_storage/backlog/ftrs_done/`,
+  `docs/backlog/_ftrs_open.adoc` include removed, and a new entry added to
+  `docs/cold_storage/backlog/_backlog.adoc`.
+* No runtime or test file modified by this review at any point.
+* Nothing pushed; remained on `main` throughout; no branch created or
+  switched.
+
+[source,text]
+----
+NUMPY TIMEDELTA64 BUG ACCEPTED.
+SCALAR-ARRAY / TRUSTED-INGRESS KNOWLEDGE ANCHOR ACCEPTED.
+----
+
+==== Next project action
+
+Not automatically D-T1. `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc`
+still carries two open Important findings this review does not resolve:
+
+* *DTVM-REVIEW-F1* -- now largely superseded at the *runtime* level by this
+  accepted BUG fix (the misclassification it flagged no longer exists), but
+  the *FTR text itself* (section 3's inventory-table row and section 10's
+  "already correctly rejects... confirmed by probe" claim about
+  `numpy.timedelta64`) independently re-confirmed still present and still
+  factually incorrect (`grep` against current `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc`
+  line 563 and surrounding text). Correcting that text is a small, separate
+  documentation follow-up on that FTR, not performed by this review.
+* *DTVM-REVIEW-F2* -- the D-T2 scope-ownership question (whether Phase D or
+  Phase E owns the general `normalize_scalar()`-shaped primitive) remains
+  fully open and undecided; this review does not adjudicate it.
+
+The precise next action is: correct `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc`'s
+section 3/section 10 text to reflect the now-fixed `numpy.timedelta64`
+behavior (closing DTVM-REVIEW-F1 at the documentation level), and resolve
+DTVM-REVIEW-F2's D-T2 scope question, before D-T1/D-T2 are treated as
+implementation-ready. Neither is performed in this review, per the task's
+explicit instruction.
