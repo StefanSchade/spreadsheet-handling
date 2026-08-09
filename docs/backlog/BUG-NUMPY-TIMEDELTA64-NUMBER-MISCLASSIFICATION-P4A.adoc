@@ -1,6 +1,10 @@
 ===== BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A -- `numpy.timedelta64` silently classifies as `"number"` instead of being rejected as an unsupported Duration carrier
 
-*Status:* New
+*Status:* Fixed (2026-08-09). Implemented and independently self-verified
+(pre-fix red / post-fix green regressions, full active suite, source-style
+guards); not yet independently reviewed. See "Resolution" below for the
+authoritative implementation record. Do not treat as `Done` until an
+independent review accepts it.
 *Priority:* P4A
 *Area:* Internal value model / scalar classification
 (`core/scalar_values.py`)
@@ -230,4 +234,105 @@ misclassification for the (more common) non-`NaT` case.
 
 ==== Resolution
 
-See "Implementation evidence" below, added once the fix lands.
+*Chosen boundary:* two small, explicit `isinstance(value, np.timedelta64)`
+guards inside the already-accepted `core/scalar_values.py`, mirroring the
+module's own established idiom (the Boolean-before-Number subclass-ordering
+guard already present for `bool`/`np.bool_`) rather than introducing a new
+predicate, helper module, or cross-layer dependency.
+
+* `is_missing_carrier` now returns `False` for any `np.timedelta64` value
+  (checked before the broad `isinstance(value, (int, float, np.generic))`
+  bounded-dispatch branch), so its `NaT` form is no longer recognized as
+  Missing purely as a side effect of that branch's breadth.
+* `scalar_category` now raises `UnsupportedScalarError` for any
+  `np.timedelta64` value (checked after `is_missing_carrier`/Boolean/String,
+  before the Number branch), so it can no longer satisfy the Number branch's
+  `isinstance(value, (int, float, np.integer, np.floating))` check via its
+  `numpy.integer` ancestry.
+
+Both guards were added narrowly for `np.timedelta64` specifically, not as a
+broader `np.generic`-hierarchy audit -- `numpy.complex128` and
+`numpy.datetime64` were independently re-confirmed unaffected and
+unchanged (see "Test evidence" below); a wider audit of every other
+`np.generic` subclass was not performed and is not required by this BUG's
+scope.
+
+*Root cause, confirmed pinned:* `numpy.timedelta64` subclasses
+`numpy.signedinteger` -> `numpy.integer` -> `numpy.number` -> `numpy.generic`
+(confirmed via `type(np.timedelta64(1, "D")).__mro__`); `numpy.datetime64`
+subclasses only `numpy.generic` (confirmed via
+`type(np.datetime64("2026-08-09")).__mro__` -- `(numpy.datetime64,
+numpy.generic, object)`, no `numpy.integer`/`numpy.floating` in its MRO).
+This asymmetry is why only `numpy.timedelta64` reached the Number branch
+before this fix, and why `numpy.datetime64` (non-`NaT`) was already,
+correctly, unaffected.
+
+*Docs:* the module docstring's "Explicitly out of this vocabulary" list and
+`is_missing_carrier`/`scalar_category`'s own docstrings were extended with a
+precise explanation of the exclusion and a pointer to this BUG, consistent
+with the project's established documentation-precision convention
+(`IVM-REVIEW-F2`'s own corrective pattern).
+
+*Non-regression, confirmed by direct probe against the fixed module:*
+
+[cols="2,2,2"]
+|===
+| Case | Pre-fix | Post-fix
+
+| `np.timedelta64(1, "D")`        | `"number"` (BUG)      | `UnsupportedScalarError('timedelta64')`
+| `np.timedelta64(500, "ns")`     | `"number"` (BUG)      | `UnsupportedScalarError('timedelta64')`
+| `np.timedelta64("NaT")`         | `"missing"` (IVM-REVIEW-F7) | `UnsupportedScalarError('timedelta64')`
+| `np.datetime64("2026-08-09")`   | `UnsupportedScalarError('datetime64')` | unchanged
+| `np.datetime64("NaT")`          | `"missing"`            | unchanged (owned by D-T1, not this BUG)
+| `datetime.timedelta(days=1)`    | `UnsupportedScalarError('timedelta')` | unchanged
+| `pd.Timedelta(days=1)`          | `UnsupportedScalarError('Timedelta')` | unchanged
+| `int`/`float`/`np.int64`/`np.float64`/`np.float32` | `"number"` | unchanged
+| `bool`/`np.bool_`               | `"boolean"`            | unchanged
+| `None`/`""`/NaN family/`pd.NA`/`pd.NaT` | `"missing"`     | unchanged
+|===
+
+*Test evidence:*
+
+* `pytest tests/unit/core/test_scalar_values.py -v` -- 67 passed (was 59
+  before this BUG; 8 new/extended cases:
+  `test_scalar_category_rejects_numpy_timedelta64_without_number_misclassification`
+  (3 parametrized cases: non-`NaT` day/nanosecond units, `NaT`),
+  `test_scalar_category_still_accepts_numpy_datetime64_nat_as_missing`,
+  `test_scalar_category_still_rejects_numpy_datetime64_non_nat_unchanged`,
+  `test_scalar_category_still_rejects_datetime_timedelta_and_pandas_timedelta`,
+  plus 2 new parametrized cases
+  (`numpy-timedelta64-nat`/`numpy-timedelta64-days`) added to the existing
+  `test_is_missing_carrier_matches_accepted_contract` table). Independently
+  confirmed *red* pre-fix (`git stash` on the runtime file only, tests
+  unchanged): 4 failures (`DID NOT RAISE UnsupportedScalarError` for the 3
+  parametrized `timedelta64` rejection cases plus the `is_missing_carrier`
+  NaT-parametrize case); confirmed *green* after restoring the fix.
+* Focused Missing/value-model-adjacent slice
+  (`tests/unit/io_backends/ods/test_odf_renderer_missing_carrier.py
+  tests/unit/domain/transformations/test_fk_helpers_enrich.py
+  tests/unit/domain/transformations/test_fk_edge_cases.py
+  tests/unit/io_backends/test_csv_backend.py
+  tests/roundtrip/test_pathological_cell_contracts.py tests/architecture`):
+  `200 passed`.
+* Full active suite (`make test`): `2330 passed, 1 deselected` -- exactly
+  the 8 new test cases above the `2322 passed, 1 deselected` baseline
+  independently confirmed by Slice-1's own Review Pass 002; no test removed
+  or weakened.
+* `git diff --check`: clean.
+* `make source-style-guards`: `0 error(s)`, `83 warning(s)`, `2 allowlisted
+  finding(s)` -- none referencing `scalar_values.py` or
+  `test_scalar_values.py`; no new warning introduced by this change.
+
+*Fixing commit:* `022f651`
+(`fix(BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A): reject numpy
+timedelta64 as unsupported Duration carrier`).
+
+This BUG is *Fixed*, not yet *Done*. Per this repository's BUG lifecycle
+and the review-artifact convention, it remains open on the active backlog
+surface (`docs/backlog/_ftrs_open.adoc`) pending independent review; it
+should not move to `docs/cold_storage/backlog/ftrs_done/` and Project
+Memory should not be updated until that review accepts it.
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` is unaffected and unmodified by
+this fix -- its own D-T1..D-T5 slices remain unauthorized, and its
+`numpy.datetime64('NaT')` decision (section 6, point 2) remains that FTR's
+own future work, not performed here.
