@@ -1,0 +1,1612 @@
+[[warm-domain-architecture-consolidation-inventory]]
+== Domain Architecture Consolidation Inventory
+
+_Makes the architecture that has emerged through Phase-D value-model hardening
+explicit, durable, navigable, and reviewable -- before Phase-E Trusted Ingress
+design and before broad family-by-family hardening begins._
+
+Status: *Pre-normative analysis artifact.* Not an ADR, not a Technical Model
+chapter, not an FTR, and not itself a Project Memory record. It authorizes no
+runtime change, no package reorganization, no rename, no Pydantic adoption,
+and no start of D-T3. It is written for independent architecture review and
+is expected to be consumed, corrected, and partially promoted -- not accepted
+as-is.
+
+Date: 2026-08-10. Baseline commit: `0f3b3ef` ("docs(project_memory): record
+independently accepted D-T2"), `main`.
+
+Position in the roadmap
+(link:../../backlog/roadmap_domain_hardening_sequence.adoc[roadmap_domain_hardening_sequence.adoc]):
+after independently accepted Phase-D `D-T1`/`D-T2`
+(link:../../backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc[FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A]),
+before Phase-E Trusted Ingress design. It does *not* select or begin `D-T3`
+(the still-unselected transformation/family-compatibility pilot); per the
+roadmap's own sequencing (commit `0a97fef`, reaffirmed in Project Memory by
+commit `14e91fc` and again on D-T2's acceptance in `0f3b3ef`), `D-T3` requires
+Phase E and the Domain Maintainer Contract stage to exist first, and is then
+merely a *candidate* for -- or may be absorbed into -- the roadmap's first
+family-hardening pilot.
+
+=== 0. Method and scope
+
+This inventory was produced by reading, not assuming: the roadmap, the
+current Project Memory concerns (`CONC-DOMAIN-BOUNDARY-ROBUSTNESS`,
+`CONC-MAINTAINABILITY-HYGIENE`), three accepted ADRs
+(`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`,
+`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`), the Phase-D FTRs and their full
+review histories
+(link:../../backlog/FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc[FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A],
+link:../../backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc[FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A]),
+the Trusted Ingress concept and its three review rounds, the architectural
+layers/pipeline-semantics/parse-contract/generic-IR technical-model chapters,
+the Human Readability review chain (three-family investigation + its
+synthesis concept + the accepted, non-binding review guide), the 32-file
+architecture-guard inventory under `tests/architecture/`, and the current
+source tree under `domain/`, `core/`, `pipeline/`, `io_backends/`,
+`rendering/`. Every claim below is traceable to one of these sources; where
+this document proposes something new (vocabulary, disposition, sequencing
+detail), that is marked explicitly as *proposed*, not *evidenced*.
+
+Non-goals, restated from the task framing and honored throughout: no Domain
+refactor, no Trusted Ingress design, no `D-T3` start, no package move, no
+rename, no Pydantic introduction, no new architecture guard, no rewrite of
+the Technical Model, no push.
+
+=== 1. Executive architecture map
+
+The repository is not textbook DDD (application/domain/infrastructure). Six
+layers are already named and guarded
+(link:../../technical_model/ch06_architectural_layers/architectural_layers.adoc[architectural_layers.adoc]):
+
+[source,text]
+----
+CLI  (cli/apps/)
+ |
+ v
+Pipeline / Application  (pipeline/, application/orchestrator.py)
+ |                     |
+ v                     v
+Domain  (domain/)    Render IR  (rendering/)
+ |                     |
+ v                     v
+Core  (core/)        IO Backends  (io_backends/)
+ ^                     ^
+ |_____________________|
+----
+
+Orthogonal to this layer stack, three trust/authority dimensions have been
+established piecemeal, and are the actual subject of Phase E:
+
+* **Payload trust** -- is the data flowing through the pipeline trustworthy?
+  (`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, boundary levels 2-4.)
+* **Pipeline-description trust** -- is the YAML/config describing *what to
+  run* trustworthy? (`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`, decision 2;
+  `pipeline/dotted_paths.py`.)
+* **Runtime/operator trust** -- a fixed precondition, not a variable
+  (`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`, decision 1): "The operator
+  controlling the Python runtime, process, CLI arguments, environment,
+  installation, and import path is trusted. The framework does not protect
+  that runtime from its own operator."
+
+A fourth, separately-owned concern is **output-sink capability** (decision 5
+of the same ADR): what a sink *does* with an already-accepted value (e.g. a
+string beginning with `=` becoming a live XLSX formula) is not the same
+question as whether that value was valid payload.
+
+Only two of these four dimensions have *normative* (ADR-backed) treatment
+today: Domain Boundary Robustness (payload, levels 2-4) and Trusted Runtime
+and Policy Authority (the four-dimension frame itself, at the level of
+"these are independent axes," not at the level of an implemented mechanism).
+Everything else -- profile names, an internal value/lifecycle taxonomy,
+boundary-implementation mechanics, an FTR candidate map -- remains
+explanatory in
+link:../../technical_model/ch04_concepts/trusted_ingress_and_runtime_security.adoc[Technical
+Concept 001] and is explicitly *not* implementation-authorizing.
+
+Two structural facts recur across almost every family investigated below and
+are worth stating up front because they explain much of what follows:
+
+1. **`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` is a hard, currently
+   unreopened constraint.** Visible spreadsheet payload is text at the parser
+   boundary; typing is opt-in metadata. Any Internal Value Model work is
+   scoped to structured/programmatic Frames (JSON/YAML/direct Python) and to
+   values already inside a `DataFrame`, not to the XLSX/ODS cell surface.
+2. **Nothing today reliably normalizes a scalar value.** `scalar_category`
+   (`core/scalar_values.py`) *classifies* without narrowing (a `numpy.int64`
+   stays a `numpy.int64`; a `pandas.Timestamp` stays a `pandas.Timestamp`).
+   No `normalize_scalar()`-shaped primitive exists anywhere in the
+   repository, and Phase D has twice been corrected by review
+   (IVM-REVIEW-F2, DTVM-REVIEW-F2) for drifting toward building one before
+   Phase E's scope was reached. This is the single most load-bearing "we
+   checked, twice" fact in the whole inventory.
+
+=== 2. Current trust/layer model
+
+The Technical Model documents these boundaries as *independently owned, not
+independently executed* -- direct programmatic paths (`run_pipeline`,
+domain-function calls) can bypass some of them entirely, and that bypass is a
+documented, not-yet-resolved gap, not an oversight this document is
+discovering:
+
+[cols="1,3,3"]
+|===
+| # | Boundary | Current owner / mechanism
+
+| 1
+| Parser / resource bound
+| Format-specific parser + `io_backends/parser_limits.py` (`ParserLimits`,
+  `SpreadsheetTooLargeError`). **ODS-only today** -- XLSX has no resource
+  ceiling at all. Repeatedly flagged (concept doc, ADR non-goals, FTR
+  candidate map) as the most "shovel-ready" concrete gap in the corpus.
+
+| 2
+| Structural / scalar ingress
+| `domain/ingress/coordinator.py::run_domain_ingress` -- framework-owned,
+  non-YAML-addressable, automatically invoked after `bootstrap_meta`/
+  `apply_overrides`. Current scope is exactly one rule:
+  `normalize_legend_blocks_shape` (list->mapping normalization of
+  `_meta.legend_blocks`). Not a general trusted-ingress boundary yet; the
+  *phase* is framework-owned and worth preserving, the *mechanism* (a flat
+  `IngressRule` tuple) is explicitly not pre-selected for extension.
+
+| 3
+| Pipeline authorization / addressability
+| `pipeline/dotted_paths.py::resolve_configuration_callable` -- one shared
+  resolver; its only ownership check rejects dotted references into the
+  `spreadsheet_handling.domain.ingress` namespace. "Encodes one namespace
+  exclusion, not a general trust policy" (concept doc, verbatim).
+
+| 4
+| Domain execution
+| Per-family, governed by `ADR-DOMAIN-BOUNDARY-ROBUSTNESS` -- robust to
+  malformed values reasonably implied by pandas/NumPy/config/metadata/
+  artifact contracts; explicitly not a hostile-code sandbox.
+
+| 5
+| Output sink
+| Per-writer. XLSX: an ordinary string beginning with `=` becomes a live
+  formula cell -- a named, currently unresolved formula-output policy gap.
+  ODS has no equivalent gap for ordinary values. The three filesystem
+  writers (`write_structured_yaml`, `write_key_value_resources`,
+  `write_artifact_manifest`) implement path containment via
+  `_safe_target_path`.
+|===
+
+Known, explicitly documented bypass: `pipeline.run_pipeline` (the
+programmatic entry point) skips `domain.ingress`, the persistence boundary,
+and final domain cleanup entirely. This is a "documented trusted-programmatic
+path," not a bug -- but it means boundaries 2 and 3 above are not universal
+gates today. Any Phase-E design has to decide this path's fate explicitly;
+this inventory does not decide it.
+
+**Validation ownership is already settled and is not part of the open
+question.**
+`ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB` (accepted): "Semantic cleanup
+and validation live in the domain pipeline, triggered by explicit pipeline
+steps. Writers serialize the frames they receive." The persistence boundary
+(`pipeline/persistence_boundary.py`) owns metadata *projection* (Intent
+survives, Resolution is dropped), never payload *filtering* -- a distinction
+worth restating because Trusted Ingress design will otherwise be tempted to
+grow the persistence boundary into a second validation layer.
+
+**Two orthogonal existing distinctions must not collapse into one "trust"
+axis:** (a) `metadata_canonical_vs_derived.adoc`'s canonical/derived
+distinction is *functional, not temporal* -- persistence alone does not
+promote derived metadata to canonical; (b) the registry-semantics foundation
+(`ch05_registries/registry_semantics/`) keeps *data layer*
+(original/derived) strictly orthogonal to *meta layer*
+(canonical/derived/operational-carrier), which is itself orthogonal to
+*meta classification* (model/presentation/workbook_identity) and to the
+opt-in *contract lifecycle* axis (current/target/transition). None of these
+four axes is "trust," and Trusted Ingress design should not silently reuse
+their vocabulary for a fifth thing.
+
+=== 3. Internal Value / Trusted Payload contract candidate
+
+**A. Semantic categories -- accepted, evidence-backed (Phase D, Slice 1 +
+D-T1):**
+
+[cols="1,4"]
+|===
+| Category | Status and canonical carrier
+
+| String
+| Accepted. Native `str`. `""` is both legitimate payload and the accepted
+  carrier for unresolved-reference, disambiguated by source-FK + resolution
+  state, never by string shape.
+
+| Boolean
+| Accepted. Native `bool` for structured/programmatic Frames. Checked before
+  Number (subclass hazard: `bool` is an `int` subclass). Spreadsheet-cell
+  boolean stays a string, per `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`
+  (never reaches Frames as native `bool` on that path regardless).
+
+| Number
+| Accepted as **one** category. Integer-vs-Float is a *bounded MVP
+  deferral*, not a decision made -- no evidenced consumer needs it typed, and
+  pandas does not reliably preserve the distinction across ingress paths
+  anyway.
+
+| Missing
+| Accepted, but explicitly **not a type**. A recognition predicate
+  (`is_missing_carrier`) over already-accepted carriers: `None`, `""`,
+  and a bounded NaN/`pandas.NA`/`NaT` dispatch that never invokes
+  `pandas.isna` on an arbitrary unrecognized object (closes IVM-REVIEW-F1).
+  This predicate is the *first shared, importable copy* of a shape "five
+  independent local implementations had already converged on" -- not a new
+  semantic.
+
+| Date
+| Accepted (D-T1). Native `datetime.date`. Checked *after* DateTime (same
+  subclass hazard as Boolean/Number, applied to `Timestamp`/`datetime`
+  subclassing `date`). A midnight `Timestamp` is never reclassified as Date
+  -- no time-of-day heuristic.
+
+| DateTime
+| Accepted (D-T1). Native `datetime.datetime`; `pandas.Timestamp` and
+  **every non-NaT `numpy.datetime64`, uniformly, regardless of unit** classify
+  into it as *carrier variants*, without being narrowed. Unit-based
+  Date-vs-DateTime inference was explicitly rejected as "not merely
+  undesirable but unreliable" (day-precision storage is bit-identically
+  ambiguous). Timezone-awareness is a *property* of DateTime, not a
+  category -- `tzinfo` is never stripped, never silently converted, never
+  assumed UTC. This settles category membership only, not a canonicalization
+  *policy*.
+
+| Error
+| **Deferred, not rejected.** No maintained parser produces a distinguishable
+  spreadsheet-error carrier at all -- there is currently no reachable
+  instance to classify.
+
+| Time-only / Duration
+| **Deferred, not rejected.** No maintained producer or consumer exists;
+  both are strictly more expensive to support than Date/DateTime was (e.g.
+  neither `yaml.safe_dump` nor `json.dumps` can serialize a bare
+  `datetime.time` at all). `numpy.timedelta64` is uniformly rejected
+  (`UnsupportedScalarError`), NaT-valued or not, closing a real
+  misclassification bug found along the way
+  (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`).
+
+| Formula
+| **Not a category candidate at all**, deferred or otherwise. Authored
+  backend-neutral output *Intent* (`core.formulas.FormulaSpec`), not payload.
+  Tracked separately, indefinitely deferred
+  (`FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`).
+|===
+
+**B. Carrier variants are not automatically separate semantic types** --
+this is the single cleanest, most repeatedly reaffirmed design decision in
+the whole Phase-D evidence base. `numpy.int64`/`numpy.float64`/`numpy.bool_`
+classify into Number/Boolean without narrowing; `pandas.Timestamp`/
+`numpy.datetime64` classify into DateTime without narrowing. `ScalarValue`
+(the native-Python type alias in `core/scalar_values.py`) is explicitly
+documented as *not* the full accepted carrier domain and *not* a target
+normalized shape -- its own docstring warns future readers not to
+misread it that way.
+
+**C. Classification exists today; normalization does not.**
+`scalar_category(value) -> ScalarCategory` is the classification function.
+No `normalize_scalar()`-shaped primitive exists. This split was reasserted
+twice under review pressure (IVM-REVIEW-F2 removed a Number
+normalization step that had crept into Slice 1's design; DTVM-REVIEW-F2
+removed a general `normalize_scalar()` that had crept into D-T2's original
+proposal). **Normalization remains Phase-E-owned**, consistent with current
+accepted evidence -- there is no evidence anywhere in the corpus that argues
+otherwise.
+
+**D. Normalization -- deliberately out of scope here**, per (C). The only
+thing decided about it so far is negative: it is not Phase D's job, and no
+shape has been chosen.
+
+**E. Persistence-local conversion is explicitly *not* general normalization.**
+D-T2 built exactly two conversions: `_yaml_safe_temporal` (YAML writer,
+private, unexported) and `_json_temporal_default`/`_json_temporal_object_hook`
+(JSON writer/reader, private, unexported, codec-level only -- `read_json_dir`/
+`read_multi` deliberately left unwired, "Option B" chosen explicitly over
+wiring general read paths). The FTR's own design contract states this in so
+many words: both helpers are "private, unexported, single-direction, local
+to their own backend file, never imported cross-module, never named/shaped
+as `normalize_scalar()`/`normalize_value()`/`canonicalize_scalar()` or any
+general Domain-wide primitive, and do not participate in Trusted Ingress
+(Phase E) in any way." A future Phase-E primitive *may* choose to reuse this
+logic later -- that reuse is not pre-empted, but it is also not assumed.
+
+**F. Future bounded composite values.** The scalar-only MVP is a
+*phase-scope* decision, not a permanent ban on composites. `List[Scalar]`
+remains a deferred extension candidate, explicitly distinguished from
+`List[Object]`/nested records, which stay `FTR-NESTED-LISTS`'s territory with
+no delimiter/string-shape guessing. This was reaffirmed in a 2026-08-09
+"knowledge-anchoring pass" in Project Memory specifically to prevent a future
+reader from over-reading the scalar-only MVP as a permanent architectural
+position.
+
+**Candidate vocabulary emerging from A-F (proposed synthesis, not
+independently accepted yet):**
+
+[source,text]
+----
+Trusted Domain Payload  (Phase E's eventual output)
+  = Frame of Trusted Scalar Cell  |  (future, bounded) Trusted Composite Cell
+Trusted Scalar Cell
+  = one of {String, Boolean, Number, Missing, Date, DateTime}
+    -- carrier-classified, not carrier-narrowed
+    -- Error/Time/Duration/Formula excluded (deferred or non-candidate)
+Carrier variant
+  = a concrete Python/NumPy/pandas runtime type that classifies into a
+    Trusted Scalar Cell category without being converted to a single
+    canonical carrier
+----
+
+This vocabulary is offered as a naming anchor for Section 14 (Technical Model
+target structure); it is not a proposal to build anything.
+
+=== 4. Pydantic suitability analysis
+
+The repository does not use Pydantic today. Current validated-shape tooling
+is dataclasses (`pipeline/config.py::AppConfig`/`IOConfig`/`IOEndpoint`/
+`ExcelOptions`; `domain/schema_maintenance/model.py`'s request/result/failure
+types), enums (`SchemaOperationKind`, `WriteIntent`, `ReferenceAction`,
+`ReferenceRoot`), `TypedDict`-free structural validation via hand-written
+functions (`domain/schema_maintenance/meta_update.py::apply_metadata_rules`,
+`fk_relations.py::infer_fk_relations`), a `Literal`-based closed vocabulary
+(`ScalarCategory`), and YAML/JSON loading straight into dict/DataFrame shapes
+validated by ad-hoc field checks close to their point of use.
+
+**A. No Pydantic (current state).** Cost: every new config/policy shape gets
+its own hand-rolled validation, duplicated in spirit across
+`config.py`/`schema_maintenance/model.py`/`fk_relations.py`/
+`helper_policies.py`. Benefit: no dependency, no coercion semantics to reason
+about, validation errors are exactly what the project chose to raise (typed
+`UnsupportedScalarError`, `MissingFkRelationPolicyError`, structured
+`Finding` objects with a `SeverityPolicy` gate -- not a library's generic
+`ValidationError` shape).
+
+**B. Pydantic only for external structural descriptions** (external mapping
+-> strict Pydantic boundary model -> explicit translation -> internal
+`PipelineSpec`/Policy types). This is the shape that best survives contact
+with `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`'s framework/workflow-builder split and
+with `ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB`'s validation-ownership
+rule: Pydantic would own *structural* well-formedness of YAML config
+(`AppConfig`, `IOEndpoint`, helper-policy YAML shapes, `SchemaMaintenanceRequest`
+authoring), and an explicit translation step -- not Pydantic's own
+`.model_dump()`/coercion -- would produce the internal dataclass/`Literal`
+shapes the Domain already trusts. This mirrors the accepted pattern already
+in place at the `domain.ingress` boundary: normalize externally-authored
+shape, then hand off a project-owned internal type.
+
+**C. Pydantic models used directly as internal `PipelineSpec`/Policy
+models.** Rejected by the working hypothesis, and nothing in the evidence
+argues against the hypothesis here. `domain/schema_maintenance/model.py`'s
+enums and frozen value objects are deliberately narrow and project-defined;
+letting Pydantic's coercion semantics (str->int, str->bool truthy-parsing,
+`Optional` defaulting) become the *definition* of what a
+`SchemaMaintenanceRequest` means would let a third party's coercion rules
+silently redefine Domain semantics -- the exact risk
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` and `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`
+were written to keep local and explicit.
+
+**D. Pydantic/`TypeAdapter` used for payload scalar validation.** Rejected
+by the working hypothesis, strongly. `scalar_category`'s entire design
+argument (carrier classification without narrowing, explicit rejection of a
+`normalize_scalar()` shape, "never call `repr`/`str`/comparison/hashing on a
+rejected value") is incompatible with adopting a general-purpose coercion
+library at exactly this boundary -- Pydantic's own type-coercion rules would
+become an *unreviewed* second definition of what String/Boolean/Number/
+Date/DateTime mean, sitting next to the one the project spent two FTRs and
+eleven review passes agreeing on.
+
+**Specific investigation findings:**
+
+* *Coercion risk* -- real and central. Pydantic's default (lax) mode coerces
+  `"1"` -> `1`, `1` -> `True`, etc.; strict mode narrows this but still
+  differs from `scalar_category`'s "classify, never narrow" contract for
+  carrier variants (a `numpy.int64` staying a `numpy.int64`).
+  JSON-vs-Python validation differs further (Pydantic's JSON mode is stricter
+  about some coercions than its Python mode) -- another axis the project
+  would inherit rather than choose.
+* *Dependency cost* -- Pydantic is a real runtime dependency with its own
+  release cadence (v1 -> v2 was a breaking rewrite); the project currently
+  has no runtime dependency of comparable weight outside pandas/NumPy/
+  openpyxl/odfpy.
+* *Schema generation / tooling benefit* -- real and positive for option B:
+  JSON-schema generation for external YAML config shapes could plausibly
+  help user-facing documentation/tooling, without touching internal Domain
+  types.
+* *Compatibility with plugin/config evolution* -- neutral to positive for
+  option B (`pipeline/dotted_paths.py`'s addressability model is orthogonal
+  to how a config's *shape* is validated); not evaluated for C/D since they
+  are rejected on other grounds first.
+* *Trust-boundary clarity* -- option B **preserves** the trust boundary
+  (external shape validated by Pydantic, then explicitly translated into a
+  project-owned type the rest of Domain can trust); options C and D
+  **obscure** it (Pydantic's own coercion becomes load-bearing for Domain
+  meaning, contradicting the ADR-level position that Domain owns its
+  invariants).
+
+**Provisional recommendation:** the working hypothesis in the task framing
+survives this evidence review unchanged -- Pydantic, *if* adopted at all, is
+best scoped to option B (external structural/config description only), with
+an explicit, project-owned translation step into internal types; the
+Internal Value Model and transformation invariants (Section 3) should remain
+project-owned semantics, not Pydantic coercion semantics. This is a
+recommendation for a future ADR to test, not a decision; nothing here
+authorizes adding the dependency.
+
+=== 5. Domain responsibility taxonomy
+
+Tested against the actual `domain/` tree (36 non-test files across 10
+sub-packages plus 12 flat modules), the candidate vocabulary from the task
+prompt survives largely intact, with adjustments the code evidence forces:
+
+[cols="1,3,3,2"]
+|===
+| Term | What it means here / what it must (not) own | Reference examples | Verdict
+
+| Value/type/model definitions
+| Frozen dataclasses, enums, `TypedDict`-free structural types for one
+  family's request/result/policy shapes. Must not leak pandas/NumPy carrier
+  choices into the type name (e.g. `ScalarCategory` names semantics, not
+  "int-or-float").
+| `schema_maintenance/model.py`, `grouped_xref/model.py`, `core/scalar_values.py`
+| Clear, well-populated category.
+
+| Operation / public feature entrypoint
+| The one function a pipeline step or another family is meant to call.
+  Package `__init__.py` states this explicitly where it exists.
+| `enrich_lookup/operation.py::enrich_lookup`,
+  `xref_crosstable/operation.py::contract_xref`/`expand_xref`,
+  `fk_helpers/enrich.py::enrich_helpers`
+| Clear, but not every family names its module `operation.py` (see Section
+  10 -- deliberately not mandated).
+
+| Validation / invariant checking
+| Produces `Finding` records or raises typed errors; never itself decides
+  control flow (`SeverityPolicy`/`apply_severity_policy` does that,
+  per `architectural_layers.adoc`).
+| `domain/validations/*.py`, `schema_maintenance/columns.py::_validate_*`
+| Clear as a *layer* (`domain/validations/`); less clear as a per-family
+  convention -- several families validate inline in their operation module
+  rather than a dedicated `validation.py` (e.g. `enrich_lookup/operation.py`'s
+  `_check_*` functions). Both are legitimate; see Section 7.
+
+| Policy / option resolution
+| Reconciles inline call arguments against persisted `_meta` policy once,
+  early, before the forward operation runs.
+| `enrich_lookup/policy.py`, `fk_helpers/policy.py`, `xref_crosstable`'s
+  `dense_axes.py::_dense_axes_from_config_or_meta`
+| Clear where a real resolution boundary exists (HR-04/HR-05 from the
+  Human Readability evidence agree). Not present as a separate module in
+  every family, correctly -- `xref_crosstable` folds policy into
+  `dense_axes.py` because that *is* its axis-configuration owner.
+
+| Forward projection
+| One direction of a paired transform: relation->matrix, flat->grouped,
+  compact->relation.
+| `xref_crosstable::contract_xref`, `grouped_xref::contract_grouped_xref`,
+  `compact_multiaxis::contract_compact_multiaxis`
+| Clear; see Section 6 for the vocabulary problem around the word
+  "projection" itself.
+
+| Reverse projection / reconstruction
+| The other direction; not guaranteed to exist for every family (e.g.
+  `enrich_lookup` is a one-way lookup enrichment with no declared inverse).
+| `xref_crosstable::expand_xref`, `grouped_xref::reconstruction.py`
+| Clear where paired; correctly absent where the operation is not
+  conceptually bijective.
+
+| Bijective transformation
+| A pair that is provably lossless in both directions for its declared
+  domain, and says so.
+| `discriminator_split` (`split_by_discriminator`/`merge_by_discriminator`,
+  docstring literally says "bijective split/merge symmetry"),
+  `xref_axis_mapping` (`_ensure_bijection`)
+| Clear, precise, used sparingly and correctly. See Section 6.
+
+| Unidirectional projection building block / primitive
+| A pure, backend-neutral shape transform with no side effects, no `_meta`
+  writes, consumed by a composite.
+| `grouped_xref/projection.py::build_grouped_header`/`restore_flat_matrix`
+  ("stores nothing in `_meta`, builds no MultiIndex, persists no mapping" --
+  module's own docstring)
+| Clear and well-documented as a category; the family itself names the
+  distinction between this and its impure sibling
+  (`reconstruction.py`) explicitly.
+
+| Composite / orchestration
+| A named module composing two or more primitive families into one feature.
+| `compact_multiaxis.py` (explicitly "composes the generic XRef and
+  cell-codec primitives" per its own docstring), `grouped_xref/composites.py`
+| Clear; the word "composite" is also a formal pipeline-step *category* in
+  `pipeline_semantics.adoc` (composite step, `wrapped_steps` declared) --
+  worth distinguishing explicitly in the Technical Model (a domain-level
+  composite module is not automatically a pipeline-level composite step).
+
+| Extraction
+| A declarative column-projection/filter/rename operation over one frame.
+| `domain/extractions/frame_extract.py::extract_frame`
+| Clear, small, single-purpose category.
+
+| Wrapper / facade
+| Deliberately rare. A facade narrows a wider surface for one consumer
+  group; the codebase self-labels exactly one thing this way.
+| `io_backends/spreadsheet_contract.py` ("narrow adapter-facing facade,"
+  module's own docstring) -- outside `domain/` proper.
+| No `domain/` module claims this term. Correctly so -- `domain/` has no
+  analogous narrow-consumer-facing surface need today; do not invent one.
+
+| Adapter / boundary translation
+| Translates one representation into another at a layer seam.
+| `io_backends/errors.py::DeprecatedAdapterError`, the whole `io_backends/`
+  layer conceptually.
+| Not a `domain/` concept in this codebase -- `domain/` does not translate
+  between external representations, it *is* the internal representation.
+  Confirms the layer map is accurate here.
+
+| Registry / discovery
+| A name->factory or name->policy mapping, reviewed as an artifact.
+| `pipeline/registry.py::REGISTRY`, `registries/meta_registry.yaml`,
+  `registries/pipeline_step_registry.json`
+| Lives in `pipeline/`, not `domain/` -- correct per the layer map (Domain
+  does not know about step names).
+
+| Provenance
+| Records *why*/*how* a derived value came to exist, for a later consumer
+  to trust or clean up.
+| `fk_helpers/provenance.py`, `_meta.derived.sheets.*.helper_columns`
+| Clear, single well-known shape, consistently named.
+
+| Schema maintenance
+| CRUD on frame *shape* (add/drop/rename/reorder column) plus the `_meta`
+  reference repair that keeps every other family's policy consistent
+  afterward.
+| `domain/schema_maintenance/` (5 files; `meta_update.py` is the largest
+  single module in `domain/`, over 1000 lines, ~30 `_handle_*` functions)
+| Clear as a category; internally the largest complexity concentration in
+  the whole layer -- flagged in Section 9, not proposed for action here.
+
+| Helper/local algorithm support
+| A private, file-local function existing only to keep its caller readable.
+| Overwhelming majority of `_`-prefixed functions across every family.
+| Clear and disciplined -- see Section 8; this is the healthiest category
+  in the inventory.
+|===
+
+**Terms the task vocabulary offered that code evidence does not currently
+support as distinct `domain/` categories:** *wrapper* and *adapter* (both
+belong to `io_backends/`, not `domain/`, and inventing a domain-internal
+sense for either would blur the existing, working layer boundary).
+
+**One term the evidence forces as an addition, not in the task's candidate
+list:** *configuration step* (in the `pipeline_semantics.adoc` sense: a step
+that writes/validates `_meta`, the only place heuristics/`auto` belong). Its
+Domain-side counterpart -- functions like `configure_lookup_helpers`,
+`configure_fk_helpers`, `configure_workbook_view` -- is a real, recurring
+Domain shape (policy *production*, as opposed to policy *resolution* inside
+an operation) that deserves its own row rather than being folded into
+"policy / option resolution."
+
+=== 6. Projection / reconstruction taxonomy
+
+This is the vocabulary area with the clearest, most immediately actionable
+finding in the whole inventory: **`projection` is heavily overloaded** (at
+least four distinct senses coexist today), while **`expand`/`contract` and
+`bijection` are used with strong discipline** (one minor divergence each).
+
+**Current uses of "projection" (evidence, not proposal):**
+
+. Pure header-shape primitive: `grouped_xref/projection.py::build_grouped_header`
+  / `restore_flat_matrix` -- a backend-neutral model transform with no side
+  effects.
+. Whole-module IR-to-Frames projection: `rendering/workbook_projection.py`
+  ("projects a parsed backend-neutral `WorkbookIR` back into `Frames`").
+. Axis-label vocabulary substitution: `xref_axis_projection.py::project_axis_labels`
+  -- swaps identity values through a bijection, no shape change.
+. Generic English sense (select/map a subset of columns): scattered across
+  `pipeline_cleanup.py`, `fk_relations.py`, `structured_yaml.py`,
+  `enrich_lookup/operation.py::_build_helper_projection`, `cell_codec/frame.py`,
+  `extractions/frame_extract.py::_project_columns`, `workbook_views.py`,
+  `ingress/coordinator.py`.
+. A fifth, *retired* sense still referenced in a docstring:
+  `column_roles/__init__.py` mentions the retired `project_by_role` step.
+
+**Current uses of "reconstruction":** narrowly and consistently one thing --
+the *impure*, pipeline-facing reverse step that consumes externally-parsed
+input (`grouped_xref/reconstruction.py::reconstruct_grouped_matrix`, from a
+parsed `ExactTable`). No other module in `domain/` or `rendering/` uses
+"reconstruction" for anything else. `rendering/workbook_projection.py` is
+aware of and *defers to* this usage in a comment rather than reusing
+"projection" for that piece -- a real, positive, already-self-consistent
+cross-reference between two otherwise-separate families.
+
+**`expand`/`contract`:** the most disciplined paired vocabulary found,
+consistently naming forward/inverse `Frames -> Frames` steps: `xref_crosstable`
+(`expand_xref`/`contract_xref`), `compact_multiaxis`
+(`expand_compact_multiaxis`/`contract_compact_multiaxis`), `grouped_xref`
+(`expand_grouped_xref`/`contract_grouped_xref`). One divergence:
+`sparse_defaults.py` uses `sparse_collapse`/`sparse_expand` for conceptually
+the same shape of operation (it reads `_meta.xref_crosstable` and operates on
+crosstable data) -- a naming inconsistency worth flagging (see disposition
+table, Section 16), not fixing here.
+
+**`split`/`merge`:** used only in `discriminator_split/`, self-consistently,
+explicitly self-labeled "the bijective split/merge symmetry." No collision
+with the many *generic* English uses of "merge" elsewhere (`deep_merge`,
+`_merge_constraints`, `_merge_sheet_options`, `_build_header_grid_and_merges`)
+-- context is always locally clear, so this is not flagged as a problem.
+
+**`bijection`/`bijective`:** used precisely for the `xref_axis_mapping`
+bijection concept (`_ensure_bijection`, "Immutable ordered bijection with
+exact forward and inverse lookup") and reused once, independently, by
+`discriminator_split/values.py` for its own unrelated split/merge symmetry.
+Two uses, two different mechanisms, no confusion in context -- acceptable as
+is. **"Reversible" is never used anywhere** in `domain/` or `rendering/`; the
+codebase already, consistently, prefers "bijection"/"bijective" or
+"forward/inverse."
+
+**Does the project need the task's proposed explicit vocabulary?**
+
+[cols="2,3,1"]
+|===
+| Proposed term | Verdict against evidence | Already named as
+
+| Bijective transformation
+| Needed, already exists, already precise.
+| `bijection`/`bijective` (2 uses, both correct)
+
+| Reversible projection pair
+| Not needed as new vocabulary -- `expand`/`contract` already fills this role
+  more concretely, and "reversible" is unused by choice.
+| `expand_x` / `contract_x` paired functions
+
+| Forward projection
+| Ambiguous given finding above (5 senses of "projection"). The concept is
+  real and needed; the *word* is overloaded.
+| One of: `expand_x`, `build_grouped_header`, generic "project columns"
+
+| Reconstruction
+| Needed, already exists, already precise (one consistent sense, one
+  module).
+| `reconstruct_grouped_matrix` (only user of the word as an identifier)
+
+| One-way projection primitive
+| The concept is real (`enrich_lookup` is exactly this: a one-way lookup
+  enrichment with no declared inverse) but no family currently *names*
+  itself this way -- it is implicit in "this family has no `expand`/
+  `contract` pair."
+| Not named anywhere today
+
+| Lossy projection
+| Not evidenced as a distinguished concept anywhere in the corpus. No family
+  currently claims to be a *lossy* transform as opposed to an unpaired one;
+  this may be worth naming later, but there is no current usage to anchor
+  it to.
+| Not used
+
+| Composite projection
+| Overlaps with the already-used, already-formal "composite" (domain-level
+  orchestration module *and* pipeline-step category, per Section 5). Adding
+  "composite projection" as a third sense of "composite" would make the
+  overload problem worse, not better.
+| `compact_multiaxis.py`, `grouped_xref/composites.py` (as "composite")
+|===
+
+**Proposed minimal vocabulary (for the Technical Model to adjudicate, not
+adopted here):** keep *bijection*/*bijective*, *expand*/*contract*,
+*reconstruction* exactly as currently used (they are correct); reserve
+*projection* for the header-shape/axis-substitution/IR-to-Frames senses only
+and stop using it for plain column selection (use *select*/*extract*
+consistently with `extractions/frame_extract.py`'s own vocabulary instead);
+retire the dangling `project_by_role` reference from
+`column_roles/__init__.py`'s docstring the next time that file is touched for
+an unrelated reason (not a standalone task). Do not introduce *lossy
+projection* or *composite projection* until a family actually needs to make
+that distinction operationally.
+
+A maintainer should now be able to answer, for each family in Section 9:
+
+* "Is this operation expected to have a reverse?" -- yes iff it has an
+  `expand_x`/`contract_x` (or `split`/`merge`) pair; no otherwise (e.g.
+  `enrich_lookup`, `extract_frame`, `join_frames`, `pivot_frame` are
+  genuinely one-way).
+* "If yes, where does that reverse live?" -- same module or same package,
+  always (no family splits its forward/reverse pair across packages).
+* "Is losslessness guaranteed?" -- only where the pair is explicitly
+  labeled *bijective* (`discriminator_split`, the `xref_axis_mapping`
+  resolver). `expand`/`contract` pairs are round-trip-tested but not all
+  formally claimed bijective in their own docstrings -- worth a targeted
+  documentation pass later, not decided here.
+* "Is this a public transformation or merely a building block?" -- package
+  `__init__.py` states it where the package has one (`grouped_xref`
+  explicitly enumerates its "public pipeline surface" vs. feature-internal
+  code); families without an `__init__.py` re-export list should be read as
+  not yet having drawn that line explicitly (see Section 10).
+
+=== 7. Validation taxonomy
+
+Evidence supports separating validation responsibilities along exactly the
+lines the task proposed, with concrete current owners for each:
+
+[cols="1,3,2"]
+|===
+| Category | Current owner(s) | Notes
+
+| A. External structural validation
+| Not centralized today. Closest current analogue: `pipeline/config.py`'s
+  dataclass loaders (`load_app_config`) and ad-hoc per-family YAML shape
+  checks inside `configure_*` functions.
+| This is exactly the gap Section 4's Pydantic-option-B discussion targets
+  -- currently diffuse, not owned by one contract.
+
+| B. Trusted-Ingress payload validation
+| Does not exist as a general mechanism yet. `domain/ingress/coordinator.py`
+  is its *load-side counterpart in spirit* (framework-owned, automatic,
+  pure) but its current scope is one `_meta.legend_blocks` shape rule, not
+  payload scalars.
+| Phase E's job. `core/scalar_values.py::scalar_category` is *available*
+  classification machinery for this layer, not wired to it -- "no adapter,
+  CLI, or domain transformation is wired to call it by this slice"
+  (module's own docstring).
+
+| C. Domain invariant validation
+| `domain/validations/` (produces `Finding`, never raises/logs itself;
+  `apply_severity_policy` is the sole control-flow decision point, per
+  `architectural_layers.adoc`).
+| Cleanly owned, cleanly separated from control flow. The strongest example
+  of a settled validation-ownership pattern in the codebase.
+
+| D. Transformation preconditions
+| Inline per-operation guards, e.g. `enrich_lookup/operation.py`'s
+  `_check_duplicate_lookup_keys`/`_check_column_conflict`/etc.,
+  `xref_crosstable/primitives.py`'s `_ensure_*` functions.
+| Legitimately local to the operation rather than centralized -- these are
+  "can this specific transform proceed," not general Domain invariants.
+
+| E. Reconstruction / roundtrip invariants
+| `grouped_xref/reconstruction.py::_validated_geometry`,
+  `_require_blank_row_key_uppers`; enforced separately again at the test
+  layer by `tests/roundtrip/` (full canonical->workbook->canonical cycles
+  through the public CLI, per `docs/ai_info/agent_rules.adoc`).
+| Two independent enforcement points by design (in-code precondition +
+  black-box roundtrip test), not duplication.
+
+| F. Persistence / backend validation
+| `io_backends/parser_limits.py` (ODS only), backend-local shape checks in
+  `openpyxl_parser.py`/`odf_parser.py`.
+| The XLSX resource-ceiling gap (Section 2) lives here.
+
+| G. Architecture / fitness guards
+| `tests/architecture/` (32 files; inventoried in full in Section 15).
+| Machine-checkable subset only, by design (`test_*.py`, run as ordinary
+  pytest, not a separate "guard framework").
+|===
+
+**Where these are currently mixed (the finding that matters most for a
+future Pydantic decision):** categories A and C are the pair most at risk of
+silent conflation if Pydantic were adopted carelessly. A's job ("is this
+YAML shape well-formed") and C's job ("does this value violate a Domain
+invariant, e.g. an FK relation pointing at a nonexistent sheet") are
+currently, correctly, different code paths with different failure shapes
+(`load_app_config` raising vs. `Finding` + `SeverityPolicy`). Nothing in the
+current codebase merges them. The explicit terminology recommendation this
+inventory proposes: keep the words *structural* (well-formedness of shape,
+independent of current data) and *semantic*/*invariant* (Domain-meaning
+correctness, dependent on current data and cross-references) consistently
+distinct in any future Trusted Ingress or Pydantic-adoption document, exactly
+as `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`'s capability-activation
+invariant already distinguishes "safe authorization-preparation" (parsing,
+structural validation, canonicalization) from "capability activation" for a
+different but structurally analogous reason.
+
+=== 8. Wrapper / helper / utility analysis
+
+This is the healthiest area of the inventory: the codebase already largely
+follows the rule the task asked this section to test for, and does so
+without a written rule forcing it.
+
+**Filenames matching the search terms in `domain/`:**
+`_cell_primitives.py`, `helper_policies.py`, `transformations/helpers.py`,
+`xref_crosstable/primitives.py`, `validations/fk_helpers.py`. **No
+`utils.py`, `common.py`, or `shared.py` filename exists anywhere in
+`domain/`, `core/`, or `pipeline/`.** The word "shared" appears only in
+docstrings/comments, and every time it does, it is immediately bounded by an
+explicit out-of-scope note: `_cell_primitives.py` names the three
+*incompatible* `_plain_value` variants it deliberately does *not* absorb;
+`domain/tabular/__init__.py` explicitly disclaims being "a broad pandas
+wrapper"; `_where_predicates.py` and `_legend_blocks.py` follow the same
+pattern. This is a real, consistent, evidence-backed idiom, not an accident.
+
+**No `Wrapper`/`Facade`/`Adapter`/`Common`/`Shared`/`Util` class exists
+anywhere under `domain/`.** The only self-labeled "facade" in the entire
+`src/` tree is `io_backends/spreadsheet_contract.py`, and it is exactly the
+kind of module the word should describe: a deliberately narrow, one-sentence,
+adapter-facing surface, outside `domain/` proper.
+
+**One real dumping-ground candidate, correctly narrow in practice:**
+`domain/transformations/helpers.py` -- vague by *filename* (a leftover from
+before the newer `fk_helpers/` package existed: `mark_helpers`,
+`clean_aux_columns`, `flatten_headers`/`unflatten_headers`,
+`reorder_helpers_next_to_fk`), but its actual contents remain narrowly
+scoped pipeline-step-factory wrappers, not an accreting catch-all. Flagged
+as a *naming clarification candidate* (Section 16), not a responsibility
+problem.
+
+**One real cross-family naming collision:** "helper" itself spans at least
+four distinct concepts across `domain/`: FK helper *columns*
+(`fk_helpers/` package + `core/fk.py`), lookup helper *fields*
+(`enrich_lookup/`), generic legacy step *helpers*
+(`transformations/helpers.py`), and helper-*policy configuration*
+(`domain/helper_policies.py`, which configures both of the first two). None
+of these individually violates local clarity -- each module's own identifiers
+are accurate within their file -- but a reader moving between files has to
+reconstruct which "helper" is meant each time. `fk_helpers/` is the
+best-documented and most disciplined of the four (its package docstring
+states its full scope and lineage explicitly); it is the model the others
+should be measured against if this is ever addressed, not the other way
+around.
+
+**Derived rule (matches the task's suggested rule, and the evidence supports
+it without needing modification):**
+
+* A local helper (private, single-file, `_`-prefixed) is fine when its
+  responsibility is genuinely local -- confirmed true for the overwhelming
+  majority of `_`-prefixed functions found across every family inspected.
+* A shared helper (imported cross-module) requires a named architectural
+  responsibility and an explicit scope-exclusion note -- confirmed true for
+  every actual cross-module "shared" module found (`_cell_primitives.py`,
+  `_where_predicates.py`, `finding_frame.py`, `domain/tabular/`,
+  `_legend_blocks.py`).
+* Generic `utils`/`common`/`shared` filenames must not become a substitute
+  for ownership -- trivially true here, since none exist; worth stating as a
+  *preservation* rule (keep not doing this) rather than a *correction* rule.
+
+=== 9. Family / package structural comparison
+
+Five families, chosen for variety (a paired bijective/near-bijective
+transform family, a policy-driven enrichment family, a large imperative CRUD
+family, a composite-over-primitives family, and a package with an explicit
+public/private split statement):
+
+[cols="1,2,2,2,2,2"]
+|===
+| Family | Entrypoint | Model/types | Policy | Validation | Fwd/Reverse
+
+| `xref_crosstable`
+| `operation.py::contract_xref`/`expand_xref`
+| None dedicated (plain `DataFrame`/`dict`)
+| `dense_axes.py` (config-or-persisted-meta resolution)
+| `primitives.py::_ensure_*` (package-private leaf module, explicitly
+  documented as "private aliases to shared tabular validators")
+| Both, in the same module
+
+| `grouped_xref`
+| `composites.py::contract_grouped_xref`/`expand_grouped_xref` +
+  `reconstruction.py::reconstruct_grouped_matrix`
+| `model.py` (`GroupedHeaderError`, `RowKeyColumn`, `DynamicColumn`,
+  `GroupedHeader`)
+| Delegated entirely to `xref_axis_mapping`'s resolver, resolved once per
+  call
+| `matrix.py::GroupedXrefError` + validators; `reconstruction.py`'s
+  geometry validators
+| Both, split across `composites.py` (pure) and `reconstruction.py`
+  (impure, pipeline-facing)
+
+| `enrich_lookup`
+| `operation.py::enrich_lookup`
+| `policy.py::_ResolvedKeys`
+| `policy.py` (`_resolve_policy`/`_resolve_join_keys`/etc., reconciling
+  inline args against `_meta.helper_policies.lookup`)
+| Inline `_check_*` guards in `operation.py`
+| Forward only, by design -- no declared inverse
+
+| `fk_helpers`
+| `enrich.py::enrich_helpers` / `drop.py::drop_helpers`
+| Reuses `core.fk.FKDef`/`HelperValueProvider` -- no new model in-package
+| `policy.py` (`resolve_v2_fk_relations`, consumes
+  `_meta.helper_policies.fk.relations` only, deliberately not re-deriving
+  from column-name convention)
+| `MissingFkRelationPolicyError` + separate `domain/validations/fk_helpers.py`
+  module (validation kept as its own module because it's validation, not
+  transformation)
+| Both, but asymmetric: `enrich_helpers` (add) / `drop_helpers` (remove,
+  via provenance, falling back to policy) -- not a bijective codec pair, a
+  lifecycle pair
+
+| `compact_multiaxis`
+| `compact_multiaxis.py::expand_compact_multiaxis`/`contract_compact_multiaxis`
+| None dedicated -- composes `xref_crosstable` + `cell_codec` shapes
+| `_legend_groups` (reads `_meta.legend_blocks` via the shared
+  `_legend_blocks.py` reader)
+| `_ensure_distinct_output_columns`, `_reject_dense_axes` (explicitly
+  forbids what plain `xref_crosstable` allows)
+| Both, in one flat module -- explicitly self-labeled a *composite*, not a
+  primitive, in its own docstring
+|===
+
+**Convergent patterns already emerging (safe to name as observed, not yet
+safe to mandate):**
+
+* A policy-resolution step happens once, early, before the forward operation
+  runs, in every family that has real authored policy to resolve
+  (`enrich_lookup`, `fk_helpers`, `xref_crosstable`'s dense axes). Families
+  without real policy (`enrich_lookup`'s absence of policy would be wrong --
+  it *has* policy; the correct contrast is `grouped_xref`, which delegates
+  policy entirely to a sibling family rather than inventing its own) simply
+  do not have a `policy.py`, correctly.
+* Validation is inline for small per-call preconditions, a separate module
+  for cross-cutting invariants that other consumers also need
+  (`domain/validations/fk_helpers.py` is consumed by more than one entry
+  point). This split tracks *reuse*, not family size.
+* Package `__init__.py` states the public/private line explicitly in the two
+  families that have accumulated the most internal complexity
+  (`fk_helpers`, `grouped_xref`) and is silent (not wrong, just silent) in
+  the two smaller/flatter families (`enrich_lookup` re-exports without
+  commentary, `compact_multiaxis` is a single flat file with no package at
+  all).
+
+**Accidental differences (naming, not structural):**
+
+* `sparse_defaults.py` diverges from the `expand`/`contract` vocabulary
+  (`sparse_collapse`/`sparse_expand`) for a conceptually similar shape of
+  operation on the same `_meta.xref_crosstable` data (Section 6).
+* `transformations/helpers.py` (legacy) and `fk_helpers/` (current) both use
+  "helper" for different scopes, discussed in Section 8.
+
+**Genuinely family-specific structures, correctly not converged:**
+`schema_maintenance`'s CRUD-plus-reference-repair shape
+(`meta_update.py::apply_metadata_rules`'s ~30 `_handle_*` dispatch functions)
+has no equivalent anywhere else in `domain/` and should not be forced toward
+the transform-family shape -- it answers a structurally different question
+("keep every `_meta` root consistent after a shape change") than any
+expand/contract family does.
+
+=== 10. Explicit non-goal: no rigid universal package template
+
+Restated because the family comparison in Section 9 could tempt the opposite
+conclusion: no family in this inventory has the same file set as any other,
+and every deviation found has a legitimate local reason (`grouped_xref`
+needs a `model.py` because it invents a real new type,`GroupedHeader`;
+`enrich_lookup` does not, because it has none to invent; `compact_multiaxis`
+has no package at all because a composite over two already-modeled
+primitives does not need one). The rule that survives evidence is: *if a
+responsibility exists, its ownership/location/name should be recognizable* --
+not that a fixed file skeleton must exist regardless of whether the
+responsibility is present. Which conventions can already be treated as
+normative on this basis, and which still need the first full family-pilot to
+validate, is separated explicitly in Section 17.
+
+=== 11. Human-readability evidence
+
+The accepted, non-binding Human Readability Review Guide
+(link:../../developer_guide/ch06_code_conventions/03_human_readability_review.adoc[developer_guide/ch06_code_conventions/03_human_readability_review.adoc],
+distilled from a three-family investigation across FK Helpers, Enrich
+Lookup, and XRef Crosstable) is the direct evidentiary source for this
+section. It ranks explicitly *below* architecture, public-API,
+persisted-metadata, lifecycle, ownership, and compatibility contracts, and it
+creates no enforcement.
+
+[cols="3,1,4"]
+|===
+| Principle (evidence-backed, HR-0x id) | Classification | One-line grounding
+
+| Pass the smallest coherent owned dependency (not maximal scalarization)
+| Already evidenced / safe to adopt
+| Established across all three investigated families (HR-01).
+
+| Names/descriptions must state current semantics and authority
+| Already evidenced / safe to adopt
+| Produced one real accepted rename (`target_registry` ->
+  `target_lookup_index`) and one accepted documentation-only direction fix
+  in XRef (HR-02).
+
+| Name/type materially distinct lifecycle states where real
+| Already evidenced / safe to adopt
+| `enrich_lookup/policy.py::_ResolvedKeys` and XRef's authored-Intent-vs-
+  transient-Resolution split are both cited as positive patterns to
+  *preserve* (HR-03).
+
+| Resolve broad/raw option bags early -- but only where a real resolution
+  boundary exists
+| Plausible, contextual, not universal
+| True for FK's raw-vs-resolved split; explicitly *false* for
+  `enrich_lookup`, which already had explicit arguments and would have been
+  worse with an invented config object (HR-04, confidence "provisional").
+
+| Comments explain non-local reason (ownership, ordering, compatibility,
+  side-effect boundary), not syntax
+| Already evidenced / safe to adopt
+| Confirmed across all three families' load-bearing comments; narrating
+  every branch/empty-path explicitly rejected as noise (HR-06, HR-10).
+
+| Semantic DRY over textual DRY -- reuse only a real shared contract
+| Already evidenced / safe to adopt
+| XRef's look-alike validation blocks protecting different direction/
+  identity/precedence is the explicit anti-example; also independently
+  stated as a *normative* Domain Boundary Pattern ("Narrow semantic
+  helper," `02_domain_boundary_patterns.adoc`), giving this one dual
+  grounding.
+
+| Local clarity before generic extraction (algorithmic locality)
+| Already evidenced / safe to adopt
+| XRef's 516-line `operation.py` and 411-line `dense_axes.py` were
+  positively validated as cohesive; extraction-by-length would have hidden
+  validation order and error precedence (HR-12). This is also the direct
+  evidentiary basis for `CONC-MAINTAINABILITY-HYGIENE`'s current posture
+  ("module size... [is an] inspection signal, not a finding by itself").
+
+| Explicit ownership and mutation
+| Plausible but requires family-pilot validation
+| The one clear counter-case (`enrich_lookup`'s nested-provenance-mutation
+  finding, EL-HR-002) was judged important but *transferred* to an
+  architecture/lifecycle owner rather than fixed locally -- evidence that
+  this principle's actionability depends on which layer owns the fix, not
+  yet settled as a reviewable rule on its own.
+
+| Keep imports locally coherent; make dependency *direction* guardable
+| Already evidenced / safe to adopt (direction only)
+| Explicitly named in the Guide itself as suitable for "an automated static
+  guard for forbidden dependency directions only" (HR-11) -- this is the
+  one Human Readability principle that already has a direct line to
+  Section 15's guard candidates.
+
+| Optimize for local idiom, not maximum explicitness
+| Subjective / developer-guide guidance only
+| Explicitly framed as a judgment call against "procedural expansion of
+  idiomatic Python" (HR-13); no objective test proposed or possible.
+|===
+
+**A "Human Readability Sentinel" AI review role** was proposed in the
+synthesis concept and never authorized or implemented -- correctly excluded
+from anything this inventory proposes.
+
+**Rejected-mechanical-rules set** (durably accepted, cited repeatedly as
+`DEC-HUMAN-READABILITY-BOUNDED-RECONSTRUCTION` in Project Memory, reproduced
+faithfully by the Guide though no standalone decision-record file was found
+under `docs/warm_storage/`): no max parameter count, no max function/file
+length, no ban on `Any` at legitimately heterogeneous boundaries, no ban on
+the word `sheet`, no single mandatory import spelling, no mandatory helper
+extraction, no mandatory dataclass/config-object conversion, no comment
+requirement on every empty/no-op path, no procedural expansion of idiomatic
+Python. These are worth restating explicitly in any Technical-Model or
+Developer-Guide promotion, precisely because they are the boundary that
+keeps this material from becoming a second, competing style-guard system
+next to `tools/check_source_style.py`.
+
+Existing normative coverage this section must not duplicate:
+`docs/developer_guide/ch06_code_conventions/02_domain_boundary_patterns.adoc`
+already covers adjacent, ADR-backed, *defensive-coding* territory (its
+pattern 6, "Narrow semantic helper," is the same semantic-DRY idea as HR-06
+above, arrived at independently from a robustness angle rather than a
+readability angle) -- any future promotion of HR material should cross-link
+to it rather than re-deriving it.
+
+=== 12. Documentation ownership model
+
+[cols="1,4,2"]
+|===
+| Layer | What belongs here (permanently) | Current gap this inventory found
+
+| ADR
+| Irreversible/significant architectural decisions and rationale.
+| Four recent, load-bearing ADRs (`ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB`,
+  `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`,
+  `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY`) are listed in
+  `ch03_architecture_decisions/_adrs.adoc`'s index but are **not** included
+  in `ch03_architecture_decisions/_chapter.adoc`'s build list -- they exist
+  and are linkable, but do not render into the built Technical Model
+  document. This looks like build-wiring drift, not a content gap; worth a
+  narrow follow-up independent of this inventory's scope.
+
+| Technical Model
+| Normative structural contracts: layers, responsibilities, trust
+  boundaries, domain taxonomy, dependency directions, projection/
+  reconstruction semantics.
+| `ch01_structure/` and `ch02_contracts/` are both entirely `TBD`
+  placeholder chapters. The Trusted Ingress concept itself already
+  flags this as blocking "which chapter should eventually own which
+  durable piece of this concept" -- this inventory hits the identical
+  wall for Sections 3, 5, 6, 14 below.
+
+| Developer Guide
+| Practical implementation conventions: file naming, package organization,
+  entrypoints, helper placement, examples.
+| Split today across `02_domain_boundary_patterns.adoc` (normative,
+  ADR-backed, defensive-coding-shaped) and `03_human_readability_review.adoc`
+  (non-normative, reconstruction-cost-shaped) -- not a gap so much as an
+  authority-level distinction future promotions must preserve, not blur.
+
+| Architecture guards/tests
+| Objectively machine-checkable subset only.
+| 32 files under `tests/architecture/`, already well-organized by seam
+  (inventoried in Section 15); `ch07_guardrails/architecture_guard_inventory.adoc`
+  already exists as the current index. No structural gap found; only
+  candidate *additions* proposed (Section 15).
+
+| FTR/backlog
+| Transition plan from current state to target state.
+| `roadmap_domain_hardening_sequence.adoc` already carries this role
+  correctly for the Phase-D-through-Phase-F sequence; nothing to add.
+
+| Project Memory
+| Curated current state / accepted milestones, not normative architecture.
+| Correctly not touched by this inventory (Section 19 below) beyond
+  recording that the inventory exists, once independently reviewed.
+|===
+
+**Concepts currently living in the wrong place, identified but not
+relocated here:** the boundary-ownership table in
+`trusted_ingress_and_runtime_security.adoc` section 9 is explicitly named,
+by that document's own adoption plan, as Technical Model candidate material
+"once at least one of the FTR candidates... gives it runtime grounding" --
+none does yet. This inventory does not accelerate that plan; Section 17
+below states explicitly what depends on that plan proceeding first.
+
+=== 13. ADR candidate(s)
+
+Minimum candidate set, tested against what already exists (13 ADRs
+inventoried; see Section 15's sibling guard inventory for the full current
+list) to avoid duplication:
+
+**ADR candidate 1 -- "Structural Boundary Validation and Domain Semantic
+Ownership"** (the one the task explicitly asked to consider). Proposed scope,
+*not drafted here*:
+
+* Whether Pydantic is adopted at all, and if so, restricted to option B
+  (external structural description only) per Section 4.
+* Whether explicit translation to project-owned internal types is required
+  at that boundary (yes, per Section 4's analysis -- but this is a
+  recommendation for the ADR to test, not a pre-decision).
+* Whether Domain scalar semantics may ever depend on third-party coercion
+  (no, per the unanimous direction of Sections 3 and 4's evidence -- again,
+  for the ADR to state formally, not for this inventory to declare).
+* The relationship between external structural validation and Domain
+  invariant validation (Section 7's category A vs. C), stated as a durable
+  rule rather than an inventory observation.
+
+This ADR should be written only once Pydantic adoption is a live question
+with a concrete proposed use site -- writing it purely speculatively risks
+exactly the kind of premature authority-granting `ADR-TRUSTED-RUNTIME-AND-
+POLICY-AUTHORITY`'s own non-goals list was careful to avoid.
+
+**No second ADR is proposed.** The task's caution against "one ADR per
+trivial naming rule" is honored: the `sparse_defaults` vocabulary
+divergence (Section 6), the `transformations/helpers.py` naming
+clarification (Section 8), and the projection-vocabulary overload
+(Section 6) are all Developer-Guide-level or Technical-Model-glossary-level
+concerns, not decisions requiring ADR weight.
+
+=== 14. Technical Model target structure
+
+Given the existing chapter scheme (`chNN_<slug>/` with a `_chapter.adoc`
+include wrapper; ch01/ch02 structure/contracts are `TBD`; ch03 ADRs; ch04
+concepts, explicitly provisional/non-normative; ch05 registries; ch06
+architectural layers; ch07 guardrails; ch08 architecture details, mixed
+draft/concept status; ch09 glossary):
+
+[cols="2,3,2"]
+|===
+| Maintainer question | Best current/target home | Status
+
+| What may enter the Domain? / What is a trusted payload?
+| Target: a promoted Technical Model contract, once Phase E gives the
+  boundary-ownership table (concept doc section 9) runtime grounding, per
+  that document's own adoption plan.
+| Not yet extracted; explanatory only in ch04's Trusted Ingress concept.
+
+| What is a `PipelineSpec`?
+| No such name exists in the codebase today (`AppConfig`/`IOConfig` in
+  `pipeline/config.py` play this role). Target: ch08 (architecture details)
+  companion to `pipeline_semantics.adoc`, or folded into it directly.
+| Gap -- `pipeline_semantics.adoc` describes step *categories* and
+  configuration *contracts* but has no single dedicated "what is a
+  PipelineSpec" section under that name.
+
+| Where does structural validation end and semantic validation begin?
+| Target: Section 7's A-vs-C distinction, promoted into ch06
+  (`architectural_layers.adoc`'s existing "Validation Findings and Severity
+  Policy" section is the natural extension point) or a new ch08 note.
+| Gap -- currently only implicit in code, not stated as a named contract
+  anywhere in the Technical Model.
+
+| What is a projection? What makes a transformation bijective/reversible?
+  What is reconstruction?
+| Target: ch09 glossary (`01_terms.adoc` already has the closest-adjacent
+  entries: frame, canonical tuple frame, matrix/pivot axis) is the most
+  natural home for Section 6's proposed minimal vocabulary; ch04 already
+  has `compact_transforms.adoc` as a partial precedent for documenting one
+  bijective-transform family's shape.
+| Gap -- no glossary entry for *projection*, *reconstruction*, or
+  *bijection* exists today despite all three being real, load-bearing,
+  already-used vocabulary.
+
+| What is a primitive vs. composite?
+| Already partly answered at the *pipeline-step* level (`pipeline_semantics.adoc`'s
+  primitive/configuration/composite/plugin/infrastructure taxonomy). Target:
+  extend explicitly to the *domain-module* level (Section 5's finding that
+  a domain-level composite module is not automatically a pipeline-level
+  composite step) so the two senses of "composite" do not collide.
+| Partial gap -- the pipeline-step sense is well documented; the
+  domain-module sense (Section 9's family comparison) is evidenced in code
+  but not named anywhere in the Technical Model.
+
+| Where do validation and policy live?
+| Already well-documented at the layer level (ch06); Section 5's per-family
+  taxonomy (policy resolution vs. policy production, Section 5's "term the
+  evidence forces as an addition") is new and could extend ch06 or become
+  a ch08 note.
+| Minor gap -- the *configuration-step-vs-operation-policy-resolution*
+  distinction (Section 5) is real and currently undocumented as such.
+
+| How are transformation families structured?
+| Target: Section 9's comparison table + Section 10's explicit non-goal,
+  as a new ch08 "architecture detail" note once validated by the first
+  family pilot (per the roadmap's own Domain Maintainer Contract stage) --
+  not before.
+| Gap, deliberately not filled yet -- see Section 17.
+
+| What direction may dependencies flow?
+| Already fully answered, ch06 (`architectural_layers.adoc`'s dependency
+  diagram) plus the 32-file guard inventory (Section 15) enforcing it.
+| No gap.
+|===
+
+**Preference for extending existing chapters over creating parallel
+concepts**, per the task's explicit instruction: every "gap" row above names
+an existing chapter/file as the extension point rather than proposing a new
+top-level chapter. The one structural blocker repeated across three rows
+(Technical Model, this section; ADR build-wiring, Section 12; Trusted
+Ingress's own section 13) is the same one: **ch01/ch02 remain `TBD`**, and
+until a maintainer decides whether durable boundary/contract material lives
+there, in ch06, or in ch08, every promotion effort will keep landing in ch08
+"architecture details" by default rather than a more fitting home. This
+inventory flags the blocker; it does not resolve it.
+
+=== 15. Architecture guard candidates
+
+32 guard files already exist under `tests/architecture/`, organized by seam
+(carrier_boundary, current_state, dependency_guards, domain_transformations,
+formula_boundary, parse_contract, pipeline_semantics, semantic_invariants,
+spreadsheet_contract, plus two top-level files). Full current coverage
+(grouped by the task's own categories) confirms the codebase already
+enforces most of what "objectively enforceable" would ask for:
+
+* **Forbidden cross-layer imports** -- `test_layer_boundaries.py`,
+  `test_spreadsheet_boundary_guards.py`, `test_adapter_alignment.py`,
+  `test_ir_architecture_clarity.py`, `test_raw_formula_boundary_guards.py`,
+  `test_ir_call_chain.py`, `test_adapter_contract_boundary_guards.py`,
+  `test_domain_ingress_boundary.py`, `test_schema_maintenance_private_step.py`,
+  `test_architecture_guard_fk_helpers.py`, `test_compact_multiaxis_contract.py`,
+  `test_project_memory_dependency_boundary.py`.
+* **Cross-family coupling** (the closest analogue to cycle detection this
+  repo has -- no dedicated graph-cycle checker exists; risk is handled via
+  directional forbidden-import guards instead) --
+  `test_no_cross_family_internal_imports.py`.
+* **Registry-target resolution** -- `test_pipeline_step_registry.py`,
+  `test_discriminator_split_package_reexports.py`,
+  `test_pipeline_registry_uses_public_transform_apis.py`,
+  `test_meta_registry.py`, `test_meta_registry_hardening.py`,
+  `test_meta_registry_contract_lifecycle.py`, `test_meta_reference_surfaces.py`,
+  `test_pipeline_semantics_guards.py`.
+* **Package-internal import restriction (public-API-surface-only)** --
+  `test_fk_helpers_package_reexports.py`,
+  `test_discriminator_split_package_reexports.py`,
+  `test_package_public_api_boundaries.py`,
+  `test_fk_helper_primitives_consume_policy.py`.
+* **Other boundary/ownership (semantic-invariant / carrier-authority)** --
+  `test_ir_writepath_semantics.py`, `test_meta_carrier_boundary_guards.py`,
+  `test_spreadsheet_semantic_invariants.py`, `test_spreadsheet_meta_semantics.py`,
+  `test_carrier_boundary_guards.py`, `test_ods_parser_modularization.py`,
+  `test_xlsx_parser_modularization.py`, `test_spreadsheet_parse_contract.py`,
+  `test_validation_role_targeting_uses_shared_resolver.py`.
+
+[cols="1,4"]
+|===
+| Class | Candidates (not implemented here)
+
+| A. Objectively enforceable now
+| *(1)* A guard that `domain/` never imports `pydantic` -- trivially
+  checkable today, and directly protects Section 4's provisional
+  recommendation before any Pydantic adoption happens, so it could exist
+  *before* Pydantic is even introduced, as a tripwire.
+  *(2)* A guard, matching the existing `test_package_public_api_boundaries.py`
+  pattern, that any *new* family package with an `__init__.py` re-export
+  list is imported only through its package root (this already exists for
+  the guarded families named in that test; extending it to newly-split
+  families as they appear is mechanical, not exploratory).
+  *(3)* A guard that `core/scalar_values.py` stays unimported by
+  `io_backends/` (protects the "classification available, not yet wired to
+  ingress" boundary stated in that module's own docstring, and would catch
+  an accidental premature wiring before Phase E authorizes it).
+
+| B. Enforceable after structural cleanup
+| A guard enforcing the `expand_x`/`contract_x` naming convention across
+  all XRef-family sibling modules (would currently fail against
+  `sparse_defaults.py`'s `collapse`/`expand` pair -- Section 6 -- so it
+  cannot be added until that naming question is resolved, which this
+  inventory explicitly does not resolve).
+
+| C. Subjective / never CI enforcement
+| Function length, "too many files," HR-13's "local idiom vs. maximum
+  explicitness," any per-family file-skeleton mandate (explicitly rejected
+  in Section 10).
+|===
+
+None of these are implemented by this inventory. A and B are candidates for
+a future FTR to pick up; C is listed to state explicitly what should *not*
+become a gate, matching `CONC-MAINTAINABILITY-HYGIENE`'s current accepted
+posture.
+
+=== 16. Current Domain map
+
+Representative subset (not exhaustive -- `domain/` has 36+ files; this table
+covers every module discussed in Sections 5-10 plus a few load-bearing ones
+not otherwise mentioned, chosen to be independently checkable against the
+source tree).
+
+[cols="2,2,3,1,1,2"]
+|===
+| Path | Family | Actual responsibility | Fwd/Rev/Both/Neither | Boundary role | Recommended disposition
+
+| `core/scalar_values.py`
+| Internal Value Model
+| Classification predicate (`scalar_category`, `is_missing_carrier`), not
+  normalization
+| Neither
+| Available-but-unwired boundary primitive
+| Reference pattern
+
+| `domain/ingress/coordinator.py`
+| Ingress
+| Framework-owned, automatic, pure `Frames -> Frames` rule sequence (1 rule
+  today)
+| Neither
+| Load-side boundary (structural/scalar ingress, Section 2, row 2)
+| Reference pattern; scope narrower than its eventual role -- expected, not
+  a defect
+
+| `pipeline/dotted_paths.py`
+| Pipeline authorization
+| One shared resolver; one namespace exclusion
+| Neither
+| Pipeline-description-trust boundary (Section 2, row 3)
+| Reference pattern; explicitly narrow per its own docs
+
+| `pipeline/persistence_boundary.py`
+| Persistence
+| Intent-vs-Resolution projection, never payload filtering
+| Neither
+| Egress-side boundary
+| Reference pattern
+
+| `domain/transformations/xref_crosstable/`
+| XRef base
+| Relation<->matrix transform, dense-axis policy, own validation
+| Both
+| N/A (pure transform)
+| Reference pattern
+
+| `domain/transformations/grouped_xref/`
+| XRef composite
+| Header-shape primitive (pure) + reconstruction (impure) + composites
+| Both
+| N/A
+| Reference pattern -- explicit public/private split is a model other
+  families should be measured against
+
+| `domain/transformations/compact_multiaxis.py`
+| XRef composite
+| Composes XRef + cell-codec primitives
+| Both
+| N/A
+| Acceptable family-specific shape (flat file, no package -- correctly so
+  per Section 10)
+
+| `domain/transformations/sparse_defaults.py`
+| XRef-adjacent
+| Sparse default collapse/expand over crosstable data
+| Both
+| N/A
+| Naming clarification candidate (`collapse`/`expand` vs. project-wide
+  `contract`/`expand`, Section 6)
+
+| `domain/transformations/enrich_lookup/`
+| Lookup enrichment
+| Policy-resolved join+project, one-way
+| Fwd only (by design)
+| N/A
+| Reference pattern
+
+| `domain/transformations/fk_helpers/`
+| FK helpers
+| v2-policy-driven FK helper-column lifecycle (add/drop/provenance)
+| Both (lifecycle pair, not bijective codec)
+| N/A
+| Reference pattern -- best-documented package in the inventory
+
+| `domain/transformations/helpers.py`
+| Legacy step helpers
+| Pipeline-step-factory wrappers predating `fk_helpers/`
+| Neither
+| N/A
+| Naming clarification candidate (Section 8)
+
+| `domain/helper_policies.py`
+| FK + lookup policy production
+| `configure_fk_helpers`/`configure_lookup_helpers` -- writes `_meta`
+| Neither
+| Configuration-step boundary
+| Acceptable family-specific shape; cross-referenced by "helper" naming
+  clarification (Section 8)
+
+| `domain/fk_relations.py`
+| FK policy inference
+| `infer_fk_relations` (config step) + v2 relation construction
+| Neither
+| Configuration-step boundary
+| Acceptable family-specific shape
+
+| `domain/validations/fk_helpers.py`
+| FK validation
+| `Finding`-producing checks over v2 policy + provenance
+| Neither
+| N/A
+| Reference pattern
+
+| `domain/schema_maintenance/`
+| Schema CRUD
+| Column add/drop/rename/reorder + full `_meta` reference repair
+  (`meta_update.py` ~30 `_handle_*` functions, largest module in `domain/`)
+| Neither (imperative CRUD, not a codec)
+| N/A
+| Requires family-pilot evidence before any structural change is
+  considered; correctly not a transform-family shape (Section 9)
+
+| `domain/transformations/discriminator_split/`
+| Split/merge
+| Explicit, self-labeled bijective split/merge
+| Both, bijective
+| N/A
+| Reference pattern
+
+| `domain/transformations/xref_axis_mapping/`
+| Axis bijection
+| Slice-1 resolver: immutable ordered bijection
+| Both, bijective
+| N/A
+| Reference pattern
+
+| `domain/_cell_primitives.py`
+| Shared primitives
+| Two byte-for-byte-duplicated predicates, centralized with explicit
+  scope-exclusion note
+| Neither
+| N/A
+| Reference pattern (Section 8's "shared helper" idiom)
+
+| `domain/column_roles/`
+| Role resolution
+| Reads xref/workbook-view/FK-provenance to classify column roles;
+  references a *retired* `project_by_role` step in its own docstring
+| Neither
+| N/A
+| Naming clarification candidate (retire the dangling reference, Section 6)
+
+| `io_backends/spreadsheet_contract.py`
+| Backend boundary
+| Self-labeled "narrow adapter-facing facade"
+| N/A
+| Adapter/facade boundary (outside domain/, included for contrast)
+| Reference pattern
+|===
+
+Disposition vocabulary used throughout this table matches the task's
+modest set exactly (*reference pattern*, *acceptable family-specific
+shape*, *naming clarification candidate*, *requires family-pilot evidence*)
+-- *responsibility split candidate* and *historical/legacy ambiguity* were
+available and deliberately not needed for any row above; nothing found rose
+to that level of concern.
+
+=== 17. What can be standardized now vs. what waits for the family pilot
+
+**Safe to standardize now** (evidence-backed across multiple independent
+families, no structural change required to state it):
+
+* The five-category-plus-Missing-predicate scalar vocabulary (Section 3.A),
+  as classification vocabulary only -- not as a normalization mechanism.
+* "Carrier variants are not automatically separate semantic types"
+  (Section 3.B) as an explicit, named Technical Model principle.
+* The validation taxonomy's A-vs-C distinction (Section 7) as named
+  vocabulary, independent of any Pydantic decision.
+* The `expand`/`contract`/`bijection`/`reconstruction` vocabulary exactly as
+  currently used (Section 6), plus retiring "projection" from its generic
+  column-selection sense.
+* The "shared helper requires a named responsibility + scope-exclusion
+  note" idiom (Section 8) as an explicit Developer Guide rule -- it is
+  already universal practice, so naming it costs nothing and prevents
+  drift.
+* HR-01, HR-02, HR-03, HR-06/HR-10, HR-11 (direction only), and the
+  semantic-DRY principle (Section 11) as promoted, still-non-binding
+  Developer Guide guidance -- they already cleared their own independent
+  review and have multi-family evidence.
+* Architecture guard class A candidates (Section 15) -- objectively
+  checkable today, no design work required.
+
+**Must wait for the first full family-hardening pilot** (plausible, but
+only validated in one family so far, or not yet validated at all):
+
+* Any per-family file-skeleton convention beyond "if a responsibility
+  exists, name it recognizably" (Section 10 -- explicit non-goal until the
+  pilot).
+* HR-04/HR-05 (contextual, "provisional" by the Guide's own confidence
+  label) and the explicit-ownership/mutation principle (Section 11 --
+  its one clear test case was transferred to another owner rather than
+  resolved locally).
+* Section 9's "convergent patterns" (policy-resolution-once, validation
+  split by reuse scope, explicit public/private `__init__.py` statement) --
+  observed in 2-3 families each, not yet the "first full family pilot"
+  the roadmap calls for.
+* The domain-module sense of "composite" as a named Technical Model
+  category distinct from the pipeline-step sense (Section 14) -- real, but
+  only two families (`grouped_xref`, `compact_multiaxis`) currently
+  demonstrate it.
+* Architecture guard class B candidates (Section 15) -- blocked on the
+  `sparse_defaults` naming question, which this inventory does not resolve.
+* Any Pydantic adoption (Section 4) -- the provisional recommendation
+  needs a concrete proposed use site and its own ADR before it is more than
+  a hypothesis this inventory found no counter-evidence against.
+
+=== 18. Recommended implementation / documentation sequence
+
+Preserves the roadmap thread exactly as it exists today; nothing here
+reorders Phase E ahead of this inventory's own review, or pulls `D-T3`
+forward.
+
+[arabic]
+. Independently review *this* inventory (architecture-review pass, not an
+  acceptance rubber-stamp -- several claims above, especially in
+  Sections 4, 6, 14, are proposals for the reviewer to test, not settled
+  facts).
+. Write/adopt the minimal ADR decision(s) from Section 13 -- at most one
+  (Structural Boundary Validation and Domain Semantic Ownership), and only
+  once a concrete Pydantic-adoption use site exists; do not draft it
+  speculatively.
+. Promote the accepted Phase-D value/trust contracts (Section 3.A-E) into
+  the Technical Model, extending existing chapters per Section 14's table
+  rather than creating new ones -- this is the specific "not yet performed"
+  next step the D-T2 acceptance record (`0f3b3ef`) itself names.
+. Establish the minimal Domain responsibility/taxonomy vocabulary
+  (Section 5's table, Section 6's projection/reconstruction vocabulary) in
+  the Technical Model, most naturally as ch09 glossary entries plus a ch08
+  companion note, per Section 14.
+. Add the evidence-backed implementation conventions from Section 17's
+  "safe to standardize now" list to the Developer Guide, cross-linking
+  rather than duplicating `02_domain_boundary_patterns.adoc` and
+  `03_human_readability_review.adoc`.
+. Design Phase-E Trusted Ingress using the boundaries this inventory
+  restates from Section 2 -- payload trust, pipeline-description trust,
+  runtime/operator trust (fixed), sink-capability (separate) -- and the
+  Section 3 candidate vocabulary as a starting point, not a constraint.
+. Implement Trusted Ingress.
+. Run the first full family-hardening pilot (Phase F sub-cycle 0 onward,
+  per the roadmap) -- `D-T3` becomes a live candidate for this step, or may
+  be absorbed into it, exactly as Project Memory already states; this
+  inventory does not select the family.
+. Use that pilot to validate or refine the Section 17 "must wait" items --
+  package/file conventions, HR-04/HR-05, the domain-module composite
+  category, architecture guard class B.
+. Only then apply validated conventions broadly across the remaining Domain
+  families.
+
+No step above is authorized to begin by this document. It is a map for
+Step 1.
+
+=== 19. Project Memory
+
+Per the task's own instruction, Project Memory is deliberately **not**
+curated with any of the speculative architecture above. The only Project
+Memory action this inventory recommends is recording, after independent
+review, that this inventory artifact exists and where it lives -- as a
+pointer, not a paraphrase of its contents. No current concern's
+`next_action` (in particular `CONC-DOMAIN-BOUNDARY-ROBUSTNESS`'s existing
+"promote the stable Internal Value Model / Trusted Domain Payload intent...
+into the durable Technical Model, then proceed toward Phase-E" language,
+already accurate) is changed by this document.
