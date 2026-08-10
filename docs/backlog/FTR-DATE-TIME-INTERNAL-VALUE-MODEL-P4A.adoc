@@ -2014,3 +2014,734 @@ developer action per `agent_rules.adoc`).
 Per the task's own explicit instruction: Project Memory was not updated;
 D-T1 was not self-declared independently accepted; D-T2 was not started;
 this FTR was not archived or marked Done; Phase D was not declared complete.
+
+==== 27. D-T2 -- structured persistence compatibility contract [RECOMMENDATION -- decision-ready, not yet independently reviewed]
+
+*Status: design only, not implemented.* This section is the requested D-T2
+contract/design pass -- a documentation-only addendum, exactly like section
+26 was for D-T1's implementation. No production or test file is touched by
+this section. D-T1 (section 26) is independently accepted
+(`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc`, `be8738a`/`dfc727f`);
+this FTR itself stays *Open*: D-T2 remains unauthorized for implementation
+until a fresh-context independent architecture review confirms this design,
+exactly mirroring section 26's own posture toward D-T1. Nothing here
+self-declares D-T2 accepted, and nothing here updates Project Memory, per the
+task's own explicit instructions.
+
+*Central design question, restated from the task:* what is the smallest
+explicit persistence contract that lets the accepted Date/DateTime
+categories (section 7-8, D-T1) survive `save_yaml_dir`/`load_yaml_dir` and
+the JSON directory backend without inventing general normalization or
+changing spreadsheet (XLSX/ODS) semantics? The answer developed below: YAML
+needs exactly one narrow write-side carrier conversion (no wire-format
+invention); JSON needs a narrow, tagged-envelope wire format plus a
+symmetric encode/decode function pair, wired into the write path today and
+deliberately *not* wired into the directory-level read path yet (section
+27.11 is this design's one genuinely open fork).
+
+===== 27.1 YAML current-state findings [FACT, independently re-probed for D-T2]
+
+Re-confirms section 14's finding against current `core` HEAD, plus new
+evidence section 14 did not gather (pure-Date round trip, aware-Timestamp
+crash symmetry, and the exact fix shape):
+
+[cols="3,5",options="header"]
+|===
+| Probe | Outcome
+
+| `datetime.date` column through `save_yaml_dir` + `load_yaml_dir`
+  (`yaml_backend.py:66-93`/`20-63`)
+| *Already works, zero gap.* Writes as native YAML `date` scalars
+  (`2026-08-09`, unquoted); reads back as real `datetime.date`, dtype
+  `object`, confirmed by direct execution of the real backend functions (not
+  a synthetic `yaml.safe_dump` call).
+
+| Naive `pandas.Timestamp` column (the scalar every full-timestamp YAML
+  column actually holds, per section 5) through `save_yaml_dir`
+| *Crashes.* `yaml.representer.RepresenterError: ('cannot represent an
+  object', Timestamp('2026-08-09 10:30:00'))` -- `save_yaml_dir` calls
+  `yaml.safe_dump(records, ...)` (`yaml_backend.py:87`) where `records` is
+  `df.to_dict(orient="records")` (`yaml_backend.py:83-84`); `Timestamp` has
+  no `SafeDumper` representer registered anywhere in the dependency chain.
+
+| Timezone-aware `pandas.Timestamp` column (object dtype, mixed offsets)
+  through `save_yaml_dir`
+| *Crashes identically.* Same `RepresenterError`, confirmed by direct probe
+  with `+02:00`/`+05:00` offsets in the same column -- the crash is caused by
+  `Timestamp` itself lacking a representer, not by timezone-awareness
+  specifically (restates section 11's finding, re-confirmed for D-T2).
+
+| Does `to_dict(orient="records")` ever hand the writer a raw
+  `numpy.datetime64` scalar? (new probe, resolves task step 7 -- see 27.8)
+| *No, never, even when forced.* An object-dtype `pandas.Series` explicitly
+  constructed from raw `numpy.datetime64` scalars (`pd.Series([np.datetime64(...)],
+  dtype=object)`, bypassing the normal `datetime64[...]`-dtype column
+  promotion path entirely) still comes back from
+  `to_dict(orient="records")` as `pandas.Timestamp`, not `numpy.datetime64`.
+  Stronger evidence than section 3's original claim (which only checked
+  ordinary dtype-promoted column construction, not an explicit object-dtype
+  array of raw scalars).
+
+| `pandas.Timestamp -> datetime.datetime` conversion via bare
+  `Timestamp.to_pydatetime()` on a nanosecond-precision `Timestamp`
+| *Lossy AND noisy.* Silently discards the nanosecond remainder *and* emits
+  `UserWarning: Discarding nonzero nanoseconds in conversion` -- a real,
+  reproducible side effect a persistence writer should not trigger as a
+  matter of ordinary operation (could interfere with any test suite or
+  caller that treats warnings as errors).
+
+| `Timestamp.as_unit("us").to_pydatetime()` on the same nanosecond-precision
+  `Timestamp`
+| *Lossy, but silent.* Same microsecond truncation (YAML's own native
+  timestamp scalar has no representation finer than microseconds either --
+  this is not a loss D-T2 introduces, see 27.4), with no warning emitted --
+  `as_unit("us")` is an explicit, intentional unit change, not an implicit
+  truncation PyYAML/pandas performs on the caller's behalf.
+
+| `datetime.date`/naive+aware `datetime.datetime` through
+  `yaml.safe_dump`/`safe_load` directly (bypassing pandas entirely)
+| Unaffected by anything in this section, restates section 4/11's finding:
+  full identity round trip, offset preserved exactly.
+|===
+
+*Conclusion:* YAML's read side needs no change at all. YAML's write side
+needs exactly one narrow conversion -- `pandas.Timestamp ->
+datetime.datetime` via `.as_unit("us").to_pydatetime()` -- applied only to
+`Timestamp`-typed values, leaving every other already-working carrier
+(`datetime.date`, plain `datetime.datetime`, `str`, `int`, `float`, `bool`,
+`None`) untouched.
+
+===== 27.2 JSON current-state findings [FACT, independently re-probed for D-T2]
+
+[cols="3,5",options="header"]
+|===
+| Probe | Outcome
+
+| `json.dumps(value)` for `datetime.date`, `datetime.datetime`,
+  `pandas.Timestamp` (naive and aware)
+| All three raise `TypeError: Object of type <X> is not JSON serializable`,
+  confirmed directly (restates section 14). No `default=` callback or custom
+  `JSONEncoder` exists anywhere in `json_backend.py` today (re-read in full
+  for D-T2, unchanged from section 14/19's finding).
+
+| `JSONBackend.read_multi` (`json_backend.py:92`) --
+  `pd.read_json(p, dtype=str, convert_dates=False)`
+| *[FACT, restated]* Forces every scalar to `str`; `convert_dates=False`
+  is a deliberate, already-present guard against pandas' own opportunistic
+  date-string-to-`Timestamp` inference. This is the existing "no
+  type-guessing" ingress contract D-T2 must not weaken (task's own
+  instruction; also this FTR's section 4 framing).
+
+| Same read call, given a JSON file containing a nested nested-object cell
+  (`{"a": {"$date": "2026-08-09"}, "b": "x"}`) -- new probe, motivated by
+  evaluating whether a tagged-envelope wire format could be decoded through
+  the *existing* read call with no further change
+| *Cannot be decoded through the existing call.* With `dtype=str` set,
+  pandas does not preserve the nested object as a dict -- it stringifies it
+  via Python's own `dict.__repr__` (`"{'$date': '2026-08-09'}"`, single
+  quotes, not valid JSON), which is unparseable back into anything
+  meaningful. This is the concrete evidence that a JSON decode step, if
+  added, cannot simply piggyback on `pd.read_json(dtype=str, ...)` -- it
+  needs either a materially different read strategy, or (this design's
+  recommendation, 27.11) to stay a standalone, non-wired codec for now.
+
+| Same nested-object cell, read *without* `dtype=str`
+  (`pd.read_json(p, convert_dates=False)`), and via plain
+  `json.load(fh)` + `pd.DataFrame(records)` (bypassing pandas' own JSON
+  parser entirely)
+| Both preserve the nested object as a genuine Python `dict` at that cell
+  (object-dtype column) -- confirmed by probe. This is *a* viable read
+  strategy in principle, but abandoning `dtype=str` for the general case
+  means the loader must independently reproduce whatever `dtype=str`
+  currently does for every *other* scalar (int/float/bool stringification),
+  which is the risk explored in the next row.
+
+| Does plain `str(value)` (Python) match what `pd.read_json(..., dtype=str)`
+  currently produces, for representative int/float/bool/large-int/negative-zero
+  cells? -- new probe, feeds directly into 27.11
+| *Matches on every case probed* (`3`, `3.0`, `3.14`, `True`, `100000000000000`,
+  `1e20`, `9007199254740993` [2**53+1, beyond float64-exact-integer range],
+  `-0.0`), but this is a representative sample, not an exhaustive proof
+  across pandas' internal JSON-to-string coercion (locale/format-string
+  edge cases, `NaN`/`Infinity` literals, exotic large numbers). Re-implementing
+  this coercion by hand to replace `dtype=str` would be a materially larger,
+  less-audited surface than the "narrow, persistence-local conversion"
+  D-T2's own accepted scope (section 20) authorizes.
+|===
+
+*Conclusion:* JSON's write side has no existing encoder gap-closer at all
+(unlike YAML, this is not "one narrow conversion," it is "invent a wire
+format," per section 14's own framing). JSON's read side has a real,
+evidenced technical obstacle to reusing the current `dtype=str` call for
+decode, and abandoning `dtype=str` carries a compatibility risk broader than
+this slice's own narrow-conversion mandate -- this is the direct input to
+27.11.
+
+===== 27.3 Existing repository-native tagged/enveloped-value precedent [FACT]
+
+Three independent, pre-existing local call sites already convert
+`pandas.Timestamp -> ISO string via .isoformat()`, discovered by re-grepping
+the whole `domain/` tree for D-T2 (none of these were named by section 3-19's
+original inventory, which focused on ingress/egress/serialization paths, not
+Domain-internal key-normalization helpers):
+
+* `domain/transformations/discriminator_split/values.py:47` (`_plain_value`)
+* `domain/transformations/xref_crosstable/dense_axes.py:347` (`_yaml_value`,
+  despite the name, used for a sort token, not YAML I/O)
+* `domain/structured_yaml.py:456`
+
+All three share the identical two-line shape: unwrap a NumPy scalar via
+`.item()` if present, then `if isinstance(value, pd.Timestamp): return
+value.isoformat()`. None of the three defines a decode/tag envelope, a
+`datetime.date` branch, or a naive/aware distinction beyond what
+`.isoformat()` already encodes -- they are Domain-layer sort-key/dict-key
+normalization helpers, not persistence codecs, and they do not by themselves
+satisfy D-T2's round-trip requirement. Their relevance to D-T2 is narrower
+but real: they are existing, already-accepted repository evidence that
+*ISO-8601 string form (via stdlib `.isoformat()`, not a custom formatter) is
+already this codebase's chosen wire substrate for a temporal value*,
+independently arrived at three times. D-T2's JSON wire format (27.5) reuses
+this same substrate rather than inventing a different date-string format,
+precisely because no repository evidence supports inventing a second one.
+
+===== 27.4 Roundtrip semantics decision [DECIDED, part of this contract]
+
+What D-T2 preserves and does not, stated per the task's own instruction to
+decide this explicitly:
+
+[cols="3,2,5",options="header"]
+|===
+| Property | Preserved? | Basis
+
+| Date vs DateTime category
+| Yes
+| Two distinct wire tags (27.5); decode dispatches on which tag is present,
+  never on string shape/content.
+
+| Time-of-day (for DateTime)
+| Yes, to microsecond precision
+| `.isoformat()`/`.fromisoformat()` round-trip exactly for micro-precision
+  input (probe-confirmed, 27's prototype).
+
+| Timezone/offset
+| Yes, exactly as authored -- aware stays aware with its original offset,
+  naive stays naive, no UTC assumption
+| `datetime.fromisoformat()` reconstructs a naive value from an offset-less
+  string and an aware value with the exact original fixed offset from one
+  that has one (probe-confirmed); this is the same non-normalizing posture
+  section 11 already decided for classification, extended to persistence
+  without adding a new policy.
+
+| Missing
+| Unaffected -- bypasses the codec entirely
+| A missing carrier is already rewritten to `""` by the existing
+  `df.where(pd.notnull(df), "")` call, in both backends, *before* any
+  record reaches the writer (`yaml_backend.py`'s missing-normalization is
+  read-side only today; `json_backend.py:131` applies it write-side). The
+  codec never receives a Missing carrier as input; nothing in D-T2 touches
+  Missing/NaT semantics, which remain exactly what D-T1 (section 6) decided.
+
+| Carrier identity (`pandas.Timestamp` vs plain `datetime.datetime`)
+| *No, deliberately not preserved*
+| Per the task's own instruction ("should NOT be preserved unless repository
+  evidence requires it") and D-T1's own "conceptual canonical carrier"
+  framing (section 12): decode always yields native `datetime.date`/
+  `datetime.datetime`, never reconstructs a `Timestamp`. No repository
+  evidence (grepped for D-T2, none found) depends on getting a `Timestamp`
+  back specifically from a persistence round trip.
+
+| Sub-microsecond precision (`numpy.datetime64[ns]` nanosecond remainder)
+| No -- truncated to microseconds
+| Already true before D-T2: `pandas.Timestamp` itself is the carrier that
+  reaches every persistence writer (27.1, 27.8), YAML's own native timestamp
+  scalar has no sub-microsecond representation, and D-T1 already established
+  (section 8) that `numpy.datetime64` unit/precision carries no reliable
+  semantic signal worth preserving. D-T2 does not introduce this loss; it
+  is inherited, unchanged, from YAML's own format ceiling and from what
+  `to_dict(orient="records")` already hands the writer.
+|===
+
+===== 27.5 JSON wire format decision [RECOMMENDATION]
+
+*Decision:* two reserved single-key tagged-scalar envelopes,
+`{"$date": "<datetime.date.isoformat() string>"}` and
+`{"$datetime": "<datetime.datetime.isoformat() string>"}` (offset suffix
+present iff the source value is timezone-aware; absent iff naive).
+
+Alternatives considered and rejected:
+
+[cols="3,5",options="header"]
+|===
+| Alternative | Why rejected
+
+| Bare ISO strings, no envelope (e.g. write `"2026-08-09"` directly as the
+  cell value)
+| Violates the task's own explicit instruction and the accepted
+  no-delimiter/type-guessing philosophy (section 8's own citation of the
+  string-substrate Stage C precedent): an ordinary text cell that happens to
+  contain `"2026-08-09"` and a genuine Date value would be *indistinguishable*
+  on decode without inferring type from string shape/content -- exactly the
+  heuristic this framework has already rejected once (for strings generally)
+  and must not reintroduce here for dates specifically.
+
+| A single discriminator-field envelope, e.g.
+  `{"$type": "date", "value": "2026-08-09"}`
+| Strictly more verbose for no evidenced benefit -- D-T1 already keeps Date
+  and DateTime as two distinct top-level scalar categories, not one shared
+  "Temporal" category with a `kind` sub-field (section 7-8's own explicit
+  rejection of a shared-category model); the wire format should not invent a
+  shared-category shape the value model itself does not have.
+
+| A custom `JSONEncoder`/`object_hook` class hierarchy, or a new dependency
+  (e.g. a JSON5/extended-JSON library)
+| No repository evidence justifies a new dependency or class hierarchy for
+  two scalar categories; `json.dumps(..., default=...)` and
+  `json.loads(..., object_hook=...)` are stdlib, zero-dependency, and
+  already sufficient (prototyped, 27's probes).
+|===
+
+*Prior art, not invented from nothing:* the `{"$date": ...}` shape mirrors
+MongoDB Extended JSON's well-known convention for exactly this problem
+(a JSON-safe envelope for a temporal scalar); this design adds a second,
+`$datetime`, tag rather than overloading one tag for both categories,
+because -- unlike MongoDB's own data model -- this framework's accepted
+value model has two distinct temporal categories, not one.
+
+*Known, accepted limitation, named rather than defended against* (matching
+this FTR's own established practice for other low-probability edge cases,
+e.g. section 24's XLSX/ODS egress-parity disposition): a legitimate
+MultiIndex-nested JSON object (`_records_nested_from_multiindex`,
+`json_backend.py:41-66`) whose *only* field is literally named `$date` or
+`$datetime` would collide with the envelope shape. No repository evidence
+shows a column ever named this; the collision is named here as a boundary,
+not silently risked or elaborately defended against.
+
+===== 27.6 YAML contract decision [DECIDED / RECOMMENDATION]
+
+*YAML's native `date`/`timestamp` tags already are the right semantic
+substrate* -- confirmed by 27.1's probes: no wire-format invention is needed
+for YAML, unlike JSON. Only a writer-side carrier conversion closes the gap.
+
+*Decision:* immediately before `yaml.safe_dump` in `save_yaml_dir`
+(`yaml_backend.py:87`), map every `pandas.Timestamp` value in every record
+to `value.as_unit("us").to_pydatetime()`; leave every other value (`str`,
+`int`, `float`, `bool`, `None`, `datetime.date`, plain `datetime.datetime`)
+unchanged. No recursion is needed -- `yaml_backend.py` has no
+MultiIndex/nested-object handling analogous to `json_backend.py`'s (grepped,
+confirmed: `load_yaml_dir`/`save_yaml_dir` only ever handle flat
+`List[Dict[str, Any]]` records), so a flat per-value map over each record's
+`.items()` is sufficient and correct.
+
+*Alternative considered and rejected:* registering a custom representer for
+`pandas.Timestamp` on `yaml.SafeDumper` via `yaml.add_representer`/
+`SafeDumper.add_representer`. Rejected because `yaml.SafeDumper` is a shared,
+process-global class; registering a representer on it mutates that global
+registry for the entire process, including any other code (tests, a future
+consumer, the demo repo) that happens to call `yaml.safe_dump` elsewhere in
+the same process -- a spooky-action-at-a-distance risk out of proportion to
+the narrow problem being solved, and a strictly worse fit for "keep the
+helper strictly within persistence ownership" (task's own instruction) than
+a local value-mapping function scoped to exactly the one call site that
+needs it. A dedicated local `Dumper` subclass (registering the representer
+only on that subclass, not on the shared `SafeDumper`) was also considered
+and rejected as unnecessary extra surface -- the value-conversion approach
+needs no new PyYAML API at all.
+
+*Why `.as_unit("us")` before `.to_pydatetime()`, not bare
+`.to_pydatetime()`:* probe-confirmed (27.1) that bare `.to_pydatetime()` on
+a nanosecond-precision `Timestamp` both loses precision *and* emits
+`UserWarning: Discarding nonzero nanoseconds in conversion` -- an
+unnecessary, avoidable side effect for a persistence writer's ordinary
+operation. `.as_unit("us")` performs the identical truncation explicitly and
+silently; the resulting precision loss is unavoidable either way (YAML's own
+timestamp scalar has no sub-microsecond form), but the helper should not
+emit a runtime warning as a side effect of normal, expected behavior.
+
+===== 27.7 Persistence-local conversion ownership [DECIDED, per already-accepted section 20 boundary]
+
+Restates and makes concrete the boundary section 20/23 already accepted:
+
+* The YAML `Timestamp -> datetime.datetime` helper (27.6) is a private,
+  unexported function local to `yaml_backend.py` (e.g.
+  `_yaml_safe_temporal(value)`), called only from `save_yaml_dir`. It is not
+  imported by `json_backend.py`, any Domain module, or `core/scalar_values.py`.
+* The JSON encode/decode functions (27.5) are private, unexported functions
+  local to `json_backend.py` (e.g. `_json_temporal_default(value)` for
+  `json.dumps(default=...)`, `_json_temporal_object_hook(obj)` for
+  `json.loads(object_hook=...)`), called only from `JSONBackend.write_multi`
+  (and, if 27.11's Option A is ever chosen later, `read_multi`). Neither is
+  exported from `core/__init__.py`'s curated public surface.
+* Neither helper is named, shaped, or reachable as `normalize_scalar()`,
+  `normalize_value()`, `canonicalize_scalar()`, or any general Domain-wide
+  primitive. Each is a pure, narrow, single-direction mapping scoped to
+  exactly the writer (or, for JSON decode, the standalone codec, 27.11) that
+  needs it -- neither accepts nor is called with any value shape beyond what
+  its own call site already hands it.
+* Neither helper participates in Trusted Ingress (Phase E) in any way: no
+  frame-level traversal, no rejection/trust policy, no ingress boundary
+  wiring. A future Phase-E `normalize_scalar()`-shaped primitive may or may
+  not choose to reuse either helper's logic; that remains Phase E's own
+  decision, not pre-empted here, exactly as section 20 already states.
+
+===== 27.8 numpy.datetime64 finding [FACT, resolves task step 7]
+
+*Finding:* maintained JSON/YAML persistence never receives a raw
+`numpy.datetime64` scalar directly, under any construction path probed for
+D-T2 -- including one specifically designed to defeat pandas' normal
+dtype-promotion behavior (27.1's object-dtype-array probe). `.to_dict(orient="records")`,
+the call both writers use to materialize records, always boxes any
+`numpy.datetime64` it encounters into `pandas.Timestamp` first.
+
+*Conclusion:* no `numpy.datetime64`-specific persistence conversion is
+needed, in either backend. The `Timestamp`-handling helper (27.6/27.5)
+already covers every reachable case; adding a redundant
+`isinstance(value, np.datetime64)` branch to either helper would be dead
+code with no evidenced call site, which this design does not recommend
+adding speculatively.
+
+===== 27.9 Time / Duration non-goal restated [DECIDED, non-goal]
+
+The JSON encoder (`_json_temporal_default`) dispatches only on
+`isinstance(value, datetime.datetime)` (covers `Timestamp`, checked first,
+same subclass-ordering discipline D-T1 already established) and
+`isinstance(value, datetime.date)` (checked second); anything else --
+`datetime.time`, `datetime.timedelta`, `pandas.Timedelta`,
+`numpy.timedelta64` -- falls through to an explicit final `raise
+TypeError(...)` inside the helper itself, reproducing exactly the
+`TypeError` `json.dumps` already raises for these types today with no
+`default=` callback at all. This is a zero-behavior-change guarantee by
+construction, not merely by intention: the helper does not have a bare
+`except`/fallback branch that could accidentally widen acceptance.
+
+The YAML helper (`_yaml_safe_temporal`) only ever matches
+`isinstance(value, pd.Timestamp)`; every other value (including
+`datetime.time`/`datetime.timedelta`, which YAML's own `SafeDumper` already
+cannot represent at all, per section 9's finding) passes through unchanged
+and fails exactly as it does today, with the same underlying
+`RepresenterError`/`TypeError`, unaffected by this design.
+
+===== 27.10 Spreadsheet boundary [DECIDED, non-goal, restated]
+
+No XLSX/ODS parser or renderer file is touched by this design.
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE` remains authoritative and
+unreopened. D-T2 is scoped exactly as section 20 originally authorized:
+`yaml_dir` and `json_dir` structured persistence only. CSV and XML are
+unaffected (both already force string-only cell content for unrelated
+reasons, section 4) and are not discussed further here.
+
+===== 27.11 Read-side wiring decision [OPEN -- the one fork this design asks a maintainer/reviewer to confirm]
+
+*Option A -- full `JSONBackend.read_multi` rewiring.* Replace
+`pd.read_json(p, dtype=str, convert_dates=False)` with `json.load(fh,
+object_hook=_json_temporal_object_hook)` + `pd.DataFrame(records)`, then an
+explicit post-pass that stringifies every remaining non-temporal,
+non-missing scalar to reproduce `dtype=str`'s current external contract.
+Gives a true end-to-end directory round trip (`write_json_dir` then
+`read_json_dir` recovers Date/DateTime as native values on real DataFrame
+columns).
+
+*Option B (this design's recommendation) -- codec-level round trip only;
+`read_multi`/`read_json_dir` untouched.* `_json_temporal_default` and
+`_json_temporal_object_hook` exist as a tested, symmetric pair
+(`_json_temporal_object_hook(json.loads(json.dumps(value, default=_json_temporal_default)))
+== value`, exercised directly, satisfying section 22's "JSON encode/decode
+round-trip test" literally) without wiring the decode half into
+`JSONBackend.read_multi` at all. `write_json_dir` gains the encoder (closes
+the concrete write-side gap, symmetric to YAML); `read_json_dir`'s existing
+`dtype=str, convert_dates=False` contract is untouched, byte-for-byte.
+
+[cols="3,5",options="header"]
+|===
+| Consideration | Favors
+
+| Does not touch the already-deliberate "no type-guessing" JSON ingress
+  guard (`convert_dates=False`, section 4) at all
+| B
+
+| Avoids re-implementing pandas' own JSON-scalar-to-string coercion by hand
+  (27.2's own probe found close but not exhaustively proven agreement --
+  large-int/float-format/`NaN`-literal edge cases were not exhaustively
+  checked, and re-deriving this behavior is a materially larger surface than
+  "one narrow conversion")
+| B
+
+| Gives adopters a genuine end-to-end "read a JSON file I wrote, get native
+  Date/DateTime objects back" experience without any extra step
+| A
+
+| Matches the size of the YAML fix (one narrow, already-working-both-ways
+  format; only a write-side carrier conversion needed) -- JSON asymmetry
+  (write closes a real gap; read stays exactly as deliberate as it already
+  is) mirrors, rather than overreaches, that shape
+| B
+
+| No current maintained consumer or roadmap item was found (grepped for
+  D-T2) that needs a JSON-directory Date/DateTime *read* path today --
+  matches this FTR's own established practice of not building ahead of
+  evidenced need (e.g. section 16's XLSX/ODS egress-parity deferral)
+| B
+|===
+
+*Recommendation: Option B.* Record Option A explicitly as an available,
+scoped, future extension -- not designed further here -- gated the same way
+this FTR already gates other evidenced-but-unbuilt options (XLSX/ODS egress
+parity, section 16/24): pick it up in a later slice if a concrete adopter
+need for JSON-directory Date/DateTime *read* support actually surfaces, at
+which point the `dtype=str`-replacement compatibility question (27.2's own
+open risk) gets its own dedicated evidence-gathering pass, not a
+speculative one bundled into D-T2.
+
+*YAML needs no analogous decision.* `load_yaml_dir` already correctly reads
+native YAML date/datetime tags back as `datetime.date`/`datetime.datetime`
+today (27.1), unaffected by D-T2 -- only `save_yaml_dir` needs the fix
+(27.6). YAML's own contract is therefore already fully closed by this
+design, read and write; JSON's read side is the only place this design
+leaves a fork for the maintainer/reviewer to confirm rather than settling
+outright.
+
+===== 27.12 Concrete D-T2 contract summary (deliverable)
+
+[cols="2,5",options="header"]
+|===
+| Item | Contract
+
+| Supported structured persistence paths
+| `yaml_dir` write (fixed by this design) and read (already correct,
+  unchanged); `json_dir` write (new encoder, this design); `json_dir` read
+  (unchanged at the backend level -- Option B, 27.11; the decode function
+  exists and is independently tested but is not wired into `read_multi`).
+
+| Wire representation -- YAML
+| Unchanged: PyYAML's own native `date`/`timestamp` scalar tags. No new
+  format.
+
+| Wire representation -- JSON
+| `{"$date": "<ISO date>"}` for `datetime.date`;
+  `{"$datetime": "<ISO 8601 datetime>"}` (offset suffix iff aware) for
+  `datetime.datetime`/`pandas.Timestamp` (27.5).
+
+| Decode rules
+| Exact single-key-set match only (`set(obj.keys()) == {"$date"}` /
+  `{"$datetime"}`); no string-shape/content inference anywhere, on any
+  format. A matched envelope whose value is not a string, or is a string
+  that fails `date.fromisoformat`/`datetime.fromisoformat`, raises an
+  explicit, persistence-local decode error -- it must not silently pass
+  through as an ordinary dict once the reserved-key shape has matched, per
+  the "fail loud, do not guess" posture this framework already uses
+  elsewhere (`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`). A dict that does not match
+  either reserved key set exactly (extra keys, wrong key name, wrong value
+  type before parsing is attempted) passes through unchanged -- necessary so
+  an ordinary MultiIndex-nested payload object is never misclassified.
+
+| Preservation guarantees
+| Per 27.4: Date/DateTime category, time-of-day, timezone/offset (exactly as
+  authored, no UTC assumption) all preserved; Missing bypasses the codec
+  entirely, unaffected; carrier identity (`Timestamp` vs plain
+  `datetime.datetime`) deliberately not preserved; sub-microsecond precision
+  not preserved (pre-existing loss, not introduced by D-T2).
+
+| Local conversion ownership
+| Per 27.7: two small, private, unexported functions, one per backend module,
+  each scoped to exactly the call site that needs it; neither is
+  `normalize_scalar()`-shaped, neither is Domain/Trusted-Ingress
+  infrastructure, neither is reused across backends.
+
+| Non-goals
+| General scalar normalization / `normalize_scalar()`-shaped primitive
+  (Phase E's, per section 20/23, unchanged); `datetime.time` support;
+  Duration/`timedelta` support (any carrier); timezone canonicalization
+  *policy* (only category-membership/round-trip-fidelity is addressed here,
+  same boundary as section 11); XLSX/ODS parser/renderer changes; any change
+  to `ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`; `numpy.datetime64`-specific
+  persistence handling (27.8 -- not reachable, not needed); `JSONBackend.read_multi`
+  rewiring (Option A, 27.11 -- recorded, not built, pending evidenced need);
+  carrier-identity preservation on decode; Project Memory updates; any
+  runtime, test, or `scalar_values.py` change (this section, like section 26
+  before it and every other section of this FTR, is documentation only).
+
+| Test matrix (minimum, for whichever future slice implements this)
+| See 27.13.
+
+| Proposed narrow implementation slices, if/when D-T2 is authorized
+| *D-T2.1* -- `yaml_backend.py`: add `_yaml_safe_temporal`, apply it in
+  `save_yaml_dir` only; regression test reproducing the `Timestamp`
+  `RepresenterError` (naive and aware) no longer crashing, plus a
+  non-regression that `load_yaml_dir` output is unaffected.
++
+  *D-T2.2* -- `json_backend.py`: add `_json_temporal_default`, wire it into
+  `write_multi`'s two `json.dump(...)` calls (`json_backend.py:140-148`);
+  regression test that a `datetime.date`/`datetime.datetime`/`Timestamp`
+  (naive and aware) column no longer raises `TypeError` on write, and that
+  the written file matches the `$date`/`$datetime` envelope shape exactly.
++
+  *D-T2.3* -- `json_backend.py`: add `_json_temporal_object_hook`, tested
+  directly as a standalone encode/decode round trip (satisfies section 22's
+  requirement); explicitly *not* wired into `JSONBackend.read_multi`/
+  `read_json_dir` (Option B, 27.11) unless a follow-up decision reopens that
+  choice.
+|===
+
+===== 27.13 Test matrix [for the slices this section proposes -- not run by this section itself]
+
+Mirrors section 22's own style and placement -- authored here so a future
+implementer does not have to rediscover it, not executed by this
+documentation-only pass:
+
+* *D-T2.1 (YAML):* extends `tests/integration/io_backends/yaml/test_yaml_roundtrip.py`
+  (natural existing home) with: a naive-`Timestamp`-backed column no longer
+  raises `RepresenterError` on `save_yaml_dir`; an aware-`Timestamp`-backed
+  column (mixed offsets) no longer raises; the written YAML file contains
+  native (unquoted) timestamp scalars, not quoted strings; a
+  nanosecond-precision `Timestamp` writes without emitting `UserWarning`
+  (`pytest.warns` used as a *non*-emission assertion, or
+  `warnings.simplefilter("error")` around the call); a pure-`datetime.date`
+  column's existing working round trip is unaffected (non-regression).
+* *D-T2.2/D-T2.3 (JSON):* extends `tests/integration/io_backends/json/test_json_roundtrip.py`
+  with: `write_json_dir` no longer raises `TypeError` for a
+  `datetime.date`/naive-`datetime.datetime`/aware-`datetime.datetime`/
+  naive-`Timestamp`/aware-`Timestamp` column, for each producing the exact
+  `{"$date": ...}`/`{"$datetime": ...}` envelope in the written file (byte-level
+  or parsed-JSON assertion); a standalone
+  `_json_temporal_object_hook(json.loads(json.dumps(value,
+  default=_json_temporal_default)))` round trip for both categories, naive
+  and aware, midnight and non-midnight (pinning that a midnight `Timestamp`
+  still decodes to `datetime.datetime`, never `datetime.date`, consistent
+  with D-T1's own no-time-of-day-heuristic decision, section 8); a malformed
+  single-key envelope (`{"$date": "not-a-date"}`, `{"$datetime": 123}`)
+  raises the explicit decode error, not a silent pass-through; an ordinary
+  multi-field nested object (MultiIndex payload shape) is confirmed
+  unaffected by the `object_hook`, i.e. still returned unchanged (guards
+  against 27.5's named collision risk in the one direction that is
+  practically testable); `JSONBackend.read_multi`'s existing `dtype=str`
+  behavior is asserted unchanged for every pre-existing fixture (Option B
+  non-regression).
+* No test for a general Phase-D `normalize_scalar()` primitive belongs to
+  either slice, restated from section 22 -- that slice does not exist.
+
+===== 27.14 Acceptance criteria for this design addendum
+
+* [ ] This section exists inside `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc`,
+  not a separate file, matching section 26's own placement precedent for a
+  design/evidence addendum that is not yet a runtime change.
+* [ ] YAML and JSON current behavior are each independently re-probed for
+  this section, not assumed from section 14/19 (27.1, 27.2).
+* [ ] The known `Timestamp` `RepresenterError` is reproduced directly against
+  the real `save_yaml_dir` function, naive and aware (27.1).
+* [ ] Roundtrip semantics (Date/DateTime category, time-of-day, timezone,
+  Missing, carrier identity) are each decided explicitly, not left implicit
+  (27.4).
+* [ ] At least two JSON wire-format alternatives are compared before a
+  choice is made, and the choice does not infer type from untagged string
+  content (27.5).
+* [ ] YAML's native tags are confirmed sufficient substrate before any
+  wire-format work is proposed for YAML (27.6) -- none is.
+* [ ] Any persistence-local carrier conversion is explicitly scoped to
+  exactly its own writer, not shaped as `normalize_scalar()` or exported
+  outside its own backend module (27.7).
+* [ ] `numpy.datetime64`'s actual reachability through the persistence
+  writers is checked by direct probe, not assumed (27.8).
+* [ ] Time/Duration are confirmed to remain rejected, by construction of the
+  proposed encoder (an explicit final `raise`, not a bare fallback) (27.9).
+* [ ] The spreadsheet/ADR boundary is restated, not reopened (27.10).
+* [ ] The JSON read-wiring question is presented as an explicit fork with a
+  stated recommendation, not silently decided either way (27.11).
+* [ ] A concrete, table-form contract (supported paths, wire representation,
+  decode rules, preservation guarantees, ownership, non-goals, test matrix,
+  proposed slices) exists in one place (27.12).
+* [ ] A test matrix is authored for the proposed slices, not executed by
+  this pass (27.13).
+* [ ] `git status --short` and `git diff --check` show only this
+  documentation change. No Python source, test, or Project Memory file is
+  touched.
+
+===== 27.15 Probes performed for this design pass
+
+Read-only; nothing written inside the repository; mirrors the top-level
+"Validation" section's own role for section 1-25, and section 26.4's role
+for D-T1:
+
+[source,console]
+----
+git status --short
+git log --oneline -15 -- docs/backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A.adoc \
+    docs/backlog/FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc \
+    src/spreadsheet_handling/core/scalar_values.py
+----
+
+Source re-reads: `src/spreadsheet_handling/io_backends/yaml_backend.py`
+(full module), `src/spreadsheet_handling/io_backends/json_backend.py` (full
+module), `src/spreadsheet_handling/core/scalar_values.py` (full module,
+current D-T1 state), `docs/ai_info/_ai_info.adoc`.
+
+Live probes (scratchpad-only, `.venv/bin/python`, pandas `3.0.2`):
+
+* Direct execution of `save_yaml_dir`/`load_yaml_dir` against a pure-`date`
+  DataFrame (confirms zero-gap round trip) and against naive/aware
+  `Timestamp`-backed DataFrames (reproduces the `RepresenterError`
+  identically for both).
+* `pd.Timestamp.to_pydatetime()` vs `pd.Timestamp.as_unit("us").to_pydatetime()`
+  on a nanosecond-precision `Timestamp`, confirming the former emits
+  `UserWarning` and the latter does not, both truncating identically.
+* `pd.Timestamp.isoformat()` vs `.to_pydatetime().isoformat()`, naive and
+  aware, confirming identical string output for microsecond-precision input.
+* `DataFrame.to_dict(orient="records")` on a `datetime64`-dtype column and
+  on an explicitly-constructed object-dtype column of raw
+  `numpy.datetime64` scalars, confirming both box to `pandas.Timestamp`,
+  never leaving a raw `numpy.datetime64` for either writer to see.
+* `json.dumps`/`json.loads` prototype of the `$date`/`$datetime` envelope
+  with a `default=`/`object_hook` pair, exercised against
+  `datetime.date`, naive `datetime.datetime`, aware and naive `Timestamp`
+  (including a midnight `Timestamp`, pinning DateTime-not-Date), and against
+  an ordinary nested dict (`{"x": {"y": 1, "z": "hi"}}`) to confirm the
+  `default` callback is never invoked for values `json.dumps` already knows
+  how to serialize.
+* `pd.read_json(dtype=str, convert_dates=False)` against a JSON file
+  containing a nested `{"$date": ...}`-shaped object, confirming the nested
+  object is stringified via Python `dict.__repr__` (not decodable) under
+  `dtype=str`, and confirming it survives as a genuine `dict` when
+  `dtype=str` is not passed or when read via plain `json.load` instead.
+* `pd.read_json(dtype=str, convert_dates=False)` vs plain Python `str(v)`
+  for representative `int`/`float`/`bool`/large-integer/negative-zero
+  values, to evaluate (not resolve) the read-side rewiring risk named in
+  27.2/27.11.
+* `datetime.date.fromisoformat`/`datetime.datetime.fromisoformat` round trip
+  for naive and aware input, confirming exact tzinfo/offset reconstruction
+  with no UTC assumption.
+
+No production or test file was modified by any probe.
+
+===== 27.16 Open decisions requiring human/independent-review confirmation
+
+Unlike section 24 (which found nothing genuinely open blocking D-T1), this
+design leaves exactly one fork open, plus two smaller naming-level choices,
+for a fresh-context independent architecture review to confirm before D-T2
+is authorized for implementation:
+
+. *(27.11) JSON read-side wiring -- Option A vs Option B.* This design
+  recommends B (codec-level round trip only; `read_multi` untouched) and
+  states the evidence and trade-offs; a reviewer may reasonably weigh
+  "adopters get a real end-to-end JSON Date/DateTime read path sooner"
+  (Option A) against "smallest footprint, zero risk to the already-deliberate
+  `dtype=str` ingress guard, no unaudited re-implementation of pandas' own
+  JSON scalar-to-string coercion" (Option B, this design's recommendation)
+  differently. This is the central decision a reviewer should either confirm
+  or overturn.
+. *(27.5) Wire-tag spelling -- `$date`/`$datetime` vs an alternative
+  reserved-key scheme.* Low-stakes but worth a reviewer's explicit sign-off
+  since it is a wire-compatibility choice, not merely an internal one, once
+  any file is ever written with it.
+. *(27.12) Decode-error type.* This design specifies "an explicit,
+  persistence-local decode error" for a malformed envelope without naming a
+  concrete exception class (deliberately, since class-naming is
+  implementation, not design) -- a reviewer/implementer should confirm
+  whether a new dedicated exception (mirroring `UnsupportedScalarError`'s
+  own shape) or a narrower reuse of an existing persistence-layer exception
+  is preferred.
+
+No other item in sections 27.1-27.15 is left open by this design; the
+central "smallest explicit persistence contract" question posed at this
+section's own start is answered concretely in 27.12, pending confirmation of
+the one fork above.
+
+D-T2 STRUCTURED PERSISTENCE CONTRACT DESIGNED --
+READY FOR INDEPENDENT ARCHITECTURE REVIEW.
