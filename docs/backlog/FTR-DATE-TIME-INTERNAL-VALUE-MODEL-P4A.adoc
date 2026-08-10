@@ -3172,3 +3172,376 @@ not begin implementation.
 
 D-T2 DESIGN FINDINGS CORRECTED --
 READY FOR INDEPENDENT FOLLOW-UP REVIEW.
+
+==== 29. D-T2 implementation evidence
+
+*Status: D-T2 implemented, not yet independently reviewed.* This section
+records what was actually built, strictly inside the boundaries the
+independently accepted D-T2 contract (section 27, corrected per section 28,
+independently confirmed *ACCEPTED WITH MINOR FOLLOW-UP -- D-T2 CONTRACT
+IMPLEMENTATION-READY* by the Independent D-T2 Correction Follow-up Review,
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A_review.adoc`, `04fe32a`/`772684e`)
+already established. This FTR itself stays *Open*: D-T3 (transformation/
+family compatibility pilot, still unselected) and D-T4 (spreadsheet-adapter
+adoption, ADR-gated) remain unauthorized and unimplemented. This section does
+not self-declare D-T2 accepted; a fresh-context independent implementation
+review is still required, mirroring section 26's own posture toward D-T1.
+Project Memory is not updated by this section, per the task's own explicit
+instruction.
+
+*Task baseline:* core HEAD `f746cb4b9d0fcc25a7bdd9fc8f78967fbf93466d`
+("docs(project_memory): record D-T2 implementation readiness"), clean
+worktree, verified at task start. Remained on `main`; no branch created/
+switched, no amend/rebase/reset, nothing pushed.
+
+===== 29.1 What was built
+
+Exactly two production files changed, both persistence-backend-local, per
+section 27.7's ownership boundary -- no new module, no registry, no wrapper
+class, no shared helper:
+
+[source,text]
+----
+src/spreadsheet_handling/io_backends/yaml_backend.py (modified, +40/-3)
+src/spreadsheet_handling/io_backends/json_backend.py (modified, +119/-4)
+----
+
+*D-T2.1 (YAML), `yaml_backend.py`:* a private, unexported
+`_yaml_safe_temporal(value)` helper, matching section 27.6's decided
+dispatch order exactly:
+
+[source,python]
+----
+def _yaml_safe_temporal(value: Any) -> Any:
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.as_unit("us").to_pydatetime()
+    return value
+----
+
+Applied in `save_yaml_dir`, immediately after `df.to_dict(orient="records")`
+and before `yaml.safe_dump`, as a flat per-value map over each record's
+`.items()` (no recursion, per 27.6's own finding that `yaml_backend.py` has
+no nested/MultiIndex record shape to traverse):
+
+[source,python]
+----
+records = [
+    {key: _yaml_safe_temporal(value) for key, value in record.items()}
+    for record in records
+]
+----
+
+`load_yaml_dir` is untouched -- zero lines changed -- per 27.1/27.11's own
+finding that YAML's read side already round-trips native `date`/`timestamp`
+tags correctly.
+
+*D-T2.2/D-T2.3 (JSON), `json_backend.py`:* two private, unexported functions,
+matching section 27.9/27.12's decided dispatch order and decode rules
+exactly:
+
+[source,python]
+----
+def _json_temporal_default(value: Any) -> Any:
+    if value is pd.NaT:
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return {"$datetime": value.as_unit("us").isoformat()}
+    if isinstance(value, datetime.datetime):
+        return {"$datetime": value.isoformat()}
+    if isinstance(value, datetime.date):
+        return {"$date": value.isoformat()}
+    raise TypeError(
+        f"Object of type {type(value).__name__!r} is not JSON serializable"
+    )
+
+
+def _json_temporal_object_hook(obj: dict[str, Any]) -> Any:
+    if set(obj.keys()) == {"$date"}:
+        raw = obj["$date"]
+        if not isinstance(raw, str):
+            raise ValueError(...)
+        return datetime.date.fromisoformat(raw)
+    if set(obj.keys()) == {"$datetime"}:
+        raw = obj["$datetime"]
+        if not isinstance(raw, str):
+            raise ValueError(...)
+        return datetime.datetime.fromisoformat(raw)
+    return obj
+----
+
+`_json_temporal_default` is wired as `default=_json_temporal_default` into
+both `json.dump(...)` call sites inside `JSONBackend.write_multi`
+(`json_backend.py`'s pretty and compact branches) -- the only maintained JSON
+*write* path (D-T2.2, closing the encoder gap). `_json_temporal_object_hook`
+is *not* wired into `JSONBackend.read_multi`/`read_json_dir` anywhere
+(D-T2.3, Option B, section 27.11) -- it is a standalone codec component,
+exercised only directly by the test suite. `JSONBackend.read_multi`'s body
+(`pd.read_json(p, dtype=str, convert_dates=False)`) is untouched -- zero
+lines changed.
+
+The `JSONBackend` class docstring was extended with the wire-tag reserved-
+semantics documentation section 27.14's checklist (as amended by
+`DT2-FOLLOWUP-F1`'s disposition) requires: `$date`/`$datetime` are named as
+reserved single-key envelopes, the Missing (`""`)/precision (microsecond)/
+carrier-identity (not preserved) contract is restated, and the deliberate
+`read_multi` non-wiring is stated explicitly, satisfying that acceptance
+criterion in the JSON backend's own public contract/documentation (not only
+in this design document, which already carried it).
+
+*Not built, per section 27.12's explicit non-goals, confirmed unchanged by
+this diff:* no general `normalize_scalar()`-shaped primitive; no Trusted
+Ingress wiring; no `read_json_dir`/`JSONBackend.read_multi` rewiring
+(Option A remains a recorded, unbuilt future extension); no
+`numpy.datetime64`-specific branch in either helper (27.8's non-reachability
+finding, unperturbed); no `datetime.time`/Duration acceptance; no XLSX/ODS
+parser/renderer change; no change to
+`ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE`; no global `yaml.SafeDumper`/
+`yaml.add_representer` mutation; no change to `core/scalar_values.py`
+(confirmed by `git diff --stat`, zero lines).
+
+===== 29.2 Missing precedence and JSON/YAML boundary -- verified by direct probe
+
+Independently re-executed against the modified modules before finalizing
+tests (scratchpad-only probes, not left in the repository beyond the
+committed test suite):
+
+[source,pycon]
+----
+>>> from spreadsheet_handling.io_backends.yaml_backend import _yaml_safe_temporal
+>>> _yaml_safe_temporal(pd.NaT)
+>>> _yaml_safe_temporal(pd.Timestamp("2026-08-09T10:30:00.123456789"))
+datetime.datetime(2026, 8, 9, 10, 30, 0, 123456)
+>>> _yaml_safe_temporal(pd.Timestamp("2026-08-09").date())
+datetime.date(2026, 8, 9)
+
+>>> from spreadsheet_handling.io_backends.json_backend import (
+...     _json_temporal_default, _json_temporal_object_hook)
+>>> import json
+>>> json.dumps(pd.NaT, default=_json_temporal_default)
+'""'
+>>> json.dumps(pd.Timestamp("2026-08-09T10:30:00.123456789"), default=_json_temporal_default)
+'{"$datetime": "2026-08-09T10:30:00.123456"}'
+>>> json.loads('{"$date": "not-a-date"}', object_hook=_json_temporal_object_hook)
+Traceback (most recent call last):
+    ...
+ValueError: ...
+----
+
+Confirms the load-bearing claim both design reviews centered on: `pd.NaT`
+never reaches the `Timestamp`/`datetime.datetime` dispatch in either helper,
+a nanosecond-precision `Timestamp` truncates to exactly six fractional
+digits in both wire forms, and a malformed matched JSON envelope raises
+`ValueError` rather than silently passing through.
+
+===== 29.3 YAML backend-level roundtrip -- verified
+
+The realistic scenario named throughout section 27 (task's own explicit
+question) was exercised against the real, unmodified `load_yaml_dir`/
+`save_yaml_dir` functions, not a reimplementation:
+
+[source,pycon]
+----
+>>> # events.yml: one Timestamp row + one blank ("at:") row
+>>> loaded = load_yaml_dir(str(src))
+>>> loaded["events"]["at"].dtype
+dtype('<M8[us]')
+>>> save_yaml_dir(loaded, str(out))   # previously raised RepresenterError
+>>> reloaded = load_yaml_dir(str(out))
+>>> reloaded["events"].iloc[0]["at"]
+datetime.datetime(2026, 8, 9, 10, 30)
+>>> pd.isna(reloaded["events"].iloc[1]["at"])
+True
+----
+
+Confirmed the same behavior in the committed test,
+`test_load_then_unmodified_resave_of_timestamp_and_blank_succeeds`. One
+detail sharpened relative to section 27's own prose: reloading a written
+`null` cell inside an otherwise all-`Timestamp` column, pandas' own
+`DataFrame` constructor promotes the column to `datetime64`-dtype and
+represents the missing entry as `pandas.NaT` (the temporal column's own
+Missing carrier), not as the bare `None` the intermediate YAML `null` value
+was mapped from -- consistent with 27.1/27.4's own finding that
+`to_dict(orient="records")`/`DataFrame` construction always boxes a missing
+temporal value into `pandas.NaT` for a uniformly-temporal column. This is
+the same `None`-in, `NaT`-out promotion pandas already performs for any
+`Timestamp`+`None` column construction, not a new behavior introduced by
+this change.
+
+===== 29.4 JSON writer + codec-level roundtrip -- verified
+
+`write_json_dir` no longer raises `TypeError` for `datetime.date`/
+`datetime.datetime`/`pandas.Timestamp` (naive and aware) columns; each
+written file contains the exact `$date`/`$datetime` envelope shape (asserted
+by parsed-JSON equality in the committed tests, not merely "no exception").
+A `Timestamp`+`pandas.NaT`-mixed column writes `""` for the missing entry
+and never `{"$datetime": "NaT"}` anywhere in the file (asserted by both
+substring-absence and parsed-value checks).
+
+`_json_temporal_object_hook(json.loads(json.dumps(value,
+default=_json_temporal_default)))` round-trips Date, naive DateTime, and
+aware DateTime exactly at the codec level; a `pandas.Timestamp` round-trips
+to a plain `datetime.datetime` (carrier identity deliberately not
+preserved, confirmed by `type(decoded) is datetime.datetime` and `not
+isinstance(decoded, pd.Timestamp)`). Malformed matched envelopes
+(`{"$date": "not-a-date"}`, `{"$datetime": "not-a-datetime"}`,
+`{"$datetime": 123}`) each raise `ValueError`; an ordinary nested dict passes
+through the `object_hook` unchanged.
+
+===== 29.5 JSON reader deliberately untouched -- verified
+
+`JSONBackend.read_multi`'s body is byte-for-byte unchanged (`git diff`
+confirms zero lines touched inside the method); the pre-existing
+`test_json_read_preserves_iso_date_strings` regression test still passes
+unmodified. A new non-regression test,
+`test_read_json_dir_dtype_str_behavior_unchanged_by_temporal_encoder`,
+independently confirms a `$datetime` envelope written by the new encoder
+reads back through the unmodified `read_json_dir` as a plain, undecoded
+string (not a native `datetime.datetime`), matching Option B's own stated
+boundary (27.11) rather than silently exceeding it.
+
+===== 29.6 Precision -- verified
+
+A nanosecond-precision `pandas.Timestamp`
+(`2026-08-09T10:30:00.123456789`) writes as exactly six fractional digits
+in both backends: `2026-08-09 10:30:00.123456` in YAML (native, unquoted
+timestamp scalar) and `"2026-08-09T10:30:00.123456"` inside the JSON
+`$datetime` envelope. The YAML write is exercised under
+`warnings.simplefilter("error")` and does not raise -- `.as_unit("us")` is an
+explicit truncation, not the implicit one `Timestamp.to_pydatetime()` alone
+would perform (which emits `UserWarning`).
+
+===== 29.7 Timezone fidelity boundary -- verified
+
+A `zoneinfo.ZoneInfo("Europe/Berlin")`-tagged `Timestamp`, probed in two
+different DST periods (August `+02:00` CEST, December `+01:00` CET), writes
+and reads back through the real YAML backend with its exact numeric offset
+preserved for both periods; `tzinfo` on reload is `datetime.timezone`, never
+a `ZoneInfo`-backed zone, confirmed by
+`not isinstance(loaded_value.tzinfo, zoneinfo.ZoneInfo)` for both. This
+matches section 27.4/`DT2-DESIGN-REVIEW-F4`'s corrected contract exactly:
+awareness and numeric offset preserved, named/IANA identity not.
+
+===== 29.8 Tests added
+
+[cols="2,4,1",options="header"]
+|===
+| File | What it proves | Count
+
+| `tests/integration/io_backends/yaml/test_yaml_roundtrip.py` (modified)
+| Extends the existing YAML backend integration slice in place. New
+  coverage: pure-Date roundtrip non-regression; naive-`Timestamp` write no
+  longer crashes; aware-`Timestamp` write (mixed offsets) no longer crashes;
+  a `Timestamp`+`pandas.NaT`-mixed column no longer crashes and the missing
+  entry writes as YAML `null`; the realistic
+  load-timestamp-and-blank/resave-unchanged scenario, exercised against the
+  real `load_yaml_dir`/`save_yaml_dir`; nanosecond-`Timestamp` writes at
+  exactly microsecond precision with no `UserWarning` (asserted under
+  `warnings.simplefilter("error")`); a named-zone (`ZoneInfo`) input
+  preserves DST-correct numeric offset across two periods but not `ZoneInfo`
+  identity; no global `yaml.SafeDumper.yaml_representers` mutation
+  (before/after set-equality check). `pytestmark` carries
+  `pytest.mark.ftr("FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A")`.
+| 9 tests total (1 pre-existing, 8 new)
+
+| `tests/integration/io_backends/json/test_json_roundtrip.py` (modified)
+| Extends the existing JSON backend integration slice in place. New
+  coverage: exact `$date`/`$datetime` envelope shape for Date/naive-
+  DateTime/aware-DateTime/naive-Timestamp/aware-Timestamp (parsed-JSON
+  equality, not substring matching); a midnight `Timestamp` still writes
+  `$datetime`, never `$date` (no time-of-day heuristic); a
+  nanosecond-`Timestamp` writes at most six fractional digits; a
+  `Timestamp`+`pandas.NaT`-mixed column writes `""` for the missing entry
+  and never `{"$datetime": "NaT"}` anywhere in the file; standalone codec
+  roundtrip for Date, naive DateTime, and aware DateTime; carrier-identity
+  non-preservation for a `Timestamp` round trip; malformed matched envelopes
+  (`{"$date": "not-a-date"}`, `{"$datetime": "not-a-datetime"}`,
+  `{"$datetime": 123}`, parametrized) raise `ValueError`; an ordinary nested
+  dict passes through the `object_hook` unchanged; `read_json_dir`'s
+  `dtype=str` behavior confirmed unchanged by the new encoder (Option B
+  non-regression); the pre-existing `test_json_read_preserves_iso_date_strings`
+  kept unmodified and green. `pytestmark` carries
+  `pytest.mark.ftr("FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A")`.
+| 19 tests total (2 pre-existing, 17 new)
+|===
+
+===== 29.9 Validation performed
+
+[source,console]
+----
+.venv/bin/pytest tests/integration/io_backends/yaml/test_yaml_roundtrip.py \
+    tests/integration/io_backends/json/test_json_roundtrip.py -v
+.venv/bin/pytest tests/unit/core/test_scalar_values.py
+.venv/bin/pytest tests/architecture
+.venv/bin/pytest tests/integration/io_backends
+.venv/bin/pytest tests/roundtrip/test_pathological_cell_contracts.py
+make test
+make source-style-guards
+git diff --check
+----
+
+Results:
+
+* Focused YAML+JSON suite: *28 passed*, 0 failed, 0 skipped (9 YAML + 19
+  JSON).
+* `tests/unit/core/test_scalar_values.py` (D-T1 regression, unmodified by
+  this diff): *74 passed*, unaffected -- confirms D-T2 did not perturb
+  `core/scalar_values.py` (also independently confirmed by `git diff --stat`
+  showing zero lines touched in that file).
+* `tests/architecture`: *156 passed*, unaffected -- no import-boundary or
+  layering rule touches either modified module's dependency shape (both
+  already imported `pandas`/`yaml`/`json`; `json_backend.py` gained a
+  `datetime` import, `yaml_backend.py` gained no new import beyond
+  `typing.Any`, already available via `from __future__ import annotations`
+  callers).
+* `tests/integration/io_backends` (full slice, both backends plus XLSX/ODS/
+  XML): *120 passed*, unaffected outside the two modified files' own tests.
+* `tests/roundtrip/test_pathological_cell_contracts.py`: *14 passed*,
+  unaffected.
+* `make test` (`ACTIVE_TEST_PATHS = tests/unit tests/integration
+  tests/roundtrip tests/architecture`, `-m 'not legacy and not prehex and
+  not slow'`): *2362 passed, 1 deselected*, 0 failed -- 25 more than D-T1's
+  own last-recorded baseline (2337), matching exactly the 8 new YAML + 17
+  new JSON test items this diff adds. The one deselection is pre-existing
+  (unrelated `slow`/`legacy`/`prehex`-marked test), unchanged from D-T1's own
+  validation record.
+* `make source-style-guards`: exit code 0, zero `ERROR`-level findings.
+  Pre-existing `WARN`-level function-length/branch-complexity findings are
+  unrelated files this diff does not touch; neither `_yaml_safe_temporal`,
+  `_json_temporal_default`, nor `_json_temporal_object_hook` appears in the
+  guard's own warning list (independently grepped).
+* `git diff --check`: clean, no whitespace errors, exit code 0.
+* No new warning was introduced or suppressed; no pre-existing warning was
+  touched.
+
+===== 29.10 Scope search -- verified absent
+
+Grepped the full diff (`git diff -- src/ tests/`) for every term section 9
+of the task lists: `normalize_scalar`, `normalize_value`, `canonicalize`,
+`Trusted Ingress`, `SafeDumper.add_representer`, `yaml.add_representer`. The
+only three matches are explanatory docstring/test-name prose stating the
+*non-goal* explicitly (`"not part of Trusted Ingress"`,
+`"(normalize_scalar()-shaped or otherwise)"`, and a test docstring naming
+`yaml.SafeDumper.add_representer` as the *rejected alternative* it verifies
+was not taken) -- no executable code path matches any of these terms. No
+`read_multi`/`read_json_dir` rewiring: both method bodies are confirmed
+byte-for-byte unchanged by `git diff`. Both new helper pairs remain private
+(leading-underscore, unexported) and backend-local, confirmed by `git diff
+--stat` showing exactly the two `io_backends/*.py` files plus their own test
+files changed -- no third production file, no `core/__init__.py` export
+change, no registry change.
+
+===== 29.11 Not performed by this section
+
+Per the task's own explicit instruction: Project Memory was not updated;
+D-T2 was not self-declared independently accepted; D-T3/D-T4 were not
+started; this FTR was not archived or marked Done; Phase D was not declared
+complete; no release-note entry was added (this is an internal persistence-
+backend fix behind no documented CLI/config surface change of its own, and
+`docs/release_notes/release_notes.adoc`'s checkpoint criteria are not met by
+a private codec addition -- the same disposition D-T1 recorded in 26.6, for
+the same reason).
+
+D-T2 STRUCTURED PERSISTENCE IMPLEMENTED --
+READY FOR INDEPENDENT IMPLEMENTATION REVIEW.
