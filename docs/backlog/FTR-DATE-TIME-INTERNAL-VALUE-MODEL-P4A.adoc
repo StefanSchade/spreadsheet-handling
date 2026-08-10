@@ -1690,3 +1690,323 @@ and the small discoverability pointer added to
 section, by explicit path (not `git add -A`/`git add .`). Does not update
 Project Memory. Does not push (remote sync is a developer action per
 `agent_rules.adoc`).
+
+==== 26. D-T1 implementation evidence
+
+*Status: D-T1 implemented, not yet independently reviewed.* This section
+records what was actually built, strictly inside the boundaries the accepted
+contract (sections 1-25) already established. This FTR itself stays *Open*:
+D-T2 (structured persistence compatibility), D-T3 (transformation/family
+compatibility pilot, still unselected), and D-T4 (spreadsheet-adapter
+adoption, ADR-gated) remain unauthorized and unimplemented. This section does
+not self-declare D-T1 accepted; a fresh-context independent implementation
+review is still required (section 22's test requirements were followed as
+the minimum bar, not as a review substitute).
+
+*Task baseline:* core HEAD `879a3bfb28eec65311271bf0c04fb322b6e9d751`
+("docs(warm_storage): record 2026-08-09 stale-lifecycle audit (second
+pass)"), clean worktree, verified at task start. Remained on `main`; no
+branch created/switched, no amend/rebase/reset, nothing pushed.
+
+===== 26.1 What was built
+
+Exactly one production file changed, per section 13's own scope bound (no
+new module, no registry, no wrapper class):
+
+[source,text]
+----
+src/spreadsheet_handling/core/scalar_values.py (modified)
+----
+
+* `ScalarCategory` extended from a four-member to a six-member closed
+  `Literal`: `"string", "boolean", "number", "missing", "date", "datetime"`.
+  No `"time"`, `"duration"`, `"formula"`, or `"list"` member -- matching
+  section 15's instruction exactly.
+* `ScalarValue` extended from `str | bool | int | float | None` to
+  `str | bool | int | float | datetime.date | datetime.datetime | None`.
+  `datetime.date`/`datetime.datetime` were added because they play the same
+  "conceptual canonical carrier" role for Date/DateTime that `int`/`float`
+  already play for Number (section 12); their carrier *variants*
+  (`pandas.Timestamp`, `numpy.datetime64`) were deliberately *not* added,
+  for the same reason `numpy.int64`/`numpy.float64` were never added --
+  consistent with the alias's own documented meaning, not a claim that every
+  accepted carrier class is enumerated by it.
+* `scalar_category` gained two new branches, appended after the existing
+  Number branch and before the trailing `raise`:
++
+[source,python]
+----
+if isinstance(value, (np.datetime64, datetime.datetime)):
+    return "datetime"
+if isinstance(value, datetime.date):
+    return "date"
+----
++
+`datetime.datetime` and `np.datetime64` are checked together because
+`np.datetime64` is unrelated to `datetime.date`/`datetime.datetime` by
+inheritance (confirmed: its `__mro__` is only `(numpy.datetime64,
+numpy.generic, object)`), so there is no ordering hazard between them; the
+DateTime-before-Date ordering hazard is only between `datetime.datetime`
+(and its subclass `pandas.Timestamp`) and `datetime.date`, and the code
+above resolves it by checking the `datetime.datetime` branch first, exactly
+mirroring the existing Boolean-before-Number pattern in the same function.
+`pandas.Timestamp` is not named explicitly in the `isinstance` check -- it
+does not need to be, since it subclasses `datetime.datetime` and is caught
+by that check.
+* `is_missing_carrier` gained one new explicit branch, inserted after the
+  existing `np.timedelta64` exclusion and before the generic
+  `np.generic`-bounded dispatch:
++
+[source,python]
+----
+if isinstance(value, np.datetime64):
+    return bool(np.isnat(value))
+----
++
+This closes the remaining `numpy.datetime64` half of IVM-REVIEW-F7
+(section 6, decision 2): before this change, `np.datetime64('NaT')` reached
+`"missing"` only as a side effect of the broad `np.generic`-bounded
+`pandas.isna` dispatch (the same mechanism that, pre-D-T1, made no
+distinction between "this NumPy scalar family is a supported category" and
+"this NumPy scalar family merely happens to expose NaN-like behavior").
+`numpy.isnat` was chosen over `pandas.isna` for this branch per the task's
+own preference for "a bounded temporal-specific operation supported directly
+by NumPy" -- it operates only on `datetime64`/`timedelta64` scalars, raising
+`TypeError` on anything else, so no broadening of what reaches the function
+occurs; the `isinstance(value, np.datetime64)` guard means it is only ever
+called on a value already known to be exactly that type.
+* Module docstring, `UnsupportedScalarError`'s diagnostic message, and both
+  functions' own docstrings were updated to describe the new Date/DateTime
+  categories and the explicit `datetime64`-NaT branch, replacing the
+  now-stale "date/datetime/Timestamp is rejected" language Slice 1 had left
+  in place.
+
+*Not built, per sections 9/10/23's explicit deferrals, confirmed unchanged by
+this diff:* no `"time"`/`"duration"` category; no `datetime.time`,
+`datetime.timedelta`, `pandas.Timedelta`, or `numpy.timedelta64` acceptance;
+no `normalize_scalar()`-shaped primitive of any name; no persistence/JSON/
+YAML change; no parser/renderer change; no ingress/CLI/registry wiring; no
+timezone canonicalization policy (aware values classify as DateTime, `tzinfo`
+untouched, no UTC assumption -- category membership only, per section 11).
+
+===== 26.2 Ordering and Missing/NaT correctness -- verified by direct probe
+
+Independently re-executed against the modified module before writing tests
+(scratchpad-only, not left in the repository):
+
+[source,pycon]
+----
+>>> scalar_category(datetime.date(2026, 8, 9))
+'date'
+>>> scalar_category(datetime.datetime(2026, 8, 9, 12, 0, 0))
+'datetime'
+>>> scalar_category(pd.Timestamp("2026-08-09"))
+'datetime'
+>>> scalar_category(datetime.datetime(2026, 8, 9, 0, 0, 0))   # midnight
+'datetime'                                                     # not "date"
+>>> scalar_category(pd.Timestamp("2026-08-09 00:00:00"))       # midnight
+'datetime'                                                     # not "date"
+>>> [scalar_category(np.datetime64("2026-08-09", u)) for u in ("D","m","us","ns")]
+# actual per-unit values used, not a single truncated string -- see 26.3
+['datetime', 'datetime', 'datetime', 'datetime']
+>>> is_missing_carrier(np.datetime64("NaT")), scalar_category(np.datetime64("NaT"))
+(True, 'missing')
+>>> is_missing_carrier(np.datetime64("2026-08-09"))
+False
+>>> aware_dt = datetime.datetime(2026, 8, 9, 10, 30,
+...     tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+>>> scalar_category(aware_dt), aware_dt.tzinfo, aware_dt.utcoffset()
+('datetime', datetime.timezone(datetime.timedelta(seconds=7200)), datetime.timedelta(seconds=7200))
+>>> aware_ts = pd.Timestamp("2026-08-09T10:30:00+02:00")
+>>> scalar_category(aware_ts), aware_ts.tzinfo
+('datetime', <UTC+02:00>)
+>>> scalar_category(np.timedelta64(1, "D"))
+Traceback (most recent call last):
+    ...
+UnsupportedScalarError: ...'timedelta64'...
+>>> is_missing_carrier(np.timedelta64("NaT"))
+False
+>>> scalar_category(datetime.time(12, 30))
+Traceback (most recent call last):
+    ...
+UnsupportedScalarError: ...'time'...
+----
+
+Every outcome matches section 3/8/11's accepted contract exactly: DateTime
+before Date for both the plain-`datetime.datetime` and the `pandas.Timestamp`
+(subclass) case, including the midnight edge case (no time-of-day
+heuristic); every `numpy.datetime64` unit classifies uniformly as DateTime
+(no unit-based Date inference); `numpy.datetime64('NaT')` is Missing through
+the new explicit branch, a non-NaT value is not; timezone-aware values
+classify as DateTime with `tzinfo`/offset genuinely unmodified after
+classification; `numpy.timedelta64` and `datetime.time` remain uniformly
+`UnsupportedScalarError`, unaffected.
+
+===== 26.3 Tests added
+
+[cols="2,4,1",options="header"]
+|===
+| File | What it proves | Count
+
+| `tests/unit/core/test_scalar_values.py` (modified)
+| Extends the existing Slice-1 contract suite in place, in the same
+  parametrized-test style already established. New coverage: `datetime.date`
+  classifies `"date"`; `datetime.datetime`/`pandas.Timestamp` classify
+  `"datetime"`; DateTime-before-Date ordering for both the plain-subclass
+  case and the midnight-time-of-day edge case (no heuristic reclassification
+  to Date); every non-`NaT` `numpy.datetime64` unit (`D`/`m`/`us`/`ns`)
+  classifies `"datetime"` uniformly, with an explicit pinning test that unit
+  `D` does *not* produce Date; `numpy.datetime64('NaT')` is Missing through
+  the new explicit branch (both via `is_missing_carrier` directly and via
+  `scalar_category`); timezone-aware `datetime.datetime`/`Timestamp`
+  classify `"datetime"` without normalization, with an explicit assertion
+  that `tzinfo`/`utcoffset()` survive classification unchanged;
+  `ScalarCategory`'s six-member vocabulary is pinned exactly (no `"time"`/
+  `"duration"`/`"formula"`/`"list"`); `datetime.time` remains
+  `UnsupportedScalarError` (previously untested at this level, now covered
+  explicitly); `numpy.timedelta64` (both `NaT` and non-`NaT`) and
+  `datetime.timedelta`/`pandas.Timedelta` non-regression tests were kept
+  unchanged (still pass, unaffected by this diff); the previous
+  `test_scalar_category_rejects_date_time_without_silent_coercion` and
+  `test_scalar_category_still_rejects_numpy_datetime64_non_nat_unchanged`
+  tests were removed/replaced, since their prior assertion (Date/DateTime is
+  rejected) is exactly what D-T1 changes; the deterministic/idempotence test
+  was extended to include the new Date/DateTime cases. `pytestmark` now
+  carries both `pytest.mark.ftr("FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A")` and
+  `pytest.mark.ftr("FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A")`, per this
+  repository's own established multi-FTR-per-file convention (e.g.
+  `tests/roundtrip/test_pathological_cell_contracts.py`).
+| 74 tests total (independently confirmed via `pytest --collect-only`: 67
+  before this change, 74 after -- 4 test items removed/superseded, 11 new
+  test items added across 8 new test functions, one of them a 4-case
+  `unit in {D, m, us, ns}` parametrization; the remaining 63 pre-existing
+  test items are unmodified)
+|===
+
+===== 26.4 Validation performed
+
+[source,console]
+----
+.venv/bin/pytest tests/unit/core/test_scalar_values.py -v
+.venv/bin/pytest tests/roundtrip/test_pathological_cell_contracts.py -v
+.venv/bin/pytest tests/architecture -q
+make test
+make source-style-guards
+git diff --check
+----
+
+Results:
+
+* Focused suite: 74 passed, 0 failed, 0 skipped.
+* `tests/roundtrip/test_pathological_cell_contracts.py` (the only other test
+  file importing `scalar_values`/`is_missing_carrier`-shaped behavior,
+  independently re-grepped for this evidence): 14 passed, unaffected.
+* `tests/architecture`: 74 passed (unaffected; no import-boundary or
+  layering rule touches `scalar_values.py`'s own dependency shape, which is
+  unchanged -- `numpy`/`pandas`/`datetime`, no new cross-layer import).
+* `make test` (`ACTIVE_TEST_PATHS = tests/unit tests/integration
+  tests/roundtrip tests/architecture`, `-m 'not legacy and not prehex and
+  not slow'`): *2337 passed, 1 deselected*, 0 failed. The one deselection is
+  pre-existing (a `slow`/`legacy`/`prehex`-marked test excluded by the
+  active-suite marker filter, not something this diff introduced).
+* `make source-style-guards`: exit code 0, zero `ERROR`-level findings.
+  Pre-existing `WARN`-level function-length/branch-complexity findings are
+  unrelated files this diff does not touch (`enrich_lookup`,
+  `xref_crosstable`, `odf_parser`, `openpyxl_renderer`, `layout_composer`,
+  `flow.py`, and others); neither `scalar_values.py` nor
+  `test_scalar_values.py` appears in the warning list, confirmed by direct
+  grep of the guard's own output.
+* `git diff --check`: clean, no whitespace errors, exit code 0.
+* No new warning was introduced or suppressed; no pre-existing warning was
+  touched.
+
+===== 26.5 Self-review against task step 20
+
+. *Did D-T1 only extend classification?* Yes -- `scalar_category` gained two
+  new `isinstance` branches returning category labels; `is_missing_carrier`
+  gained one new `isinstance` branch. No value is converted, narrowed, or
+  mutated by either function; a supported value is still returned to the
+  caller unexamined and unchanged, exactly as Slice 1 already established.
+. *Did any normalization primitive sneak in?* No -- no
+  `normalize_scalar()`/`normalize_value()`/`canonicalize_scalar()`/
+  `coerce_scalar()` function or equivalent exists anywhere in the diff;
+  `pandas.Timestamp -> datetime.datetime` and
+  `numpy.datetime64 -> datetime.datetime` conversions were not implemented
+  (section 9's own instruction), confirmed by grep of the diff for any `->`
+  conversion logic: none found outside test assertions.
+. *Did any backend change?* No -- `git diff --stat` shows exactly two files,
+  `scalar_values.py` and its own test file; no parser, renderer, CLI,
+  registry, or persistence-boundary file was touched.
+. *Did any ingress wiring change?* No -- `scalar_category`/
+  `is_missing_carrier`/`is_supported_scalar` are still not imported or
+  called by any adapter, CLI, or domain transformation (confirmed by the
+  same grep run at task start, re-run unchanged after implementation: only
+  `scalar_values.py` itself and its test file import these symbols).
+. *Did DateTime ordering correctly precede Date?* Yes -- verified by direct
+  probe (26.2) and by test
+  (`test_scalar_category_never_mistakes_datetime_for_date`), including the
+  midnight-time-of-day edge case.
+. *Is np.datetime64 NaT explicit rather than accidental?* Yes -- its own
+  dedicated `isinstance(value, np.datetime64)` branch using `numpy.isnat`,
+  no longer reachable only through the generic `np.generic` bucket.
+. *Is np.timedelta64 still uniformly unsupported?* Yes -- unchanged code
+  path, confirmed by the pre-existing non-regression tests (all pass
+  unmodified) and by direct probe (26.2).
+. *Are Time/Duration still rejected?* Yes -- `datetime.time`,
+  `datetime.timedelta`, `pandas.Timedelta`, and `numpy.timedelta64` all
+  still raise `UnsupportedScalarError`, confirmed by test and by probe; no
+  `"time"`/`"duration"` category was added to `ScalarCategory`.
+. *Are timezone-aware values merely classified, not normalized?* Yes --
+  `tzinfo`/`utcoffset()` are asserted unchanged after classification
+  (26.2's probe and 26.3's test); no naive-to-aware or aware-to-naive
+  conversion, no UTC assumption, anywhere in the diff.
+. *Did we accidentally touch List[Scalar] architecture?* No -- nothing in
+  the diff references frame traversal, ingress payload policy, or the
+  List[Scalar]/Trusted-Ingress extension point named in section 18/23.
+. *Is Formula unchanged?* Yes --
+  `test_scalar_category_rejects_formula_spec_intent` is unmodified and
+  passes; `FormulaSpec` is not `datetime.date`/`datetime.datetime`/
+  `np.datetime64`, so none of the new branches touch it.
+. *Does the FTR remain Open with D-T2+ residual scope?* Yes -- this section
+  is appended, not a status change; the FTR's own `*Status:*` line at the
+  top of the document is untouched by this commit, and D-T2/D-T3/D-T4 remain
+  unauthorized and unimplemented (26's own opening paragraph).
+
+===== 26.6 Release-note disposition
+
+No release note added. `docs/release_notes/release_notes.adoc`'s own
+checkpoint criteria (`docs/ai_info/git_and_workflow.adoc`, "Release-notes
+checkpoint") name public CLI/YAML/configuration surface, package/import/
+plugin surface, demo behavior, documentation entry points, migration
+semantics, or other release-relevant behavior. D-T1 extends an internal
+classifier (`core.scalar_values`) that is not re-exported from
+`core/__init__.py`'s curated `__all__` (confirmed unchanged by this diff,
+matching Slice 1's own established precedent, section 17.4 of
+`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A.adoc`) and is not wired to any real
+ingress point, CLI flag, or documented consumer surface -- nothing a
+released version's user-observable behavior depends on changed. This matches
+this FTR's own section 18/20 framing: Date/Time acceptance becomes
+release-relevant once a future slice (Phase E ingress wiring, or a D-T4
+spreadsheet-adapter change) actually exposes it to a consumer, not at this
+classification-only step.
+
+===== 26.7 Commits
+
+Two commits, path-specific staging, no `git add -A`/`git add .`, no amend:
+
+[source,text]
+----
+feat(FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A): add Date/DateTime scalar classification
+docs(FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A): record D-T1 implementation evidence
+----
+
+The first stages `src/spreadsheet_handling/core/scalar_values.py` and
+`tests/unit/core/test_scalar_values.py`. The second stages this section
+alone. Working tree is clean after both; nothing pushed (remote sync is a
+developer action per `agent_rules.adoc`).
+
+===== 26.8 Not performed by this section
+
+Per the task's own explicit instruction: Project Memory was not updated;
+D-T1 was not self-declared independently accepted; D-T2 was not started;
+this FTR was not archived or marked Done; Phase D was not declared complete.
