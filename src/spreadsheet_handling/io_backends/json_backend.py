@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+import datetime
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,92 @@ from .base import BackendBase, BackendOptions, coerce_backend_options
 Frames = Dict[str, pd.DataFrame]
 
 _JSON_FORMAT_KEYS = ("pretty", "indent", "sort_keys", "ensure_ascii")
+
+
+def _json_temporal_default(value: Any) -> Any:
+    """Persistence-local temporal encoder for `json.dump(..., default=...)`.
+
+    Ordered checks -- `pandas.NaT` before `pandas.Timestamp` before plain
+    `datetime.datetime` before `datetime.date` -- per the accepted D-T2.2
+    contract (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 27.9):
+
+    * `value is pd.NaT` (temporal Missing) -> `""`, matching every other
+      column's existing Missing convention (this module's own
+      `df.where(pd.notnull(df), "")` write-side normalization). Checked
+      first because `pandas.NaTType` subclasses both `datetime.datetime` and
+      `datetime.date` -- without this leading check `pd.NaT` would silently
+      encode as `{"$datetime": "NaT"}` instead.
+    * `isinstance(value, pd.Timestamp)` -> `{"$datetime":
+      value.as_unit("us").isoformat()}` -- truncated to microsecond
+      precision before `.isoformat()`, since `pandas.Timestamp.isoformat()`
+      emits up to nine fractional-second digits for a nanosecond-precision
+      value, unlike `datetime.datetime.isoformat()`'s maximum of six.
+    * `isinstance(value, datetime.datetime)` -> `{"$datetime":
+      value.isoformat()}` (offset suffix present iff timezone-aware, absent
+      iff naive; no truncation needed, a plain `datetime.datetime` carries no
+      sub-microsecond component).
+    * `isinstance(value, datetime.date)` -> `{"$date": value.isoformat()}`.
+    * anything else -> `raise TypeError`, reproducing exactly the `TypeError`
+      `json.dumps` already raises for an unsupported type with no `default=`
+      callback at all -- no bare fallback that could accidentally widen
+      acceptance.
+
+    Private, unexported, and scoped to exactly `JSONBackend.write_multi`'s
+    own `json.dump` calls -- not a general normalization primitive
+    (`normalize_scalar()`-shaped or otherwise) and not part of Trusted
+    Ingress.
+    """
+    if value is pd.NaT:
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return {"$datetime": value.as_unit("us").isoformat()}
+    if isinstance(value, datetime.datetime):
+        return {"$datetime": value.isoformat()}
+    if isinstance(value, datetime.date):
+        return {"$date": value.isoformat()}
+    raise TypeError(
+        f"Object of type {type(value).__name__!r} is not JSON serializable"
+    )
+
+
+def _json_temporal_object_hook(obj: dict[str, Any]) -> Any:
+    """Persistence-local temporal decoder for `json.loads(..., object_hook=...)`.
+
+    Symmetric counterpart to `_json_temporal_default` (D-T2.3, accepted
+    contract section 27.12's "Decode rules"). Recognizes only exact
+    reserved single-key envelopes:
+
+    * `{"$date": "<str>"}` -> `datetime.date.fromisoformat(<str>)`.
+    * `{"$datetime": "<str>"}` -> `datetime.datetime.fromisoformat(<str>)`.
+
+    A matched envelope whose value is not a string, or is a string that
+    fails the corresponding `fromisoformat` parse, raises `ValueError` --
+    it must not silently pass through as an ordinary dict once the reserved
+    key shape has matched. Any dict that does not match either reserved key
+    set exactly (extra keys, wrong key name) passes through unchanged, so an
+    ordinary nested (e.g. MultiIndex-payload) object is never misclassified.
+
+    Private, unexported, tested directly as a standalone codec -- this is a
+    persistence codec component, not wired into `JSONBackend.read_multi`/
+    `read_json_dir` (Option B, accepted contract section 27.11).
+    """
+    if set(obj.keys()) == {"$date"}:
+        raw = obj["$date"]
+        if not isinstance(raw, str):
+            raise ValueError(
+                "malformed $date envelope: expected a string value, got "
+                f"{type(raw).__name__!r}"
+            )
+        return datetime.date.fromisoformat(raw)
+    if set(obj.keys()) == {"$datetime"}:
+        raw = obj["$datetime"]
+        if not isinstance(raw, str):
+            raise ValueError(
+                "malformed $datetime envelope: expected a string value, got "
+                f"{type(raw).__name__!r}"
+            )
+        return datetime.datetime.fromisoformat(raw)
+    return obj
 
 
 def _is_empty_header_segment(x: Any) -> bool:
@@ -77,6 +164,32 @@ def _json_format_overrides(options: BackendOptions | Mapping[str, Any] | None) -
 class JSONBackend(BackendBase):
     """
     Backend for a directory of JSON files, one file per sheet (e.g. products.json).
+
+    Temporal wire format (D-T2.2, accepted contract
+    `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 27.5): `$date` and
+    `$datetime` are *reserved* single-key object envelopes on write --
+    `{"$date": "<datetime.date.isoformat() string>"}` for a Date value,
+    `{"$datetime": "<datetime.datetime.isoformat() string>"}` (offset suffix
+    present iff timezone-aware, absent iff naive) for a DateTime value, at
+    most microsecond precision. A missing temporal cell (`pandas.NaT`)
+    writes as `""`, matching every other column's existing Missing
+    convention -- never `{"$datetime": "NaT"}`. Named/IANA timezone identity
+    is not preserved by this wire format (only the numeric UTC offset is);
+    carrier identity (`pandas.Timestamp` vs plain `datetime.datetime`) is
+    not preserved either. A legitimate data column whose only field is
+    literally named `$date` or `$datetime` would collide with this envelope
+    shape; no repository evidence shows a column named this today.
+
+    `write_multi` (via `write_json_dir`) emits this format for
+    `datetime.date`/`datetime.datetime`/`pandas.Timestamp` cell values.
+    `read_multi` (via `read_json_dir`) is deliberately, and for this slice
+    permanently, *not* wired to decode it (Option B, accepted contract
+    section 27.11) -- reading a file containing a `$date`/`$datetime`
+    envelope back through this backend's own `dtype=str` read contract
+    produces a stringified, unparseable Python-repr value, not a native
+    `datetime.date`/`datetime.datetime`. A private, symmetric decoder
+    (`_json_temporal_object_hook`) exists and is exercised directly as a
+    standalone codec by the test suite; it is not called from `read_multi`.
     """
 
     def read_multi(self, path: str, header_levels: int, options: BackendOptions | None = None) -> Frames:
@@ -139,12 +252,14 @@ class JSONBackend(BackendBase):
                 if fmt["pretty"]:
                     json.dump(records, fh, ensure_ascii=fmt["ensure_ascii"],
                               indent=fmt["indent"],
-                              sort_keys=fmt["sort_keys"])
+                              sort_keys=fmt["sort_keys"],
+                              default=_json_temporal_default)
                     fh.write("\n")  # keep Git diffs tidy
                 else:
                     json.dump(records, fh, ensure_ascii=fmt["ensure_ascii"],
                               separators=(",", ":"),  # compact
-                              sort_keys=fmt["sort_keys"])
+                              sort_keys=fmt["sort_keys"],
+                              default=_json_temporal_default)
                     fh.write("\n")
 
         # --- write optional _meta sidecar -----------------------------------

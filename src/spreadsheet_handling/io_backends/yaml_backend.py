@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 import yaml
@@ -9,6 +9,40 @@ import yaml
 from .base import BackendOptions
 
 Frames = Dict[str, pd.DataFrame]
+
+
+def _yaml_safe_temporal(value: Any) -> Any:
+    """Persistence-local temporal carrier conversion for `save_yaml_dir`.
+
+    Ordered checks -- `pandas.NaT` before `pandas.Timestamp` before
+    everything else -- per the accepted D-T2.1 contract
+    (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 27.6):
+
+    * `value is pd.NaT` (temporal Missing) -> `None`, matching a
+      `datetime.date` column's own already-working `None` -> YAML `null`
+      Missing representation.
+    * `isinstance(value, pd.Timestamp)` -> `value.as_unit("us").to_pydatetime()`,
+      so PyYAML's native timestamp scalar receives a plain
+      `datetime.datetime` at microsecond precision, with no `UserWarning`
+      side effect (unlike bare `.to_pydatetime()` on a nanosecond-precision
+      `Timestamp`).
+    * everything else (`datetime.date`, plain `datetime.datetime`, `str`,
+      `int`, `float`, `bool`, `None`) is returned unchanged -- YAML's native
+      `date`/`timestamp` tags already round-trip those correctly.
+
+    Private, unexported, and scoped to exactly `save_yaml_dir`'s own record
+    mapping -- not a general normalization primitive
+    (`normalize_scalar()`-shaped or otherwise), not part of Trusted Ingress,
+    and not imported by `json_backend.py`, any Domain module, or
+    `core/scalar_values.py`. No global `yaml.SafeDumper` representer is
+    registered; this is a value-level conversion applied before
+    `yaml.safe_dump` sees the record, not a representer.
+    """
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.as_unit("us").to_pydatetime()
+    return value
 
 
 def _glob_yaml_files(root: Path) -> Iterable[Path]:
@@ -83,6 +117,10 @@ def save_yaml_dir(
         records: List[dict] = (
             df.to_dict(orient="records") if not df.empty else []
         )
+        records = [
+            {key: _yaml_safe_temporal(value) for key, value in record.items()}
+            for record in records
+        ]
         with file.open("w", encoding="utf-8") as f:
             yaml.safe_dump(
                 records,
