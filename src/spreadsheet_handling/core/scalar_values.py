@@ -1,6 +1,8 @@
 """Minimal internal scalar-value contract (Phase D, domain hardening roadmap).
 
-This module is the runtime slice of `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`. It
+This module is the runtime slice of `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`
+(String/Boolean/Number/Missing, Slice 1) and, since D-T1, also of
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` (Date/DateTime classification). It
 answers one narrow *value-model* question -- "is this payload representable
 in the framework's normal internal scalar space?" -- and does not answer any
 *ingress-policy* question ("what happens when it is not?") or *sink-capability*
@@ -33,19 +35,40 @@ instead of drifting this docstring out of sync with it):
   distinguishable spreadsheet error carrier, so there is no reachable input
   to classify; `scalar_category` correctly rejects an error-*looking* string
   as an ordinary String, and there is nothing else to reject it as.
+* *Date* -- native `datetime.date`. Added by D-T1
+  (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A`). Checked *after* DateTime, since
+  `datetime.datetime` (and `pandas.Timestamp`) subclass `datetime.date` --
+  the same subclass-ordering hazard Boolean-before-Number already solves for
+  `bool`/`int`, applied to a second pair.
+* *DateTime* -- native `datetime.datetime` (and `pandas.Timestamp`,
+  `numpy.datetime64`, which do not subclass `datetime.datetime`/`date` but
+  classify into it without being narrowed to it -- the same "classify
+  without normalizing" contract Number/Boolean already use for their own
+  NumPy variants). Every non-`NaT` `numpy.datetime64` value classifies as
+  DateTime uniformly, regardless of unit/precision -- day-precision storage
+  is bit-identically ambiguous between "authored as a date" and "a datetime
+  truncated to day granularity", so no unit-based Date-vs-DateTime heuristic
+  is used. Timezone-aware `datetime.datetime`/`Timestamp` classifies as
+  DateTime, the same as naive -- `tzinfo` is never stripped, an aware value
+  is never silently converted to naive, and a naive value is never assumed
+  to be UTC; this settles category membership only, not a timezone
+  canonicalization policy (deferred to a future boundary/consumer).
 
 Explicitly out of this vocabulary, on purpose, not by omission:
 
-* `date` / `datetime` / `pandas.Timestamp` -- a real date/time scalar is
-  rejected (`UnsupportedScalarError`), never silently coerced to String or
-  Number. Date/Time is the expected next Phase-D slice, not this one.
+* `datetime.time` -- deferred (`UnsupportedScalarError`). No maintained
+  producer or consumer of a bare `time` value exists, and neither
+  `yaml.safe_dump` nor `json.dumps` can even serialize one -- strictly more
+  expensive to support than Date/DateTime, not merely equally deferred.
 * `datetime.timedelta` / `pandas.Timedelta` / `numpy.timedelta64` (Duration)
   -- rejected (`UnsupportedScalarError`), uniformly, `NaT`-valued or not.
   `numpy.timedelta64` requires an explicit exclusion (both here and in
   `is_missing_carrier`) because it subclasses `numpy.integer`, which would
   otherwise silently accept it as Number
-  (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`); Duration is not a
-  category candidate this module supports, deferred or otherwise.
+  (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`); Duration is
+  conceptually distinct from Date/Time even though NumPy implements both
+  under one shared `np.generic` ancestor, and is not a category candidate
+  this module supports, deferred or otherwise.
 * `core.formulas.FormulaSpec` (`ListLiteralFormulaSpec`, `LookupFormulaSpec`)
   -- authored backend-neutral output Intent, not a payload scalar. Formula
   is not a category candidate at all, deferred or otherwise; see
@@ -71,47 +94,62 @@ an unwanted `io_backends` -> `domain` dependency.
 """
 from __future__ import annotations
 
+import datetime
 from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import pandas as pd
 
-ScalarValue: TypeAlias = str | bool | int | float | None
+ScalarValue: TypeAlias = (
+    str | bool | int | float | datetime.date | datetime.datetime | None
+)
 """Candidate native-Python value shape for the MVP scalar vocabulary -- not
 the complete accepted carrier domain, and not a canonical normalized
 representation. Do not read this alias as "what `scalar_category` narrows an
 accepted value down to."
 
-`ScalarCategory` (below) is the actual Slice-1 semantic vocabulary --
-String/Boolean/Number/Missing. `scalar_category` *classifies* a value into
-one of those categories; its accepted carrier domain is broader than this
-alias states on its own, because it also accepts the NumPy scalar variants
+`ScalarCategory` (below) is the actual semantic vocabulary --
+String/Boolean/Number/Missing/Date/DateTime. `scalar_category` *classifies* a
+value into one of those categories; its accepted carrier domain is broader
+than this alias states on its own, because it also accepts carrier variants
 named in the module docstring above (`numpy.integer`, `numpy.floating`,
-`numpy.bool_`, `numpy.str_`) without narrowing them to a `ScalarValue`
-member -- a `numpy.int64` classifies as `"number"` while remaining a
-`numpy.int64`, not becoming a Python `int`.
+`numpy.bool_`, `numpy.str_`, `pandas.Timestamp`, `numpy.datetime64`) without
+narrowing them to a `ScalarValue` member -- a `numpy.int64` classifies as
+`"number"` while remaining a `numpy.int64`, not becoming a Python `int`; a
+`pandas.Timestamp` classifies as `"datetime"` while remaining a
+`pandas.Timestamp`, not becoming a `datetime.datetime`. `datetime.date`/
+`datetime.datetime` are included here, consistent with `int`/`float`, because
+they are Date/DateTime's own conceptual canonical carriers (D-T1,
+`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 12) -- the same role `int`/
+`float` already play for Number; their carrier *variants*
+(`pandas.Timestamp`, `numpy.datetime64`) are deliberately not added here, for
+the same reason `numpy.int64`/`numpy.float64` are not.
 
 Slice 1 (`FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`) does *not* establish a
-canonical normalized scalar representation. `scalar_category` is pure
-classification, not conversion (see its own docstring): it never narrows an
-accepted value down to this alias's literal members. No
-`normalize_scalar()`-shaped primitive exists anywhere in this module.
-Producing an actual normalized value from an accepted carrier (NumPy scalar
-variants included) remains Phase E's "value normalization and type
-resolution" boundary-shape stage (`roadmap_domain_hardening_sequence.adoc`
-Phase E) -- a follow-on this slice deliberately does not provide, per
-Independent Review 001, finding IVM-REVIEW-F2.
+canonical normalized scalar representation, and D-T1 does not change that
+posture. `scalar_category` is pure classification, not conversion (see its
+own docstring): it never narrows an accepted value down to this alias's
+literal members. No `normalize_scalar()`-shaped primitive exists anywhere in
+this module. Producing an actual normalized value from an accepted carrier
+(NumPy scalar variants, `pandas.Timestamp`, `numpy.datetime64` included)
+remains Phase E's "value normalization and type resolution" boundary-shape
+stage (`roadmap_domain_hardening_sequence.adoc` Phase E) -- a follow-on this
+slice deliberately does not provide, per Independent Review 001, finding
+IVM-REVIEW-F2, and per `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 12/
+DTVM-REVIEW-F2.
 
 `None` is the most common Missing carrier, but it is not the only one
-`is_missing_carrier` recognizes (`""` and the NaN/`pandas.NA`/`NaT` family
-are also accepted carriers) -- Missing is a recognition predicate over
-carriers already accepted by `scalar_category`, not a distinct member of
-this union. See `is_missing_carrier`.
+`is_missing_carrier` recognizes (`""` and the NaN/`pandas.NA`/`NaT`/
+`numpy.datetime64('NaT')` family are also accepted carriers) -- Missing is a
+recognition predicate over carriers already accepted by `scalar_category`,
+not a distinct member of this union. See `is_missing_carrier`.
 """
 
-ScalarCategory: TypeAlias = Literal["string", "boolean", "number", "missing"]
-"""The MVP's closed scalar-category vocabulary. Error, Integer-vs-Float, and
-Date/Time are deliberately not members -- see the module docstring."""
+ScalarCategory: TypeAlias = Literal[
+    "string", "boolean", "number", "missing", "date", "datetime"
+]
+"""The closed scalar-category vocabulary. Error, Integer-vs-Float, Time, and
+Duration are deliberately not members -- see the module docstring."""
 
 
 class UnsupportedScalarError(TypeError):
@@ -127,8 +165,8 @@ class UnsupportedScalarError(TypeError):
         self.value_type_name = type(value).__name__
         super().__init__(
             "unsupported internal scalar value of type "
-            f"{self.value_type_name!r}; expected str, bool, int, float, or a "
-            "recognized missing carrier"
+            f"{self.value_type_name!r}; expected str, bool, int, float, "
+            "date, datetime, or a recognized missing carrier"
         )
 
 
@@ -178,6 +216,19 @@ def is_missing_carrier(value: Any) -> bool:
     Duration is not a supported category (see `scalar_category`), so no
     `numpy.timedelta64` value -- `NaT` or not -- is Missing; it is uniformly
     unsupported (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`).
+
+    `numpy.datetime64` is given its own explicit branch, ahead of the
+    `np.generic` bounded dispatch, using `numpy.isnat` -- a bounded,
+    temporal-specific NumPy operation, not the broad `pandas.isna` dispatch
+    the other `np.generic` scalars share. Before D-T1
+    (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 6, closing the
+    remaining half of Independent Review 001's finding IVM-REVIEW-F7), a
+    `numpy.datetime64('NaT')` value reached "missing" only as an accidental
+    side effect of the generic `np.generic` bucket below, before Date/Time
+    was a supported category at all. Now that DateTime is a supported
+    category (see `scalar_category`), this is its own owned, explicit rule:
+    `numpy.datetime64('NaT')` is Missing; every other `numpy.datetime64`
+    value is not.
     """
     if value is None:
         return True
@@ -187,6 +238,8 @@ def is_missing_carrier(value: Any) -> bool:
         return True
     if isinstance(value, np.timedelta64):
         return False
+    if isinstance(value, np.datetime64):
+        return bool(np.isnat(value))
     if isinstance(value, (int, float, np.generic)):
         try:
             return bool(pd.isna(value))
@@ -203,16 +256,18 @@ def scalar_category(value: Any) -> ScalarCategory:
     function (it only inspects `type`); nothing here parses string content,
     coerces a numeric-looking string, or unifies missing-carrier
     representation. Raises `UnsupportedScalarError` for anything outside the
-    vocabulary -- including dates/datetimes/Timestamps, `FormulaSpec`
-    instances, and arbitrary Python objects -- rather than silently widening
-    a category to fit them.
+    vocabulary -- including `datetime.time`, `datetime.timedelta`/
+    `pandas.Timedelta`/`numpy.timedelta64`, `FormulaSpec` instances, and
+    arbitrary Python objects -- rather than silently widening a category to
+    fit them.
 
     Classification order matters and is deliberate:
 
     1. `is_missing_carrier` first, so every accepted missing carrier
-       (`None`, `""`, NaN/`pandas.NA`/`NaT`, including a NaN-valued `float`
-       or `numpy.floating`) classifies as `"missing"` before any type check
-       below could otherwise misclassify it as `"number"`.
+       (`None`, `""`, NaN/`pandas.NA`/`NaT`/`numpy.datetime64('NaT')`,
+       including a NaN-valued `float` or `numpy.floating`) classifies as
+       `"missing"` before any type check below could otherwise misclassify
+       it as `"number"` or `"datetime"`.
     2. Boolean before Number, because Python's `bool` is a subclass of
        `int` (and because `numpy.bool_` is checked explicitly, as it does
        not subclass `bool`).
@@ -223,6 +278,15 @@ def scalar_category(value: Any) -> ScalarCategory:
        rejected explicitly rather than silently accepted as an ordinary
        Number stripped of its unit
        (`BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A`).
+    4. DateTime before Date, because `datetime.datetime` subclasses
+       `datetime.date`, and `pandas.Timestamp` subclasses `datetime.datetime`
+       -- the identical subclass-ordering hazard Boolean-before-Number
+       already solves, applied to a second pair
+       (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 8, D-T1).
+       `numpy.datetime64` is checked alongside DateTime; it is unrelated to
+       `datetime.date`/`datetime.datetime` by inheritance, so its own
+       ordering relative to them does not matter, only that its `NaT` form
+       was already routed to `"missing"` by step 1 above.
     """
     if is_missing_carrier(value):
         return "missing"
@@ -234,6 +298,10 @@ def scalar_category(value: Any) -> ScalarCategory:
         raise UnsupportedScalarError(value)
     if isinstance(value, (int, float, np.integer, np.floating)):
         return "number"
+    if isinstance(value, (np.datetime64, datetime.datetime)):
+        return "datetime"
+    if isinstance(value, datetime.date):
+        return "date"
     raise UnsupportedScalarError(value)
 
 

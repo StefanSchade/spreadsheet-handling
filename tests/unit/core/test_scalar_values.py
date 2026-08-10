@@ -4,9 +4,17 @@ Proves the invariants `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A` requires of its
 runtime slice: `is_missing_carrier` recognizes exactly the accepted Missing
 carriers (and nothing else); `scalar_category`/`is_supported_scalar` classify
 the MVP vocabulary (String/Boolean/Number/Missing) without heuristic string
-coercion, with Boolean taking precedence over Number, and reject dates,
-`FormulaSpec` Intent, and arbitrary Python objects rather than silently
+coercion, with Boolean taking precedence over Number, and reject
+`FormulaSpec` Intent and arbitrary Python objects rather than silently
 widening a category to fit them.
+
+Also proves `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` D-T1's own extension:
+`datetime.date` classifies as Date; `datetime.datetime`/`pandas.Timestamp`/
+non-`NaT` `numpy.datetime64` (any unit, naive or timezone-aware) classify as
+DateTime, with DateTime checked before Date (subclass-ordering hazard);
+`numpy.datetime64('NaT')` classifies as Missing through its own explicit
+branch; `numpy.timedelta64`, `datetime.time`, `datetime.timedelta`, and
+`pandas.Timedelta` remain uniformly unsupported, as non-regressions.
 """
 from __future__ import annotations
 
@@ -19,13 +27,17 @@ import pytest
 
 from spreadsheet_handling.core.formulas import list_literal_formula
 from spreadsheet_handling.core.scalar_values import (
+    ScalarCategory,
     UnsupportedScalarError,
     is_missing_carrier,
     is_supported_scalar,
     scalar_category,
 )
 
-pytestmark = pytest.mark.ftr("FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A")
+pytestmark = [
+    pytest.mark.ftr("FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A"),
+    pytest.mark.ftr("FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A"),
+]
 
 
 class _Opaque:
@@ -208,21 +220,13 @@ def test_scalar_category_is_pure_classification_not_coercion() -> None:
     assert original == "007"  # unchanged; never promoted to a number
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        datetime.date(2026, 8, 9),
-        datetime.datetime(2026, 8, 9, 12, 0, 0),
-        pd.Timestamp("2026-08-09"),
-    ],
-    ids=["date", "datetime", "pandas-timestamp"],
-)
-def test_scalar_category_rejects_date_time_without_silent_coercion(value: Any) -> None:
-    # Date/Time is an explicit MVP deferral: it must never be silently
-    # promoted to String or Number to fit this slice's category set.
-    with pytest.raises(UnsupportedScalarError):
-        scalar_category(value)
-    assert is_supported_scalar(value) is False
+def test_scalar_category_vocabulary_is_exactly_six_categories() -> None:
+    # FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A D-T1 section 15: the closed
+    # vocabulary is exactly string/boolean/number/missing/date/datetime --
+    # no time, duration, formula, or list member.
+    assert set(ScalarCategory.__args__) == {
+        "string", "boolean", "number", "missing", "date", "datetime",
+    }
 
 
 @pytest.mark.parametrize(
@@ -256,23 +260,15 @@ def test_scalar_category_rejects_numpy_timedelta64_without_number_misclassificat
 
 
 def test_scalar_category_still_accepts_numpy_datetime64_nat_as_missing() -> None:
-    # Non-regression: numpy.datetime64('NaT')'s own Missing classification
-    # is unaffected by this fix -- its eventual correction is owned by
-    # FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A's own D-T1 slice, not this BUG,
-    # since it is entangled with whether/when Date/DateTime itself becomes a
-    # supported category. Only the numpy.timedelta64 family is uniformly
-    # unsupported by this fix.
+    # Non-regression from BUG-NUMPY-TIMEDELTA64-NUMBER-MISCLASSIFICATION-P4A:
+    # numpy.datetime64('NaT') classifies as Missing. As of D-T1
+    # (FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A), this is no longer an
+    # accidental side effect of the generic np.generic dispatch -- it goes
+    # through is_missing_carrier's own explicit numpy.datetime64 branch (see
+    # test_is_missing_carrier_numpy_datetime64_explicit_branch below), which
+    # this test pins at the scalar_category level too.
     assert is_missing_carrier(np.datetime64("NaT")) is True
     assert scalar_category(np.datetime64("NaT")) == "missing"
-
-
-def test_scalar_category_still_rejects_numpy_datetime64_non_nat_unchanged() -> None:
-    # Non-regression: numpy.datetime64 (non-NaT) already correctly raised
-    # UnsupportedScalarError before this fix (it does not subclass
-    # np.integer/np.floating); confirm it still does.
-    with pytest.raises(UnsupportedScalarError) as excinfo:
-        scalar_category(np.datetime64("2026-08-09"))
-    assert excinfo.value.value_type_name == "datetime64"
 
 
 def test_scalar_category_still_rejects_datetime_timedelta_and_pandas_timedelta() -> None:
@@ -283,6 +279,96 @@ def test_scalar_category_still_rejects_datetime_timedelta_and_pandas_timedelta()
         with pytest.raises(UnsupportedScalarError):
             scalar_category(value)
         assert is_supported_scalar(value) is False
+
+
+def test_scalar_category_still_rejects_datetime_time() -> None:
+    # Non-regression / explicit deferral: Time is not added to the
+    # vocabulary by D-T1 (FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A section 9).
+    value = datetime.time(12, 30)
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+    assert excinfo.value.value_type_name == "time"
+    assert is_supported_scalar(value) is False
+
+
+# ---------------------------------------------------------------------------
+# scalar_category -- Date/DateTime (FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A, D-T1)
+# ---------------------------------------------------------------------------
+
+
+def test_scalar_category_classifies_date_and_datetime() -> None:
+    assert scalar_category(datetime.date(2026, 8, 9)) == "date"
+    assert is_supported_scalar(datetime.date(2026, 8, 9)) is True
+
+    assert scalar_category(datetime.datetime(2026, 8, 9, 12, 0, 0)) == "datetime"
+    assert is_supported_scalar(datetime.datetime(2026, 8, 9, 12, 0, 0)) is True
+
+    assert scalar_category(pd.Timestamp("2026-08-09")) == "datetime"
+    assert is_supported_scalar(pd.Timestamp("2026-08-09")) is True
+
+
+def test_scalar_category_never_mistakes_datetime_for_date() -> None:
+    # datetime.datetime subclasses datetime.date, and pandas.Timestamp
+    # subclasses datetime.datetime -- DateTime must win the ordering check
+    # for both, mirroring Boolean-before-Number.
+    assert scalar_category(datetime.datetime(2026, 8, 9)) == "datetime"
+    assert scalar_category(pd.Timestamp("2026-08-09")) == "datetime"
+    # A genuine midnight DateTime is not reclassified as Date merely because
+    # its time-of-day happens to be midnight -- no time-of-day heuristic.
+    assert scalar_category(datetime.datetime(2026, 8, 9, 0, 0, 0)) == "datetime"
+    assert scalar_category(pd.Timestamp("2026-08-09 00:00:00")) == "datetime"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.datetime64("2026-08-09", "D"),
+        np.datetime64("2026-08-09T12:34", "m"),
+        np.datetime64("2026-08-09T12:34:56.123456", "us"),
+        np.datetime64("2026-08-09T12:34:56.123456789", "ns"),
+    ],
+    ids=["unit-D", "unit-m", "unit-us", "unit-ns"],
+)
+def test_scalar_category_classifies_numpy_datetime64_as_datetime_for_every_unit(
+    value: Any,
+) -> None:
+    assert scalar_category(value) == "datetime"
+    assert is_supported_scalar(value) is True
+
+
+def test_scalar_category_does_not_infer_date_from_numpy_datetime64_day_unit() -> None:
+    # Pin explicitly: unit "D" does NOT produce Date. Day-precision storage
+    # is genuinely ambiguous between "authored as a date" and "datetime
+    # truncated to day granularity" (section 8's [DECIDED] rule) -- no
+    # carrier-internal heuristic distinguishes them.
+    assert scalar_category(np.datetime64("2026-08-09", "D")) == "datetime"
+
+
+def test_is_missing_carrier_numpy_datetime64_explicit_branch() -> None:
+    # Closes the remaining numpy.datetime64 half of IVM-REVIEW-F7: NaT is
+    # Missing through its own explicit branch; a non-NaT value is not.
+    assert is_missing_carrier(np.datetime64("NaT")) is True
+    assert is_missing_carrier(np.datetime64("2026-08-09")) is False
+    assert is_missing_carrier(np.datetime64("2026-08-09T12:34", "m")) is False
+
+
+def test_scalar_category_classifies_timezone_aware_datetime_and_timestamp_as_datetime() -> None:
+    offset = datetime.timezone(datetime.timedelta(hours=2))
+    aware_dt = datetime.datetime(2026, 8, 9, 10, 30, tzinfo=offset)
+    aware_ts = pd.Timestamp("2026-08-09T10:30:00+02:00")
+
+    assert scalar_category(aware_dt) == "datetime"
+    assert scalar_category(aware_ts) == "datetime"
+    assert is_supported_scalar(aware_dt) is True
+    assert is_supported_scalar(aware_ts) is True
+
+    # Classification must not mutate/normalize the carrier -- tzinfo/offset
+    # remains present after classification (no stripping, no naive
+    # conversion, no UTC assumption).
+    assert aware_dt.tzinfo is not None
+    assert aware_dt.utcoffset() == datetime.timedelta(hours=2)
+    assert aware_ts.tzinfo is not None
+    assert aware_ts.utcoffset() == datetime.timedelta(hours=2)
 
 
 def test_scalar_category_rejects_formula_spec_intent() -> None:
@@ -337,5 +423,10 @@ def test_unsupported_scalar_error_diagnostic_never_calls_value_repr() -> None:
 
 
 def test_scalar_category_deterministic_and_idempotent_for_every_supported_case() -> None:
-    for value in ("hello", True, 1, 1.5, None, "", np.int64(2), np.bool_(True)):
+    values = (
+        "hello", True, 1, 1.5, None, "", np.int64(2), np.bool_(True),
+        datetime.date(2026, 8, 9), datetime.datetime(2026, 8, 9, 12, 0, 0),
+        pd.Timestamp("2026-08-09"), np.datetime64("2026-08-09"),
+    )
+    for value in values:
         assert scalar_category(value) == scalar_category(value)
