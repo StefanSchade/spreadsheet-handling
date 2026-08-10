@@ -1,0 +1,260 @@
+== Internal Scalar Value Model
+
+=== Status and authority
+
+This is normative documentation of *current, implemented* architecture, not a
+design proposal. It documents:
+
+* the accepted, independently-reviewed scalar category vocabulary from
+  `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A` (Slice 1: String / Boolean / Number /
+  Missing) and `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` (D-T1: Date /
+  DateTime), both independently reviewed and accepted;
+* the runtime module that implements it,
+  `src/spreadsheet_handling/core/scalar_values.py` (`ScalarValue`,
+  `ScalarCategory`, `is_missing_carrier`, `scalar_category`,
+  `is_supported_scalar`, `UnsupportedScalarError`).
+
+This document does not decide anything on its own; it promotes durable
+description of an already-accepted contract into the Technical Model, per the
+Domain Architecture Consolidation Inventory
+(`docs/warm_storage/architecture/domain_architecture_consolidation_inventory.adoc`,
+independently reviewed and corrected) and
+`roadmap_domain_hardening_sequence.adoc` Phase D.
+
+*What this document is not*: it is not the Trusted Ingress boundary. Nothing
+here is wired to any real ingress point -- `scalar_category` classifies a
+value already in memory; it does not decide what happens to a value outside
+its vocabulary at a parser, CLI, or pipeline boundary. That boundary is
+`roadmap_domain_hardening_sequence.adoc` Phase E ("mandatory trusted
+ingress"), not started. See
+link:../ch04_concepts/trusted_ingress_and_runtime_security.adoc[Trusted
+Ingress, Internal Value Model, and Runtime Security Profiles] for the
+provisional Phase-E mechanism sketch, and
+<<internal-value-model-trust-authority-pointer,below>> for what is already
+normative about trust/authority independent of that mechanism.
+
+=== Semantic categories versus carrier variants
+
+The Domain's accepted scalar *semantic category* vocabulary is:
+
+[cols="1,3,3",options="header"]
+|===
+| Category | Native conceptual carrier | Accepted carrier variants (classify without narrowing)
+
+| String
+| `str`
+| `numpy.str_` (already a `str` subclass)
+
+| Boolean
+| `bool`
+| `numpy.bool_` (does not subclass `bool`; checked explicitly)
+
+| Number
+| `int` / `float` -- one category; Integer-vs-Float is a bounded MVP
+  deferral, not a decision made here
+| `numpy.integer`, `numpy.floating` (`numpy.float64` already subclasses
+  `float`)
+
+| Missing
+| not a value or a type -- a *recognition* over carriers (see below)
+| `None`, `""`, `float("nan")`, `pandas.NA`, `pandas.NaT`,
+  `numpy.datetime64('NaT')`, and the bounded `numpy.generic` NaN family
+
+| Date
+| `datetime.date`
+| none named yet (checked *after* DateTime, since `datetime.datetime`
+  subclasses `datetime.date`)
+
+| DateTime
+| `datetime.datetime`
+| `pandas.Timestamp`, every non-`NaT` `numpy.datetime64` (uniformly,
+  regardless of unit/precision -- no unit-based Date-vs-DateTime inference:
+  day-precision storage is bit-identically ambiguous between "authored as a
+  date" and "a datetime truncated to day granularity"). Timezone-aware
+  values classify as DateTime the same as naive ones -- `tzinfo` is never
+  stripped, never silently converted, never assumed UTC. This settles
+  category membership only, not a timezone canonicalization *policy*.
+|===
+
+*Carrier variants are not automatically separate semantic types.* This is
+the single most repeatedly reaffirmed design decision in the accepted
+Phase-D evidence: a `numpy.int64` classifies as `"number"` while *remaining*
+a `numpy.int64`, not becoming a Python `int`; a `pandas.Timestamp` classifies
+as `"datetime"` while remaining a `pandas.Timestamp`. Classification never
+narrows, converts, or rewraps an accepted value -- it only labels it.
+
+Do not read the category table above as a canonical *normalized carrier
+set*. `ScalarValue` (the native-Python type alias in `core/scalar_values.py`)
+is explicitly documented, in its own docstring, as neither the complete
+accepted carrier domain nor a target normalized shape -- it names the
+categories' own conceptual canonical carriers (`str`, `bool`, `int`/`float`,
+`datetime.date`/`datetime.datetime`), not every carrier variant that
+classifies into them.
+
+Deliberately *not* members of this vocabulary, on purpose:
+
+* *Error* -- deferred, not rejected in principle. No current maintained
+  parser can produce a distinguishable spreadsheet error carrier, so there
+  is no reachable input to classify.
+* *Time* (`datetime.time`) and *Duration* (`datetime.timedelta` /
+  `pandas.Timedelta` / `numpy.timedelta64`) -- deferred/rejected,
+  respectively; conceptually distinct from Date/DateTime even though NumPy
+  implements both under one shared `np.generic` ancestor.
+* *Formula* (`core.formulas.FormulaSpec` and its concrete subclasses) --
+  not a category candidate at all, deferred or otherwise. It is authored
+  backend-neutral output *Intent* the framework itself constructs, not a
+  payload scalar. Tracked separately and durably by
+  `FTR-FORMULA-INGRESS-ROUNDTRIP-WHITELIST-P5`.
+* Structural/trusted carriers (`core.exact_table.ExactTable`,
+  `domain.transformations.grouped_xref.matrix.GroupedMatrix`) -- carriers,
+  not scalar payload.
+* Any collection, callable, module, generator, file handle, or other opaque
+  object.
+
+None of these deferrals is a permanent architectural prohibition; each is a
+current-phase scope boundary. In particular, a future explicitly-declared
+bounded `List[Scalar]` composite payload capability remains an open,
+undecided extension candidate, distinct from an arbitrary/unbounded Python
+container and distinct from `List[Object]`/nested structured records (which
+remain `FTR-NESTED-LISTS`'s structural, child-frame territory).
+
+=== Classification versus normalization
+
+*Classification exists today; general normalization does not, and is not
+this document's subject.*
+
+`scalar_category(value) -> ScalarCategory` is *classification*, not
+*conversion*: for a supported value it returns a category label without
+inspecting string content, without unifying missing-carrier representation,
+and without mutating or rewrapping the value. It answers "what category does
+this already-in-memory value belong to," never "what should this value be
+converted to."
+
+No `normalize_scalar()`-shaped primitive exists anywhere in the repository.
+This split was reasserted twice under independent review pressure during
+Phase D (`IVM-REVIEW-F2` removed a normalization step that had crept into
+Slice 1's design; `DTVM-REVIEW-F2` removed a general `normalize_scalar()`
+that had crept into D-T2's original proposal) -- both times, the correction
+was the same: classification is Phase D's job; general scalar normalization
+and type resolution remain Phase E's ownership
+(`roadmap_domain_hardening_sequence.adoc`, "Phase E: establish mandatory
+trusted ingress"), not decided here.
+
+The two narrow, private, persistence-local temporal conversions added by
+D-T2 (`_yaml_safe_temporal` in the YAML backend; `_json_temporal_default` /
+`_json_temporal_object_hook` in the JSON backend) are explicitly *not*
+general normalization: each is unexported, single-direction, local to its
+own backend file, never imported cross-module, never named or shaped as a
+general Domain-wide primitive, and does not participate in Trusted Ingress
+in any way. Do not read their existence as a precedent for a general
+`normalize_scalar()` API, and do not extend either of them into one without
+fresh Phase-E-scoped evidence and review.
+
+=== Missing is recognition, not representation
+
+`is_missing_carrier(value)` answers "is this cell's *current carrier* a
+missing one" -- it never produces or mutates a value, and it is not a
+distinct `Missing` type or sentinel. No new `Missing` class, wrapper, or
+in-band sentinel value exists or is planned for this MVP; the evidence
+(`BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A`'s accepted contract) showed
+that a distinct sentinel would relocate ambiguity rather than remove it.
+
+On the spreadsheet-visible side, the canonical missing representation stays
+the ordinary string `""`, exactly as
+link:../ch03_architecture_decisions/ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE.adoc[ADR-VISIBLE-CELL-TYPING-STRING-SUBSTRATE]
+already implies -- this document does not propose a spreadsheet-visible
+token distinct from `""`. `""` remains simultaneously legitimate ordinary
+payload *and* the accepted carrier for an unresolved reference,
+disambiguated elsewhere (the authoritative source FK plus live resolution),
+never by the string's own shape.
+
+`is_missing_carrier` recognizes `None`, `""`, and a *bounded* NaN family
+(`float`, NumPy scalars via a restricted `pandas.isna` dispatch that never
+runs on an arbitrary unrecognized object, plus `pandas.NA`/`pandas.NaT`
+identity checks and an explicit `numpy.datetime64` `NaT` branch). A literal
+domain string that happens to equal `"nan"` is deliberately *not*
+recognized as missing -- carrier type is checked before carrier content.
+`numpy.timedelta64` is explicitly excluded from missing-recognition (as from
+every other category): Duration is not a supported category, so no
+`numpy.timedelta64` value, `NaT` or not, is Missing.
+
+=== Structural, ingress, and Domain-invariant validation
+
+[[internal-value-model-trust-authority-pointer]]
+Three validation-responsibility questions stay distinct and must not be
+collapsed under one undifferentiated "validation" word:
+
+[cols="2,3,3",options="header"]
+|===
+| Question | Current owner | Status
+
+| *External/description structural validation* -- is this YAML/config
+  shape well-formed, independent of current data?
+| Diffuse today: `pipeline/config.py`'s dataclass loaders
+  (`load_app_config`) and ad-hoc per-family YAML shape checks inside
+  `configure_*` functions.
+| Not centralized behind one contract yet; a candidate future consolidation
+  point, not decided here.
+
+| *Payload ingress validity* -- does an already-parsed value belong to the
+  accepted scalar/carrier vocabulary before it reaches ordinary Domain
+  transformations?
+| `core.scalar_values.scalar_category` is available classification
+  machinery for this layer; nothing currently calls it at a real ingress
+  point.
+| Phase E's job (`roadmap_domain_hardening_sequence.adoc`, "mandatory
+  trusted ingress"), not started.
+
+| *Domain semantic/invariant validity* -- does a value violate a Domain
+  invariant given current data and cross-references (for example an FK
+  relation pointing at a nonexistent sheet)?
+| `domain/validations/` -- pure functions producing `Finding` objects;
+  `apply_severity_policy` is the sole control-flow decision point. See
+  link:../ch06_architectural_layers/architectural_layers.adoc#validation-findings-severity[Validation
+  Findings and Severity Policy].
+| Cleanly owned today; the most settled of the three.
+|===
+
+Nothing in current maintained code merges the first and third: `Finding` +
+`SeverityPolicy` and `load_app_config`'s own raising are different code
+paths with different failure shapes today, and this document does not
+propose merging them. Any future ADR or FTR proposing a schema-validation
+mechanism (Pydantic or otherwise) for the first row must keep these three
+questions separately nameable rather than have one library's error type
+stand in for all three; see
+link:../ch04_concepts/trusted_ingress_and_runtime_security.adoc[Trusted
+Ingress...] for the still-undecided, ADR-gated question of whether and where
+such a mechanism is adopted.
+
+=== Trust and authority dimensions
+
+The Domain's boundary-robustness model
+(link:../ch03_architecture_decisions/ADR-DOMAIN-BOUNDARY-ROBUSTNESS.adoc[ADR-DOMAIN-BOUNDARY-ROBUSTNESS]
+and its Technical Model concept,
+link:../ch04_concepts/domain_boundary_robustness.adoc[Domain Boundary
+Robustness]) answers "how hard must a boundary defend against a malformed
+value." A second, independent question -- "safe against what, assuming
+which input is hostile" -- is answered by
+link:../ch03_architecture_decisions/ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY.adoc[ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY],
+which this document restates only at the level already accepted there (its
+Decisions 1-5), without repeating its rationale or reopening it. See
+link:../ch06_architectural_layers/architectural_layers.adoc[Architectural
+Layers] for the normative restatement of these dimensions alongside the
+validation taxonomy above.
+
+=== Non-implications
+
+To keep this promotion from being read more broadly than the evidence
+supports, none of the following follows from this document:
+
+* *Not* "all accepted values are normalized to native Python" -- carrier
+  variants classify without narrowing; no normalization primitive exists.
+* *Not* "Pydantic is forbidden in `domain/`" -- no package-location
+  prohibition is accepted anywhere in the repository; a future Pydantic
+  decision is an open, ADR-gated question requiring a concrete use site, not
+  decided or foreclosed here.
+* *Not* "Trusted Ingress already protects `run_pipeline`" -- Phase E has not
+  started; `pipeline.run_pipeline` remains the framework's documented
+  trusted-programmatic-composition surface, unchanged by this document.
+* *Not* "D-T3 is next" -- the Date/Time FTR's family-compatibility pilot
+  slice (D-T3) remains an unselected, unauthorized future candidate.
