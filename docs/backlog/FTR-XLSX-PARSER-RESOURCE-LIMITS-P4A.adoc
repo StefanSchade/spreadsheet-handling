@@ -1,0 +1,394 @@
+===== FTR-XLSX-PARSER-RESOURCE-LIMITS-P4A -- Design XLSX serialized-input parser and resource limits
+
+*Status:* New -- OPEN; design and evidence only.
+
+*Gate:* No implementation is authorized by this FTR until the investigation,
+design, compatibility, and review gates below are complete.
+
+*Priority:* P4A
+
+*Area:* XLSX backend / serialized-input boundary / deployment hardening
+
+*Date:* 2026-08-11
+
+*Evidence baseline:* `8d88ec3926745be85fb16d6ba80db70a82d2055e`,
+`main`, clean worktree at task start.
+
+==== Purpose
+
+Establish the evidence and design needed for a framework-owned XLSX
+parser/resource-limit contract. The known target is the maintained XLSX read
+path. This FTR records an open deployment-hardening gap; it does not implement
+limits, choose an API, or imply that identifying the boundary has hardened it.
+
+The concrete deployment driver is that `spreadsheet-handling` is intended to
+be usable behind applications that receive spreadsheet files from untrusted or
+unauthenticated end users. In that use case, serialized XLSX bytes may be
+adversarially constructed. A trusted runtime and trusted operator do not make
+the payload origin trusted. Pipeline-description trust is another independent
+dimension: a deployment may trust or distrust payload and pipeline description
+separately.
+
+==== 1. Repository evidence and confirmed gap
+
+===== 1.1 Maintained read paths
+
+The current XLSX path is:
+
+[source,text]
+----
+ExcelBackend.read_multi / load_xlsx
+-> spreadsheet_contract.read_spreadsheet_frames
+-> xlsx.openpyxl_parser.parse_workbook
+-> openpyxl.load_workbook(path, data_only=True)
+-> WorkbookIR
+-> workbook_projection
+-> Frames / parsed Python carriers
+----
+
+`xlsx/openpyxl_parser.py:parse_workbook` accepts only
+`exact_header_depths`; it imports neither `ParserLimits` nor
+`SpreadsheetTooLargeError`. It calls `openpyxl.load_workbook` without a
+framework preflight, a limits argument, or a framework-owned resource
+ceiling. `xlsx_backend.py` exposes no resource-limit configuration to that
+parser.
+
+The current ODS path is structurally similar but has one important difference:
+
+[source,text]
+----
+OdsBackend.read_multi / load_ods
+-> spreadsheet_contract.read_spreadsheet_frames
+-> ods.odf_parser.parse_workbook(limits=DEFAULT_LIMITS)
+-> odfpy load
+-> framework-owned repeated-row/column and grid interpretation
+   with ParserLimits enforcement
+-> WorkbookIR
+-> workbook_projection
+-> Frames / parsed Python carriers
+----
+
+`io_backends/parser_limits.py` defines `ParserLimits`, `DEFAULT_LIMITS`, and
+`SpreadsheetTooLargeError`. The default per-sheet bounds are 1,048,576 rows,
+16,384 columns, and 10,000,000 materialized cells. The ODS parser passes the
+limits through hidden/visible grid parsing and cell-addressed presentation
+walks, rejects over-limit content-bearing repeat blocks before expanding them,
+and skips materialization of empty repeated fillers. Focused regression tests
+in `tests/unit/io_backends/ods/test_ods_parser_repeated_cells.py` exercise the
+typed failure and the non-materialization behavior.
+
+Those ODS protections are real but narrow. They run during framework-owned ODS
+interpretation after `odfpy.load`, and do not establish an archive/input-byte,
+compression-expansion, style-count, named-range-count, sheet-count, string-size,
+or parse-time ceiling. They are a semantic comparison point, not evidence that
+the entire ODS serialized-input boundary is generically isolated.
+
+===== 1.2 Where XLSX work and materialization occur
+
+At this baseline the repository asks OpenPyXL to use its normal, non-read-only
+load mode; only `data_only=True` is supplied. Current OpenPyXL behavior parses
+the XLSX ZIP/package manifest, shared strings, workbook structures, properties,
+theme, stylesheet, and worksheets before `load_workbook` returns. Worksheet
+cells and related carrier structures can therefore already be materially
+allocated before framework code can examine `wb.sheetnames`, `ws.max_row`, or
+`ws.max_column`.
+
+After that dependency-owned materialization, framework code can add substantial
+work:
+
+* `_read_meta_sheet` and `_parse_hidden_sheet` iterate hidden-sheet rows;
+* three presentation extractors independently walk the used
+  `max_row` by `max_column` rectangle and may build cell-addressed dictionaries;
+* column-dimension spans are expanded into per-column entries;
+* `xlsx.parser_interpretation` scans table extents and materializes table data
+  as Python lists of strings; and
+* merge handling can enumerate merged coordinates while resolving cells.
+
+Some scans stop at empty rows/columns, and table extent loops use the XLSX
+worksheet axis maxima. These are interpretation heuristics and format bounds,
+not a configurable resource contract. A workbook can still induce expensive
+OpenPyXL work before those scans and expensive framework work within those
+bounds.
+
+===== 1.3 Current partial protections -- and their limits
+
+The XLSX path is not wholly devoid of defensive behavior:
+
+* OpenPyXL and its ZIP/XML dependencies reject some malformed packages and XML;
+* the repository uses `data_only=True`, the OpenPyXL default `keep_vba=False`,
+  and closes the workbook in a `finally` block;
+* visible table discovery has empty-row/column stopping behavior and bounded
+  axis loops;
+* hidden metadata reads only the first two columns; and
+* parsed visible payload is narrowed to the accepted string substrate before
+  Domain use.
+
+None of these establishes a framework-owned limit on input bytes, archive
+members or expansion, sheet count, shared strings, styles, physical cells,
+framework materialization, memory, or time. `data_only=True` and string
+collapse are semantic/carrier choices, not pre-materialization resource
+controls. Closing a workbook releases resources after parsing; it does not cap
+the resources consumed while parsing.
+
+The task-start environment had OpenPyXL 3.1.5 and `defusedxml` installed, and
+OpenPyXL reported that it would use `defusedxml`. However,
+`pyproject.toml` declares only `openpyxl>=3.1`; it does not declare
+`defusedxml`, and OpenPyXL's installed distribution does not require it. This
+environment observation is not a portable framework guarantee. Even when a
+defused XML parser is active, its XML-entity protections do not by themselves
+bound ZIP expansion, worksheet population, shared-string growth, or later
+framework materialization. Dependency behavior must be re-established across
+the actually supported versions during design.
+
+Maintained XLSX tests cover parse-contract ownership, interpretation helpers,
+exact headers, workbook metadata, formulas, presentation metadata, and
+roundtrips. No maintained XLSX test supplies `ParserLimits`, expects
+`SpreadsheetTooLargeError`, or proves a framework resource ceiling. The
+architecture reviews in
+`docs/technical_model/ch04_concepts/trusted_ingress_and_runtime_security*.adoc`
+independently record the same ODS-only/XLSX-unbounded current state.
+
+===== 1.4 Existing backlog ownership
+
+No active FTR or BUG currently owns this concrete XLSX serialized-input gap.
+The Trusted Ingress concept's candidate map names a broader future inventory of
+CSV/JSON/YAML/XML and XLSX parser/resource constraints, and explicitly says
+XLSX must be included because current `ParserLimits` coverage is ODS-only. That
+candidate is evidence of the recognized class, not an implemented guarantee or
+an already-registered XLSX work package.
+
+`FTR-PERF-LIMITS` concerns combinatorial lists and validation sources, not
+backend parser safety. This FTR does not absorb that work. Nor does it silently
+adopt the broader multi-format candidate: the evidenced, concrete target here
+is XLSX. Other parser backends need their own evidence and authorization unless
+the investigation proves a narrowly shared contract is necessary.
+
+==== 2. Threat model and exact boundary
+
+The serialized-input threat path is:
+
+[source,text]
+----
+untrusted XLSX bytes
+-> XLSX/backend parser boundary
+-> parsed Python/workbook carriers
+-> Trusted Ingress
+-> conformant Domain payload
+----
+
+The first boundary owns safe-enough handling of the serialized container and
+parser/resource exposure. Trusted Ingress owns semantic admission of the
+carriers that survive parsing. They are separate, complementary boundaries:
+
+* Trusted Ingress cannot prevent work/resource exhaustion or exploitation of a
+  parser vulnerability that occurs before parsed carriers reach ingress.
+* Parser limits cannot establish the Scalar grammar, metadata substrate,
+  carrier rules, controlled-role lifecycle, or any other Trusted Ingress
+  semantic postcondition.
+
+The threat addressed here is adversarial serialized input, not arbitrary
+hostile Python already executing in-process. Ordinary XLSX content traversing
+the maintained OpenPyXL path produces dependency-owned workbook objects and
+plain carrier values; repository evidence does not support a claim that an
+ordinary XLSX payload can directly instantiate arbitrary attacker-selected
+Python classes or metaclasses. Conversely, a caller or plugin already able to
+execute arbitrary hostile Python in the process is inside a different threat
+path that parser limits cannot sandbox.
+
+Runtime/operator trust, payload-origin trust, and pipeline-description trust
+must therefore remain distinct in all later design wording. This FTR makes no
+claim of arbitrary-Python containment or generic parser isolation.
+
+==== 3. Problem statement
+
+ODS already has framework-owned bounds for the resource dimensions produced by
+its custom repeated-row/column and grid expansion. XLSX lacks an equivalent
+framework-owned parser/resource-limit contract. It delegates expensive initial
+materialization to OpenPyXL and then performs additional potentially expensive
+framework scans without a caller-visible, typed, configured resource ceiling.
+
+Therefore complete public/untrusted XLSX upload readiness has an explicit open
+gap. The gap remains *OPEN* until a later design is accepted, implemented, and
+independently evidenced. Neither this FTR nor documentation that locates the
+boundary may be cited as proof that the boundary is hardened:
+
+[source,text]
+----
+boundary identified != boundary hardened
+----
+
+==== 4. Required investigation and design scope
+
+The design phase must produce a current, dependency-aware census of the full
+XLSX read path and decide, with evidence, which resource dimensions the
+framework will bound. It must investigate at least the following where they
+apply:
+
+* serialized file size, ZIP member/package size, member count, compression
+  ratio, and total expansion exposure;
+* sheet count and package/workbook structures;
+* declared worksheet dimensions and actual physical/materialized cell counts;
+* framework-created cell-addressed presentation entries and table-data cells;
+* shared-string count, individual string length, and aggregate string growth;
+* styles, relationships, names, merges, validations, drawings, external links,
+  and other XML/package structures that materially affect parsing;
+* OpenPyXL's protections, defaults, dependency choices, documented limitations,
+  and version-dependent behavior;
+* checks that can run on serialized/package metadata before expensive workbook
+  materialization;
+* checks that are trustworthy only during or after OpenPyXL materialization;
+* whether streaming/read-only modes are compatible with the maintained parser's
+  semantics and metadata requirements, without presuming that they are the
+  answer;
+* configuration ownership, safe defaults, operator overrides, and any public
+  API implications;
+* deterministic error/failure semantics, diagnostics, cleanup, and partial
+  publication behavior; and
+* consistency with existing ODS `ParserLimits` where the dimensions and
+  semantics genuinely match.
+
+This list is an investigation checklist, not a mandate for one field or limit
+per bullet. The design may deliberately leave a dimension unbounded only when
+it records the evidence, consequence, owner, and rationale. It must distinguish
+decompressed/package observations, dependency-owned materialization, and
+framework-owned materialization; one late cell-count check must not be
+presented as protection for work that already occurred.
+
+The design must also decide whether the existing `ParserLimits` type and
+`SpreadsheetTooLargeError` semantics can be extended coherently, require
+format-specific additions, or should remain ODS-specific behind a broader
+contract. Naming similarity is not enough to force false XLSX/ODS parity.
+
+==== 5. Design and evidence gates before implementation
+
+No runtime implementation slice is ready until a reviewable design package
+contains all of the following:
+
+. *XLSX parser-path census* -- every public/router/backend entry, OpenPyXL load
+  option, package/materialization stage, framework scan, projection stage, and
+  cleanup point relevant to resource use.
+. *Protection-and-gap matrix* -- current framework checks, OpenPyXL/dependency
+  behavior, format constraints, operator/environment constraints, and the
+  resource dimensions each does and does not protect.
+. *ODS comparison* -- exact `ParserLimits` call sites and semantics, including
+  the fact that ODS limits are dimension/materialization bounds after
+  `odfpy.load`, not a complete package sandbox.
+. *Dependency evidence* -- behavior for the supported OpenPyXL/Python/XML/ZIP
+  dependency range relevant to the selected checks, with version assumptions
+  explicit.
+. *Resource decision table* -- every investigated dimension classified as
+  bounded before materialization, bounded during/after materialization,
+  deliberately unbounded, dependency-owned, or separately deployment-owned,
+  with rationale.
+. *Configuration/default analysis* -- proposed ownership and defaults backed by
+  representative compatibility evidence; no arbitrary constants presented as
+  universal safe values.
+. *Failure contract* -- exception family, diagnostic context, cleanup,
+  no-partial-result expectations, and distinction between malformed input,
+  dependency failure, and configured resource-limit rejection.
+. *Compatibility analysis* -- impact on valid large workbooks, existing Python
+  and CLI/backend options, exact-header and presentation readback, hidden
+  `_meta`, named ranges, validations, workbook-view reconstruction, and the
+  supported dependency range.
+. *Implementation evidence plan* -- focused synthetic adversarial/resource
+  tests for every chosen limit, boundary-placement tests proving rejection at
+  the intended stage where feasible, regression coverage for accepted large
+  inputs, and end-to-end public-path evidence.
+. *Honest guarantee statement* -- the exact bounded dimensions and residual
+  risks, with no claim of generic parser isolation, malware detection, process
+  containment, or protection for unrelated formats.
+
+The eventual implementation must be a separately authorized slice with
+independently reviewable evidence. Tests must avoid destabilizing CI through
+unbounded allocations; synthetic packages and narrowly instrumented probes
+should establish timing and rejection behavior without deliberately exhausting
+the test host.
+
+==== 6. Explicit non-goals
+
+This FTR does not design or implement:
+
+* E1--E7 Trusted Ingress semantics or Phase-E orchestration;
+* scalar carrier classification or the six-category Scalar grammar;
+* controlled framework roles or their transition lifecycle;
+* pipeline-description authorization or dotted-extension policy;
+* arbitrary Python sandboxing, plugin containment, or hostile in-process object
+  defense;
+* output/sink security, including formula-output policy;
+* malware scanning, content disarm/reconstruction, or antivirus integration;
+* generic HTTP upload size, reverse-proxy, filesystem quota, request timeout,
+  process, container, or OS controls;
+* a framework-wide security rewrite or generic parser-isolation layer;
+* automatic hardening of CSV, JSON, YAML, XML, ODS package parsing, or any
+  future backend; or
+* runtime code, tests, Trusted Ingress implementation, ADRs, the Technical
+  Model, or Project Memory in this design-only registration slice.
+
+Application/web-server limits and process isolation may remain separately owned
+deployment controls. Their existence must not be used to erase the
+framework-owned XLSX parser question, and this FTR must not absorb them.
+
+==== 7. Relationship to Phase E Trusted Ingress
+
+This work package is independent from Phase-E Trusted Ingress implementation.
+It is not E1--E7, is not a hidden Phase-E sub-slice, and does not block E2 merely
+because it exists. Phase E may continue independently under its own accepted
+sequencing and gates.
+
+The deployment claim is stricter than either work package alone:
+
+[source,text]
+----
+untrusted XLSX deployment readiness
+    = serialized-input boundary sufficiently hardened
+    + Trusted Ingress semantics
+    + any other separately owned deployment controls
+----
+
+Accordingly, completion of Trusted Ingress must not be advertised as complete
+public/untrusted XLSX upload readiness while this parser/resource-limit work
+remains open. Likewise, implementing parser limits would not establish Trusted
+Ingress conformance or authorize less-trusted pipeline descriptions.
+
+==== 8. Durable architecture promotion
+
+After the design and implementation lifecycle supplies accepted evidence, a
+later Technical Model condensation should explain the permanent layered
+boundary:
+
+[source,text]
+----
+serialized input -> parser boundary -> Trusted Ingress
+----
+
+While XLSX parser hardening remains open, that durable architecture surface
+should reference `FTR-XLSX-PARSER-RESOURCE-LIMITS-P4A` and state the gap without
+implying the work is complete. This registration slice does not modify the
+Technical Model.
+
+==== 9. Lifecycle and acceptance
+
+This FTR may move from *New/Open* to design-ready only after sections 4 and 5
+have reviewable evidence and a justified design. Design acceptance does not by
+itself close the deployment gap. Closure requires a separately authorized
+implementation, focused adversarial/resource tests, compatibility evidence,
+normal regression checks, and independent acceptance review.
+
+The final accepted evidence must make it possible for a reviewer to answer:
+
+* which XLSX resources are bounded;
+* at what stage each bound is enforced;
+* which expensive work can still occur before rejection;
+* what valid inputs may now fail by default and how operators configure that;
+* how failure is surfaced without partial Domain publication;
+* which guarantees come from the framework versus OpenPyXL, its dependencies,
+  the OS, or deployment infrastructure; and
+* why no sentence can be read as a claim of generic parser isolation.
+
+Until all closure conditions are met, the truthful status is:
+
+[source,text]
+----
+XLSX serialized-input parser/resource hardening: OPEN
+Public/untrusted XLSX upload readiness: NOT ESTABLISHED
+----
