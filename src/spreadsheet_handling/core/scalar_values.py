@@ -155,19 +155,50 @@ Duration are deliberately not members -- see the module docstring."""
 class UnsupportedScalarError(TypeError):
     """`value` is outside the MVP internal scalar vocabulary.
 
-    The diagnostic reports only `type(value).__name__`. It deliberately never
-    calls `repr`, `str`, comparison, hashing, or iteration on the rejected
-    value -- a bounded, safe diagnostic per `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`,
-    not an attempt to describe the value's content.
+    The diagnostic reports only the actual runtime type name, obtained through
+    a bounded descriptor that bypasses metaclass overrides. It deliberately
+    never calls `repr`, `str`, comparison, hashing, iteration, instance
+    `__class__`, or metaclass `__name__` behavior on the rejected value -- a
+    bounded, safe diagnostic per `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, not an
+    attempt to describe the value's content.
     """
 
     def __init__(self, value: Any) -> None:
-        self.value_type_name = type(value).__name__
+        self.value_type_name = _bounded_actual_type_name(type(value))
         super().__init__(
             "unsupported internal scalar value of type "
             f"{self.value_type_name!r}; expected str, bool, int, float, "
             "date, datetime, or a recognized missing carrier"
         )
+
+
+def _actual_type_is_subclass_of(
+    actual_type: type[Any], accepted_types: tuple[type[Any], ...]
+) -> bool:
+    """Whether the real runtime type descends from an accepted carrier type.
+
+    ``isinstance(value, ...)`` can consult a caller-controlled
+    ``value.__class__`` attribute.  Instead, this helper reads the real type's
+    MRO through ``type``'s descriptor directly, bypassing custom metaclass
+    attribute access, then uses identity comparisons only.  The returned MRO
+    is an interpreter-owned tuple; neither the candidate instance nor its
+    metaclass receives a protocol callback.
+    """
+    actual_mro = type.__getattribute__(actual_type, "__mro__")
+    return any(
+        actual_base is accepted_type
+        for actual_base in actual_mro
+        for accepted_type in accepted_types
+    )
+
+
+def _bounded_actual_type_name(actual_type: type[Any]) -> str:
+    """Return the real type name without honoring metaclass overrides."""
+    try:
+        name = type.__getattribute__(actual_type, "__name__")
+    except (AttributeError, TypeError):
+        return "unsupported runtime type"
+    return name if type(name) is str else "unsupported runtime type"
 
 
 def is_missing_carrier(value: Any) -> bool:
@@ -176,9 +207,9 @@ def is_missing_carrier(value: Any) -> bool:
     This is *recognition*, not *representation*: it answers whether `value`'s
     current carrier is a missing one; it does not produce or mutate a value.
     A literal string that happens to equal `"nan"` is deliberately not
-    recognized as missing -- `isinstance(value, str)` is checked before
-    `pandas.isna`, matching every existing accepted implementation of this
-    shape (`domain._cell_primitives._is_empty_cell`,
+    recognized as missing -- actual runtime String ancestry is checked before
+    `pandas.isna`, matching the semantics of every existing accepted
+    implementation of this shape (`domain._cell_primitives._is_empty_cell`,
     `io_backends.ods.odf_renderer._is_missing_carrier`, and others).
 
     Bounded, not universally dispatched to `pandas.isna`: calling
@@ -230,17 +261,18 @@ def is_missing_carrier(value: Any) -> bool:
     `numpy.datetime64('NaT')` is Missing; every other `numpy.datetime64`
     value is not.
     """
+    actual_type = type(value)
     if value is None:
         return True
-    if isinstance(value, str):
+    if _actual_type_is_subclass_of(actual_type, (str,)):
         return value == ""
     if value is pd.NA or value is pd.NaT:
         return True
-    if isinstance(value, np.timedelta64):
+    if _actual_type_is_subclass_of(actual_type, (np.timedelta64,)):
         return False
-    if isinstance(value, np.datetime64):
+    if _actual_type_is_subclass_of(actual_type, (np.datetime64,)):
         return bool(np.isnat(value))
-    if isinstance(value, (int, float, np.generic)):
+    if _actual_type_is_subclass_of(actual_type, (int, float, np.generic)):
         try:
             return bool(pd.isna(value))
         except (TypeError, ValueError):
@@ -288,19 +320,22 @@ def scalar_category(value: Any) -> ScalarCategory:
        ordering relative to them does not matter, only that its `NaT` form
        was already routed to `"missing"` by step 1 above.
     """
+    actual_type = type(value)
     if is_missing_carrier(value):
         return "missing"
-    if isinstance(value, (bool, np.bool_)):
+    if _actual_type_is_subclass_of(actual_type, (bool, np.bool_)):
         return "boolean"
-    if isinstance(value, str):
+    if _actual_type_is_subclass_of(actual_type, (str,)):
         return "string"
-    if isinstance(value, np.timedelta64):
+    if _actual_type_is_subclass_of(actual_type, (np.timedelta64,)):
         raise UnsupportedScalarError(value)
-    if isinstance(value, (int, float, np.integer, np.floating)):
+    if _actual_type_is_subclass_of(
+        actual_type, (int, float, np.integer, np.floating)
+    ):
         return "number"
-    if isinstance(value, (np.datetime64, datetime.datetime)):
+    if _actual_type_is_subclass_of(actual_type, (np.datetime64, datetime.datetime)):
         return "datetime"
-    if isinstance(value, datetime.date):
+    if _actual_type_is_subclass_of(actual_type, (datetime.date,)):
         return "date"
     raise UnsupportedScalarError(value)
 

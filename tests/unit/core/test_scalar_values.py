@@ -156,6 +156,126 @@ def test_scalar_category_rejects_array_like_bomb_with_unsupported_scalar_error()
     assert bomb.array_called is False
 
 
+def test_scalar_category_rejects_spoofed_number_without_reading_instance_class() -> None:
+    calls: list[str] = []
+
+    class _SpoofedNumber:
+        @property
+        def __class__(self) -> type[int]:  # pragma: no cover - must never run
+            calls.append("class")
+            return int
+
+    value = _SpoofedNumber()
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+
+    error = excinfo.value
+    assert error.value_type_name == "_SpoofedNumber"
+    assert str(error).startswith("unsupported internal scalar value")
+    assert vars(error) == {"value_type_name": "_SpoofedNumber"}
+    assert is_supported_scalar(value) is False
+    assert calls == []
+
+
+def test_scalar_category_rejects_spoofed_string_without_equality() -> None:
+    calls: list[str] = []
+
+    class _SpoofedString:
+        @property
+        def __class__(self) -> type[str]:  # pragma: no cover - must never run
+            calls.append("class")
+            return str
+
+        def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
+            calls.append("eq")
+            raise AssertionError("equality must not run for a spoofed String")
+
+    value = _SpoofedString()
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+
+    assert excinfo.value.value_type_name == "_SpoofedString"
+    assert is_supported_scalar(value) is False
+    assert calls == []
+
+
+def test_scalar_category_rejects_without_reading_raising_instance_class() -> None:
+    calls: list[str] = []
+
+    class _RaisingClassLookup:
+        def __getattribute__(self, name: str) -> object:
+            if name == "__class__":  # pragma: no cover - must never run
+                calls.append("class")
+                raise AssertionError("instance __class__ lookup must not run")
+            return object.__getattribute__(self, name)
+
+    value = _RaisingClassLookup()
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+
+    error = excinfo.value
+    assert error.value_type_name == "_RaisingClassLookup"
+    assert str(error).startswith("unsupported internal scalar value")
+    assert vars(error) == {"value_type_name": "_RaisingClassLookup"}
+    assert calls == []
+
+
+def test_scalar_category_preserves_actual_native_subclass_semantics() -> None:
+    class _String(str):
+        pass
+
+    class _Integer(int):
+        pass
+
+    class _Float(float):
+        pass
+
+    class _Date(datetime.date):
+        pass
+
+    class _DateTime(datetime.datetime):
+        pass
+
+    values_and_categories = (
+        (_String("text"), "string"),
+        (_String(""), "missing"),
+        (_Integer(7), "number"),
+        (_Float(1.5), "number"),
+        (_Date(2026, 8, 11), "date"),
+        (_DateTime(2026, 8, 11, 12, 30), "datetime"),
+    )
+    for value, expected_category in values_and_categories:
+        assert scalar_category(value) == expected_category
+        assert is_supported_scalar(value) is True
+
+
+def test_unsupported_scalar_error_bypasses_hostile_metaclass_type_name() -> None:
+    calls: list[str] = []
+
+    class _BombMeta(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":  # pragma: no cover - must never run
+                calls.append("name")
+                raise AssertionError("metaclass __name__ lookup must not run")
+            return super().__getattribute__(name)
+
+    class _Bomb(metaclass=_BombMeta):
+        pass
+
+    value = _Bomb()
+    with pytest.raises(UnsupportedScalarError) as excinfo:
+        scalar_category(value)
+
+    error = excinfo.value
+    assert error.value_type_name == "_Bomb"
+    assert str(error) == (
+        "unsupported internal scalar value of type '_Bomb'; expected str, bool, "
+        "int, float, date, datetime, or a recognized missing carrier"
+    )
+    assert vars(error) == {"value_type_name": "_Bomb"}
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # scalar_category / is_supported_scalar -- classification, not conversion
 # ---------------------------------------------------------------------------
