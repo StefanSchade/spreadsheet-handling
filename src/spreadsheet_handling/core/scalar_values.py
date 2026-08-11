@@ -155,16 +155,16 @@ Duration are deliberately not members -- see the module docstring."""
 class UnsupportedScalarError(TypeError):
     """`value` is outside the MVP internal scalar vocabulary.
 
-    The diagnostic reports only the actual runtime type name, obtained through
-    a bounded descriptor that bypasses metaclass overrides. It deliberately
-    never calls `repr`, `str`, comparison, hashing, iteration, instance
-    `__class__`, or metaclass `__name__` behavior on the rejected value -- a
-    bounded, safe diagnostic per `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, not an
-    attempt to describe the value's content.
+    The diagnostic deliberately uses constant type detail rather than
+    introspecting the rejected value or its runtime type. It never calls
+    `repr`, `str`, comparison, hashing, iteration, instance `__class__`, or
+    metaclass behavior on the rejected value -- a bounded, safe diagnostic per
+    `ADR-DOMAIN-BOUNDARY-ROBUSTNESS`, not an attempt to describe the value's
+    content or provide a general same-process sandbox.
     """
 
     def __init__(self, value: Any) -> None:
-        self.value_type_name = _bounded_actual_type_name(type(value))
+        self.value_type_name = "unsupported runtime type"
         super().__init__(
             "unsupported internal scalar value of type "
             f"{self.value_type_name!r}; expected str, bool, int, float, "
@@ -177,28 +177,16 @@ def _actual_type_is_subclass_of(
 ) -> bool:
     """Whether the real runtime type descends from an accepted carrier type.
 
-    ``isinstance(value, ...)`` can consult a caller-controlled
-    ``value.__class__`` attribute.  Instead, this helper reads the real type's
-    MRO through ``type``'s descriptor directly, bypassing custom metaclass
-    attribute access, then uses identity comparisons only.  The returned MRO
-    is an interpreter-owned tuple; neither the candidate instance nor its
-    metaclass receives a protocol callback.
+    ``actual_type`` is anchored by the caller with ``type(value)`` so a
+    caller-controlled ``value.__class__`` cannot affect membership.
+    ``issubclass`` performs the ancestry test without attribute lookup on that
+    first-argument type. Its customizable side is the second argument's
+    metaclass; every ``accepted_types`` entry here is a fixed built-in,
+    ``datetime``, or NumPy carrier type using the standard ``type`` metaclass.
+    Thus neither the candidate instance nor its user-controlled metaclass
+    participates in proving membership for this bounded family set.
     """
-    actual_mro = type.__getattribute__(actual_type, "__mro__")
-    return any(
-        actual_base is accepted_type
-        for actual_base in actual_mro
-        for accepted_type in accepted_types
-    )
-
-
-def _bounded_actual_type_name(actual_type: type[Any]) -> str:
-    """Return the real type name without honoring metaclass overrides."""
-    try:
-        name = type.__getattribute__(actual_type, "__name__")
-    except (AttributeError, TypeError):
-        return "unsupported runtime type"
-    return name if type(name) is str else "unsupported runtime type"
+    return issubclass(actual_type, accepted_types)
 
 
 def is_missing_carrier(value: Any) -> bool:

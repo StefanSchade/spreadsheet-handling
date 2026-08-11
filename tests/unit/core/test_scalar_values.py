@@ -170,9 +170,9 @@ def test_scalar_category_rejects_spoofed_number_without_reading_instance_class()
         scalar_category(value)
 
     error = excinfo.value
-    assert error.value_type_name == "_SpoofedNumber"
+    assert error.value_type_name == "unsupported runtime type"
     assert str(error).startswith("unsupported internal scalar value")
-    assert vars(error) == {"value_type_name": "_SpoofedNumber"}
+    assert vars(error) == {"value_type_name": "unsupported runtime type"}
     assert is_supported_scalar(value) is False
     assert calls == []
 
@@ -194,7 +194,7 @@ def test_scalar_category_rejects_spoofed_string_without_equality() -> None:
     with pytest.raises(UnsupportedScalarError) as excinfo:
         scalar_category(value)
 
-    assert excinfo.value.value_type_name == "_SpoofedString"
+    assert excinfo.value.value_type_name == "unsupported runtime type"
     assert is_supported_scalar(value) is False
     assert calls == []
 
@@ -214,9 +214,9 @@ def test_scalar_category_rejects_without_reading_raising_instance_class() -> Non
         scalar_category(value)
 
     error = excinfo.value
-    assert error.value_type_name == "_RaisingClassLookup"
+    assert error.value_type_name == "unsupported runtime type"
     assert str(error).startswith("unsupported internal scalar value")
-    assert vars(error) == {"value_type_name": "_RaisingClassLookup"}
+    assert vars(error) == {"value_type_name": "unsupported runtime type"}
     assert calls == []
 
 
@@ -249,6 +249,43 @@ def test_scalar_category_preserves_actual_native_subclass_semantics() -> None:
         assert is_supported_scalar(value) is True
 
 
+def test_scalar_category_bypasses_hostile_metaclass_mro_hooks() -> None:
+    calls: list[str] = []
+
+    class _MroDescriptor:
+        def __get__(
+            self, instance: object, owner: type[object] | None = None
+        ) -> object:  # pragma: no cover - must never run
+            calls.append("mro-descriptor")
+            raise AssertionError("metaclass __mro__ descriptor must not run")
+
+    class _BombMeta(type):
+        __mro__ = _MroDescriptor()
+
+        def __getattribute__(cls, name: str) -> object:
+            if name in {"__mro__", "mro"}:  # pragma: no cover - must never run
+                calls.append(f"getattribute-{name}")
+                raise AssertionError(f"metaclass {name} lookup must not run")
+            return super().__getattribute__(name)
+
+        def mro(cls) -> list[type[object]]:
+            calls.append("mro-override")
+            return super().mro()
+
+    class _Opaque(metaclass=_BombMeta):
+        pass
+
+    class _String(str, metaclass=_BombMeta):
+        pass
+
+    calls.clear()  # Class creation legitimately asks the metaclass for an MRO.
+    value = _Opaque()
+    with pytest.raises(UnsupportedScalarError):
+        scalar_category(value)
+    assert scalar_category(_String("text")) == "string"
+    assert calls == []
+
+
 def test_unsupported_scalar_error_bypasses_hostile_metaclass_type_name() -> None:
     calls: list[str] = []
 
@@ -267,12 +304,36 @@ def test_unsupported_scalar_error_bypasses_hostile_metaclass_type_name() -> None
         scalar_category(value)
 
     error = excinfo.value
-    assert error.value_type_name == "_Bomb"
+    assert error.value_type_name == "unsupported runtime type"
     assert str(error) == (
-        "unsupported internal scalar value of type '_Bomb'; expected str, bool, "
-        "int, float, date, datetime, or a recognized missing carrier"
+        "unsupported internal scalar value of type 'unsupported runtime type'; "
+        "expected str, bool, int, float, date, datetime, or a recognized "
+        "missing carrier"
     )
-    assert vars(error) == {"value_type_name": "_Bomb"}
+    assert vars(error) == {"value_type_name": "unsupported runtime type"}
+    assert calls == []
+
+
+def test_unsupported_scalar_error_bypasses_metaclass_name_descriptor() -> None:
+    calls: list[str] = []
+
+    class _NameDescriptor:
+        def __get__(
+            self, instance: object, owner: type[object] | None = None
+        ) -> object:  # pragma: no cover - must never run
+            calls.append("name-descriptor")
+            raise AssertionError("metaclass __name__ descriptor must not run")
+
+    class _BombMeta(type):
+        __name__ = _NameDescriptor()
+
+    class _Bomb(metaclass=_BombMeta):
+        pass
+
+    error = UnsupportedScalarError(_Bomb())
+    assert error.value_type_name == "unsupported runtime type"
+    assert str(error).startswith("unsupported internal scalar value")
+    assert vars(error) == {"value_type_name": "unsupported runtime type"}
     assert calls == []
 
 
@@ -371,7 +432,7 @@ def test_scalar_category_rejects_numpy_timedelta64_without_number_misclassificat
     # than partially "number" and partially "missing".
     with pytest.raises(UnsupportedScalarError) as excinfo:
         scalar_category(value)
-    assert excinfo.value.value_type_name == "timedelta64"
+    assert excinfo.value.value_type_name == "unsupported runtime type"
     assert is_supported_scalar(value) is False
     # The NaT form must not be recognized as Missing either -- an unsupported
     # category rejects all its instances, it does not partially fold its
@@ -407,7 +468,7 @@ def test_scalar_category_still_rejects_datetime_time() -> None:
     value = datetime.time(12, 30)
     with pytest.raises(UnsupportedScalarError) as excinfo:
         scalar_category(value)
-    assert excinfo.value.value_type_name == "time"
+    assert excinfo.value.value_type_name == "unsupported runtime type"
     assert is_supported_scalar(value) is False
 
 
@@ -520,8 +581,8 @@ def test_scalar_category_rejects_formula_spec_intent() -> None:
 def test_scalar_category_rejects_arbitrary_objects_with_safe_diagnostic(value: Any) -> None:
     with pytest.raises(UnsupportedScalarError) as excinfo:
         scalar_category(value)
-    # The diagnostic names only the type, never the value's own repr/str.
-    assert type(value).__name__ in str(excinfo.value)
+    # The constant diagnostic does not inspect either the value or its type.
+    assert "unsupported runtime type" in str(excinfo.value)
     assert is_supported_scalar(value) is False
 
 

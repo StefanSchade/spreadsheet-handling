@@ -160,7 +160,7 @@ def test_admit_ordinary_scalar_rejects_unsupported_carriers_with_stable_safe_det
 
     error = excinfo.value
     assert error.kind == "unsupported_scalar_carrier"
-    assert error.carrier_type_name == type(value).__name__
+    assert error.carrier_type_name == "unsupported runtime type"
     assert str(error) == (
         "unsupported ordinary scalar carrier of type "
         f"'{error.carrier_type_name}'; expected String, Boolean, Number, Missing, "
@@ -209,9 +209,9 @@ def test_complete_admission_rejection_path_does_not_invoke_hostile_protocols() -
 
     error = excinfo.value
     assert error.kind == "unsupported_scalar_carrier"
-    assert error.carrier_type_name == "_ProtocolBomb"
+    assert error.carrier_type_name == "unsupported runtime type"
     assert str(error).startswith("unsupported ordinary scalar carrier")
-    assert vars(error) == {"carrier_type_name": "_ProtocolBomb"}
+    assert vars(error) == {"carrier_type_name": "unsupported runtime type"}
     assert calls == []
 
 
@@ -230,9 +230,9 @@ def test_admission_rejects_spoofed_number_without_reading_instance_class() -> No
 
     error = excinfo.value
     assert error.kind == "unsupported_scalar_carrier"
-    assert error.carrier_type_name == "_SpoofedNumber"
+    assert error.carrier_type_name == "unsupported runtime type"
     assert str(error).startswith("unsupported ordinary scalar carrier")
-    assert vars(error) == {"carrier_type_name": "_SpoofedNumber"}
+    assert vars(error) == {"carrier_type_name": "unsupported runtime type"}
     assert calls == []
 
 
@@ -253,7 +253,7 @@ def test_admission_rejects_spoofed_string_without_equality() -> None:
     with pytest.raises(OrdinaryScalarAdmissionError) as excinfo:
         admit_ordinary_scalar(value)
 
-    assert excinfo.value.carrier_type_name == "_SpoofedString"
+    assert excinfo.value.carrier_type_name == "unsupported runtime type"
     assert calls == []
 
 
@@ -273,9 +273,9 @@ def test_admission_rejects_without_reading_raising_instance_class() -> None:
 
     error = excinfo.value
     assert error.kind == "unsupported_scalar_carrier"
-    assert error.carrier_type_name == "_RaisingClassLookup"
+    assert error.carrier_type_name == "unsupported runtime type"
     assert str(error).startswith("unsupported ordinary scalar carrier")
-    assert vars(error) == {"carrier_type_name": "_RaisingClassLookup"}
+    assert vars(error) == {"carrier_type_name": "unsupported runtime type"}
     assert calls == []
 
 
@@ -307,6 +307,62 @@ def test_admission_preserves_actual_native_subclass_identity() -> None:
         assert admit_ordinary_scalar(value) is value
 
 
+def test_complete_admission_path_bypasses_hostile_metaclass_descriptors() -> None:
+    calls: list[str] = []
+
+    class _HostileDescriptor:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def __get__(
+            self, instance: object, owner: type[object] | None = None
+        ) -> object:  # pragma: no cover - must never run
+            calls.append(self.label)
+            raise AssertionError(f"metaclass {self.label} descriptor must not run")
+
+    class _BombMeta(type):
+        __mro__ = _HostileDescriptor("mro")
+        __name__ = _HostileDescriptor("name")
+
+    class _Bomb(metaclass=_BombMeta):
+        pass
+
+    value = _Bomb()
+    with pytest.raises(OrdinaryScalarAdmissionError) as excinfo:
+        admit_ordinary_scalar(value)
+
+    error = excinfo.value
+    assert error.kind == "unsupported_scalar_carrier"
+    assert error.carrier_type_name == "unsupported runtime type"
+    assert str(error) == (
+        "unsupported ordinary scalar carrier of type 'unsupported runtime type'; "
+        "expected String, Boolean, Number, Missing, Date, or DateTime"
+    )
+    assert vars(error) == {"carrier_type_name": "unsupported runtime type"}
+    assert calls == []
+
+
+def test_admission_preserves_hostile_metaclass_string_subclass_identity() -> None:
+    calls: list[str] = []
+
+    class _MroDescriptor:
+        def __get__(
+            self, instance: object, owner: type[object] | None = None
+        ) -> object:  # pragma: no cover - must never run
+            calls.append("mro")
+            raise AssertionError("metaclass __mro__ descriptor must not run")
+
+    class _BombMeta(type):
+        __mro__ = _MroDescriptor()
+
+    class _String(str, metaclass=_BombMeta):
+        pass
+
+    value = _String("text")
+    assert admit_ordinary_scalar(value) is value
+    assert calls == []
+
+
 def test_complete_admission_path_bypasses_hostile_metaclass_type_name() -> None:
     calls: list[str] = []
 
@@ -326,10 +382,10 @@ def test_complete_admission_path_bypasses_hostile_metaclass_type_name() -> None:
 
     error = excinfo.value
     assert error.kind == "unsupported_scalar_carrier"
-    assert error.carrier_type_name == "_Bomb"
+    assert error.carrier_type_name == "unsupported runtime type"
     assert str(error) == (
-        "unsupported ordinary scalar carrier of type '_Bomb'; expected String, "
-        "Boolean, Number, Missing, Date, or DateTime"
+        "unsupported ordinary scalar carrier of type 'unsupported runtime type'; "
+        "expected String, Boolean, Number, Missing, Date, or DateTime"
     )
-    assert vars(error) == {"carrier_type_name": "_Bomb"}
+    assert vars(error) == {"carrier_type_name": "unsupported runtime type"}
     assert calls == []
