@@ -6847,3 +6847,281 @@ slice exclusions are sound. Trusted Ingress cannot claim its E1 postcondition
 until actual carrier membership and rejection diagnostics no longer dispatch
 through unsupported caller-controlled `__class__`/metaclass `__name__`
 behavior.
+
+===== FTR-TRUSTED-INGRESS-P4A -- Independent Follow-up E1 Scalar-Safety Implementation Review
+
+*Review date:* 2026-08-11
+
+*Review type:* fresh-context, independent, narrow follow-up implementation
+review of only the two Blocking findings from the Independent E1
+Implementation Review at `305d820`. Correction-author `RESOLVED` labels were
+treated as claims only. This review does not implement E2 or later work,
+redesign Trusted Ingress, or modify runtime, tests, the FTR, ADR, Technical
+Model, roadmap, or Project Memory.
+
+*Correction runtime/test commit:*
+`137a96c9f8ae04ea3d6510fe0a7a5aa97d41bf7f`
+(`fix(trusted-ingress): harden scalar carrier classification`).
+
+*Correction evidence commit:*
+`ccec8ff078a66d8a5b41bc5c7cd022219a8a4f9a`
+(`docs(trusted-ingress): resolve E1 scalar safety findings`).
+
+*Verdict:* *E1 CHANGES REQUIRED -- SCALAR SAFETY FINDINGS REMAIN OPEN.*
+
+The correction closes the candidate-instance `__class__` spoof demonstrated
+by the original review and bypasses ordinary metaclass `__getattribute__`
+overrides. It does not establish the claimed bounded primitives:
+`type.__getattribute__` still performs descriptor lookup through the actual
+type's metaclass. A metaclass-owned descriptor for `__mro__` or `__name__` is
+therefore executed. A raised `RuntimeError` escapes instead of the owned E1
+error, and an actual supported `str` subclass with such an `__mro__`
+descriptor regresses from acceptance to a foreign exception. Those are direct
+failures of F1 and F2, not a demand for a general same-process Python sandbox.
+
+==== 1. Exact baseline and correction scope
+
+[cols="3,7",options="header"]
+|===
+|Item |Independent verification
+
+|Repository and branch
+|`/home/stefan/repos/spreadsheet-handling/core`; remained on `main`. Nothing
+was pushed.
+
+|Starting state
+|Clean worktree at exact
+`ccec8ff078a66d8a5b41bc5c7cd022219a8a4f9a`. The branch's pre-existing
+`ahead 18` relation to `origin/main` was unchanged review context.
+
+|Reviewed range
+|Exact `305d820364a407056434d052991102299743cf7a..ccec8ff078a66d8a5b41bc5c7cd022219a8a4f9a`:
+445 insertions and 18 deletions across four files.
+
+|Runtime/test correction
+|Only `src/spreadsheet_handling/core/scalar_values.py`, its shared scalar
+tests, and the focused E1 scalar-admission tests changed.
+
+|Correction evidence
+|Only `docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc` changed in the evidence
+commit. The original review verdicts in this sibling review artifact were not
+edited by either correction commit.
+
+|Scope exclusions
+|No E1 production seam, traversal, metadata, controlled-role, producer-
+certificate, orchestration, registry, public-API, authorization, ADR,
+Technical Model, roadmap, Project Memory, or release-note change appears in
+the correction range. No E2+ implementation leaked into the correction.
+|===
+
+==== 2. Actual carrier-membership review
+
+`is_missing_carrier` and `scalar_category` now establish
+`actual_type = type(value)`. All carrier-family decisions call
+`_actual_type_is_subclass_of(actual_type, accepted_types)` instead of
+`isinstance(value, ...)`. For ordinary Python class shapes, this correctly
+prevents a candidate-controlled instance `__class__` from establishing
+membership. The helper compares only identities from the returned MRO and the
+fixed accepted-type tuple; it does not invoke candidate equality, hashing,
+iteration, representation, or conversion.
+
+The original counterexamples now behave correctly:
+
+* an opaque object whose instance `__class__` property reports `int` raises
+  `UnsupportedScalarError` at Phase D and `OrdinaryScalarAdmissionError` at
+  E1, with zero property calls;
+* the equivalent `str` spoof rejects without invoking either instance
+  `__class__` or equality;
+* an instance that raises on `__class__` lookup rejects stably with zero such
+  lookups; and
+* ordinary real subclasses of `str`, `int`, `float`, `datetime.date`, and
+  `datetime.datetime` retain their intended classifications and E1 identity.
+
+The existing NumPy/pandas families also remain accepted in the maintained
+matrix and independent probe: `numpy.str_`, `numpy.bool_`, `numpy.integer`,
+`numpy.floating`, `pandas.Timestamp`, non-NaT `numpy.datetime64`, and the
+NaN/NA/NaT Missing family all classify as intended and are returned unchanged
+by E1.
+
+==== 3. Adversarial inspection of the actual-MRO primitive
+
+The claimed bypass is narrower than documented. Calling
+
+[source,python]
+----
+type.__getattribute__(actual_type, "__mro__")
+----
+
+does bypass an override of the metaclass's `__getattribute__` method. It still
+runs `type`'s normal class-attribute algorithm, which searches the actual
+type's metaclass and invokes a descriptor found there. An independently
+defined metaclass with a recording/raising descriptor stored at `__mro__`
+produced:
+
+[source,text]
+----
+_actual_type_is_subclass_of(...) -> RuntimeError("hostile metaclass descriptor __mro__")
+scalar_category(opaque_value)    -> same foreign RuntimeError
+admit_ordinary_scalar(value)     -> same foreign RuntimeError
+----
+
+The descriptor call log contained one `__mro__` invocation for each attempt.
+This is a user-controlled metaclass descriptor hook introduced into every
+carrier-family test by the correction. No candidate instance hook is involved.
+
+The issue also affects a relevant supported Python class shape, not only an
+opaque negative. For a genuine `str` subclass using that metaclass,
+`type(value)` is the subclass, `isinstance(value, str)` remains `True` without
+executing the descriptor, and pre-correction membership semantics accept it.
+The corrected `scalar_category` and E1 path instead execute the `__mro__`
+descriptor and propagate its `RuntimeError`. Thus the correction does not
+preserve intended real-subclass semantics for this concrete shape.
+
+==== 4. Bounded type-diagnostic review
+
+For a metaclass that records and raises only from an ordinary
+`__getattribute__(cls, "__name__")` override, `_bounded_actual_type_name`
+successfully retrieves the real name and never calls the override. The
+complete ordinary hostile rejection path constructs both error types, renders
+the E1 error, and exposes only
+`{"carrier_type_name": "ProtocolBomb"}` through `vars(error)`.
+
+The helper is nevertheless not bounded against a metaclass-owned `__name__`
+descriptor. The independent probe produced:
+
+[source,text]
+----
+_bounded_actual_type_name(type(value)) -> RuntimeError("hostile metaclass descriptor __name__")
+UnsupportedScalarError(value)          -> same foreign RuntimeError
+----
+
+`_bounded_actual_type_name` catches only `AttributeError` and `TypeError`, so
+this `RuntimeError` does not reach the documented constant fallback. Catching
+it would not by itself satisfy the no-hook guarantee: the caller-controlled
+descriptor has already executed. On the complete E1 path, the `__mro__`
+descriptor is reached even earlier; consequently no
+`OrdinaryScalarAdmissionError` exists to render or inspect and the stable
+error kind is absent.
+
+No rejected raw value is retained when the ordinary path succeeds in
+constructing the owned errors. That error-state shape remains sound, but it
+does not repair the pre-construction metaclass dispatch.
+
+==== 5. Ordering of carrier-specific operations
+
+Source inspection confirms the intended ordering:
+
+* `value == ""` follows the actual-String-family helper call;
+* `numpy.isnat(value)` follows the actual-`numpy.datetime64` helper call; and
+* `pandas.isna(value)` follows the actual native-numeric/`numpy.generic`
+  helper call.
+
+With ordinary opaque/spoofed values, independent monkey-patched probes left
+String equality, `numpy.isnat`, and `pandas.isna` call logs empty. The ordering
+therefore prevents candidate-level dispatch after ordinary negative
+membership. The unresolved issue is earlier: the family-establishment helper
+itself dispatches through a metaclass descriptor.
+
+==== 6. Required finding dispositions
+
+[cols="4,2,8",options="header"]
+|===
+|Finding |Verdict |Independent evidence
+
+|`TRUSTED-INGRESS-E1-REVIEW-F1`
+|NOT RESOLVED
+|The exact instance-`__class__` Number/String spoofs and raising lookup are
+fixed, with no candidate equality or other instance hook invoked. However,
+the replacement actual-MRO primitive executes a metaclass-owned `__mro__`
+descriptor. Its foreign exception escapes Phase D and E1, and the same hook
+regresses an actual supported `str` subclass from acceptance to failure. The
+required bounded membership mechanism and preserved real-subclass semantics
+are therefore not established.
+
+|`TRUSTED-INGRESS-E1-REVIEW-F2`
+|NOT RESOLVED
+|Ordinary hostile metaclass `__getattribute__` for `__name__` is bypassed, but
+`type.__getattribute__` invokes a metaclass-owned `__name__` descriptor.
+`UnsupportedScalarError(value)` executes that hook and propagates its
+`RuntimeError` instead of obtaining the real name or the constant fallback;
+the complete E1 path cannot guarantee its stable owned error.
+|===
+
+No separately numbered new finding is created. The metaclass-descriptor
+failures and the concrete actual-subclass regression are direct failures of
+the bounded carrier-classification and bounded-diagnostic obligations already
+owned by F1 and F2; duplicating them would not clarify correction ownership.
+
+==== 7. Semantic and diagnostics regression check
+
+Outside the hostile-metaclass descriptor shape, the six-member
+`ScalarCategory` vocabulary and ordinary carrier behavior are unchanged:
+Missing retains precedence; Boolean precedes Number; `numpy.timedelta64`
+remains uniformly unsupported; DateTime precedes Date; both current
+`FormulaSpec` variants reject; and `datetime.time`, `datetime.timedelta`, and
+`pandas.Timedelta` remain unsupported. Standard supported subclasses and all
+maintained native/NumPy/pandas carriers retain identity through E1.
+
+The complete ordinary hostile rejected-value matrix records zero calls to
+candidate `__repr__`, `__str__`, `__eq__`, `__hash__`, `__iter__`,
+`__array__`, or instance `__class__`, and zero calls to ordinary hostile
+metaclass `__name__`/`__mro__` overrides. Metaclass descriptors for `__name__`
+and `__mro__` fail as described above. This is a bounded deliberate-rejection
+guarantee only; it does not claim that arbitrary hostile Python can be made
+safe in-process.
+
+==== 8. Validation evidence
+
+[cols="4,7",options="header"]
+|===
+|Validation |Result
+
+|Shared scalar and E1 suites
+|127 passed: 79 shared scalar cases and 48 E1 scalar-admission cases.
+
+|Focused temporal/FormulaSpec regression set
+|205 passed across the shared/E1 suites, JSON/YAML roundtrips, FormulaSpec
+rendering and producer suites, and the formula-boundary architecture guard.
+
+|Architecture suite
+|156 passed.
+
+|Full active suite
+|`make test`: 2,415 passed, 1 marker deselected.
+
+|Hostile probes
+|All ordinary instance spoof/raising/protocol and ordinary hostile-metaclass
+override probes passed with empty hook logs. Metaclass descriptor probes
+reproduced foreign `RuntimeError` from both `__mro__` and `__name__`; a real
+`str` subclass with the `__mro__` descriptor also failed Phase D and E1.
+
+|Static and style checks
+|Focused Ruff passed. Source-style guardrails reported zero errors, with the
+existing 83 warnings and two allowlisted findings.
+
+|Render and diff checks
+|The correction FTR and complete review artifact render under Asciidoctor at
+failure level ERROR. `git diff --check` passes for the exact correction range
+and the review-only working diff.
+|===
+
+Passing maintained suites do not override the independently reproduced
+descriptor dispatch because the committed hostile-metaclass tests cover an
+overridden `__getattribute__`, not metaclass-owned descriptors.
+
+==== 9. E1 readiness and final verdict
+
+The correction remains narrow and contains no E2+ leakage. Ordinary carrier
+classification safety improves materially, error objects still retain no raw
+rejected value, and the standard six-category/identity semantics remain
+sound. E1 is not ready for acceptance because both claimed bounded primitives
+still execute user-controlled metaclass descriptors and one such descriptor
+regresses a genuine supported subclass. No speculative hardening is required
+by this verdict; only the current F1/F2 contract remains open. E2 stays
+blocked.
+
+[source,text]
+----
+E1 CHANGES REQUIRED —
+SCALAR SAFETY FINDINGS REMAIN OPEN.
+----
