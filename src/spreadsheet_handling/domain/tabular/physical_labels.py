@@ -91,10 +91,31 @@ def is_scalar_addressable_label(value: Any) -> bool:
     )
 
 
+def _label_diagnostic_detail(
+    labels: list[Any],
+    include_label_values: bool,
+    positional_detail: str,
+) -> str:
+    return f" {labels!r}" if include_label_values else positional_detail
+
+
+def _duplicate_labels(labels: list[Any]) -> list[Any]:
+    duplicates: list[Any] = []
+    seen: list[Any] = []
+    for label in labels:
+        if any(_values_equal(label, existing) for existing in seen):
+            if not any(_values_equal(label, existing) for existing in duplicates):
+                duplicates.append(label)
+        else:
+            seen.append(label)
+    return duplicates
+
+
 def ensure_unique_physical_column_labels(
     frame: pd.DataFrame,
     *,
     frame_name: str,
+    include_label_values: bool = True,
 ) -> None:
     """Reject physical column labels that cannot address a scalar field.
 
@@ -117,44 +138,53 @@ def ensure_unique_physical_column_labels(
 
     Validation runs before any pandas selection, equality-based membership,
     grouping, row indexing, metadata write, or cleanup scheduling.
+
+    ``include_label_values=False`` preserves the same predicate and rejection
+    categories while omitting label rendering for boundaries that must report
+    only safe structural context.
     """
     labels = frame.columns.tolist()
     missing = [label for label in labels if _is_missing_like(label)]
     if missing:
+        detail = _label_diagnostic_detail(
+            missing, include_label_values, " at one or more physical column positions"
+        )
         raise ValueError(
-            f"Frame {frame_name!r} has missing-like physical column label(s) "
-            f"{missing!r}; physical labels must be non-missing to address a "
+            f"Frame {frame_name!r} has missing-like physical column label(s)"
+            f"{detail}; physical labels must be non-missing to address a "
             "scalar column"
         )
     ambiguous = [label for label in labels if not _has_deterministic_equality(label)]
     if ambiguous:
+        detail = _label_diagnostic_detail(
+            ambiguous, include_label_values, " at one or more physical column positions"
+        )
         raise ValueError(
-            f"Frame {frame_name!r} has physical column label(s) with ambiguous "
-            f"equality {ambiguous!r}; physical labels must be deterministically "
+            f"Frame {frame_name!r} has physical column label(s) with ambiguous"
+            f" equality{detail}; physical labels must be deterministically "
             "comparable to address a scalar column"
         )
     unhashable = [label for label in labels if not _is_hashable(label)]
     if unhashable:
+        detail = _label_diagnostic_detail(
+            unhashable, include_label_values, " at one or more physical column positions"
+        )
         raise ValueError(
-            f"Frame {frame_name!r} has unhashable physical column label(s) "
-            f"{unhashable!r}; physical labels must be hashable to address a "
+            f"Frame {frame_name!r} has unhashable physical column label(s)"
+            f"{detail}; physical labels must be hashable to address a "
             "scalar column"
         )
     # Every remaining label compares with an unambiguous boolean, so this
     # equality-based duplicate detection is safe and stays non-hashing so
     # valid tuple labels are not rejected for being unhashable-by-value.
-    duplicates: list[Any] = []
-    seen: list[Any] = []
-    for label in labels:
-        if any(_values_equal(label, existing) for existing in seen):
-            if not any(_values_equal(label, existing) for existing in duplicates):
-                duplicates.append(label)
-        else:
-            seen.append(label)
+    duplicates = _duplicate_labels(labels)
     if duplicates:
+        detail = _label_diagnostic_detail(
+            duplicates, include_label_values, " at two or more physical column positions"
+        )
         raise ValueError(
-            f"Frame {frame_name!r} has duplicate physical column label(s) "
-            f"{duplicates!r}; duplicate columns cannot be addressed as "
+            f"Frame {frame_name!r} has duplicate physical column label(s)"
+            f"{detail}; duplicate columns cannot be addressed as "
             "scalar fields"
         )
 
