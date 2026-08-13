@@ -35,6 +35,31 @@ _FailureKind = Literal[
 _PayloadEntry = tuple[int, str, pd.DataFrame | ExactTable, _CarrierRole]
 
 
+def _actual_type_is_subclass_of(
+    candidate: object, accepted_types: tuple[type[Any], ...]
+) -> bool:
+    """Whether ``candidate``'s real runtime type descends from a fixed family.
+
+    Anchored by ``type(candidate)``, which reads the C-level type slot
+    directly and never consults a candidate instance's own ``__class__``
+    attribute/property -- so an opaque object cannot spoof membership by
+    overriding ``__class__``, and a raising ``__class__`` override is never
+    invoked at all (confirmed empirically for both RHS families used by this
+    module). ``issubclass`` then performs the ancestry test; its
+    customizable side is ``accepted_types``' own metaclass, and every
+    ``accepted_types`` entry actually passed by this module --
+    ``pandas.DataFrame`` and ``str`` -- uses the standard ``type`` metaclass
+    (verified: ``type(pd.DataFrame) is type`` and ``type(str) is type``), so
+    no candidate-side or RHS-side hook participates in proving membership for
+    these two closed families. This mirrors the bounded pattern
+    ``core.scalar_values._actual_type_is_subclass_of`` established for E1;
+    kept as a small local copy here (not a shared import) because widening
+    that private E1 helper's contract is not warranted for two duplicated
+    lines, and this module owns its own closed RHS families.
+    """
+    return issubclass(type(candidate), accepted_types)
+
+
 class OrdinaryStructureAdmissionError(TypeError):
     """A safe, positional E2 rejection with no rejected value or label."""
 
@@ -107,7 +132,7 @@ def _dispatch_payload_entries(frames: object) -> tuple[_PayloadEntry, ...]:
     for frame_ordinal, (frame_name, carrier) in enumerate(items):
         if frame_name == "_meta":
             continue
-        if isinstance(carrier, pd.DataFrame):
+        if _actual_type_is_subclass_of(carrier, (pd.DataFrame,)):
             payload_entries.append((frame_ordinal, frame_name, carrier, "dataframe"))
             continue
         if type(carrier) is ExactTable:
@@ -194,7 +219,7 @@ def _validate_exact_table_structure(
                 row_ordinal=row_ordinal,
             )
         for column_ordinal, cell in enumerate(row):
-            if not isinstance(cell, str):
+            if not _actual_type_is_subclass_of(cell, (str,)):
                 _raise_exact_structure_error(
                     "invalid_exact_table_header_cell",
                     frame_ordinal=frame_ordinal,

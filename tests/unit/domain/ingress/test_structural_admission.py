@@ -29,6 +29,31 @@ class _FramesSubclass(dict[str, object]):
     pass
 
 
+class _SpoofedClassProperty:
+    """Data descriptor so instance ``__class__`` lookup returns a fixed spoof.
+
+    A regular ``__class__`` assignment on a class body is intercepted by
+    Python itself; a descriptor is required to make instance ``__class__``
+    attribute access return an arbitrary object, the same technique the
+    independent E2 review used to reproduce F1/F2.
+    """
+
+    def __init__(self, spoofed_type: type) -> None:
+        self._spoofed_type = spoofed_type
+
+    def __get__(self, obj: object, owner: type | None = None) -> type:
+        return self._spoofed_type
+
+
+class _RaisingClassProperty:
+    """Data descriptor whose instance ``__class__`` lookup always raises."""
+
+    def __get__(  # pragma: no cover - must never run after correction
+        self, obj: object, owner: type | None = None
+    ) -> type:
+        raise RuntimeError("hostile __class__ lookup must not escape")
+
+
 def _exact_table(
     *,
     header_grid: tuple[tuple[Any, ...], ...] = (("left", "right"),),
@@ -554,3 +579,213 @@ def test_reserved_meta_root_is_recognized_without_e3_validation() -> None:
     assert admit_ordinary_frames(frames) is frames
     assert frames["_meta"] is metadata
     assert metadata["cyclic"] is metadata
+
+
+# --- TRUSTED-INGRESS-E2-REVIEW-F1: DataFrame-family classification -------
+
+
+def test_spoofed_dataframe_class_is_rejected_as_unsupported_top_level_carrier() -> None:
+    class _SpoofedDataFrame:
+        __class__ = _SpoofedClassProperty(pd.DataFrame)  # type: ignore[assignment]
+
+        @property
+        def columns(self) -> list[object]:  # pragma: no cover - must never run
+            raise AssertionError("columns must not be read for an opaque candidate")
+
+    with pytest.raises(OrdinaryStructureAdmissionError) as excinfo:
+        admit_ordinary_frames({"spoof": _SpoofedDataFrame()})
+
+    _assert_error(
+        excinfo,
+        kind="unsupported_top_level_carrier",
+        carrier_role="frames",
+        frame_ordinal=0,
+        frame_name="spoof",
+    )
+
+
+def test_raising_dataframe_class_lookup_rejects_without_a_foreign_exception() -> None:
+    class _RaisingDataFrameClass:
+        __class__ = _RaisingClassProperty()  # type: ignore[assignment]
+
+    with pytest.raises(OrdinaryStructureAdmissionError) as excinfo:
+        admit_ordinary_frames({"raiser": _RaisingDataFrameClass()})
+
+    assert excinfo.value.kind == "unsupported_top_level_carrier"
+
+
+def test_dataframe_class_spoof_can_no_longer_mutate_frames_during_membership_test() -> None:
+    hook_calls: list[str] = []
+    frames: dict[str, object] = {}
+
+    class _MutatingClassProperty:
+        def __get__(  # pragma: no cover - must never run after correction
+            self, obj: object, owner: type | None = None
+        ) -> type:
+            hook_calls.append("class")
+            frames["poisoned"] = object()
+            return pd.DataFrame
+
+    class _MutatingCandidate:
+        __class__ = _MutatingClassProperty()  # type: ignore[assignment]
+
+    frames["mutator"] = _MutatingCandidate()
+
+    with pytest.raises(OrdinaryStructureAdmissionError):
+        admit_ordinary_frames(frames)
+
+    assert hook_calls == []
+    assert tuple(frames) == ("mutator",)
+
+
+def test_genuine_dataframe_subclass_still_admits() -> None:
+    class _DataFrameSubclass(pd.DataFrame):
+        pass
+
+    subclass_frame = _DataFrameSubclass({"a": [1]})
+
+    assert admit_ordinary_frames({"sub": subclass_frame})["sub"] is subclass_frame
+
+
+def test_genuine_dataframe_subclass_with_hostile_class_hook_admits_without_invoking_it() -> None:
+    class _HostileClassHookDataFrame(pd.DataFrame):
+        @property
+        def __class__(self) -> type:  # pragma: no cover - must never run
+            raise AssertionError("instance __class__ lookup must not run for a genuine subclass")
+
+    subclass_frame = _HostileClassHookDataFrame({"a": [1]})
+
+    result = admit_ordinary_frames({"hostile": subclass_frame})
+
+    assert result["hostile"] is subclass_frame
+
+
+def test_genuine_hostile_metaclass_dataframe_subclass_admits_without_metaclass_hooks() -> None:
+    class _HostileMeta(type):
+        def __subclasscheck__(  # pragma: no cover - must never run
+            cls, subclass: type
+        ) -> bool:
+            raise AssertionError("metaclass __subclasscheck__ must not run for a fixed RHS")
+
+        def __instancecheck__(  # pragma: no cover - must never run
+            cls, instance: object
+        ) -> bool:
+            raise AssertionError("metaclass __instancecheck__ must not run for a fixed RHS")
+
+    class _HostileMetaclassDataFrame(pd.DataFrame, metaclass=_HostileMeta):
+        pass
+
+    subclass_frame = _HostileMetaclassDataFrame({"a": [1]})
+
+    result = admit_ordinary_frames({"hostile-meta": subclass_frame})
+
+    assert result["hostile-meta"] is subclass_frame
+
+
+def test_unsupported_candidate_rejects_before_any_dataframe_like_operation() -> None:
+    """Complete-path atomicity retest: no candidate-owned operation runs."""
+    calls: list[str] = []
+
+    class _ProtocolBomb:
+        def __getattribute__(self, name: str) -> object:
+            if name == "__class__":  # pragma: no cover - must never run
+                calls.append("class")
+                raise AssertionError("instance __class__ lookup must not run")
+            return object.__getattribute__(self, name)
+
+        def __repr__(self) -> str:  # pragma: no cover - must never run
+            calls.append("repr")
+            raise AssertionError("repr must not run")
+
+        def __iter__(self):  # pragma: no cover - must never run
+            calls.append("iter")
+            raise AssertionError("iteration must not run")
+
+    bomb = _ProtocolBomb()
+    metadata = {"legend_blocks": {"sheet": [{"title": "untouched"}]}}
+    frames = {"bomb": bomb, "_meta": metadata}
+    keys_before = tuple(frames)
+
+    with pytest.raises(OrdinaryStructureAdmissionError) as excinfo:
+        admit_ordinary_frames(frames)
+
+    _assert_error(
+        excinfo,
+        kind="unsupported_top_level_carrier",
+        carrier_role="frames",
+        frame_ordinal=0,
+        frame_name="bomb",
+    )
+    assert calls == []
+    assert tuple(frames) == keys_before
+    assert frames["bomb"] is bomb
+    assert frames["_meta"] is metadata
+
+
+# --- TRUSTED-INGRESS-E2-REVIEW-F2: ExactTable header String-family -------
+
+
+def test_spoofed_header_class_is_rejected_as_invalid_header_cell() -> None:
+    class _SpoofedHeader:
+        __class__ = _SpoofedClassProperty(str)  # type: ignore[assignment]
+
+    header = _SpoofedHeader()
+    table = _exact_table(header_grid=((header,),), data=((1,),), n_cols=1)
+
+    with pytest.raises(OrdinaryStructureAdmissionError) as excinfo:
+        admit_ordinary_frames({"exact": table})
+
+    _assert_error(
+        excinfo,
+        kind="invalid_exact_table_header_cell",
+        carrier_role="exact_table",
+        frame_ordinal=0,
+        frame_name="exact",
+        row_ordinal=0,
+        column_ordinal=0,
+    )
+    assert "exact" in str(excinfo.value)
+    assert repr(header) not in str(excinfo.value)
+
+
+def test_raising_header_class_lookup_rejects_without_a_foreign_exception() -> None:
+    class _RaisingHeader:
+        __class__ = _RaisingClassProperty()  # type: ignore[assignment]
+
+    table = _exact_table(header_grid=((_RaisingHeader(),),), data=((1,),), n_cols=1)
+
+    with pytest.raises(OrdinaryStructureAdmissionError) as excinfo:
+        admit_ordinary_frames({"exact": table})
+
+    assert excinfo.value.kind == "invalid_exact_table_header_cell"
+
+
+def test_ordinary_and_empty_string_headers_still_admit() -> None:
+    ordinary = _exact_table(header_grid=(("left",),), data=((1,),), n_cols=1)
+    empty = _exact_table(header_grid=(("",),), data=((1,),), n_cols=1)
+
+    assert admit_ordinary_frames({"exact": ordinary})["exact"] is ordinary
+    assert admit_ordinary_frames({"exact": empty})["exact"] is empty
+
+
+def test_genuine_string_subclass_header_admits_without_invoking_hostile_hooks() -> None:
+    class _HostileStringSubclass(str):
+        def __repr__(self) -> str:  # pragma: no cover - must never run
+            raise AssertionError("repr must not run")
+
+        def __str__(self) -> str:  # pragma: no cover - must never run
+            raise AssertionError("str must not run")
+
+        def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
+            raise AssertionError("equality must not run")
+
+        def __hash__(self) -> int:  # pragma: no cover - must never run
+            raise AssertionError("hashing must not run")
+
+    header = _HostileStringSubclass("left")
+    table = _exact_table(header_grid=((header,),), data=((1,),), n_cols=1)
+
+    result = admit_ordinary_frames({"exact": table})
+
+    assert result["exact"] is table
+    assert result["exact"].header_grid[0][0] is header
