@@ -1,7 +1,9 @@
 """Package-private leaf primitives for the ``xref_crosstable`` package.
 
-Owns narrow guards, metadata selection and ambiguity handling, carrier-stable
-identity validation, and private aliases to shared tabular validators.
+Owns narrow guards, metadata selection and ambiguity handling, two distinct
+carrier-stable validation families (matrix-axis identities; durable
+selector-reference nomination), and private aliases to shared tabular
+validators.
 """
 from __future__ import annotations
 
@@ -61,6 +63,53 @@ def _ensure_flat_axis_labels(values: Iterable[Any], field_name: str) -> None:
         raise ValueError(
             f"{field_name} contains tuple labels {unsupported!r}; "
             "FTR-XREF-CROSSTABLE first slice requires flat labels"
+        )
+
+
+def _is_durable_selector_reference(value: Any) -> bool:
+    """True when ``value`` is an exact, non-empty native ``str``.
+
+    A physical column label keeps the broad, unchanged physical-label
+    contract everywhere it addresses a DataFrame column as ordinary data.
+    The moment a label is *nominated* as an XRef ``row_keys`` or dense-axis
+    ``key``/``keys`` selector -- directly, or inherited through Compact
+    Multiaxis's forwarding -- it is also persisted as ``_meta`` selector
+    Intent, so it must additionally survive a frame-plus-metadata round trip
+    with type fidelity. Only an exact native ``str`` does that on every
+    currently maintained carrier; ``type(value) is str`` (not ``isinstance``)
+    excludes both a ``str`` subclass and ``numpy.str_``. Whitespace-only
+    strings are ordinary carrier-stable strings and are accepted -- this is
+    a deliberately different whitespace rule than the matrix-axis identity
+    contract below.
+    """
+    return type(value) is str and value != ""
+
+
+def _ensure_selector_reference_labels(values: Iterable[Any], field_name: str) -> None:
+    """Enforce the XRef durable selector-reference contract on nominated labels.
+
+    A narrow, family-specific qualification layered *after* the existing
+    physical-label / flat-axis / uniqueness checks for one role only: a
+    physical label nominated as a ``row_keys`` or dense-axis ``key``/``keys``
+    selector. This is not the general physical-label contract (unchanged
+    everywhere else) and not the matrix-axis identity contract
+    (:func:`_ensure_column_identity_values`). A rejected candidate is never
+    inspected -- no ``repr``, ``str``, equality, hashing, or iteration is
+    performed on it; only its position in ``values`` is reported.
+    """
+    invalid_positions = [
+        position
+        for position, value in enumerate(values)
+        if not _is_durable_selector_reference(value)
+    ]
+    if invalid_positions:
+        raise ValueError(
+            f"{field_name} must contain exact, non-empty native str selector "
+            f"reference(s); value(s) at position(s) {invalid_positions!r} are "
+            "not. A physical label nominated as an XRef selector is "
+            "persisted as _meta intent and must be carrier-stable across "
+            "every maintained carrier; non-nominated physical columns keep "
+            "the broader physical-label contract unchanged."
         )
 
 

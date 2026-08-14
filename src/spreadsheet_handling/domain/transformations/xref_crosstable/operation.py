@@ -27,6 +27,7 @@ from .primitives import (
     _ensure_column_identity_values,
     _ensure_columns,
     _ensure_flat_axis_labels,
+    _ensure_selector_reference_labels,
     _ensure_unique_field_list,
     _ensure_unique_physical_labels,
     _ordered_values_equal,
@@ -68,6 +69,12 @@ def expand_xref(
     Column identities follow the carrier-stable contract: duplicate
     physical matrix labels are rejected before expansion, and the expanded
     labels must be unique, non-empty strings.
+
+    ``row_keys`` selects physical frame columns and is also persisted as
+    ``_meta`` selector Intent, so each entry must be an exact, non-empty
+    native ``str`` (the durable selector-reference contract); a physical
+    column not nominated as a selector keeps the broader physical-label
+    contract unchanged.
     """
     config_id = name or output
     if drop_source and matrix == output:
@@ -84,6 +91,9 @@ def expand_xref(
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
     _ensure_unique_field_list(row_key_cols, field_name="row_keys")
+    # row_keys is nominated as a durable XRef selector reference the moment it
+    # is configured: it rides into _meta.xref_crosstable.<id>.row_keys below.
+    _ensure_selector_reference_labels(row_key_cols, "row_keys")
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
     # Load and physical-validate the base relation before any output-name set
     # construction or membership: a configured physical base field
@@ -241,6 +251,12 @@ def contract_xref(
     ``column_key`` values and every column-identity source (explicit,
     metadata-derived, dense-derived) are validated before the matrix is
     built.
+
+    ``row_keys`` selects physical frame columns and is also persisted as
+    ``_meta`` selector Intent, so each entry must be an exact, non-empty
+    native ``str`` (the durable selector-reference contract); a physical
+    column not nominated as a selector keeps the broader physical-label
+    contract unchanged.
     """
     config_id = name or relation
     if drop_source and relation == output:
@@ -252,6 +268,9 @@ def contract_xref(
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
     _ensure_unique_field_list(row_key_cols, field_name="row_keys")
+    # row_keys is nominated as a durable XRef selector reference the moment it
+    # is configured: it rides into _meta.xref_crosstable.<id>.row_keys below.
+    _ensure_selector_reference_labels(row_key_cols, "row_keys")
     _ensure_columns(
         source,
         [*row_key_cols, column_key, value],

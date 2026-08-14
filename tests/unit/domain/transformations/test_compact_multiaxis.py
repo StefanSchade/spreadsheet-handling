@@ -22,6 +22,7 @@ pytestmark = [
     pytest.mark.ftr("FTR-COMPACT-MULTIAXIS"),
     pytest.mark.ftr("FTR-COMPACT-MULTIAXIS-META-PERSISTENCE-CORRECTION-P5"),
 ]
+SELECTOR_FTR = pytest.mark.ftr("FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A")
 
 
 def _legend_meta() -> dict:
@@ -950,3 +951,69 @@ def test_trace_and_final_cleanup_contain_only_public_frame_names() -> None:
     assert "pipeline_cleanup" not in cleaned["_meta"]
     assert set(cleaned) == {"matrix", "explicit", "_meta"}
     _assert_no_internal_temp_reference(cleaned["_meta"])
+
+
+@SELECTOR_FTR
+class TestDurableSelectorReferenceInheritance:
+    """Compact Multiaxis inherits the XRef durable selector-reference contract.
+
+    FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A section 7.2: both
+    composites build ``row_key_cols`` and forward it into the real
+    ``expand_xref``/``contract_xref`` seam *before* writing their own
+    ``_meta.compact_multiaxis.<id>.row_keys`` copy, so a non-conforming
+    selector is rejected by the inner XRef call and no independent, invalid
+    Compact-Multiaxis trace is ever written. These tests verify that
+    inheritance directly rather than inferring it from a code read.
+    """
+
+    def test_contract_compact_multiaxis_accepts_valid_str_row_key_selector(self) -> None:
+        frames = {
+            "explicit": pd.DataFrame([
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+            ]),
+        }
+
+        out = contract_compact_multiaxis(
+            frames, relation="explicit", output="matrix", row_keys=["feature_id"]
+        )
+
+        assert out["_meta"]["compact_multiaxis"]["explicit"]["row_keys"] == ["feature_id"]
+
+    def test_contract_compact_multiaxis_rejects_non_str_row_key_before_own_meta_write(
+        self,
+    ) -> None:
+        # Physical column 7 exists on the source frame (Class A, unchanged)
+        # so the rejection below is proven to come from the row_keys
+        # selector-reference contract, not from a missing-column error.
+        frames = {
+            "explicit": pd.DataFrame([
+                {7: "f1", "column_key": "A", "code": "E"},
+            ]),
+        }
+
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_compact_multiaxis(
+                frames, relation="explicit", output="matrix", row_keys=[7]
+            )
+
+        # No independent invalid trace: the inner XRef seam raised first, so
+        # neither xref_crosstable nor compact_multiaxis metadata was written.
+        assert "_meta" not in frames
+
+    def test_expand_compact_multiaxis_rejects_non_str_row_key_before_own_meta_write(
+        self,
+    ) -> None:
+        frames = {
+            "product_matrix": pd.DataFrame({"feature_id": ["f1"], "P-001": ["E"]}),
+        }
+
+        with pytest.raises(ValueError, match="selector reference"):
+            expand_compact_multiaxis(
+                frames,
+                matrix="product_matrix",
+                output="feature_product_codes",
+                row_keys=[7],
+                value_columns=["P-001"],
+            )
+
+        assert "_meta" not in frames

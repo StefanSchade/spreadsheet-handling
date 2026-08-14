@@ -18,6 +18,7 @@ from .primitives import (
     _ensure_column_identity_values,
     _ensure_columns,
     _ensure_flat_axis_labels,
+    _ensure_selector_reference_labels,
     _ordered_values_equal,
     _require_frame,
     _xref_config,
@@ -120,6 +121,10 @@ def _axis_source_config(
         raise ValueError(f"{field_name} must configure key or keys explicitly")
 
     _ensure_flat_axis_labels(keys, f"{field_name}.key")
+    # A dense-axis key/keys selector is a physical-frame reference that is
+    # also persisted as _meta selector Intent (rows_from/columns_from), so it
+    # is subject to the same durable selector-reference contract as row_keys.
+    _ensure_selector_reference_labels(keys, f"{field_name}.key")
     if not allow_multiple and len(keys) != 1:
         raise ValueError(f"{field_name}.key must identify exactly one flat axis column")
     config: dict[str, Any] = {"frame": frame}

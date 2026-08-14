@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +19,7 @@ from spreadsheet_handling.domain.transformations.xref_crosstable.primitives impo
 
 pytestmark = pytest.mark.ftr("FTR-XREF-CROSSTABLE")
 DENSE_FTR = pytest.mark.ftr("FTR-XREF-DENSE-AXES-P4A2")
+SELECTOR_FTR = pytest.mark.ftr("FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A")
 
 
 class TestXRefFramesMetaBridgeContract:
@@ -2316,3 +2321,193 @@ class TestProducerReplacementAndLegacySediment:
             "matrix": "other_matrix",
             "operation": "legacy",
         }
+
+
+class _StrSubclass(str):
+    """A str subclass; ``type(value) is str`` deliberately excludes it."""
+
+
+@dataclass(frozen=True, order=True)
+class _StableComparableLabel:
+    """A stable, hashable, deterministically comparable custom label.
+
+    Satisfies the general physical-label predicate (Class A) but is not a
+    native str, so it must be rejected in the selector-nomination role.
+    """
+
+    value: str
+
+
+def _unsupported_selector_cases() -> list[Any]:
+    """Every previously-mechanically-accepted non-str selector family (FTR-9.G)."""
+    return [
+        pytest.param("", id="empty-string"),
+        pytest.param(7, id="int"),
+        pytest.param(True, id="bool"),
+        pytest.param(3.5, id="float"),
+        pytest.param(date(2024, 1, 1), id="date"),
+        pytest.param(datetime(2024, 1, 1, 12, 0), id="datetime"),
+        pytest.param(np.int64(7), id="numpy-int64"),
+        pytest.param(np.float64(3.5), id="numpy-float64"),
+        pytest.param(np.bool_(True), id="numpy-bool"),
+        pytest.param(np.str_("region"), id="numpy-str"),
+        pytest.param(pd.Timestamp("2024-01-01"), id="pandas-timestamp"),
+        pytest.param(b"region", id="bytes"),
+        pytest.param(3 + 4j, id="complex"),
+        pytest.param(frozenset({1, 2, 3}), id="frozenset"),
+        pytest.param(_StableComparableLabel("region"), id="custom-comparable-object"),
+        pytest.param(_StrSubclass("region"), id="str-subclass"),
+    ]
+
+
+@SELECTOR_FTR
+class TestDurableSelectorReferenceContract:
+    """XRef ``row_keys`` / dense-axis ``key``/``keys`` are durable selectors.
+
+    FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A: the moment a physical
+    label is nominated as a ``row_keys`` or dense-axis ``key``/``keys``
+    selector it rides into persisted ``_meta`` Intent and must additionally
+    be an exact, non-empty native ``str``. This is narrower than the general
+    physical-label contract exercised by ``TestMissingLikePhysicalLabelBoundary``
+    above, which is unchanged for columns that are not nominated as a
+    selector.
+    """
+
+    @staticmethod
+    def _relation() -> pd.DataFrame:
+        return pd.DataFrame([
+            {"region": "north", "column_key": "q1", "value": 10},
+            {"region": "south", "column_key": "q1", "value": 20},
+        ])
+
+    # -- positive boundary -------------------------------------------------
+
+    def test_contract_xref_accepts_exact_non_empty_str_row_key(self) -> None:
+        out = contract_xref(
+            {"rel": self._relation()}, relation="rel", output="matrix", row_keys=["region"]
+        )
+        assert out["_meta"]["xref_crosstable"]["rel"]["row_keys"] == ["region"]
+
+    def test_contract_xref_accepts_numeric_looking_str_row_key(self) -> None:
+        frames = {"rel": pd.DataFrame([{"7": "r1", "column_key": "q1", "value": 1}])}
+        out = contract_xref(frames, relation="rel", output="matrix", row_keys=["7"])
+        assert out["_meta"]["xref_crosstable"]["rel"]["row_keys"] == ["7"]
+
+    def test_contract_xref_accepts_composite_str_row_keys(self) -> None:
+        frames = {
+            "rel": pd.DataFrame([
+                {"region": "north", "category": "A", "column_key": "q1", "value": 1},
+            ])
+        }
+        out = contract_xref(
+            frames, relation="rel", output="matrix", row_keys=["region", "category"]
+        )
+        assert out["_meta"]["xref_crosstable"]["rel"]["row_keys"] == ["region", "category"]
+
+    def test_contract_xref_accepts_whitespace_only_str_row_key(self) -> None:
+        # Section 7.2: whitespace-only strings are ordinary carrier-stable
+        # strings for this role; the matrix-axis-identity whitespace rule is
+        # deliberately not imported here.
+        frames = {"rel": pd.DataFrame([{"   ": "r1", "column_key": "q1", "value": 1}])}
+        out = contract_xref(frames, relation="rel", output="matrix", row_keys=["   "])
+        assert out["_meta"]["xref_crosstable"]["rel"]["row_keys"] == ["   "]
+
+    # -- negative boundary: row_keys at both operation seams ---------------
+
+    @pytest.mark.parametrize("value", _unsupported_selector_cases())
+    def test_contract_xref_rejects_non_str_row_key(self, value: Any) -> None:
+        frames = {"rel": self._relation()}
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(frames, relation="rel", output="matrix", row_keys=[value])
+        assert "_meta" not in frames
+
+    @pytest.mark.parametrize("value", _unsupported_selector_cases())
+    def test_expand_xref_rejects_non_str_row_key(self, value: Any) -> None:
+        frames = {"matrix": pd.DataFrame([{"region": "north", "q1": 10}])}
+        with pytest.raises(ValueError, match="selector reference"):
+            expand_xref(frames, matrix="matrix", output="rel", row_keys=[value])
+        assert "_meta" not in frames
+
+    # -- negative boundary: dense-axis key/keys share the same helper ------
+
+    @DENSE_FTR
+    @pytest.mark.parametrize("value", _unsupported_selector_cases())
+    def test_dense_rows_from_key_rejects_non_str_selector(self, value: Any) -> None:
+        frames = {
+            "resources": pd.DataFrame({"resource_key": ["r1"]}),
+            "values": pd.DataFrame([{"resource_key": "r1", "column_key": "q1", "value": 10}]),
+        }
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(
+                frames,
+                relation="values",
+                output="matrix",
+                row_keys=["resource_key"],
+                dense_axes={"rows_from": {"frame": "resources", "key": value}},
+            )
+        assert "_meta" not in frames
+
+    @DENSE_FTR
+    def test_dense_rows_from_keys_list_form_rejects_non_str_selector(self) -> None:
+        frames = {
+            "resources": pd.DataFrame({"resource_key": ["r1"], "period": ["p1"]}),
+            "values": pd.DataFrame([{"resource_key": "r1", "column_key": "q1", "value": 10}]),
+        }
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(
+                frames,
+                relation="values",
+                output="matrix",
+                row_keys=["resource_key"],
+                dense_axes={"rows_from": {"frame": "resources", "keys": [7]}},
+            )
+        assert "_meta" not in frames
+
+    @DENSE_FTR
+    def test_dense_columns_from_key_rejects_non_str_selector(self) -> None:
+        frames = {
+            "resources": pd.DataFrame({"resource_key": ["r1"]}),
+            "values": pd.DataFrame([{"resource_key": "r1", "column_key": "q1", "value": 10}]),
+        }
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(
+                frames,
+                relation="values",
+                output="matrix",
+                row_keys=["resource_key"],
+                dense_axes={"columns_from": {"frame": "resources", "key": 7}},
+            )
+        assert "_meta" not in frames
+
+    # -- adversarial safe-diagnostic proof ----------------------------------
+
+    def test_rejection_never_invokes_hostile_candidate_protocols(self) -> None:
+        calls: list[str] = []
+
+        class _ProtocolBomb:
+            def __repr__(self) -> str:  # pragma: no cover - must never run
+                calls.append("repr")
+                raise AssertionError("repr must not run")
+
+            def __str__(self) -> str:  # pragma: no cover - must never run
+                calls.append("str")
+                raise AssertionError("str must not run")
+
+            def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
+                calls.append("eq")
+                raise AssertionError("equality must not run")
+
+            def __hash__(self) -> int:  # pragma: no cover - must never run
+                calls.append("hash")
+                raise AssertionError("hashing must not run")
+
+            def __iter__(self):  # pragma: no cover - must never run
+                calls.append("iter")
+                raise AssertionError("iteration must not run")
+
+        bomb = _ProtocolBomb()
+        frames = {"rel": self._relation()}
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(frames, relation="rel", output="matrix", row_keys=[bomb])
+        assert calls == []
+        assert "_meta" not in frames
