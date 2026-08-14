@@ -20,6 +20,20 @@ merely because a ``legend_blocks`` member was present. Every test below
 proves the corrected delegate leaves such a container untouched, so the
 same generic ``metadata_substrate`` rejection applies with or without the
 named subtree.
+
+Residual F1 (bounded follow-up review `6a6e8375e2a449700dc9c5a53e59916ffb3770a5`):
+the first correction's `_safe_find_str_key` made every *lookup* safe, but
+three staging/reconstruction sites still re-hashed or re-compared a rejected
+key merely by copying it into a *different* dict object -- the root
+`new_meta[_ROOT_KEY] = ...` assignment (candidate `__eq__` during native
+collision resolution), `_strip_resolved`'s dict comprehension (candidate
+`__hash__` on re-insertion), and `_normalize_mapping`'s
+`normalized[name] = ...` (candidate `__hash__` on re-insertion). The tests in
+the dedicated section below arm the hostile hook only *after* fixture
+construction (which may itself legitimately need one safe `__hash__` call)
+and prove each staging site now preflights every relevant dict's keys as
+exact `str` before attempting any reconstruction, bailing out to the
+unmodified generic post-check instead.
 """
 
 from __future__ import annotations
@@ -164,6 +178,125 @@ def test_custom_mapping_legend_root_triggers_zero_mapping_protocol_calls():
         run_domain_ingress(frames)
 
     assert proto_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Residual F1: staging/reconstruction must not re-hash or re-compare a
+# rejected key merely by copying it into a different dict object.
+# ---------------------------------------------------------------------------
+
+
+def test_root_sibling_collision_with_active_legend_member_triggers_zero_eq_calls():
+    # Unlike test_colliding_hostile_root_key_triggers_zero_eq_calls above,
+    # this root ALSO carries a legitimate "legend_blocks" member, which
+    # activates the delegate's staging/reconstruction path (`dict(meta)`
+    # followed by `new_meta[_ROOT_KEY] = ...`) -- the specific site the
+    # first correction's `_safe_find_str_key` did not cover.
+    calls: list[Any] = []
+
+    class HostileKey:
+        def __init__(self) -> None:
+            self._armed = False
+
+        def __hash__(self) -> int:
+            return hash("legend_blocks")
+
+        def __eq__(self, other: object) -> bool:
+            if self._armed:  # pragma: no cover - must never run
+                calls.append(("eq", other))
+                raise RuntimeError("hostile eq must not run")
+            return False
+
+    key = HostileKey()
+    frames = {"_meta": {key: "x", "legend_blocks": {"s": {"entries": []}}}}
+    key._armed = True  # arm only after fixture construction
+    calls.clear()
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        run_domain_ingress(frames)
+
+    assert excinfo.value.kind == "unsupported_metadata_key"
+    assert calls == []
+
+
+def test_list_form_block_extra_key_triggers_zero_ingress_time_hash_calls():
+    hash_calls: list[str] = []
+
+    class HostileBlockKey:
+        def __init__(self) -> None:
+            self._armed = False
+
+        def __hash__(self) -> int:
+            if self._armed:  # pragma: no cover - must never run
+                hash_calls.append("hash")
+                raise RuntimeError("hostile hash must not run")
+            return 12345
+
+        def __eq__(self, other: object) -> bool:
+            return False
+
+    key = HostileBlockKey()
+    item = {"name": "s", "entries": [], key: "extra"}
+    frames = {"_meta": {"legend_blocks": [item]}}
+    key._armed = True  # arm only after fixture construction
+    hash_calls.clear()
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        run_domain_ingress(frames)
+
+    assert excinfo.value.kind == "unsupported_metadata_key"
+    assert hash_calls == []
+
+
+def test_mapping_form_outer_key_triggers_zero_ingress_time_hash_calls():
+    hash_calls: list[str] = []
+
+    class HostileOuterKey:
+        def __init__(self) -> None:
+            self._armed = False
+
+        def __hash__(self) -> int:
+            if self._armed:  # pragma: no cover - must never run
+                hash_calls.append("hash")
+                raise RuntimeError("hostile hash must not run")
+            return 54321
+
+        def __eq__(self, other: object) -> bool:
+            return False
+
+    key = HostileOuterKey()
+    frames = {"_meta": {"legend_blocks": {key: {"entries": []}}}}
+    key._armed = True  # arm only after fixture construction
+    hash_calls.clear()
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        run_domain_ingress(frames)
+
+    assert excinfo.value.kind == "unsupported_metadata_key"
+    assert hash_calls == []
+
+
+def test_safe_staging_still_normalizes_when_every_key_is_admitted():
+    # Positive companion: the new preflights must not block ordinary staging
+    # when every relevant key really is an exact str.
+    sheets = {"Data": {"freeze_header": True}}
+    shared_entries = [{"token": "A"}]
+    frames = {
+        "_meta": {
+            "sheets": sheets,
+            "legend_blocks": [
+                {"name": "s", "entries": shared_entries, "resolved": {"top": 1}},
+            ],
+        }
+    }
+
+    out = run_domain_ingress(frames)
+
+    blocks = out["_meta"]["legend_blocks"]
+    assert set(blocks) == {"s"}
+    assert "resolved" not in blocks["s"]
+    assert blocks["s"]["entries"] is shared_entries
+    assert out["_meta"]["sheets"] is sheets
 
 
 # ---------------------------------------------------------------------------

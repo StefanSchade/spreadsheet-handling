@@ -23,7 +23,8 @@ canonicalizes the block-container shape and drops the render-derived
 
 Bounded named-delegate authority (`FTR-TRUSTED-INGRESS-P4A` section 11,
 "Controlled metadata delegate governance"; `TRUSTED-INGRESS-E3-IMPL-REVIEW-F1`/
-`-F2` correction): this delegate owns *authoring shape* for exactly the
+`-F2` correction, with a bounded residual-F1 staging follow-up): this
+delegate owns *authoring shape* for exactly the
 ``_meta.legend_blocks`` root, not the global metadata substrate. It is
 authorized to accept the two authoring forms above -- an exact ``dict`` or an
 exact ``list`` -- nothing else. A ``dict``/``list`` *subclass*, a ``Mapping``
@@ -56,6 +57,14 @@ that attribute read; they name only the stable failure shape and (where
 applicable) a safe positional location, matching the diagnostic discipline
 already established by ``core.scalar_values`` and
 ``domain.ingress.structural_admission``.
+
+Safe lookup is not sufficient by itself: every place this module *stages* a
+new dict from an already-admitted one (copying an exact ``_meta``/
+``legend_blocks``/block ``dict`` and inserting into it, or comprehending one
+into a fresh dict) re-hashes or re-compares whichever of its own keys
+participate in that reconstruction, even a key that was found perfectly
+safely a moment earlier. See ``_all_keys_are_exact_str``, run as a preflight
+before every such reconstruction.
 """
 
 from __future__ import annotations
@@ -68,6 +77,29 @@ _ROOT_KEY = "legend_blocks"
 _NAME_KEY = "name"
 _ID_KEY = "id"
 _RESOLVED_KEY = "resolved"
+
+
+def _all_keys_are_exact_str(mapping: dict[Any, Any]) -> bool:
+    """Whether every key of an already-confirmed exact ``dict`` is exact ``str``.
+
+    Only ever evaluates ``type(key) is str`` -- never hashes, compares,
+    formats, or iterates an unclassified key's own protocols. This must run
+    as a preflight *before* any staging operation that reconstructs, copies,
+    or inserts into a *different* dict object using ``mapping``'s own keys
+    (``dict(mapping)`` followed by a keyed assignment, a dict comprehension
+    over ``mapping.items()``, or ``target[key] = ...`` for a ``key`` drawn
+    from ``mapping``). ``mapping`` already safely holding an unclassified key
+    is not by itself enough: Python re-hashes/re-compares a key every time it
+    participates in inserting or looking something up in a *different* dict,
+    which can invoke a rejected candidate's own ``__hash__``/``__eq__`` again
+    during that later staging step, even though the original lookup that
+    found ``mapping``'s relevant entry was itself safe. ``mapping`` must
+    already be confirmed ``type(mapping) is dict`` by the caller.
+    """
+    for key in mapping:
+        if type(key) is not str:
+            return False
+    return True
 
 
 def _safe_find_str_key(mapping: dict[Any, Any], target: str) -> tuple[bool, Any]:
@@ -112,6 +144,13 @@ def normalize_legend_blocks_shape(frames: Frames) -> Frames:
         # contain a legend_blocks member would launder it into the accepted
         # substrate outside this delegate's authorized scope.
         return frames
+    if not _all_keys_are_exact_str(meta):
+        # An unsupported sibling root key would be re-hashed/re-compared by
+        # the `new_meta[_ROOT_KEY] = ...` staging assignment below, even
+        # though `dict(meta)` itself is safe and even though a legitimate
+        # "legend_blocks" member may be present. Leave the whole root
+        # untouched for the generic walker's ordinal-key rejection.
+        return frames
 
     found, raw = _safe_find_str_key(meta, _ROOT_KEY)
     if not found:
@@ -126,7 +165,7 @@ def normalize_legend_blocks_shape(frames: Frames) -> Frames:
     return new_frames
 
 
-def _normalize_root(raw: Any) -> dict[str, Any]:
+def _normalize_root(raw: Any) -> Any:
     if raw is None:
         return {}
     if type(raw) is dict:
@@ -136,7 +175,13 @@ def _normalize_root(raw: Any) -> dict[str, Any]:
     raise ValueError("_meta.legend_blocks must be a mapping or a list of mappings")
 
 
-def _normalize_mapping(raw: dict[str, Any]) -> dict[str, Any]:
+def _normalize_mapping(raw: dict[str, Any]) -> Any:
+    if not _all_keys_are_exact_str(raw):
+        # An unsupported Legend identity key would be re-hashed by inserting
+        # it into the fresh `normalized` dict below. Leave the whole
+        # mapping-form root untouched (no reconstruction attempted at all)
+        # so the generic walker rejects that key at its own ordinal path.
+        return raw
     normalized: dict[str, Any] = {}
     for name, block in raw.items():
         normalized[name] = _strip_resolved(block)
@@ -186,16 +231,20 @@ def _strip_resolved(block: Any) -> Any:
         # (no reconstruction) rather than laundering a Mapping/dict-subclass
         # into an exact dict -- the generic walker rejects it uniformly.
         return block
-    # Shallow copy that drops `resolved` while preserving field order. Nested
-    # containers (entries, placement) are shared but never mutated here. The
-    # key comparison is type-guarded before `==` so an unclassified block key
-    # (which the generic walker will reject on its own path) never has its
-    # `__eq__` invoked here.
-    return {
-        key: value
-        for key, value in block.items()
-        if not (type(key) is str and key == _RESOLVED_KEY)
-    }
+    if not _all_keys_are_exact_str(block):
+        # An unsupported block key would be re-hashed merely by being copied
+        # into the comprehension's fresh dict below, even though it is only
+        # ever *compared* to "resolved" when already known str. Leave the
+        # entire block untouched (including any "resolved" field) so the
+        # generic walker rejects the unsupported key at its own ordinal path;
+        # the block is rejected either way, so an un-stripped `resolved`
+        # field here is harmless.
+        return block
+    # Every key is already confirmed exact str, so this comprehension only
+    # ever inserts/compares already-safe keys. Shallow copy that drops
+    # `resolved` while preserving field order; nested containers (entries,
+    # placement) are shared but never mutated here.
+    return {key: value for key, value in block.items() if key != _RESOLVED_KEY}
 
 
 __all__ = ["normalize_legend_blocks_shape"]
