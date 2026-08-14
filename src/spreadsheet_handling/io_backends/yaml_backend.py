@@ -51,6 +51,59 @@ def _glob_yaml_files(root: Path) -> Iterable[Path]:
     yield from root.glob("*.yaml")
 
 
+# Trusted Ingress YAML Option A (`FTR-TRUSTED-INGRESS-P4A` section 11, accepted
+# unchanged by the E3 metadata census): the stem ``_meta`` is reserved for a
+# framework metadata sidecar, never an ordinary DataFrame sheet. At most one of
+# ``_meta.yaml``/``_meta.yml`` may be present; its root must be a mapping. Both
+# are backend/parse-boundary facts owned here -- Domain ingress (Phase-E E3)
+# never reinterprets an ordinary DataFrame as metadata, and never sees a
+# DataFrame at this key at all now.
+_RESERVED_META_STEM = "_meta"
+
+
+def _load_reserved_meta_sidecar(reserved_files: list[Path]) -> dict[str, Any] | None:
+    if not reserved_files:
+        return None
+    if len(reserved_files) > 1:
+        names = ", ".join(repr(f.name) for f in sorted(reserved_files, key=lambda f: f.name))
+        raise ValueError(
+            "YAML directory reserved metadata sidecar is ambiguous: found "
+            f"{names}; provide at most one of '_meta.yaml' or '_meta.yml'."
+        )
+    sidecar = reserved_files[0]
+    with sidecar.open("r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f)
+    if type(loaded) is not dict:
+        actual = "an empty file (None)" if loaded is None else type(loaded).__name__
+        raise ValueError(
+            f"YAML directory reserved metadata sidecar {sidecar.name!r} must "
+            f"be a mapping at its root; got {actual}."
+        )
+    return loaded
+
+
+def _ordinary_sheet_dataframe(data: Any) -> pd.DataFrame:
+    """Convert one ordinary (non-reserved) YAML file's parsed content to a sheet."""
+    if data is None:
+        df = pd.DataFrame()
+    elif isinstance(data, list):
+        df = pd.DataFrame(data)
+    elif isinstance(data, dict):
+        # If a file contains a mapping instead of a list, use homogeneous
+        # dict values as rows; otherwise wrap the mapping as one row.
+        values = list(data.values())
+        if all(isinstance(x, dict) for x in values):
+            df = pd.DataFrame(values)  # type: ignore[arg-type]
+        else:
+            df = pd.DataFrame([data])
+    else:
+        # Fallback: wrap scalars in a "value" column.
+        df = pd.DataFrame([{"value": data}])
+
+    # Normalize missing values to "" like the JSON backend.
+    return df.where(pd.notnull(df), "")
+
+
 def load_yaml_dir(
     path: str,
     options: BackendOptions | None = None,
@@ -63,6 +116,9 @@ def load_yaml_dir(
       - each file contains a list of objects (List[Dict[str, Any]])
       - empty files/lists become empty DataFrames with 0 columns
       - header_levels is accepted for router compatibility; YAML has no header rows
+      - a file whose stem is ``_meta`` is a reserved metadata sidecar, not an
+        ordinary sheet (Trusted Ingress YAML Option A; see
+        ``_load_reserved_meta_sidecar``)
     """
     in_dir = Path(path)
     frames: Frames = {}
@@ -70,29 +126,18 @@ def load_yaml_dir(
     if not in_dir.exists():
         raise FileNotFoundError(f"YAML input folder not found: {in_dir}")
 
-    for file in _glob_yaml_files(in_dir):
-        sheet_name = file.stem
+    all_files = list(_glob_yaml_files(in_dir))
+    reserved_files = [f for f in all_files if f.stem == _RESERVED_META_STEM]
+    ordinary_files = [f for f in all_files if f.stem != _RESERVED_META_STEM]
+
+    meta = _load_reserved_meta_sidecar(reserved_files)
+    if meta is not None:
+        frames["_meta"] = meta  # type: ignore[assignment]
+
+    for file in ordinary_files:
         with file.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f)  # may be None, list, or dict
-        if data is None:
-            df = pd.DataFrame()
-        elif isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            # If a file contains a mapping instead of a list, use homogeneous
-            # dict values as rows; otherwise wrap the mapping as one row.
-            values = list(data.values())
-            if all(isinstance(x, dict) for x in values):
-                df = pd.DataFrame(values)  # type: ignore[arg-type]
-            else:
-                df = pd.DataFrame([data])
-        else:
-            # Fallback: wrap scalars in a "value" column.
-            df = pd.DataFrame([{"value": data}])
-
-        # Normalize missing values to "" like the JSON backend.
-        df = df.where(pd.notnull(df), "")
-        frames[sheet_name] = df
+        frames[file.stem] = _ordinary_sheet_dataframe(data)
 
     return frames
 
