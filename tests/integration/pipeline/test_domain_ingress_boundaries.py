@@ -5,6 +5,12 @@ boundaries (orchestrator load, ``bootstrap_meta`` post-merge,
 ``apply_overrides`` post-merge), that list form never reaches persistence, and
 that an ingress failure aborts before the saver runs.
 See FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5.
+
+The Phase-E E3 section at the bottom of this module proves the same three
+boundaries abort atomically for a *metadata substrate* violation (not just a
+Legend Blocks shape violation) -- i.e. every rule in ``INGRESS_RULES``, not
+only the first one, is reached and enforced at every maintained call site.
+See FTR-TRUSTED-INGRESS-P4A.
 """
 
 from __future__ import annotations
@@ -17,11 +23,17 @@ import pytest
 import yaml
 
 from spreadsheet_handling.application.orchestrator import orchestrate
+from spreadsheet_handling.domain.ingress.metadata_admission import (
+    MetadataSubstrateAdmissionError,
+)
 from spreadsheet_handling.domain.meta_bootstrap import bootstrap_meta
 from spreadsheet_handling.domain.yaml_overrides import apply_overrides
 from spreadsheet_handling.pipeline.build import build_steps_from_config
 
-pytestmark = pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+pytestmark = [
+    pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5"),
+    pytest.mark.ftr("FTR-TRUSTED-INGRESS-P4A"),
+]
 
 
 def _write_json_dir(path: Path, records: dict, meta: dict | None = None) -> None:
@@ -299,3 +311,67 @@ def test_apply_overrides_ingress_failure_suppresses_saver(tmp_path: Path):
         )
 
     assert not out_dir.exists()
+
+
+# ===========================================================================
+# Phase-E E3: metadata substrate violation at every boundary (not just
+# Legend Blocks shape). Proves ``metadata_substrate`` -- the second
+# ``INGRESS_RULES`` entry -- is actually reached and enforced, and aborts
+# atomically, at all three maintained call sites. See FTR-TRUSTED-INGRESS-P4A.
+# ===========================================================================
+
+
+def test_orchestrate_load_metadata_substrate_failure_suppresses_saver(tmp_path: Path):
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir()
+    (in_dir / "products.yml").write_text("- id: 1\n", encoding="utf-8")
+    # Reserved YAML metadata sidecar (Option A) carrying a non-str key --
+    # loads fine at the backend boundary (mapping-shaped), then E3 rejects it.
+    (in_dir / "_meta.yaml").write_text("1: x\n", encoding="utf-8")
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        orchestrate(
+            input={"kind": "yaml_dir", "path": str(in_dir)},
+            output={"kind": "json_dir", "path": str(out_dir)},
+        )
+
+    assert excinfo.value.kind == "unsupported_metadata_key"
+    assert not out_dir.exists()
+
+
+def test_bootstrap_meta_metadata_substrate_failure_leaves_complete_caller_graph_unchanged():
+    frames = {
+        "_meta": {
+            "legend_blocks": {"kept": {"entries": [{"token": "K"}]}},
+        }
+    }
+    before = copy.deepcopy(frames)
+    meta = frames["_meta"]
+    legend_blocks = meta["legend_blocks"]
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        bootstrap_meta(frames, cli_overrides={"bad": (1, 2)})
+
+    assert excinfo.value.kind == "invalid_metadata_node"
+    assert frames == before
+    assert frames["_meta"] is meta
+    assert frames["_meta"]["legend_blocks"] is legend_blocks
+
+
+def test_apply_overrides_metadata_substrate_failure_leaves_complete_caller_graph_unchanged():
+    frames = {
+        "_meta": {
+            "legend_blocks": {"kept": {"entries": [{"token": "K"}]}},
+        }
+    }
+    before = copy.deepcopy(frames)
+    meta = frames["_meta"]
+    legend_blocks = meta["legend_blocks"]
+
+    with pytest.raises(MetadataSubstrateAdmissionError) as excinfo:
+        apply_overrides(frames, {"defaults": {"bad": {1, 2}}})
+
+    assert excinfo.value.kind == "invalid_metadata_node"
+    assert frames == before
+    assert frames["_meta"] is meta
+    assert frames["_meta"]["legend_blocks"] is legend_blocks

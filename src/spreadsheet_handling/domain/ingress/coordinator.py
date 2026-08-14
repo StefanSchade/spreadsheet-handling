@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .legend_blocks import normalize_legend_blocks_shape
+from .metadata_admission import admit_metadata_substrate
 
 Frames = dict[str, Any]
 
@@ -43,8 +44,16 @@ class IngressRule:
 # Ordered rule sequence. Kept explicit and module-level so the ingress
 # contract is discoverable and extensible: append a new IngressRule here rather
 # than threading ad-hoc normalization through the orchestrator.
+#
+# ``metadata_substrate`` runs last and deliberately after every authoring-shape
+# delegate (currently only ``legend_blocks_shape``): it validates the
+# *complete* post-delegate ``_meta`` tree against the Phase-E E3 bounded
+# substrate grammar, so a delegate's own output is checked by the same generic
+# recursive pass as directly authored metadata -- no delegate output is exempt
+# by virtue of delegate status. See ``metadata_admission.py``.
 INGRESS_RULES: tuple[IngressRule, ...] = (
     IngressRule(name="legend_blocks_shape", apply=normalize_legend_blocks_shape),
+    IngressRule(name="metadata_substrate", apply=admit_metadata_substrate),
 )
 
 

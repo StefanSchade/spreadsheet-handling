@@ -9,10 +9,16 @@ from __future__ import annotations
 
 from .coordinator import INGRESS_RULES, IngressRule, run_domain_ingress
 from .legend_blocks import normalize_legend_blocks_shape
+from .metadata_admission import (
+    MetadataSubstrateAdmissionError,
+    admit_metadata_substrate,
+)
 
 __all__ = [
     "INGRESS_RULES",
     "IngressRule",
     "run_domain_ingress",
     "normalize_legend_blocks_shape",
+    "MetadataSubstrateAdmissionError",
+    "admit_metadata_substrate",
 ]
