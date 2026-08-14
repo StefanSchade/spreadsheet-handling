@@ -475,3 +475,248 @@ accepted FTR, or architecture review file was modified. Nothing pushed.
 BOUNDED XREF DURABLE-SELECTOR PREREQUISITE
 REQUIRES CORRECTION --
 PRE-E3 CENSUS DISPOSITION REMAINS BLOCKED.
+
+== 18. Follow-up finding-disposition review of correction `f12283e`
+
+*Review date:* 2026-08-14. *Bounded, same review context.* Scope: dispose
+`XREF-SELECTOR-IMPL-REVIEW-F1` against correction commit
+`f12283e0d321a327083c82fa6e9e2a2f411a23e3` ("fix(xref): preflight durable
+selectors before composite processing"), verify the additional Compact
+pre-delegation gap the correction discovered is closed, and check for any
+direct correction-induced regression. Sections 1-17 above are not repeated.
+`XREF-SELECTOR-IMPL-REVIEW-F2` (Minor, documentation wording) was
+deliberately untouched and is not re-litigated here.
+
+=== 18.1 Baseline
+
+Confirmed on a clean `main` worktree: `HEAD` is `f12283e`, directly following
+`199e039`; `3f03ca2` and `fc3d288` are unchanged (no amend/rewrite --
+`git log` shows a linear five-commit sequence). `git diff 199e039..f12283e
+--stat`: 5 files, +192/-28 -- exactly `operation.py`,
+`xref_crosstable/__init__.py`, `compact_multiaxis.py`, and their two unit
+test files. No documentation, registry, census, census review, Roadmap, or
+Project Memory file is touched (confirmed empty `git diff --stat` against
+those paths). `_ftrs_open.adoc` still blocks `TRUSTED-INGRESS-E3-CENSUS-FOLLOWUP-F1`
+on this FTR; E3-E7 remain unstarted.
+
+=== 18.2 F1 reproduction and post-fix result
+
+Independently re-ran the exact original counterexample
+(`row_keys=["region", ProtocolBomb()]`, bomb recording/raising on
+`__eq__`/`__hash__`/`__repr__`/`__str__`/`__iter__`) against both
+`contract_xref` and `expand_xref`. Both now raise the clean
+`ValueError: row_keys must contain exact, non-empty native str selector
+reference(s); ... position(s) [1] ...`, with `calls == []` and `"_meta" not
+in frames`. The raw `AssertionError` from the candidate's own `__eq__` no
+longer occurs.
+
+=== 18.3 Call-order verification
+
+Directly read both seams in `operation.py`: `_ensure_flat_axis_labels` ->
+`_ensure_selector_reference_labels` -> `_ensure_unique_field_list` ->
+`_ensure_columns`, in both `contract_xref` and `expand_xref`. No other file
+defines or imports a second copy of `_ensure_unique_field_list`/
+`ensure_unique_field_declaration`; the generic shared uniqueness helper in
+`domain/tabular/physical_labels.py` is byte-for-byte unchanged (confirmed by
+`git diff 199e039..f12283e -- src/spreadsheet_handling/domain/tabular/`,
+empty). Since the gate now runs first, every element the duplicate scan later
+compares is already a known exact, non-empty `str`; `_values_equal` between
+two trusted strings never dispatches arbitrary candidate `__eq__`.
+
+Diagnostic-order regression probe (independently run, not inferred from the
+new tests):
+
+* Tuple `row_keys` -> unchanged flat-axis diagnostic (`_ensure_flat_axis_labels`
+  still runs first).
+* Tuple and non-str together -> flat-axis diagnostic still fires first.
+* Pure duplicate valid strings (`["region", "region"]`) -> unchanged
+  duplicate-field diagnostic (the gate passes cleanly on two valid strings
+  before the duplicate scan runs).
+* Mixed invalid (`["region", "region", 7]`) -> now the selector-reference
+  diagnostic fires before the duplicate scan reaches position 2. This is the
+  intentional, accepted change: preserving duplicate-first semantics for this
+  case would require inspecting an unclassified `7` inside the equality scan,
+  which is exactly the defect being closed. Not a regression.
+
+=== 18.4 Compact pre-delegation gap -- independently confirmed, not an artifact
+
+Independently verified the correction author's discovery is real, by reading
+both composites at the pre-fix commit (`199e039`, via a temporary detached
+worktree, removed after use) and by direct probe against that code:
+
+* `contract_compact_multiaxis` calls `encode_cell_values(..., group_by=[*row_key_cols,
+  column_key], ...)` *before* ever calling `contract_xref`. `encode_cell_values`
+  runs `_ensure_configured_field_labels(group_cols, ...)`
+  (`cell_codec/frame.py:374`), which calls the *same* shared
+  `ensure_unique_field_declaration` -- a genuinely separate, Cell-Codec-owned
+  invocation, not the XRef seam's own duplicate scan.
+* `expand_compact_multiaxis` calls `_ensure_distinct_output_columns(passthrough,
+  ...)` *before* calling `expand_xref`; this checks `column in reserved`
+  against a Python `set`, which hashes every element of `passthrough`
+  (`[*row_key_cols, column_key]`) regardless of position.
+
+Both are real, independently reachable pre-delegation paths, not a probe
+artifact. Probed directly at `199e039` with a **single-element** hostile
+`row_keys=[bomb]` (not composite): `contract_compact_multiaxis` raised
+`AssertionError` from `bomb.__eq__` (`calls == ["eq"]`); `expand_compact_multiaxis`
+raised `AssertionError` from `bomb.__hash__` (`calls == ["hash"]`). This is a
+*broader* exposure than the direct XRef seam's "non-first position only"
+shape: because `group_by`/`passthrough` always append `column_key` after
+`row_key_cols`, and `_ensure_distinct_output_columns` uses set membership
+(hashing every element unconditionally), even a lone hostile `row_keys` entry
+was unsafe at the Compact layer before this fix. The original review's
+"Compact inherits both the fix and the defect from the underlying seam"
+framing was accurate for the *shape* of bypass (a non-conforming selector
+still reaches Compact-owned code before XRef's own gate) but incomplete on
+mechanism and position-scope; this correction's discovery and fix are
+independently confirmed to close a real, previously-unexercised gap, not a
+restatement of F1.
+
+=== 18.5 Compact preflight verification
+
+Read the preflight placement in `compact_multiaxis.py`: in both
+`contract_compact_multiaxis` and `expand_compact_multiaxis`,
+`_ensure_selector_reference_labels(row_key_cols, "row_keys")` runs
+immediately after `row_key_cols = _as_list(row_keys, "row_keys")` and before
+`passthrough`/`group_by` is built or any Compact-owned check runs. Traced the
+short path ahead of the preflight (`_reject_dense_axes` -- checks only
+`dense_axes is not None`; `config_id = name or output` -- no candidate touch;
+`_as_list` -- `isinstance`/`list()`/length check only) and confirmed none of
+it invokes candidate protocols. The later `contract_xref`/`expand_xref` call
+remains unmodified and is still the authoritative family gate for every
+other case (single-element hostile candidates were already safe there before
+this correction; composite non-first candidates are now safe per 18.2-18.3).
+No second, competing selector vocabulary was introduced -- the preflight
+calls the identical predicate object.
+
+Independently probed all four combinations directly against production code
+(not the shipped tests): sole-element and non-first hostile `row_keys` for
+both `contract_compact_multiaxis` and `expand_compact_multiaxis`. All four
+produce the clean selector-reference `ValueError`, `calls == []`, and
+`"_meta" not in frames`.
+
+=== 18.6 Package-private helper reuse assessment
+
+`xref_crosstable/__init__.py` now also imports `_ensure_selector_reference_labels`
+from `.primitives`, re-exported (not added to `__all__`, which remains
+`["contract_xref", "expand_xref"]`). `compact_multiaxis.py`'s import
+statement was already `from .xref_crosstable import contract_xref,
+expand_xref` (the package's public entry point, not a submodule reach); this
+correction only extends that existing import list, it does not introduce a
+new submodule-reaching import pattern. Verified no circular import
+(`import spreadsheet_handling.domain.transformations.compact_multiaxis` and
+the `xref_crosstable` package both import cleanly). The helper stays
+single-underscore/package-private, is not surfaced via `__all__` or any
+wildcard import, and there is exactly one implementation of the
+`type(value) is str and value != ""` rule -- Compact does not duplicate it.
+No layering, ownership, or public-API concern; accepted as coherent
+package-private reuse.
+
+=== 18.7 Dense axes and `row_identities`/E3 non-change
+
+`git diff 199e039..f12283e -- .../xref_crosstable/dense_axes.py` is empty --
+confirmed unchanged. Re-ran
+`tests/unit/domain/transformations/test_xref_crosstable.py`'s dense-axis
+selector-rejection cases (already covering the `keys` seam, which has no
+duplicate-scan pre-gate) -- all pass, no regression. No `row_identities`
+representation change, no consumer change, no E3/persistence-boundary/census
+file touched (18.1).
+
+=== 18.8 Regression tests
+
+Read all four new composite-hostile tests
+(`test_contract_xref_rejects_composite_hostile_row_key_without_candidate_equality`,
+`test_expand_xref_rejects_composite_hostile_row_key_without_candidate_equality`,
+`test_contract_compact_multiaxis_rejects_composite_hostile_row_key_before_encode`,
+`test_expand_compact_multiaxis_rejects_composite_hostile_row_key_before_collision_check`).
+Each places the hostile candidate at a non-first position, asserts the clean
+`ValueError`, `calls == []`, and no `_meta` publication -- genuinely pinning
+the discovered control-flow defects, not merely re-running the original
+single-element case. The original single-element hostile test is retained
+unmodified and still covers its own distinct minimal shape.
+
+=== 18.9 Validation
+
+* `pytest tests/unit/domain/transformations/test_xref_crosstable.py
+  tests/unit/domain/transformations/test_compact_multiaxis.py
+  tests/integration/io_backends/test_xref_selector_reference_roundtrip.py
+  tests/unit/domain/transformations/test_grouped_xref.py
+  tests/unit/domain/transformations/test_grouped_xref_composites.py
+  tests/unit/pipeline/test_persistence_boundary.py` -- *302 passed*.
+* Full active suite (`pytest -q`, cross-checked via `--junit-xml`): *2531
+  tests, 0 failures, 0 errors, 0 skipped* -- independently confirms the
+  implementer's reported count.
+* `python tools/check_source_style.py`: exit 0, 82 warnings -- identical set
+  of pre-existing function-length/branch-complexity warnings as at `199e039`
+  (diffed line-by-line; only line numbers and lengths shift by the added
+  lines, no new violation).
+* `git diff --check 199e039..f12283e` -- clean.
+* No AsciiDoc/registry render needed (no docs/registry files in this range).
+
+=== 18.10 Finding disposition
+
+[cols="3,2,7",options="header"]
+|===
+|Finding |Verdict |Independent evidence
+
+|`XREF-SELECTOR-IMPL-REVIEW-F1`
+|RESOLVED
+|Reproduced the exact original counterexample post-fix: clean `ValueError`,
+zero candidate protocol calls, no `_meta` leakage, for both `contract_xref`
+and `expand_xref`. Confirmed call order (`flat-axis` -> `selector-reference`
+-> `duplicate-field`) by direct read; confirmed the generic shared uniqueness
+helper itself is unchanged. Confirmed tuple/duplicate/mixed-invalid
+diagnostic behavior is preserved except for the one intentional, accepted
+reordering (mixed invalid now yields the selector-reference diagnostic,
+which is required by the safe-rejection contract, not a regression).
+
+|`XREF-SELECTOR-IMPL-REVIEW-F2`
+|Minor / unchanged
+|Deliberately untouched by this correction. No new evidence surfaced during
+this bounded review that makes the carrier-list wording materially false;
+remains accepted residual Minor documentation debt, not a blocker.
+|===
+
+*Compact pre-delegation safe-rejection gap:* *CLOSED.* Independently confirmed
+real and reachable at `199e039` (both sole-element and non-first hostile
+`row_keys`, both directions, via direct probe against the pre-fix code) and
+confirmed closed at `f12283e` (all four combinations produce the clean
+diagnostic with zero candidate protocol calls and no partial `_meta`).
+
+*New correction-induced Blocking findings:* 0.
+*New correction-induced Important findings:* 0. No direct material
+regression was found: diagnostic ordering changes are limited to the one
+intentional, accepted case (18.3); the shared uniqueness helper, dense-axis
+seam, `row_identities` shape, and package `__all__` surface are all
+unchanged; no circular import or layering defect was introduced (18.6); the
+full suite and source-style guards are clean.
+
+=== 18.11 Overall verdict
+
+*A. ACCEPTED.*
+
+`XREF-SELECTOR-IMPL-REVIEW-F1` is independently confirmed resolved; the
+additional Compact pre-delegation gap discovered during correction is
+independently confirmed real and closed; no new Blocking or Important
+correction-induced defect was found. `XREF-SELECTOR-IMPL-REVIEW-F2` remains
+Minor and does not block acceptance.
+
+=== 18.12 Lifecycle consequence
+
+The bounded XRef durable-selector prerequisite is now independently
+implemented and accepted. Per the governing scope, no lifecycle curation and
+no E3 work is performed in this review. `TRUSTED-INGRESS-E3-CENSUS-FOLLOWUP-F1`
+remains open; E3-E7 remain unstarted; the census was not touched. The exact
+next task is one final bounded disposition of
+`TRUSTED-INGRESS-E3-CENSUS-FOLLOWUP-F1`, using the independently accepted
+architecture plus this independently accepted implementation, without
+replaying the four historical census-correction cycles.
+
+Only this appended section was added to this review artifact in this pass.
+No runtime, test, registry, model, guide, roadmap, Project Memory, census,
+census review, accepted FTR, or architecture review file was modified.
+Nothing pushed.
+
+BOUNDED XREF DURABLE-SELECTOR PREREQUISITE
+INDEPENDENTLY ACCEPTED --
+READY FOR ONE FINAL BOUNDED PRE-E3 CENSUS DISPOSITION.
