@@ -1,0 +1,477 @@
+= Independent Implementation Review -- XRef Durable Selector-Reference Contract
+:revdate: 2026-08-14
+:toc:
+
+*Verdict:* *B. CHANGES REQUIRED.*
+
+One Blocking finding: the shared `row_keys` duplicate-field check
+(`ensure_unique_field_declaration`, aliased `_ensure_unique_field_list`) runs
+*before* the new exact-`str` selector-reference gate and performs
+candidate-controlled `==` comparisons against not-yet-classified `row_keys`
+entries whenever an invalid selector is not the first list element. This
+contradicts the accepted contract's explicit "must not call repr, str,
+arbitrary equality, or hashing on a rejected candidate" requirement
+(FTR section 7.2) and can surface a raw, uncontrolled exception from the
+candidate's own `__eq__` instead of the intended domain `ValueError`. One
+Minor documentation-wording observation is also recorded. Everything else
+independently reviewed -- scope, the positive/negative selector matrix,
+Compact Multiaxis inheritance, Grouped XRef forwarding, `row_identities`
+non-change, cross-carrier proof, documentation/registry truthfulness, and
+the full test suite -- is sound.
+
+== 1. Baseline and reviewed range
+
+Fresh-context review, no prior conversation state. Repository:
+`~/repos/spreadsheet-handling/core`, branch `main`, worktree clean at start
+and end. `HEAD` is `fc3d288`.
+
+Reviewed range: `84d1a9b..fc3d288` (implementation baseline
+`84d1a9ba32da5797ec6d85d602c4bd7504b4f914`):
+
+* `3f03ca2` -- `feat(FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A): enforce
+  durable selector reference contract` (runtime + tests).
+* `fc3d288` -- `docs(xref): align durable selector reference contract`
+  (documentation/registry/release-notes transition).
+
+`git diff 84d1a9b..fc3d288 --stat`: 12 files, +514/-5 -- 3 runtime files
+(`primitives.py`, `operation.py`, `dense_axes.py`), 3 test files (2 unit, 1
+new integration roundtrip), 4 documentation files (Technical Model,
+Functional Model, User Guide, release notes), 2 registries. No `_ftrs_open.adoc`,
+Roadmap, Project Memory, census, census review, or FTR/architecture-review file
+is touched anywhere in the range -- confirmed by targeted `git diff --stat`
+against those paths (empty). No unrelated refactor, opportunistic cleanup, or
+E3 code was found in either commit; every changed line traces to the corrected
+FTR's section 9 package (items A, B, C, F, G, H, I, J) or its own test/doc
+support.
+
+== 2. Contract independently reconstructed
+
+Read the FTR (969 lines) and its review (737 lines, including the `3bc46cf`
+disposition section 12, verdict *A. ACCEPTED*) in full, independently of the
+implementation. The accepted contract:
+
+* General physical-label authority (Class A, `physical_labels.py`) is
+  unchanged everywhere a column is not nominated as a selector.
+* The moment a physical label is nominated as `row_keys`
+  (`contract_xref`/`expand_xref`) or dense-axis
+  `rows_from`/`columns_from.key`/`.keys` -- directly, or inherited through
+  Compact Multiaxis forwarding -- it must additionally satisfy
+  `type(value) is str and value != ""`. No coercion, no stringification.
+  Whitespace-only strings are deliberately accepted.
+* `dense_axes.resolved.row_identities` keeps its existing `dict` shape;
+  no list-of-records migration.
+* The rejection path must not call `repr`/`str`/equality/hashing/iteration on
+  a rejected candidate merely to classify or diagnose it.
+* Every current authority layer naming the retired non-string example must be
+  atomically corrected in the same commit, preserving the unqualified Class A
+  statement.
+
+This matches the implementation's own stated intent (commit message,
+docstrings). No divergence between my independent reading and the
+implementer's summary was found at the contract level.
+
+== 3. Runtime helper (`primitives.py`)
+
+`_is_durable_selector_reference`: `return type(value) is str and value != ""`
+-- exact predicate match, `type(...) is str` (not `isinstance`), confirmed by
+direct read and by probe that a `str` subclass and `numpy.str_` both fail
+`type(value) is str` while passing `isinstance`.
+
+`_ensure_selector_reference_labels`: builds `invalid_positions` by iterating
+and testing `_is_durable_selector_reference`; on failure raises `ValueError`
+with only `field_name` and `invalid_positions` (an `int` list) in the message
+-- never `value!r}` or any candidate-derived text. Independently confirmed:
+calling it directly with a hostile object whose `__repr__`/`__str__`/`__eq__`/
+`__hash__`/`__iter__` all raise produces *zero* candidate protocol calls when
+invoked in isolation. The helper itself is safe.
+
+== 4. CRITICAL -- the complete pre-gate path (falsification target)
+
+This section is the primary adversarial target the governing review
+instructions named. The helper in isolation is safe; the question is whether
+anything upstream of it, inside the real `contract_xref`/`expand_xref`/
+`_axis_source_config` call chain, touches an unclassified candidate first.
+
+Call order in both `contract_xref` (`operation.py:268-273`) and `expand_xref`
+(`operation.py:91-96`):
+
+....
+row_key_cols = _as_list(row_keys, "row_keys")
+_ensure_flat_axis_labels(row_key_cols, "row_keys")        # isinstance(value, tuple) only
+_ensure_unique_field_list(row_key_cols, field_name="row_keys")  # <-- see below
+_ensure_selector_reference_labels(row_key_cols, "row_keys")     # the new gate
+....
+
+`_ensure_flat_axis_labels` uses `isinstance(value, tuple)` only -- no protocol
+calls on a non-tuple candidate. Safe, confirmed by probe.
+
+`_ensure_unique_field_list` aliases `ensure_unique_field_declaration`
+(`domain/tabular/physical_labels.py:192-217`), which de-duplicates by walking
+the list and calling `_values_equal(value, existing)` (`bool(value == existing)`)
+against every element already accepted into a local `seen` list. For a
+*single-element* `row_keys` list, `seen` is empty when the sole element is
+processed, so the comparison generator is never entered -- zero calls. This is
+exactly why the shipped adversarial test
+(`test_rejection_never_invokes_hostile_candidate_protocols`, which uses
+`row_keys=[bomb]`, a one-element list) reports zero calls: the chosen list
+shape structurally cannot exercise the comparison branch, not because the
+production code is safe in general.
+
+*Independently reproduced counterexample* (composite `row_keys`, hostile
+candidate *not* first):
+
+[source,python]
+----
+class ProtocolBomb:
+    def __eq__(self, other):
+        calls.append("eq"); raise AssertionError("equality must not run")
+    def __repr__(self): ...  # (all raise, per the shipped test's own bomb)
+
+contract_xref(frames, relation="rel", output="matrix",
+              row_keys=["region", ProtocolBomb()])
+----
+
+Result: `AssertionError: equality must not run`, `calls == ["eq"]`. The
+duplicate-field scan reaches `_values_equal(bomb, "region")`, which evaluates
+`bomb == "region"`, invoking `bomb.__eq__` -- before
+`_ensure_selector_reference_labels` ever runs. Reproduced identically for
+`expand_xref` with `row_keys=["region", bomb]`. A "quiet" well-behaved
+non-string object (no exception, just `__eq__` returning `False`) is still
+*compared* once before rejection -- the safe-rejection discipline is violated
+even when the candidate does not crash. `_meta` is not left in `frames` in
+either case (no partial publication), but the intended clean domain
+diagnostic is bypassed by an unrelated, uncontrolled exception for a genuinely
+adversarial candidate.
+
+The dense-axis `key`/`keys` seam (`_axis_source_config`, `dense_axes.py:97-135`)
+does *not* call `_ensure_unique_field_list` at all -- only
+`_ensure_flat_axis_labels` then `_ensure_selector_reference_labels` -- so a
+composite `dense_axes.rows_from.keys` list with a non-first hostile candidate
+is unaffected; independently reproduced (`keys=["period", bomb]` raises the
+clean selector-reference `ValueError`, zero protocol calls). The defect is
+scoped exactly to the two `row_keys` seams (`contract_xref`, `expand_xref`)
+and everything that forwards a composite `row_keys` list through them
+(Compact Multiaxis both directions, Grouped XRef forwarding) -- confirmed by
+direct reproduction through `contract_compact_multiaxis` as well (same
+`AssertionError`, `_meta` not leaked).
+
+See Finding F1 (section 9).
+
+== 5. Diagnostic ordering for representative invalid configurations
+
+Independently probed (not inferred from tests) with combinations designed to
+race the new gate against existing diagnostics:
+
+* Tuple `row_keys` entry -> flat-axis diagnostic fires (unchanged).
+* Tuple *and* non-str entry together -> flat-axis diagnostic still fires
+  first (tuple check runs before both the duplicate scan and the new gate).
+* Duplicate string entries plus a non-str entry -> duplicate-field diagnostic
+  fires first, as the FTR's own text anticipates ("existing diagnostics ...
+  fire first, unchanged").
+* Non-str selector naming a column absent from the frame -> the new
+  selector-reference diagnostic fires *before* the frame-existence check,
+  matching the commit message's stated placement ("before the frame-existence
+  check").
+* Empty-string selector alone -> selector-reference diagnostic, correct.
+* Dense-axis: missing `key`/`keys` declaration, invalid arity, tuple
+  selector, non-str selector, and a nonexistent-but-valid-`str` field all
+  fire in the expected order (`_axis_source_config`'s existing checks, then
+  the new gate, then arity, then frame lookup).
+
+Ordering is otherwise faithful to the FTR's description; the exception is the
+duplicate-vs-hostile-candidate interaction in section 4, which is not an
+ordering-of-diagnostics defect but a safety-of-diagnosis defect (the
+diagnostic ordering is arguably as intended -- the *mechanism* used to reach
+it is not safe for an unclassified candidate).
+
+== 6. `row_keys` route coverage, including rediscovery
+
+`row_keys` itself is a required parameter of `contract_xref`/`expand_xref`
+(no default, no internal fallback to `_meta`); every caller -- direct,
+pipeline-step, Compact Multiaxis, Grouped XRef -- passes it explicitly through
+`_as_list` and therefore through the full check chain (subject to section 4's
+finding for composite lists).
+
+`dense_axes` *does* have a rediscovery fallback
+(`_dense_axes_from_config_or_meta`, reading `_meta.xref_crosstable.<id>.dense_axes`
+when no explicit `dense_axes` argument is supplied). Independently verified
+this rediscovered, stored configuration is re-validated: constructed a
+`_meta.xref_crosstable.matrix.dense_axes.rows_from.key = 7` (simulating
+legacy persisted numeric selector metadata) with no explicit `dense_axes`
+argument; `contract_xref` raised the expected selector-reference `ValueError`
+cleanly, with no partial `_meta` mutation. Legacy numeric metadata fails
+cleanly, not with a confusing downstream lookup failure.
+
+== 7. Dense-axis coverage
+
+The gate covers exactly `rows_from.key`/`.keys` and `columns_from.key`/`.keys`
+via the shared `_axis_source_config`, both singular and plural forms
+(independently probed). It does not touch `frame`, resolved axis values,
+matrix-axis identities, or any other dense-axis field -- confirmed by reading
+`_axis_source_config` end to end; the new call sits between the existing
+flat-axis check and the arity check, touching only `keys`.
+
+== 8. Compact Multiaxis inheritance
+
+Directly read `compact_multiaxis.py`. Both `contract_compact_multiaxis`
+(lines 74, 111-122, 158-188) and `expand_compact_multiaxis` (mirrored) build
+`row_key_cols` once and pass the *same* object into the real
+`expand_xref`/`contract_xref` call before `_write_multiaxis_meta` ever runs.
+A rejection inside the inner XRef call raises before that write is reached.
+Independently verified atomicity: for both directions, a rejected selector
+leaves `"_meta" not in frames` -- no partial `_meta.xref_crosstable` or
+`_meta.compact_multiaxis` publication on the caller-owned input. Confirmed the
+shipped tests exercise this directly (not merely inferred), and independently
+reproduced the section-4 composite-list defect propagating transparently
+through this path (no second, independent gate exists here -- as intended --
+so it inherits both the fix and the defect from the underlying seam).
+
+== 9. Grouped XRef forwarding
+
+`grouped_xref/composites.py` builds `owned_row_keys` (isinstance/tuple checks
+only, no protocol calls) and forwards it into unchanged `contract_xref`/
+`expand_xref`. No independent durable raw-selector copy exists; the module's
+own docstring states grouped XRef keeps XRef-owned metadata. No second grouped
+metadata authority was found, consistent with the review's own section 3/12.4
+finding. Grouped forwarding introduces no bypass around this slice, and (as
+expected) inherits the section-4 defect rather than adding a new one.
+
+== 10. `row_identities` non-change
+
+Directly read `_dense_axes_meta_payload` (`dense_axes.py:369-416`): the
+`row_identities` dict-comprehension is byte-for-byte unchanged from before
+this FTR. Traced the `row_keys` parameter it closes over back to
+`operation.py`'s `row_key_cols`, confirming `_resolve_dense_axes` (which
+ultimately produces the values folded into this dict) is called *after*
+`_ensure_selector_reference_labels(row_key_cols, "row_keys")` in both
+`contract_xref` and `expand_xref` -- every key reaching
+`dense_axes.resolved.row_identities` is therefore guaranteed exact `str` by
+construction. No producer, same-run consumer (`_stored_row_identities`), or
+pinned-test shape changed; confirmed by diff (no lines touched in that
+function) and by the full test run (section 13).
+
+== 11. Positive and negative selector boundary
+
+Positive: `"region"`, `"7"` (literal string), composite `["region",
+"category"]`, and whitespace-only `"   "` are all accepted and correctly
+published to `_meta` -- independently reproduced via `contract_xref`, not
+taken from the shipped tests.
+
+Whitespace-only carrier observation: independently round-tripped
+`row_keys=["   "]` through real `JSONBackend`/`ExcelBackend`/`OdsBackend`.
+The physical column label and the persisted `row_keys` entry both survive
+every carrier as the identical `"   "` -- the durable selector-reference
+contract itself is carrier-stable for whitespace-only strings, as the FTR
+requires. A subsequent `expand_xref` call against the resulting matrix then
+fails with the *pre-existing, separate* Class C matrix-axis-identity
+diagnostic (`_ensure_column_identity_values`'s own `.strip()` rule, which
+FTR section 7.2 explicitly declines to import and explicitly does not require
+harmonizing). This is not a selector-reference carrier defect and not a
+regression: it is the FTR's own acknowledged, pre-existing asymmetry between
+the selector-reference contract (whitespace-only accepted) and the
+matrix-header identity contract (whitespace-only rejected after `.strip()`),
+unchanged by this implementation. Recorded as an observation, not a finding.
+
+Negative: independently exercised `""`, `int`, `bool`, `float`, `date`,
+`datetime`, `numpy.int64`, `numpy.float64`, `numpy.bool_`, `numpy.str_`,
+`pandas.Timestamp`, `bytes`, `complex`, `frozenset`, a stable custom
+hashable/comparable dataclass, and a `str` subclass -- all rejected at both
+`row_keys` seams and the shared dense-axis seam with the intended
+selector-reference `ValueError`, none producing a raw Python `TypeError`, an
+ambiguous pandas/numpy error, or a missing-column lookup, and none leaving
+partial `_meta`. Confirmed an ordinary non-nominated non-string physical
+column (e.g. an integer-labeled DataFrame column not used as `row_keys` or a
+dense-axis selector) is still fully usable -- the general physical-label
+authority for non-nominated columns is unchanged.
+
+== 12. Cross-carrier proof
+
+The new integration test
+(`tests/integration/io_backends/test_xref_selector_reference_roundtrip.py`)
+persists an accepted `row_keys=["region"]` selector through JSON directory,
+XLSX, and ODS, reloads, and asserts on the *reloaded* frame/metadata (not
+reconstructed configuration): physical column label present and exact `str`,
+persisted `row_keys` entry exact `str`, and a subsequent `expand_xref`
+rediscovery/lookup reproduces the original relation. `check_dtype=False` is
+used only for cell values (`10`/`"10"`), not for the selector-reference
+property under test, so it does not mask the claim being pinned. This is a
+genuine regression pin: changing `row_keys` type or the physical label's type
+would fail it.
+
+YAML directory (`yaml_backend.py`, registered as `yaml_dir`/`yaml` in
+`io_backends/router.py`) is also a maintained frame-plus-metadata carrier,
+distinct from CSV and XML (both of which explicitly drop `_meta` on write --
+`if sheet_name == "_meta": continue` -- and are therefore not
+frame-plus-metadata carriers relevant to this claim at all). Per the FTR's own
+section 8.1 table, YAML already round-trips a numeric selector correctly
+end-to-end (both physical label and metadata stay native `int`, lookup
+passes) -- YAML was never part of the failure boundary this FTR fixes, so its
+omission from the new regression test is justified; the accepted section 9
+package (item H) only requires JSON-directory/XLSX/ODS. No test-scope defect.
+
+== 13. Documentation, registry, and release-note truthfulness
+
+Independently grepped `docs/` and `registries/` for the retired phrases
+("not required to be strings", "unique numeric label", bare "numeric label").
+Every current-tense occurrence outside this FTR/review and historical
+cold-storage archives is one of the six locations the correction commit
+updates, and each is correctly scoped: the unqualified Class A statement is
+preserved verbatim, immediately followed by a new paragraph that narrows only
+the selector-nomination role (`crosstab_binary_xref.adoc`,
+`xref_crosstable.adoc`, `02_bijective_transforms.adoc`,
+`meta_registry.yaml`'s `xref_crosstable` entry, `pipeline_step_registry.json`'s
+two `drop_source` notes, `release_notes.adoc`'s active `== unknown -- planned`
+section). No dated `(released)` section contains the retired statement.
+`meta_registry.yaml`'s `compact_multiaxis` entry was independently read and
+makes no type-preservation claim the corrected vocabulary would falsify --
+correctly left unchanged. Dense-axis selector narrowing is represented in the
+public `xref_crosstable` registry entry, not silently absent. No other
+use-case doc (`business_calculation_workbook_roundtrip.adoc`,
+`compact_multiaxis.adoc`, `localized_resource_workbook_roundtrip.adoc`,
+`worldbuilding_continuity_workbook_roundtrip.adoc`) references a non-string
+`row_keys` example, so none needed updating.
+
+*Minor wording observation:* four of the six updated prose passages (Technical
+Model, Functional Model, User Guide, release notes -- not the two registries)
+state the carrier-neutrality claim with the parenthetical "(JSON directory,
+XLSX, ODS)" immediately after "every currently maintained carrier". Read
+literally, this implies those three are the complete maintained
+frame-plus-metadata carrier set; YAML directory is also maintained (section
+12) and is simply not part of the failure boundary, so its omission from the
+*carrier list in prose* is imprecise even though its omission from the
+*regression test* is correct. The underlying normative claim ("only `str` is
+carrier-neutral across every maintained carrier") remains true whether or not
+YAML is named, because YAML was never the carrier that breaks non-string
+selectors. Not blocking per the governing review instructions' own guidance
+(do not block on wording that does not make a normative contract materially
+false); recorded as Finding F2 (Minor) for optional low-touch cleanup.
+
+== 14. Validation performed independently
+
+* `pytest tests/unit/domain/transformations/test_xref_crosstable.py
+  tests/unit/domain/transformations/test_compact_multiaxis.py
+  tests/integration/io_backends/test_xref_selector_reference_roundtrip.py`
+  -- 191 passed.
+* `pytest tests/unit/domain/transformations/test_grouped_xref.py
+  tests/unit/domain/transformations/test_grouped_xref_composites.py
+  tests/unit/pipeline/test_persistence_boundary.py tests/architecture
+  tests/integration/pipeline/test_grouped_xref_public_build.py
+  tests/integration/pipeline/test_gx5_grouped_xref_public_roundtrip.py
+  tests/integration/io_backends/ods/test_gx4_ods_grouped_roundtrip.py` --
+  275 passed.
+* Full active suite (`pytest -q`, cross-checked via `--junit-xml`): *2527
+  tests, 0 failures, 0 errors, 0 skipped* -- independently confirms, rather
+  than trusts, the implementer's reported "~2527".
+* `python tools/check_source_style.py` (the current `source-style-guards`
+  target): exit 0; all emitted warnings are pre-existing complexity/length
+  warnings in unrelated ODS/XLSX/rendering files untouched by this range.
+* `registries/pipeline_step_registry.json` and `registries/meta_registry.yaml`
+  independently parsed with `json.load`/`yaml.safe_load` -- both valid.
+* `git diff --check 84d1a9b..fc3d288` -- clean, no whitespace errors.
+* Asciidoctor rendered all four changed `.adoc` files individually
+  (`xref_crosstable.adoc`, `crosstab_binary_xref.adoc`,
+  `02_bijective_transforms.adoc`, `release_notes.adoc`) with no error or
+  warning output.
+* Adversarial probes in sections 4, 6, and 11 were run against the real
+  installed package (`.venv`), not inferred from source reading alone.
+
+== 15. Findings
+
+=== XREF-SELECTOR-IMPL-REVIEW-F1 -- Blocking -- composite `row_keys` reaches candidate-controlled equality before the new gate
+
+*Evidence:* Section 4. `contract_xref`/`expand_xref` call
+`_ensure_unique_field_list` (duplicate-field scan, `==`-based) before
+`_ensure_selector_reference_labels` (the new exact-`str` gate). For a
+composite `row_keys` list, the duplicate scan compares every later element
+against every earlier-accepted element via `_values_equal`
+(`bool(value == existing)`). When an invalid, non-first selector defines a
+raising or side-effecting `__eq__`, that method runs before the candidate is
+ever classified as invalid. Independently reproduced for `contract_xref`,
+`expand_xref`, and (by inheritance) `contract_compact_multiaxis`; the dense-
+axis `key`/`keys` seam is unaffected (no duplicate scan there). The shipped
+"rejection never invokes hostile candidate protocols" test uses a
+single-element `row_keys=[bomb]` list, which structurally cannot enter the
+duplicate scan's comparison branch (`seen` is empty on the only iteration),
+so it does not exercise -- and does not disprove -- this path.
+
+*Affected accepted criterion:* FTR section 7.2, third bullet and the
+"Normalization ownership" paragraph: "it must not call `repr`, `str`,
+arbitrary equality, or hashing on a rejected candidate merely for
+diagnostics." The primitives.py docstring for
+`_ensure_selector_reference_labels` states the same guarantee unconditionally
+("A rejected candidate is never inspected").
+
+*Counterexample:*
+
+[source,python]
+----
+contract_xref(frames, relation="rel", output="matrix",
+              row_keys=["region", ProtocolBomb()])
+# -> AssertionError: equality must not run  (raised inside ProtocolBomb.__eq__)
+# instead of the intended ValueError("... selector reference ...")
+----
+
+*Smallest required correction:* Make the duplicate-field scan safe against an
+unclassified `row_keys` candidate before the new gate runs -- either evaluate
+`_ensure_selector_reference_labels` on each element ahead of the duplicate
+scan specifically for the two `row_keys` seams (dense-axis already does this
+and is unaffected), or harden the duplicate-detection comparison so it does
+not invoke a candidate's `__eq__` until the candidate's own type has been
+established as comparable/nominated. Add a composite-list regression test
+(hostile candidate at a non-first position) alongside the existing
+single-element hostile test, since the two are not equivalent.
+
+=== XREF-SELECTOR-IMPL-REVIEW-F2 -- Minor -- carrier-list parenthetical omits YAML directory
+
+*Evidence:* Section 13. Four prose passages (Technical Model, Functional
+Model, User Guide, release notes) phrase the carrier-neutrality claim as
+"every currently maintained carrier (JSON directory, XLSX, ODS)". YAML
+directory is also a maintained frame-plus-metadata carrier (`yaml_backend.py`,
+registered in `io_backends/router.py`) and was already carrier-neutral for
+non-string selectors per the FTR's own section 8.1 evidence, so it was
+correctly excluded from the regression test but is imprecisely omitted from
+the prose enumeration.
+
+*Affected accepted criterion:* Section 10's documentation-truthfulness
+requirement, read strictly on the parenthetical's literal completeness claim;
+does not affect the normative "exact `str` is the only carrier-neutral
+selector vocabulary" statement, which remains true with or without YAML named.
+
+*Smallest required correction (optional, non-blocking):* Reword the
+parenthetical to "(for example, JSON directory, XLSX, ODS)" or add "; YAML
+directory is unaffected because it was already carrier-neutral for these
+values" in the four prose locations, at the next low-touch documentation
+pass. No release-relevance and no runtime implication.
+
+== 16. Verdict
+
+*B. CHANGES REQUIRED.*
+
+One Blocking finding (F1) directly prevents independent acceptance: it is a
+verified, reproducible violation of an explicit accepted-architecture
+safety guarantee (no candidate-controlled introspection on a rejected
+selector), not a speculative or generic-hardening concern excluded by the
+repository's proportionate threat model -- the FTR itself states the
+guarantee as a requirement, and the implementation's own adversarial test
+suite does not cover the input shape that breaks it. F2 is Minor and does not
+independently block; it may be folded into the same correction pass or
+deferred to a low-touch documentation cleanup.
+
+== 17. Lifecycle consequence
+
+Per the governing review scope, no lifecycle curation, census disposition, or
+E3 work is performed in this review. The implementation remains the current
+slice. `TRUSTED-INGRESS-E3-CENSUS-FOLLOWUP-F1` stays open, blocked on this
+implementation's independent acceptance; E3-E7 remain unstarted; the census is
+not touched. The census must not be dispositioned, and no lifecycle curation
+of this FTR's status should occur, until F1 is corrected and a follow-up
+implementation review confirms it closed (F2 may be closed in the same pass or
+noted as accepted residual Minor debt at that time).
+
+Only this review artifact was created by this review. No runtime, test,
+registry, model, guide, roadmap, Project Memory, census, census review,
+accepted FTR, or architecture review file was modified. Nothing pushed.
+
+BOUNDED XREF DURABLE-SELECTOR PREREQUISITE
+REQUIRES CORRECTION --
+PRE-E3 CENSUS DISPOSITION REMAINS BLOCKED.
