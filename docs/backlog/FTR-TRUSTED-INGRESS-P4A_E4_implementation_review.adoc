@@ -1,0 +1,624 @@
+= FTR-TRUSTED-INGRESS-P4A -- Independent E4 Implementation Review
+:toc:
+
+*Review date:* 2026-08-15
+
+*Review type:* fresh-context, independent implementation review of Phase-E
+Trusted Ingress slice E4 ("exact producer-transition representation and
+bounded certificates") only. The implementation author's report (FTR section
+40, "E4 implementation evidence") is treated as a claim to verify, not as
+review authority. This review does not start E5, perform lifecycle curation,
+or condense documentation.
+
+*Lifecycle baseline:* `5c34f751b1e1ba35b17f27c349a3c4f606443f31`
+(`docs(trusted-ingress): advance lifecycle to E4`).
+
+*Reviewed range:* `5c34f75..6b974e5`
+
+* `2bbfafa0d92df8eb575c0fed898e86b7359e8bbf` --
+  `feat(FTR-TRUSTED-INGRESS-P4A): represent E4 execution transitions`
+* `ef833914446afb56106b09481128936b9632f79c` --
+  `fix(FTR-TRUSTED-INGRESS-P4A): scalarize MultiIndex row_index in finding
+  reports`
+* `6b974e533c8e767f51862156db2e4044dc8b6e05` --
+  `docs(FTR-TRUSTED-INGRESS-P4A): record E4 implementation evidence`
+
+*Accepted design authority:* `docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc`
+section 23 ("E4 -- exact producer-transition representation and bounded
+certificates") and section 25 (Phase-E scope/defer matrix), interpreted
+through `FTR-TRUSTED-INGRESS-P4A_review.adoc` Independent Follow-up Review
+005 (commit `334c331`), the final accepted architecture interpretation.
+
+*Verdict:* *B. CHANGES REQUIRED -- E4 REPRESENTATION CONTAINS THREE BLOCKING
+DEFECTS THAT ALLOW A CLASSIFIER TO CERTIFY BEHAVIOR IT DID NOT BIND, EXECUTE,
+OR CORRECTLY LOCATE.*
+
+3 Blocking, 2 Important, 1 Minor finding. All three Blocking findings were
+independently reproduced with concrete runtime probes against the actual
+implementation, not constructed hypothetically.
+
+== 1. Accepted E4 contract, reconstructed independently
+
+Before inspecting the implementation, the accepted contract is restated here
+in this reviewer's own words from the FTR and Review 005 (no implementation
+code was open yet when this section was drafted):
+
+E4 must provide an *implementation-local, execution/control-plane*
+representation -- not payload metadata, not a runtime registry -- of exact
+producer transitions for a closed, bounded role vocabulary: standalone
+`LookupFormulaSpec`, transition-only `GroupedMatrix`, exactly one nested
+composition `GroupedMatrix[LookupFormulaSpec@grouped-dynamic-value-cell]`,
+and `ArtifactManifestSourceFrames`. Every bound invocation must classify to
+either an *exact certificate* -- naming its real input/output state, provable
+against actual runtime, never by nominal/identity resemblance -- or the
+closed `Uncertified` default. The default is closed: no callable, registry
+entry, family, wrapper, or factory identity confers certification by itself.
+Preserving certificates may legitimately be an empty set. The bounded
+disjoint-role locality proof must be a real semantic footprint (reads/writes/
+drops), stronger than "we observed no mutation." The representation must
+correctly encode forward source-retaining derivation, both reverse
+`expand_grouped_xref` endpoints, the projection/adapter exit chain (including
+*exact render-cell locations*, per Review 005 section 5), cleanup
+termination, R1 (Scalar-safe diagnostic row-index), and M1 (artifact-manifest
+role), all without wiring into E5 macro flow.
+
+The single load-bearing acceptance criterion this review falsifies most
+directly is FTR section 23's own sentence: *"the exact locality proof is
+stronger than observed non-mutation and does not require a universal role
+registry"* and Review 005 section 11's *"an implementation-local exact
+role/transition representation."* A representation whose certificate can be
+obtained for behavior the implementation never bound or never actually
+computed the location of is not that.
+
+== 2. Changed-file scope
+
+`git diff --stat 5c34f75..6b974e5` -- 25 files, +3036/-7. New package
+`src/spreadsheet_handling/pipeline/execution_state/` (9 modules), 16 new test
+files, 2 small runtime-correction files
+(`domain/finding_frame.py`,
+`domain/validations/reference_validations.py`), and FTR/release-note
+documentation. No file under `application/`, `pipeline/runner.py`,
+`pipeline/execution.py`, `pipeline/build.py`, `pipeline/registry.py`, or any
+CLI/router module changed. Independent `grep` for `execution_state` across
+`application/`, `pipeline/runner.py`, `pipeline/execution.py`,
+`pipeline/build.py`, `pipeline/registry.py`, and `cli*` returned nothing.
+`tests/architecture/test_execution_state_not_wired.py` (AST-based import
+check + registry-membership check) independently confirms the same. *No
+hidden E5/E6/E7 work, orchestrator threading, or lifecycle curation was
+found.*
+
+== 3. Package / layering
+
+`pipeline/execution_state/` correctly lives under `pipeline/` rather than
+`domain/ingress/`: it must compare `pipeline.types.BoundStep` against
+`domain`/`core` role types, and the architecture layer map only allows
+`pipeline` to depend on both without inversion. Every function in the
+package is pure (`classify_*` / `resolve_*` / `compose_*` taking explicit
+arguments, returning a value); nothing writes into `Frames`, `_meta`, a
+`DataFrame`, or a carrier object, and nothing is looked up by name against a
+global table. There is no public/runtime role registry. *Layering verdict:
+SOUND.*
+
+== 4. BLOCKING F1 -- exact-bound certification is not tied to executable behavior
+
+*Accepted criterion violated:* FTR section 23 ("no callable, registry entry,
+family, wrapper, factory, or built-in inherits certification") and the
+decision-table row for "Caller-supplied callable / `BoundStep`" (FTR line
+~1622): certification requires *"its exact bound behavior carries a
+framework-reviewed producer contract through an implementation mechanism"* --
+not merely a matching descriptive label.
+
+Every classifier in the package (`classify_formula_helper_step`,
+`classify_grouped_producer_step`, `classify_expand_grouped_step`,
+`classify_artifact_manifest_step`) inspects only `step.config`
+(`formula_helper.py:78` etc.). None of them ever reads `step.fn`. `BoundStep`
+(`pipeline/types.py:32-44`) is a frozen dataclass whose `name`/`config`/`fn`
+fields are three independent values with no structural link between
+`config["target"]` and what `fn` actually does -- nothing prevents
+constructing one with a certifiable `config` and an unrelated `fn`.
+
+*Counterexample A -- forged `BoundStep` (probe run against the real
+implementation):*
+
+[source,python]
+----
+forged = BoundStep(
+    name="forged",
+    config={
+        "target": FORMULA_HELPER_TARGET,
+        "source": "orders", "lookup": "products", "output": "orders",
+        "key": "product_id", "helpers": {"fields": ["value"]},
+        "missing": "empty", "helper_value_mode": "formula",
+    },
+    fn=lambda frames: {**frames, "PWNED": pd.DataFrame({"x": [1]})},
+)
+classify_formula_helper_step(forged)
+# -> FormulaHelperCertificate(source='orders', lookup='products', ...)
+forged(frames)
+# -> {'orders': ..., 'products': ..., 'PWNED': ...}   # fn does nothing formula-related
+----
+
+The classifier returns a full `FormulaHelperCertificate` for a step whose
+executable closure has no relationship whatsoever to `enrich_lookup`. This is
+precisely the "prebound/caller-supplied BoundStep" case the FTR's own
+decision table places on the uncertified side unless an implementation
+mechanism verifies *exact bound behavior*; no such mechanism exists here.
+
+*Counterexample B -- real registry-built step, mutated after binding (TOCTOU,
+no forgery needed):*
+
+[source,python]
+----
+[step] = build_steps_from_config([{
+    "step": "add_lookup_helpers", "source": "orders", "lookup": "products",
+    "output": "orders", "key": "product_id",
+    "helpers": {"fields": ["value"]}, "missing": "empty",
+    "helper_value_mode": "values",       # <- real executing closure: VALUES mode
+}])
+classify_formula_helper_step(step)        # Uncertified(reason='uncovered_configuration')
+result0 = step(frames)                    # orders['value'] cells are plain str
+
+step.config["helper_value_mode"] = "formula"   # single top-level dict write
+
+classify_formula_helper_step(step)
+# -> FormulaHelperCertificate(...)   # NOW CERTIFIED
+result1 = step(frames)
+# orders['value'] cells are STILL plain `str`, not LookupFormulaSpec
+----
+
+Root cause: `pipeline/steps.py:71-87` (`make_frames_target_step`) builds
+`cfg = {"target": ..., **dict(kwargs)}` (a *new* dict, shallow-copied) but
+the returned closure is `def run(fr): return fn(fr, **kwargs)` --
+`pipeline/steps.py:84` -- which closes over the *original* `kwargs` object,
+not `cfg`. `step.config` (== `cfg`) and the value the closure actually
+executes with (`kwargs`) are two different dict objects from the moment the
+step is built. A top-level key reassignment on `step.config` is therefore
+purely cosmetic to execution, but *not* cosmetic to `classify_formula_helper_step`,
+which re-reads `step.config` fresh every call (by design, for the opposite,
+intended direction -- see FTR section 18). The result is a real,
+single-threaded, no-forgery divergence between "what the certificate says
+this step does" and "what it actually does when called," reachable through
+the real `build_steps_from_config` → registry → `make_frames_target_step`
+path with an ordinary dict mutation in between.
+
+*Evidence-accuracy note:* FTR section 40.3 states *"callable identity is
+necessary but never sufficient"* for certification. This is not what the
+code does -- callable/`fn` identity is never inspected anywhere in this
+package; only the `config["target"]` *label* is compared. The sentence
+describes a check that does not exist.
+
+*Test-coverage note:* `test_bound_configuration_mutation_safety.py:97-104`
+proves only the *safe* direction (certified → mutate → uncertified) and its
+own comment explicitly states *"[top-level reassignment] does not even
+affect the actual execution closure for this binder"* -- the author was
+aware of the asymmetry but the shipped test suite never exercises the
+dangerous reverse direction demonstrated in Counterexample B, and
+`test_uncertified_default.py` never constructs a forged `BoundStep` with a
+mismatched `fn` (Counterexample A).
+
+*Smallest bounded correction:* either (a) `BoundStep` must bind an immutable,
+closure-verifiable identity between `config` and `fn` (e.g. the binder
+closing over `cfg` itself instead of a separate `kwargs`, plus freezing
+`cfg`/making it read-only after bind), or (b) every E4 classifier must
+independently authenticate `step.fn` (e.g. via `id()`/registry-resolved
+callable comparison) as well as `config`, and the FTR's "callable identity is
+necessary" sentence must become true of the code. Per FTR section 45, this is
+an implementation defect in how the accepted contract was encoded, not an
+architecture contradiction -- Review 005's own decision-table row already
+anticipated exactly this boundary.
+
+== 5. BLOCKING F2 -- projection does not represent exact render-cell locations
+
+*Accepted criterion violated:* Review 005 section 5 ("workbook projection and
+rename rule B"): *"`grouped_matrix_to_exact_table` terminates `GroupedMatrix`
+[and] relocates nested FormulaSpec to exact-table DATA LOCATIONS"* and
+section 24 of the review brief: *"XLSX / ODS adapter consumes FormulaSpec...
+carries exact CELL LOCATIONS."*
+
+`projection.relocate_nested_formula_at_projection` (`projection.py:53-74`)
+takes only `(nested: GroupedMatrixFormulaRole, render_frame: str)` and
+returns:
+
+[source,python]
+----
+return LookupFormulaSpecRole(
+    frame=render_frame,
+    column=source.column,      # <- projection.py:68
+    ...
+)
+----
+
+`source.column` is `nested.source.column` -- the *pre-grouping* flat helper's
+value-column name (e.g. `"value"`), carried forward unchanged from
+`compose_formula_to_grouped`. It is not derived from the actual projected
+location at all. Independently reading the real projection function
+(`grouped_xref/matrix.py:156-198`, `grouped_matrix_to_exact_table`) shows why
+this cannot be correct: its output, `ExactTable`, has no named "column"
+concept whatsoever -- `data` is row-major positional tuples
+(`frame.values.tolist()`) and `header_grid` is a tuple of label rows read
+from `matrix.header`; a "column name" identity does not survive projection.
+The one function in this same package that *does* correctly resolve real
+physical dynamic-column identity, `dynamic_column_labels`
+(`grouped_matrix.py:393-408`), reads the live `GroupedHeader`/`DynamicColumn`
+positions from the matrix being expanded -- exactly the mechanism
+`relocate_nested_formula_at_projection` would need and does not use. The
+function is not merely imprecise; it is structurally incapable of naming a
+render-cell location, because it is never given the `GroupedMatrix`,
+`ExactTable`, or render-plan object that location would have to be computed
+from.
+
+*Test-quality confirmation:* `test_projection_transition.py:53-64`
+(`test_nested_formula_relocates_to_the_render_cell_at_projection`) hand-builds
+`_source_role()` with `column="value"` and merely asserts the function
+echoes that same string back -- it never runs
+`grouped_matrix_to_exact_table`/`compose_workbook`/`build_render_plan` to
+compare against a real projected cell location. No test in the new suite
+proves correspondence between this descriptor and actual render output. This
+matches the review brief's section 42 concern precisely.
+
+*Concrete risk:* if E5 later uses this descriptor to decide which render
+cell the XLSX/ODS adapter must treat as formula-bearing (its explicitly
+intended purpose, per Review 005 section 5's own table), it will be told the
+wrong location (a stale flat-frame column name instead of the true dynamic
+render position), for every certified nested formula/grouped composition.
+
+*Smallest bounded correction:* `relocate_nested_formula_at_projection` needs
+the same kind of live-structure input `dynamic_column_labels` already uses
+(the `GroupedMatrix`/`ExactTable`/render-plan object being projected) to
+compute the real post-projection location, or the descriptor's `column`
+field must be renamed/documented as "pre-projection provenance only," and a
+separate, correctly-computed field added for the actual render-cell address
+-- and E4's acceptance criteria (section 23) require the latter, since E5 is
+explicitly expected to "enforce adapter consumption" from this
+representation alone.
+
+== 6. BLOCKING F3 -- disjoint-locality footprint omits declared frame-read dependencies
+
+*Accepted criterion violated:* FTR section 10 ("its footprint proves that the
+existing role location, contained payload, descriptor/provenance, and
+rename/relocation identity are unaffected") and `vocabulary.py`'s own
+docstring requirement that the proof be based on *"the transition's own
+declared frame names... never observed runtime behaviour."*
+
+`GroupedProducerCertificate.footprint()` (`grouped_matrix.py:130-134`) and
+`ExpandGroupedCertificate.footprint()` (`grouped_matrix.py:312-323`) declare
+`reads`/`writes`/`drops` built only from `relation`/`table`/`matrix` and
+`output`. Both classifiers accept -- as known, reviewed configuration keys --
+`source_frame` (`_CONTRACT_KNOWN_KEYS`, `_RECONSTRUCT_KNOWN_KEYS`,
+`_EXPAND_KNOWN_KEYS`) and `dense_axes`/`base_relation`, but the footprint
+never includes them.
+
+Independently confirmed against the real functions: `source_frame` is a
+*required* parameter of `contract_grouped_xref`, `reconstruct_grouped_matrix`,
+and `expand_grouped_xref` (`grouped_xref/composites.py`), fed into
+`AxisMappingIntent(source_frame=source_frame, ...)` and then genuinely read
+via `frames[intent.source_frame]` inside `resolve_axis_mapping`
+(`xref_axis_mapping/resolver.py:150`). A runtime probe against the real
+`contract_grouped_xref` confirmed this dependency is live and load-bearing
+(the call fails with `AxisMappingError: ... axis mapping source frame 'A'
+row 0 ...` when frame `A`'s content does not match, proving `A`'s content is
+read and validated during the transition -- not merely accepted-but-inert).
+
+*Concrete falsification (matching the review brief's prescribed construction
+exactly):*
+
+[source,python]
+----
+existing = GroupedMatrixRole(frame="A", producer="contract_grouped_xref",
+                              source="rel0", effect=TransitionEffect.INTRODUCE)
+second_cert = GroupedProducerCertificate(
+    producer="contract_grouped_xref", output="B_out", source="B_rel",
+    value_column="value", drop_source=False, row_keys=("id",),
+)   # relation="B_rel", output="B_out" -- both disjoint from "A"
+second_cert.footprint()
+# -> TransitionFootprint(reads={'B_rel'}, writes={'B_out'}, drops=set())
+disjoint_grouped_introduction(existing, second_cert)
+# -> existing   (claims "A" is PRESERVED / disjoint)
+----
+
+but a real invocation of this exact certificate's configuration with
+`source_frame="A"` genuinely reads frame `A`'s content (confirmed above) --
+a dependency the declared footprint hides entirely. The proof is not
+"stronger than observed non-mutation"; on its own declared terms it is
+*silent* about a real, required, classifier-accepted input.
+
+Because reads (as opposed to writes/drops) do not themselves mutate the
+existing role's frame in the current `resolve_axis_mapping` implementation,
+this specific gap does not yet cause an observed runtime corruption of an
+existing role -- but the FTR is explicit that the proof must not rest on
+"our implementation happens not to write there today." A future
+`resolve_axis_mapping` change, or a `dense_axes` shape that does write back,
+would silently invalidate every locality claim this package has made, with
+no test able to catch it, because the dependency was never declared. Per
+finding discipline, an under-declared footprint is exactly "locality proof
+is unsound."
+
+*Smallest bounded correction:* add `source_frame` (and, for
+`expand_grouped_xref`, `base_relation` if it is genuinely frame-valued -- not
+independently re-verified here) to each certificate's `footprint().reads`.
+
+== 7. IMPORTANT -- R1 scalarization only special-cases `tuple`
+
+FTR section 23's E4 acceptance criterion states unconditionally: *"the R1
+report projection emits only Scalar cells."* `_safe_row_index`
+(`reference_validations.py:729-742`) is:
+
+[source,python]
+----
+def _safe_row_index(row_index: Any) -> Any:
+    if type(row_index) is tuple:
+        return _row_index_label(row_index)
+    return row_index
+----
+
+Any row-index label that is neither already an ordinary Scalar carrier nor
+exactly `tuple` (a `MultiIndex` artifact) passes straight through unclassified.
+Independently probed: a `pandas.Index` built from a plain hashable
+non-Scalar object (a custom class instance, deliberately implementing hostile
+`__str__`/`__repr__`) reaches `validate_references`'s finding output as the
+*raw object itself*, not a String and not rejected:
+
+[source,python]
+----
+idx = pd.Index([Hostile(), Hostile()], dtype=object)
+frame = pd.DataFrame({"id": ["p1", "p1"]}, index=idx)
+out = validate_references(frames, rules=[{"type": "unique", "frame": "items",
+                                            "columns": ["id"]}], mode="warn")
+[type(v).__name__ for v in out["validation_findings"]["row_index"]]
+# -> ['Hostile', 'Hostile']   -- raw object in the report DataFrame cell
+----
+
+This is reachable under *current* physical-axis authority: E2's row-index
+grammar is explicitly not yet selected (FTR section 25 defer matrix: "No
+row-index grammar or scalar/tuple grammar is selected now"), so nothing in
+the framework currently prevents a DataFrame with an arbitrary hashable
+object index from reaching `validate_references`/`validate_graph`. No
+hostile `str()`/`repr()` call is triggered by the library itself (the
+existing guarded-formatting discipline inside the *tuple* branch,
+`_safe_row_index_component`, is sound and correctly classifies each
+component through `scalar_category` before formatting), so this is not a
+Domain Boundary Robustness violation in the "executes attacker code" sense --
+but it does mean R1's own unconditional "emits only Scalar cells" acceptance
+criterion is false for any non-tuple, non-Scalar index label, which is a
+currently reachable state, not a hypothetical one.
+
+*Recommended correction:* classify the *whole* `row_index` (not only inside
+the `tuple` branch) through the same `scalar_category` gate `finding_frame.py`
+already uses for tuple components, falling back to the existing
+`"<unsupported row index>"` placeholder for anything that fails it.
+
+== 8. IMPORTANT -- M1 has no explicit consume/exit representation
+
+FTR section 10 ("Artifact-manifest role decision") names three exit
+possibilities for `ArtifactManifestSourceFramesRole`: consumption by the
+manifest's own JSON/YAML writer, termination by exact whole-frame exclusion,
+and deliberate rejection at an unsupported sink -- and Review 005's
+twelve-flow closure item 8 lists all three explicitly as part of the
+maintained flow. `artifact_manifest.py` represents only introduction
+(`classify_artifact_manifest_step` / `artifact_manifest_role`, both with
+`effect=TransitionEffect.INTRODUCE`); unlike `projection.py`, which gives
+`GroupedMatrixRole`/`GroupedMatrixFormulaRole` an explicit, unwired
+`terminate_grouped_matrix_at_projection` descriptor for their exit, there is
+no analogous function for the manifest role.
+
+In practice, whole-frame cleanup termination is already covered generically
+by `roles.terminate_roles_removed_by_cleanup` (a pure frame-name
+set-difference that applies to any `ControlledRole`, including this one), and
+rejection at an unsupported general sink is plausibly already covered by the
+existing E1 ordinary-Scalar classifier (a `list` cell fails ordinary
+admission). But the fact that the JSON/YAML artifact-adapter "consume" effect
+and the unsupported-sink "reject" path have no discrete E4 representation --
+while the parallel FormulaSpec/GroupedMatrix exit chain received one in the
+same slice -- is an asymmetry in representational completeness within E4's
+own claimed scope, worth resolving before E5 needs to reconstruct that
+reasoning from first principles. Not Blocking: nothing here fabricates false
+role authority, and the generic mechanisms plausibly already produce correct
+behavior.
+
+== 9. MINOR -- evidence miscount ("seven exact registered dotted paths")
+
+FTR section 40.3 states classifiers accept "one of the seven reviewed dotted
+paths (the registry's own `target` strings for `add_lookup_helpers`,
+`contract_grouped_xref`, `reconstruct_grouped_matrix`, `expand_grouped_xref`,
+and `write_artifact_manifest`)." Independently enumerated: there are exactly
+five target constants in the package
+(`FORMULA_HELPER_TARGET`, `CONTRACT_GROUPED_XREF_TARGET`,
+`RECONSTRUCT_GROUPED_MATRIX_TARGET`, `EXPAND_GROUPED_XREF_TARGET`,
+`WRITE_ARTIFACT_MANIFEST_TARGET`), matching the five named functions. The
+prose says "seven." Behavior is unaffected; this is a documentation-accuracy
+defect only.
+
+== 10. What was independently verified as SOUND
+
+* *Role vocabulary* (`roles.py`): exactly the closed four descriptors;
+  `DeclaredComposite` stays empty; no generic schema. Matches FTR section 6/7.
+* *Preserving-certificate representation* (`preserving.py`): the zero initial
+  set is legitimate per Review 005's twelve-flow proof. Noted (not a
+  finding, since dormant): `PreservingCertificate.closed_options` records
+  option *key names* only, not reviewed *values*, so as written it could not
+  by itself distinguish two invocations of the same target/keys with
+  different semantic values if a future certificate were added -- worth
+  tightening whenever the first non-empty entry is proposed, not now.
+* *Forward composition* (`compose_formula_to_grouped`): independently
+  exercised via the real `enrich_lookup` → `contract_grouped_xref` chain
+  (`test_formula_grouped_composition.py`); confirmed real assertions against
+  `type(cell) is LookupFormulaSpec`, not hand-built doubles.
+* *Reverse retain/drop endpoints*: independently exercised via the real
+  `enrich_lookup` → `contract_grouped_xref` → `expand_grouped_xref` chain for
+  both `drop_source` values (`test_expand_grouped_reverse_endpoints.py`);
+  `type(result["grouped"]) is GroupedMatrix` / `is pd.DataFrame` and
+  `_meta.pipeline_cleanup.drop_frames` membership are asserted against real
+  runtime state, matching Review 005 section 6 exactly.
+* *`dynamic_column_labels` str() exactness* (review brief section 23):
+  independently traced -- `matrix.frame.columns` values reaching this
+  function are already guaranteed unique non-empty `str` by the upstream
+  XRef pipeline (`_dynamic_headers` docstring and validation in
+  `composites.py`) before a `GroupedMatrix` can exist, so `str(...)` here is
+  a safe no-op, not a lossy surrogate. No finding.
+* *Cleanup* (`terminate_roles_removed_by_cleanup`): a straightforward,
+  correctly-scoped pure set-difference over declared `frame` values; matches
+  Review 005 section 7.
+* *E4/E5 boundary*: `tests/architecture/test_execution_state_not_wired.py`
+  (AST-based import scan across `orchestrator.py`/`runner.py`/`execution.py`
+  /`build.py`/`registry.py`, plus registry-membership and
+  `pipeline_step_registry.json` checks) independently re-verified by direct
+  `grep`; no macro-flow module references `execution_state`.
+* *Package re-export surface* (`__init__.py`): a plain internal-package
+  barrel; not registered anywhere, not documented as public API, no
+  layering/promise problem found.
+
+== 11. Evidence-truthfulness summary
+
+Two claims in FTR section 40 do not match the implementation: "callable
+identity is necessary but never sufficient" (section 40.3 -- no callable
+identity check exists at all; see Finding F1) and "seven ... dotted paths"
+(section 40.3 -- five exist; see section 9 above). The claimed test/style/
+render counts (section 40.14) were independently reproduced exactly (see
+below) and are accurate.
+
+== 12. Independent validation
+
+[cols="3,7",options="header"]
+|===
+|Check |Independent result
+
+|`tests/unit/pipeline/execution_state/`
+|42 passed
+
+|`tests/architecture/test_execution_state_not_wired.py`
+|3 passed
+
+|`tests/unit/domain/validations/test_reference_and_graph_row_index_scalarization.py`
+|3 passed
+
+|`tests/unit/domain/test_finding_frame.py`
+|10 passed
+
+|Combined focused E4 suites
+|58 passed (matches FTR section 40.14 exactly)
+
+|Regression: `test_reference_validations.py`, `test_graph_validations.py`,
+`tests/unit/pipeline/`, `test_lookup_formula_mode.py`,
+`test_grouped_xref_composites.py`, `test_gx3b_reconstruction.py`,
+`test_artifact_manifest.py`, `tests/architecture/`
+|512 passed
+
+|XLSX/ODS FormulaSpec adapter + workbook-view suites
+|35 passed
+
+|`make test`
+|*2670 passed, 1 deselected* -- matches the implementation author's claimed
+result exactly
+
+|`ruff check` on every changed/new file (`git diff --name-only` filtered to
+`*.py`)
+|All checks passed
+
+|`make source-style-guards`
+|0 errors, 82 warnings, 2 allowlisted findings -- matches claimed baseline
+exactly
+
+|`asciidoctor --failure-level=ERROR` on the FTR and release notes
+|Both pass (exit 0)
+
+|`git diff --check 5c34f75..6b974e5`
+|Passes (exit 0)
+|===
+
+Independent adversarial probes run (temporary scripts only, none committed):
+forged `BoundStep` with certifiable config / unrelated `fn` (F1-A); real
+registry-built step mutated post-bind, values-mode → claimed formula-mode
+(F1-B); disjoint-locality footprint construction with a `source_frame`
+collision plus a real `contract_grouped_xref` call proving the read
+dependency (F3); hostile non-tuple row-index object reaching
+`validate_references` output raw (section 7).
+
+== 13. Findings summary
+
+[cols="1,2,6,1",options="header"]
+|===
+|ID |Severity |Summary |Section
+
+|F1
+|BLOCKING
+|Exact-bound certification is keyed only to `BoundStep.config`; `step.fn` is
+never inspected and `config`/`fn` are not structurally bound, so a forged or
+post-bind-mutated step can be certified while its executable behavior differs
+from the certificate.
+|4
+
+|F2
+|BLOCKING
+|`relocate_nested_formula_at_projection` reuses the pre-grouping flat helper
+column name as the "render-cell location"; `ExactTable`/render projection has
+no such column identity, so the descriptor cannot and does not name the real
+projected FormulaSpec cell.
+|5
+
+|F3
+|BLOCKING
+|`GroupedProducerCertificate`/`ExpandGroupedCertificate` footprints omit the
+required, classifier-accepted, genuinely-read `source_frame` configuration
+key, making the disjoint-locality proof structurally incomplete on its own
+declared terms.
+|6
+
+|I1
+|IMPORTANT
+|R1's `_safe_row_index` only special-cases `type(row_index) is tuple`; any
+other non-Scalar, non-tuple index label reaches the finding frame raw,
+violating the unconditional "emits only Scalar cells" acceptance criterion on
+a currently reachable path.
+|7
+
+|I2
+|IMPORTANT
+|`ArtifactManifestSourceFramesRole` has no explicit consume/exit descriptor
+analogous to `projection.py`'s grouped/formula exit chain, though generic
+cleanup and ordinary-fallback mechanisms plausibly already produce correct
+behavior.
+|8
+
+|M1
+|MINOR
+|FTR section 40.3 claims "seven" reviewed dotted paths; five exist.
+|9
+|===
+
+== 14. Verdict and lifecycle consequence
+
+*B. CHANGES REQUIRED.*
+
+E4 is not independently accepted. Three Blocking findings each demonstrate a
+concrete, reproduced gap between what a certificate claims and what the
+implementation actually binds, executes, or locates -- exactly the class of
+defect the review brief flagged as the primary falsification targets (its
+sections 5, 6/7, and 24 respectively), and all three were independently
+reproduced against the real implementation rather than argued
+hypothetically.
+
+E4 remains the current slice. E5 remains blocked and unstarted; no E5 macro
+wiring was performed during this review. No lifecycle curation was performed
+(FTR status, `_ftrs_open.adoc`, cold storage, Project Memory, and roadmap are
+all untouched). Residual scope for a follow-up correction pass: F1 (bind
+`config`/`fn` correspondence or authenticate `step.fn`), F2 (compute real
+render-cell locations at projection using live `GroupedMatrix`/`ExactTable`
+structure, not the pre-grouping column name), F3 (add `source_frame` -- and
+verify `base_relation` -- to declared footprints), plus the two Important
+items when convenient. No new architecture contradiction was found (FTR
+section 45): every Blocking finding is an implementation defect in how the
+already-accepted Review 005 contract was encoded, not a flaw in that
+contract itself.
+
+== 15. Lifecycle cleanup check
+
+This is not a final green verdict, so per `docs/ai_info/review_instructions.adoc`
+the lifecycle cleanup section is brief: FTR status must *not* change to
+`Done`/`Superseded`; nothing moves to cold storage; `docs/backlog/_ftrs_open.adoc`
+is unchanged; no follow-up FTR is needed (this is bounded correction within
+the existing E4 slice, not new residual scope). A corrected E4 implementation
+requires a fresh independent review pass before any lifecycle status change.
+
+PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
+AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
+E5 REMAINS BLOCKED.
