@@ -41,6 +41,24 @@ def test_row_index_label_renders_scalar_and_tuple() -> None:
     assert row_index_label((1, 2, 3)) == "1, 2, 3"
 
 
+def test_row_index_label_reports_unsupported_component_by_ordinal_not_inspection() -> None:
+    calls: list[str] = []
+
+    class _Hostile:
+        def __repr__(self) -> str:  # pragma: no cover - must never run
+            calls.append("repr")
+            raise AssertionError("repr must not run")
+
+        def __str__(self) -> str:  # pragma: no cover - must never run
+            calls.append("str")
+            raise AssertionError("str must not run")
+
+    bomb = _Hostile()
+    assert row_index_label(bomb) == "<unsupported row index>"
+    assert row_index_label(("a", bomb, 3)) == "a, <unsupported row-index component #1>, 3"
+    assert calls == []
+
+
 def test_to_record_renders_columns_row_index_and_value() -> None:
     finding = Finding(
         rule_type="duplicate_tuple",

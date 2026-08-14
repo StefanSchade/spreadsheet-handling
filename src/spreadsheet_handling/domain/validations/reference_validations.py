@@ -12,14 +12,20 @@ import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain.finding_frame import findings_to_frame as _serialize_findings
+from spreadsheet_handling.domain.finding_frame import row_index_label as _row_index_label
 
 Frames = dict[str, Any]
 
 # Module-specific extension of the canonical finding schema: reference
 # validations additionally carry ``target_frame`` / ``target_columns`` and
-# render ``row_index`` / ``value`` differently (raw index, JSON-encoded tuple),
-# so this producer keeps its own column list and ``ReferenceFinding`` record.
-# Only the tabular serialization mechanic is shared (see findings_to_frame).
+# render ``value`` differently (JSON-encoded tuple), so this producer keeps
+# its own column list and ``ReferenceFinding`` record. Only the tabular
+# serialization mechanic is shared (see findings_to_frame). ``row_index``
+# preserves an already-admitted Scalar label unchanged and projects only a
+# ``pandas.MultiIndex`` row index (a Python ``tuple`` from
+# ``DataFrame.iterrows()``, not Scalar-compatible on its own) through the
+# shared safe serializer -- Phase-E Trusted Ingress R1,
+# FTR-TRUSTED-INGRESS-P4A section 10, "Validation finding-frame decision".
 FINDING_COLUMNS = [
     "rule_type",
     "frame",
@@ -60,7 +66,7 @@ class ReferenceFinding:
             "rule_type": self.rule_type,
             "frame": self.frame,
             "columns": _format_columns(self.columns),
-            "row_index": "" if self.row_index is None else self.row_index,
+            "row_index": "" if self.row_index is None else _safe_row_index(self.row_index),
             "value": "" if self.value is None else _format_value(self.value),
             "target_frame": self.target_frame,
             "target_columns": _format_columns(self.target_columns or []),
@@ -718,6 +724,22 @@ def _plain_value(value: Any) -> Any:
     return value
 
 
+
+
+def _safe_row_index(row_index: Any) -> Any:
+    """R1: preserve an already Scalar-compatible ``row_index`` unchanged;
+    project a ``pandas.MultiIndex`` tuple to the shared safe String label.
+
+    ``frame.loc[:, columns].iterrows()`` yields the DataFrame's own index
+    value for each row: a plain scalar (the maintained default-index case,
+    left untouched -- "an already-admitted Scalar label may be preserved")
+    or a ``tuple`` when ``frame.index`` is a ``MultiIndex``, which is not
+    itself Scalar-compatible and must not reach a report cell as a raw
+    Python tuple.
+    """
+    if type(row_index) is tuple:
+        return _row_index_label(row_index)
+    return row_index
 
 
 def _key_token(key: tuple[Any, ...]) -> tuple[str, ...]:

@@ -30,6 +30,8 @@ from typing import Any, Protocol
 
 import pandas as pd
 
+from spreadsheet_handling.core.scalar_values import UnsupportedScalarError, scalar_category
+
 # Canonical seven-column finding-frame schema.  Reference validations extend
 # this with module-specific ``target_frame`` / ``target_columns`` columns and
 # keep their own constant; the shared serialization still drives both.
@@ -51,10 +53,32 @@ class FindingRecord(Protocol):
 
 
 def row_index_label(row_index: Any) -> str:
-    """Render a row index (a scalar or a tuple of positions) as a label."""
+    """Render a row index (a scalar or a tuple of positions) as a safe label.
+
+    This is the R1 shared diagnostic serializer (Phase-E Trusted Ingress,
+    FTR-TRUSTED-INGRESS-P4A section 10, "Validation finding-frame decision"):
+    a ``pandas.MultiIndex`` row index surfaces as a Python ``tuple`` from
+    ``DataFrame.iterrows()``, which is not itself Scalar-compatible. Each
+    component is classified with the same bounded, safe classifier ordinary
+    cell admission uses (``scalar_category``) before being rendered, and an
+    unsupported/unsafe component is reported by its ordinal position rather
+    than inspected with ``str()``/``repr()`` -- this function never formats a
+    value it has not first classified as an accepted Scalar carrier.
+    """
     if isinstance(row_index, tuple):
-        return ", ".join(map(str, row_index))
-    return str(row_index)
+        return ", ".join(
+            _safe_row_index_component(component, ordinal=ordinal)
+            for ordinal, component in enumerate(row_index)
+        )
+    return _safe_row_index_component(row_index, ordinal=None)
+
+
+def _safe_row_index_component(component: Any, *, ordinal: int | None) -> str:
+    try:
+        scalar_category(component)
+    except UnsupportedScalarError:
+        return f"<unsupported row-index component #{ordinal}>" if ordinal is not None else "<unsupported row index>"
+    return str(component)
 
 
 @dataclass(frozen=True)
