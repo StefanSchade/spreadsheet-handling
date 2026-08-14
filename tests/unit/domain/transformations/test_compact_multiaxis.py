@@ -25,6 +25,38 @@ pytestmark = [
 SELECTOR_FTR = pytest.mark.ftr("FTR-XREF-PHYSICAL-LABEL-METADATA-AUTHORITY-P4A")
 
 
+class _ProtocolBomb:
+    """A hostile object whose protocol methods must never execute.
+
+    Records into a caller-supplied list and raises immediately, so a test
+    can assert both "the candidate's own methods never ran" (``calls ==
+    []``) and, if one somehow did run, fail loudly rather than silently.
+    """
+
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def __repr__(self) -> str:  # pragma: no cover - must never run
+        self._calls.append("repr")
+        raise AssertionError("repr must not run")
+
+    def __str__(self) -> str:  # pragma: no cover - must never run
+        self._calls.append("str")
+        raise AssertionError("str must not run")
+
+    def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
+        self._calls.append("eq")
+        raise AssertionError("equality must not run")
+
+    def __hash__(self) -> int:  # pragma: no cover - must never run
+        self._calls.append("hash")
+        raise AssertionError("hashing must not run")
+
+    def __iter__(self):  # pragma: no cover - must never run
+        self._calls.append("iter")
+        raise AssertionError("iteration must not run")
+
+
 def _legend_meta() -> dict:
     return {
         "legend_blocks": {
@@ -961,9 +993,21 @@ class TestDurableSelectorReferenceInheritance:
     composites build ``row_key_cols`` and forward it into the real
     ``expand_xref``/``contract_xref`` seam *before* writing their own
     ``_meta.compact_multiaxis.<id>.row_keys`` copy, so a non-conforming
-    selector is rejected by the inner XRef call and no independent, invalid
+    selector is rejected before that write and no independent, invalid
     Compact-Multiaxis trace is ever written. These tests verify that
-    inheritance directly rather than inferring it from a code read.
+    directly rather than inferring it from a code read.
+
+    A rejection for a *single* invalid selector is raised by the inner
+    ``contract_xref``/``expand_xref`` call, as originally documented. A
+    composite ``row_keys`` list with a hostile, non-first candidate is
+    instead rejected earlier, by this module's own preflight call to the
+    same reused validator (XREF-SELECTOR-IMPL-REVIEW-F1 follow-up): both
+    composites perform their own selector-sensitive work -- an output-name
+    membership check (expand) or a Cell Codec ``group_by`` duplicate scan
+    (contract) -- *before* ever reaching the inner XRef seam, and neither of
+    those existing checks is safe to run against an unclassified candidate.
+    The inner XRef seam remains the authoritative family gate for every
+    other case.
     """
 
     def test_contract_compact_multiaxis_accepts_valid_str_row_key_selector(self) -> None:
@@ -1016,4 +1060,54 @@ class TestDurableSelectorReferenceInheritance:
                 value_columns=["P-001"],
             )
 
+        assert "_meta" not in frames
+
+    def test_contract_compact_multiaxis_rejects_composite_hostile_row_key_before_encode(
+        self,
+    ) -> None:
+        # XREF-SELECTOR-IMPL-REVIEW-F1 follow-up: before the Compact preflight
+        # existed, a non-first hostile row_keys candidate reached Cell Codec's
+        # own group_by duplicate-field scan (via encode_cell_values), which
+        # compares elements with candidate-controlled == before this contract
+        # ever classifies them. The preflight must reject it first.
+        calls: list[str] = []
+        bomb = _ProtocolBomb(calls)
+        frames = {
+            "explicit": pd.DataFrame([
+                {"feature_id": "f1", "column_key": "A", "code": "E"},
+            ]),
+        }
+
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_compact_multiaxis(
+                frames, relation="explicit", output="matrix", row_keys=["feature_id", bomb]
+            )
+
+        assert calls == []
+        assert "_meta" not in frames
+
+    def test_expand_compact_multiaxis_rejects_composite_hostile_row_key_before_collision_check(
+        self,
+    ) -> None:
+        # XREF-SELECTOR-IMPL-REVIEW-F1 follow-up: before the Compact preflight
+        # existed, a non-first hostile row_keys candidate reached this
+        # composite's own _ensure_distinct_output_columns, which tests set
+        # membership (hashing the candidate) before this contract ever
+        # classifies it. The preflight must reject it first.
+        calls: list[str] = []
+        bomb = _ProtocolBomb(calls)
+        frames = {
+            "product_matrix": pd.DataFrame({"region": ["f1"], "P-001": ["E"]}),
+        }
+
+        with pytest.raises(ValueError, match="selector reference"):
+            expand_compact_multiaxis(
+                frames,
+                matrix="product_matrix",
+                output="out",
+                row_keys=["region", bomb],
+                value_columns=["P-001"],
+            )
+
+        assert calls == []
         assert "_meta" not in frames

@@ -2338,6 +2338,38 @@ class _StableComparableLabel:
     value: str
 
 
+class _ProtocolBomb:
+    """A hostile object whose protocol methods must never execute.
+
+    Records into a caller-supplied list and raises immediately, so a test
+    can assert both "the candidate's own methods never ran" (``calls ==
+    []``) and, if one somehow did run, fail loudly rather than silently.
+    """
+
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def __repr__(self) -> str:  # pragma: no cover - must never run
+        self._calls.append("repr")
+        raise AssertionError("repr must not run")
+
+    def __str__(self) -> str:  # pragma: no cover - must never run
+        self._calls.append("str")
+        raise AssertionError("str must not run")
+
+    def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
+        self._calls.append("eq")
+        raise AssertionError("equality must not run")
+
+    def __hash__(self) -> int:  # pragma: no cover - must never run
+        self._calls.append("hash")
+        raise AssertionError("hashing must not run")
+
+    def __iter__(self):  # pragma: no cover - must never run
+        self._calls.append("iter")
+        raise AssertionError("iteration must not run")
+
+
 def _unsupported_selector_cases() -> list[Any]:
     """Every previously-mechanically-accepted non-str selector family (FTR-9.G)."""
     return [
@@ -2483,31 +2515,41 @@ class TestDurableSelectorReferenceContract:
 
     def test_rejection_never_invokes_hostile_candidate_protocols(self) -> None:
         calls: list[str] = []
-
-        class _ProtocolBomb:
-            def __repr__(self) -> str:  # pragma: no cover - must never run
-                calls.append("repr")
-                raise AssertionError("repr must not run")
-
-            def __str__(self) -> str:  # pragma: no cover - must never run
-                calls.append("str")
-                raise AssertionError("str must not run")
-
-            def __eq__(self, other: object) -> bool:  # pragma: no cover - must never run
-                calls.append("eq")
-                raise AssertionError("equality must not run")
-
-            def __hash__(self) -> int:  # pragma: no cover - must never run
-                calls.append("hash")
-                raise AssertionError("hashing must not run")
-
-            def __iter__(self):  # pragma: no cover - must never run
-                calls.append("iter")
-                raise AssertionError("iteration must not run")
-
-        bomb = _ProtocolBomb()
+        bomb = _ProtocolBomb(calls)
         frames = {"rel": self._relation()}
         with pytest.raises(ValueError, match="selector reference"):
             contract_xref(frames, relation="rel", output="matrix", row_keys=[bomb])
+        assert calls == []
+        assert "_meta" not in frames
+
+    def test_contract_xref_rejects_composite_hostile_row_key_without_candidate_equality(
+        self,
+    ) -> None:
+        # XREF-SELECTOR-IMPL-REVIEW-F1: a single-element row_keys list never
+        # enters the duplicate-field equality scan (its `seen` list starts
+        # empty), so it cannot exercise that path. A hostile candidate at a
+        # non-first position previously reached candidate-controlled `==`
+        # there before this selector-reference gate ever ran; the gate must
+        # now run first.
+        calls: list[str] = []
+        bomb = _ProtocolBomb(calls)
+        frames = {"rel": self._relation()}
+        with pytest.raises(ValueError, match="selector reference"):
+            contract_xref(
+                frames, relation="rel", output="matrix", row_keys=["region", bomb]
+            )
+        assert calls == []
+        assert "_meta" not in frames
+
+    def test_expand_xref_rejects_composite_hostile_row_key_without_candidate_equality(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        bomb = _ProtocolBomb(calls)
+        frames = {"matrix": pd.DataFrame([{"region": "north", "q1": 10}])}
+        with pytest.raises(ValueError, match="selector reference"):
+            expand_xref(
+                frames, matrix="matrix", output="rel", row_keys=["region", bomb]
+            )
         assert calls == []
         assert "_meta" not in frames

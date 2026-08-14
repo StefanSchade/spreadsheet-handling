@@ -90,10 +90,13 @@ def expand_xref(
     )
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
-    _ensure_unique_field_list(row_key_cols, field_name="row_keys")
     # row_keys is nominated as a durable XRef selector reference the moment it
     # is configured: it rides into _meta.xref_crosstable.<id>.row_keys below.
+    # This gate must run before the duplicate-field scan: the scan compares
+    # elements with candidate-controlled ==, which is only safe to invoke once
+    # every element is already a known-classified, exact non-empty str.
     _ensure_selector_reference_labels(row_key_cols, "row_keys")
+    _ensure_unique_field_list(row_key_cols, field_name="row_keys")
     _ensure_columns(source, row_key_cols, frame_name=matrix, field_name="row_keys")
     # Load and physical-validate the base relation before any output-name set
     # construction or membership: a configured physical base field
@@ -267,10 +270,13 @@ def contract_xref(
     _ensure_unique_physical_labels(source, frame_name=relation)
     row_key_cols = _as_list(row_keys, "row_keys")
     _ensure_flat_axis_labels(row_key_cols, "row_keys")
-    _ensure_unique_field_list(row_key_cols, field_name="row_keys")
     # row_keys is nominated as a durable XRef selector reference the moment it
     # is configured: it rides into _meta.xref_crosstable.<id>.row_keys below.
+    # This gate must run before the duplicate-field scan: the scan compares
+    # elements with candidate-controlled ==, which is only safe to invoke once
+    # every element is already a known-classified, exact non-empty str.
     _ensure_selector_reference_labels(row_key_cols, "row_keys")
+    _ensure_unique_field_list(row_key_cols, field_name="row_keys")
     _ensure_columns(
         source,
         [*row_key_cols, column_key, value],

@@ -15,7 +15,7 @@ import pandas as pd
 
 from ._legend_blocks import _read_legend_block
 from .cell_codec import decode_cell_values, encode_cell_values
-from .xref_crosstable import contract_xref, expand_xref
+from .xref_crosstable import _ensure_selector_reference_labels, contract_xref, expand_xref
 
 Frames = dict[str, Any]
 
@@ -72,6 +72,13 @@ def expand_compact_multiaxis(
     _reject_dense_axes(dense_axes)
     config_id = name or output
     row_key_cols = _as_list(row_keys, "row_keys")
+    # Preflight the same accepted XRef durable selector-reference contract
+    # here, before this composite's own selector-sensitive work (the output-
+    # collision membership check below, then Cell Codec encode) can compare,
+    # hash, or otherwise inspect an unclassified row_keys entry. The later
+    # expand_xref call remains the authoritative family seam; this is a
+    # preflight, not a replacement.
+    _ensure_selector_reference_labels(row_key_cols, "row_keys")
     passthrough = [*row_key_cols, column_key]
     _ensure_distinct_output_columns(passthrough, code=code, group=group)
 
@@ -215,6 +222,12 @@ def contract_compact_multiaxis(
     _reject_dense_axes(dense_axes)
     config_id = name or relation
     row_key_cols = _as_list(row_keys, "row_keys")
+    # Preflight the same accepted XRef durable selector-reference contract
+    # here, before this composite's own selector-sensitive work (Cell Codec
+    # encode's group_by duplicate-field scan below) can compare an
+    # unclassified row_keys entry. The later contract_xref call remains the
+    # authoritative family seam; this is a preflight, not a replacement.
+    _ensure_selector_reference_labels(row_key_cols, "row_keys")
     group_by = [*row_key_cols, column_key]
 
     prior_xref = _snapshot_xref_meta(frames)
