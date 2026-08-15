@@ -22,6 +22,7 @@ test/roundtrip fixtures for formula mode use exactly this inline shape (see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
@@ -147,7 +148,11 @@ def _classify_join_keys(config: Mapping[str, Any]) -> tuple[str | None, str | No
 
 
 def _classify_formula_fields(helpers: Any) -> tuple[str, ...] | None:
-    if type(helpers) is not dict:
+    # A dict-shaped ``helpers`` value is stored inside ``call.kwargs`` as a
+    # deep-frozen ``MappingProxyType`` (see
+    # ``pipeline.types._freeze_effective_value``), not a plain ``dict``, so
+    # both exact types are accepted here.
+    if type(helpers) is not dict and type(helpers) is not MappingProxyType:
         return None
     if set(helpers.keys()) != {"fields"}:
         return None
