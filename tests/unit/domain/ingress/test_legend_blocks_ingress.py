@@ -19,7 +19,9 @@ from spreadsheet_handling.domain.ingress import (
     run_domain_ingress,
 )
 
-pytestmark = pytest.mark.ftr("FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5")
+pytestmark = pytest.mark.ftr(
+    ["FTR-LEGEND-BLOCKS-RESOLVED-SHAPE-CORRECTION-P5", "FTR-TRUSTED-INGRESS-P4A"]
+)
 
 
 def _legend(frames: dict) -> dict:
@@ -30,7 +32,11 @@ def _legend(frames: dict) -> dict:
 
 
 def test_absent_meta_is_noop():
-    frames = {"data": object()}
+    # No top-level carrier at all (beyond the absent `_meta`) so the fixture
+    # also satisfies E2 ordinary structural admission, now wired into
+    # `run_domain_ingress` by Phase-E slice E5; an arbitrary opaque object
+    # would (correctly) be rejected before this rule ever runs.
+    frames: dict = {}
     assert run_domain_ingress(frames) is frames
 
 
@@ -196,7 +202,11 @@ def test_failure_does_not_mutate_caller_input():
 
 def test_ingress_rule_sequence_is_visible_and_ordered():
     # The coordinator exposes its ordered rule sequence so later normalizations
-    # can be added without hiding logic in orchestration.
+    # can be added without hiding logic in orchestration. E2 ordinary
+    # structural admission (Phase-E slice E5 wiring) runs first; the
+    # legend-blocks authoring delegate still runs before generic metadata
+    # substrate admission.
     names = [rule.name for rule in INGRESS_RULES]
-    assert names[0] == "legend_blocks_shape"
+    assert names[0] == "ordinary_structural_admission"
+    assert names.index("legend_blocks_shape") < names.index("metadata_substrate")
     assert len(names) == len(set(names))

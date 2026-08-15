@@ -102,7 +102,11 @@ def _meta_of(frames: dict) -> dict:
 
 
 def test_absent_meta_is_noop():
-    frames = {"data": object()}
+    # No top-level carrier at all (beyond the absent `_meta`) so the fixture
+    # also satisfies E2 ordinary structural admission, now wired into
+    # `run_domain_ingress` by Phase-E slice E5; an arbitrary opaque object
+    # would (correctly) be rejected before this rule ever runs.
+    frames: dict = {}
     assert run_domain_ingress(frames) is frames
 
 
