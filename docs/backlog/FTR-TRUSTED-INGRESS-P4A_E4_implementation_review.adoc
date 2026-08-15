@@ -1242,3 +1242,225 @@ every prior residual, an implementation defect in how that architecture's
 PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
 AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
 E5 REMAINS BLOCKED.
+
+== 18. Final bounded E4 acceptance disposition
+
+*Review date:* 2026-08-15 (same-context final pass). *Reviewed correction
+commits:* `e15f466` (freeze E4 executable bindings), `5e26bb7` (record final
+correction). Range `01c2e93..5e26bb7`. Scope confirmed clean: only
+`pipeline/types.py`, `pipeline/steps.py`,
+`pipeline/execution_state/formula_helper.py`, and one test file changed --
+no orchestrator/registry/runner file, no lifecycle-status file.
+
+=== 18.1 Corrected mechanism, reconstructed independently
+
+`BoundFramesTargetCall` is now `@dataclass(frozen=True, slots=True)` with
+`target`/`kwargs` fields. `bind(target, kwargs)` -- the classmethod
+`make_frames_target_step` actually uses -- deep-freezes `kwargs` via
+`_freeze_effective_value` (`dict` -> `MappingProxyType` of a *new* dict of
+recursively frozen values; `list`/`tuple` -> a new `tuple`; other leaves by
+reference). `__call__` thaws a fresh, invocation-local `dict`/`list`
+structure via `_thaw_effective_value` before calling `target`. This matches
+the task's reconstruction exactly.
+
+=== 18.2 Original review reproduction -- both vectors closed
+
+Against a genuinely framework-built, already-certified `add_lookup_helpers`
+step: `step.fn.target = malicious` and `step.fn.kwargs = other_mapping`
+both now raise `dataclasses.FrozenInstanceError` immediately; execution
+after each (failed) attempt still matches the original certificate exactly
+(real `LookupFormulaSpec` cells). *Closed, confirmed.*
+
+=== 18.3 Nested-alias root correction -- confirmed for the `.bind()` path
+
+Built a formula step from `helpers={"fields": fields}` (`fields =
+["value"]`, a caller-held list) and a grouped-producer step from a
+caller-held `row_keys` list, via the real `build_steps_from_config` path.
+Mutating the *original* aliases after binding (`fields.append(...)`,
+`helpers["fields"] = [...]`, `row_keys_list.append(...)`) had no effect on
+either bound call's execution or on a fresh classification of it -- both
+independently reproduced and matching the shipped
+`test_original_caller_held_aliases_cannot_affect_an_already_bound_call`.
+Mutation attempted through the bound call's own exposed nested view
+(`step.fn.kwargs[...]`) also correctly fails. Freeze/thaw round-trip
+independently verified with a synthetic target that mutates its own thawed
+containers in place: three successive invocations of the same call all
+started from the identical original frozen snapshot.
+
+=== 18.4 CRITICAL -- direct-constructor bypass of `.bind()`
+
+`resolve_trusted_call` accepts any object satisfying `type(step.fn) is
+BoundFramesTargetCall` and `step.fn.target is expected_target` --
+regardless of whether that object went through `.bind()`. The public,
+`@dataclass`-generated constructor `BoundFramesTargetCall(target, kwargs)`
+remains directly callable and does *not* deep-freeze `kwargs`; it only
+stores whatever object it is given. `frozen=True` blocks *reassigning* the
+`kwargs` attribute afterward, but does nothing to the mutable object that
+attribute already points at.
+
+[source,python]
+----
+mutable_kwargs = {  # exact certifiable FormulaHelper configuration
+    "source": "orders", "lookup": "products", "output": "orders",
+    "key": "product_id", "helpers": {"fields": ["value"]},
+    "missing": "empty", "helper_value_mode": "formula",
+}
+call = BoundFramesTargetCall(enrich_lookup, mutable_kwargs)  # bypasses .bind()
+step = BoundStep(name="manual", config={...}, fn=call)
+
+classify_formula_helper_step(step)   # -> FormulaHelperCertificate(...)
+step(frames)                          # -> orders["value"] cells are LookupFormulaSpec
+
+mutable_kwargs["helper_value_mode"] = "values"   # caller mutates its OWN dict
+
+step(frames)                          # -> orders["value"] cells are now plain str
+# the certificate issued before the mutation is unchanged and now false
+----
+
+Two further variants independently confirmed the same divergence: (a) a
+caller-held nested list inside `helpers={"fields": fields}` passed to the
+direct constructor -- mutating `fields` after certification changes which
+columns execution actually produces while `certificate.fields` still names
+only the original set; (b) `BoundFramesTargetCall(enrich_lookup,
+MappingProxyType(underlying))` -- wrapping the caller's own live `dict` in a
+proxy does not freeze it; mutating `underlying` directly (not through the
+proxy) after certification flips execution from formula-mode to
+values-mode while the certificate is unchanged.
+
+*E4-REVIEW-F1: NOT RESOLVED* -- the fourth consecutive disposition of the
+same underlying invariant. `resolve_trusted_call` proves nothing about
+objects it accepts that were not constructed via `.bind()`, and nothing
+distinguishes the two at the point of classification.
+
+*Documentation truthfulness:* FTR section 43.9 states the correction makes
+"the bound executable/configuration pair... genuinely immutable after
+construction." This is true only for `.bind()`-constructed instances, not
+for every instance `resolve_trusted_call` actually accepts. The shipped
+`test_copying_a_genuine_binding_necessarily_executes_the_reviewed_behavior`
+(`test_uncertified_default.py:185-202`) constructs
+`BoundFramesTargetCall(enrich_lookup, kwargs)` directly (the same bypass
+above) but classifies and executes it immediately without ever mutating
+`kwargs` in between, so it proves only "an unmutated direct construction is
+truthful," not the docstring's broader claim (F1's actual bar) that
+*obtaining* the accepted shape is harmless regardless of what the caller
+does with it afterward. This is not a separate finding; it is F1's own
+evidence not yet matching F1's own requirement.
+
+*Smallest bounded correction:* per the required invariant (task section 7),
+either (A) make `BoundFramesTargetCall.__new__`/`__init__` itself perform
+the freeze unconditionally (so the public constructor and `.bind()` are the
+same operation and no unfrozen instance can exist), or (B) give
+`resolve_trusted_call` a structural way to reject a non-canonically-frozen
+instance (e.g. asserting `type(call.kwargs) in (MappingProxyType,) or
+call.kwargs == ()` is insufficient by itself since nested values must also
+be checked recursively; freezing unconditionally at construction is the
+simpler, load-bearing fix).
+
+=== 18.5 Remaining sanity -- unaffected
+
+Wrong-target, subclass-override, and plain-forgery probes all still
+correctly reject. A genuine `.bind()`-constructed call copied into a fresh
+`BoundStep` still certifies and necessarily executes the reviewed behavior
+(unmutated). `None`-return semantics unchanged
+(`BoundFramesTargetCall.bind(target, {})` where `target` returns `None`
+yields the identical input `frames` object back). All five E4-reviewed
+targets (`enrich_lookup`, `contract_grouped_xref`,
+`reconstruct_grouped_matrix`, `expand_grouped_xref`,
+`write_artifact_manifest`) independently re-audited through the real
+binder: correct target identity, frozen configuration, matching classifier
+snapshot, successful execution. No maintained target bound through
+`make_frames_target_step` was found to depend on the tuple/list identity
+the freeze/thaw round-trip collapses (`isinstance(..., tuple)` hits in
+`domain/` are all about DataFrame column/row-index labels, never about
+`**kwargs`-shaped step configuration; every full-suite run below passed
+unchanged across all ~30 non-E4-reviewed steps sharing this binder).
+
+=== 18.6 F2/F3/I1/I2/M1 regression sanity
+
+No production code for any of the five previously-resolved findings was
+touched. Re-ran the same independent probes from sections 16-17 unchanged:
+F2's projection cell correspondence, F3's `source_frame`
+collision/disjoint/`base_relation` cases, I1's default/MultiIndex/hostile
+row-index scalarization for both validators, and I2's frame/column
+mismatch plus positive manifest-consume correspondence all produced
+identical, correct results. M1's FTR text is unaffected. *All five REMAIN
+RESOLVED, no regression.*
+
+=== 18.7 Validation
+
+Focused corrected suites: *87 passed*
+(`tests/unit/pipeline/execution_state/` + architecture guard + R1
+scalarization + finding_frame). Broader regression (`tests/unit/pipeline/`,
+formula/grouped/reconstruction, artifact manifest, `application/` including
+schema maintenance, XLSX/ODS FormulaSpec, architecture): *529 passed*.
+`make test`: *2699 passed, 1 deselected* -- matches the correction author's
+claimed result exactly. `ruff check` on changed files: all pass. `make
+source-style-guards`: 0 errors, 82 warnings, 2 allowlisted findings --
+matches exactly. `asciidoctor --failure-level=ERROR` on the FTR: passes.
+`git diff --check 01c2e93..5e26bb7`: passes.
+
+=== 18.8 Final disposition table
+
+[cols="2,2,6",options="header"]
+|===
+|Finding |Verdict |Independent evidence
+
+|E4-REVIEW-F1
+|*NOT RESOLVED*
+|Attribute reassignment (`step.fn.target = ...`, `step.fn.kwargs = ...`) is
+now correctly blocked (`FrozenInstanceError`). The public
+`BoundFramesTargetCall(target, kwargs)` constructor bypasses `.bind()`'s
+deep-freezing entirely and is accepted identically by
+`resolve_trusted_call`; a caller-held mutable `kwargs` object (or a nested
+alias, or a `MappingProxyType` wrapping a still-live dict) passed to it
+directly can still be mutated after certification, changing execution while
+the certificate stays unchanged -- reproduced three ways.
+
+|E4-REVIEW-F2
+|*REMAINS RESOLVED*
+|Projection cell correspondence unchanged.
+
+|E4-REVIEW-F3
+|*REMAINS RESOLVED*
+|Locality collision/disjoint/footprint cases unchanged.
+
+|E4-REVIEW-I1
+|*REMAINS RESOLVED*
+|Scalar row_index scalarization unchanged for both validators.
+
+|E4-REVIEW-I2
+|*REMAINS RESOLVED*
+|Manifest frame/column correspondence and positive consume unchanged.
+
+|E4-REVIEW-M1
+|*REMAINS RESOLVED*
+|No regression.
+|===
+
+New correction-induced Blocking findings: *0* (F1's residual is the same
+finding under a further-narrowed mechanism, not a new one).
+New correction-induced Important findings: *0*.
+New correction-induced Minor findings: *0*.
+
+=== 18.9 Verdict
+
+*B. CHANGES REQUIRED.*
+
+F1 remains the sole open Blocking finding after four correction passes. All
+five previously-resolved findings remain resolved with no regression. E4 is
+not independently accepted. E4 remains the current slice; E5 remains
+blocked and unstarted; no E5 macro wiring or lifecycle curation was
+performed during this pass.
+
+Residual scope: `BoundFramesTargetCall` must be unconditionally
+deep-frozen at construction (not only via the `.bind()` classmethod), so
+that every object `resolve_trusted_call` can accept is, by construction,
+incapable of diverging from its certificate -- not merely the subset built
+through the one path the framework's own binder happens to use. This does
+not implicate the accepted Review 005 architecture; it is, like every prior
+residual, an implementation defect in how that architecture's "exact bound
+executable behavior" requirement was encoded.
+
+PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
+AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
+E5 REMAINS BLOCKED.
