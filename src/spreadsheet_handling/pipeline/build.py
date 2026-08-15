@@ -45,7 +45,11 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         except TypeError:
             if name is not None:
                 tmp = registration.factory(**spec)  # type: ignore[arg-type]
-                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
+                # Rebinding only the *name*: carry the original config/fn/
+                # binding through unchanged so this rename cannot silently
+                # downgrade a trusted-bound step to an unauthenticated one
+                # (see pipeline.types.BoundStep / pipeline.execution_state).
+                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn, binding=tmp.binding)
             else:
                 raise
         steps.append(bound)

@@ -2,14 +2,29 @@
 
 Each factory binds configuration into a BoundStep closure.
 Factories use lazy imports to avoid loading domain/core modules at import time.
+
+Every factory here exposes ``BoundStep.config`` as a read-only
+``MappingProxyType`` view and passes the shared ``_TRUSTED_BINDING`` marker,
+so a step built through this module cannot have its descriptive config
+reassigned after binding (closing the divergence between "what the
+certificate says" and "what actually executes" -- see
+``pipeline.execution_state`` and FTR-TRUSTED-INGRESS-P4A section 18) and
+carries proof that it was genuinely produced by a trusted binder rather than
+hand-constructed with a merely public-looking config (section 23's exact-bound
+certification). A caller may still mutate a *nested* mutable value reachable
+through ``config`` (e.g. a list under a dict key) in place; that changes both
+the exposed config and the executing closure identically, because the two
+were never independently copied -- it is a real, consistently-observed
+change, not a divergence.
 """
 from __future__ import annotations
 
 import logging
+from types import MappingProxyType
 from typing import Any, Callable, Dict
 
 from .dotted_paths import resolve_configuration_callable
-from .types import BoundStep, Frames
+from .types import BoundStep, Frames, _TRUSTED_BINDING
 
 log = logging.getLogger("sheets.pipeline")
 
@@ -43,7 +58,7 @@ def make_plugin_step(*, dotted: str, args: Dict[str, Any] | None = None, name: s
         result = fn(fr, **cfg["args"])
         return fr if result is None else result
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_builder_target_step(
@@ -65,7 +80,7 @@ def make_builder_target_step(
         result = step(fr)
         return fr if result is None else result
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_frames_target_step(
@@ -84,7 +99,7 @@ def make_frames_target_step(
         result = fn(fr, **kwargs)
         return fr if result is None else result
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +110,7 @@ def make_identity_step(name: str = "identity") -> BoundStep:
     cfg: Dict[str, Any] = {}
     def run(fr: Frames) -> Frames:
         return fr
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_validate_step(
@@ -132,7 +147,7 @@ def make_validate_step(
         apply_severity_policy(findings, policy)
         return fr
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_apply_fks_step(
@@ -155,7 +170,7 @@ def make_apply_fks_step(
     def run(fr: Frames) -> Frames:
         return enrich_helpers(fr, cfg["defaults"])
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_drop_helpers_step(
@@ -179,7 +194,7 @@ def make_drop_helpers_step(
     def run(fr: Frames) -> Frames:
         return drop_helpers(fr, prefix=cfg["prefix"])
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_fk_helpers") -> BoundStep:
@@ -209,7 +224,7 @@ def make_check_fk_helpers_step(
         apply_severity_policy(findings, policy)
         return fr
 
-    return BoundStep(name=name, config=cfg, fn=run)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
 
 
 def make_add_validations_step(*, rules: list[dict], name: str = "add_validations") -> BoundStep:
