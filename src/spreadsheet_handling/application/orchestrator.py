@@ -5,10 +5,14 @@ from typing import Any, Dict, Iterable, Mapping, TypeAlias
 
 import logging
 
-from ..domain import ingress as domain_ingress
+from .managed_pipeline import (
+    ManagedExecutionState,
+    establish_initial_state,
+    finalize_managed_state,
+    run_managed_steps,
+)
 from ..domain.pipeline_cleanup import execute_final_domain_cleanup
 from ..io_backends.router import get_loader, get_saver
-from ..pipeline.execution import run_pipeline
 from ..pipeline.persistence_boundary import project_meta_to_persistable_contract
 from ..pipeline.types import BoundStep, Frames
 
@@ -61,6 +65,35 @@ def _save_frames(out: IODesc, frames: Frames) -> None:
     saver(frames, out.path, options=out.options)
 
 
+def _finalize_and_persist(frames: Frames, managed_state: ManagedExecutionState, out: IODesc) -> Frames:
+    """Final domain cleanup, E5 state closure, persistence boundary, save.
+
+    Carrier-neutral; runs for every output kind. Each phase is part of the
+    orchestrator's macro flow, not a configurable pipeline step:
+
+    * final domain cleanup executes pending explicit ``_meta.pipeline_cleanup``
+      commands (``domain.pipeline_cleanup``);
+    * E5 state closure (``managed_pipeline.finalize_managed_state``)
+      terminates every controlled role whose frame cleanup removed, then
+      authorizes every role still live against the exact sink kind -- raising
+      before any saver runs if a controlled role (FormulaSpec, GroupedMatrix,
+      or the artifact-manifest ``source_frames`` role) has no exact reviewed
+      consuming transition for this sink;
+    * the persistence boundary projects runtime ``_meta`` onto its
+      persistable contract immediately before the saver runs
+      (``pipeline.persistence_boundary``).
+    """
+    frames_before_cleanup = frames
+    frames = execute_final_domain_cleanup(frames)
+    frames = finalize_managed_state(frames_before_cleanup, frames, managed_state, sink_kind=out.kind)
+
+    meta = frames.get("_meta")
+    if isinstance(meta, dict):
+        frames = dict(frames)
+        frames["_meta"] = project_meta_to_persistable_contract(meta)
+    return frames
+
+
 # ---------------------------
 # Public API
 # ---------------------------
@@ -102,40 +135,25 @@ def orchestrate(
     log.info("orchestrate: loading input kind=%s path=%s", inp.kind, inp.path)
     frames = _load_frames(inp, header_levels=header_levels)
 
-    # Domain ingress: canonicalize externally authored _meta (e.g. Legend
-    # Blocks list-form authoring sugar) into its single downstream shape the
-    # moment frames enter the domain, before the first configured step. Every
-    # router-backed input kind converges here. Like the persistence boundary
-    # below, this is part of the orchestrator's macro flow, not a configurable
-    # pipeline step; it is not registered and cannot be built from YAML. See
-    # src/spreadsheet_handling/domain/ingress/coordinator.py.
-    frames = domain_ingress.run_domain_ingress(frames)
+    # Initial ordinary conformance establishment (Trusted Ingress E1-E3,
+    # wired here by E5) before any configured step; a rejection means zero
+    # steps, zero cleanup, zero save. See domain/ingress/coordinator.py and
+    # FTR-TRUSTED-INGRESS-P4A.adoc section 23 (E1-E5).
+    frames, managed_state = establish_initial_state(frames)
 
     if steps:
         step_list = list(steps)
         log.info("orchestrate: running %d step(s)", len(step_list))
-        frames = run_pipeline(frames, step_list)
+        # E5 macro wiring: classify each step against the exact E4
+        # transition representation, execute it through the unmodified,
+        # still step-only `run_pipeline`, and apply its declared
+        # controlled-role transition -- or, absent an exact certified
+        # transition, end all prior controlled-role authority and ordinarily
+        # re-establish the return before the next step/cleanup/save. See
+        # application/managed_pipeline.py.
+        frames, managed_state = run_managed_steps(frames, managed_state, step_list)
 
-    # Final domain cleanup: execute pending explicit cleanup commands
-    # (_meta.pipeline_cleanup) and consume them. Carrier-neutral; runs for
-    # every output kind, immediately before the persistence boundary. Like
-    # the persistence boundary below, this is part of the orchestrator's
-    # macro flow, not a configurable pipeline step. It executes only
-    # explicit drop/keep declarations and never infers cleanup from
-    # lifecycle roles. See
-    # src/spreadsheet_handling/domain/pipeline_cleanup.py.
-    frames = execute_final_domain_cleanup(frames)
-
-    # Persistence boundary: project runtime _meta onto its persistable
-    # contract before any backend writes anything. Carrier-neutral; runs for
-    # every output kind. The boundary is part of the orchestrator's macro
-    # flow, not a configurable pipeline step. See
-    # docs/semantic_model/08_lifecycle_and_update_semantics.adoc and
-    # src/spreadsheet_handling/pipeline/persistence_boundary.py.
-    meta = frames.get("_meta")
-    if isinstance(meta, dict):
-        frames = dict(frames)
-        frames["_meta"] = project_meta_to_persistable_contract(meta)
+    frames = _finalize_and_persist(frames, managed_state, out)
 
     log.info("orchestrate: writing output kind=%s path=%s", out.kind, out.path)
     _save_frames(out, frames)
