@@ -5,7 +5,7 @@ Other modules (steps, registry, runner) import from this module.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Protocol, TypedDict
 
 import pandas as pd
@@ -29,28 +29,50 @@ class Step(Protocol):
     def __call__(self, frames: Frames) -> Frames: ...
 
 
-class _TrustedBinding:
-    """Framework-owned marker proving a ``BoundStep`` was produced by a
-    trusted binder factory in ``pipeline/steps.py``, not hand-constructed.
+class BoundFramesTargetCall:
+    """The closed executable/configuration pair for a frames-first target
+    callable (``target(frames, **kwargs) -> Frames | None``).
 
-    Every factory in ``pipeline/steps.py`` passes the shared module-level
-    ``_TRUSTED_BINDING`` instance as ``BoundStep.binding`` when it builds a
-    step. Nothing outside this module constructs a ``_TrustedBinding``
-    instance, so a ``BoundStep`` built directly by calling the public
-    ``BoundStep(...)`` constructor (a forged or caller-supplied step) leaves
-    ``binding`` at its default of ``None`` and cannot present a matching
-    token merely by supplying a public-looking ``config`` dict. This is the
-    authenticity half of Phase-E Trusted Ingress E4's exact-bound
-    certification (FTR-TRUSTED-INGRESS-P4A section 23): a classifier proves
-    both "this exact configuration" *and* "this step was genuinely produced
-    by binding that configuration to its matching callable," not either
-    alone. See ``pipeline.execution_state.bound_configuration.is_trusted_binding``.
+    This is the *only* way ``pipeline.steps.make_frames_target_step`` builds
+    a ``BoundStep.fn``: ``__call__`` mechanically invokes exactly
+    ``self.target(frames, **self.kwargs)``. There is therefore no way to
+    construct an instance whose declared ``target``/``kwargs`` describe one
+    behavior while ``__call__`` performs another -- inspecting the fields
+    *is* inspecting what executes, not a separately maintained description
+    of it that could drift or be forged independently of the callable that
+    actually runs.
+
+    This is the structural authenticity proof Phase-E Trusted Ingress E4
+    certification relies on (see
+    ``pipeline.execution_state.bound_configuration.resolve_trusted_call``):
+    a classifier that confirms ``type(step.fn) is BoundFramesTargetCall``
+    (never ``isinstance`` -- a subclass could override ``__call__`` while
+    ``target``/``kwargs`` still look legitimate) and ``step.fn.target is
+    <the exact reviewed callable>`` (object identity, not a string label a
+    caller could supply independently of what actually runs) has proven the
+    executed behavior. A prior sentinel-marker mechanism
+    (``BoundStep.binding``) was found forgeable -- possessing an importable
+    module-level value proves nothing about what a hand-constructed step's
+    ``fn`` does -- and is superseded by this class; nothing in this codebase
+    still references it.
+
+    ``kwargs`` should be an immutable mapping (the binder wraps it in
+    ``types.MappingProxyType``) so a caller cannot reassign a top-level key
+    after binding; a nested mutable value remains mutable in place and
+    changes both this object's own view and ``BoundStep.config`` (built from
+    the same underlying values) identically -- a real, consistently observed
+    change, not a divergence.
     """
 
-    __slots__ = ()
+    __slots__ = ("target", "kwargs")
 
+    def __init__(self, target: Callable[..., Any], kwargs: Mapping[str, Any]) -> None:
+        self.target = target
+        self.kwargs = kwargs
 
-_TRUSTED_BINDING = _TrustedBinding()
+    def __call__(self, frames: Frames) -> Frames:
+        result = self.target(frames, **self.kwargs)
+        return frames if result is None else result
 
 
 @dataclass(frozen=True)
@@ -58,19 +80,13 @@ class BoundStep:
     """
     Bound step (Name + Config + Callable).
     name/config are useful for logging, debugging, and introspection.
-    fn encapsulates the actual logic (typically a closure from a factory).
-
-    ``binding`` defaults to ``None`` for any step built by directly calling
-    this constructor. Every factory in ``pipeline/steps.py`` instead passes
-    the shared ``_TRUSTED_BINDING`` sentinel and builds ``config`` as a
-    read-only view over the exact same mapping its execution closure reads,
-    so ``config`` and executable behavior cannot diverge for a trusted-bound
-    step (see ``pipeline/steps.py`` module docstring and FTR section 18).
+    fn encapsulates the actual logic (typically a closure from a factory, or
+    a ``BoundFramesTargetCall`` for steps built by
+    ``pipeline.steps.make_frames_target_step``).
     """
     name: str
     config: Mapping[str, Any]
     fn: Callable[[Frames], Frames]
-    binding: object = field(default=None, repr=False)
 
     def __call__(self, frames: Frames) -> Frames:
         return self.fn(frames)

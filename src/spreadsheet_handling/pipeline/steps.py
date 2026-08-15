@@ -4,18 +4,24 @@ Each factory binds configuration into a BoundStep closure.
 Factories use lazy imports to avoid loading domain/core modules at import time.
 
 Every factory here exposes ``BoundStep.config`` as a read-only
-``MappingProxyType`` view and passes the shared ``_TRUSTED_BINDING`` marker,
-so a step built through this module cannot have its descriptive config
+``MappingProxyType`` view built from the same values its execution reads, so
+a step built through this module cannot have its descriptive config
 reassigned after binding (closing the divergence between "what the
 certificate says" and "what actually executes" -- see
-``pipeline.execution_state`` and FTR-TRUSTED-INGRESS-P4A section 18) and
-carries proof that it was genuinely produced by a trusted binder rather than
-hand-constructed with a merely public-looking config (section 23's exact-bound
-certification). A caller may still mutate a *nested* mutable value reachable
-through ``config`` (e.g. a list under a dict key) in place; that changes both
-the exposed config and the executing closure identically, because the two
-were never independently copied -- it is a real, consistently-observed
-change, not a divergence.
+``pipeline.execution_state`` and FTR-TRUSTED-INGRESS-P4A section 18).
+
+``make_frames_target_step`` -- the shared binder for every Phase-E E4
+reviewed target (``add_lookup_helpers``, ``contract_grouped_xref``,
+``reconstruct_grouped_matrix``, ``expand_grouped_xref``,
+``write_artifact_manifest``) -- additionally builds its ``BoundStep.fn`` as a
+``types.BoundFramesTargetCall`` rather than an anonymous closure: that
+class's ``__call__`` mechanically executes exactly
+``self.target(frames, **self.kwargs)``, so E4's classifiers can prove which
+callable and configuration a step actually runs by inspecting ``step.fn``
+itself (``type(step.fn) is BoundFramesTargetCall`` and ``step.fn.target is
+<the exact reviewed callable>``), not by trusting a separately-suppliable
+label or marker. See ``BoundFramesTargetCall``'s docstring in
+``pipeline/types.py`` and ``pipeline.execution_state.bound_configuration``.
 """
 from __future__ import annotations
 
@@ -24,7 +30,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Dict
 
 from .dotted_paths import resolve_configuration_callable
-from .types import BoundStep, Frames, _TRUSTED_BINDING
+from .types import BoundFramesTargetCall, BoundStep, Frames
 
 log = logging.getLogger("sheets.pipeline")
 
@@ -58,7 +64,7 @@ def make_plugin_step(*, dotted: str, args: Dict[str, Any] | None = None, name: s
         result = fn(fr, **cfg["args"])
         return fr if result is None else result
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_builder_target_step(
@@ -80,7 +86,7 @@ def make_builder_target_step(
         result = step(fr)
         return fr if result is None else result
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_frames_target_step(
@@ -91,15 +97,17 @@ def make_frames_target_step(
 ) -> BoundStep:
     """
     Generic binder for frames-first callables: ``(frames, **config) -> Frames``.
+
+    ``fn`` is a ``BoundFramesTargetCall`` wrapping the resolved ``target``
+    and an immutable view of ``kwargs``, not an anonymous closure -- see the
+    module docstring and that class's own docstring for why this is the E4
+    authenticity seam.
     """
     fn = _resolve_target(target)
-    cfg = {"target": _target_label(target), **dict(kwargs)}
-
-    def run(fr: Frames) -> Frames:
-        result = fn(fr, **kwargs)
-        return fr if result is None else result
-
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    effective_kwargs = MappingProxyType(dict(kwargs))
+    cfg = MappingProxyType({"target": _target_label(target), **effective_kwargs})
+    call = BoundFramesTargetCall(fn, effective_kwargs)
+    return BoundStep(name=name, config=cfg, fn=call)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +118,7 @@ def make_identity_step(name: str = "identity") -> BoundStep:
     cfg: Dict[str, Any] = {}
     def run(fr: Frames) -> Frames:
         return fr
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_validate_step(
@@ -147,7 +155,7 @@ def make_validate_step(
         apply_severity_policy(findings, policy)
         return fr
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_apply_fks_step(
@@ -170,7 +178,7 @@ def make_apply_fks_step(
     def run(fr: Frames) -> Frames:
         return enrich_helpers(fr, cfg["defaults"])
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_drop_helpers_step(
@@ -194,7 +202,7 @@ def make_drop_helpers_step(
     def run(fr: Frames) -> Frames:
         return drop_helpers(fr, prefix=cfg["prefix"])
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_reorder_helpers_step(*, sheet: str | None = None, helper_prefix: str = "_", name: str = "reorder_fk_helpers") -> BoundStep:
@@ -224,7 +232,7 @@ def make_check_fk_helpers_step(
         apply_severity_policy(findings, policy)
         return fr
 
-    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run, binding=_TRUSTED_BINDING)
+    return BoundStep(name=name, config=MappingProxyType(cfg), fn=run)
 
 
 def make_add_validations_step(*, rules: list[dict], name: str = "add_validations") -> BoundStep:

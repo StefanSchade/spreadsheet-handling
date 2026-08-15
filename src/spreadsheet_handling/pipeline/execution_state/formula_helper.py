@@ -24,22 +24,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
 from spreadsheet_handling.pipeline.types import BoundStep
 
 from .bound_configuration import (
-    is_trusted_binding,
     only_known_keys,
+    resolve_trusted_call,
     snapshot_scalar,
     snapshot_string_sequence,
 )
 from .roles import LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, TransitionFootprint, Uncertified
 
+# Descriptive label only, matching BoundStep.config["target"]; the actual
+# authenticity proof is `enrich_lookup` object identity via
+# `resolve_trusted_call`, not this string.
 FORMULA_HELPER_TARGET = "spreadsheet_handling.domain.transformations.enrich_lookup:enrich_lookup"
 
 _KNOWN_OPTION_KEYS = frozenset(
     {
-        "target",
         "source",
         "lookup",
         "output",
@@ -76,18 +79,18 @@ class FormulaHelperCertificate:
 def classify_formula_helper_step(step: BoundStep) -> FormulaHelperCertificate | Uncertified:
     """Classify one bound ``add_lookup_helpers`` invocation.
 
-    Re-reads ``step.config`` fresh on every call; see ``bound_configuration``
-    for the authenticity and mutation-safety rationale. Authenticity is
-    checked first: a step whose ``config`` looks exactly like a reviewed
-    invocation but was not genuinely produced by a trusted pipeline binder
-    (forged, or hand-constructed with an unrelated ``fn``) is UNCERTIFIED
-    regardless of its configuration.
+    Resolves the authenticated executable/config pair first (see
+    ``bound_configuration.resolve_trusted_call``): a step whose ``config``
+    looks exactly like a reviewed invocation but does not structurally
+    execute ``enrich_lookup`` (forged, or hand-constructed with an unrelated
+    ``fn``) is UNCERTIFIED regardless of its configuration. Configuration is
+    then read from ``call.kwargs`` -- the exact mapping that call actually
+    executes with -- fresh on every invocation.
     """
-    if not is_trusted_binding(step):
+    call = resolve_trusted_call(step, expected_target=enrich_lookup)
+    if call is None:
         return Uncertified(reason="unauthenticated_binding")
-    config = step.config
-    if config.get("target") != FORMULA_HELPER_TARGET:
-        return Uncertified(reason="unrecognized_target")
+    config = call.kwargs
     if not only_known_keys(config, known=_KNOWN_OPTION_KEYS):
         return Uncertified(reason="unknown_option", detail="add_lookup_helpers")
 

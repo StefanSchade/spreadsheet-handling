@@ -25,15 +25,20 @@ columns a role occupies -- the same safe, closed dispatch
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
-from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
+from spreadsheet_handling.domain.transformations.grouped_xref import (
+    GroupedMatrix,
+    contract_grouped_xref,
+    expand_grouped_xref,
+    reconstruct_grouped_matrix,
+)
 from spreadsheet_handling.domain.transformations.grouped_xref.model import DynamicColumn
 from spreadsheet_handling.pipeline.types import BoundStep
 
 from .bound_configuration import (
-    is_trusted_binding,
     only_known_keys,
+    resolve_trusted_call,
     snapshot_scalar,
     snapshot_string_sequence,
 )
@@ -41,6 +46,9 @@ from .formula_helper import FormulaHelperCertificate
 from .roles import GroupedMatrixFormulaRole, GroupedMatrixRole, LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, TransitionFootprint, Uncertified, proves_disjoint
 
+# Descriptive labels only, matching BoundStep.config["target"]; the actual
+# authenticity proof is the imported callables' object identity via
+# `resolve_trusted_call`, not these strings.
 CONTRACT_GROUPED_XREF_TARGET = (
     "spreadsheet_handling.domain.transformations.grouped_xref:contract_grouped_xref"
 )
@@ -55,7 +63,6 @@ _ProducerKind = Literal["contract_grouped_xref", "reconstruct_grouped_matrix"]
 
 _CONTRACT_KNOWN_KEYS = frozenset(
     {
-        "target",
         "relation",
         "output",
         "row_keys",
@@ -76,7 +83,6 @@ _CONTRACT_KNOWN_KEYS = frozenset(
 )
 _RECONSTRUCT_KNOWN_KEYS = frozenset(
     {
-        "target",
         "table",
         "output",
         "row_keys",
@@ -91,7 +97,6 @@ _RECONSTRUCT_KNOWN_KEYS = frozenset(
 )
 _EXPAND_KNOWN_KEYS = frozenset(
     {
-        "target",
         "matrix",
         "output",
         "row_keys",
@@ -151,19 +156,24 @@ class GroupedProducerCertificate:
 
 
 def classify_grouped_producer_step(step: BoundStep) -> GroupedProducerCertificate | Uncertified:
-    """Classify one bound ``contract_grouped_xref`` or ``reconstruct_grouped_matrix`` call."""
-    if not is_trusted_binding(step):
-        return Uncertified(reason="unauthenticated_binding")
-    config = step.config
-    target = config.get("target")
-    if target == CONTRACT_GROUPED_XREF_TARGET:
-        return _classify_contract(config)
-    if target == RECONSTRUCT_GROUPED_MATRIX_TARGET:
-        return _classify_reconstruct(config)
-    return Uncertified(reason="unrecognized_target")
+    """Classify one bound ``contract_grouped_xref`` or ``reconstruct_grouped_matrix`` call.
+
+    Resolves the authenticated executable/config pair first (see
+    ``bound_configuration.resolve_trusted_call``) against each of the two
+    admitted producer callables in turn; a step whose ``fn`` does not
+    structurally execute one of them is UNCERTIFIED regardless of its
+    configuration.
+    """
+    call = resolve_trusted_call(step, expected_target=contract_grouped_xref)
+    if call is not None:
+        return _classify_contract(call.kwargs)
+    call = resolve_trusted_call(step, expected_target=reconstruct_grouped_matrix)
+    if call is not None:
+        return _classify_reconstruct(call.kwargs)
+    return Uncertified(reason="unauthenticated_binding")
 
 
-def _classify_contract(config: dict) -> GroupedProducerCertificate | Uncertified:
+def _classify_contract(config: Mapping[str, Any]) -> GroupedProducerCertificate | Uncertified:
     if not only_known_keys(config, known=_CONTRACT_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="contract_grouped_xref")
     if config.get("dense_axes") is not None:
@@ -204,7 +214,7 @@ def _classify_contract(config: dict) -> GroupedProducerCertificate | Uncertified
     )
 
 
-def _classify_reconstruct(config: dict) -> GroupedProducerCertificate | Uncertified:
+def _classify_reconstruct(config: Mapping[str, Any]) -> GroupedProducerCertificate | Uncertified:
     if not only_known_keys(config, known=_RECONSTRUCT_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="reconstruct_grouped_matrix")
     table = snapshot_scalar(config.get("table"))
@@ -376,11 +386,10 @@ class ExpandGroupedCertificate:
 
 
 def classify_expand_grouped_step(step: BoundStep) -> ExpandGroupedCertificate | Uncertified:
-    if not is_trusted_binding(step):
+    call = resolve_trusted_call(step, expected_target=expand_grouped_xref)
+    if call is None:
         return Uncertified(reason="unauthenticated_binding")
-    config = step.config
-    if config.get("target") != EXPAND_GROUPED_XREF_TARGET:
-        return Uncertified(reason="unrecognized_target")
+    config = call.kwargs
     if not only_known_keys(config, known=_EXPAND_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="expand_grouped_xref")
     matrix = snapshot_scalar(config.get("matrix"))

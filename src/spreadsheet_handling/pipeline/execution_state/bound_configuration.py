@@ -5,37 +5,47 @@ carries a framework-reviewed producer contract through an implementation
 mechanism"* -- not a merely descriptive label. A truthful classifier answer
 therefore has two independent parts, both required:
 
-1. *Authenticity* -- was this exact ``BoundStep`` genuinely produced by a
-   trusted framework binder (``pipeline/steps.py``), or could it be a
-   caller-forged/hand-constructed object whose ``config`` merely *looks*
-   like a certifiable invocation while ``fn`` executes something unrelated?
-   ``is_trusted_binding`` answers this by checking ``step.binding is
-   pipeline.types._TRUSTED_BINDING`` -- a sentinel only ``pipeline/steps.py``
-   factories ever set (see that module's docstring). A step built by calling
-   the public ``BoundStep(...)`` constructor directly leaves ``binding`` at
-   its default of ``None`` and fails this check regardless of how
-   convincing its ``config`` looks.
+1. *Authenticity* -- does this exact ``BoundStep`` *necessarily* execute the
+   reviewed target with the configuration being inspected, or could its
+   ``config``/``fn`` be an unrelated pairing that merely looks certifiable?
+   ``resolve_trusted_call`` answers this structurally, not by trusting a
+   caller-suppliable marker: it requires ``type(step.fn) is
+   BoundFramesTargetCall`` (exact type, never ``isinstance`` -- a subclass
+   could override ``__call__`` while ``target``/``kwargs`` still look
+   legitimate) and ``step.fn.target is expected_target`` (object identity
+   against the actual imported callable, not a string label). Because
+   ``BoundFramesTargetCall.__call__`` mechanically executes
+   ``self.target(frames, **self.kwargs)``, a step passing both checks
+   *cannot* execute anything other than ``expected_target`` called with
+   ``step.fn.kwargs`` -- there is no way to construct an instance whose
+   fields describe one behavior while ``__call__`` performs another. An
+   earlier mechanism (a ``BoundStep.binding`` sentinel, ``pipeline.types
+   ._TRUSTED_BINDING``) checked only *object-identity possession of an
+   importable module-level value*, which any caller could import and pass
+   to a hand-built ``BoundStep`` with an unrelated ``fn`` -- proven
+   forgeable by the independent E4 implementation review and removed; this
+   module and ``BoundFramesTargetCall`` supersede it.
 
 2. *Immutable effective configuration* (FTR section 18) -- given an
-   authentically-bound step, does ``step.config`` still describe exactly
-   what ``step.fn`` executes? Every ``pipeline/steps.py`` factory now
-   exposes ``config`` as a read-only ``MappingProxyType`` view built from the
-   *same* shallow-copied values its execution closure reads, so a caller can
-   no longer reassign a top-level key after binding (that previously
-   diverged the two -- see the corrected E4 review evidence); a
-   ``TypeError`` is raised instead. A caller can still mutate a *nested*
-   mutable value (e.g. a list under a dict key) in place, but that changes
-   both the exposed config and the executing closure identically, because
-   the two were never independently copied -- a real, consistently-observed
-   change, not a divergence.
+   authentic call, does the configuration a classifier reads still describe
+   exactly what executes? Classifiers read ``step.fn.kwargs`` -- the *same*
+   mapping ``BoundFramesTargetCall.__call__`` passes to ``target`` -- not a
+   separately-built view, so there is no seam left where the two could
+   diverge. ``make_frames_target_step`` wraps that mapping in
+   ``types.MappingProxyType`` before binding, so a caller can no longer
+   reassign a top-level key after binding; a ``TypeError`` is raised
+   instead. A caller can still mutate a *nested* mutable value (e.g. a list
+   under a dict key) in place, but that changes what actually executes
+   identically, because there is only one copy of it -- a real,
+   consistently-observed change, not a divergence.
 
-Every classifier in this package must therefore check authenticity *first*,
-then snapshot the (now-truthfully-descriptive) configuration:
+Every classifier in this package must therefore resolve the trusted call
+*first*, then snapshot the (now-provably-executed) configuration:
 
-* every ``classify_*`` function re-reads ``step.config`` fresh on every
-  call -- nothing about a ``BoundStep`` is cached -- so a mutation made
-  *before* classification (of a nested value; top-level reassignment is no
-  longer possible) is honestly reflected in the answer;
+* every ``classify_*`` function re-reads ``step.fn``/``step.fn.kwargs``
+  fresh on every call -- nothing about a ``BoundStep`` is cached -- so a
+  mutation made *before* classification (of a nested value; top-level
+  reassignment is no longer possible) is honestly reflected in the answer;
 * every accepted value is immediately copied into a new, closed-type
   immutable snapshot (``str`` / ``bool`` / ``int`` / ``float`` / ``None`` /
   ``tuple[str, ...]``) before it is placed in a returned certificate, so a
@@ -49,21 +59,36 @@ rather than best-effort coercion -- callers turn that into ``Uncertified``.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-from spreadsheet_handling.pipeline.types import BoundStep, _TRUSTED_BINDING
+from spreadsheet_handling.pipeline.types import BoundFramesTargetCall, BoundStep
 
 
-def is_trusted_binding(step: BoundStep) -> bool:
-    """Whether ``step`` was genuinely produced by a trusted pipeline binder.
+def resolve_trusted_call(
+    step: BoundStep, *, expected_target: Callable[..., Any]
+) -> BoundFramesTargetCall | None:
+    """The step's authenticated executable/config pair, or ``None``.
 
-    This is a necessary precondition for certification, checked before any
-    configuration inspection: a step failing this check is UNCERTIFIED
-    regardless of how closely its ``config`` resembles a reviewed
-    invocation, because its ``fn`` has no proven relationship to that
-    config at all.
+    Returns ``step.fn`` itself only when it is *exactly* a
+    ``BoundFramesTargetCall`` (never a subclass) whose ``target`` is
+    identically (``is``) ``expected_target``. Because
+    ``BoundFramesTargetCall.__call__`` mechanically executes
+    ``self.target(frames, **self.kwargs)``, this is a structural proof that
+    ``step`` executes ``expected_target`` with exactly the configuration
+    named by the returned object's ``kwargs`` -- not a caller-suppliable
+    label that could describe one behavior while ``step.fn`` performs
+    another. This is a necessary precondition for certification, checked
+    before any configuration inspection: a step failing this check is
+    UNCERTIFIED regardless of how closely its ``config`` resembles a
+    reviewed invocation.
     """
-    return step.binding is _TRUSTED_BINDING
+    call = step.fn
+    if type(call) is not BoundFramesTargetCall:
+        return None
+    if call.target is not expected_target:
+        return None
+    return call
+
 
 # Exact-type membership only (``type(value) in ...``), never ``isinstance``,
 # so a hostile ``__class__``-spoofing object cannot pass as a safe scalar.
@@ -115,7 +140,7 @@ def only_known_keys(config: Mapping[str, Any], *, known: frozenset[str]) -> bool
 
 
 __all__ = [
-    "is_trusted_binding",
+    "resolve_trusted_call",
     "snapshot_scalar",
     "snapshot_string_sequence",
     "only_known_keys",

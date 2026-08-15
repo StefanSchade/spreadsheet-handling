@@ -25,18 +25,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from spreadsheet_handling.domain.artifact_manifest import write_artifact_manifest
 from spreadsheet_handling.pipeline.types import BoundStep
 
-from .bound_configuration import is_trusted_binding, only_known_keys, snapshot_scalar
+from .bound_configuration import only_known_keys, resolve_trusted_call, snapshot_scalar
 from .roles import ArtifactManifestSourceFramesRole
 from .vocabulary import TransitionEffect, TransitionFootprint, Uncertified
 
+# Descriptive label only, matching BoundStep.config["target"]; the actual
+# authenticity proof is `write_artifact_manifest` object identity via
+# `resolve_trusted_call`, not this string.
 WRITE_ARTIFACT_MANIFEST_TARGET = (
     "spreadsheet_handling.domain.artifact_manifest:write_artifact_manifest"
 )
 
 _KNOWN_OPTION_KEYS = frozenset(
-    {"target", "reports", "output", "output_dir", "manifest_path", "checksum", "name"}
+    {"reports", "output", "output_dir", "manifest_path", "checksum", "name"}
 )
 
 _DEFAULT_OUTPUT = "generated_artifacts"
@@ -70,11 +74,10 @@ class ArtifactManifestCertificate:
 
 
 def classify_artifact_manifest_step(step: BoundStep) -> ArtifactManifestCertificate | Uncertified:
-    if not is_trusted_binding(step):
+    call = resolve_trusted_call(step, expected_target=write_artifact_manifest)
+    if call is None:
         return Uncertified(reason="unauthenticated_binding")
-    config = step.config
-    if config.get("target") != WRITE_ARTIFACT_MANIFEST_TARGET:
-        return Uncertified(reason="unrecognized_target")
+    config = call.kwargs
     if not only_known_keys(config, known=_KNOWN_OPTION_KEYS):
         return Uncertified(reason="unknown_option", detail="write_artifact_manifest")
     output = snapshot_scalar(config.get("output", _DEFAULT_OUTPUT))
@@ -106,7 +109,19 @@ def consume_manifest_at_sink(
     UNCERTIFIED rather than silently granting consumption (FTR section 10:
     "current generic backends do not provide a stable cross-format
     manifest-role round trip").
+
+    ``role`` must be exactly the role ``certificate`` itself introduces --
+    its declared output frame and the fixed ``source_frames`` column -- not
+    merely *a* manifest role. Without this check an unrelated certificate
+    could authorize termination of a role it never introduced (independent
+    E4 implementation review `ad700f0`, residual I2), the same correspondence
+    proof `resolve_formula_expand_transition` already applies between a
+    `GroupedMatrixFormulaRole` and its `ExpandGroupedCertificate`.
     """
+    if role.frame != certificate.output:
+        return Uncertified(reason="mismatched_composition", detail="output")
+    if role.column != "source_frames":
+        return Uncertified(reason="mismatched_composition", detail="column")
     if sink_kind != MANIFEST_ADAPTER_SINK_KIND or not certificate.writes_manifest_file:
         return Uncertified(reason="uncovered_configuration", detail="sink_kind")
     return ArtifactManifestSourceFramesRole(

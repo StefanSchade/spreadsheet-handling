@@ -154,6 +154,47 @@ def test_unsupported_sink_does_not_silently_certify_consumption() -> None:
     assert result == Uncertified(reason="uncovered_configuration", detail="sink_kind")
 
 
+def test_consume_rejects_a_role_from_an_unrelated_certificate() -> None:
+    """I2 residual reproduction (independent E4 implementation review
+    `ad700f0`, section 16.5): a certificate for frame A must not authorize
+    termination of an unrelated role at frame B."""
+    cert_a = ArtifactManifestCertificate(output="A", writes_manifest_file=True)
+    role_b = ArtifactManifestSourceFramesRole(frame="B")
+
+    result = consume_manifest_at_sink(cert_a, role_b, sink_kind=MANIFEST_ADAPTER_SINK_KIND)
+    assert result == Uncertified(reason="mismatched_composition", detail="output")
+
+
+def test_consume_rejects_a_role_with_the_wrong_column() -> None:
+    cert = ArtifactManifestCertificate(output="manifest", writes_manifest_file=True)
+    wrong_column_role = ArtifactManifestSourceFramesRole(frame="manifest", column="other")
+
+    result = consume_manifest_at_sink(cert, wrong_column_role, sink_kind=MANIFEST_ADAPTER_SINK_KIND)
+    assert result == Uncertified(reason="mismatched_composition", detail="column")
+
+
+def test_consume_accepts_the_role_the_certificate_actually_introduced() -> None:
+    step = build_steps_from_config(
+        [
+            {
+                "step": "write_artifact_manifest",
+                "reports": ["written_files"],
+                "output": "manifest",
+                "output_dir": "build/out",
+                "manifest_path": "manifest.json",
+            }
+        ]
+    )[0]
+    certificate = classify_artifact_manifest_step(step)
+    assert isinstance(certificate, ArtifactManifestCertificate)
+    role = artifact_manifest_role(certificate)
+
+    result = consume_manifest_at_sink(certificate, role, sink_kind=MANIFEST_ADAPTER_SINK_KIND)
+    assert result == ArtifactManifestSourceFramesRole(
+        frame="manifest", effect=TransitionEffect.CONSUME_TERMINATE
+    )
+
+
 def test_same_adapter_kind_without_configured_write_does_not_certify_consumption() -> None:
     # The role was introduced, but this exact invocation never configured a
     # write (no manifest_path/output_dir) -- there is nothing to consume.

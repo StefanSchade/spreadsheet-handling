@@ -55,11 +55,12 @@ Module map
     ``ArtifactManifestSourceFramesRole``) and
     ``terminate_roles_removed_by_cleanup``.
 ``bound_configuration``
-    ``is_trusted_binding`` (authenticity: was this ``BoundStep`` genuinely
-    produced by a trusted ``pipeline/steps.py`` binder, checked before any
-    configuration inspection) plus the shared exact-bound-configuration
-    snapshot primitives (immutability strategy for FTR section 18). Both
-    halves are required for certification -- see the module docstring.
+    ``resolve_trusted_call`` (authenticity: does this ``BoundStep`` structurally
+    execute the exact reviewed callable, checked before any configuration
+    inspection -- see that function's docstring for why this supersedes the
+    earlier, forgeable ``BoundStep.binding`` sentinel mechanism) plus the
+    shared exact-bound-configuration snapshot primitives (immutability
+    strategy for FTR section 18). Both halves are required for certification.
 ``preserving``
     ``PreservingCertificate`` and the (deliberately empty)
     ``PRESERVING_CERTIFICATES`` initial set (FTR section 5).
@@ -88,11 +89,13 @@ Module map
     referenced-lookup-sheet-rename rejection (compatibility rule B).
 
 Closed default: every classifier in this package returns ``Uncertified``
-unless a bound invocation (a) was genuinely produced by a trusted pipeline
-binder (``is_trusted_binding``) and (b) matches one of the exact reviewed
-configurations above -- known callable identity, registry membership,
-family, wrapper, or matching output shape never substitute for that exact
-match (FTR section 4), and a config that merely *looks* like a reviewed
+unless a bound invocation (a) structurally executes one of the exact
+reviewed callables (``resolve_trusted_call``: exact ``BoundFramesTargetCall``
+type plus target object identity) and (b) that call's own effective
+configuration matches one of the exact reviewed shapes below -- known
+callable identity, registry membership, family, wrapper, or matching output
+shape never substitute for that exact match (FTR section 4), and a
+descriptive ``config["target"]`` label that merely *looks* like a reviewed
 invocation never substitutes for (a) either (FTR section 23's "caller-
 supplied callable/BoundStep" decision-table row).
 """
@@ -107,8 +110,8 @@ from .artifact_manifest import (
     consume_manifest_at_sink,
 )
 from .bound_configuration import (
-    is_trusted_binding,
     only_known_keys,
+    resolve_trusted_call,
     snapshot_scalar,
     snapshot_string_sequence,
 )
@@ -171,7 +174,7 @@ __all__ = [
     "ControlledRole",
     "terminate_roles_removed_by_cleanup",
     # bound configuration
-    "is_trusted_binding",
+    "resolve_trusted_call",
     "snapshot_scalar",
     "snapshot_string_sequence",
     "only_known_keys",

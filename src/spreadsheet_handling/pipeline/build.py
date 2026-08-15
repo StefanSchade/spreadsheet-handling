@@ -45,11 +45,12 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
         except TypeError:
             if name is not None:
                 tmp = registration.factory(**spec)  # type: ignore[arg-type]
-                # Rebinding only the *name*: carry the original config/fn/
-                # binding through unchanged so this rename cannot silently
-                # downgrade a trusted-bound step to an unauthenticated one
-                # (see pipeline.types.BoundStep / pipeline.execution_state).
-                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn, binding=tmp.binding)
+                # Rebinding only the *name*: carry the original config/fn
+                # through unchanged. `fn` is preserved by reference (e.g. a
+                # BoundFramesTargetCall instance), so E4's executable-identity
+                # checks (see pipeline.execution_state) see exactly the same
+                # bound call this rename did not otherwise touch.
+                bound = BoundStep(name=name, config=tmp.config, fn=tmp.fn)
             else:
                 raise
         steps.append(bound)
