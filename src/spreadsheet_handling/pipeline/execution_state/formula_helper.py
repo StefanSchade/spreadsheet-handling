@@ -26,7 +26,12 @@ from typing import Any, Mapping
 
 from spreadsheet_handling.pipeline.types import BoundStep
 
-from .bound_configuration import only_known_keys, snapshot_scalar, snapshot_string_sequence
+from .bound_configuration import (
+    is_trusted_binding,
+    only_known_keys,
+    snapshot_scalar,
+    snapshot_string_sequence,
+)
 from .roles import LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, TransitionFootprint, Uncertified
 
@@ -72,8 +77,14 @@ def classify_formula_helper_step(step: BoundStep) -> FormulaHelperCertificate | 
     """Classify one bound ``add_lookup_helpers`` invocation.
 
     Re-reads ``step.config`` fresh on every call; see ``bound_configuration``
-    for the mutation-safety rationale.
+    for the authenticity and mutation-safety rationale. Authenticity is
+    checked first: a step whose ``config`` looks exactly like a reviewed
+    invocation but was not genuinely produced by a trusted pipeline binder
+    (forged, or hand-constructed with an unrelated ``fn``) is UNCERTIFIED
+    regardless of its configuration.
     """
+    if not is_trusted_binding(step):
+        return Uncertified(reason="unauthenticated_binding")
     config = step.config
     if config.get("target") != FORMULA_HELPER_TARGET:
         return Uncertified(reason="unrecognized_target")

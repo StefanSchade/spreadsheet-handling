@@ -47,6 +47,7 @@ class TransitionEffect(Enum):
 
 
 UncertifiedReason = Literal[
+    "unauthenticated_binding",
     "unrecognized_target",
     "unknown_option",
     "unsupported_configuration_value",

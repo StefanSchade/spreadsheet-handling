@@ -1,15 +1,25 @@
 """E4 falsification target (FTR section 18): mutation-after-bind safety.
 
-``pipeline.steps.make_frames_target_step`` builds ``BoundStep.config`` as
-``{"target": ..., **dict(kwargs)}`` -- a *shallow* copy. A nested mutable
-value (a ``list``) inside ``kwargs`` is therefore the *same object* the
-step's execution closure (which closes over ``kwargs``, not ``config``)
-reads at call time, so mutating ``bound_step.config[...]`` in place after
-binding really does change what the next invocation of the *same BoundStep*
-executes. These tests prove the value this package returns does not silently
-retain that false certification once configuration has moved on, and that an
-already-returned certificate is not retroactively corrupted by a later
-mutation of the ``BoundStep`` it was read from.
+``pipeline.steps.make_frames_target_step`` builds ``BoundStep.config`` as a
+read-only ``MappingProxyType`` view over ``{"target": ..., **dict(kwargs)}``
+-- a *shallow* copy. A nested mutable value (a ``list``) inside that dict is
+therefore the *same object* the step's execution closure (which closes over
+the original ``kwargs``, not the ``config`` view) reads at call time, so
+mutating a *nested* value reachable through ``bound_step.config[...]`` in
+place after binding really does change what the next invocation of the same
+``BoundStep`` executes -- a real, consistently-observed change, not a
+divergence, because both ``config`` and the closure see the identical
+object. A *top-level* key reassignment on ``config``, which used to cause a
+genuine, silent config/execution divergence (the independent E4
+implementation review's Blocking F1 finding, counterexample B), now raises
+immediately instead: ``config`` is frozen at bind time.
+
+These tests prove: the value this package returns does not silently retain
+a stale certification once configuration has genuinely moved on (nested
+mutation); an already-returned certificate is not retroactively corrupted by
+a later mutation of the ``BoundStep`` it was read from; and top-level
+reassignment -- the vector that used to produce false certification -- is no
+longer possible at all.
 """
 from __future__ import annotations
 
@@ -19,7 +29,6 @@ import pytest
 from spreadsheet_handling.pipeline.build import build_steps_from_config
 from spreadsheet_handling.pipeline.execution_state import (
     FormulaHelperCertificate,
-    Uncertified,
     classify_formula_helper_step,
 )
 
@@ -75,7 +84,7 @@ def test_mutating_the_shared_helpers_list_after_bind_changes_what_actually_runs(
     assert refreshed.fields == ("label_de", "code")
 
 
-def test_mutating_config_after_classification_cannot_downgrade_a_returned_certificate() -> None:
+def test_top_level_config_reassignment_is_no_longer_possible() -> None:
     step = build_steps_from_config(
         [
             {
@@ -94,11 +103,13 @@ def test_mutating_config_after_classification_cannot_downgrade_a_returned_certif
     certificate = classify_formula_helper_step(step)
     assert isinstance(certificate, FormulaHelperCertificate)
 
-    # Reassigning a top-level config key does not even affect the actual
-    # execution closure for this binder (it captures its own `kwargs`), but
-    # it must also not retroactively change the already-returned value.
-    step.config["helper_value_mode"] = "values"
-    assert certificate.fields == ("label_de",)
+    # The exact vector the independent review used to silently diverge
+    # config from execution (counterexample B) now raises immediately.
+    with pytest.raises(TypeError):
+        step.config["helper_value_mode"] = "values"  # type: ignore[index]
 
+    # Nothing changed: the already-returned certificate and a fresh
+    # classification both still agree with reality.
+    assert certificate.fields == ("label_de",)
     refreshed = classify_formula_helper_step(step)
-    assert isinstance(refreshed, Uncertified)
+    assert refreshed == certificate

@@ -1,30 +1,46 @@
-"""Exact bound-configuration snapshotting shared by every E4 classifier.
+"""Exact bound-configuration authenticity and snapshotting for every E4 classifier.
 
-FTR section 18 ("Bound configuration and mutation safety") requires a
-certificate to correspond to *immutable effective configuration*.
-``BoundStep`` (``pipeline/types.py``) is a frozen dataclass, but its
-``config`` field is a plain mutable ``dict`` built by
-``pipeline.steps.make_frames_target_step`` as
-``cfg = {"target": ..., **dict(kwargs)}``. ``dict(kwargs)`` only *shallow*-
-copies: a nested mutable value (e.g. a ``list`` passed as ``row_keys`` or
-``helpers["fields"]``) is the *same object* that step's execution closure
-(``run``, which closes over the original ``kwargs``, not ``cfg``) reads at
-call time. So mutating ``bound_step.config["row_keys"]`` in place after
-binding really does change what the next invocation executes -- a classifier
-that just held a reference to ``step.config`` and remembered "certified"
-once would be lying the moment a caller mutates that nested value.
+FTR section 23 requires that certification prove *"its exact bound behavior
+carries a framework-reviewed producer contract through an implementation
+mechanism"* -- not a merely descriptive label. A truthful classifier answer
+therefore has two independent parts, both required:
 
-This module solves it the smallest way that satisfies both directions of the
-requirement:
+1. *Authenticity* -- was this exact ``BoundStep`` genuinely produced by a
+   trusted framework binder (``pipeline/steps.py``), or could it be a
+   caller-forged/hand-constructed object whose ``config`` merely *looks*
+   like a certifiable invocation while ``fn`` executes something unrelated?
+   ``is_trusted_binding`` answers this by checking ``step.binding is
+   pipeline.types._TRUSTED_BINDING`` -- a sentinel only ``pipeline/steps.py``
+   factories ever set (see that module's docstring). A step built by calling
+   the public ``BoundStep(...)`` constructor directly leaves ``binding`` at
+   its default of ``None`` and fails this check regardless of how
+   convincing its ``config`` looks.
 
-* every ``classify_*`` function in this package re-reads ``step.config``
-  fresh on every call -- nothing about a ``BoundStep`` is cached -- so a
-  mutation made *before* classification is honestly reflected in the answer;
+2. *Immutable effective configuration* (FTR section 18) -- given an
+   authentically-bound step, does ``step.config`` still describe exactly
+   what ``step.fn`` executes? Every ``pipeline/steps.py`` factory now
+   exposes ``config`` as a read-only ``MappingProxyType`` view built from the
+   *same* shallow-copied values its execution closure reads, so a caller can
+   no longer reassign a top-level key after binding (that previously
+   diverged the two -- see the corrected E4 review evidence); a
+   ``TypeError`` is raised instead. A caller can still mutate a *nested*
+   mutable value (e.g. a list under a dict key) in place, but that changes
+   both the exposed config and the executing closure identically, because
+   the two were never independently copied -- a real, consistently-observed
+   change, not a divergence.
+
+Every classifier in this package must therefore check authenticity *first*,
+then snapshot the (now-truthfully-descriptive) configuration:
+
+* every ``classify_*`` function re-reads ``step.config`` fresh on every
+  call -- nothing about a ``BoundStep`` is cached -- so a mutation made
+  *before* classification (of a nested value; top-level reassignment is no
+  longer possible) is honestly reflected in the answer;
 * every accepted value is immediately copied into a new, closed-type
   immutable snapshot (``str`` / ``bool`` / ``int`` / ``float`` / ``None`` /
   ``tuple[str, ...]``) before it is placed in a returned certificate, so a
-  mutation made *after* classification cannot retroactively change an
-  already-returned certificate's meaning.
+  later nested mutation cannot retroactively change an already-returned
+  certificate's meaning.
 
 A configuration key outside a classifier's declared closed vocabulary, or a
 value that is not one of the closed scalar/string-sequence shapes below,
@@ -34,6 +50,20 @@ rather than best-effort coercion -- callers turn that into ``Uncertified``.
 from __future__ import annotations
 
 from typing import Any, Mapping
+
+from spreadsheet_handling.pipeline.types import BoundStep, _TRUSTED_BINDING
+
+
+def is_trusted_binding(step: BoundStep) -> bool:
+    """Whether ``step`` was genuinely produced by a trusted pipeline binder.
+
+    This is a necessary precondition for certification, checked before any
+    configuration inspection: a step failing this check is UNCERTIFIED
+    regardless of how closely its ``config`` resembles a reviewed
+    invocation, because its ``fn`` has no proven relationship to that
+    config at all.
+    """
+    return step.binding is _TRUSTED_BINDING
 
 # Exact-type membership only (``type(value) in ...``), never ``isinstance``,
 # so a hostile ``__class__``-spoofing object cannot pass as a safe scalar.
@@ -84,4 +114,9 @@ def only_known_keys(config: Mapping[str, Any], *, known: frozenset[str]) -> bool
     return set(config.keys()) <= known
 
 
-__all__ = ["snapshot_scalar", "snapshot_string_sequence", "only_known_keys"]
+__all__ = [
+    "is_trusted_binding",
+    "snapshot_scalar",
+    "snapshot_string_sequence",
+    "only_known_keys",
+]

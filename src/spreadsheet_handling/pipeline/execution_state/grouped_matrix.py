@@ -31,7 +31,12 @@ from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatr
 from spreadsheet_handling.domain.transformations.grouped_xref.model import DynamicColumn
 from spreadsheet_handling.pipeline.types import BoundStep
 
-from .bound_configuration import only_known_keys, snapshot_scalar, snapshot_string_sequence
+from .bound_configuration import (
+    is_trusted_binding,
+    only_known_keys,
+    snapshot_scalar,
+    snapshot_string_sequence,
+)
 from .formula_helper import FormulaHelperCertificate
 from .roles import GroupedMatrixFormulaRole, GroupedMatrixRole, LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, TransitionFootprint, Uncertified, proves_disjoint
@@ -118,11 +123,20 @@ class GroupedProducerCertificate:
     (``None`` for ``reconstruct_grouped_matrix``, which has no such
     parameter); it is what the composition classifier below matches against
     a retained ``FormulaHelperCertificate.fields`` entry.
+
+    ``source_frame`` is the axis-mapping label-source frame, a *separate*
+    required parameter from ``source`` (the ``relation``/``table`` data
+    input): both ``contract_grouped_xref`` and ``reconstruct_grouped_matrix``
+    build an ``AxisMappingIntent(source_frame=source_frame, ...)`` and call
+    ``resolve_axis_mapping``, which genuinely reads ``frames[source_frame]``
+    (independently confirmed against ``xref_axis_mapping/resolver.py``); it
+    is a real footprint dependency, not merely an accepted-but-inert option.
     """
 
     producer: _ProducerKind
     output: str
     source: str
+    source_frame: str
     value_column: str | None
     drop_source: bool
     row_keys: tuple[str, ...]
@@ -130,12 +144,16 @@ class GroupedProducerCertificate:
     def footprint(self) -> TransitionFootprint:
         drops = frozenset({self.source}) if self.drop_source else frozenset()
         return TransitionFootprint(
-            reads=frozenset({self.source}), writes=frozenset({self.output}), drops=drops
+            reads=frozenset({self.source, self.source_frame}),
+            writes=frozenset({self.output}),
+            drops=drops,
         )
 
 
 def classify_grouped_producer_step(step: BoundStep) -> GroupedProducerCertificate | Uncertified:
     """Classify one bound ``contract_grouped_xref`` or ``reconstruct_grouped_matrix`` call."""
+    if not is_trusted_binding(step):
+        return Uncertified(reason="unauthenticated_binding")
     config = step.config
     target = config.get("target")
     if target == CONTRACT_GROUPED_XREF_TARGET:
@@ -148,14 +166,28 @@ def classify_grouped_producer_step(step: BoundStep) -> GroupedProducerCertificat
 def _classify_contract(config: dict) -> GroupedProducerCertificate | Uncertified:
     if not only_known_keys(config, known=_CONTRACT_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="contract_grouped_xref")
+    if config.get("dense_axes") is not None:
+        # dense_axes.rows_from/columns_from may itself name a further frame
+        # (dense_axes.py: _axis_source_config reads frames[config["frame"]]),
+        # which this classifier cannot safely declare a footprint for without
+        # re-implementing that family-owned parsing. Unrepresentable
+        # frame-valued configuration defaults UNCERTIFIED rather than
+        # under-declaring the footprint (FTR section 4).
+        return Uncertified(reason="uncovered_configuration", detail="dense_axes")
     relation = snapshot_scalar(config.get("relation"))
     output = snapshot_scalar(config.get("output"))
+    source_frame = snapshot_scalar(config.get("source_frame"))
     value = snapshot_scalar(config.get("value", "value"))
     drop_source = snapshot_scalar(config.get("drop_source", False))
     row_keys = snapshot_string_sequence(config.get("row_keys"))
-    if not (_is_nonempty_str(relation) and _is_nonempty_str(output) and _is_nonempty_str(value)):
+    if not (
+        _is_nonempty_str(relation)
+        and _is_nonempty_str(output)
+        and _is_nonempty_str(source_frame)
+        and _is_nonempty_str(value)
+    ):
         return Uncertified(
-            reason="unsupported_configuration_value", detail="relation/output/value"
+            reason="unsupported_configuration_value", detail="relation/output/source_frame/value"
         )
     if type(drop_source) is not bool:
         return Uncertified(reason="unsupported_configuration_value", detail="drop_source")
@@ -165,6 +197,7 @@ def _classify_contract(config: dict) -> GroupedProducerCertificate | Uncertified
         producer="contract_grouped_xref",
         output=output,
         source=relation,
+        source_frame=source_frame,
         value_column=value,
         drop_source=drop_source,
         row_keys=row_keys,
@@ -176,10 +209,13 @@ def _classify_reconstruct(config: dict) -> GroupedProducerCertificate | Uncertif
         return Uncertified(reason="unknown_option", detail="reconstruct_grouped_matrix")
     table = snapshot_scalar(config.get("table"))
     output = snapshot_scalar(config.get("output"))
+    source_frame = snapshot_scalar(config.get("source_frame"))
     drop_source = snapshot_scalar(config.get("drop_source", False))
     row_keys = snapshot_string_sequence(config.get("row_keys"))
-    if not (_is_nonempty_str(table) and _is_nonempty_str(output)):
-        return Uncertified(reason="unsupported_configuration_value", detail="table/output")
+    if not (_is_nonempty_str(table) and _is_nonempty_str(output) and _is_nonempty_str(source_frame)):
+        return Uncertified(
+            reason="unsupported_configuration_value", detail="table/output/source_frame"
+        )
     if type(drop_source) is not bool:
         return Uncertified(reason="unsupported_configuration_value", detail="drop_source")
     if row_keys is None:
@@ -188,6 +224,7 @@ def _classify_reconstruct(config: dict) -> GroupedProducerCertificate | Uncertif
         producer="reconstruct_grouped_matrix",
         output=output,
         source=table,
+        source_frame=source_frame,
         value_column=None,
         drop_source=drop_source,
         row_keys=row_keys,
@@ -302,11 +339,23 @@ def compose_formula_to_grouped(
 
 @dataclass(frozen=True)
 class ExpandGroupedCertificate:
-    """The exact reviewed ``expand_grouped_xref`` configuration."""
+    """The exact reviewed ``expand_grouped_xref`` configuration.
+
+    ``source_frame`` is the axis-mapping label-source frame (see
+    ``GroupedProducerCertificate.source_frame``; the same
+    ``resolve_axis_mapping`` dependency applies here). ``base_relation`` is
+    the optional scoped-recomposition frame: when supplied,
+    ``expand_xref`` genuinely reads ``frames[base_relation]``
+    (``xref_crosstable/operation.py``: ``_require_frame(frames,
+    base_relation)``) to append its out-of-scope rows, so it is a real read
+    dependency exactly when present.
+    """
 
     matrix: str
     output: str
     output_value_column: str
+    source_frame: str
+    base_relation: str | None
     drop_source: bool
 
     def footprint(self) -> TransitionFootprint:
@@ -316,14 +365,19 @@ class ExpandGroupedCertificate:
         # contract_grouped_xref's own drop_source bookkeeping. ``drops``
         # therefore names "marked for later cleanup", not "removed now".
         drops = frozenset({self.matrix}) if self.drop_source else frozenset()
+        reads = {self.matrix, self.source_frame}
+        if self.base_relation is not None:
+            reads.add(self.base_relation)
         return TransitionFootprint(
-            reads=frozenset({self.matrix}),
+            reads=frozenset(reads),
             writes=frozenset({self.output, self.matrix}),
             drops=drops,
         )
 
 
 def classify_expand_grouped_step(step: BoundStep) -> ExpandGroupedCertificate | Uncertified:
+    if not is_trusted_binding(step):
+        return Uncertified(reason="unauthenticated_binding")
     config = step.config
     if config.get("target") != EXPAND_GROUPED_XREF_TARGET:
         return Uncertified(reason="unrecognized_target")
@@ -331,16 +385,31 @@ def classify_expand_grouped_step(step: BoundStep) -> ExpandGroupedCertificate | 
         return Uncertified(reason="unknown_option", detail="expand_grouped_xref")
     matrix = snapshot_scalar(config.get("matrix"))
     output = snapshot_scalar(config.get("output"))
+    source_frame = snapshot_scalar(config.get("source_frame"))
     value = snapshot_scalar(config.get("value", "value"))
     drop_source = snapshot_scalar(config.get("drop_source", False))
-    if not (_is_nonempty_str(matrix) and _is_nonempty_str(output) and _is_nonempty_str(value)):
+    base_relation_raw = config.get("base_relation")
+    base_relation = snapshot_scalar(base_relation_raw)
+    if base_relation_raw is not None and not _is_nonempty_str(base_relation):
+        return Uncertified(reason="unsupported_configuration_value", detail="base_relation")
+    if not (
+        _is_nonempty_str(matrix)
+        and _is_nonempty_str(output)
+        and _is_nonempty_str(source_frame)
+        and _is_nonempty_str(value)
+    ):
         return Uncertified(
-            reason="unsupported_configuration_value", detail="matrix/output/value"
+            reason="unsupported_configuration_value", detail="matrix/output/source_frame/value"
         )
     if type(drop_source) is not bool:
         return Uncertified(reason="unsupported_configuration_value", detail="drop_source")
     return ExpandGroupedCertificate(
-        matrix=matrix, output=output, output_value_column=value, drop_source=drop_source
+        matrix=matrix,
+        output=output,
+        output_value_column=value,
+        source_frame=source_frame,
+        base_relation=base_relation,
+        drop_source=drop_source,
     )
 
 

@@ -80,10 +80,40 @@ def test_mismatched_matrix_frame_is_uncertified() -> None:
         matrix="different_frame",
         output=certificate.output,
         output_value_column=certificate.output_value_column,
+        source_frame=certificate.source_frame,
+        base_relation=certificate.base_relation,
         drop_source=certificate.drop_source,
     )
     result = resolve_grouped_matrix_expand_transition(other_frame_certificate, role)
     assert result == Uncertified(reason="mismatched_composition", detail="matrix")
+
+
+def test_expand_footprint_includes_source_frame_and_base_relation_when_present() -> None:
+    """F3 audit (independent E4 implementation review section 6): both the
+    axis-mapping label-source frame and, when supplied, the scoped-
+    recomposition `base_relation` are genuine read dependencies of
+    `expand_grouped_xref` (`xref_crosstable/operation.py`:
+    `_require_frame(frames, base_relation)`) and must appear in the
+    declared footprint."""
+    step = build_steps_from_config(
+        [
+            {
+                "step": "expand_grouped_xref",
+                "matrix": "grouped",
+                "output": "expanded",
+                "row_keys": "variable_id",
+                "source_frame": "labels",
+                "key_column": "key",
+                "label_columns": ["grp"],
+                "base_relation": "base",
+            }
+        ]
+    )[0]
+    certificate = classify_expand_grouped_step(step)
+    assert certificate.source_frame == "labels"
+    assert certificate.base_relation == "base"
+    reads = certificate.footprint().reads
+    assert {"grouped", "labels", "base"} <= reads
 
 
 def test_preserving_certificate_set_may_remain_zero() -> None:
