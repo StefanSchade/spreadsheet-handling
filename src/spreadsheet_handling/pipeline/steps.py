@@ -99,15 +99,15 @@ def make_frames_target_step(
     Generic binder for frames-first callables: ``(frames, **config) -> Frames``.
 
     ``fn`` is a ``BoundFramesTargetCall`` wrapping the resolved ``target``
-    and a deep-frozen snapshot of ``kwargs`` (see ``BoundFramesTargetCall
-    .bind``), not an anonymous closure -- see the module docstring and that
-    class's own docstring for why this is the E4 authenticity seam.
-    ``config`` is built from the *same* frozen snapshot ``fn.kwargs`` holds
-    (plus the descriptive ``"target"`` label), so introspecting ``config``
-    and executing ``fn`` always agree.
+    and ``kwargs``; that class's own ``__post_init__`` unconditionally
+    deep-freezes ``kwargs`` at construction, not an anonymous closure -- see
+    the module docstring and that class's own docstring for why this is the
+    E4 authenticity seam. ``config`` is built from the *same* frozen
+    snapshot ``fn.kwargs`` holds (plus the descriptive ``"target"`` label),
+    so introspecting ``config`` and executing ``fn`` always agree.
     """
     fn = _resolve_target(target)
-    call = BoundFramesTargetCall.bind(fn, kwargs)
+    call = BoundFramesTargetCall(fn, kwargs)
     cfg = MappingProxyType({"target": _target_label(target), **call.kwargs})
     return BoundStep(name=name, config=cfg, fn=call)
 

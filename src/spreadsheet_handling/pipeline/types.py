@@ -33,34 +33,55 @@ class Step(Protocol):
 def _freeze_effective_value(value: Any) -> Any:
     """Recursively freeze ``value`` into an immutable equivalent.
 
-    Used to build a ``BoundFramesTargetCall``'s stored ``kwargs`` so that no
-    alias the *caller* still holds to the original mutable containers it
-    passed in (a ``dict``, a nested ``list``) can affect that call's
-    executable behavior after construction -- FTR-TRUSTED-INGRESS-P4A
-    section 18's "certificate corresponds to immutable effective
-    configuration" requirement, applied to the object itself, not only to
-    one ``MappingProxyType`` view of it.
-
-    ``dict`` -> ``MappingProxyType`` wrapping a *new* dict of recursively
-    frozen values (never the caller's own dict, so later mutating the
-    original has no effect). ``list``/``tuple`` -> a *new* ``tuple`` of
+    ``dict``/``MappingProxyType`` -> a *new*, owned ``MappingProxyType``
+    wrapping a *new* dict of recursively frozen values -- never the
+    caller's own dict, and never merely re-wrapping a ``MappingProxyType``
+    that could still be backed by a live caller-owned dict (a
+    ``MappingProxyType`` is a *view*, not a copy: freezing it means reading
+    its *current* key/value pairs into a disconnected structure, exactly as
+    for a plain ``dict``). ``list``/``tuple`` -> a *new* ``tuple`` of
     recursively frozen values (a tuple is re-frozen too, in case it holds a
-    mutable nested element). Any other value -- an already-immutable scalar,
-    or a shape outside this closed vocabulary (e.g. a DataFrame, a plugin's
-    own object, a callback) -- is returned by reference: this is a generic
-    binder used by many non-E4-reviewed targets too, and any value shape
-    outside dict/list/tuple/scalar is never accepted by an E4 classifier
-    regardless (see ``pipeline.execution_state.bound_configuration``), so
-    there is nothing E4-relevant to protect for it, and copying it would
-    only risk changing identity-sensitive non-E4 behavior for no benefit.
+    mutable nested element). Any other value -- an already-immutable
+    scalar, or a shape outside this closed vocabulary (e.g. a DataFrame, a
+    plugin's own object, a callback) -- is returned by reference: this is a
+    generic binder used by many non-E4-reviewed targets too, and any value
+    shape outside dict/list/tuple/scalar is never accepted by an E4
+    classifier regardless (see
+    ``pipeline.execution_state.bound_configuration``), so there is nothing
+    E4-relevant to protect for it, and copying it would only risk changing
+    identity-sensitive non-E4 behavior for no benefit.
     """
-    if type(value) is dict:
+    if type(value) is dict or type(value) is MappingProxyType:
         return MappingProxyType(
             {key: _freeze_effective_value(item) for key, item in value.items()}
         )
     if type(value) is list or type(value) is tuple:
         return tuple(_freeze_effective_value(item) for item in value)
     return value
+
+
+def _freeze_effective_kwargs(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The one root-level canonicalization every ``BoundFramesTargetCall``
+    construction funnels through (see ``__post_init__``).
+
+    Accepts only an exact built-in ``dict`` or an exact ``MappingProxyType``
+    at this boundary -- every current framework binding path
+    (``pipeline.steps.make_frames_target_step``) starts from ordinary
+    ``**kwargs``, and E4 needs one closed, authoritative configuration
+    representation, not an open set of caller-suppliable ``Mapping``
+    implementations whose own ``__getitem__``/``keys()`` could do anything.
+    Any other ``Mapping`` (or non-mapping) is rejected with ``TypeError``:
+    no current maintained construction path supplies one, and this is the
+    exact construction boundary the whole immutability invariant depends
+    on, so it fails closed rather than silently trusting an unrecognized
+    shape.
+    """
+    if type(kwargs) is not dict and type(kwargs) is not MappingProxyType:
+        raise TypeError(
+            "BoundFramesTargetCall kwargs must be an exact dict or "
+            f"MappingProxyType, got {type(kwargs).__name__}"
+        )
+    return _freeze_effective_value(kwargs)
 
 
 def _thaw_effective_value(value: Any) -> Any:
@@ -103,9 +124,9 @@ class BoundFramesTargetCall:
     ``target``/``kwargs`` still look legitimate) and ``step.fn.target is
     <the exact reviewed callable>`` (object identity, not a string label a
     caller could supply independently of what actually runs) has proven the
-    executed behavior. Two earlier mechanisms were each found insufficient
+    executed behavior. Three earlier mechanisms were each found insufficient
     and are superseded by this class; nothing in this codebase still
-    references either:
+    references any of them:
 
     * a sentinel-marker (``BoundStep.binding``) -- possessing an importable
       module-level value proved nothing about what a hand-constructed
@@ -115,33 +136,54 @@ class BoundFramesTargetCall:
       ``call.kwargs = other_mapping`` silently changed what an
       already-certified, genuinely framework-built call executed while its
       already-issued certificate stayed unchanged (independent E4
-      implementation review `01c2e93`, section 17.3).
+      implementation review `01c2e93`, section 17.3);
+    * a frozen version that only deep-froze ``kwargs`` inside a *separate*
+      ``bind()`` classmethod -- the public, dataclass-generated
+      ``BoundFramesTargetCall(target, kwargs)`` constructor remained a
+      second, unfrozen construction path that ``resolve_trusted_call``
+      accepted identically, so a caller-held mutable ``kwargs`` dict (or a
+      nested alias inside it, or a ``MappingProxyType`` wrapping a still-live
+      dict) passed directly to that constructor could still be mutated
+      after certification (independent E4 implementation review `9feb324`,
+      section 18.4).
 
+    The invariant this class now owns is: **every object
+    ``resolve_trusted_call`` can accept owns an immutable effective
+    execution snapshot from the instant construction completes** -- not
+    merely the subset built through one particular classmethod.
     ``@dataclass(frozen=True, slots=True)`` makes ordinary attribute
-    reassignment raise ``FrozenInstanceError`` for *both* fields -- real
-    enforced immutability, not a naming convention. ``kwargs`` is stored
-    already deep-frozen via :func:`_freeze_effective_value` (see
-    :meth:`bind`), not merely wrapped in one top-level
-    ``types.MappingProxyType``: a caller mutating the *original* dict/list it
-    passed in after binding cannot affect this call's stored configuration,
-    because the stored structures share no mutable object with anything the
-    caller still holds. Classifiers read ``self.kwargs`` directly (the exact
+    reassignment raise ``FrozenInstanceError`` for both fields, and
+    ``__post_init__`` unconditionally replaces whatever ``kwargs`` object
+    the constructor was given with :func:`_freeze_effective_kwargs`'s
+    canonical, deep-frozen result -- there is no supported constructor
+    argument, keyword, or classmethod that skips this. A caller mutating
+    the *original* dict/list/``MappingProxyType`` it passed in after
+    construction cannot affect this call's stored configuration, because
+    the stored structures share no mutable object with anything the caller
+    still holds. Classifiers read ``self.kwargs`` directly (the exact
     frozen structure ``__call__`` also reads, via
     :func:`_thaw_effective_value`), so there is no separate "classifier
     snapshot" that could itself drift from what executes.
+
+    Normal-construction threat boundary: this invariant covers ordinary
+    Python construction, attribute assignment, and container mutation
+    reachable through this class's own public surface -- including direct
+    ``BoundFramesTargetCall(target, kwargs)`` construction, caller-held
+    aliases, subclassing, and copying/reusing an instance. It does not
+    defend against ``object.__new__`` bypassing ``__init__``, deliberate
+    ``object.__setattr__`` abuse of the frozen-dataclass protection,
+    ``function.__code__`` patching, ``ctypes``/memory manipulation, or
+    interpreter compromise -- E4 is an exact execution-contract mechanism
+    inside an already-trusted runtime (the FTR's trusted-description
+    precondition), not a Python sandbox, and defending against a caller
+    already willing to use those mechanisms is out of Phase-E's scope.
     """
 
     target: Callable[..., Any]
     kwargs: Mapping[str, Any]
 
-    @classmethod
-    def bind(cls, target: Callable[..., Any], kwargs: Mapping[str, Any]) -> BoundFramesTargetCall:
-        """Construct a call with ``kwargs`` deep-frozen (see
-        :func:`_freeze_effective_value`). The only supported construction
-        path for a genuinely bound call; this is what
-        ``pipeline.steps.make_frames_target_step`` uses.
-        """
-        return cls(target, _freeze_effective_value(kwargs))
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kwargs", _freeze_effective_kwargs(self.kwargs))
 
     def __call__(self, frames: Frames) -> Frames:
         materialized = _thaw_effective_value(self.kwargs)
