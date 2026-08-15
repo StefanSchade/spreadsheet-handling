@@ -987,3 +987,258 @@ implementation defects in how that architecture was encoded.
 PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
 AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
 E5 REMAINS BLOCKED.
+
+== 17. Final bounded independent disposition pass
+
+*Review date:* 2026-08-15 (same-context final pass). *Reviewed correction
+commits:* `acd3f77` (bind E4 authority to executable behavior), `2f7b153`
+(record residual corrections). Range `ad700f0..2f7b153`. Scope confirmed by
+`git diff --stat`: `pipeline/types.py`, `pipeline/steps.py`,
+`pipeline/build.py`, `pipeline/execution_state/*` (binding/classifiers/
+artifact-manifest exit), FTR evidence, and the corresponding test files
+only -- no orchestrator/registry/runner file, no lifecycle-status file. This
+section reviews only F1's final disposition, I2's final disposition, and
+direct regression sanity for F2/F3/I1/M1, per the bounded task.
+
+=== 17.1 Corrected mechanism, reconstructed independently
+
+`pipeline/types.py` removes `_TrustedBinding`/`_TRUSTED_BINDING`/
+`BoundStep.binding` entirely and adds `BoundFramesTargetCall` (`__slots__ =
+("target", "kwargs")`), whose `__call__` mechanically executes
+`self.target(frames, **self.kwargs)`. `make_frames_target_step` -- the
+shared binder for all five E4-reviewed targets, independently confirmed via
+`registry.py` (`add_lookup_helpers`, `contract_grouped_xref`,
+`reconstruct_grouped_matrix`, `expand_grouped_xref`,
+`write_artifact_manifest` all route through it) -- now builds `BoundStep.fn`
+as `BoundFramesTargetCall(resolved_target, MappingProxyType(kwargs))`.
+`resolve_trusted_call(step, expected_target=...)` returns `step.fn` only
+when `type(step.fn) is BoundFramesTargetCall` (exact type) and `step.fn
+.target is expected_target` (object identity); all four classifiers use it
+and read configuration from `call.kwargs` directly -- confirmed by source
+inspection, matching the task's description exactly.
+
+=== 17.2 Original forgery probes -- all four now correctly reject
+
+Re-run against corrected HEAD: (A) plain forged `BoundStep` (certifiable
+config, unrelated lambda `fn`, no proof object at all) ->
+`Uncertified(reason="unauthenticated_binding")`. (B) a real
+`BoundFramesTargetCall` pointed at an unrelated target with otherwise
+certifiable kwargs -> `Uncertified(reason="unauthenticated_binding")`. (C) a
+`class Evil(BoundFramesTargetCall)` subclass overriding `__call__`, with
+`target` set to the genuine `enrich_lookup` -> `Uncertified` (`type(x) is
+BoundFramesTargetCall` correctly excludes the subclass; `isinstance` was not
+used). (D) a genuinely copied `BoundFramesTargetCall(enrich_lookup, real
+kwargs)` wrapped in a fresh `BoundStep` -> certifies *and* executing it
+produces real `LookupFormulaSpec` cells, not a false certificate. All four
+match the required results exactly.
+
+=== 17.3 CRITICAL final falsification -- mutability of `BoundFramesTargetCall` itself
+
+`BoundFramesTargetCall` has plain `__slots__` attributes with no
+`__setattr__` override, no property, no frozen semantics. Nothing prevents
+reassigning `target` or `kwargs` on an already-constructed, already-classified
+instance -- including one obtained through the fully legitimate
+`build_steps_from_config` path, not merely a hand-built one:
+
+[source,python]
+----
+[step] = build_steps_from_config([{  # ordinary, framework-built, real step
+    "step": "add_lookup_helpers", "source": "orders", "lookup": "products",
+    "output": "orders", "key": "product_id",
+    "helpers": {"fields": ["value"]}, "missing": "empty",
+    "helper_value_mode": "formula",
+}])
+cert = classify_formula_helper_step(step)      # -> FormulaHelperCertificate(...)
+type(step.fn.kwargs)                           # -> mappingproxy (item assignment IS blocked)
+
+def malicious(frames, **kw):
+    return {**frames, "PWNED": pd.DataFrame({"x": [1]})}
+
+step.fn.target = malicious                     # <-- succeeds, no exception
+step(frames)                                    # -> {'orders': ..., 'products': ..., 'PWNED': ...}
+# `cert` (issued before the reassignment) still reads FormulaHelperCertificate(...)
+----
+
+The same result holds for `step.fn.kwargs = {**dict(step.fn.kwargs),
+"helper_value_mode": "values"}` (whole-attribute reassignment, bypassing the
+item-level `MappingProxyType` protection entirely): execution flips from
+producing `LookupFormulaSpec` cells to plain `str` cells while the
+already-issued certificate is unchanged. Both were independently reproduced
+against a genuinely framework-built `BoundStep`, and separately against
+manually-constructed `BoundFramesTargetCall` instances built with a plain
+mutable `dict` (which nothing requires a caller to avoid -- the public
+constructor accepts any `Mapping`).
+
+*Root cause:* the correction proves authenticity of the pairing *at the
+moment `resolve_trusted_call` runs*, but nothing makes that pairing
+immutable afterward. `MappingProxyType` closes item-level mutation of a
+`kwargs` mapping the *binder* chose to wrap, but the `BoundFramesTargetCall`
+object holding a reference to that mapping (and to `target`) is itself an
+ordinary mutable object at both the framework-built and hand-built call
+sites. This is the same class of defect as the original F1 finding
+(TOCTOU: a certificate is issued, then an accessible mutable surface changes
+what actually executes), relocated from `BoundStep.config`/`binding` onto
+`BoundFramesTargetCall.target`/`.kwargs`, not a new attack surface.
+
+The correction's own new FTR narrative (section 42.1) states the property
+established is *"obtaining and reusing that proof object is harmless
+because using it necessarily runs the reviewed behavior"* and demonstrates
+this only by *copying* an unmutated `BoundFramesTargetCall` into a second
+`BoundStep` (`test_copying_a_genuine_binding_necessarily_executes_the
+_reviewed_behavior`). No shipped test mutates `.target` or `.kwargs` on an
+already-certified call object. "Reusing unmutated" and "mutating after
+certification" are different properties; the correction proves the first
+and the FTR's evidence conflates it with the second, which does not hold.
+
+*E4-REVIEW-F1: NOT RESOLVED.* Per FTR section 18's own requirement
+("certificate corresponds to immutable effective configuration"), the
+accepted invariant is that *every* object `resolve_trusted_call` accepts
+must itself be incapable of diverging from its certificate before execution
+-- not merely that the framework's own binder happens to produce
+well-behaved instances today.
+
+*Smallest bounded correction:* make `BoundFramesTargetCall` genuinely
+immutable after construction (e.g. `__setattr__` raising, or storing
+`target`/`kwargs` behind a frozen-dataclass-style mechanism actually
+enforced at the instance level, not only conventionally documented as
+"should be" for `kwargs`), so identity/type checks at classification time
+remain true for the lifetime of the object.
+
+=== 17.4 F1 binder/regression sanity
+
+The original TOCTOU vector remains closed: `step.config[...] = ...` on a
+framework-built step still raises `TypeError` immediately (`config` is
+still `MappingProxyType`), and classification/execution stay consistently
+uncertified/values-mode. Nested mutation sanity re-confirmed: mutating a
+shared nested list changes exposed config and execution identically, and an
+earlier-returned certificate stays immutable. No leftover production
+reference to `_TrustedBinding`/`_TRUSTED_BINDING`/`BoundStep.binding`/
+`is_trusted_binding` exists (grep-confirmed; only historical prose remains).
+All four classifier families independently confirmed to use
+`resolve_trusted_call` with the actual imported callable, never a string
+fallback. `build.py`'s rename fallback carries `fn` through by reference (no
+`binding` field to drop), so a `BoundFramesTargetCall` survives a rename
+unchanged. `application/schema_maintenance.py`'s private `BoundStep`
+(outside `pipeline/steps.py`) is unaffected: its config never matched any
+E4-reviewed target under either mechanism, so it is `Uncertified` for the
+same underlying reason (never certified) both before and after -- confirmed
+via its own passing test suite. *Not a regression.*
+
+=== 17.5 I2 final disposition -- resolved
+
+`consume_manifest_at_sink` now checks `role.frame != certificate.output`
+(-> `Uncertified(reason="mismatched_composition", detail="output")`) and
+`role.column != "source_frames"` (-> `detail="column"`) before authorizing
+consumption. Independently reproduced all three required cases: (13) a
+certificate for frame `A` against an unrelated role at frame `B` ->
+correctly rejected with `detail="output"`. (14) matching frame but a role
+constructed with a non-`"source_frames"` column -> correctly rejected with
+`detail="column"`. (15) a real `write_artifact_manifest` `BoundStep` with
+both `manifest_path`/`output_dir` configured, `role =
+artifact_manifest_role(certificate)` (the maintained shape) -> consumption
+succeeds, returning the exact role location with
+`effect=CONSUME_TERMINATE`; unsupported sink kind and "no configured write"
+both independently re-confirmed still `Uncertified`; whole-frame cleanup
+still terminates the role via the unchanged generic
+`terminate_roles_removed_by_cleanup`.
+
+*E4-REVIEW-I2: RESOLVED.*
+
+=== 17.6 F2/F3/I1/M1 regression sanity
+
+No production code for F2, F3, I1, or M1 was touched by this correction
+range. Re-ran the same independent probes used in section 16 (fresh, not
+merely the shipped tests) unchanged: F2's 4x2 `GroupedMatrix` projection
+correspondence still matches exactly in both directions and
+`xlsx`/`ods`/unsupported sink gating is unchanged. F3's `source_frame`
+collision, fully-disjoint preservation, `relation` collision, and
+`drop_source` footprint are all unchanged. I1's default/MultiIndex/hostile
+row-index cases for both `validate_references` and `validate_graph` are
+unchanged. M1's FTR text still names five (not seven) targets. *All four
+REMAIN RESOLVED, no regression.*
+
+=== 17.7 Source-style and validation
+
+`make source-style-guards`: 0 errors, *82 warnings* (back to the original
+independently-verified baseline; the one warning the prior correction pass
+added is gone, since the extra branch moved out of
+`classify_formula_helper_step` and into `resolve_trusted_call`), 2
+allowlisted findings -- independently reproduced exactly. `ruff check` on
+changed files: all pass. Focused corrected suites: *83 passed*
+(`tests/unit/pipeline/execution_state/` + architecture guard + R1
+scalarization + finding_frame). Broader regression (validation, pipeline,
+formula/grouped/reconstruction, artifact manifest, XLSX/ODS FormulaSpec,
+workbook views, rendering, `application/` including schema maintenance,
+architecture): *678 passed*. `make test`: *2695 passed, 1 deselected* --
+matches the correction author's claimed result exactly.
+`asciidoctor --failure-level=ERROR` on the FTR: passes. `git diff --check
+ad700f0..2f7b153`: passes.
+
+=== 17.8 Final disposition table
+
+[cols="2,2,6",options="header"]
+|===
+|Finding |Verdict |Independent evidence
+
+|E4-REVIEW-F1
+|*NOT RESOLVED*
+|The sentinel-forgery vector is closed, but the new `BoundFramesTargetCall`
+object is itself mutable after certification: `step.fn.target = ...` and
+`step.fn.kwargs = ...` both succeed on a genuinely framework-built,
+already-certified `BoundStep`, changing what executes while the
+already-issued certificate remains unchanged. Reproduced against both a
+hand-built call object and a real `build_steps_from_config`-built step.
+
+|E4-REVIEW-F2
+|*REMAINS RESOLVED*
+|Independent 4x2 `GroupedMatrix` projection re-run; exact bidirectional
+correspondence and adapter-kind gating unchanged.
+
+|E4-REVIEW-F3
+|*REMAINS RESOLVED*
+|`source_frame` collision, disjoint preservation, `relation` collision, and
+`drop_source` footprint declarations all unchanged and independently
+re-verified.
+
+|E4-REVIEW-I1
+|*REMAINS RESOLVED*
+|Default/MultiIndex/hostile-object row-index scalarization unchanged for
+both validators.
+
+|E4-REVIEW-I2
+|*RESOLVED*
+|`consume_manifest_at_sink` now verifies `role.frame == certificate.output`
+and `role.column == "source_frames"`; frame mismatch, column mismatch, and
+positive correspondence all independently reproduced correctly.
+
+|E4-REVIEW-M1
+|*REMAINS RESOLVED*
+|FTR still names five targets; no regression.
+|===
+
+New correction-induced Blocking findings: *0* (F1's residual is the same
+finding under a further-changed mechanism, not a new one).
+New correction-induced Important findings: *0*.
+New correction-induced Minor findings: *0*.
+
+=== 17.9 Verdict
+
+*B. CHANGES REQUIRED.*
+
+F1 remains the sole open Blocking finding after three correction passes. I2,
+F2, F3, I1, and M1 are all independently confirmed resolved/unregressed. E4
+is not independently accepted. E4 remains the current slice; E5 remains
+blocked and unstarted; no E5 macro wiring or lifecycle curation was
+performed during this pass.
+
+Residual scope: F1 requires `BoundFramesTargetCall` (or whatever object
+`resolve_trusted_call` accepts) to be genuinely immutable after
+construction, not merely wrapped in a `MappingProxyType` at the mapping
+level while its own `target`/`kwargs` attributes remain freely reassignable.
+This does not implicate the accepted Review 005 architecture -- it is, like
+every prior residual, an implementation defect in how that architecture's
+"exact bound executable behavior" requirement was encoded.
+
+PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
+AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
+E5 REMAINS BLOCKED.
