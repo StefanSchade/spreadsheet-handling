@@ -12,6 +12,21 @@ log = logging.getLogger("sheets.pipeline")
 
 
 def run_pipeline(frames: Frames, steps: Iterable[Step]) -> Frames:
+    """Execute ``steps`` in order over ``frames`` and return the result.
+
+    Supported programmatic / caller-precondition surface (Trusted Ingress
+    slice E6, ``docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc`` section 23):
+    ``run_pipeline`` is deliberately step-only. It performs no Trusted
+    Ingress establishment before the first step and no E4/E5 controlled-role
+    tracking or re-establishment around or after any step -- the caller
+    supplies Frames that already satisfy whatever contract the given steps
+    require, and owns every later preservation, controlled transition, or
+    re-establishment decision. This is *not* equivalent to
+    :func:`spreadsheet_handling.application.orchestrator.orchestrate` and is
+    not a safe shortcut around its automatic macro guarantees; see
+    ``docs/ai_info/interfaces_and_gates.adoc`` for the full programmatic-
+    surface contract.
+    """
     out = frames
     for step in steps:
         step_name = getattr(step, "name", "<unnamed>")

@@ -22,6 +22,17 @@ itself (``type(step.fn) is BoundFramesTargetCall`` and ``step.fn.target is
 <the exact reviewed callable>``), not by trusting a separately-suppliable
 label or marker. See ``BoundFramesTargetCall``'s docstring in
 ``pipeline/types.py`` and ``pipeline.execution_state.bound_configuration``.
+
+Building a ``BoundStep`` here never itself establishes payload conformance
+or grants E4 controlled-role authority (Trusted Ingress slice E6): a built
+step only gains E5's automatic classification/transition semantics when
+executed through ``application.orchestrator.orchestrate``'s managed macro;
+executed any other way (e.g. directly via ``pipeline.execution.run_pipeline``)
+it inherits that lower-level surface's own caller-precondition contract
+instead. ``make_identity_step``, ``make_validate_step``,
+``make_apply_fks_step``, ``make_drop_helpers_step``, ``make_bootstrap_meta_
+step``, and ``make_apply_overrides_step`` are the documented public builders
+(``pipeline.__all__``); other factories in this module remain internal.
 """
 from __future__ import annotations
 

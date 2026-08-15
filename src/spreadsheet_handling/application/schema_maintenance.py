@@ -3,6 +3,15 @@
 Schema maintenance is intentionally not exposed as a public,
 YAML-configurable pipeline step. A private BoundStep is constructed only to
 reuse the orchestrator's I/O and persistence-boundary flow.
+
+``run_schema_maintenance`` (backing ``sheets-schema-maintain``) is itself a
+supported programmatic entry point: it delegates entirely to
+``application.orchestrator.orchestrate``, so it inherits the same automatic
+Trusted Ingress establishment and E4/E5 guarantees (Phase-E slice E6, see
+that function's docstring). The private step it builds is always
+E5-uncertified -- never a certified transition -- so a valid schema-
+maintenance result is conservatively ordinarily re-established before save,
+exactly like any other uncertified step return.
 """
 
 from __future__ import annotations

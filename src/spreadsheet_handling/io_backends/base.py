@@ -44,6 +44,19 @@ def coerce_backend_options(
 
 
 class BackendBase:
+    """Direct backend read/write surface (pre-existing public export).
+
+    Caller precondition (Trusted Ingress slice E6): a direct backend
+    ``read``/``write`` call is *not* equivalent to
+    ``application.orchestrator.orchestrate``. A direct loader returns a raw
+    carrier-level ``Frames``/``DataFrame`` representation without E1-E3
+    ordinary-conformance establishment; a direct saver does not authorize or
+    reject E4 controlled roles and does not apply the persistence-boundary
+    projection. Neither side receives the complete E1-E5 macro guarantee
+    unless the caller separately routes the result through ``orchestrate``
+    (or its own equivalent). See ``docs/ai_info/interfaces_and_gates.adoc``.
+    """
+
     def write(
         self,
         df: pd.DataFrame,

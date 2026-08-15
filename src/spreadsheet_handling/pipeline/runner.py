@@ -22,6 +22,11 @@ def run_app(
     persistence boundary that projects runtime ``_meta`` onto its
     persistable contract immediately before save.
 
+    Supported programmatic surface (Trusted Ingress slice E6): ``run_app``
+    reaches the same framework-managed macro as ``orchestrate`` and inherits
+    its automatic Trusted Ingress establishment and E4/E5 guarantees in
+    full -- see that function's docstring for the complete contract.
+
     Returns: ``(frames, meta, issues)``.
     """
     # Local import: ``application.orchestrator`` pulls in modules that

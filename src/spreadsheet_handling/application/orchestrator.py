@@ -128,6 +128,25 @@ def orchestrate(
     Raises
     ------
     ValueError for invalid I/O descriptors or unknown kinds.
+
+    Programmatic surface contract (Trusted Ingress slice E6, ``docs/backlog/
+    FTR-TRUSTED-INGRESS-P4A.adoc`` sections 23/46): this is the one
+    framework-managed macro seam every router-backed entry point
+    (``sheets-run``, :func:`spreadsheet_handling.pipeline.runner.run_app`,
+    the ``spreadsheet_handling.orchestrator`` compatibility shim,
+    ``sheets-schema-maintain``/``application.schema_maintenance.
+    run_schema_maintenance``) funnels through. It automatically establishes
+    E1-E3 ordinary Trusted Ingress conformance before any configured step
+    runs, applies E4/E5 controlled-role classification/transition around
+    each step, and authorizes every surviving controlled role against the
+    exact output sink kind before saving -- raising before the saver runs
+    otherwise. Configured ``steps`` themselves remain a *trusted pipeline
+    description*: this automatic payload-conformance establishment does not
+    authorize an untrusted/less-trusted pipeline description (dotted
+    plugin targets, YAML step configuration) -- that remains a separate,
+    still-open concern (Phase-E slice E7). See ``docs/ai_info/
+    interfaces_and_gates.adoc`` for the complete programmatic-surface
+    matrix.
     """
     inp = _coerce_io(input, "input")
     out = _coerce_io(output, "output")
