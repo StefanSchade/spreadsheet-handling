@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.core.scalar_values import UnsupportedScalarError, scalar_category
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain.finding_frame import findings_to_frame as _serialize_findings
 from spreadsheet_handling.domain.finding_frame import row_index_label as _row_index_label
@@ -727,18 +728,30 @@ def _plain_value(value: Any) -> Any:
 
 
 def _safe_row_index(row_index: Any) -> Any:
-    """R1: preserve an already Scalar-compatible ``row_index`` unchanged;
-    project a ``pandas.MultiIndex`` tuple to the shared safe String label.
+    """R1: emit only a Scalar-compatible ``row_index`` cell, unconditionally.
 
     ``frame.loc[:, columns].iterrows()`` yields the DataFrame's own index
-    value for each row: a plain scalar (the maintained default-index case,
-    left untouched -- "an already-admitted Scalar label may be preserved")
-    or a ``tuple`` when ``frame.index`` is a ``MultiIndex``, which is not
-    itself Scalar-compatible and must not reach a report cell as a raw
-    Python tuple.
+    value for each row. Three cases:
+
+    * a ``tuple`` (``frame.index`` is a ``pandas.MultiIndex``) is projected
+      through the shared safe serializer to a stable String;
+    * an already-admitted ordinary Scalar (the maintained default-index
+      case) is preserved unchanged -- "an already-admitted Scalar label may
+      be preserved" -- not stringified;
+    * anything else -- current physical-axis authority imposes no row-index
+      grammar (FTR-TRUSTED-INGRESS-P4A section 25), so an arbitrary hashable
+      object index is reachable here -- is neither a tuple nor an admitted
+      Scalar and is replaced by the existing stable safe placeholder rather
+      than inspected with ``str()``/``repr()``. This makes the "R1 report
+      projection emits only Scalar cells" acceptance criterion unconditional,
+      not merely true for the ``tuple``/ordinary-Scalar cases.
     """
     if type(row_index) is tuple:
         return _row_index_label(row_index)
+    try:
+        scalar_category(row_index)
+    except UnsupportedScalarError:
+        return "<unsupported row index>"
     return row_index
 
 
