@@ -1,0 +1,804 @@
+= FTR-TRUSTED-INGRESS-P4A -- Independent E5 Implementation Review
+:toc:
+
+*Review date:* 2026-08-15
+
+*Review type:* fresh-context, independent implementation review of Phase-E
+Trusted Ingress slice E5 ("framework-managed macro wiring") only. The
+implementation author's report (FTR section 45, "E5 implementation
+evidence") is treated as a claim to verify, not as review authority. This
+review does not start E6/E7, perform lifecycle curation, or modify
+runtime/tests/FTR.
+
+*Lifecycle baseline:* `987ed27fd7343d6f02d76e8cf752f4ea64a64d18`
+(`docs(trusted-ingress): advance lifecycle from E4 to E5`). E1-E4
+independently accepted at this baseline; E4's final acceptance commit is
+`0f74d5574c94fa2938b430adfa4865e627a0f80d`.
+
+*Reviewed range:* `987ed27..9ecc447`
+
+* `43d7811211e26cb1fd38bb3a97d80177aa9a209e` --
+  `feat(FTR-TRUSTED-INGRESS-P4A): wire managed Phase-E E5 execution`
+* `2fe42b48131370e7c58d5f8a4ad7f86d5d56e1a3` --
+  `test(FTR-TRUSTED-INGRESS-P4A): cover E5 managed ingress lifecycle`
+* `9ecc447fdef5afbdbc23fd0e76db81a365996427` --
+  `docs(FTR-TRUSTED-INGRESS-P4A): record E5 implementation evidence`
+
+*Accepted design authority:* `docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc`
+section 23 ("E5 -- framework-managed macro wiring", lines 2436-2491) and
+section 25 (Phase-E scope/defer matrix), read alongside the accepted E4
+mechanism (`pipeline/execution_state/`, independently accepted per
+`FTR-TRUSTED-INGRESS-P4A_E4_implementation_review.adoc` section 19.9) and
+`roadmap_domain_hardening_sequence.adoc`.
+
+*Verdict:* *A. ACCEPTED.* 0 Blocking, 0 Important, 3 Minor findings. Every
+accepted maintained E5 flow independently closes -- several only after this
+review's own reproduction probes, since the committed test suite does not
+exercise them (see findings F1/F2).
+
+== 1. Independently reconstructed E5 contract
+
+Restated from FTR section 23 before opening implementation code: E5 must
+wire the *already-accepted* E1-E4 machinery into the *one* framework-owned
+macro seam, without duplicating or reinterpreting it. Concretely:
+
+* run E1-E3 ordinary conformance ingress before any configured step, for
+  every router-backed entry point, with rejection occurring before any
+  configured step, cleanup, or save;
+* classify each configured step against E4's four exact classifiers,
+  execute it exactly once through the unmodified `run_pipeline`, and apply
+  the classified transition to a threaded, control-plane-only execution
+  state;
+* for any step that does not classify to an exact certificate (built-in
+  without an exact certificate, dotted/plugin wrapper, hand-built
+  `BoundStep`, or one exact target with unreviewed configuration), execute
+  it once and then conservatively re-establish ordinary conformance over
+  the *entire* returned candidate, ending all prior controlled-role
+  authority regardless of outcome;
+* at final macro closure (after final domain cleanup, before the saver):
+  terminate every controlled role whose frame cleanup removed, then
+  authorize every role still live against the exact final sink kind --
+  raising before the saver runs if any role has no exact reviewed consuming
+  transition for that sink;
+* `run_pipeline` itself, `pipeline/build.py`, and `pipeline/registry.py`
+  remain step-only and unaware of `execution_state`; `PRESERVING_CERTIFICATES`
+  stays the empty tuple E4 established; no E6 (programmatic-surface
+  contract) or E7 (less-trusted description authorization) work is in scope.
+
+Everything below either confirms or falsifies this restatement against
+actual source and actual runtime behavior -- not against the implementation
+author's own section 45 narrative, which is used only as a claim to verify.
+
+== 2. Diff shape and implementation-shape verdict
+
+`git diff --stat 987ed27..9ecc447`: 9 files, +1471/-57. Runtime:
+`domain/ingress/coordinator.py` (+20 lines: one new `IngressRule`),
+`application/managed_pipeline.py` (new, 399 lines), `application/
+orchestrator.py` (82 changed lines: replaces inline ingress/cleanup/
+persistence-boundary code with delegation to `managed_pipeline`). Tests:
+one new integration suite (449 lines) plus two small, narrow fixture fixes
+in pre-existing E3 unit tests (discussed in section 4). Docs: the FTR
+evidence section and a release-note entry. `git diff --stat` for
+`pipeline/execution.py`, `pipeline/runner.py`, `pipeline/build.py`,
+`pipeline/registry.py`, any `cli*` module, and any `io_backends` adapter
+returns nothing -- independently confirmed empty. *No hidden E6/E7 or
+lifecycle-curation work found.*
+
+`application.managed_pipeline` is genuinely the *one* small, named macro
+execution component, not a second orchestration architecture: it has no
+step registry, no YAML-addressable surface, no public entry point besides
+the three functions `orchestrate` calls (`establish_initial_state`,
+`execute_managed_step`/`run_managed_steps`, `finalize_managed_state`), and
+every one of its four `_handle_*` transition handlers is a thin dispatcher
+over E4's own classify/compose/resolve functions -- it re-implements
+exactly one thing E4 left generic (see finding F3), and nothing else.
+*Verdict: SOUND -- one seam, one small component.*
+
+== 3. Actual call graph / seam
+
+Independently traced (not merely re-reading section 45.1):
+
+[source,text]
+----
+sheets-run (pyproject entry point -> cli/apps/run.py:main)
+  -> application.orchestrator.orchestrate                      (direct import, line 10)
+
+run_app (pipeline/runner.py:run_app)
+  -> application.orchestrator.orchestrate                      (local import, cycle-avoidance)
+
+spreadsheet_handling.orchestrator (compatibility shim, top-level package)
+  -> application.orchestrator.orchestrate, IODesc               (bare re-export, same object)
+
+sheets-schema-maintain (pyproject entry point -> cli/apps/schema_maintain.py:main)
+  -> application.schema_maintenance.run_schema_maintenance
+       -> application.orchestrator.orchestrate  (steps=[private BoundStep])
+----
+
+All four converge on the same `orchestrate` function object (confirmed by
+reading the shim's source, not merely its docstring: `from
+.application.orchestrator import orchestrate, IODesc`). `orchestrate`
+itself calls `establish_initial_state` before any configured step,
+`run_managed_steps` for the configured loop, and `_finalize_and_persist`
+(final cleanup -> `finalize_managed_state` -> persistence boundary) before
+`_save_frames`. There is no second code path that loads via
+`io_backends.router` and saves without passing through these three calls.
+
+The six router-backed backend families are exactly `io_backends/router.py`'s
+`SAVERS`/`LOADERS` keys: `csv_dir`, `json_dir`, `yaml_dir`, `xml_dir`,
+`xlsx`, `ods` (grep-confirmed, no seventh key, no bypass). `orchestrate`'s
+`_load_frames`/`_save_frames` call `get_loader`/`get_saver` unconditionally
+against `inp.kind`/`out.kind` -- there is no per-kind branch that skips
+`establish_initial_state` or `finalize_managed_state`. The committed
+`test_all_six_backend_families_reach_initial_ingress`
+(`tests/integration/pipeline/test_trusted_ingress_e5_managed_lifecycle.py:62`)
+independently exercises all six kinds through a real `orchestrate` call with
+a spy step and passes. *Verdict: no supported router-backed macro path
+bypasses initial ingress, managed execution, or final state closure.*
+
+== 4. Initial E1-E3 ingress wiring
+
+`domain/ingress/coordinator.py` now prepends `IngressRule(name=
+"ordinary_structural_admission", apply=admit_ordinary_frames)` to
+`INGRESS_RULES`, ahead of the pre-existing `legend_blocks_shape` and
+`metadata_substrate` rules. `admit_ordinary_frames`
+(`domain/ingress/structural_admission.py`) is the already-independently-
+accepted E2 rule (itself calling E1's `admit_ordinary_scalar` per cell,
+confirmed by reading `_admit_dataframe_cells`/`_admit_exact_table_cells`);
+E5 only adds the one missing `IngressRule` entry, matching the FTR's own
+description of the gap (a rule that existed but was never registered).
+
+Read independently, in order:
+
+1. *E2 includes E1:* confirmed from source -- every ordinary DataFrame/
+   `ExactTable` cell is passed through `admit_ordinary_scalar` before
+   `admit_ordinary_frames` returns.
+2. *`_meta` stays opaque to E2:* `_dispatch_payload_entries` explicitly
+   `continue`s on `frame_name == "_meta"` before any carrier-type check --
+   confirmed by direct code read, not inference.
+3. *Rule ordering cannot let a delegate bypass final E3 validation:*
+   `ordinary_structural_admission` never opens `_meta` (point 2), so its
+   position relative to `legend_blocks_shape`/`metadata_substrate` is
+   provably a documentation choice, not a functional dependency; the
+   pre-existing E3 ordering (delegate before the generic substrate pass)
+   is untouched.
+4. *Rejection precedes any configured step, cleanup, or save:*
+   `establish_initial_state` is the first call in `orchestrate`, before the
+   configured-step loop and before `_finalize_and_persist`; a raised
+   exception there propagates out of `orchestrate` unconditionally.
+5. *All six router families reach this boundary:* section 3.
+
+*Other callers of `run_domain_ingress`:* `domain.meta_bootstrap.
+bootstrap_meta` and `domain.yaml_overrides.apply_overrides` both call
+`run_domain_ingress({"_meta": <merged-meta>})` -- a Frames mapping
+containing *only* `_meta`. Since `admit_ordinary_frames` skips the `_meta`
+key entirely and produces zero payload entries for such an input, it is a
+guaranteed no-op for both callers -- not merely "tests happen to still
+pass". This is proven by construction from `_dispatch_payload_entries`'s
+early `continue`, independently of the two rewritten E3 unit-test fixtures
+that made this explicit (`test_absent_meta_is_noop` in both
+`test_legend_blocks_ingress.py` and `test_metadata_admission.py`: the old
+fixture `{"data": object()}` would now correctly be rejected by the newly
+reachable E2 rule as an unsupported top-level carrier, so both tests were
+narrowly updated to `{}` -- a legitimate, transparent fix, not a weakening
+of the new rule). *Verdict: SOUND, no incompatible caller.*
+
+== 5. classify -> execute -> apply correspondence
+
+`execute_managed_step` tries `classify_formula_helper_step`,
+`classify_grouped_producer_step`, `classify_expand_grouped_step`,
+`classify_artifact_manifest_step` in a fixed order, returning on the first
+non-`Uncertified` result. `bound_configuration.resolve_trusted_call`
+requires `type(step.fn) is BoundFramesTargetCall` (exact type) and
+`call.target is expected_target` (object identity) -- since a `BoundStep`'s
+bound callable structurally executes exactly one target,
+`resolve_trusted_call` against the four *distinct* target objects
+(`enrich_lookup`, `contract_grouped_xref`/`reconstruct_grouped_matrix`,
+`expand_grouped_xref`, `write_artifact_manifest`) cannot both succeed for
+two different classifiers on the same step. The dispatch is exhaustive and
+unambiguous by construction, not a heuristic -- confirmed by reading
+`resolve_trusted_call` itself, not merely trusting the docstring's claim.
+
+Every certified path calls `_run_one` (== `run_pipeline(frames, (step,))`)
+exactly once; the uncertified fallback also calls it exactly once. No
+handler calls `_run_one` twice, and no classifier itself executes anything
+(all four are pure, `frames`-free functions of `step`/`call.kwargs`).
+Classification-relevant live state (`dynamic_column_labels(live_matrix)` in
+`_handle_expand_grouped`) is read from `frames` *before* `_run_one`
+executes the step, matching the required classify-then-execute-then-apply
+ordering; verified by direct code read of `_handle_expand_grouped`, lines
+234-243. Config/name/registry membership never substitutes for the exact
+E4 authority: `test_generic_dotted_step_is_not_certified_by_name_alone`
+proves the *registered* `add_lookup_helpers` step with non-formula
+configuration still falls to the closed default. *Verdict: SOUND.*
+
+== 6. Uncertified fallback and `PRESERVING_CERTIFICATES`
+
+`_fallback_uncertified` executes the step once, then calls
+`admit_ordinary_frames(executed)` unconditionally and returns a fresh, empty
+`ManagedExecutionState` regardless of outcome. Because none of the three
+controlled-carrier shapes (`GroupedMatrix`, `LookupFormulaSpec` cell values,
+manifest `list[str]` cells) are accepted ordinary top-level carriers or
+Scalar values, a single re-admission call is sufficient to reject any
+candidate that still carries one -- independently confirmed against all six
+cases the task lists:
+
+* *A/B/C (ordinary built-in, dotted/plugin valid, dotted/plugin invalid):*
+  covered by committed tests
+  `test_plugin_step_with_valid_ordinary_return_reestablishes_and_continues`
+  and `test_plugin_step_with_invalid_return_blocks_later_domain_and_save`.
+* *D (hand/prebound BoundStep):* the schema-maintenance private step (F,
+  below) is exactly this shape.
+* *E (schema-maintenance private step):* `_build_private_step`
+  (`application/schema_maintenance.py`) wraps `apply_schema_maintenance` in
+  a raw closure -- `type(step.fn)` is a function, never
+  `BoundFramesTargetCall` -- so all four classifiers reject it at the
+  authenticity check regardless of its fixed/prebound status.
+  `test_schema_maintenance_private_step_still_conservatively_reestablishes`
+  confirms the valid-return side; a block is raised *inside* step execution
+  itself (`_SchemaMaintenanceBlocked`), so it propagates before
+  `admit_ordinary_frames` is even reached -- independently traced from
+  source.
+* *F (uncertified step following existing controlled roles):* not covered
+  by any committed test, so independently reproduced during this review
+  (probe, not committed): a `configure_pipeline_cleanup` step placed
+  *after* a live `contract_grouped_xref(drop_source=True)` composition
+  (state already holding a `GroupedMatrixFormulaRole`) is itself
+  uncertified; at that point the grouped/formula-bearing frame has *not yet*
+  been physically removed (`drop_source` only queues removal via
+  `_meta.pipeline_cleanup`, executed later -- confirmed from
+  `xref_crosstable/operation.py`'s `mark_frames_for_cleanup` call), so
+  `admit_ordinary_frames` on the intermediate result correctly raises
+  `OrdinaryStructureAdmissionError` (unsupported top-level carrier) and the
+  whole run aborts. When the *same* uncertified step is placed *before* any
+  controlled role is introduced (the committed pattern,
+  `test_artifact_manifest_role_dropped_by_cleanup_reaches_save`), it
+  succeeds trivially. *Both outcomes independently reproduced and correct.*
+
+`PRESERVING_CERTIFICATES` remains the empty tuple
+(`pipeline/execution_state/preserving.py`, byte-identical to E4); E5 never
+imports `preserving.py` and constructs no equivalent bypass under another
+name -- confirmed by grep across the changed files. *Verdict: SOUND.*
+
+== 7. Controlled-role state model and locality
+
+`ManagedExecutionState` holds `roles: tuple[ControlledRole, ...]` (E4's own
+closed role types, unchanged) plus `last_formula_certificate:
+FormulaHelperCertificate | None` -- "the smallest additional memory the
+macro needs beyond that set" per its own docstring, citing FTR's exclusion
+of a general certificate history/registry.
+
+*Multi-role sufficiency, probed directly (not assumed):*
+
+* *Two independently-live `GroupedMatrix` introductions* (disjoint source
+  frames): both roles independently authorized at the final sink --
+  reproduced, `xlsx` save succeeds with both `grouped1`/`grouped2` present.
+* *A single `FormulaHelperCertificate` producing multiple fields, only one
+  selected by a later `contract_grouped_xref`:* the unselected field's
+  `LookupFormulaSpecRole` remains independently retained and is correctly
+  (a) authorized together with the nested role at a capable sink and (b)
+  rejected at an incapable sink because of the retained role alone --
+  reproduced both ways. This is what FTR's test-strategy phrase "multiple
+  helper roles" and Review 005's "multiple-helper probe" describe (grep-
+  confirmed: both always co-occur with "every source helper role"/"retained
+  all original helper roles" language, i.e. one certificate, several
+  fields -- not several certificates).
+* *A grouped producer composing with a non-latest live
+  `FormulaHelperCertificate`* (two separate `add_lookup_helpers` calls with
+  different outputs, the grouped step's `relation` naming the *first*, while
+  `last_formula_certificate` now holds the *second*): `compose_formula_to_
+  grouped` correctly returns `Uncertified` (source/output mismatch), so no
+  composition is attempted; the grouped-producer certificate's *own*
+  footprint then collides with the still-live first-certificate role (it
+  reads/drops that exact frame), so `_footprint_collides` routes to
+  `_fallback_uncertified`, which hard-rejects the whole run once the
+  surviving raw `GroupedMatrix` fails ordinary re-admission. *This fails
+  closed* -- no false authorization -- and no accepted maintained flow found
+  in the FTR or Review 005 requires composing with a non-latest certificate
+  (a single certificate's multiple fields is the only "multiple roles"
+  scenario named in either document). See finding F2 for the associated
+  test-coverage gap; this is not a soundness defect.
+
+*Verdict:* the single-slot `last_formula_certificate` design is sufficient
+for every accepted maintained flow this review could locate, and its one
+uncovered case fails closed rather than mis-authorizing. *SOUND WITH A
+DOCUMENTED, INTENTIONAL BOUND* (finding F3 covers a related traceability
+point, not a soundness gap).
+
+== 8. Locality / footprint generalization
+
+`_footprint_collides(footprint, roles)` calls `vocabulary.proves_disjoint`
+against *every* currently-live role's `.frame`, for *every* certified
+transition kind (all four `_handle_*` functions use it uniformly) --
+strictly more general than E4's own `disjoint_grouped_introduction`, which
+is the same `proves_disjoint(new_certificate.footprint(),
+existing_role_frame=existing.frame)` call specialized to one `GroupedMatrixRole`.
+Since `disjoint_grouped_introduction` is not itself imported by
+`managed_pipeline.py`, this is a genuine generalization, not a bypass --
+confirmed by reading both call sites side by side. Independently probed:
+two disjoint `GroupedMatrix` introductions coexist (section 7); a colliding
+introduction (grouped producer whose declared footprint touches a live
+role's frame) routes to the uncertified fallback and fails closed (section
+6, case F). Every certificate's `footprint()` was read directly from source
+for all four families and, in each case, declares every genuinely
+frame-valued configuration key the underlying family function actually
+reads/writes/drops (`source_frame` for the axis-mapping read,
+`base_relation` for `expand_grouped_xref` when supplied, etc.) --
+under-declared footprints default `Uncertified` rather than silently
+narrowing (e.g. `contract_grouped_xref`'s `dense_axes` branch). *Verdict:
+SOUND -- valid disjoint roles remain possible, overlapping authority fails
+closed, and no step is executed twice by the fallback path (the certified
+branch and the uncertified branch are mutually exclusive within one
+`execute_managed_step` call).*
+
+== 9. Forward FormulaSpec -> GroupedMatrix composition
+
+`compose_formula_to_grouped` requires exact `relation == formula.output`,
+`value` in `formula.fields`, the source-key column present in `row_keys`,
+and a non-colliding output frame -- all four independently re-derived from
+source and matched to FTR section 11's descriptor. Both `drop_source`
+values were independently exercised end to end (not only via the
+committed `drop_source=True` E2E test):
+
+* `drop_source=False` (retain): the standalone `enriched` frame survives
+  with an `INTRODUCE`-effect role, the nested nested role is
+  `COPY_DERIVE` -- reproduced, `xlsx` save succeeds with `enriched` present
+  in the result alongside `grouped`.
+* `drop_source=True` (drop): the retained-source role becomes
+  `PENDING_CLEANUP`/`pending_cleanup=True`; the frame is *not* removed
+  immediately by `contract_grouped_xref` itself -- confirmed from source,
+  it only calls `mark_frames_for_cleanup`, deferring physical removal to
+  the shared final-cleanup mechanism -- and `finalize_managed_state`'s
+  `frames_before_cleanup`/`frames_after_cleanup` diff (captured at the
+  start of `_finalize_and_persist`, i.e. *after* the step ran but *before*
+  final cleanup executes) correctly observes and terminates it. Reproduced;
+  the committed E2E test already exercises this path.
+
+*Verdict: SOUND for both modes;* the committed test suite only exercises
+`drop_source=True` (finding F2 notes the retain-mode gap in committed
+coverage, independently closed by this review's probe).
+
+== 10. Reverse `expand_grouped_xref`
+
+Not exercised by any committed test (`expand_grouped_xref` does not appear
+anywhere in `test_trusted_ingress_e5_managed_lifecycle.py`) -- independently
+reproduced during this review for all four combinations of {forward
+`drop_source`} x {reverse `drop_source`}, plus the ordinary (non-nested)
+case:
+
+* *Nested retain* (`resolve_formula_expand_transition`, `drop_source=False`):
+  returns `ExpandRetainProduct(nested=<unchanged>, output=<COPY_DERIVE>)` --
+  the nested role survives unchanged, a new standalone output role is
+  derived. Reproduced for both forward modes (source retained/dropped);
+  both reach `xlsx` successfully.
+* *Nested drop* (`drop_source=True`): `dynamic_column_labels(live_matrix)`
+  is read from the *live* `GroupedMatrix` in `frames` immediately before
+  execution (`_handle_expand_grouped`, confirmed reading the actual object,
+  not bound configuration) and used to build `restored_source` roles
+  (`RELOCATE`, `pending_cleanup=True`) at `certificate.matrix`; the outer
+  nested role terminates (`CONSUME_TERMINATE`); a new output role is
+  derived. Reproduced for both forward modes; both reach `xlsx`
+  successfully, and the physical removal of `matrix` is deferred to final
+  cleanup exactly like the forward-drop case (same `mark_frames_for_cleanup`
+  mechanism, confirmed from `xref_crosstable/operation.py`).
+* *Ordinary (all-Scalar) `GroupedMatrix` expansion*, both modes: `drop_source=
+  False` retains the `GroupedMatrixRole` unchanged (correctly rejects at
+  `json_dir`, correctly authorizes at `xlsx`, both reproduced); `drop_source=
+  True` returns `None` (no role to track) because the underlying family
+  transformation removes the `matrix` key outright rather than restoring a
+  flat frame under it for the ordinary case (asymmetric from the nested
+  case by design -- there is no provenance to preserve for purely-ordinary
+  data) -- reproduced, reaches `json_dir` successfully with `matrix` absent
+  from the result.
+
+*Verdict: SOUND for every combination reproduced.* This is the single
+largest gap between FTR's Test Strategy and the committed suite (finding
+F2) -- the underlying mechanism is correct, but no regression test pins any
+of it.
+
+== 11. FormulaSpec projection / final sink -- high-attention finding
+
+`_authorize_role_for_sink` does *not* call E4's exact
+`consume_formula_at_capable_adapter`, `relocate_nested_formula_at_
+projection`, `terminate_grouped_matrix_at_projection`, or
+`consume_manifest_at_sink` -- none of the four are imported by
+`managed_pipeline.py` (confirmed by reading its full import list). Instead
+it reimplements the same decision inline: `sink_kind not in
+FORMULA_CAPABLE_SINK_KINDS` for `GroupedMatrixRole`/
+`GroupedMatrixFormulaRole`/`LookupFormulaSpecRole`, `sink_kind !=
+MANIFEST_ADAPTER_SINK_KIND` for `ArtifactManifestSourceFramesRole`.
+
+Independently proving equivalence rather than assuming it:
+
+* `consume_formula_at_capable_adapter`'s entire authorization decision is
+  `if sink_kind not in FORMULA_CAPABLE_SINK_KINDS: return Uncertified(...)`
+  -- it does not inspect `location.cells` (the exact projected `(row,
+  column)` positions `locate_nested_formula_cells` computes) at all in
+  reaching that decision; the cell-location data is a *representation* of
+  where the role now lives, not an additional gate. `_authorize_role_for_
+  sink`'s inline check is therefore the *identical* decision, not a
+  weaker one. What E5 does not do is *record* the relocated/consumed
+  effect on the role value itself (roles in `ManagedExecutionState` keep
+  whatever `effect` classification/composition last set, never advancing
+  to `RELOCATE`/`CONSUME_TERMINATE` at final authorization) -- a
+  traceability gap, not a correctness one, since nothing downstream reads
+  a role's `effect` field after `_authorize_role_for_sink` returns.
+* `consume_manifest_at_sink` additionally requires `certificate.
+  writes_manifest_file` and an exact role/certificate correspondence check
+  -- `managed_pipeline` does not retain the `ArtifactManifestCertificate`
+  at all, so it cannot reproduce that check. This is immaterial in
+  practice: `MANIFEST_ADAPTER_SINK_KIND` ("artifact_manifest_writer") is
+  never a value `io_backends.router`'s `SAVERS` registers (grep-confirmed:
+  the six keys are exactly `csv_dir`/`json_dir`/`yaml_dir`/`xml_dir`/
+  `xlsx`/`ods`), and `orchestrate` always passes `sink_kind=out.kind`,
+  which is validated against that same registry before/at the saver call.
+  *The `MANIFEST_ADAPTER_SINK_KIND` branch in `_authorize_role_for_sink`
+  can therefore never be reached with a matching `sink_kind` in the current
+  macro* -- any surviving manifest role is unconditionally rejected at
+  every real router sink, regardless of `writes_manifest_file`. The
+  implementation evidence (FTR section 45.6) states this outright ("`sink_
+  kind` (`json_dir`) is never `MANIFEST_ADAPTER_SINK_KIND` -- no
+  router-backed saver kind is"), which this review independently confirmed
+  from `io_backends/router.py` and from `orchestrator.py`'s `sink_kind=
+  out.kind` wiring before opening the evidence section. The manifest
+  role's *only* currently-reachable exit is whole-frame cleanup; the FTR's
+  "or another explicitly capable exit" clause is honestly not yet
+  instantiated by any router-backed adapter, and the release note does not
+  overclaim one.
+
+*Verdict:* E5's sink gating is the *same decision* E4's exact functions
+would produce for every reachable case in the current macro, proven from
+source rather than assumed -- not a bypass that "merely checks `sink_kind
+in {"xlsx","ods"}` and trusts the renderer independently" in the sense the
+review brief warns against, because the decision *is* the full accepted
+decision, not a subset of it. The non-use of the four E4 helper functions
+themselves is a real finding (F3): a future change to any of their
+semantics would not automatically propagate to `managed_pipeline`'s inline
+copy, and nothing pins the two to stay in sync.
+
+Referenced lookup-sheet rename (compatibility rule B): `reject_referenced_
+lookup_sheet_rename` *is* called (only for `GroupedMatrixFormulaRole`), fed
+by `_extract_sheet_renames` -- a local, non-validating `_meta.workbook_
+view.sheets` reader that explicitly defers all shape validation to
+`rendering.frame_selection`. Independently probed: a rename of the nested
+role's referenced lookup sheet correctly raises
+`UnauthorizedControlledRoleAtSinkError` before the saver runs; a harmless
+rename of an unrelated sheet (the grouped output carrier itself), given a
+complete `workbook_view.sheets` list, correctly proceeds to a successful
+save. (An initial probe using a *partial* `sheets` list -- naming only the
+renamed frame -- hit a `KeyError` inside the unmodified XLSX renderer,
+unrelated to E5's own authorization, which had already returned without
+raising; resolved by supplying an exhaustive list. This looks like a
+pre-existing `workbook_view`/renderer sensitivity to partial rename lists,
+entirely outside `application/managed_pipeline.py` and E4's `execution_
+state` package -- flagged as a watch-only observation for whoever owns
+`rendering.frame_selection`, not scored as an E5 finding, per the review's
+own instruction to stop at the E5 boundary rather than prescribe a
+workaround for a different layer.) *Verdict: SOUND*, no dual/conflicting
+interpretation found between E5's local reader and the renderer for any
+case this review could construct.
+
+== 12. Manifest exact-exit
+
+Covered in section 11: the manifest role's only currently-reachable exit is
+whole-frame cleanup; the "exact adapter" exit
+(`write_artifact_manifest`'s own internal `_manifest_to_records`/`_write_
+manifest_file`, selected by `manifest_path`+`output_dir`) happens
+*synchronously inside step execution*, before E5's role tracking is even
+consulted, and does not itself change what is in `Frames` -- the manifest
+*file* gets written regardless of E5, but the in-memory `source_frames`
+role only leaves `Frames` via cleanup. `test_artifact_manifest_role_
+dropped_by_cleanup_reaches_save` and `test_artifact_manifest_role_
+surviving_to_unsupported_sink_is_rejected` cover exactly the two reachable
+outcomes; no accepted authority requires a third, router-backed manifest
+adapter to exist yet. *Verdict: SOUND, honestly represented by both the
+implementation and the release note.*
+
+== 13. Cleanup ordering, `run_pipeline` exclusion, architecture guard, schema maintenance, policy stability
+
+*Cleanup ordering:* `_finalize_and_persist` captures `frames_before_cleanup`
+before `execute_final_domain_cleanup`, then calls `finalize_managed_state`
+(cleanup-diff termination, then sink authorization) before the persistence-
+boundary projection and before `_save_frames`. The `frames_before_cleanup`/
+`frames_after_cleanup` key-set diff is sufficient for every currently
+recognized E4 cleanup termination *because* every `drop_source`/explicit-
+cleanup removal funnels through the same `mark_frames_for_cleanup` ->
+`_meta.pipeline_cleanup` -> `execute_final_domain_cleanup` mechanism --
+independently confirmed by tracing `contract_grouped_xref`'s and
+`expand_grouped_xref`'s `drop_source=True` source, not merely observed
+behaviorally (section 6, case F walks through the one scenario where a
+premature/misordered uncertified step, not the diff mechanism itself, is
+the actual gate).
+
+*No generic controlled-role re-establishment:* grep across
+`application/managed_pipeline.py` and `domain/ingress/` for any inference
+of a controlled role from payload shape, class, frame name, or registry
+membership after authority is lost found none -- every role in
+`ManagedExecutionState` is produced only by an E4 classifier/composition/
+resolution function.
+
+*Initial external FormulaSpec remains impossible regardless of sink:*
+independently probed -- a `pd.DataFrame` cell holding a programmatically
+constructed `LookupFormulaSpec` object, passed directly to `establish_
+initial_state` (i.e. before any sink is even known), correctly raises
+`OrdinaryStructureAdmissionError`; no "capable sink" consideration is
+reachable from `establish_initial_state` at all, since it runs before
+`out.kind` is consulted anywhere in the macro.
+
+*`run_pipeline` exclusion:* `git diff 987ed27..9ecc447 -- pipeline/
+execution.py` is empty (0 lines). `managed_pipeline._run_one` calls
+`run_pipeline(frames, (step,))`, i.e. calls it, not modifies it. A direct
+`run_pipeline(...)` caller bypassing `orchestrate` still receives no
+automatic ingress or re-establishment -- there is no code path from
+`pipeline/execution.py` back into `execution_state` or `managed_pipeline`.
+
+*Architecture guard quality:* the rewritten `tests/architecture/test_
+execution_state_not_wired.py` now positively proves the new contract
+(`managed_pipeline` imports `execution_state`; `orchestrator.py` does not
+import it directly and does not import `pipeline.execution`) in addition to
+the negative boundary on `runner.py`/`execution.py`/`build.py`/
+`registry.py`. Its `_imports_execution_state` AST helper matches both
+`node.module == "pipeline.execution_state"` (the exact form
+`managed_pipeline.py`'s real `from ..pipeline.execution_state import (...)`
+produces, since `ast.ImportFrom.module` omits leading dots for relative
+imports) and dotted-suffix/absolute forms -- independently verified against
+the actual import statement in `managed_pipeline.py`, not just read as
+plausible. *Verdict: SOUND, proves the actual boundary rather than a
+string-spelling accident.*
+
+*Schema-maintenance path:* covered in section 6 (case E). The private
+`_schema_maintenance_private` step is a raw closure, never certified
+regardless of being fixed/prebound; a blocked schema-maintenance operation
+raises *during* step execution (inside `run`), before `admit_ordinary_
+frames` is reached, so it blocks save through ordinary exception
+propagation, not through the fallback's re-admission check -- independently
+traced from `_build_private_step`'s source, a distinction the implementation
+evidence does not spell out but does not misstate either.
+
+*Policy stability:* no configurable/narrowing ingress-grammar policy exists
+in current production code (confirmed: `admit_ordinary_frames`, `admit_
+metadata_substrate`, and every E4 classifier take no policy/config
+parameter beyond the candidate itself), so there is nothing for a payload
+step to narrow. This review does not invent a policy system as a
+requirement, per the task's own instruction.
+
+== 14. Release-note accuracy
+
+The new `docs/release_notes/release_notes.adoc` entry (under the active
+`== unknown -- planned` section, correctly above the frozen `0.2.1
+(released)` heading) claims: E1-E4 now enforced end-to-end at the one macro
+seam; initial ordinary admission now rejects before any configured step;
+uncertified returns are conservatively re-established; `GroupedMatrix`/
+`LookupFormulaSpec` roles require `xlsx`/`ods`; the manifest role requires
+whole-frame cleanup removal (not an "or capable adapter" alternative --
+correctly omitted, matching section 11/12's finding that no such adapter is
+router-reachable); `run_pipeline` is unchanged and unwired. Every claim
+independently verified true in this review, including the ones the
+implementation evidence could have overstated (the manifest-exit clause
+does not claim a capable-adapter exit exists). *Verdict: SOUND, no material
+overstatement.*
+
+== 15. Maintained-flow closure table
+
+Evidence column marks whether the row is proven by a *committed* test, an
+*independent review probe* (this review, reproduced above, not committed),
+or both.
+
+[cols="3,2,2,2,2,3",options="header"]
+|===
+|Flow |Initial ingress |Certified transitions |Final exit |Result |Evidence
+
+|Ordinary pipeline (six backend families)
+|ordinary
+|fallback as needed
+|ordinary sink
+|CLOSES
+|committed test
+
+|FormulaHelper standalone -> XLSX/ODS
+|ordinary
+|formula role
+|capable adapter
+|CLOSES
+|committed test (standalone-sink-reject variant) + review probe (positive path)
+
+|FormulaHelper -> Grouped retain -> XLSX/ODS
+|ordinary
+|nested (retain)
+|projection/adapter
+|CLOSES
+|review probe (not committed)
+
+|FormulaHelper -> Grouped drop -> XLSX/ODS
+|ordinary
+|nested + cleanup
+|projection/adapter
+|CLOSES
+|committed test
+
+|Nested expand retain (both forward modes)
+|ordinary
+|exact reverse
+|later state / xlsx
+|CLOSES
+|review probe (not committed)
+
+|Nested expand drop (both forward modes)
+|ordinary
+|relocate/derive + cleanup
+|later state / xlsx
+|CLOSES
+|review probe (not committed)
+
+|Ordinary GroupedMatrix (retain, drop)
+|ordinary
+|grouped role
+|exact exit/unsupported
+|CLOSES
+|review probe (not committed)
+
+|Two independent grouped introductions
+|ordinary
+|disjoint locality proof
+|both authorized
+|CLOSES
+|review probe (not committed)
+
+|Multiple helper roles (one certificate, 2 fields, 1 composed)
+|ordinary
+|retained + nested
+|both gated correctly
+|CLOSES
+|review probe (not committed)
+
+|Referenced lookup-sheet rename
+|ordinary
+|nested
+|rejects before renderer
+|CLOSES
+|review probe (not committed)
+
+|Artifact manifest cleanup exit
+|ordinary
+|M1 role
+|cleanup terminate
+|CLOSES
+|committed test
+
+|Artifact manifest exact-adapter exit
+|ordinary
+|M1
+|not router-reachable (n/a)
+|N/A -- no accepted router adapter exists yet
+|source-proven (section 11/12)
+
+|Plugin valid ordinary
+|ordinary
+|uncertified
+|re-establish
+|CLOSES
+|committed test
+
+|Plugin invalid controlled
+|ordinary
+|uncertified
+|reject
+|CLOSES
+|committed test
+
+|Schema maintenance
+|ordinary
+|uncertified
+|re-establish / reject
+|CLOSES
+|committed test (valid side); source-traced (blocked side)
+|===
+
+== 16. Validation
+
+Focused E5 suites (`tests/unit/domain/ingress/`, `tests/architecture/
+test_execution_state_not_wired.py`, `tests/integration/pipeline/test_
+trusted_ingress_e5_managed_lifecycle.py`): *209 passed.* Broader relevant
+suites (`tests/unit/pipeline/execution_state/`, `tests/architecture/`,
+`tests/integration/pipeline/`, `tests/integration/schema_maintenance/`,
+`tests/integration/io_backends/`, `tests/unit/application/`): *476 passed.*
+`make test`: *2727 passed, 1 deselected* -- matches the implementation
+author's claimed result exactly. `ruff check` on every changed source/test
+file: all pass. `make source-style-guards`: *0 errors, 82 warnings, 2
+allowlisted findings* -- matches exactly. `asciidoctor --failure-level=ERROR`
+on the FTR and on `release_notes.adoc`: both pass. `git diff --check
+987ed27..9ecc447`: passes. Additional independent review probes (not
+committed, not part of `make test`): documented inline in sections 6-13
+above, all executed against the real installed package via `.venv/bin/
+python`, all outcomes as described.
+
+== 17. Findings
+
+*F1 (MINOR -- test-strategy coverage gap, independently closed by this
+review).* FTR section 23's Test Strategy explicitly names "both grouped
+production paths and their inverse/render consumers", "nested grouped
+expansion with both drop modes", "two independent grouped outputs",
+"forward/reverse state before and after final cleanup", "multiple helper
+roles", and "referenced lookup-sheet rename rejection" as required E5 test
+strategy. None of these appear in the committed `test_trusted_ingress_e5_
+managed_lifecycle.py` (only the forward `drop_source=True` composition and
+its unsupported-sink rejection are committed). This review independently
+reproduced all of the missing scenarios (sections 9-11) and found the
+underlying mechanism correct in every case, so there is no contract-
+soundness impact today -- but nothing in the committed suite would catch a
+regression in the highest-attention area of this slice (FormulaSpec
+projection/reverse-expand). *Recommendation:* port this review's
+reproduction probes (or equivalent) into the committed integration suite
+as a fast-follow, ideally before or alongside E6.
+
+*F2 (MINOR -- documented, intentional bound, not a soundness defect).*
+`ManagedExecutionState.last_formula_certificate` retains only the most
+recently certified `FormulaHelperCertificate`. A grouped-producer step
+whose `relation` names an earlier, still-live (non-latest) formula
+certificate cannot be recognized as the accepted nested composition; the
+run fails closed (hard rejection via footprint collision + uncertified
+re-admission), never mis-authorizes. No accepted maintained flow located in
+the FTR or Review 005 requires composing with a non-latest certificate --
+every "multiple roles" reference found is the single-certificate,
+multiple-field case (F1), which *is* correctly handled. Documented
+in-source (`ManagedExecutionState`'s own docstring cites the excluded
+general-registry alternative). *Recommendation:* none required; worth a
+one-line addition to the docstring or FTR compatibility notes making the
+fail-closed behavior explicit for future maintainers, since it is currently
+only discoverable by reading the fallback path's interaction with
+`_footprint_collides`.
+
+*F3 (MINOR -- traceability/future-drift risk).* `_authorize_role_for_sink`
+reimplements the authorization decisions of E4's `consume_formula_at_
+capable_adapter`, `relocate_nested_formula_at_projection`, `terminate_
+grouped_matrix_at_projection`, and `consume_manifest_at_sink` inline rather
+than calling them; none of the four is imported by `managed_pipeline.py`.
+This review independently proved the inline decisions are semantically
+identical to what the four functions would produce for every case reachable
+in the current macro (section 11), so there is no present correctness gap.
+The risk is prospective: a future change to any of those four functions'
+semantics (e.g. a new manifest adapter making `MANIFEST_ADAPTER_SINK_KIND`
+reachable, or a locality refinement to `consume_formula_at_capable_
+adapter`) would not automatically propagate to `managed_pipeline`'s
+separate inline copy, and nothing currently pins the two to stay in sync.
+*Recommendation:* consider having `_authorize_role_for_sink` call the four
+E4 functions directly (even though today's decision is identical) the next
+time either module is touched, so one representation stays authoritative.
+
+No Blocking or Important findings. No E1-E4 defect was found or reopened.
+
+== 18. Lifecycle cleanup check
+
+This is a slice-level acceptance within a still-open FTR (E6-E7 remain
+unstarted; the Phase-E Payload-Conformance Milestone is not yet reached),
+not a final green verdict for the FTR workstream, so per `docs/ai_info/
+review_instructions.adoc` this section is brief: FTR status does not change
+to `Done`/`Superseded`; nothing moves to `docs/cold_storage/backlog/ftrs_
+done/`; `docs/backlog/_ftrs_open.adoc` is unchanged. No follow-up FTR is
+needed for finding F1's residual test-coverage work -- it is bounded,
+in-slice hardening, not new scope, and belongs as a fast-follow commit
+against this same FTR ID. Lifecycle curation (advancing the FTR's own
+internal slice marker from E5 to E6) is explicitly out of scope for this
+review, per the task's own instruction, and is left for a separate, minimal
+curation commit.
+
+== 19. Verdict
+
+*A. ACCEPTED.*
+
+0 Blocking, 0 Important, 3 Minor findings (F1-F3, all either closed by this
+review's own independent reproduction or documented, intentional, fail-
+closed bounds with no soundness impact). Every accepted maintained E5 flow
+this review could reconstruct from FTR/Review-005 authority independently
+closes. Minor findings coexist with acceptance per repository convention.
+
+E1-E4 remain independently accepted.
+
+E5 is independently *ACCEPTED*.
+
+E6-E7 remain unstarted.
+
+No lifecycle curation was performed in this review.
+
+PHASE-E E5 FRAMEWORK-MANAGED MACRO WIRING
+INDEPENDENTLY ACCEPTED --
+READY FOR MINIMAL LIFECYCLE CURATION BEFORE E6.
