@@ -622,3 +622,368 @@ requires a fresh independent review pass before any lifecycle status change.
 PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
 AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
 E5 REMAINS BLOCKED.
+
+== 16. Bounded finding-disposition review (correction pass)
+
+*Review date:* 2026-08-15 (same-context follow-up).
+
+*Reviewed correction commits:* `c0db7cb` (bind certificates to executable
+steps), `80d2fee` (correct transition locations/footprints), `5cf8017`
+(complete diagnostic/manifest exits), `0de8b2b` (record corrections).
+Range `af2dcc2..0de8b2b`. Scope confirmed by `git diff --stat`: only
+`pipeline/types.py`, `pipeline/steps.py`, `pipeline/build.py`,
+`pipeline/execution_state/*`, `domain/validations/reference_validations.py`,
+FTR/release-note docs, and the corresponding test files changed -- no
+orchestrator/runner/execution/registry file, no lifecycle-status file. This
+section only re-tests the six original findings; it does not repeat the full
+E4 census.
+
+=== 16.1 F1 -- exact-bound certification
+
+Both original counterexamples were re-reproduced against corrected HEAD and
+now behave correctly: (A) a forged `BoundStep` with no `binding` token is
+`Uncertified(reason="unauthenticated_binding")`, and its unrelated `fn`
+correctly remains disconnected from any certificate. (B) A real
+registry-built values-mode step: `step.config["helper_value_mode"] =
+"formula"` now raises `TypeError` (`step.config` is `MappingProxyType`);
+classification stays `Uncertified` and execution stays values-mode
+throughout. The nested-mutation invariant was independently re-verified with
+a fresh fixture (different from the shipped test): mutating
+`step.config["helpers"]["fields"]` in place changes both the exposed config
+and actual execution consistently, and an earlier-returned certificate stays
+immutable.
+
+*However, the CRITICAL correction-induced falsification the original review
+specified was run and succeeds:*
+
+[source,python]
+----
+from spreadsheet_handling.pipeline.types import BoundStep, _TRUSTED_BINDING
+forged = BoundStep(
+    name="forged",
+    config={  # byte-for-byte certifiable FormulaHelper config
+        "target": FORMULA_HELPER_TARGET, "source": "orders", "lookup": "products",
+        "output": "orders", "key": "product_id",
+        "helpers": {"fields": ["value"]}, "missing": "empty",
+        "helper_value_mode": "formula",
+    },
+    fn=lambda frames: {**frames, "PWNED": pd.DataFrame({"x": [1]})},
+    binding=_TRUSTED_BINDING,   # imported, not constructed
+)
+is_trusted_binding(forged)              # -> True
+classify_formula_helper_step(forged)    # -> FormulaHelperCertificate(...)
+forged(frames)                          # -> {'orders': ..., 'products': ..., 'PWNED': ...}
+----
+
+`_TRUSTED_BINDING` (`pipeline/types.py`) is a module-level singleton, and
+`is_trusted_binding` (`bound_configuration.py:57-66`) checks only `step.binding
+is _TRUSTED_BINDING` -- object identity against a value any importer can
+obtain with `from spreadsheet_handling.pipeline.types import
+_TRUSTED_BINDING`. The docstring's claim that "`_TrustedBinding` is never
+instantiated outside `pipeline/steps.py`" is literally true and irrelevant:
+forgery requires importing the existing instance, not constructing a new one.
+Repeated against `classify_artifact_manifest_step` with an unrelated `fn`
+that writes no manifest file at all -- same result
+(`ArtifactManifestCertificate(output='generated_artifacts',
+writes_manifest_file=False)`), confirming the bypass is shared by all four
+classifiers (they all call the same `is_trusted_binding`).
+
+The correction's own test suite and FTR section 41.1 evidence never attempt
+this probe -- both only re-exercise the two *original* counterexamples. The
+new claim in FTR section 40.3 ("Binding authenticity... is necessary")
+describes the intended mechanism accurately as *written*, but the mechanism
+itself does not deliver unforgeable authenticity, so declaring F1 resolved
+on that evidence would be accepting a description of intended behavior over
+demonstrated behavior -- exactly what this bounded review was told not to do.
+
+*E4-REVIEW-F1: NOT RESOLVED.* The TOCTOU/mutation vector (original
+Counterexample B) is genuinely closed; the forgery vector (original
+Counterexample A, generalized) is not -- it changed shape from "no token
+needed" to "the public token is importable and reusable," which is the same
+underlying defect (certification provable by possessing a caller-copyable
+marker, not by proof of exact bound executable behavior).
+
+*Smallest bounded correction:* an object identity check against a public
+module attribute cannot be an authenticity proof in Python. Options include
+(a) a per-process-random or per-binder-call unique sentinel never exposed as
+a module-level importable name (e.g. a closure-local object created fresh
+inside each `make_*_step` call and never assigned to a public/importable
+name), or (b) deriving certification from structural proof that `fn` is
+`_resolve_target(config["target"])`'s actual return value (comparing
+`fn.__module__`/`fn.__qualname__`/`id(fn)` against a fresh resolution of the
+registry target), which ties authenticity to the callable itself rather than
+to possession of a marker.
+
+=== 16.2 F2 -- exact render-cell locations at projection
+
+`relocate_nested_formula_at_projection` now requires the live `GroupedMatrix`
+and returns `ProjectedFormulaLocation(role, cells)`, where `cells` is
+computed by `locate_nested_formula_cells` from the real `DynamicColumn`
+positions crossed with every physical data row. `role.column` is now
+explicit provenance-only documentation, not a claimed address.
+
+Independently re-derived (a *different* fixture from the shipped test: 4
+rows x 2 dynamic columns, not the shipped 3x3) by running the real
+`enrich_lookup` -> `contract_grouped_xref` -> `grouped_matrix_to_exact_table`
+chain and comparing every `LookupFormulaSpec` instance's actual `(row, col)`
+position in `ExactTable.data` against `locate_nested_formula_cells(matrix)`:
+both directions matched exactly (8 of 8 cells, row-key column correctly
+excluded). `consume_formula_at_capable_adapter` correctly gates on
+`FORMULA_CAPABLE_SINK_KINDS = {"xlsx", "ods"}`; `json`/`csv`/`bogus` sink
+kinds independently confirmed `Uncertified`.
+
+On the adapter-consume question the review specified (does discarding
+`location.cells` in the CONSUME_TERMINATE return value lose the exact
+locations?): the input `ProjectedFormulaLocation` -- the exact transition
+precondition -- remains available to whatever caller invoked
+`consume_formula_at_capable_adapter`; nothing is mutated or destroyed. This
+matches disposition (A) from the original review brief: semantically
+sufficient, not incomplete. `_exact_grouped_table_block`
+(`layout_composer.py:281`) independently confirmed to copy `ExactTable.data`
+into `TableBlock.data` in the same row-major order with no reordering, so
+the `(row, col)` coordinate the certificate declares does carry forward
+unambiguously into the render-plan structures the docstring claims it does.
+
+*E4-REVIEW-F2: RESOLVED.*
+
+=== 16.3 F3 -- disjoint-locality footprint completeness
+
+`GroupedProducerCertificate` and `ExpandGroupedCertificate` now carry
+`source_frame` (required for both `contract_grouped_xref` and
+`reconstruct_grouped_matrix`) and `base_relation` (optional, for
+`expand_grouped_xref`) in `footprint().reads`. `dense_axes` presence now
+forces `Uncertified(reason="uncovered_configuration", detail="dense_axes")`
+rather than under-declaring a further frame dependency it cannot safely
+parse. Independently confirmed this conservative rejection has no maintained
+E4 flow depending on it: `dense_axes` appears only in plain-XRef and
+compact-multiaxis tests unrelated to any of the required grouped/formula
+flows.
+
+Independently re-ran the original locality falsification against corrected
+HEAD: an existing role at frame `A`, a second certificate with
+`relation="B_rel"`/`output="B_out"` (both disjoint from `A`) but
+`source_frame="A"` now produces `footprint().reads == {"A", "B_rel"}` and
+`disjoint_grouped_introduction(...)` correctly returns
+`Uncertified(reason="locality_collision", detail="A")`. Sanity matrix also
+re-confirmed: fully disjoint second introduction still preserves the
+existing role; a `relation` collision on `A` is rejected;
+`ExpandGroupedCertificate(matrix="A", drop_source=True)`'s footprint
+correctly declares `drops={"A"}`.
+
+*E4-REVIEW-F3: RESOLVED.*
+
+=== 16.4 I1 -- unconditional R1 Scalar projection
+
+`_safe_row_index` now classifies any non-tuple `row_index` through
+`scalar_category` and substitutes the existing safe `"<unsupported row
+index>"` placeholder on failure, rather than passing an unrecognized carrier
+through raw. Independently re-run for both `validate_references` and
+`validate_graph` with three cases each (default integer index, `MultiIndex`,
+and a hostile object with `__str__`/`__repr__` that raise): all six
+combinations produced the correct Scalar-typed cell
+(`int`/`str`/`"<unsupported row index>"` respectively) with zero hostile
+exceptions raised, confirming no `str()`/`repr()` call reaches the hostile
+object. The release note no longer implies a reversible codec ("the label is
+a diagnostic projection, not a reversible codec").
+
+*E4-REVIEW-I1: RESOLVED.*
+
+=== 16.5 I2 -- manifest exit representation
+
+`consume_manifest_at_sink(certificate, role, *, sink_kind)` was added,
+gated on `MANIFEST_ADAPTER_SINK_KIND` and `certificate.writes_manifest_file`
+(independently confirmed this predicate matches
+`write_artifact_manifest`'s own real gate at
+`domain/artifact_manifest.py:96`, `manifest_path is not None and out_dir is
+not None`, exactly). Whole-frame cleanup termination remains generically
+covered by `terminate_roles_removed_by_cleanup`. Unsupported sink kinds
+correctly return `Uncertified`. The malformed-path distinction the review
+asked about resolves cleanly: `_safe_target_path` raises before
+`write_artifact_manifest` returns any Frames at all, so that is "transition
+fails before post-state publication," not a falsely-authorized consume --
+not a defect.
+
+*However, the review's specified mismatch probe was run and reveals a real
+gap:*
+
+[source,python]
+----
+cert_A = ArtifactManifestCertificate(output="A", writes_manifest_file=True)
+role_B = ArtifactManifestSourceFramesRole(frame="B")   # unrelated role
+consume_manifest_at_sink(cert_A, role_B, sink_kind=MANIFEST_ADAPTER_SINK_KIND)
+# -> ArtifactManifestSourceFramesRole(frame='B', effect=CONSUME_TERMINATE)
+----
+
+`consume_manifest_at_sink` never checks `role.frame == certificate.output`;
+it authorizes termination of whatever `role` object is passed, using an
+unrelated certificate's `writes_manifest_file` flag as if it justified that
+role's consumption. This is inconsistent with the correspondence checks the
+same package applies everywhere else two role/certificate objects are
+combined (e.g. `resolve_formula_expand_transition` checks `nested.frame !=
+certificate.matrix` before proceeding; F2's `ProjectedFormulaLocation`
+structurally bundles `role` and `cells` from one call so this class of
+mismatch cannot arise at all). No shipped test constructs a
+non-matching pair -- every test derives `role = artifact_manifest_role(certificate)`
+from the same certificate immediately before calling
+`consume_manifest_at_sink`, so the gap was never exercised.
+
+*E4-REVIEW-I2: NOT RESOLVED* (residual manifestation of the original
+finding: the introduction, cleanup, and reject-at-unsupported-sink paths are
+correct and complete; the new consume/exit transition itself does not
+verify it is consuming the role introduced by its own certificate).
+
+*Smallest bounded correction:* add `if role.frame != certificate.output:
+return Uncertified(reason="mismatched_composition", detail="output")` before
+authorizing consumption.
+
+=== 16.6 M1 -- evidence miscount
+
+FTR section 40.3 now says "five" reviewed dotted paths (independently
+recounted: `FORMULA_HELPER_TARGET`, `CONTRACT_GROUPED_XREF_TARGET`,
+`RECONSTRUCT_GROUPED_MATRIX_TARGET`, `EXPAND_GROUPED_XREF_TARGET`,
+`WRITE_ARTIFACT_MANIFEST_TARGET` -- five, matches). The false "callable
+identity is necessary but never sufficient" sentence was replaced with a
+description of `is_trusted_binding`. Per section 16.1 above, that replacement
+description is not itself false as written (it accurately describes what the
+code does and why), but presenting it as evidence that authenticity is
+achieved would be premature given F1's demonstrated bypass -- this review
+does not re-open M1 over that, since the sentence describes mechanism, not a
+resolved-security claim, but flags it for the next correction pass to update
+once F1's forgery vector is actually closed.
+
+*E4-REVIEW-M1: RESOLVED* (the specific miscount and the false
+callable-identity sentence are both corrected).
+
+=== 16.7 Source-style warning delta
+
+`make source-style-guards`: 0 errors, 83 warnings (was 82), 2 allowlisted
+findings -- independently reproduced exactly. The one new warning is
+`branch-complexity` on `classify_formula_helper_step` (complexity 13 >
+threshold 12), caused by the added `is_trusted_binding` early-return guard
+clause -- structurally identical in shape to the function's other early
+returns, no readability regression. *Disposition: (A) accepted
+review-trigger warning, no architectural/readability issue, not a finding.*
+
+=== 16.8 Correction-induced regression search
+
+No BoundStep-shape/compatibility regression found. `Dict[str, Any]` ->
+`Mapping[str, Any]` for `BoundStep.config`: no production code mutates
+`step.config` after construction (`grep` for `.config[`, `.config.update`,
+`.config.pop` outside `pipeline/steps.py`/`execution_state` returned
+nothing), so the `MappingProxyType` change is compatible. `pipeline/build.py`'s
+name-rebinding fallback now threads `tmp.binding` through instead of
+dropping it -- confirmed correct. One legitimate framework-owned `BoundStep`
+construction site exists outside `pipeline/steps.py`
+(`application/schema_maintenance.py:60`, a private step reusing the
+orchestrator's I/O flow); it does not pass `binding=_TRUSTED_BINDING` and its
+config never matches any E4-reviewed target string, so it now yields
+`Uncertified(reason="unauthenticated_binding")` instead of the pre-correction
+`Uncertified(reason="unrecognized_target")` -- same outcome (never
+certified before or after), only the reason code differs. *Not a
+regression.*
+
+=== 16.9 Independent validation
+
+[cols="3,7",options="header"]
+|===
+|Check |Independent result
+
+|Focused corrected suites (`execution_state/`, architecture guard, R1
+scalarization, finding_frame)
+|77 passed (59 + 3 + 5 + 10) -- matches correction author's "62 + 15"
+grouping exactly
+
+|Broader regression (reference/graph validation, `tests/unit/pipeline/`,
+formula/grouped/reconstruction, artifact manifest, XLSX/ODS FormulaSpec,
+workbook views, rendering, architecture)
+|669 passed
+
+|`make test`
+|*2689 passed, 1 deselected* -- matches correction author's claimed result
+exactly
+
+|`ruff check` on changed files
+|All checks passed
+
+|`make source-style-guards`
+|0 errors, 83 warnings (+1, disposed above), 2 allowlisted findings --
+matches claimed delta exactly
+
+|`asciidoctor --failure-level=ERROR` (FTR, release notes)
+|Both pass (exit 0)
+
+|`git diff --check af2dcc2..0de8b2b`
+|Passes (exit 0)
+|===
+
+=== 16.10 Disposition table
+
+[cols="2,2,6",options="header"]
+|===
+|Finding |Verdict |Independent evidence
+
+|E4-REVIEW-F1
+|*NOT RESOLVED*
+|TOCTOU/mutation vector closed (`MappingProxyType`); forgery vector open --
+importing the public `_TRUSTED_BINDING` singleton and passing it to a
+hand-built `BoundStep` with an unrelated `fn` still certifies (reproduced
+against both the formula-helper and artifact-manifest classifiers).
+
+|E4-REVIEW-F2
+|*RESOLVED*
+|Real projected `ExactTable` cell positions independently re-derived with a
+fresh fixture and matched exactly against `locate_nested_formula_cells` in
+both directions; adapter-kind gating and render-plan carry-forward confirmed.
+
+|E4-REVIEW-F3
+|*RESOLVED*
+|`source_frame`/`base_relation` added to declared footprints and
+independently confirmed against real `resolve_axis_mapping`/`expand_xref`
+reads; locality-collision, disjoint, and drop cases all re-verified;
+`dense_axes` conservative rejection confirmed not to regress any maintained
+flow.
+
+|E4-REVIEW-I1
+|*RESOLVED*
+|Unconditional Scalar projection independently re-verified for both
+`validate_references` and `validate_graph` across default/MultiIndex/hostile
+cases; release-note reversibility implication removed.
+
+|E4-REVIEW-I2
+|*NOT RESOLVED*
+|Introduction/cleanup/reject-at-unsupported-sink paths correct;
+`consume_manifest_at_sink` does not verify `role.frame == certificate.output`,
+reproduced with a certificate for frame A authorizing termination of an
+unrelated role at frame B.
+
+|E4-REVIEW-M1
+|*RESOLVED*
+|"Seven" corrected to "five"; false callable-identity claim replaced with an
+accurate (if not yet fully achieved) description of the intended mechanism.
+|===
+
+New correction-induced Blocking findings: *0* (F1's residual is the same
+finding under a changed mechanism, not a new one).
+New correction-induced Important findings: *0* (I2's residual is the same
+finding, narrowed to its consume transition).
+New correction-induced Minor findings: *0*.
+
+=== 16.11 Verdict
+
+*B. CHANGES REQUIRED.*
+
+F1 (Blocking) and I2 (Important) are not resolved. F2, F3, I1, and M1 are
+independently confirmed resolved. E4 is not independently accepted. E4
+remains the current slice; E5 remains blocked and unstarted; no E5 macro
+wiring or lifecycle curation was performed during this pass.
+
+Residual scope for the next correction: F1 requires an authenticity
+mechanism that does not depend on possessing a copyable module-level value
+(see the two options in section 16.1); I2 requires a one-line correspondence
+check in `consume_manifest_at_sink`. Neither implicates the accepted Review
+005 architecture -- both are, as with the original three Blocking findings,
+implementation defects in how that architecture was encoded.
+
+PHASE-E E4 EXACT PRODUCER-TRANSITION REPRESENTATION
+AND BOUNDED CERTIFICATES REQUIRES CORRECTION --
+E5 REMAINS BLOCKED.
