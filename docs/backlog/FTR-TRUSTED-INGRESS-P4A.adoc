@@ -5064,36 +5064,56 @@ certificate, so none was manufactured merely to demonstrate the mechanism.
 
 ===== 40.3 Uncertified default and exact-bound configuration strategy
 
+[NOTE]
+====
+*Corrected by the section 41 review-correction pass below* (Independent E4
+Implementation Review `af2dcc2`, findings F1 and M1). The paragraphs
+immediately following this note now describe the *corrected* implementation;
+the original claims of "seven reviewed dotted paths" and "callable identity
+is necessary but never sufficient" were false as originally written -- see
+section 41.2/41.7 for the correction record and why they were false.
+====
+
 Every classifier (`classify_formula_helper_step`,
 `classify_grouped_producer_step`, `classify_expand_grouped_step`,
 `classify_artifact_manifest_step`) returns the closed `Uncertified` value
-unless `BoundStep.config["target"]` matches exactly one of the seven reviewed
-dotted paths (the registry's own `target` strings for `add_lookup_helpers`,
-`contract_grouped_xref`, `reconstruct_grouped_matrix`, `expand_grouped_xref`,
-and `write_artifact_manifest`) *and* every configuration key is inside that
-classifier's declared closed vocabulary *and* every role-relevant value
-freezes into an exact closed-type scalar/string-tuple
-(`bound_configuration.snapshot_scalar` / `snapshot_string_sequence`, exact
-`type()` membership, never `isinstance`, mirroring the E1/E2
-actual-runtime-type discipline). A submodule-qualified target string (the
-label produced when a *callable* rather than the registry's string is bound)
-does not match and is UNCERTIFIED
-(`test_uncertified_default.py::test_representative_uncertified_forms_are_rejected[submodule_qualified_target]`)
--- E4 certifies the canonical registered invocation path only; callable
-identity is necessary but never sufficient.
+unless, first, `is_trusted_binding(step)` holds -- `step.binding is
+pipeline.types._TRUSTED_BINDING`, a sentinel only `pipeline/steps.py`'s
+trusted binder factories ever set, checked *before* any configuration
+inspection -- and, second, `BoundStep.config["target"]` matches exactly one
+of the *five* reviewed dotted paths (the registry's own `target` strings for
+`add_lookup_helpers`, `contract_grouped_xref`, `reconstruct_grouped_matrix`,
+`expand_grouped_xref`, and `write_artifact_manifest`) *and* every
+configuration key is inside that classifier's declared closed vocabulary
+*and* every role-relevant value freezes into an exact closed-type
+scalar/string-tuple (`bound_configuration.snapshot_scalar` /
+`snapshot_string_sequence`, exact `type()` membership, never `isinstance`,
+mirroring the E1/E2 actual-runtime-type discipline). A submodule-qualified
+target string (the label produced when a *callable* rather than the
+registry's string is bound) does not match and is UNCERTIFIED -- E4
+certifies the canonical registered invocation path only. Binding
+authenticity (not callable identity, and not config-label matching alone) is
+necessary; combined with exact configuration, both are required and neither
+is sufficient alone -- see section 41 for the full correction record.
 
-Mutation-after-bind handling: `pipeline.steps.make_frames_target_step`
-builds `BoundStep.config` as `{"target": ..., **dict(kwargs)}` -- a shallow
-copy, so a nested mutable value (e.g. a `list` under `helpers["fields"]`) is
-the *same object* the step's execution closure reads at call time.
-`test_bound_configuration_mutation_safety.py` proves both directions: (a)
-mutating that shared list in place after an earlier classification really
-does change what the next invocation of the same `BoundStep` executes, and a
-*fresh* classification honestly reflects it; (b) the value already returned
-by the earlier classification is an immutable snapshot (a `tuple[str, ...]`
-copy, not a reference) and is not retroactively corrupted by the later
-mutation. No classifier caches a "certified" flag against a `BoundStep`;
-every call re-reads `step.config` fresh.
+Mutation-after-bind handling: every `pipeline/steps.py` factory now exposes
+`BoundStep.config` as a read-only `MappingProxyType` view built from the same
+shallow-copied values its execution closure reads, so a top-level key
+reassignment on `config` (the exact vector that previously diverged the
+certificate from execution) now raises `TypeError` immediately instead of
+silently succeeding. A nested mutable value (e.g. a `list` under
+`helpers["fields"]`) remains mutable in place and is still the *same object*
+the execution closure reads, so mutating it still changes both the exposed
+config and actual execution identically -- a real, consistently-observed
+change, not a divergence. `test_bound_configuration_mutation_safety.py`
+proves both: (a) mutating that shared nested list in place after an earlier
+classification really does change what the next invocation of the same
+`BoundStep` executes, and a *fresh* classification honestly reflects it; (b)
+the value already returned by the earlier classification is an immutable
+snapshot (a `tuple[str, ...]` copy, not a reference) and is not
+retroactively corrupted by the later mutation, and top-level reassignment is
+no longer possible at all. No classifier caches a "certified" flag against a
+`BoundStep`; every call re-reads `step.config` fresh.
 
 ===== 40.4 FormulaSpec descriptor
 
@@ -5300,3 +5320,344 @@ No E5 macro wiring, no E6/E7 work, and no Trusted-Ingress documentation
 condensation were performed. This section records implementation evidence
 only; independent implementation review and any lifecycle status change
 happen separately.
+
+==== 41. E4 review-correction evidence
+
+*Reviewed:* Independent E4 Implementation Review, commit `af2dcc2`
+(`docs/backlog/FTR-TRUSTED-INGRESS-P4A_E4_implementation_review.adoc`,
+read-only; not modified). Verdict was *B. CHANGES REQUIRED* with three
+Blocking findings (F1, F2, F3), two Important findings (I1, I2), and one
+Minor finding (M1). The review found no architecture contradiction: every
+finding was an implementation defect in how the already-accepted Review 005
+contract was encoded. This section records the bounded correction pass;
+findings are marked *correction-author RESOLVED* only, not independently
+accepted.
+
+===== 41.1 F1 -- exact-bound certification tied to executable behavior
+
+*Reproduced first, exactly as the review specified.*
+
+Counterexample A (forged `BoundStep`): confirmed that a hand-constructed
+`BoundStep` with a byte-for-byte certifiable `add_lookup_helpers` config and
+an unrelated `fn` (`lambda frames: {**frames, "PWNED": ...}`) was certified
+by the pre-correction classifier.
+
+Counterexample B (TOCTOU): confirmed that a real `build_steps_from_config`
+step built with `helper_value_mode="values"` classified `Uncertified`,
+executed values-mode; after `step.config["helper_value_mode"] = "formula"`
+(a single top-level dict write), the classifier returned a
+`FormulaHelperCertificate` while the step still executed values-mode on the
+next call -- a genuine, silent config/execution divergence with no forgery.
+
+*Root cause* (independently re-derived from `pipeline/types.py`,
+`pipeline/steps.py`, `pipeline/build.py`, `pipeline/registry.py`):
+`make_frames_target_step` built `cfg = {"target": ..., **dict(kwargs)}` (a
+new, separate dict) but its closure captured the original `kwargs`, not
+`cfg` -- two different objects from the moment of binding. `BoundStep` had
+no field linking `config` to `fn` at all, so any `config`/`fn` pairing was
+constructible.
+
+*Chosen mechanism (combines both directions the task authorized):*
+
+. *Authenticity* -- `pipeline/types.py` adds a private `_TrustedBinding`
+  marker type and a shared `_TRUSTED_BINDING` instance, plus a new
+  `BoundStep.binding: object = None` field. Every `BoundStep`-constructing
+  factory in `pipeline/steps.py` (all eight: `make_plugin_step`,
+  `make_builder_target_step`, `make_frames_target_step`,
+  `make_identity_step`, `make_validate_step`, `make_apply_fks_step`,
+  `make_drop_helpers_step`, `make_check_fk_helpers_step`) now passes
+  `binding=_TRUSTED_BINDING`. `pipeline/build.py`'s name-rebinding fallback
+  path now carries `tmp.binding` through instead of dropping it. A `BoundStep`
+  built by calling the public constructor directly leaves `binding` at its
+  default of `None` and cannot present a matching token merely by
+  constructing a public-looking `config` dict -- `_TrustedBinding` is never
+  instantiated outside `pipeline/steps.py`.
+. *Immutable effective configuration* -- every factory now wraps its config
+  dict in `types.MappingProxyType` before returning it as `BoundStep.config`.
+  A top-level key reassignment (Counterexample B's exact vector) now raises
+  `TypeError` immediately instead of silently diverging from execution. A
+  nested mutable value (e.g. a `list` under `helpers["fields"]`) remains
+  mutable in place and still changes both the exposed config and the
+  executing closure identically (they were never independently copied), so
+  this is a real, consistently-observed change, not a divergence.
+
+`pipeline/execution_state/bound_configuration.py` adds
+`is_trusted_binding(step) -> bool`, checked *first*, before any
+configuration inspection, by all four classifiers
+(`classify_formula_helper_step`, `classify_grouped_producer_step`,
+`classify_expand_grouped_step`, `classify_artifact_manifest_step`). A new
+closed `Uncertified` reason, `"unauthenticated_binding"`, names this
+failure distinctly from `"unrecognized_target"`.
+
+*Post-fix results:*
+
+* Counterexample A: `classify_formula_helper_step(forged)` now returns
+  `Uncertified(reason="unauthenticated_binding")`
+  (`test_uncertified_default.py::test_forged_bound_step_with_certifiable_config_and_unrelated_fn_is_uncertified`).
+* Counterexample B: `step.config["helper_value_mode"] = "formula"` now
+  raises `TypeError`; the step remains `Uncertified` and continues executing
+  values-mode both before and after the attempted mutation
+  (`test_uncertified_default.py::test_post_bind_config_mutation_cannot_upgrade_execution_to_certified`).
+* Independent layering proof: a genuinely trusted-bound step
+  (`make_plugin_step`) whose config simply does not match any reviewed
+  target is `Uncertified(reason="unrecognized_target")`, not
+  `"unauthenticated_binding"` -- the two checks are independent, neither
+  alone sufficient
+  (`test_uncertified_default.py::test_trusted_binding_alone_without_matching_target_is_still_uncertified`).
+* Nested-mutation regression: the already-shipped
+  `test_bound_configuration_mutation_safety.py` scenario (mutating a shared
+  `helpers["fields"]` list in place) still passes unchanged -- config and
+  execution move together, honestly.
+* Full independent regression matrix (task section 25) verified: framework-
+  built exact supported invocation certifies and executes matching behavior
+  (`test_uncertified_default.py::test_known_callable_name_alone_does_not_certify_without_exact_configuration`
+  and the formula/grouped/expand/manifest "exact configuration" tests);
+  arbitrary manually constructed `BoundStep` is uncertified; framework-built
+  unsupported invocation is uncertified; nested mutation cannot diverge
+  certificate from execution; an already-returned certificate is immutable;
+  fresh classification reflects the true current configuration.
+
+*E4-REVIEW-F1: correction-author RESOLVED.*
+
+===== 41.2 F2 -- exact render-cell locations at projection
+
+*Reproduced first.* Independently re-read `grouped_matrix_to_exact_table`
+(`grouped_xref/matrix.py`): its output `ExactTable.data` is row-major
+positional tuples (`frame.values.tolist()`); no "column name" identity
+exists past that point. The pre-correction
+`relocate_nested_formula_at_projection(nested, render_frame)` returned
+`column=nested.source.column` -- the *pre-grouping* flat helper column name
+(e.g. `"value"`) -- as if it were a render-cell address, which it structurally
+cannot be.
+
+*Correction:* `projection.py` adds `ExactTableCellLocation` (a `(row,
+column)` position in a projected `ExactTable`'s data grid -- the only
+truthful coordinate at that point in the chain) and
+`locate_nested_formula_cells(matrix: GroupedMatrix)`, which derives every
+dynamic-column position from the same closed `RowKeyColumn`/`DynamicColumn`
+header dispatch `dynamic_column_labels` already used (already independently
+verified SOUND by the review), crossed with every physical data row -- not a
+reimplementation of grouped geometry, and not cell-value inspection.
+`relocate_nested_formula_at_projection` now takes the live `GroupedMatrix`
+being projected and returns a new `ProjectedFormulaLocation(role, cells)`:
+`role.column` is retained and documented as pre-grouping *provenance only*
+(per the review's own suggested correction shape), and `cells` names the
+real projected positions. No new `ControlledRole` kind was introduced --
+`ProjectedFormulaLocation` wraps the existing `LookupFormulaSpecRole`.
+
+*Real-projection correspondence proof*
+(`test_projection_transition.py::test_nested_formula_relocation_names_real_projected_exact_table_cells`
+and `test_locate_nested_formula_cells_matches_real_projection_directly`):
+built a real `GroupedMatrix[LookupFormulaSpec]` via
+`enrich_lookup` -> `contract_grouped_xref` with 3 data rows x 3 dynamic
+columns (9 cells), then independently computed the real `LookupFormulaSpec`
+positions by calling the actual `grouped_matrix_to_exact_table` and scanning
+its `data` for `isinstance(cell, LookupFormulaSpec)`. Asserted set equality
+in both directions between `locate_nested_formula_cells`'s declared
+positions and the real projected positions -- proving correspondence over
+multiple rows and multiple columns, not one column label.
+
+*Adapter-consume representation added* (per task section 12, discovered
+missing while correcting F2): `projection.FORMULA_CAPABLE_SINK_KINDS =
+frozenset({"xlsx", "ods"})` (matching `io_backends.router`'s own kind
+strings) and `consume_formula_at_capable_adapter(location, *, sink_kind)`,
+returning the role re-stated `CONSUME_TERMINATE` for a capable sink or
+`Uncertified(reason="uncovered_configuration", detail="sink_kind")`
+otherwise. Tested for both `"xlsx"`/`"ods"` (consume) and
+`"json"`/`"csv"`/`"yaml_dir"`/an unknown string (reject) in
+`test_projection_transition.py`.
+
+*E4-REVIEW-F2: correction-author RESOLVED.*
+
+===== 41.3 F3 -- complete frame-dependency audit for disjoint locality
+
+*Reproduced first, exactly as the review's construction.* Confirmed
+`GroupedProducerCertificate.footprint()` omitted `source_frame` even though
+it is a *required* parameter of `contract_grouped_xref`,
+`reconstruct_grouped_matrix`, and `expand_grouped_xref`, fed into
+`AxisMappingIntent(source_frame=source_frame, ...)` and genuinely read via
+`frames[intent.source_frame]` in `resolve_axis_mapping`
+(`xref_axis_mapping/resolver.py:150`). Independently reproduced the read
+dependency with a real `contract_grouped_xref` call against a `source_frame`
+missing the required row: raises `AxisMappingError`, proving the frame's
+*content* is read and validated, not merely accepted-but-inert
+(`test_grouped_matrix_transition.py::test_source_frame_is_a_real_load_bearing_read_dependency`).
+
+*Complete audit of every accepted config key that may name another frame*
+(task section 14), each independently traced against the real source:
+
+[cols="2,2,6",options="header"]
+|===
+|Transition |Key |Disposition
+
+|`contract_grouped_xref` / `reconstruct_grouped_matrix` / `expand_grouped_xref`
+|`source_frame`
+|Required; genuinely read (`resolve_axis_mapping`). *Added to `reads`.*
+
+|`expand_grouped_xref`
+|`base_relation`
+|Optional; when supplied, `expand_xref` calls `_require_frame(frames,
+base_relation)` (`xref_crosstable/operation.py`). *Added to `reads` when
+present.*
+
+|`contract_grouped_xref`
+|`dense_axes`
+|Optional nested mapping; `dense_axes.rows_from.frame` /
+`columns_from.frame` (`xref_crosstable/dense_axes.py`:
+`_axis_source_config`/`_row_identities_from_axis_source`) genuinely name and
+read a *further* frame. Safely declaring this footprint would require
+re-implementing family-owned dense-axis parsing. *Unrepresentable ->
+the classifier now returns `Uncertified(reason="uncovered_configuration",
+detail="dense_axes")` when `dense_axes is not None`* rather than
+under-declaring the footprint. None of the twelve maintained flows use
+`dense_axes` with the FormulaSpec/GroupedMatrix composition, so this does
+not narrow required E4 coverage.
+
+|all three
+|`column_keys`, `value_columns`, `label_columns`, `key_column`, `column_key`
+|Confirmed scalar/string-list selectors *within* the already-declared
+`relation`/`table`/`matrix`/`source_frame` frames, not separate frame
+references (`xref_crosstable/operation.py`: `_matrix_column_keys` etc.). No
+change.
+|===
+
+`GroupedProducerCertificate` and `ExpandGroupedCertificate` both gained a
+required `source_frame: str` field; `ExpandGroupedCertificate` also gained
+`base_relation: str | None`. Both `footprint()` methods now include them.
+
+*Post-fix collision proof, exactly reproducing the review's construction*
+(`test_grouped_matrix_transition.py::test_source_frame_collision_deliberately_rejects`):
+existing role at frame `"A"`; second certificate with `relation="B_rel"`,
+`output="B_out"` (both disjoint from `"A"`) but `source_frame="A"` --
+`disjoint_grouped_introduction` now returns
+`Uncertified(reason="locality_collision", detail="A")` instead of falsely
+claiming preservation. `base_relation` collision and presence are covered by
+`test_ordinary_grouped_expand_and_preserving_set.py::test_expand_footprint_includes_source_frame_and_base_relation_when_present`.
+The previously-passing disjoint and `drop_source` collision cases were
+re-verified unchanged.
+
+*E4-REVIEW-F3: correction-author RESOLVED.*
+
+===== 41.4 I1 -- unconditional Scalar-only row_index
+
+`reference_validations._safe_row_index` only special-cased `type(row_index)
+is tuple`; any other non-Scalar, non-tuple label (independently reproduced:
+a `pandas.Index` of a hostile-`__str__`/`__repr__` object instance) reached
+the finding DataFrame raw. Corrected to classify the *whole* non-tuple value
+through the existing `scalar_category` gate before preserving it, falling
+back to the existing `"<unsupported row index>"` placeholder otherwise; the
+already-sound tuple-component classification (`_safe_row_index_component`)
+is unchanged. No `str()`/`repr()` is ever invoked on an unclassified value.
+Two new regression tests reproduce the reviewer's exact scenario end-to-end
+through both maintained report producers -- a hashable object whose
+`__repr__`/`__str__` raise `AssertionError` if called, indexing a real
+`validate_references` and a real `validate_graph` input frame -- and assert
+the finding cell is the stable placeholder String, not the raw object
+(`test_reference_and_graph_row_index_scalarization.py::test_validate_references_replaces_a_hostile_nonscalar_nontuple_row_index`
+/ `test_validate_graph_replaces_a_hostile_nonscalar_nontuple_row_index`).
+Release note updated to describe the unconditional behavior (was previously
+worded as `MultiIndex`-only).
+
+*E4-REVIEW-I1: correction-author RESOLVED.*
+
+===== 41.5 I2 -- explicit M1 exit representation
+
+`artifact_manifest.py` represented only introduction. Added
+`ArtifactManifestCertificate.writes_manifest_file: bool` (true exactly when
+both `manifest_path` and `output_dir` are configured -- the same
+precondition `write_artifact_manifest` itself uses to decide whether to call
+its internal `_manifest_to_records`/`_write_manifest_file` adapter) and
+`consume_manifest_at_sink(certificate, role, *, sink_kind)`, returning
+`CONSUME_TERMINATE` only for `MANIFEST_ADAPTER_SINK_KIND` with
+`writes_manifest_file=True`, `Uncertified(reason="uncovered_configuration",
+detail="sink_kind")` otherwise (wrong sink kind, or the same invocation
+without both options configured). Whole-frame cleanup termination continues
+to reuse the existing generic `terminate_roles_removed_by_cleanup`, now with
+a dedicated regression test for the manifest role specifically. A runtime
+test confirms `writes_manifest_file=True` corresponds to the adapter
+actually writing a file to disk.
+
+*E4-REVIEW-I2: correction-author RESOLVED.*
+
+===== 41.6 M1 -- evidence miscount and false-claim correction
+
+FTR section 40.3 previously said classifiers accept "one of the seven
+reviewed dotted paths"; there are exactly five (`FORMULA_HELPER_TARGET`,
+`CONTRACT_GROUPED_XREF_TARGET`, `RECONSTRUCT_GROUPED_MATRIX_TARGET`,
+`EXPAND_GROUPED_XREF_TARGET`, `WRITE_ARTIFACT_MANIFEST_TARGET`). Corrected
+in place in section 40.3 above. The related false claim, "callable identity
+is necessary but never sufficient" (no callable identity check existed at
+all before this correction pass), is also corrected in place in section
+40.3: it now accurately describes binding-authenticity (`is_trusted_binding`)
+combined with exact configuration, which the section 41.1 correction makes
+true.
+
+*E4-REVIEW-M1: correction-author RESOLVED.*
+
+===== 41.7 Validation
+
+[cols="3,7",options="header"]
+|===
+|Check |Result
+
+|Focused execution_state + architecture guard suites
+|62 passed (`tests/unit/pipeline/execution_state/` (59, up from 42: +4 F1
+forged/TOCTOU/layering tests, +3 F3 source_frame/dense_axes tests, +1
+`base_relation` audit test, +6 M1 exit tests, +3 F2 real-projection/adapter
+tests), plus `tests/architecture/test_execution_state_not_wired.py` (3,
+unchanged))
+
+|R1 finding-frame suites
+|15 passed (`test_reference_and_graph_row_index_scalarization.py` (5, up
+from 3: +2 I1 hostile-non-tuple-row-index tests for both
+`validate_references` and `validate_graph`) + `test_finding_frame.py` (10,
+unchanged))
+
+|Broad regression sweep (`tests/unit/pipeline/`,
+`test_lookup_formula_mode.py`, `test_grouped_xref_composites.py`,
+`test_gx3b_reconstruction.py`, `test_artifact_manifest.py`,
+`tests/unit/domain/validations/`, `test_finding_frame.py`,
+`tests/unit/rendering/`, `tests/integration/pipeline/`,
+`tests/integration/io_backends/`, `tests/architecture/`)
+|912 passed, 0 failed
+
+|`make test`
+|2,689 passed, 1 deselected (`tests/integration/io_backends/ods/test_ods_libreoffice_interop.py`,
+pre-existing slow/external, consistent with current convention; +19 over the
+pre-correction 2,670, matching the net new focused tests: 17 in
+`execution_state` + 2 new I1 hostile-row-index tests)
+
+|`ruff check` on every changed/new source and test file
+|All checks passed
+
+|`make source-style-guards`
+|0 errors, 83 warnings (was 82), 2 allowlisted findings -- the one new
+warning is `branch-complexity` on `classify_formula_helper_step` (13 exceeds
+threshold 12), from adding the authenticity check as one more early-return
+guard clause; a review-trigger warning per repository convention, not an
+error, and splitting the function further would be a mechanical split
+against its own stated purpose (classify one invocation) per
+`docs/ai_info/conventions.adoc`
+
+|`asciidoctor --failure-level=ERROR` on this FTR and release notes
+|Both pass (exit 0)
+
+|`git diff --check`
+|Passed
+|===
+
+===== 41.8 Disposition
+
+    E4-REVIEW-F1 correction-author RESOLVED.
+    E4-REVIEW-F2 correction-author RESOLVED.
+    E4-REVIEW-F3 correction-author RESOLVED.
+    E4-REVIEW-I1 correction-author RESOLVED.
+    E4-REVIEW-I2 correction-author RESOLVED.
+    E4-REVIEW-M1 correction-author RESOLVED.
+
+All Blocking and Important findings from Independent E4 Implementation
+Review `af2dcc2` are correction-author resolved. E4 remains implemented but
+*not* independently accepted; this correction requires its own fresh
+independent review pass before any lifecycle status change. E5-E7 remain
+unstarted; no E5 macro wiring, no E6/E7 work, and no lifecycle curation were
+performed during this correction.
