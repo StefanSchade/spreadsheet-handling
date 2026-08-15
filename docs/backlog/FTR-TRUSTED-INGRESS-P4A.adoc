@@ -5066,17 +5066,20 @@ certificate, so none was manufactured merely to demonstrate the mechanism.
 
 [NOTE]
 ====
-*Corrected twice.* Section 41 (Independent E4 Implementation Review
+*Corrected three times.* Section 41 (Independent E4 Implementation Review
 `af2dcc2`, findings F1/M1) first replaced the original no-authenticity-check
 implementation with a `BoundStep.binding is _TRUSTED_BINDING` sentinel
 check. A second independent review (`ad700f0`, section 16.1) found that
-sentinel forgeable -- object-identity possession of an *importable*
-module-level value proves nothing about what a hand-built step's `fn`
-actually does -- and section 42 below replaces it with the structural
-mechanism described in the paragraphs immediately following this note,
-which is the *current* implementation. Section 41's own text is left
-unedited as a historical record of the first (superseded) correction; do
-not treat its `is_trusted_binding`/`_TRUSTED_BINDING` description as current.
+sentinel forgeable and section 42 replaced it with an unfrozen
+`BoundFramesTargetCall`/`resolve_trusted_call` mechanism. A third
+independent review (`01c2e93`, section 17.3) found *that* object itself
+freely mutable after certification (`call.target = ...`, `call.kwargs = ...`
+both silently succeeded on a genuinely framework-built, already-certified
+step), and section 43 below makes it a frozen, deep-immutable object -- the
+paragraphs immediately following this note describe that *current*
+implementation. Sections 41 and 42's own text is left unedited as a
+historical record of the first two (superseded) correction attempts; do not
+treat their mutability claims as current.
 ====
 
 Every classifier (`classify_formula_helper_step`,
@@ -5087,17 +5090,23 @@ non-``None`` `BoundFramesTargetCall` -- which requires `type(step.fn) is
 BoundFramesTargetCall` (exact type, never `isinstance`) *and* `step.fn
 .target is expected_target` (object identity against the actual imported
 reviewed callable, e.g. `enrich_lookup`, not a string label) -- and, second,
-that call's own `kwargs` (the exact mapping `BoundFramesTargetCall.__call__`
-passes to `target`, not a separately maintained config view) has every key
-inside the classifier's declared closed vocabulary *and* every role-relevant
-value freezes into an exact closed-type scalar/string-tuple
-(`bound_configuration.snapshot_scalar` / `snapshot_string_sequence`, exact
-`type()` membership, never `isinstance`, mirroring the E1/E2
-actual-runtime-type discipline). Because `BoundFramesTargetCall.__call__`
-mechanically executes `self.target(frames, **self.kwargs)`, a step passing
-the first check cannot execute anything other than `expected_target` called
-with the exact `kwargs` the classifier reads -- there is no remaining seam
-where a certificate could describe behavior other than what actually runs.
+that call's own `kwargs` (the exact deep-frozen mapping
+`BoundFramesTargetCall.__call__` thaws before passing to `target`, not a
+separately maintained config view) has every key inside the classifier's
+declared closed vocabulary *and* every role-relevant value freezes into an
+exact closed-type scalar/string-tuple (`bound_configuration.snapshot_scalar`
+/ `snapshot_string_sequence`, exact `type()` membership, never `isinstance`,
+mirroring the E1/E2 actual-runtime-type discipline). `BoundFramesTargetCall`
+is a frozen, slotted dataclass (`target`/`kwargs` reassignment both raise
+`FrozenInstanceError`) whose `kwargs` is deep-frozen at construction, so
+neither attribute can be swapped after certification and no nested
+dict/list value can be mutated through any reachable alias -- see section 43
+for the full correction record. Because `BoundFramesTargetCall.__call__`
+mechanically executes `self.target(frames, **thaw(self.kwargs))`, a step
+passing the first check cannot execute anything other than `expected_target`
+called with the exact configuration the classifier reads -- there is no
+remaining seam where a certificate could describe behavior other than what
+actually runs, now or after any later mutation attempt.
 Callable identity is necessary but not sufficient: `resolve_trusted_call`
 alone proves *which function* runs, not that its *configuration* matches a
 reviewed shape, which the subsequent option/value checks still establish
@@ -5705,6 +5714,16 @@ records the bounded correction of those two residuals only.
 
 ===== 42.1 F1 residual -- authenticity mechanism replaced
 
+[NOTE]
+====
+*Superseded.* The `BoundFramesTargetCall` this subsection describes was
+itself found freely mutable after construction by Independent Follow-up
+Review `01c2e93` (section 17.3) -- `target`/`kwargs` were ordinary
+reassignable attributes and `kwargs` was only shallow-frozen. Section 43
+makes the class frozen and deep-immutable. This subsection is left unedited
+as the historical record of the second correction attempt.
+====
+
 *Reproduced first, exactly as the review specified* (`_TRUSTED_BINDING` and
 `is_trusted_binding` no longer exist in this codebase at the point of
 reading this section; the probe below is reconstructed against pre-fix HEAD
@@ -5958,3 +5977,234 @@ accepted; this correction requires its own fresh independent review pass
 before any lifecycle status change. E5-E7 remain unstarted; no E5 macro
 wiring, no E6/E7 work, and no lifecycle curation were performed during this
 correction.
+
+==== 43. E4 root F1 correction -- deep-immutable bound calls (review `01c2e93`)
+
+*Reviewed:* Final bounded independent disposition pass, commit `01c2e93`
+(`docs/backlog/FTR-TRUSTED-INGRESS-P4A_E4_implementation_review.adoc`
+section 17, read-only; not modified). Disposition entering this pass: F1
+(Blocking) NOT RESOLVED for a third time, under a further-changed
+mechanism; F2/F3/I1/I2/M1 all independently confirmed RESOLVED and
+unchanged. This section records F1's root correction only; F2/F3/I1/I2/M1
+production code is untouched.
+
+===== 43.1 Reproduced first, exactly as the review specified
+
+Against a genuinely framework-built, already-certified `add_lookup_helpers`
+step (`build_steps_from_config`, not a hand-built object):
+
+[source,python]
+----
+cert = classify_formula_helper_step(step)      # -> FormulaHelperCertificate(...)
+step.fn.target = malicious                     # pre-fix: succeeded, no exception
+step(frames)                                    # pre-fix: -> {'orders': ..., 'PWNED': ...}
+# `cert`, issued before the reassignment, still read FormulaHelperCertificate(...)
+----
+
+and, separately, `step.fn.kwargs = {**dict(step.fn.kwargs), "helper_value_mode": "values"}`
+-- both succeeded pre-fix. Root cause confirmed exactly as the review
+stated: `BoundFramesTargetCall` was a plain object with ordinary
+(reassignable) `target`/`kwargs` attributes, and `kwargs` was only
+shallow-frozen (one top-level `MappingProxyType`), so a nested value (e.g. a
+`list` inside `helpers`) was still the same object a caller's held alias
+could mutate.
+
+===== 43.2 Root correction -- frozen, deep-immutable `BoundFramesTargetCall`
+
+`pipeline/types.py`'s `BoundFramesTargetCall` becomes
+`@dataclass(frozen=True, slots=True)`: ordinary attribute reassignment on
+either field now raises `dataclasses.FrozenInstanceError` -- real enforced
+immutability at the instance level, not a documented convention. This
+closes target/kwargs-reference reassignment (task matrix items E/F), but by
+itself does not close nested-container mutation through a still-shared
+list/dict, so the module also adds a paired freeze/thaw:
+
+* `_freeze_effective_value(value)` -- recursively rebuilds `dict` into a
+  `MappingProxyType` wrapping a *new* dict of recursively frozen values
+  (never the caller's own dict) and `list`/`tuple` into a *new* `tuple` of
+  recursively frozen values; any other value (an already-immutable scalar,
+  or a shape outside this closed vocabulary -- a DataFrame, a plugin's own
+  object, a callback) is returned by reference. `BoundFramesTargetCall.bind`
+  -- the sole construction path `make_frames_target_step` uses -- freezes
+  `kwargs` this way before storing it, so the stored snapshot shares no
+  mutable object with anything the caller still holds, closing nested
+  mutation through the *original* alias (task item H).
+* `_thaw_effective_value(value)` -- the deterministic inverse, materializing
+  fresh, invocation-local `dict`/`list` containers from the frozen snapshot.
+  `__call__` calls `target(frames, **thaw(self.kwargs))`: every invocation
+  gets ordinary mutable containers (preserving call-surface expectations
+  such as `isinstance(helpers, dict)` inside `enrich_lookup`'s own
+  `policy.py`), the stored snapshot itself is never mutated, and a later
+  invocation of the same call thaws fresh containers from the same
+  unchanged snapshot again.
+
+Bounded to E4-relevant semantics per task section 6: only `dict`/`list`/
+`tuple` are recursively frozen (the shapes the five reviewed targets'
+closed configuration vocabulary actually uses -- `helpers={"fields":
+[...]}`, `row_keys`, `label_columns`, etc.); any other value shape passes
+through unchanged, exactly as a generic binder used by ~30 non-E4-reviewed
+registered steps must (task section 7) -- and such a shape is never
+accepted by an E4 classifier's `snapshot_scalar`/`snapshot_string_sequence`
+regardless, so nothing E4-relevant needed protecting for it. No universal
+Python object freezer, no generic deep-copy of arbitrary graphs, no
+serialization format.
+
+*Why classifier and execution cannot diverge* (task section 11):
+`resolve_trusted_call` returns `step.fn` itself; every classifier reads
+configuration from `call.kwargs` directly. `__call__` reads that exact same
+`self.kwargs` object (via `thaw`, not a copy taken at a different time).
+There is one immutable snapshot, read by both; no second, independently
+maintained "classifier view" exists that could itself drift.
+
+`make_frames_target_step` now calls `BoundFramesTargetCall.bind(fn, kwargs)`
+and builds `BoundStep.config` from `call.kwargs` (the same frozen structure,
+plus the descriptive `"target"` label) rather than a separately constructed
+dict, so `step.config` and `step.fn.kwargs` remain the same data by
+construction, not merely by convention.
+
+One classifier-side fix was required: `formula_helper._classify_formula_fields`
+checked `type(helpers) is not dict`, but a dict-shaped `helpers` value now
+arrives frozen as `MappingProxyType`, not `dict`; the check now accepts
+either exact type.
+
+===== 43.3 Post-fix falsification -- the exact review reproduction, re-run
+
+[source,python]
+----
+step.fn.target = malicious      # -> dataclasses.FrozenInstanceError: cannot assign to field 'target'
+step.fn.kwargs = other_mapping  # -> dataclasses.FrozenInstanceError: cannot assign to field 'kwargs'
+----
+
+Both independently re-verified against a genuinely framework-built step
+(`test_target_reassignment_after_certification_is_impossible`,
+`test_kwargs_reassignment_after_certification_is_impossible`); execution
+after each attempted (and failed) reassignment still matches the
+already-issued certificate exactly.
+
+===== 43.4 Nested-alias falsification (task section 10)
+
+Built a formula step from `helpers={"fields": fields}` where `fields =
+["label_de"]` is a caller-held list; classified it successfully; then
+mutated the *original* aliases directly (`fields.append("code")`,
+`helpers["fields"] = ["other"]`, never touching the bound call itself).
+Required and confirmed: the already-bound call's executable semantics did
+not change (still produces exactly a `label_de` column, not `code`/`other`),
+and a fresh classification of the same (internally untouched) bound call
+still equals the original certificate
+(`test_original_caller_held_aliases_cannot_affect_an_already_bound_call`).
+Separately confirmed mutation is also impossible *through* the bound call's
+own exposed nested view: `step.fn.kwargs["helpers"]["fields"] = (...)` and
+`step.fn.kwargs["helpers"]["fields"].append(...)` both raise
+(`TypeError`/`AttributeError` respectively --
+`test_bound_calls_nested_configuration_view_is_immutable`). Repeated for a
+`GroupedProducerCertificate`'s `row_keys` sequence to prove this is not
+FormulaHelper-specific
+(`test_nested_sequence_configuration_is_also_deep_frozen_for_grouped_producer`).
+
+===== 43.5 Complete adversarial matrix (task section 17)
+
+[cols="1,6,2",options="header"]
+|===
+|# |Probe |Result
+
+|A |Plain forged lambda + certifiable description |UNCERTIFIED
+|B |`BoundFramesTargetCall` with unrelated target |UNCERTIFIED
+|C |Subclass overriding `__call__` |UNCERTIFIED
+|D |Genuine copied `BoundFramesTargetCall` |Certifies AND executes the reviewed behavior
+|E |Target reassignment after certification |`FrozenInstanceError` -- impossible
+|F |`kwargs`-reference reassignment after certification |`FrozenInstanceError` -- impossible
+|G |`kwargs` top-level item mutation |`TypeError` -- impossible (unchanged from prior pass)
+|H |Mutation through original nested list/dict aliases after bind |No effect on bound execution
+|I |Mutation through the bound call's own nested configuration view |`TypeError`/`AttributeError` -- impossible
+|J |Old certificate remains truthful for later execution of the same bound call |Confirmed in every test above
+|K |Legitimate formula step |Certifies and runs `LookupFormulaSpec` behavior
+|L |Values-mode step |UNCERTIFIED, runs plain values
+|M |Grouped (`contract_grouped_xref`/`reconstruct_grouped_matrix`/`expand_grouped_xref`) and manifest reviewed examples |Certify and run correctly (all five targets independently re-audited: target identity, immutable config, matching classifier snapshot, successful real execution)
+|===
+
+Items A-D and K/L were already covered by `test_uncertified_default.py`
+(re-verified passing, unchanged); E/F/G/I/J are new in
+`test_bound_configuration_mutation_safety.py`; H is new in the same file;
+M was independently re-audited by direct script for all five targets
+(`enrich_lookup`, `contract_grouped_xref`, `reconstruct_grouped_matrix`,
+`expand_grouped_xref`, `write_artifact_manifest`), each confirming
+`step.fn.target is <real callable>`, a fully frozen `kwargs` structure, and
+successful real execution. The generic binder's `None -> return original
+frames` semantics were independently re-verified unchanged
+(`BoundFramesTargetCall.bind(target, {})` where `target` returns `None`
+yields the identical input `frames` object back).
+
+===== 43.6 Compatibility audit
+
+Broad regression sweep (`tests/unit/pipeline/`, formula/grouped/
+reconstruction, artifact manifest, reference/graph validations,
+finding_frame, rendering, integration pipeline/io_backends, architecture,
+`tests/unit/application/`) -- which together exercise the large majority of
+the ~30 non-E4-reviewed steps also bound through `make_frames_target_step`
+(`validate_references`, `configure_workbook_view`, `expand_xref`,
+`join_frames`, `apply_derived_column_policy`, etc.) -- passed unchanged:
+*925 passed, 0 failed*, confirming the freeze/thaw round-trip is
+behavior-preserving generically, not only for the five E4-reviewed targets.
+`application/schema_maintenance.py`'s private `BoundStep` (built outside
+`pipeline/steps.py`) is unaffected. No E5 code was introduced.
+
+===== 43.7 Preserved findings -- regression confirmation
+
+No production code for F2, F3, I1, I2, or M1 was touched. Re-ran their
+focused suites unchanged and passing:
+`test_projection_transition.py` (8), `test_grouped_matrix_transition.py`
+(9), `test_ordinary_grouped_expand_and_preserving_set.py` (5),
+`test_reference_and_graph_row_index_scalarization.py` (5),
+`test_finding_frame.py` (10), `test_artifact_manifest_transition.py` (13,
+including the I2 correspondence checks), `test_schema_maintenance.py`.
+
+===== 43.8 Validation
+
+[cols="3,7",options="header"]
+|===
+|Check |Result
+
+|Focused execution_state + architecture guard + R1 + finding_frame suites
+|87 passed (`tests/unit/pipeline/execution_state/` 69 -- up from 65:
+`test_bound_configuration_mutation_safety.py` rewritten from 2 tests to 6 --
++ architecture guard 3 + R1 scalarization 5 + finding_frame 10)
+
+|Broad regression sweep
+|925 passed, 0 failed
+
+|`make test`
+|2,699 passed, 1 deselected (pre-existing LibreOffice interop; +4 over the
+prior 2,695, matching the net new focused tests)
+
+|`ruff check` on every changed/new source and test file
+|All checks passed
+
+|`make source-style-guards`
+|0 errors, 82 warnings, 2 allowlisted findings -- unchanged baseline
+
+|`asciidoctor --failure-level=ERROR` on this FTR
+|Passed (exit 0)
+
+|`git diff --check`
+|Passed
+|===
+
+===== 43.9 Disposition
+
+    E4-REVIEW-F1 correction-author RESOLVED.
+    E4-REVIEW-F2 remains RESOLVED (unchanged).
+    E4-REVIEW-F3 remains RESOLVED (unchanged).
+    E4-REVIEW-I1 remains RESOLVED (unchanged).
+    E4-REVIEW-I2 remains RESOLVED (unchanged).
+    E4-REVIEW-M1 remains RESOLVED (unchanged).
+
+F1 -- the sole open finding after three correction passes -- is
+correction-author resolved: the bound executable/configuration pair is now
+genuinely immutable after construction (frozen attributes, deep-frozen
+nested configuration), not merely wrapped in one shallow
+`MappingProxyType`. Every previously independently-resolved finding remains
+resolved with unchanged production code. E4 remains implemented but *not*
+independently accepted; this correction requires its own fresh independent
+review pass before any lifecycle status change. E5-E7 remain unstarted; no
+E5 macro wiring, no E6/E7 work, and no lifecycle curation were performed
+during this correction.
