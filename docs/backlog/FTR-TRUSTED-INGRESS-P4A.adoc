@@ -5066,20 +5066,24 @@ certificate, so none was manufactured merely to demonstrate the mechanism.
 
 [NOTE]
 ====
-*Corrected three times.* Section 41 (Independent E4 Implementation Review
+*Corrected four times.* Section 41 (Independent E4 Implementation Review
 `af2dcc2`, findings F1/M1) first replaced the original no-authenticity-check
 implementation with a `BoundStep.binding is _TRUSTED_BINDING` sentinel
 check. A second independent review (`ad700f0`, section 16.1) found that
 sentinel forgeable and section 42 replaced it with an unfrozen
 `BoundFramesTargetCall`/`resolve_trusted_call` mechanism. A third
 independent review (`01c2e93`, section 17.3) found *that* object itself
-freely mutable after certification (`call.target = ...`, `call.kwargs = ...`
-both silently succeeded on a genuinely framework-built, already-certified
-step), and section 43 below makes it a frozen, deep-immutable object -- the
-paragraphs immediately following this note describe that *current*
-implementation. Sections 41 and 42's own text is left unedited as a
-historical record of the first two (superseded) correction attempts; do not
-treat their mutability claims as current.
+freely mutable after certification, and section 43 made it a frozen,
+deep-immutable object -- but only through a separate `bind()` classmethod,
+leaving the public dataclass constructor as a second, unfrozen path. A
+fourth independent review (`9feb324`, section 18.4) found that residual
+bypass, and section 44 below moves the freeze into `__post_init__` itself
+and removes `bind()`, so there is exactly one construction path and it
+always freezes -- the paragraphs immediately following this note describe
+that *current* implementation. Sections 41-43's own text is left unedited
+as a historical record of the first three (superseded) correction attempts;
+do not treat their mutability or "only supported construction path" claims
+as current.
 ====
 
 Every classifier (`classify_formula_helper_step`,
@@ -5098,10 +5102,12 @@ exact closed-type scalar/string-tuple (`bound_configuration.snapshot_scalar`
 / `snapshot_string_sequence`, exact `type()` membership, never `isinstance`,
 mirroring the E1/E2 actual-runtime-type discipline). `BoundFramesTargetCall`
 is a frozen, slotted dataclass (`target`/`kwargs` reassignment both raise
-`FrozenInstanceError`) whose `kwargs` is deep-frozen at construction, so
-neither attribute can be swapped after certification and no nested
-dict/list value can be mutated through any reachable alias -- see section 43
-for the full correction record. Because `BoundFramesTargetCall.__call__`
+`FrozenInstanceError`) whose `kwargs` is unconditionally deep-frozen inside
+`__post_init__` -- the single construction path every accepted instance
+passes through, direct or otherwise -- so neither attribute can be swapped
+after certification and no nested dict/list value can be mutated through
+any reachable alias, regardless of how the instance was constructed -- see
+section 44 for the full correction record. Because `BoundFramesTargetCall.__call__`
 mechanically executes `self.target(frames, **thaw(self.kwargs))`, a step
 passing the first check cannot execute anything other than `expected_target`
 called with the exact configuration the classifier reads -- there is no
@@ -5988,6 +5994,18 @@ mechanism; F2/F3/I1/I2/M1 all independently confirmed RESOLVED and
 unchanged. This section records F1's root correction only; F2/F3/I1/I2/M1
 production code is untouched.
 
+[NOTE]
+====
+*Superseded.* This section's `.bind()`-based freezing was found to be a
+*second, unfrozen construction path* -- the public
+`BoundFramesTargetCall(target, kwargs)` constructor bypassed it entirely --
+by Independent Follow-up Review `9feb324` (section 18.4). Section 44 moves
+the invariant into `__post_init__` itself, removes `.bind()`, and makes it
+the *only* construction path. This section is left unedited as the
+historical record of the third correction attempt; do not treat its
+"the only supported construction path" claim about `.bind()` as current.
+====
+
 ===== 43.1 Reproduced first, exactly as the review specified
 
 Against a genuinely framework-built, already-certified `add_lookup_helpers`
@@ -6208,3 +6226,304 @@ independently accepted; this correction requires its own fresh independent
 review pass before any lifecycle status change. E5-E7 remain unstarted; no
 E5 macro wiring, no E6/E7 work, and no lifecycle curation were performed
 during this correction.
+
+==== 44. E4 F1 construction-invariant correction (review `9feb324`)
+
+*Reviewed:* Final bounded E4 acceptance disposition, commit `9feb324`
+(`docs/backlog/FTR-TRUSTED-INGRESS-P4A_E4_implementation_review.adoc`
+section 18, read-only; not modified). Disposition entering this pass: F1
+(Blocking) NOT RESOLVED for a fourth time -- the same underlying invariant,
+narrowed to one residual mechanism; F2/F3/I1/I2/M1 all independently
+confirmed RESOLVED and unchanged. This is not another counterexample patch:
+the task explicitly required placing the invariant at the one construction
+boundary every accepted instance passes through, so this section records a
+structural change to `BoundFramesTargetCall` itself, not another guarded
+attribute.
+
+===== 44.1 Reproduced first -- all three direct-constructor bypasses
+
+Against `BoundFramesTargetCall(enrich_lookup, kwargs)` constructed directly
+(bypassing the prior correction's `bind()` classmethod entirely, which
+`resolve_trusted_call` accepted identically either way):
+
+* *(A) plain mutable dict* -- `call = BoundFramesTargetCall(enrich_lookup,
+  mutable_kwargs)`; certify; `mutable_kwargs["helper_value_mode"] =
+  "values"`; pre-fix, execution flipped to values-mode while the earlier
+  certificate stayed unchanged.
+* *(B) nested caller alias* -- `helpers={"fields": fields}` passed to the
+  direct constructor; certify; `fields.append("code")`; pre-fix, execution
+  produced an extra `code` column the certificate never named.
+* *(C) `MappingProxyType` over a caller-owned live dict* -- `proxy =
+  MappingProxyType(underlying)`; `BoundFramesTargetCall(enrich_lookup,
+  proxy)`; certify; mutate `underlying` directly (not through the proxy);
+  pre-fix, execution flipped to values-mode while the certificate stayed
+  unchanged -- wrapping a still-live dict in a proxy does not freeze it.
+
+All three independently reproduced exactly as the review specified before
+this correction, using the exact review reproduction script structure.
+
+===== 44.2 Root correction -- the invariant moves into `__post_init__`
+
+*Chosen invariant* (task section 2): every normally constructed
+`BoundFramesTargetCall` that `resolve_trusted_call` can accept owns an
+immutable effective execution snapshot from the instant construction
+completes -- not merely the subset built through one particular classmethod.
+There is no longer a "safe constructor" (`bind()`) and an "unsafe
+constructor" (the public dataclass constructor): there is exactly one.
+
+* `BoundFramesTargetCall.bind()` is *removed*. `pipeline/steps.py`'s
+  `make_frames_target_step` now calls `BoundFramesTargetCall(fn, kwargs)`
+  directly -- the same constructor available to any other caller.
+* `BoundFramesTargetCall.__post_init__` unconditionally replaces whatever
+  `kwargs` value the constructor received with
+  `_freeze_effective_kwargs(self.kwargs)`'s canonical result, via
+  `object.__setattr__` (the same mechanism the frozen dataclass's own
+  generated `__init__` uses internally). No constructor argument, keyword
+  form, or code path skips this -- confirmed by
+  `test_construction_freezes_unconditionally_regardless_of_keyword_style`
+  (positional and keyword construction both produce a frozen
+  `MappingProxyType`).
+* `_freeze_effective_kwargs(kwargs)` is the one root-level canonicalization
+  boundary (task section 5): it accepts only an exact `dict` or exact
+  `MappingProxyType` -- anything else raises `TypeError` immediately (task
+  section 7's arbitrary-`Mapping` rule; verified: `repository-wide grep`
+  confirms every current `make_frames_target_step` caller supplies plain
+  `**kwargs`, so no maintained path is narrowed) -- then delegates to
+  `_freeze_effective_value`, which now treats `dict` *and* `MappingProxyType`
+  identically at every nesting depth (task section 6): both are read into a
+  **new**, disconnected dict before being re-wrapped in a **new**
+  `MappingProxyType`, so a `MappingProxyType` that happens to still be
+  backed by a live caller-owned dict is never trusted as "already frozen" --
+  its *current* contents are copied out from under that live backing at the
+  moment of construction. `list`/`tuple` continue to freeze into a new
+  `tuple` of recursively frozen values; every other leaf is returned by
+  reference (unchanged from the prior correction; see 44.6 for why this
+  remains sufficient).
+
+===== 44.3 Post-fix falsification -- the exact three bypasses, re-run
+
+All three re-verified closed (`test_bound_construction_invariant.py`):
+
+[source,python]
+----
+call = BoundFramesTargetCall(enrich_lookup, mutable_kwargs)
+type(call.kwargs)          # -> mappingproxy
+call.kwargs is mutable_kwargs   # -> False
+mutable_kwargs["helper_value_mode"] = "values"   # no effect
+step(frames)                # -> still real LookupFormulaSpec cells
+classify_formula_helper_step(step) == certificate   # -> True
+----
+
+(A) `test_a_direct_constructor_with_mutable_dict_is_disconnected_from_the_original`,
+(B) `test_b_direct_constructor_with_nested_caller_alias_is_disconnected`,
+(C) `test_c_mappingproxytype_over_a_caller_owned_live_dict_is_disconnected` --
+each certifies once, then mutates the original object the caller still
+holds, then re-executes and re-classifies, asserting both the executed
+behavior and the certificate are unaffected.
+
+===== 44.4 Mutation through the call's own view, and attribute reassignment
+
+Unchanged in spirit from the prior pass, re-verified against a *directly*
+constructed call (not only a binder-built one): `call.kwargs[...] = ...`
+and `call.kwargs["helpers"]["fields"] = ...` both raise `TypeError`
+(`test_d_mutation_through_the_directly_constructed_calls_own_view_is_rejected`);
+`call.target = ...` and `call.kwargs = ...` both raise
+`FrozenInstanceError`
+(`test_e_target_and_kwargs_reassignment_on_a_directly_constructed_call_is_impossible`).
+
+===== 44.5 Arbitrary-`Mapping` rejection
+
+A hand-written `collections.abc.Mapping` implementation (not `dict`, not
+`MappingProxyType`) passed to the constructor raises `TypeError` naming the
+two accepted exact types
+(`test_arbitrary_mapping_implementations_are_rejected_at_construction`).
+This closes the boundary itself: E4's authoritative configuration
+representation cannot be an open set of caller-suppliable `Mapping`
+implementations whose own `__getitem__`/`keys()` could do anything.
+
+===== 44.6 Normal-construction threat boundary (task section 8)
+
+Recorded explicitly, per the task's instruction to give the independent
+review a stable falsification boundary. *In scope* (and closed by this
+correction): direct `BoundFramesTargetCall(...)` construction (positional
+or keyword), `.bind()` if a caller still expects it (removed -- no longer
+exists), caller-held mutable aliases to anything passed in, ordinary
+attribute assignment, ordinary `dict`/`list` mutation, a `MappingProxyType`
+wrapping a caller-owned live dict, subclass construction (still rejected by
+`resolve_trusted_call`'s exact-type check, unaffected by this pass), and
+ordinary copying/reuse of an already-canonical instance (still safe --
+44.8). *Out of scope for E4* (not defended against, and not attempted):
+`object.__new__` bypassing `__init__`, deliberate `object.__setattr__`
+abuse of the frozen-dataclass protection, `function.__code__` patching,
+monkey-patching the imported reviewed callable itself, `ctypes`/memory
+manipulation, or interpreter compromise. E4 is an exact execution-contract
+mechanism inside the FTR's trusted-description precondition, not a Python
+sandbox; defending against a caller already willing to use those mechanisms
+is out of Phase-E's scope (task section 8, confirmed unchanged from the
+architecture's own stated trust model).
+
+===== 44.7 Role-relevant leaf audit (task section 14)
+
+Every field any of the four certificate types (`FormulaHelperCertificate`,
+`GroupedProducerCertificate`, `ExpandGroupedCertificate`,
+`ArtifactManifestCertificate`) actually extracts and uses for role
+identity, classified:
+
+[cols="3,4,3",options="header"]
+|===
+|Certificate |Role-relevant fields |Stored shape
+
+|`FormulaHelperCertificate`
+|`source`, `lookup`, `output`, `source_key_column`, `lookup_key_column`,
+`missing`
+|Immutable scalar (`str`)
+
+|
+|`fields`
+|Frozen `tuple[str, ...]` (via `snapshot_string_sequence` over the
+already-deep-frozen `helpers["fields"]`)
+
+|`GroupedProducerCertificate`
+|`producer`, `output`, `source`, `source_frame`, `value_column`
+|Immutable scalar (`str`/`None`)
+
+|
+|`drop_source`
+|Immutable scalar (`bool`)
+
+|
+|`row_keys`
+|Frozen `tuple[str, ...]`
+
+|`ExpandGroupedCertificate`
+|`matrix`, `output`, `output_value_column`, `source_frame`,
+`base_relation`
+|Immutable scalar (`str`/`None`)
+
+|
+|`drop_source`
+|Immutable scalar (`bool`)
+
+|`ArtifactManifestCertificate`
+|`output`
+|Immutable scalar (`str`)
+
+|
+|`writes_manifest_file`
+|Immutable scalar (`bool`, derived from two presence checks)
+|===
+
+Zero mutable-by-reference "other" values participate in any certificate.
+Every non-role-relevant kwarg (`key_column`, `label_columns`,
+`column_key`, `dense_axes`, etc. -- family-owned, never extracted into a
+certificate) is nonetheless *also* deep-frozen as an incidental consequence
+of freezing the whole `kwargs` mapping uniformly at construction, though
+E4 does not depend on that for its own correctness. *F1 closure proof
+complete* per the task's own acceptance bar.
+
+===== 44.8 Construction-path equivalence and genuine-copy safety
+
+With `bind()` removed there is exactly one construction path, so
+path-equivalence is trivially true. Re-verified the property that matters
+(task section 12): copying/reusing an already-canonical
+`BoundFramesTargetCall` in a fresh `BoundStep` remains allowed and safe --
+it certifies *and* necessarily executes the identical immutable reviewed
+snapshot, no provenance or secrecy check
+(`test_genuine_copy_of_a_directly_constructed_call_still_certifies_and_executes_correctly`).
+
+===== 44.9 Preserved structural authenticity and five-target audit
+
+Re-verified unchanged: plain forged lambda + certifiable-looking config ->
+`Uncertified`; `BoundFramesTargetCall` with an unrelated target ->
+`Uncertified`; a subclass overriding `__call__` -> `Uncertified`. All five
+E4-reviewed targets (`enrich_lookup`, `contract_grouped_xref`,
+`reconstruct_grouped_matrix`, `expand_grouped_xref`,
+`write_artifact_manifest`) independently re-audited through the real
+binder: correct `step.fn.target is <real callable>` identity, deep-frozen
+configuration, matching classifier/executor snapshot, successful real
+execution, and (spot-checked on `contract_grouped_xref`'s `row_keys` and
+`write_artifact_manifest`'s `reports`) unaffected by mutating the original
+list after certification. `None`-return binder semantics unchanged.
+
+===== 44.10 Non-E4 compatibility and preserved findings
+
+Broad regression sweep (`tests/unit/pipeline/`, formula/grouped/
+reconstruction, artifact manifest, reference/graph validations,
+finding_frame, rendering, integration pipeline/io_backends, architecture,
+`tests/unit/application/`) -- exercising the ~30 non-E4-reviewed steps
+sharing this same generic binder -- passed unchanged: *933 passed, 0
+failed*. No production code for F2, F3, I1, I2, or M1 was touched; their
+focused suites (projection, locality, R1 scalarization, manifest
+correspondence, schema-maintenance compatibility) were re-run and pass
+unchanged.
+
+===== 44.11 Validation
+
+[cols="3,7",options="header"]
+|===
+|Check |Result
+
+|Focused execution_state + architecture guard + R1 + finding_frame suites
+|95 passed (`tests/unit/pipeline/execution_state/` 77 -- up from 69: new
+`test_bound_construction_invariant.py` (8 tests) -- + architecture guard 3
++ R1 scalarization 5 + finding_frame 10)
+
+|Broad regression sweep
+|933 passed, 0 failed
+
+|`make test`
+|2,707 passed, 1 deselected (pre-existing LibreOffice interop; +8 over the
+prior 2,699, matching the one new focused test file)
+
+|`ruff check` on every changed/new source and test file
+|All checks passed
+
+|`make source-style-guards`
+|0 errors, 82 warnings, 2 allowlisted findings -- unchanged baseline
+
+|`asciidoctor --failure-level=ERROR` on this FTR
+|Passed (exit 0)
+
+|`git diff --check`
+|Passed
+|===
+
+===== 44.12 Final self-review (task section 24)
+
+*"Can I construct, through any normal Python constructor/API this class
+exposes, an object `resolve_trusted_call` accepts whose target or
+role-relevant effective config can subsequently change through an ordinary
+caller-held alias?"* Enumerated every normal construction API: the public
+dataclass constructor (positional or keyword) is the only one: `bind()` no
+longer exists. `__post_init__` freezes unconditionally regardless of which
+form was used. Answer: *No.*
+
+*"Does closing this rely on secrecy or provenance?"* No: `enrich_lookup`,
+`BoundFramesTargetCall`, and every reviewed target remain ordinarily
+importable; nothing about the fix depends on a caller being unable to
+obtain or construct these values -- only on what constructing/using them
+*necessarily* causes to execute.
+
+*"Can a copied genuine binding still certify safely?"* Yes (44.8): it
+executes exactly the immutable reviewed snapshot it was constructed with,
+not a false certificate.
+
+===== 44.13 Disposition
+
+    E4-REVIEW-F1 correction-author RESOLVED.
+    E4-REVIEW-F2 remains RESOLVED (unchanged).
+    E4-REVIEW-F3 remains RESOLVED (unchanged).
+    E4-REVIEW-I1 remains RESOLVED (unchanged).
+    E4-REVIEW-I2 remains RESOLVED (unchanged).
+    E4-REVIEW-M1 remains RESOLVED (unchanged).
+
+F1 -- the sole open finding after four correction passes -- is
+correction-author resolved: the immutability invariant now lives at
+`BoundFramesTargetCall`'s one construction boundary, so every object
+`resolve_trusted_call` can accept is, by construction, incapable of
+diverging from its certificate. Every previously independently-resolved
+finding remains resolved with unchanged production code. E4 remains
+implemented but *not* independently accepted; this correction requires its
+own fresh independent review pass before any lifecycle status change. E5-E7
+remain unstarted; no E5 macro wiring, no E6/E7 work, and no lifecycle
+curation were performed during this correction.
