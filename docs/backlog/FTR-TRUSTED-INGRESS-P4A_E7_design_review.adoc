@@ -1,0 +1,591 @@
+= FTR-TRUSTED-INGRESS-P4A -- E7 Description-Authorization Design -- Independent Review
+:toc: left
+:toclevels: 3
+
+Independent, fresh-context design review of the E7 (`less-trusted description
+authorization`) design artifact. Not an E7 design-author context, not an E7
+implementation task, not an implementation review, not a new
+dotted-extension-architecture assessment, not a review of E1--E6, and not
+lifecycle curation. Work performed on `main`; no branch created; nothing
+pushed.
+
+== 1. Scope and baseline
+
+Starting HEAD: `2c963d47153b3e24d841635394d017df46379e54` (`docs(trusted-
+ingress): design E7 description authorization`) -- confirmed by
+`git rev-parse HEAD` at review start, clean tree.
+
+Design artifact under review:
+`docs/backlog/FTR-TRUSTED-INGRESS-P4A_E7_design.adoc` (1135 lines, read in
+full).
+
+Lifecycle baseline immediately before design:
+`151db64c76f602402e71d96618568e3128feb72d` (`docs(trusted-ingress): satisfy
+E7 extension-architecture prerequisite`) -- confirmed by `git log`.
+
+Durable accepted state confirmed by direct document inspection (not taken on
+the design's word): E1--E6 independently accepted; Phase-E
+Payload-Conformance Milestone reached under a mandatory trusted-description
+precondition; `FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A` architecture
+independently accepted (`0e79367`, review-followup verdict `A. ACCEPTED`);
+E7 prerequisite gate satisfied; E7 current but unimplemented; Phase E open.
+`docs/backlog/roadmap_domain_hardening_sequence.adoc` corroborates this
+lifecycle state verbatim (grepped and cross-read).
+
+The design author declares E7 DESIGN COMPLETE but not independently accepted.
+This review does not trust the design's 21-point self-review; every load-
+bearing claim below was independently tested against accepted authority and
+current source.
+
+== 2. Reconstructed E7 obligations
+
+Independently reconstructed from `FTR-TRUSTED-INGRESS-P4A.adoc` section 14
+(pipeline-description trust and capability activation), section 23's E7
+slice (scope/preconditions/acceptance criteria/exclusions), section 25's
+Phase-E defer matrix "Description authorization" row, and
+`ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` Decisions 1--5 (all read in full,
+not summarized from a secondary source): an acceptable E7 design must settle
+operator-owned authorization for the supported declarative surface with
+rejection before import/binding/acquisition; keep policy outside the
+description; preserve trusted-description compatibility and direct-Python
+trust; keep payload trust independent of description authority; represent
+all four payload/description combinations; support real import-observation
+evidence; handle the allowlist/parameter-policy intersection the FTR's own
+E7 test-strategy line names; reject unknown/contradictory/widening requests;
+claim no Python sandbox; and keep sink/output authority separate except
+where E7's own selected step capability chooses a resource. Section 3 below
+tests the design against this reconstruction, not against the design's own
+self-check.
+
+== 3. Current topology verification
+
+An independent read-only source investigation (full reads of
+`pipeline/build.py`, `pipeline/registry.py`, `pipeline/steps.py`,
+`pipeline/dotted_paths.py`, `pipeline/config.py`, `application/
+orchestrator.py`, `pipeline/runner.py`, `application/schema_maintenance.py`,
+`pipeline/execution.py`, plus targeted greps for `importlib.import_module`,
+`yaml.load`/`safe_load`, and every registered-step resource selector) was
+performed for this review, independent of the design's and the accepted
+architecture assessment's own prose. Results:
+
+* **Topology premise (design section 2) CONFIRMED.** `build_steps_from_yaml`/
+  `build_steps_from_config` fully resolve/import/instantiate every step's
+  callable (`pipeline/build.py:30,36-37,44`; `pipeline/steps.py:53-54,65,90,
+  120`) before `orchestrate()` is ever called; `orchestrate` (`application/
+  orchestrator.py:102-179`) receives an already-built `list[BoundStep]` and
+  never itself resolves or imports anything. Authorization supplied only to
+  `orchestrate(..., steps=prebound_steps)` would indeed be too late.
+* **Direct-colon import timing CONFIRMED.** `resolve_registration`
+  (`pipeline/registry.py:199-205`) calls
+  `resolve_configuration_callable(step_id)` -- which imports immediately
+  (`pipeline/dotted_paths.py:31-38`) -- inline, on its own return path, for
+  any unregistered colon-bearing `step_id`. No other call path reaches this
+  importer for the outer `step` identifier.
+* **Plugin/target-resolution order CONFIRMED.** `make_plugin_step` and
+  `_resolve_target` call `resolve_configuration_callable`/`_resolve_target`
+  as their first statement (`pipeline/steps.py:65,71,90,120`).
+  `_split_reference` (the colon/final-dot grammar) is a pure, import-free
+  string operation (`pipeline/dotted_paths.py:41-64`), confirming the
+  design's canonicalizer is buildable without import.
+* **Nested-target reachability CONFIRMED bounded.** No ordinary registered
+  step accepts a free-form `target:` string from configuration (registration-
+  owned targets are unconditionally overwritten before the factory call,
+  `pipeline/build.py:36-37`); the only route to a nested `target:` is through
+  the outer unregistered direct-colon surface. A plugin-mediated route was
+  independently tested and is not practically reachable (`make_frames_target_
+  step`/`make_builder_target_step` are keyword-only with no `frames`
+  parameter, so plugin's `(frames, **args)` convention raises `TypeError`).
+* **Registered-step resource census CONFIRMED complete.** Every `REGISTRY`
+  entry other than `plugin` was independently classified. Exactly four
+  filesystem-touching registered steps exist -- `apply_overrides`,
+  `write_structured_yaml`, `write_key_value_resources`,
+  `write_artifact_manifest` -- matching the design's section 5 classification
+  table exactly. `normalize_resource_overrides`'s "resource" is a value-
+  override concept, not I/O (its module has no filesystem/network primitive).
+  No environment-variable-driven resource selection, subprocess call, or
+  network call exists anywhere in the reachable registered-step graph. This
+  independently reproduces the accepted architecture assessment's own census
+  (section 6.4 of its independent review) and the already-resolved I-1
+  finding about `apply_overrides.overrides_path` being uncontained.
+* **`apply_overrides.overrides_path` CONFIRMED uncontained.**
+  `domain/yaml_overrides.py:36-48` (`load_overrides`) calls `Path(path)`
+  directly with no `_safe_target_path`-equivalent containment; inline
+  `overrides` never touches the filesystem
+  (`load_and_apply_overrides`, lines 99-114).
+* **Writer containment CONFIRMED.** `write_structured_yaml`, `write_
+  key_value_resources`, and `write_artifact_manifest` share an identical
+  `_safe_output_dir`/`_safe_target_path` pattern (`Path.resolve(strict=
+  False)` plus `is_relative_to()` containment); `write_artifact_manifest`'s
+  `checksum="sha256"` triggers `_sha256_of_file` reads of `out_dir /
+  row["path"]` for every row in assembled report frames (which may include
+  rows not written by the current run), contained to `out_dir` by the same
+  helper.
+* **YAML parser safety CONFIRMED.** Every YAML parse site in the codebase
+  (`pipeline/build.py:88`, `pipeline/config.py:37`, `domain/
+  yaml_overrides.py:45`, both `io_backends` YAML/JSON sites, `cli/apps/
+  run.py`) uses `yaml.safe_load`; no `yaml.load`/`FullLoader`/`UnsafeLoader`/
+  unsafe `ruamel` construction exists anywhere. Parsing itself cannot
+  construct arbitrary Python objects or execute code.
+* **Current signatures CONFIRMED as the design states them.**
+  `orchestrate(*, input, output, steps=None, header_levels=1)` has no
+  `step_specs` parameter today. `run_app(app, run_id=None, **_)` builds steps
+  internally via `build_steps_from_config` before calling `orchestrate
+  (steps=..., ...)`. `AppConfig` has separate `.io: IOConfig` and
+  `.pipeline: list[dict]` fields, read independently by `run_app`
+  (`pipeline/config.py:27-32`; `pipeline/runner.py:37,43`).
+* **Architecture-test precedent CONFIRMED.** `tests/architecture/` contains
+  import-direction and "not reachable via ordinary REGISTRY/YAML surface"
+  guards (`test_domain_ingress_boundary.py`, `dependency_guards/
+  test_pipeline_step_registry.py`, `domain_transformations/
+  test_layer_boundaries.py`) that are a workable pattern precedent for the
+  design's proposed E7 architecture guard; no existing guard yet pins
+  "authorization precedes import," confirming this would be new evidence, not
+  duplicated evidence.
+
+*Verdict: the design's topology premise (section 2 of this review) and every
+downstream ordering/containment claim tested against it are confirmed true
+at current HEAD. No topology finding.*
+
+== 4. Trust-mode / policy-value review
+
+`authorization=None` (trusted) vs. `authorization=LessTrustedDescription
+Authorization(...)` (less trusted) is a single value-or-None representation
+with no parallel boolean/enum that could diverge from it, and no description
+field that can construct, replace, weaken, or remove the value (design
+sections 3.1, 3.2 -- reserved step-spec keys `description_authority`/
+`description_authorization`/`description_policy` reject in less-trusted
+mode; a same-file key ignored by a legacy parser grants nothing because mode
+arrives only through the separate Python argument). Independently grepped
+current registered-step factory signatures (`pipeline/steps.py`,
+`pipeline/registry.py`) for those three reserved names: no collision exists
+with any current parameter. A trusted operator can still mislabel external
+content as trusted -- explicitly out of scope per ADR Decision 1, and the
+design says so in the same breath as the compatibility default (section
+3.1), matching the required non-finding pattern for trusted-operator misuse.
+
+The public `LessTrustedDescriptionAuthorization` value type (section 6 of
+the review task) is necessary -- an external caller cannot construct
+`build_steps_from_config(..., authorization=...)`'s argument without a
+public constructor -- and is narrowly exported from `spreadsheet_handling.
+pipeline` (not the root package), with internal capability/constraint enums
+explicitly not exported. This does not create aggregate/root import
+promotion and is consistent with `pipeline` already owning `build_steps_
+from_config`/`build_steps_from_yaml` as the documented builder surface
+(`interfaces_and_gates.adoc`).
+
+The immutable effective-snapshot invariant (design section 4.2) is
+sufficiently and unambiguously specified: caller-provided mappings are
+copied into owned immutable containers (not merely wrapped in a
+`MappingProxyType`, which the design's "copied into owned immutable
+mappings" language avoids), nested constraint input is copied, one fresh
+snapshot is derived per less-trusted build entry and reused for every
+authorization decision in that build, and the description-container
+snapshot is separately taken (owned recursive copy of exact built-in
+containers before classification) to prevent a caller mutating a retained
+nested list/dict between authorization and binding. The structural-boundary
+section (9.1) commits to "exact built-in `list`/`tuple`/`dict`" typing
+before recursive copying, which -- if implemented as a `type(x) is dict`-
+style check rather than `isinstance`/duck-typed iteration -- avoids invoking
+arbitrary `__iter__`/`__deepcopy__`/`repr` on a hostile lookalike object,
+consistent with the repository's own Domain Boundary Robustness posture.
+
+*Verdict: trust-mode representation, public-value ownership, and
+immutability/snapshot invariants are all sound and implementable as
+specified. No finding.*
+
+== 5. Capability authorization review
+
+=== 5.1 Registered short names / registry-owned targets
+
+Independently confirmed: `resolve_registration` for a registered name is a
+pure dict lookup with zero import; the registration-owned target string is
+resolved only inside the subsequent `registration.factory(...)` call. A
+future authorization check placed between those two points authorizes the
+short name with zero import having occurred, and does not require a second
+consumer decision for the internal target (the target is never read from
+configuration -- `pipeline/build.py:36-37` unconditionally overwrites it).
+Design sections 6.1/6.4 match this exactly. No finding.
+
+=== 5.2 Direct-colon and nested-target denial
+
+`resolve_registration()` performs colon-detection and import inside the same
+call for an unregistered colon-bearing `step_id` -- there is no
+intermediate point at which `build_steps_from_config` "already knows" a
+step is colon-bearing without either hoisting the trivial string test
+(`":" in step_id and step_id not in REGISTRY`) before calling `resolve_
+registration`, or changing that function to defer import. The design
+(section 6.3) states this ordering requirement precisely and correctly
+("rejects `forbidden_capability` *before calling* `resolve_registration()`")
+-- this is exactly the already-resolved M-1 finding from the independently
+accepted architecture-review cycle, correctly carried into the design.
+Nested-target reachability was independently re-verified bounded to the
+outer direct-colon route only (section 3 above); the design's decision not
+to add nested-target policy vocabulary is therefore appropriately minimal.
+No finding.
+
+=== 5.3 Plugin canonicalization
+
+The proposed pure, import-free canonicalizer reusing the resolver's existing
+`_split_reference` grammar (colon form and final-dot form, both currently
+implemented as plain string operations with no I/O) is feasible exactly as
+described; the design correctly leaves the exact reuse/reimplementation
+mechanism to implementation while pinning the required behavior (same
+canonical text for colon/final-dot spellings of the same target; different
+text for aliases/re-exports, fail-closed not a bypass). This matches the
+already-accepted architecture review's own finding (5.2/6.2 of that review)
+that this is an explicit, internally consistent, non-safety-relevant
+identifier-vs-callable-identity choice. No finding.
+
+=== 5.4 Plugin-args authority
+
+Exact-target-only authorization (no generic `args` policy) was tested
+against real adoption evidence, not a hypothetical. The accepted
+architecture assessment's adoption census (16 Core / 4 demo / 6 worldbuilding
+/ 2+2 SSDP-family plugin sites, all currently *trusted*-description usage --
+Phase E is not complete and no repository currently runs a less-trusted
+description at all) supplies zero evidence that any currently-adopted
+plugin's argument surface needs target-specific constraint to make E7's
+grant meaningful; "authorize this exact target" already means "trust that
+target's complete current contract," which the design states prominently in
+the same paragraph as the decision (section 6.2), not buried. This matches
+the review task's own instruction not to invent hypothetical plugins, and
+the already-accepted architecture review explicitly left this choice open
+for E7 rather than mandating a target-specific scheme. No finding.
+
+== 6. Registered-step resource-policy review
+
+The four-step classification (`apply_overrides` inline-overrides-only;
+`write_structured_yaml`/`write_key_value_resources` root-contained-writer;
+`write_artifact_manifest` artifact-manifest) is independently confirmed
+complete and non-overlapping (section 3 above). The categorical `overrides_
+path` denial (absent/`None` only; empty/relative/absolute all reject) is the
+smallest truthful response to a genuinely uncontained primitive that has no
+existing root concept to layer policy onto, and is evaluated before any
+target import/binding/`exists`/open, consistent with the general
+short-name-parameter interposition point (section 6.1's decision order).
+
+The writer-root design (exact canonical `output_root` equality, `Path.
+resolve(strict=False)` canonicalization, subordinate containment reuse of
+the existing `_safe_target_path` check) was independently checked for the
+review task's specific "classify/execute divergence" concern: does replacing
+a caller-supplied relative `output_dir` with its canonical absolute form
+before binding change report/manifest content visible to the caller? Direct
+inspection of all three writer modules shows `output_dir`'s raw value is
+used only to compute the already-`.resolve()`-based `out_dir`, and report/
+manifest rows embed only the relative `path_label` the description supplied,
+never `output_dir`/`out_dir` itself. Substituting the pre-resolved canonical
+value is therefore behaviorally transparent to output content and *closes*,
+rather than introduces, a policy-root-vs-runtime-root divergence risk (an
+un-frozen `output_dir` would otherwise be re-resolved against whatever
+process `cwd` happens to be current at writer-invocation time, which could
+differ from the `cwd` in effect when the root was authorized). `Path.
+resolve(strict=False)` itself performs only filesystem-metadata symlink
+resolution, not an open/read/write -- exactly ADR Decision 4's own worked
+example of "authorization preparation," not "capability activation."
+
+The manifest checksum boolean (`allow_checksum_reads`) is a correctly scoped
+single subpermission: the read set is already contained to the authorized
+root by the existing `_safe_target_path` machinery, and the boolean exists
+specifically because manifest *write* authority must not silently imply
+manifest *read* authority over pre-existing files under that root -- a real,
+evidenced distinction (section 3 above), not an invented one.
+
+*Verdict: resource-selector policy is complete, correctly differentiated
+(contained vs. uncontained), and does not diverge between authorization time
+and execution time. No finding.*
+
+== 7. Entry-surface / public-API review
+
+=== 7.1 `build_steps_from_config`/`build_steps_from_yaml`/`run_app` additions
+
+All three additions are additive, keyword-only, and backward compatible with
+the confirmed current signatures (section 3 above: `build_steps_from_config
+(step_specs)` and `build_steps_from_yaml(path)` currently take no keyword
+arguments at all; `run_app(app, run_id=None, **_)`'s `**_` currently absorbs
+nothing that a new declared `description_authorization` keyword would
+collide with). `run_app` already internally builds steps from `app.pipeline`
+via `build_steps_from_config` today, so threading a new keyword through to
+that existing internal call is a pure extension of `run_app`'s existing
+job, not a new responsibility. No finding.
+
+=== 7.2 `orchestrate(step_specs=...)` -- IMPORTANT
+
+*Observation:* the design proposes a new `orchestrate(..., steps=None,
+step_specs=None, description_authorization=None, ...)` variant (sections
+6.5, 9.1--9.3, 10, 16) as, in the design's own words, "the primary truthful
+managed E7 seam." Independently tested against the review task's own falsi-
+fication questions (section 19): the identical seam already exists today
+without any new `orchestrate` parameter. Current CLI and (per section 3
+above) `run_app` both already execute exactly the sequence `build_steps_
+from_config(specs) -> orchestrate(steps=bound_steps, ...)`; the design
+already adds `authorization=` to `build_steps_from_config`/`build_steps_
+from_yaml` (section 7.1 above). A caller wanting a less-trusted-description-
+aware managed run from raw specs can therefore already write
+`orchestrate(steps=build_steps_from_config(step_specs, authorization=
+policy), input=..., output=...)` -- two calls, using APIs the design already
+adds, with identical ordering guarantees (all description building
+completes before payload load in both forms, because `build_steps_from_
+config` always fully completes before its result is passed anywhere).
+
+`orchestrate` itself has never built steps from specs -- it has always been
+a "receive already-bound `BoundStep`s" function (independently confirmed,
+section 3 above: "it never itself resolves/imports anything from the step
+specs"). Giving `orchestrate` a *new* internal responsibility (calling
+`build_steps_from_config` itself) is architecturally novel for that specific
+function, in a way that `run_app`'s and the two builders' additions are not
+(they extend existing jobs). `orchestrate`'s current signature is explicitly
+gated consumer-facing surface (`interfaces_and_gates.adoc`), and E6 already
+established the applicable precedent -- Decision C explicitly declined to
+add a new public conformance-establishment helper without consumer evidence.
+This design offers no consumer evidence, and none is available: Phase E is
+not complete, so no repository has adopted less-trusted descriptions at all
+yet. The design's own section 19 self-test questions (whether the composed
+`build_steps_from_config` + `orchestrate(steps=...)` path already suffices;
+whether `step_specs` duplicates builder responsibility) both resolve against
+the addition on independent inspection.
+
+*Risk:* an unnecessary expansion of a stability-gated public function's
+signature (new parameter, new mutual-exclusivity rule with `steps`, new
+argument-name split from the builders' `authorization=`) that duplicates,
+rather than adds, capability -- exactly the "unnecessary API expansion
+materially conflicts with E6's intentionally narrow API publication"
+category this review's finding-discipline names as Important.
+
+*Recommended action (smallest correction):* remove `step_specs`/`description_
+authorization` from `orchestrate`'s proposed signature (design sections 9.3,
+10's "orchestrate configured flow" row, 6.5's "new configured orchestrator
+route" paragraph, and the corresponding mentions in sections 1, 9.1--9.2,
+16). Document the two-call composition -- `build_steps_from_config(step_
+specs, authorization=policy)` then `orchestrate(steps=result, input=...,
+output=...)` -- as the supported managed E7 seam for the raw-specs case,
+alongside `run_app` for the `AppConfig` case. This is a narrow, surgical
+text change: it does not touch the capability vocabulary, the resource-
+policy tables, the four-way matrix, the activation-ordering model, or any
+of sections 3--18 substantively -- `orchestrate`'s existing accepted E6
+`steps=` contract is preserved completely unchanged, which is a *smaller*
+diff against accepted E6 than the current design proposes.
+
+*Disposition:* Important. Blocks unconditional acceptance under this
+review's finding discipline (an Important finding requires `CHANGES
+REQUIRED` regardless of how narrow the correction is), but requires no
+re-litigation of any architecture-soundness decision and no new prerequisite
+work.
+
+=== 7.3 `run_app` partial-trust boundary (`AppConfig.io` outside E7)
+
+Independently tested the scenario the review task raises: a caller loading
+an entire `AppConfig` (including `.io`) from an untrusted source and then
+passing `description_authorization` to `run_app`, potentially believing the
+whole `AppConfig` is now protected. `AppConfig.io` and `AppConfig.pipeline`
+are structurally separate dataclass fields (section 3 above); the design
+correctly leaves `.io` outside E7 scope, consistent with the FTR's own
+explicit exclusion ("Top-level input/output sink authorization... the
+trusted operator continues to own I/O descriptors") and the independently
+accepted architecture assessment's O-1 non-finding (top-level `io`/
+`profiles` descriptors are correctly outside this FTR's registered-step/
+dotted-callable scope). The design states the caveat directly in the same
+table cell as the parameter itself (section 10: "caller must separately
+own/approve `AppConfig.io` because E7 is not I/O/sink policy") and again in
+the final supported-claim paragraph, which names "`run_app`'s pipeline
+field" explicitly rather than `run_app`/`AppConfig` unqualified. This is a
+trusted-caller-misuse scenario structurally identical to the already-
+accepted non-finding pattern for a caller that falsely labels external
+content as trusted (section 4 above) -- not new territory this design
+introduces.
+
+*Disposition:* not Important/Blocking under this review's own finding
+discipline (the design does not create an unsound or ambiguous claim; it
+states the boundary in the same breath as the capability, matching the
+E6-established pattern this FTR already uses for `orchestrate`'s trusted-
+description precondition). Recorded as Minor M-2 below: the bare parameter
+name `description_authorization` on `run_app` does not itself carry the
+"pipeline only" qualifier the way the design's prose does, and a slightly
+more specific name (or a one-line docstring warning specifically about
+`AppConfig.io`) would reduce residual misreading risk at zero cost.
+
+== 8. Activation ordering
+
+Independently re-read `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` Decision 4
+in full: the capability-activation invariant is stated *per capability*
+("A forbidden capability must be rejected before any such activating
+operation runs"), not as a whole-description transactional-preflight
+requirement. `FTR-TRUSTED-INGRESS-P4A.adoc` section 14 states the same
+per-capability framing ("Python module import is capability activation and
+MUST NOT occur before an allow decision" -- for the governed capability, not
+for the description as a whole). The design's one-pass model (classify ->
+authorize -> bind, per step, in order; an earlier step's authorized import
+is not rolled back when a later step is denied) satisfies this per-capability
+invariant exactly: each governed capability's own rejection precedes its own
+activation, and an earlier step's plugin/target was positively authorized
+before its own import occurred, which is not retroactively invalidated by an
+unrelated later step's denial. The design states this limitation honestly
+(section 9.2: "no broader transactional-import claim is made") rather than
+hiding it. No accepted-authority text requires a two-pass, whole-description
+preflight-before-any-import model.
+
+*Verdict: per-capability one-pass activation is sufficient under accepted
+authority. No finding.*
+
+== 9. Four-way / E1--E6 independence
+
+The payload/description independence matrix (design section 11) mirrors ADR
+Decision 2's four-combination requirement exactly, introduces no combined
+security-level object, and does not reopen any E1--E6 behavior. E7
+authorization success is explicitly stated not to establish payload
+conformance and vice versa. No finding.
+
+== 10. Implementation feasibility / scope
+
+Every interception point the design requires (short-name authorization
+before factory call; plugin/direct-colon denial before import; resource-
+selector authorization before target import/binding) was independently
+confirmed to already exist in the current call graph without a prerequisite
+refactor (section 3 above), matching the independently accepted architecture
+review's own M-1-resolved conclusion. The design's own architecture-guard
+requirement (section 14.1: pin that every less-trusted path crosses the
+authorization seam before `resolve_configuration_callable`) is a distinct,
+E7-specific invariant from the deferred, non-gating "resolver-singularity"
+guard the accepted architecture assessment routed to the separate
+publication FTR (which proves a different, already-true-today fact: that
+only one checked resolver exists at all). E7's guard necessarily post-dates
+E7's own mechanism and is not a quiet import of the deferred work. No
+contradiction; no hidden prerequisite.
+
+Scope control: the design does not grow into a general filesystem sandbox,
+sink policy, network policy, Python containment, environment policy, general
+plugin schema, IAM, or policy-combination engine (section 1.2's exclusions
+list is upheld throughout sections 4--16 of the design), and conversely does
+not omit any capability an authorized registered step can currently select
+(section 6 above's independent resource census). Implementation-module
+placement (`pipeline/description_authorization.py`, `pipeline/dotted_
+paths.py`, `pipeline/build.py`, `application/orchestrator.py`, `pipeline/
+__init__.py`) matches the existing dependency direction and keeps
+description-capability authorization in Pipeline/Application control-plane
+code, not Domain. No finding beyond section 7.2's `orchestrate` addition.
+
+== 11. Design completeness and economy
+
+No security-critical question was found merely pushed into implementation
+without a bounded decision: trust-mode representation, policy lifetime,
+public import surface, short-name/plugin authority, canonicalization,
+direct-colon/nested denial, internal registry targets, direct-Python
+exclusion, `overrides_path` disposition, writer-root policy, manifest
+checksum policy, error kinds, and the four-way matrix are all closed,
+final decisions in the design text, several explicitly marked "a final E7
+decision, not a deferral." Every mechanism the design introduces (public
+value type, four-way classification table, checksum boolean, description
+snapshot, error-kind set, canonicalizer) has an evidenced role traced to
+current source in sections 3--6 above, except the `orchestrate(step_
+specs=...)` addition (section 7.2), which is the review's one Important
+finding.
+
+Minor M-1: `build_steps_from_config`/`build_steps_from_yaml` use
+`authorization=`, while `run_app`/`orchestrate` use `description_
+authorization=`. This is not semantically ambiguous (the longer name usefully
+disambiguates from payload/`io` trust dimensions at the surfaces that also
+juggle those), but a single consistent name across all four surfaces would
+be marginally clearer. Optional; does not block acceptance.
+
+== 12. Validation
+
+Read-only commands executed for this review:
+
+[source,shell]
+----
+git rev-parse HEAD
+git status --short
+git diff --check
+asciidoctor --failure-level=ERROR docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc
+asciidoctor --failure-level=ERROR \
+  docs/backlog/FTR-PIPELINE-DOTTED-EXTENSION-SURFACE-P4A_architecture_assessment.adoc
+asciidoctor --failure-level=ERROR docs/backlog/FTR-TRUSTED-INGRESS-P4A_E7_design.adoc
+PYTHONPATH=src .venv/bin/pytest -o addopts='' -q \
+  tests/unit/pipeline/test_plugins_dotted_path.py \
+  tests/unit/pipeline/test_step_registration.py \
+  tests/unit/pipeline/test_public_import_surface.py \
+  tests/unit/pipeline/test_programmatic_surface_contract.py \
+  tests/architecture/test_domain_ingress_boundary.py \
+  tests/architecture/dependency_guards/test_pipeline_step_registry.py
+PYTHONPATH=src .venv/bin/pytest -o addopts='' -q \
+  tests/unit/domain/test_artifact_manifest.py \
+  tests/unit/domain/test_key_value_writer.py \
+  tests/unit/domain/test_structured_yaml.py \
+  tests/unit/domain/test_yaml_overrides.py
+----
+
+Results: HEAD `2c963d4`, clean tree throughout except this new artifact;
+`git diff --check` exits 0 with no output; all three AsciiDoctor invocations
+exit 0 with no warnings/errors; `106 passed` (pipeline/registration/
+resolver/architecture focused suite); `66 passed` (resource-step suite, all
+domain writer/overrides tests). No source, test, registry, FTR, or sibling
+document was modified by this review; only this new artifact and independent
+read-only source/grep probes (recorded in sections 3, 6, 7 above) were used.
+No `make test` was run -- this is a design-only review and no finding
+required broader execution evidence.
+
+== 13. Findings
+
+=== Important I-1 -- `orchestrate(step_specs=...)` is an unnecessary, duplicative public-API addition
+
+See section 7.2. *Recommended action:* drop `step_specs`/`description_
+authorization` from `orchestrate`'s proposed signature and the corresponding
+narrative sections; document the existing `build_steps_from_config(...,
+authorization=...)` + `orchestrate(steps=...)` composition as the supported
+managed E7 seam for raw step specs. *Disposition:* Important; narrow text
+correction, no architecture-soundness re-litigation required.
+
+=== Minor M-1 -- `authorization=` vs. `description_authorization=` naming split
+
+See section 11. Optional consistency improvement; not semantically
+ambiguous.
+
+=== Minor M-2 -- `run_app`'s parameter name does not itself flag the `AppConfig.io` exclusion
+
+See section 7.3. Optional: a more specific parameter name or a one-line
+docstring warning naming `AppConfig.io` explicitly would reduce residual
+misreading risk beyond the already-explicit prose.
+
+No Blocking findings. No finding invalidates the E/D-hybrid architecture,
+the six/eight-surface vocabulary, the capability-authorization ordering, the
+resource-policy tables, the four-way matrix, or the activation-ordering
+model -- all of these were independently tested (sections 3--10) and
+confirmed sound and implementation-ready as specified.
+
+== 14. Lifecycle cleanup check
+
+This is a design-acceptance-track review, not a workstream-completion
+review: even under the disposition below, E7 remains unimplemented and
+Phase E remains open, so no FTR status change, no `_ftrs_open.adoc` edit,
+and no move to `docs/cold_storage/backlog/ftrs_done/` is applicable. No
+lifecycle cleanup was performed or is recommended by this review.
+
+== 15. Verdict
+
+*B. CHANGES REQUIRED.*
+
+0 Blocking, 1 Important (I-1), 2 Minor (M-1, M-2). Every architecture-
+soundness question this review tested -- trust-mode representation, public
+policy-value ownership, immutability/snapshot invariants, capability-
+authorization ordering for every one of the eight accepted surfaces,
+registered-step resource-policy completeness and containment, plugin
+canonicalization and args-authority, activation ordering, the four-way
+payload/description matrix, and implementation feasibility without a
+prerequisite refactor -- survived independent adversarial testing against
+accepted FTR/ADR/architecture authority and current source, with zero
+Blocking and zero architecture-soundness defects found. The one Important
+finding (I-1) is a narrow, surgical API-surface correction: remove the
+proposed `orchestrate(step_specs=...)` addition and document the equivalent
+two-call composition instead. It does not require re-selecting any
+capability-kind decision, does not change the resource-policy tables, and
+does not require new runtime evidence beyond what the design already
+specifies elsewhere.
+
+E1--E6 remain independently accepted. The Dotted-Extension architecture
+remains independently accepted. E7 DESIGN is independently **NOT ACCEPTED**
+pending the narrow correction in Important I-1 (and, optionally, Minor M-1/
+M-2). E7 remains UNIMPLEMENTED. Phase E remains open. No lifecycle curation
+was performed.
+
+    PHASE-E E7 LESS-TRUSTED DESCRIPTION AUTHORIZATION DESIGN
+    REQUIRES CORRECTION --
+    IMPLEMENTATION REMAINS BLOCKED.
