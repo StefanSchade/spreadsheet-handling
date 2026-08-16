@@ -205,6 +205,23 @@ def test_builder_requires_exact_authorization_value_type() -> None:
     )
 
 
+def test_direct_authorization_construction_fails_closed() -> None:
+    with pytest.raises(DescriptionAuthorizationError) as excinfo:
+        LessTrustedDescriptionAuthorization()
+
+    assert excinfo.value.kind == "invalid_policy"
+    assert excinfo.value.reason == "construction_requires_from_mapping"
+    assert "_registered_steps" not in str(excinfo.value)
+
+    policy = LessTrustedDescriptionAuthorization.from_mapping({})
+    _assert_error(
+        "forbidden_identifier",
+        lambda: build_steps_from_config(
+            [{"step": "identity"}], description_authorization=policy
+        ),
+    )
+
+
 def test_public_policy_value_is_frozen_and_narrowly_exported() -> None:
     import spreadsheet_handling as top_level
     import spreadsheet_handling.pipeline as pipeline

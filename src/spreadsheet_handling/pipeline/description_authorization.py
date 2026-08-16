@@ -131,6 +131,9 @@ class LessTrustedDescriptionAuthorization:
     _registered_steps: MappingProxyType
     _plugin_targets: frozenset[str]
 
+    def __init__(self) -> None:
+        _invalid_policy("construction_requires_from_mapping")
+
     @classmethod
     def from_mapping(cls, value: Any) -> LessTrustedDescriptionAuthorization:
         if type(value) not in _POLICY_MAPPING_TYPES:
