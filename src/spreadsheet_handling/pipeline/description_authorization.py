@@ -144,42 +144,48 @@ class LessTrustedDescriptionAuthorization:
         if unknown:
             _invalid_policy("unknown_top_level_field")
 
-        raw_registered = value.get("registered_steps", {})
-        if type(raw_registered) not in _POLICY_MAPPING_TYPES:
-            _invalid_policy("registered_steps_not_mapping")
-
-        registered: dict[str, _StepAuthority] = {}
-        for name, constraints in raw_registered.items():
-            if type(name) is not str:
-                _invalid_policy("registered_step_name_not_exact_string")
-            if name == "plugin":
-                _invalid_policy("plugin_not_registered_step")
-            if name not in REGISTRY:
-                _invalid_policy("unknown_registered_step")
-            classification = _REGISTERED_STEP_CLASSIFICATIONS.get(name)
-            if classification is None:
-                _invalid_policy("unclassified_registered_step")
-            registered[name] = _parse_step_authority(name, classification, constraints)
-
-        raw_targets = value.get("plugin_targets", ())
-        if type(raw_targets) not in _POLICY_COLLECTION_TYPES:
-            _invalid_policy("plugin_targets_not_collection")
-        canonical_targets: set[str] = set()
-        for target in raw_targets:
-            if type(target) is not str:
-                _invalid_policy("plugin_target_not_exact_string")
-            try:
-                canonical = canonicalize_configuration_callable(target)
-            except (TypeError, ValueError):
-                _invalid_policy("malformed_or_blocked_plugin_target")
-            if canonical in canonical_targets:
-                _invalid_policy("duplicate_canonical_plugin_target")
-            canonical_targets.add(canonical)
+        registered = _parse_registered_authorities(value.get("registered_steps", {}))
+        canonical_targets = _parse_plugin_targets(value.get("plugin_targets", ()))
 
         instance = object.__new__(cls)
         object.__setattr__(instance, "_registered_steps", MappingProxyType(dict(registered)))
         object.__setattr__(instance, "_plugin_targets", frozenset(canonical_targets))
         return instance
+
+
+def _parse_registered_authorities(raw: Any) -> dict[str, _StepAuthority]:
+    if type(raw) not in _POLICY_MAPPING_TYPES:
+        _invalid_policy("registered_steps_not_mapping")
+    registered: dict[str, _StepAuthority] = {}
+    for name, constraints in raw.items():
+        if type(name) is not str:
+            _invalid_policy("registered_step_name_not_exact_string")
+        if name == "plugin":
+            _invalid_policy("plugin_not_registered_step")
+        if name not in REGISTRY:
+            _invalid_policy("unknown_registered_step")
+        classification = _REGISTERED_STEP_CLASSIFICATIONS.get(name)
+        if classification is None:
+            _invalid_policy("unclassified_registered_step")
+        registered[name] = _parse_step_authority(classification, constraints)
+    return registered
+
+
+def _parse_plugin_targets(raw: Any) -> set[str]:
+    if type(raw) not in _POLICY_COLLECTION_TYPES:
+        _invalid_policy("plugin_targets_not_collection")
+    canonical_targets: set[str] = set()
+    for target in raw:
+        if type(target) is not str:
+            _invalid_policy("plugin_target_not_exact_string")
+        try:
+            canonical = canonicalize_configuration_callable(target)
+        except (TypeError, ValueError):
+            _invalid_policy("malformed_or_blocked_plugin_target")
+        if canonical in canonical_targets:
+            _invalid_policy("duplicate_canonical_plugin_target")
+        canonical_targets.add(canonical)
+    return canonical_targets
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,30 +203,41 @@ def _effective_authorization(value: Any) -> _EffectiveAuthorization:
     )
 
 
-def _parse_step_authority(name: str, classification: str, raw: Any) -> _StepAuthority:
+def _parse_step_authority(classification: str, raw: Any) -> _StepAuthority:
     if type(raw) not in _POLICY_MAPPING_TYPES:
         _invalid_policy("step_constraints_not_mapping")
-    fields = set(raw)
     if classification in {"ordinary", "inline-overrides-only"}:
-        if fields:
+        if raw:
             _invalid_policy("constraints_not_supported_for_step")
         return _StepAuthority()
+    if classification == "root-contained-writer":
+        return _parse_writer_authority(raw)
+    return _parse_manifest_authority(raw)
 
-    allowed = {"output_roots"}
-    if classification == "artifact-manifest":
-        allowed.add("allow_checksum_reads")
-    if fields - allowed:
+
+def _parse_writer_authority(raw: Any) -> _StepAuthority:
+    if set(raw) - {"output_roots"}:
         _invalid_policy("unknown_or_wrong_step_constraint")
+    if "output_roots" not in raw:
+        _invalid_policy("required_output_roots_missing")
+    return _StepAuthority(_canonicalize_policy_roots(raw["output_roots"]))
 
-    has_roots = "output_roots" in raw
-    if not has_roots:
-        if classification == "root-contained-writer":
-            _invalid_policy("required_output_roots_missing")
+
+def _parse_manifest_authority(raw: Any) -> _StepAuthority:
+    if set(raw) - {"output_roots", "allow_checksum_reads"}:
+        _invalid_policy("unknown_or_wrong_step_constraint")
+    if "output_roots" not in raw:
         if "allow_checksum_reads" in raw:
             _invalid_policy("checksum_permission_without_roots")
         return _StepAuthority()
+    roots = _canonicalize_policy_roots(raw["output_roots"])
+    allow_reads = raw.get("allow_checksum_reads", False)
+    if type(allow_reads) is not bool:
+        _invalid_policy("checksum_permission_not_boolean")
+    return _StepAuthority(roots, allow_reads)
 
-    raw_roots = raw["output_roots"]
+
+def _canonicalize_policy_roots(raw_roots: Any) -> frozenset[Path]:
     if type(raw_roots) not in _POLICY_COLLECTION_TYPES or not raw_roots:
         _invalid_policy("output_roots_not_nonempty_collection")
     roots: set[Path] = set()
@@ -240,11 +257,7 @@ def _parse_step_authority(name: str, classification: str, raw: Any) -> _StepAuth
         if canonical in roots:
             _invalid_policy("duplicate_canonical_output_root")
         roots.add(canonical)
-
-    allow_reads = raw.get("allow_checksum_reads", False)
-    if type(allow_reads) is not bool:
-        _invalid_policy("checksum_permission_not_boolean")
-    return _StepAuthority(frozenset(roots), allow_reads)
+    return frozenset(roots)
 
 
 def _invalid_policy(reason: str) -> None:
@@ -371,29 +384,48 @@ def _authorize_step_spec(
             identifier=step_id,
         )
 
+    _authorize_registered_step_parameters(
+        spec,
+        classification=classification,
+        authority=step_authority,
+        step_index=step_index,
+        identifier=step_id,
+        cwd=cwd,
+    )
+    return spec
+
+
+def _authorize_registered_step_parameters(
+    spec: dict[str, Any],
+    *,
+    classification: str,
+    authority: _StepAuthority,
+    step_index: int,
+    identifier: str,
+    cwd: Path,
+) -> None:
     if classification == "inline-overrides-only":
-        _authorize_apply_overrides(spec, step_index=step_index, identifier=step_id)
+        _authorize_apply_overrides(spec, step_index=step_index, identifier=identifier)
     elif classification == "root-contained-writer":
         root = _authorize_output_root(
             spec,
-            step_authority,
+            authority,
             step_index=step_index,
-            identifier=step_id,
+            identifier=identifier,
             cwd=cwd,
         )
-        if step_id == "write_structured_yaml":
-            _authorize_structured_yaml(spec, root, step_index=step_index, identifier=step_id)
+        if identifier == "write_structured_yaml":
+            _authorize_structured_yaml(spec, root, step_index=step_index, identifier=identifier)
         else:
-            _authorize_key_value_writer(spec, step_index=step_index, identifier=step_id)
+            _authorize_key_value_writer(spec, step_index=step_index, identifier=identifier)
     elif classification == "artifact-manifest":
         _authorize_artifact_manifest(
             spec,
-            step_authority,
+            authority,
             step_index=step_index,
-            identifier=step_id,
+            identifier=identifier,
             cwd=cwd,
         )
-    return spec
 
 
 def _authorize_plugin(
