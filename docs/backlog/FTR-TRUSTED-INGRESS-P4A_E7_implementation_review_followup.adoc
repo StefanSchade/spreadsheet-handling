@@ -1,0 +1,291 @@
+= FTR-TRUSTED-INGRESS-P4A -- E7 Description-Authorization Implementation -- Independent Follow-up Review
+
+:toc: left
+:toclevels: 3
+
+Fresh, bounded, independent follow-up review of the *correction* applied to
+the E7 (`less-trusted description authorization`) implementation after the
+prior independent implementation review returned `B. CHANGES REQUIRED`. This
+is not a new E7 implementation review from scratch, not an implementation-
+author context, not an E7 redesign, not a new design review, not a
+Dotted-Extension architecture review, not a review of E1--E6, not lifecycle
+curation, and not documentation condensation. Findings are recorded, not
+fixed. Work performed on `main`; no branch created; nothing pushed.
+
+== 1. Scope and baseline
+
+* Original E7 implementation review: `64f1fcc495fa2f2f40fbc0e40af9159f04d9e310`
+  ("docs(trusted-ingress): review E7 implementation"), verdict
+  `B. CHANGES REQUIRED`, 0 Blocking, 1 Important (I-1), 1 Minor (M-1).
+* Correction commits under review:
+  `c69683fb498cbbe6e70521b7b4b851a77d408910` ("fix(FTR-TRUSTED-INGRESS-P4A):
+  close E7 policy construction path") and
+  `3a5f3dd659605691e1ba5392518eb78da9b0a6f4` ("docs(FTR-TRUSTED-INGRESS-P4A):
+  record E7 I-1 correction").
+* Starting `HEAD` verified as `3a5f3dd659605691e1ba5392518eb78da9b0a6f4`
+  (exactly the expected review HEAD); `git status` clean at review start;
+  branch `main`, 97 commits ahead of `origin/main`, nothing pushed.
+
+Task scope is exactly and only: verify I-1 is resolved; verify the fix did
+not regress `from_mapping` or E7 behavior; confirm M-1 remains
+Minor/non-blocking; issue a bounded disposition. Previously-accepted E7
+implementation areas are not reopened absent concrete regression introduced
+by the two correction commits.
+
+== 2. Correction diff
+
+`git diff 64f1fcc..3a5f3dd --stat` touches exactly three files:
+
+[source,text]
+----
+docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc                        | 39 +++++++
+.../pipeline/description_authorization.py                        |  3 +
+tests/unit/pipeline/test_description_authorization.py            | 17 +++
+3 files changed, 59 insertions(+)
+----
+
+`c69683f` adds a hand-written `__init__` to
+`LessTrustedDescriptionAuthorization`:
+
+[source,python]
+----
+def __init__(self) -> None:
+    _invalid_policy("construction_requires_from_mapping")
+----
+
+where `_invalid_policy(reason)` raises
+`DescriptionAuthorizationError("invalid_policy", reason)`. It adds one new
+regression test, `test_direct_authorization_construction_fails_closed`.
+`from_mapping` is untouched and still constructs instances via
+`object.__new__(cls)` followed by `object.__setattr__` for both slots,
+entirely bypassing the new `__init__` (as it must, since `__new__` does not
+call `__init__` implicitly only when the caller does not invoke the type;
+`object.__new__(cls)` returns a bare instance and `from_mapping` never calls
+`cls(...)`, so the new `__init__` is never invoked on the valid-construction
+path). `3a5f3dd` adds section 47.12 to the FTR recording the disposition. No
+other runtime, test, or architecture-guard file is part of either commit.
+
+== 3. I-1 reproduction and closure
+
+Reproduced the exact previously-failing public construction path
+independently:
+
+[source,pycon]
+----
+>>> from spreadsheet_handling.pipeline.description_authorization import (
+...     LessTrustedDescriptionAuthorization, DescriptionAuthorizationError,
+... )
+>>> try:
+...     LessTrustedDescriptionAuthorization()
+... except DescriptionAuthorizationError as e:
+...     print(e.kind, e.reason, "_registered_steps" in str(e))
+...
+invalid_policy construction_requires_from_mapping False
+----
+
+* `DescriptionAuthorizationError` is raised -- confirmed, no `AttributeError`
+  escapes.
+* `exc.kind == "invalid_policy"` -- confirmed.
+* `exc.reason == "construction_requires_from_mapping"` -- confirmed (matches
+  the correction-author's claim exactly).
+* No private slot name (`_registered_steps`, `_plugin_targets`) appears in
+  the rendered failure message -- confirmed.
+* No partially initialized policy object is returned -- confirmed; the
+  constructor raises before any attribute is set, so no instance escapes the
+  `__init__` call at all.
+
+Independently re-drove the original end-to-end scenario
+(`build_steps_from_config(..., description_authorization=malformed)`) and
+confirmed the malformed value can no longer be constructed in the first
+place -- the rejection now happens at `LessTrustedDescriptionAuthorization()`
+itself, one step earlier than the builder call that previously produced the
+raw `AttributeError` at `build.py:41`.
+
+*I-1 RESOLVED.*
+
+== 4. `from_mapping` / immutability regression check
+
+Independently verified `from_mapping` remains the sole supported valid
+construction route and is behaviorally unchanged:
+
+* `LessTrustedDescriptionAuthorization.from_mapping({})` still succeeds and
+  returns a valid empty deny-all policy; passing it to
+  `build_steps_from_config([{"step": "identity"}], ...)` still raises
+  `DescriptionAuthorizationError(kind="forbidden_identifier", reason=
+  "registered_step_not_authorized")`, i.e. deny-all is preserved, not
+  silently reinterpreted as an allow.
+* `from_mapping({"registered_steps": {"identity": {}}, "plugin_targets":
+  []})` still succeeds and authorizes exactly `identity`; the corresponding
+  `build_steps_from_config` call succeeds. `registered_steps` and
+  `plugin_targets` parsing are unaffected by the correction (the diff never
+  touches `_parse_registered_authorities`, `_parse_plugin_targets`, or
+  `_parse_step_authority`).
+* No second supported constructor semantic was introduced. Bare
+  `LessTrustedDescriptionAuthorization()` unconditionally raises before any
+  attribute assignment -- it is not a deny-all shortcut, and no code path
+  interprets it as one. The intended contract (bare constructor: controlled
+  `invalid_policy` failure; `from_mapping(...)`: valid closed grammar) holds
+  exactly as described.
+
+Ordinary-path immutability of a `from_mapping`-constructed policy re-probed
+directly (no `object.__setattr__`, ctypes, or other threat-model-excluded
+bypass):
+
+* `policy._registered_steps` is a real `mappingproxy`; item assignment
+  raises `TypeError: 'mappingproxy' object does not support item
+  assignment`.
+* `policy._plugin_targets` is a real `frozenset`; `.add(...)` raises
+  `AttributeError`.
+* Ordinary attribute assignment on the frozen, slotted dataclass
+  (`policy._plugin_targets = frozenset()`) raises
+  `FrozenInstanceError: cannot assign to field '_plugin_targets'`, confirming
+  the new `__init__` did not weaken `frozen=True`/`slots=True` in any way for
+  the constructed-and-populated instance.
+
+Because `from_mapping` bypasses `__init__` entirely via `object.__new__`,
+confirmed it still initializes both slots correctly on every exercised path
+(empty mapping, populated `registered_steps`, empty `plugin_targets`) -- no
+partially-initialized instance is reachable through the supported route.
+
+*NO `from_mapping`/IMMUTABILITY REGRESSION.*
+
+== 5. Builder behavior for malformed direct construction
+
+Re-drove the original defect's two-step reproduction
+(`malformed = LessTrustedDescriptionAuthorization()` then
+`build_steps_from_config(..., description_authorization=malformed)`)
+end-to-end: step one now raises `DescriptionAuthorizationError` immediately,
+so `malformed` is never bound and step two is never reached under ordinary
+control flow. There is no ordinary supported way for ordinary Python to
+construct an incomplete `LessTrustedDescriptionAuthorization` and pass it
+into the builder; the rejection is unconditional and argument-free (the
+`__init__` takes no parameters other than `self` and always calls
+`_invalid_policy`, so there is no accidental "valid-looking" call shape that
+skips it). Deliberate `object.__new__`/`object.__setattr__`/ctypes/pickle-
+gadgetry bypasses remain out of the accepted threat model per task scope and
+were not explored.
+
+== 6. Regression scope check
+
+Full diff (section 2) inspected against every listed regression-scope item:
+policy grammar, registered-step classification, plugin canonicalization,
+direct-colon/nested handling, policy immutability, description snapshot,
+activation ordering, resource policies, `run_app` transport, orchestrator
+boundary, public export set, and trusted-description behavior are all
+untouched -- the diff contains exactly one four-line runtime hunk (a new
+`__init__` and its blank-line separator), one new test function, and one new
+FTR prose section. No file outside `description_authorization.py`, its unit
+test, and the FTR was changed.
+
+*NO E7 IMPLEMENTATION REGRESSION.*
+
+== 7. Regression-test quality
+
+`test_direct_authorization_construction_fails_closed`
+(`tests/unit/pipeline/test_description_authorization.py`) directly calls the
+public constructor `LessTrustedDescriptionAuthorization()` (not a helper or
+bypass), asserts `DescriptionAuthorizationError` is raised, pins both
+`exc.kind == "invalid_policy"` and the stable
+`exc.reason == "construction_requires_from_mapping"`, and asserts the
+private slot name `_registered_steps` does not leak into the rendered
+message. It additionally re-confirms `from_mapping({})` remains valid and
+denies an unauthorized `identity` step through `build_steps_from_config`,
+directly proving section 3/4's contract in the same test. The test is
+independently reproduced (section 3) and is not weak -- it pins both the
+exception type and the exact `(kind, reason)` pair the correction-author
+claimed, plus the negative private-name assertion.
+
+== 8. Minor M-1 disposition
+
+M-1 (architecture guard's resolver census in
+`test_all_configuration_dotted_activation_sites_are_bounded_and_known` is
+module-name-scoped to `registry.py`/`steps.py`) is untouched by this
+correction: the diff (section 2, section 6) does not touch
+`tests/architecture/dependency_guards/` or any resolver-census logic.
+Independently re-ran
+`tests/architecture/dependency_guards/test_description_authorization_boundary.py`
+as part of the focused E7 suite (section 9) -- still passes. The original
+review's own disposition ("Not independently load-bearing ... No fix
+required before acceptance") is unaffected by a change that never touches
+the guard.
+
+*M-1 remains Minor / non-blocking / unchanged. No fix required for
+acceptance.*
+
+== 9. Validation
+
+* New regression test, run in isolation:
+  `tests/unit/pipeline/test_description_authorization.py::test_direct_authorization_construction_fails_closed`
+  -- 1 passed.
+* All four E7 modules
+  (`tests/unit/pipeline/test_description_authorization.py`,
+  `tests/unit/pipeline/test_description_authorization_resources.py`,
+  `tests/integration/pipeline/test_description_authorization_managed.py`,
+  `tests/architecture/dependency_guards/test_description_authorization_boundary.py`)
+  run together -- *85 passed*, matching the claimed count exactly.
+* `make test` -- *2822 passed, 1 deselected*, matching the claimed result
+  exactly.
+* `ruff check` on both changed files
+  (`src/spreadsheet_handling/pipeline/description_authorization.py`,
+  `tests/unit/pipeline/test_description_authorization.py`) -- all checks
+  passed.
+* `tools/check_source_style.py` -- *0 error(s), 82 warning(s), 2 allowlisted
+  finding(s)*, matching the claimed result exactly; the pre-existing,
+  independently-confirmed-unrelated F401 in
+  `domain/transformations/xref_crosstable/__init__.py` remains present and
+  is outside this correction's diff (untouched per section 2/6).
+* `asciidoctor --failure-level=ERROR
+  docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc` -- pass, no errors.
+* `git diff --check` on both `64f1fcc..3a5f3dd` and the current working tree
+  -- clean.
+* Working tree confirmed clean before and after validation; nothing pushed.
+
+The broader "786 passed" relevant-superset figure from the correction
+author's report was not independently re-run verbatim (full `make test`
+already subsumes it and passed with the exact expected count); no
+discrepancy is implied.
+
+Release-notes checkpoint: this correction changes only an internal
+construction-safety contract of an E7 surface that is itself not yet
+independently accepted and not yet release-relevant (per the original
+review's own confirmation that `release_notes.adoc` correctly omits E7
+pending acceptance); `docs/release_notes/release_notes.adoc` is untouched by
+the diff and no release note is warranted by this narrow correction.
+
+== 10. Findings
+
+No new Blocking. No new Important. No new Minor. I-1 is closed by a minimal,
+local, single-file correction that matches the original review's own
+"smallest correction" recommendation (option two: a constructor override
+that always fails closed). M-1 is carried forward unchanged, as scoped.
+
+== 11. Lifecycle cleanup check
+
+This is a bounded correction-acceptance follow-up, not a green
+workstream-completion review. E7 implementation is independently accepted by
+this follow-up, but Phase E completion lifecycle curation (FTR status,
+`docs/backlog/_ftrs_open.adoc`, moves to
+`docs/cold_storage/backlog/ftrs_done/`) is explicitly out of scope for this
+task and was not performed. No residual implementation scope was identified
+beyond the intentionally-retained, non-blocking M-1. The next required task
+is Phase-E completion lifecycle curation, followed by the documentation-
+condensation gate, per section 13 of the review task and the original
+review's own section 16.
+
+== 12. Verdict
+
+I-1 RESOLVED. `from_mapping` and E7 behavior show no regression. M-1 remains
+Minor/non-blocking, unchanged. No E7 implementation regression. 0 new
+Blocking, 0 new Important findings.
+
+*A. ACCEPTED.*
+
+E1--E6 remain independently accepted. The Dotted-Extension architecture
+remains independently accepted. The E7 design remains independently
+accepted. E7 implementation is independently **ACCEPTED**. Phase E remains
+**Open** because no lifecycle curation was performed by this follow-up.
+
+    PHASE-E E7 CORRECTED IMPLEMENTATION
+    INDEPENDENTLY ACCEPTED --
+    READY FOR PHASE-E COMPLETION LIFECYCLE CURATION;
+    DOCUMENTATION-CLOSURE GATE REMAINS NEXT.
