@@ -10,9 +10,18 @@ automatic Trusted Ingress establishment. Other module-local factories and
 ``docs/ai_info/interfaces_and_gates.adoc`` for the full programmatic-surface
 contract and ``docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc`` section 23/46 for
 its evidence.
+
+Phase-E E7 adds the narrowly exported ``LessTrustedDescriptionAuthorization``
+and ``DescriptionAuthorizationError``. Passing the authorization value to a
+documented builder opts only that description build into fail-closed E7
+handling; omission retains trusted-description compatibility.
 """
 
 from .config import AppConfig, load_app_config
+from .description_authorization import (
+    DescriptionAuthorizationError,
+    LessTrustedDescriptionAuthorization,
+)
 from .build import build_steps_from_config, build_steps_from_yaml
 from .execution import run_pipeline
 from .registry import REGISTRY
@@ -44,4 +53,6 @@ __all__ = [
     "REGISTRY",
     "load_app_config",
     "AppConfig",
+    "DescriptionAuthorizationError",
+    "LessTrustedDescriptionAuthorization",
 ]

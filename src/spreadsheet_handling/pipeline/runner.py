@@ -5,11 +5,14 @@ from typing import Any
 
 from .build import build_steps_from_config
 from .config import AppConfig
+from .description_authorization import LessTrustedDescriptionAuthorization
 
 
 def run_app(
     app: AppConfig,
     run_id: str | None = None,
+    *,
+    description_authorization: LessTrustedDescriptionAuthorization | None = None,
     **_: object,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
@@ -27,6 +30,11 @@ def run_app(
     its automatic Trusted Ingress establishment and E4/E5 guarantees in
     full -- see that function's docstring for the complete contract.
 
+    When ``description_authorization`` is supplied it governs only
+    construction of ``AppConfig.pipeline``. ``AppConfig.io`` remains
+    trusted-operator-owned, outside E7, and must already be approved by the
+    caller.
+
     Returns: ``(frames, meta, issues)``.
     """
     # Local import: ``application.orchestrator`` pulls in modules that
@@ -41,7 +49,14 @@ def run_app(
     _inp_name, inp = next(iter(io.inputs.items()))
 
     step_specs = app.pipeline or []
-    bound_steps = build_steps_from_config(step_specs) if step_specs else []
+    bound_steps = (
+        build_steps_from_config(
+            step_specs,
+            description_authorization=description_authorization,
+        )
+        if step_specs or description_authorization is not None
+        else []
+    )
 
     out = io.output
 

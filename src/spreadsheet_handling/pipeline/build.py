@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .description_authorization import (
+    LessTrustedDescriptionAuthorization,
+    _authorize_step_spec,
+    _effective_authorization,
+    _snapshot_less_trusted_step_specs,
+)
 from .registry import REGISTRY, resolve_registration
 from .types import BoundStep
 
 
-def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[BoundStep]:
+def build_steps_from_config(
+    step_specs: Iterable[Mapping[str, Any]],
+    *,
+    description_authorization: LessTrustedDescriptionAuthorization | None = None,
+) -> list[BoundStep]:
     """
     Build steps from a config list like:
       - step: validate
@@ -18,7 +29,34 @@ def build_steps_from_config(step_specs: Iterable[Mapping[str, Any]]) -> list[Bou
     Supported 'step' values:
       1) registry key (see REGISTRY)
       2) dotted path '<module>:<factory_function>'
+
+    Omitting ``description_authorization`` retains the complete trusted-
+    description behavior above. Supplying the exact E7 authorization value
+    snapshots and authorizes the built-in description before any selected
+    capability is resolved or bound.
     """
+    if description_authorization is None:
+        return _build_trusted_steps_from_config(step_specs)
+
+    effective = _effective_authorization(description_authorization)
+    snapshots = _snapshot_less_trusted_step_specs(step_specs)
+    cwd = Path.cwd().resolve(strict=False)
+    steps: list[BoundStep] = []
+    for index, spec in enumerate(snapshots, start=1):
+        authorized = _authorize_step_spec(
+            spec,
+            step_index=index,
+            authorization=effective,
+            cwd=cwd,
+        )
+        steps.extend(_build_trusted_steps_from_config([authorized]))
+    return steps
+
+
+def _build_trusted_steps_from_config(
+    step_specs: Iterable[Mapping[str, Any]],
+) -> list[BoundStep]:
+    """Retain the pre-E7 trusted-description construction path unchanged."""
     steps: list[BoundStep] = []
     for raw in step_specs:
         spec = dict(raw)
@@ -80,8 +118,16 @@ except Exception:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 
-def build_steps_from_yaml(path: str) -> list[BoundStep]:
-    """Load a pipeline spec from YAML (expects top-level key 'pipeline': [...])."""
+def build_steps_from_yaml(
+    path: str,
+    *,
+    description_authorization: LessTrustedDescriptionAuthorization | None = None,
+) -> list[BoundStep]:
+    """Load pipeline YAML and optionally authorize its step list as less trusted.
+
+    The YAML path itself is trusted caller-selected transport. The optional
+    E7 value governs only the parsed top-level ``pipeline`` list.
+    """
     if yaml is None:
         raise RuntimeError("PyYAML not installed; install with [dev] or add pyyaml to deps.")
     with open(path, "r", encoding="utf-8") as f:
@@ -89,4 +135,7 @@ def build_steps_from_yaml(path: str) -> list[BoundStep]:
     specs = cfg.get("pipeline")
     if not isinstance(specs, list):
         raise ValueError(f"YAML missing 'pipeline' list: {path}")
-    return build_steps_from_config(specs)
+    return build_steps_from_config(
+        specs,
+        description_authorization=description_authorization,
+    )

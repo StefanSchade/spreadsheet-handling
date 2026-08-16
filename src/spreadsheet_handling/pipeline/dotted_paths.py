@@ -19,6 +19,19 @@ def ensure_configuration_addressable(reference: str) -> None:
     _ensure_module_addressable(reference, module_path)
 
 
+def canonicalize_configuration_callable(reference: str) -> str:
+    """Return the import-free canonical identity for a configuration callable.
+
+    Both accepted spellings, ``module:attribute`` and
+    ``module.attribute``, canonicalize to ``module:attribute``.  Ownership
+    checks intentionally run here too, before callers decide whether the
+    reference may be imported.
+    """
+    module_path, attribute = _split_reference(reference)
+    _ensure_module_addressable(reference, module_path)
+    return f"{module_path}:{attribute}"
+
+
 def _ensure_module_addressable(reference: str, module_path: str) -> None:
     for namespace in _FRAMEWORK_INTERNAL_CONFIGURATION_NAMESPACES:
         if module_path == namespace or module_path.startswith(f"{namespace}."):
@@ -64,4 +77,7 @@ def _split_reference(reference: str) -> tuple[str, str]:
     return module_path, attribute
 
 
-__all__ = ["ensure_configuration_addressable", "resolve_configuration_callable"]
+__all__ = [
+    "ensure_configuration_addressable",
+    "resolve_configuration_callable",
+]
