@@ -15,12 +15,13 @@ reviewed target (``add_lookup_helpers``, ``contract_grouped_xref``,
 ``reconstruct_grouped_matrix``, ``expand_grouped_xref``,
 ``write_artifact_manifest``) -- additionally builds its ``BoundStep.fn`` as a
 ``types.BoundFramesTargetCall`` rather than an anonymous closure: that
-class's ``__call__`` mechanically executes exactly
-``self.target(frames, **self.kwargs)``, so E4's classifiers can prove which
-callable and configuration a step actually runs by inspecting ``step.fn``
-itself (``type(step.fn) is BoundFramesTargetCall`` and ``step.fn.target is
-<the exact reviewed callable>``), not by trusting a separately-suppliable
-label or marker. See ``BoundFramesTargetCall``'s docstring in
+class's ``__call__`` mechanically materializes invocation-local containers
+from its authoritative ``kwargs`` snapshot and executes exactly that target,
+so controlled-role classifiers can prove which callable and effective binding
+a step actually runs by inspecting ``step.fn`` itself (``type(step.fn) is
+BoundFramesTargetCall`` and ``step.fn.target is <the exact reviewed
+callable>``), not by trusting a separately-suppliable label or marker. See
+``BoundFramesTargetCall``'s docstring in
 ``pipeline/types.py`` and ``pipeline.execution_state.bound_configuration``.
 
 Building a ``BoundStep`` here never itself establishes payload conformance

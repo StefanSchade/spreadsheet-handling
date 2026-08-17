@@ -147,8 +147,8 @@ DTVM-REVIEW-F2. Trusted Ingress (Phase E, complete) established admission/
 classification at the framework-managed entry points, not carrier
 normalization; general scalar normalization and canonical carrier
 resolution were not part of that work and remain a separate, currently
-undecided question, not owned by this module or by any current or future
-Phase.
+undecided question, not owned by this module or by any currently accepted,
+authorized, or planned phase.
 
 `None` is the most common Missing carrier, but it is not the only one
 `is_missing_carrier` recognizes (`""` and the NaN/`pandas.NA`/`NaT`/

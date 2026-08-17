@@ -44,12 +44,12 @@ def _freeze_effective_value(value: Any) -> Any:
     mutable nested element). Any other value -- an already-immutable
     scalar, or a shape outside this closed vocabulary (e.g. a DataFrame, a
     plugin's own object, a callback) -- is returned by reference: this is a
-    generic binder used by many non-E4-reviewed targets too, and any value
-    shape outside dict/list/tuple/scalar is never accepted by an E4
-    classifier regardless (see
-    ``pipeline.execution_state.bound_configuration``), so there is nothing
-    E4-relevant to protect for it, and copying it would only risk changing
-    identity-sensitive non-E4 behavior for no benefit.
+    generic binder used by many targets too. A controlled-role classifier
+    must fail closed when such a by-reference leaf can affect semantics on
+    which its certificate relies (see
+    ``pipeline.execution_state.bound_configuration``); the binder itself does
+    not claim arbitrary-object immutability. Copying opaque leaves here would
+    risk changing identity-sensitive trusted-programmatic behavior.
     """
     if type(value) is dict or type(value) is MappingProxyType:
         return MappingProxyType(
@@ -148,9 +148,12 @@ class BoundFramesTargetCall:
       section 18.4).
 
     The invariant this class now owns is: **every object
-    ``resolve_trusted_call`` can accept owns an immutable effective
-    execution snapshot from the instant construction completes** -- not
-    merely the subset built through one particular classmethod.
+    ``resolve_trusted_call`` can accept has one authoritative effective
+    binding snapshot from the instant construction completes** -- not merely
+    the subset built through one particular classmethod. Its supported
+    container structure is immutable; arbitrary leaves may remain by
+    reference for trusted-programmatic compatibility and therefore require a
+    separate fail-closed classifier check before controlled-role authority.
     ``@dataclass(frozen=True, slots=True)`` makes ordinary attribute
     reassignment raise ``FrozenInstanceError`` for both fields, and
     ``__post_init__`` unconditionally replaces whatever ``kwargs`` object
@@ -158,12 +161,15 @@ class BoundFramesTargetCall:
     canonical, deep-frozen result -- there is no supported constructor
     argument, keyword, or classmethod that skips this. A caller mutating
     the *original* dict/list/``MappingProxyType`` it passed in after
-    construction cannot affect this call's stored configuration, because
-    the stored structures share no mutable object with anything the caller
-    still holds. Classifiers read ``self.kwargs`` directly (the exact
-    frozen structure ``__call__`` also reads, via
-    :func:`_thaw_effective_value`), so there is no separate "classifier
-    snapshot" that could itself drift from what executes.
+    construction cannot affect this call's stored container structure,
+    because those containers are rebuilt without caller-held aliases.
+    Opaque leaves outside the freeze vocabulary may still be shared; a
+    certificate may depend on them only if its classifier represents them in
+    a closed stable contract, and otherwise must return ``Uncertified``.
+    Classifiers read ``self.kwargs`` directly (the authoritative frozen
+    structure ``__call__`` also reads, via :func:`_thaw_effective_value`), so
+    there is no separate "classifier snapshot" that could itself drift from
+    what executes.
 
     Normal-construction threat boundary: this invariant covers ordinary
     Python construction, attribute assignment, and container mutation

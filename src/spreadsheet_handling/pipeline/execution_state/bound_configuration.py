@@ -49,15 +49,16 @@ therefore has two independent parts, both required:
    in ``pipeline/types.py``, for exactly the closed shapes that vocabulary
    covers: every ``dict``/``MappingProxyType`` recursively becomes a new,
    owned ``MappingProxyType``, and every ``list``/``tuple`` becomes a new
-   ``tuple``, all the way down. No caller-held reference -- top-level or
-   nested -- can reassign or mutate any part of *that* frozen result after
-   construction; a caller retains only its own original, now-disconnected
-   container. A value outside dict/``MappingProxyType``/list/tuple/scalar
-   (a DataFrame, a plugin's own object, a callback) is stored *by reference*
-   and is not made immutable by this freeze -- but no E4 classifier in this
-   package certifies such a shape regardless (an uncovered value yields
-   ``None``/``Uncertified``, never a best-effort read), so there is nothing
-   E4-relevant left unprotected.
+   ``tuple``, all the way down. No caller-held reference can reassign or
+   mutate any part of *that supported container structure* after construction;
+   a caller retains only its own original, now-disconnected containers. A
+   value outside dict/``MappingProxyType``/list/tuple/scalar (a DataFrame, a
+   plugin's own object, a callback) is stored *by reference* and is not made
+   immutable by this freeze. The binder deliberately makes no universal
+   object-graph claim. Instead, a controlled-role classifier must return
+   ``Uncertified`` whenever such a by-reference value can participate in the
+   certificate-relevant execution semantics; trusted direct/programmatic
+   execution may retain the target's existing public behavior.
 
 Every classifier in this package must therefore resolve the trusted call
 *first*, then snapshot the (now-provably-executed) configuration:
@@ -67,11 +68,13 @@ Every classifier in this package must therefore resolve the trusted call
   practice no caller-held mutation of a certificate-relevant closed shape,
   top-level or nested, remains possible after ``__post_init__``'s deep
   freeze;
-* every accepted value is additionally copied into a new, closed-type
-  immutable snapshot (``str`` / ``bool`` / ``int`` / ``float`` / ``None`` /
-  ``tuple[str, ...]``) before it is placed in a returned certificate, so a
-  certificate's meaning is self-contained and does not depend on
-  ``BoundFramesTargetCall.kwargs`` remaining reachable or unchanged.
+* every value placed in a returned certificate is additionally copied into a
+  new, closed-type immutable snapshot (``str`` / ``bool`` / ``int`` /
+  ``float`` / ``None`` / ``tuple[str, ...]``); and every other effective
+  option on which controlled-role authorization depends must still fit the
+  classifier's closed immutable certifiability contract, even when its
+  family-specific semantic validation stays with the target. Unsupported
+  by-reference shapes return ``Uncertified`` rather than receiving authority.
 
 A configuration key outside a classifier's declared closed vocabulary, or a
 value that is not one of the closed scalar/string-sequence shapes below,
@@ -93,15 +96,15 @@ def resolve_trusted_call(
     Returns ``step.fn`` itself only when it is *exactly* a
     ``BoundFramesTargetCall`` (never a subclass) whose ``target`` is
     identically (``is``) ``expected_target``. Because
-    ``BoundFramesTargetCall.__call__`` mechanically executes
-    ``self.target(frames, **self.kwargs)``, this is a structural proof that
-    ``step`` executes ``expected_target`` with exactly the configuration
-    named by the returned object's ``kwargs`` -- not a caller-suppliable
-    label that could describe one behavior while ``step.fn`` performs
-    another. This is a necessary precondition for certification, checked
-    before any configuration inspection: a step failing this check is
-    UNCERTIFIED regardless of how closely its ``config`` resembles a
-    reviewed invocation.
+    ``BoundFramesTargetCall.__call__`` mechanically materializes fresh local
+    containers from ``self.kwargs`` and invokes ``self.target(frames,
+    **materialized)``, this is a structural proof that ``step`` executes
+    ``expected_target`` with the configuration described by that authoritative
+    snapshot -- not a caller-suppliable label that could describe one behavior
+    while ``step.fn`` performs another. This is a necessary precondition for
+    certification, checked before any configuration inspection: a step failing
+    this check is UNCERTIFIED regardless of how closely its ``config``
+    resembles a reviewed invocation.
     """
     call = step.fn
     if type(call) is not BoundFramesTargetCall:

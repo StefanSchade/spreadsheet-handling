@@ -85,8 +85,9 @@ def classify_formula_helper_step(step: BoundStep) -> FormulaHelperCertificate | 
     looks exactly like a reviewed invocation but does not structurally
     execute ``enrich_lookup`` (forged, or hand-constructed with an unrelated
     ``fn``) is UNCERTIFIED regardless of its configuration. Configuration is
-    then read from ``call.kwargs`` -- the exact mapping that call actually
-    executes with -- fresh on every invocation.
+    then read from ``call.kwargs`` -- the authoritative frozen snapshot from
+    which the call materializes fresh invocation-local keyword containers --
+    on every classification attempt.
     """
     call = resolve_trusted_call(step, expected_target=enrich_lookup)
     if call is None:
