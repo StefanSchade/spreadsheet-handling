@@ -145,10 +145,10 @@ def orchestrate(
     payload-conformance establishment does not itself authorize an
     untrusted/less-trusted pipeline description (dotted plugin targets, YAML
     step configuration) -- that is a separate concern owned by the pipeline
-    builder's description-authorization boundary (``pipeline.build``'s
-    ``description_authorization`` parameter, wired through
-    :func:`spreadsheet_handling.pipeline.runner.run_app`), not applied
-    automatically here. See ``docs/ai_info/interfaces_and_gates.adoc`` and
+    builder's dedicated less-trusted-description authorization boundary,
+    wired through :func:`spreadsheet_handling.pipeline.runner.run_app`, not
+    applied automatically here. See
+    ``docs/ai_info/interfaces_and_gates.adoc`` and
     ``docs/technical_model/ch06_architectural_layers/architectural_layers.adoc``
     ("Description and Resource Authority") for the complete
     programmatic-surface matrix.
