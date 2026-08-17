@@ -1,0 +1,292 @@
+= FTR-TRUSTED-INGRESS-DOCUMENTATION-CONDENSATION-P4A -- Slice A+B Final Bounded Acceptance Follow-up
+:toc: left
+:toclevels: 3
+
+Fresh, independent, final bounded acceptance review of the two correction
+commits that closed the residual A+B findings (Blocking B-2, Blocking B-3,
+Minor M-1) from the prior runtime review at `aebc40e`. Review only: no
+runtime, test, or documentation file was modified. Work was performed on
+`main`; no branch was created and nothing was pushed.
+
+== 1. Scope and baseline
+
+Starting `HEAD` was verified exactly as
+`5b4e0d33fb1777c05864a3557e50fab423099392`
+(`docs(trusted-ingress): close residual A+B review findings`), with a clean
+worktree.
+
+Correction commits reviewed:
+
+* `eae9ab416ea69abcd82e36cc4384a516e0ed16b6` --
+  `fix(trusted-ingress): close mutable expand binding certification seam`; and
+* `5b4e0d33fb1777c05864a3557e50fab423099392` --
+  `docs(trusted-ingress): close residual A+B review findings`.
+
+`git diff --stat aebc40e HEAD` confirms exactly four files changed:
+`grouped_matrix.py` (+3), the transition test file (+83), the FTR (+18/-2),
+and `orchestrator.py` (+4/-4, net 8 lines touched). Only these two commits,
+the prior `AB_runtime_review.adoc`, and the current source needed to verify
+them were read; the complete A+B review was not rerun.
+
+Phase E remains *COMPLETE*. Documentation closure remains *OPEN*. No
+historical evidence was archived. Phase F / D-T3 remains gated.
+
+== 2. B-2 -- expand-grouped certifiability seam (RESOLVED)
+
+`eae9ab4` adds, immediately after the existing `only_known_keys` check in
+`classify_expand_grouped_step` (`grouped_matrix.py:428-430`):
+
+[source,python]
+----
+unsupported = _unsupported_grouped_option(config)
+if unsupported is not None:
+    return Uncertified(reason="unsupported_configuration_value", detail=unsupported)
+----
+
+This is the identical closed-representation gate already used by
+`_classify_contract`/`_classify_reconstruct`, called here with no
+`scalar_only` set -- correct, since no `_EXPAND_KNOWN_KEYS` option plays
+`fill_value`'s direct-cell-content-injection role.
+
+=== Exhaustive `_EXPAND_KNOWN_KEYS` audit
+
+All 14 current keys were read directly from `grouped_matrix.py:98-115` and
+checked against `expand_grouped_xref`'s signature
+(`composites.py:235-251`), `_unsupported_grouped_option`
+(`grouped_matrix.py:256-278`), and `snapshot_scalar`/
+`snapshot_string_sequence` (`bound_configuration.py`):
+
+[cols="2,3,4",options="header"]
+|===
+| Option | Path through the classifier | Disposition
+
+| `matrix`, `output`, `source_frame`, `value`, `drop_source`, `base_relation`
+| Explicitly extracted via `snapshot_scalar`, additionally validated
+  non-empty/`bool`-typed, and stored in `ExpandGroupedCertificate`
+| Closed scalar; safe
+
+| `row_keys`, `key_column`, `label_columns`, `column_key`, `value_columns`,
+  `order_columns`, `xref_config_id`
+| Not stored in the certificate, but present keys must pass
+  `_unsupported_grouped_option`: scalar (`str`/`bool`/`int`/`float`/`None`)
+  or a `str`/`list`/`tuple` of exact `str`, frozen into an owned tuple by
+  `snapshot_string_sequence`
+| Closed scalar or frozen string-sequence; a non-`str`-element or
+  caller-owned custom iterable is rejected `Uncertified`, not silently
+  passed through
+
+| `order_policy`
+| Same generic gate; only ever exercised as a scalar `str` in current
+  tests/config
+| Closed scalar/default only
+|===
+
+The report's 6/7/1 categorization matches the code exactly (verified by
+direct reading, not by trusting the summary).
+
+`_unsupported_grouped_option` iterates every key *present* in `call.kwargs`
+(already filtered to `_EXPAND_KNOWN_KEYS` by `only_known_keys`), not only
+the six keys the certificate stores -- so a by-reference leaf on an
+*unused* option (e.g. `order_columns`, `xref_config_id`) is rejected exactly
+as strictly as one that feeds the certificate. This mirrors the precedent
+`_classify_reconstruct` already established and is stronger than the
+acceptance criterion strictly requires.
+
+*Confirmed*: no currently `CERTIFIED` `expand_grouped_xref` configuration
+can retain a caller-mutable by-reference value, whether or not that value's
+key is one the certificate itself stores.
+
+=== Independent probe of the original B-2 defect
+
+A standalone script (not reusing the new regression test's fixtures)
+constructed a fresh `MutableLabelColumns` iterable class, bound it through
+the real `build_steps_from_config` builder as `expand_grouped_xref`'s
+`label_columns`, and drove `classify_expand_grouped_step` directly:
+
+[source,text]
+----
+step.fn.kwargs["label_columns"] is label_columns        # True: authentic by-reference binding
+classify_expand_grouped_step(step)
+  -> Uncertified(reason="unsupported_configuration_value", detail="label_columns")
+label_columns.names[0] = "MUTATED"; label_columns.names.append("group_c")
+classify_expand_grouped_step(step)
+  -> Uncertified(reason="unsupported_configuration_value", detail="label_columns")   # unchanged
+----
+
+Both the pre-mutation and post-mutation classifications are `Uncertified`
+with the exact reason/detail the task specified.
+
+=== Public compatibility
+
+A second independent script exercised the *same* bound step's direct call
+(`step(grouped_frames)`, `grouped_frames` built through the real
+`contract_grouped_xref`) with the same custom mutable `label_columns`
+object still attached, after confirming controlled-role certification
+rejects it. Direct/trusted execution succeeded and returned the expected
+restored frame -- certification narrowing does not narrow the underlying
+family API; no gratuitous family-API restriction was introduced.
+
+== 3. New regression tests
+
+`eae9ab4`'s two additions to
+`tests/unit/pipeline/execution_state/test_grouped_matrix_transition.py`
+were read and run:
+
+* `test_expand_mutable_iterable_is_uncertified_but_direct_runtime_remains_supported`
+  -- authentic `build_steps_from_config` binding of a mutable `_MutableNames`
+  iterable (the same helper class already vetted for the contract-side B-1
+  fix), asserts `step.fn.kwargs["label_columns"] is label_columns`,
+  `Uncertified` before *and* after mutation, then drives the real step
+  against frames built via `contract_grouped_xref` and checks the restored
+  output;
+* `test_expand_closed_scalar_and_string_sequence_options_remain_certifiable`
+  -- a representative closed configuration (tuple `row_keys`, list
+  `label_columns`/`value_columns`, string `base_relation`/`order_policy`,
+  tuple `order_columns`, string `xref_config_id`) certifies to the exact
+  expected `ExpandGroupedCertificate`.
+
+Both use the maintained `build_steps_from_config`/`_expand_step` builder
+path, not a hand-built certificate. Together with the independent probes in
+section 2, they materially prove all four required properties: mutable
+custom `label_columns` uncertified; mutation after binding cannot coexist
+with certification; representative closed configurations still certify;
+direct/trusted expansion remains compatible.
+
+== 4. Transition-test result
+
+[source,text]
+----
+pytest -q tests/unit/pipeline/execution_state/test_grouped_matrix_transition.py \
+          tests/architecture/dependency_guards/test_description_authorization_boundary.py
+-> 25 passed
+pytest -q tests/unit/pipeline/execution_state/
+-> 90 passed
+----
+
+== 5. B-3 -- architecture guard (RESOLVED)
+
+`5b4e0d3` rewords `orchestrator.py:145-150`'s docstring cross-reference from
+naming `pipeline.build`'s `` ``description_authorization`` `` parameter
+verbatim to "the pipeline builder's dedicated less-trusted-description
+authorization boundary". `grep -n description_authorization
+src/spreadsheet_handling/application/orchestrator.py` returns no match
+(exit 1). The docstring still states that less-trusted-description
+authorization belongs to the pipeline builder / `run_app` boundary and
+still points to `interfaces_and_gates.adoc` / `architectural_layers.adoc`;
+it introduces no import, parameter, policy object, resolver, authorization
+logic, or raw-description responsibility.
+
+`tests/architecture/dependency_guards/test_description_authorization_boundary.py::test_orchestrator_has_no_e7_policy_or_raw_description_responsibility`
+was run individually and as part of the full guard file (section 4): both
+pass. The guard was not modified and is not proposed for weakening.
+
+== 6. M-1 -- evidence wording (RESOLVED)
+
+`FTR-TRUSTED-INGRESS-P4A.adoc` section 48 (verified at its current text) now
+states the guard failure "was pre-existing relative to the later runtime
+correction commits but inherited from the still-unaccepted A+B documentation
+commit `44c24a1`, outside those runtime corrections' own diffs; it was
+therefore within A+B acceptance scope, not unrelated" -- replacing the prior
+"unrelated baseline defect" wording the follow-up review flagged as too
+broad.
+
+The added expand-seam paragraph accurately records: the later bounded A+B
+runtime review at `aebc40e` discovered the reverse-transition seam;
+`eae9ab4` extends the same closed certifiability rule to it; the trusted
+direct family API remains available; this is corrective evidence, not a
+Phase E reopening. The section's closing sentence unchanged from before this
+follow-up: "Phase E remains *COMPLETE*; documentation closure remains
+*OPEN*; Slice A+B require fresh bounded acceptance; Slice C+D+E remain
+blocked; historical evidence remains unarchived; and Phase F / D-T3 remains
+gated."
+
+== 7. Regression check
+
+Bounded, per task scope:
+
+* `_classify_contract`/`_classify_reconstruct` are byte-for-byte unchanged
+  by both correction commits (confirmed via `git diff --stat`: only
+  `classify_expand_grouped_step` gained the new gate); B-1's `fill_value`
+  scalar-only seam (`scalar_only=frozenset({"fill_value"})`,
+  `grouped_matrix.py:187-189`) is untouched and remains closed;
+* `classify_expand_grouped_step` needed no new `scalar_only` set (no
+  `_EXPAND_KNOWN_KEYS` option plays `fill_value`'s content-injection role);
+  none was added;
+* no grouped-family semantic parsing moved into execution-state code -- the
+  diff is exactly the four-line gate call plus tests;
+* `pipeline/types.py`'s freeze/thaw mechanism (`_freeze_effective_value`,
+  `_thaw_effective_value`, `BoundFramesTargetCall`) is untouched by either
+  commit; no deepcopy/object-graph freeze was introduced;
+* `ExpandGroupedCertificate`'s fields and
+  `resolve_grouped_matrix_expand_transition` are unchanged -- no
+  controlled-role kind/composition rule changed;
+* `git diff --stat aebc40e HEAD` touches exactly `grouped_matrix.py`, the
+  transition test file, `FTR-TRUSTED-INGRESS-P4A.adoc`, and
+  `orchestrator.py` -- `docs/semantic_model/semantic_model.adoc` and
+  `docs/technical_model/technical_model.adoc` were not touched;
+* `orchestrator.py` still has zero E7 policy responsibility: no import of
+  `description_authorization`, no added parameter, confirmed by both the
+  architecture guard and direct reading.
+
+No material regression found.
+
+== 8. Full-suite and render results
+
+[source,text]
+----
+make test
+-> 2833 passed, 1 deselected in 13.19s
+----
+
+Exact match to the expected implementation-report number (2833 passed, 1
+deselected, 0 failed).
+
+`git diff --check` (working tree, and `aebc40e..HEAD`): exit 0, no issues.
+
+`asciidoctor --failure-level=ERROR`:
+
+* `docs/semantic_model/semantic_model.adoc`: exit 0;
+* `docs/technical_model/technical_model.adoc`: exit 0;
+* `docs/backlog/FTR-TRUSTED-INGRESS-P4A.adoc`: exit 0;
+* this review artifact: exit 0 (verified after drafting).
+
+== 9. Findings
+
+No Blocking or Important findings survived independent verification.
+
+No Minor finding is raised in this follow-up: the one Minor item from the
+prior review (M-1, wording) is resolved per section 6, and no new
+non-contractual observation rose to the level of worth recording.
+
+Finding count: *0 Blocking, 0 Important, 0 Minor*.
+
+== 10. Verdict
+
+*A. ACCEPTED.*
+
+B-2 is resolved: the same closed-representation gate `4dabbed` established
+for the two grouped producers now covers `classify_expand_grouped_step`,
+verified by direct code reading, an exhaustive per-key audit of all 14
+`_EXPAND_KNOWN_KEYS` entries, and two independent probes (not only the new
+regression test) confirming a fresh caller-owned mutable `label_columns`
+iterable is rejected both before and after mutation, while trusted
+direct/programmatic execution remains available. B-3 is resolved: the
+unchanged architecture guard passes against the reworded docstring, and
+`orchestrator.py` retains zero description-authorization responsibility.
+M-1 is resolved: the evidence note's "unrelated" mischaracterization is
+corrected to accurately scope the guard failure within A+B acceptance
+scope. No material regression was found in the bounded check, and the full
+suite reproduces the expected *2833 passed, 1 deselected, 0 failed*.
+
+Phase E remains *COMPLETE*.
+
+Documentation closure remains *OPEN*.
+
+No historical evidence was archived.
+
+Phase F / D-T3 remains gated.
+
+TRUSTED INGRESS DOCUMENTATION CONDENSATION
+SLICE A + B INDEPENDENTLY ACCEPTED --
+READY FOR SLICE C + D + E IMPLEMENTATION;
+DOCUMENTATION CLOSURE REMAINS OPEN.
