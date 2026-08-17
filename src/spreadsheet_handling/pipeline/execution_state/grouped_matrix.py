@@ -184,6 +184,11 @@ def _classify_contract(config: Mapping[str, Any]) -> GroupedProducerCertificate 
         # frame-valued configuration defaults UNCERTIFIED rather than
         # under-declaring the footprint (FTR section 4).
         return Uncertified(reason="uncovered_configuration", detail="dense_axes")
+    unsupported = _unsupported_grouped_option(
+        config, scalar_only=frozenset({"fill_value"})
+    )
+    if unsupported is not None:
+        return Uncertified(reason="unsupported_configuration_value", detail=unsupported)
     relation = snapshot_scalar(config.get("relation"))
     output = snapshot_scalar(config.get("output"))
     source_frame = snapshot_scalar(config.get("source_frame"))
@@ -217,6 +222,9 @@ def _classify_contract(config: Mapping[str, Any]) -> GroupedProducerCertificate 
 def _classify_reconstruct(config: Mapping[str, Any]) -> GroupedProducerCertificate | Uncertified:
     if not only_known_keys(config, known=_RECONSTRUCT_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="reconstruct_grouped_matrix")
+    unsupported = _unsupported_grouped_option(config)
+    if unsupported is not None:
+        return Uncertified(reason="unsupported_configuration_value", detail=unsupported)
     table = snapshot_scalar(config.get("table"))
     output = snapshot_scalar(config.get("output"))
     source_frame = snapshot_scalar(config.get("source_frame"))
@@ -243,6 +251,31 @@ def _classify_reconstruct(config: Mapping[str, Any]) -> GroupedProducerCertifica
 
 def _is_nonempty_str(value: object) -> bool:
     return type(value) is str and value != ""
+
+
+def _unsupported_grouped_option(
+    config: Mapping[str, Any], *, scalar_only: frozenset[str] = frozenset()
+) -> str | None:
+    """Find the first option outside the grouped certificate's closed shapes.
+
+    The binder has already disconnected exact ``dict``/``list``/``tuple``
+    containers from caller-held aliases. Grouped-producer options need only
+    exact immutable scalars or frozen string sequences; arbitrary iterable or
+    object leaves remain by reference and therefore cannot participate in a
+    controlled-role certificate. ``fill_value`` is scalar-only because
+    ``contract_xref`` writes it directly into missing ``GroupedMatrix`` cells.
+
+    This is a representation check, not a reimplementation of grouped-XRef
+    parsing or semantic validation. The family remains responsible for whether
+    a represented value is meaningful for its particular option.
+    """
+    for key, value in config.items():
+        if snapshot_scalar(value) is not None or value is None:
+            continue
+        if key not in scalar_only and snapshot_string_sequence(value) is not None:
+            continue
+        return key
+    return None
 
 
 def grouped_matrix_role(certificate: GroupedProducerCertificate) -> GroupedMatrixRole:

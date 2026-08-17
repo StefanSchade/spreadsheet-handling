@@ -23,6 +23,7 @@ from spreadsheet_handling.pipeline.execution_state import (
     disjoint_grouped_introduction,
     grouped_matrix_role,
 )
+from spreadsheet_handling.pipeline.types import BoundFramesTargetCall
 
 pytestmark = pytest.mark.ftr("FTR-TRUSTED-INGRESS-P4A")
 
@@ -52,6 +53,19 @@ def _reconstruct_step(**overrides: object):
     }
     config.update(overrides)
     return build_steps_from_config([{"step": "reconstruct_grouped_matrix", **config}])[0]
+
+
+class _MutableFill:
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+
+class _MutableNames:
+    def __init__(self, *names: str) -> None:
+        self.names = list(names)
+
+    def __iter__(self):
+        return iter(self.names)
 
 
 def test_contract_grouped_xref_produces_the_expected_descriptor() -> None:
@@ -88,6 +102,82 @@ def test_reconstruct_grouped_matrix_produces_the_expected_descriptor() -> None:
 def test_unknown_option_is_uncertified() -> None:
     certificate = classify_grouped_producer_step(_contract_step(fill_value="", extra_unreviewed=1))
     assert certificate == Uncertified(reason="unknown_option", detail="contract_grouped_xref")
+
+
+def test_mutable_fill_value_is_uncertified_but_direct_runtime_remains_supported() -> None:
+    fill = _MutableFill("before")
+    step = _contract_step(column_keys=["k1", "k2"], fill_value=fill)
+
+    # Authentic maintained binding, including the exact by-reference leaf
+    # that previously received a GroupedProducerCertificate.
+    assert type(step.fn) is BoundFramesTargetCall
+    assert step.fn.kwargs["fill_value"] is fill
+    assert classify_grouped_producer_step(step) == Uncertified(
+        reason="unsupported_configuration_value", detail="fill_value"
+    )
+
+    # Certification fails closed, while the trusted direct/programmatic API's
+    # existing Any-valued fill behavior remains unchanged.
+    fill.marker = "after"
+    frames = {
+        "source": pd.DataFrame(
+            [{"variable_id": "v1", "column_key": "k1", "value": "present"}]
+        ),
+        "variables": pd.DataFrame(
+            {"variable_id": ["k1", "k2"], "group": ["G1", "G2"]}
+        ),
+        "_meta": {},
+    }
+    result = step(frames)
+    missing_cell = result["grouped"].frame["k2"].iloc[0]
+    assert missing_cell is fill
+    assert missing_cell.marker == "after"
+
+
+@pytest.mark.parametrize("fill_value", ["", None, False, 0, 1.5])
+def test_closed_scalar_fill_values_remain_certifiable(fill_value: object) -> None:
+    certificate = classify_grouped_producer_step(_contract_step(fill_value=fill_value))
+    assert isinstance(certificate, GroupedProducerCertificate)
+
+
+def test_omitted_default_fill_value_remains_certifiable() -> None:
+    certificate = classify_grouped_producer_step(_contract_step())
+    assert isinstance(certificate, GroupedProducerCertificate)
+
+
+def test_mutable_iterable_grouped_option_is_also_uncertified() -> None:
+    label_columns = _MutableNames("group_a")
+    step = _contract_step(label_columns=label_columns)
+
+    assert step.fn.kwargs["label_columns"] is label_columns
+    assert classify_grouped_producer_step(step) == Uncertified(
+        reason="unsupported_configuration_value", detail="label_columns"
+    )
+
+    # This sibling is role-relevant too: mutation changes the visible grouped
+    # header selected by the direct family call, without changing that API.
+    label_columns.names[:] = ["group_b"]
+    frames = {
+        "source": pd.DataFrame(
+            [{"variable_id": "v1", "column_key": "k1", "value": "present"}]
+        ),
+        "variables": pd.DataFrame(
+            {"variable_id": ["k1"], "group_a": ["A"], "group_b": ["B"]}
+        ),
+        "_meta": {},
+    }
+    result = step(frames)
+    assert result["grouped"].header.columns[1].labels == ("B",)
+
+
+def test_reconstruct_mutable_iterable_option_is_uncertified() -> None:
+    label_columns = _MutableNames("group")
+    certificate = classify_grouped_producer_step(
+        _reconstruct_step(label_columns=label_columns)
+    )
+    assert certificate == Uncertified(
+        reason="unsupported_configuration_value", detail="label_columns"
+    )
 
 
 def test_dense_axes_is_unrepresentable_and_stays_uncertified() -> None:
