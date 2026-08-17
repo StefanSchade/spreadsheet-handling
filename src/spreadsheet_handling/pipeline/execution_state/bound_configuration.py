@@ -31,26 +31,29 @@ therefore has two independent parts, both required:
    exactly what executes? Classifiers read ``step.fn.kwargs`` -- the *same*
    mapping ``BoundFramesTargetCall.__call__`` passes to ``target`` -- not a
    separately-built view, so there is no seam left where the two could
-   diverge. ``make_frames_target_step`` wraps that mapping in
-   ``types.MappingProxyType`` before binding, so a caller can no longer
-   reassign a top-level key after binding; a ``TypeError`` is raised
-   instead. A caller can still mutate a *nested* mutable value (e.g. a list
-   under a dict key) in place, but that changes what actually executes
-   identically, because there is only one copy of it -- a real,
-   consistently-observed change, not a divergence.
+   diverge. ``BoundFramesTargetCall.__post_init__`` is the sole construction
+   path (an earlier ``.bind()`` path was found to be a second, bypassable
+   construction route and was removed) and unconditionally *deep*-freezes
+   ``kwargs`` through ``_freeze_effective_kwargs``/``_freeze_effective_value``
+   in ``pipeline/types.py``: every ``dict``/``MappingProxyType`` recursively
+   becomes a new, owned ``MappingProxyType`` and every ``list``/``tuple``
+   becomes a new ``tuple``, all the way down. No caller-held reference --
+   top-level or nested -- can reassign or mutate any part of the frozen
+   result after construction; a caller retains only its own original,
+   now-disconnected container.
 
 Every classifier in this package must therefore resolve the trusted call
 *first*, then snapshot the (now-provably-executed) configuration:
 
 * every ``classify_*`` function re-reads ``step.fn``/``step.fn.kwargs``
-  fresh on every call -- nothing about a ``BoundStep`` is cached -- so a
-  mutation made *before* classification (of a nested value; top-level
-  reassignment is no longer possible) is honestly reflected in the answer;
-* every accepted value is immediately copied into a new, closed-type
+  fresh on every call -- nothing about a ``BoundStep`` is cached -- though in
+  practice no caller-held mutation, top-level or nested, remains possible
+  after ``__post_init__``'s deep freeze;
+* every accepted value is additionally copied into a new, closed-type
   immutable snapshot (``str`` / ``bool`` / ``int`` / ``float`` / ``None`` /
   ``tuple[str, ...]``) before it is placed in a returned certificate, so a
-  later nested mutation cannot retroactively change an already-returned
-  certificate's meaning.
+  certificate's meaning is self-contained and does not depend on
+  ``BoundFramesTargetCall.kwargs`` remaining reachable or unchanged.
 
 A configuration key outside a classifier's declared closed vocabulary, or a
 value that is not one of the closed scalar/string-sequence shapes below,

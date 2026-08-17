@@ -84,13 +84,17 @@ Explicitly out of this vocabulary, on purpose, not by omission:
   rejected (`ADR-DOMAIN-BOUNDARY-ROBUSTNESS`).
 
 This module does not decide what happens to an unsupported value at any real
-ingress point -- it classifies, it does not enforce. No adapter, CLI, or
-domain transformation is wired to call it by this slice; that wiring is
-explicitly Phase E's job. The five existing local `is_missing_carrier`-shaped
-predicates are not retrofitted to import this one by this slice either (see
-the FTR's own D1 acceptance note) -- this module only makes the predicate
-available at a location every future implementer can reach without crossing
-an unwanted `io_backends` -> `domain` dependency.
+ingress point -- it classifies, it does not enforce. Trusted Ingress (Phase
+E, complete) is the framework code that calls this classifier at the
+framework-managed entry points to establish and re-establish
+Ingress-Conformant Domain Payload; see
+`docs/technical_model/ch06_architectural_layers/architectural_layers.adoc`,
+"Establishing and Re-establishing the Domain Scalar Language". The five
+historical local `is_missing_carrier`-shaped predicates predating this module
+were not retrofitted to import this one merely by this module's own
+introduction (see the FTR's own D1 acceptance note); this module's role
+remains to make the predicate available at a location every caller can reach
+without crossing an unwanted `io_backends` -> `domain` dependency.
 """
 from __future__ import annotations
 
