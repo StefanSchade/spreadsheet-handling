@@ -425,6 +425,9 @@ def classify_expand_grouped_step(step: BoundStep) -> ExpandGroupedCertificate | 
     config = call.kwargs
     if not only_known_keys(config, known=_EXPAND_KNOWN_KEYS):
         return Uncertified(reason="unknown_option", detail="expand_grouped_xref")
+    unsupported = _unsupported_grouped_option(config)
+    if unsupported is not None:
+        return Uncertified(reason="unsupported_configuration_value", detail=unsupported)
     matrix = snapshot_scalar(config.get("matrix"))
     output = snapshot_scalar(config.get("output"))
     source_frame = snapshot_scalar(config.get("source_frame"))

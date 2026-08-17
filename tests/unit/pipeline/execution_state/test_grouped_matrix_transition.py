@@ -15,10 +15,12 @@ from spreadsheet_handling.domain.transformations.grouped_xref import contract_gr
 from spreadsheet_handling.domain.transformations.xref_axis_mapping import AxisMappingError
 from spreadsheet_handling.pipeline.build import build_steps_from_config
 from spreadsheet_handling.pipeline.execution_state import (
+    ExpandGroupedCertificate,
     GroupedMatrixRole,
     GroupedProducerCertificate,
     TransitionEffect,
     Uncertified,
+    classify_expand_grouped_step,
     classify_grouped_producer_step,
     disjoint_grouped_introduction,
     grouped_matrix_role,
@@ -53,6 +55,21 @@ def _reconstruct_step(**overrides: object):
     }
     config.update(overrides)
     return build_steps_from_config([{"step": "reconstruct_grouped_matrix", **config}])[0]
+
+
+def _expand_step(**overrides: object):
+    config = {
+        "matrix": "grouped",
+        "output": "expanded",
+        "row_keys": ["variable_id"],
+        "source_frame": "variables",
+        "key_column": "variable_id",
+        "label_columns": ["group"],
+        "column_key": "column_key",
+        "value": "value",
+    }
+    config.update(overrides)
+    return build_steps_from_config([{"step": "expand_grouped_xref", **config}])[0]
 
 
 class _MutableFill:
@@ -177,6 +194,72 @@ def test_reconstruct_mutable_iterable_option_is_uncertified() -> None:
     )
     assert certificate == Uncertified(
         reason="unsupported_configuration_value", detail="label_columns"
+    )
+
+
+def test_expand_mutable_iterable_is_uncertified_but_direct_runtime_remains_supported() -> None:
+    label_columns = _MutableNames("group_a")
+    step = _expand_step(label_columns=label_columns)
+
+    # The maintained binding retains this opaque leaf by reference, so the
+    # controlled-role classifier must reject it before granting authority.
+    assert type(step.fn) is BoundFramesTargetCall
+    assert step.fn.kwargs["label_columns"] is label_columns
+    assert classify_expand_grouped_step(step) == Uncertified(
+        reason="unsupported_configuration_value", detail="label_columns"
+    )
+
+    # Caller mutation cannot coexist with certification, while the trusted
+    # direct/programmatic family API continues to accept the custom iterable.
+    label_columns.names[:] = ["group_b"]
+    assert classify_expand_grouped_step(step) == Uncertified(
+        reason="unsupported_configuration_value", detail="label_columns"
+    )
+    frames = {
+        "source": pd.DataFrame(
+            [{"variable_id": "v1", "column_key": "k1", "value": "present"}]
+        ),
+        "variables": pd.DataFrame(
+            {"variable_id": ["k1"], "group_a": ["A"], "group_b": ["B"]}
+        ),
+        "_meta": {},
+    }
+    grouped_frames = contract_grouped_xref(
+        frames,
+        relation="source",
+        output="grouped",
+        row_keys="variable_id",
+        source_frame="variables",
+        key_column="variable_id",
+        label_columns=["group_b"],
+        column_key="column_key",
+        value="value",
+    )
+    assert step(grouped_frames)["expanded"].to_dict("records") == [
+        {"variable_id": "v1", "column_key": "k1", "value": "present"}
+    ]
+
+
+def test_expand_closed_scalar_and_string_sequence_options_remain_certifiable() -> None:
+    certificate = classify_expand_grouped_step(
+        _expand_step(
+            row_keys=("variable_id",),
+            label_columns=["group"],
+            value_columns=["k1"],
+            base_relation="base",
+            order_policy="columns",
+            order_columns=("sort_order",),
+            drop_source=True,
+            xref_config_id="grouped-roundtrip",
+        )
+    )
+    assert certificate == ExpandGroupedCertificate(
+        matrix="grouped",
+        output="expanded",
+        output_value_column="value",
+        source_frame="variables",
+        base_relation="base",
+        drop_source=True,
     )
 
 
