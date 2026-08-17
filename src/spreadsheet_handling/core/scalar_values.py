@@ -4,11 +4,16 @@ This module is the runtime slice of `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A`
 (String/Boolean/Number/Missing, Slice 1) and, since D-T1, also of
 `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` (Date/DateTime classification). It
 answers one narrow *value-model* question -- "is this payload representable
-in the framework's normal internal scalar space?" -- and does not answer any
-*ingress-policy* question ("what happens when it is not?") or *sink-capability*
-question ("may this pipeline emit it as a formula?"). Those remain Phase E
-(mandatory trusted ingress) and existing sink-local concerns respectively; see
-the FTR's "Handoff to Trusted Ingress" section.
+in the framework's normal internal scalar space?" -- and does not itself
+answer the *ingress-policy* question ("what happens when it is not?") or the
+*sink-capability* question ("may this pipeline emit it as a formula?"). The
+ingress-policy question is Trusted Ingress's job (Phase E, complete: it calls
+this classifier at the framework-managed entry points and rejects an
+unsupported value before ordinary Domain code sees it -- see
+`docs/technical_model/ch06_architectural_layers/architectural_layers.adoc`,
+"Establishing and Re-establishing the Domain Scalar Language"); the
+sink-capability question remains an existing, separate, sink-local concern
+this module does not address either way.
 
 Scope, restated from the FTR (do not re-derive elsewhere; extend the FTR
 instead of drifting this docstring out of sync with it):
@@ -135,12 +140,15 @@ posture. `scalar_category` is pure classification, not conversion (see its
 own docstring): it never narrows an accepted value down to this alias's
 literal members. No `normalize_scalar()`-shaped primitive exists anywhere in
 this module. Producing an actual normalized value from an accepted carrier
-(NumPy scalar variants, `pandas.Timestamp`, `numpy.datetime64` included)
-remains Phase E's "value normalization and type resolution" boundary-shape
-stage (`roadmap_domain_hardening_sequence.adoc` Phase E) -- a follow-on this
-slice deliberately does not provide, per Independent Review 001, finding
+(NumPy scalar variants, `pandas.Timestamp`, `numpy.datetime64` included) is a
+deliberate non-goal of this module, per Independent Review 001, finding
 IVM-REVIEW-F2, and per `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 12/
-DTVM-REVIEW-F2.
+DTVM-REVIEW-F2. Trusted Ingress (Phase E, complete) established admission/
+classification at the framework-managed entry points, not carrier
+normalization; general scalar normalization and canonical carrier
+resolution were not part of that work and remain a separate, currently
+undecided question, not owned by this module or by any current or future
+Phase.
 
 `None` is the most common Missing carrier, but it is not the only one
 `is_missing_carrier` recognizes (`""` and the NaN/`pandas.NA`/`NaT`/

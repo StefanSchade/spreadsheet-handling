@@ -15,10 +15,13 @@ therefore has two independent parts, both required:
    legitimate) and ``step.fn.target is expected_target`` (object identity
    against the actual imported callable, not a string label). Because
    ``BoundFramesTargetCall.__call__`` mechanically executes
-   ``self.target(frames, **self.kwargs)``, a step passing both checks
-   *cannot* execute anything other than ``expected_target`` called with
-   ``step.fn.kwargs`` -- there is no way to construct an instance whose
-   fields describe one behavior while ``__call__`` performs another. An
+   ``self.target(frames, **thawed(self.kwargs))`` -- a fresh,
+   invocation-local materialization of the same frozen ``self.kwargs``
+   snapshot (see part 2 below) -- a step passing both checks *cannot*
+   execute anything other than ``expected_target`` called with the exact
+   configuration that snapshot describes: there is no way to construct an
+   instance whose fields describe one behavior while ``__call__`` performs
+   another. An
    earlier mechanism (a ``BoundStep.binding`` sentinel, ``pipeline.types
    ._TRUSTED_BINDING``) checked only *object-identity possession of an
    importable module-level value*, which any caller could import and pass
@@ -28,27 +31,42 @@ therefore has two independent parts, both required:
 
 2. *Immutable effective configuration* (FTR section 18) -- given an
    authentic call, does the configuration a classifier reads still describe
-   exactly what executes? Classifiers read ``step.fn.kwargs`` -- the *same*
-   mapping ``BoundFramesTargetCall.__call__`` passes to ``target`` -- not a
-   separately-built view, so there is no seam left where the two could
-   diverge. ``BoundFramesTargetCall.__post_init__`` is the sole construction
-   path (an earlier ``.bind()`` path was found to be a second, bypassable
+   exactly what executes? Classifiers read ``step.fn.kwargs`` directly, and
+   ``BoundFramesTargetCall.__call__`` derives what it passes to ``target``
+   from that *same authoritative frozen snapshot* -- not a same mapping
+   *object*: ``__call__`` calls ``_thaw_effective_value(self.kwargs)`` to
+   materialize a fresh, invocation-local ``dict``/``list`` structure (so the
+   target's ordinary ``isinstance(x, dict)``-shaped call surface keeps
+   working), then invokes ``self.target(frames, **materialized)``. Both the
+   classifier's read and the thaw the target receives are reconstructed from
+   the one frozen ``self.kwargs``, so there is no seam where they could
+   describe different configurations -- but a classifier never receives the
+   literal object passed to ``target``, and the reverse is also true.
+   ``BoundFramesTargetCall.__post_init__`` is the sole construction path (an
+   earlier ``.bind()`` path was found to be a second, bypassable
    construction route and was removed) and unconditionally *deep*-freezes
    ``kwargs`` through ``_freeze_effective_kwargs``/``_freeze_effective_value``
-   in ``pipeline/types.py``: every ``dict``/``MappingProxyType`` recursively
-   becomes a new, owned ``MappingProxyType`` and every ``list``/``tuple``
-   becomes a new ``tuple``, all the way down. No caller-held reference --
-   top-level or nested -- can reassign or mutate any part of the frozen
-   result after construction; a caller retains only its own original,
-   now-disconnected container.
+   in ``pipeline/types.py``, for exactly the closed shapes that vocabulary
+   covers: every ``dict``/``MappingProxyType`` recursively becomes a new,
+   owned ``MappingProxyType``, and every ``list``/``tuple`` becomes a new
+   ``tuple``, all the way down. No caller-held reference -- top-level or
+   nested -- can reassign or mutate any part of *that* frozen result after
+   construction; a caller retains only its own original, now-disconnected
+   container. A value outside dict/``MappingProxyType``/list/tuple/scalar
+   (a DataFrame, a plugin's own object, a callback) is stored *by reference*
+   and is not made immutable by this freeze -- but no E4 classifier in this
+   package certifies such a shape regardless (an uncovered value yields
+   ``None``/``Uncertified``, never a best-effort read), so there is nothing
+   E4-relevant left unprotected.
 
 Every classifier in this package must therefore resolve the trusted call
 *first*, then snapshot the (now-provably-executed) configuration:
 
 * every ``classify_*`` function re-reads ``step.fn``/``step.fn.kwargs``
   fresh on every call -- nothing about a ``BoundStep`` is cached -- though in
-  practice no caller-held mutation, top-level or nested, remains possible
-  after ``__post_init__``'s deep freeze;
+  practice no caller-held mutation of a certificate-relevant closed shape,
+  top-level or nested, remains possible after ``__post_init__``'s deep
+  freeze;
 * every accepted value is additionally copied into a new, closed-type
   immutable snapshot (``str`` / ``bool`` / ``int`` / ``float`` / ``None`` /
   ``tuple[str, ...]``) before it is placed in a returned certificate, so a
