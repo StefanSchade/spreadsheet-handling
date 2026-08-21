@@ -1,0 +1,802 @@
+= FK / Reference-Helper Pilot: Cycle-0 Assessment -- Independent Review 001
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: independent adversarial architecture review. Read-only; authorizes no
+implementation, package move, registry change, DMC change, or Project Memory
+edit.
+
+Reviewed artifact::
+`docs/warm_storage/global_reviews/domain_fk_reference_helper_cycle0_assessment_2026-08-21.adoc`
+(the "Cycle-0 artifact"), unmodified by this review.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core` only.
+A `worldbuilding` sibling repository was not present in this review's
+workspace; its consumer evidence is treated as reported Cycle-0 evidence and
+could not be independently re-verified here (see <<f-006>>).
+
+Review baseline HEAD:: `e097c25ad00e9af0999f72d6920403fbaa886458`
+(`docs(domain): assess FK reference-helper pilot Cycle 0`), branch `main`,
+`main...origin/main [ahead 6]`. Worktree clean before this review, verified
+with `git status --short --branch` and `git rev-parse HEAD`.
+
+Review date:: 2026-08-21.
+
+== 1. Method
+
+This review read the canonical Domain Maintainer Contract
+(`docs/developer_guide/ch06_code_conventions/05_domain_maintainer_contract.adoc`)
+and the Human Readability Review Guide
+(`docs/developer_guide/ch06_code_conventions/03_human_readability_review.adoc`)
+completely, then the Cycle-0 artifact completely, then the three supporting
+assessments it cites: the consolidated semantic-ownership/topology
+assessment, its independent Review 001, and the historical hardening review
+signal inventory.
+
+It then independently inspected the actual runtime the Cycle-0 artifact
+describes rather than accepting its prose at face value:
+
+* `domain/transformations/fk_helpers/{provenance,drop,enrich,policy,formula_provider}.py`
+  in full;
+* `domain/transformations/derived_column_policy.py` in full;
+* `domain/transformations/enrich_lookup/{policy,operation}.py` (policy in
+  full; operation for its provenance-writing and public-surface shape);
+* `domain/helper_policies.py` in full;
+* `domain/validations/fk_helpers.py` in full;
+* `domain/schema_maintenance/meta_update.py` (the FK/Lookup handler
+  functions);
+* `pipeline/execution_state/formula_helper.py` (Trusted Ingress formula
+  certification) in full;
+* `core/refs.py` in full, plus a repository-wide grep for consumers;
+* `tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py`
+  in full;
+* the cross-family import guard
+  (`tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`)
+  and the FK-primitive Core-convention guard
+  (`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`);
+* relevant `registries/meta_registry.yaml` and
+  `registries/pipeline_step_registry.json` entries (FK/Lookup/derived
+  namespaces, the `on` deprecated alias, `helper_prefix`/`prefix`
+  compatibility parameters, `detect_fk`);
+* `docs/backlog/FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5.adoc`.
+
+A focused test run was executed rather than trusted from the artifact's
+report:
+
+[source,text]
+----
+.venv/bin/python -m pytest \
+  tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/validations/test_fk_check.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py \
+  -q
+----
+
+Result: 185 tests, all green, at the review baseline. This is a spot-check of
+the bounded evidence, not a re-run of the full 448-test suite the Cycle-0
+artifact reports; no reason was found to doubt that broader number.
+
+This review did not repeat the whole-Domain census the topology assessment
+and its own Review 001 already rejected, and did not extend the pilot's scope
+beyond the material edges the Cycle-0 artifact itself follows.
+
+== 2. Review Area 1 -- FK family boundary
+
+*Verdict: supported, high confidence, no correction required.*
+
+Direct code inspection confirms the family shares one metadata/lifecycle
+problem rather than merely a package: `drop.py::_columns_to_drop_by_sheet`,
+`policy.py::resolve_v2_fk_relations`, `provenance.py`, and
+`validations/fk_helpers.py::_expected_helper_columns_by_sheet` all consume
+the *same* v2 relation shape (`source_frame`, `source_column`, `target_frame`,
+`target_key`, `helper_columns[].column`) with the same
+provenance-preferred/policy-fallback precedence repeated verbatim in three
+places (`drop.py`, `validations/fk_helpers.py`,
+`derived_column_policy.py::_safe_policy_helper_names`). A single-sided change
+to that shape would silently break materialization, validation, layout, and
+both cleanup paths -- exactly the DMC's family test (internal semantic and
+metadata coupling; external references narrow and explicit).
+
+Layout (`reorder_helpers_next_to_fk`) living in the historically mixed
+`transformations/helpers.py` module does not weaken the family claim: the
+topology assessment's own evidence table already flags that module as
+"historical aggregation with a real header-shape pair among other helpers,"
+i.e. a package-hygiene question, not an ownership question. The DMC is
+explicit that package layout is not ownership evidence in either direction.
+
+FK-helper validation is genuinely family-owned and not shared reference-rule
+plumbing: `validate_fk_helpers`'s value-mismatch and unresolvable-FK checks
+require the FK relation's `target_key`/`value_field` to mean anything, which
+only the FK relation model supplies. This differs in kind from
+`reference_validations.py::validate_references`, which validates declarative
+primary/unique/foreign-key rules independent of the FK-helper projection.
+
+One accurate pre-existing observation from the Cycle-0 artifact (F.2) was
+independently confirmed in code: `check_duplicate_ids` inside
+`validate_fk_helpers` iterates *every* sheet (falling back to
+`defaults["id_field"]` for sheets that are not FK targets), not just
+FK-related ones, and is only reachable standalone. The artifact's disposition
+(a genuine but non-blocking Local Human Readability hotspot, not an ownership
+defect) is correct and needs no correction.
+
+== 3. Review Area 2 -- Lookup separation
+
+*Verdict: supported, high confidence, no correction required, with one
+evidence-provenance caveat (<<f-006>>).*
+
+`enrich_lookup/policy.py::_ResolvedKeys` and `_resolve_join_keys` confirm the
+artifact's central claim: Lookup's authoritative Intent is an explicit
+source/lookup/output projection request with its own symmetric/asymmetric
+key resolution, `missing`/`order`/`allowed`/`default` policy, and no read of
+`_meta.helper_policies.fk` or FK relation state anywhere in the module.
+`configure_lookup_helpers` in `helper_policies.py` writes to
+`_meta.helper_policies.lookup.<lookup>`, a namespace FK code never reads.
+`schema_maintenance/meta_update.py` independently confirms the separation at
+a third owner: `_handle_fk_policies` and `_handle_lookup_policies` are two
+distinct functions walking two distinct metadata roots, each with its own
+malformed-shape handling -- schema maintenance, a genuinely independent
+capability, already treats FK and Lookup as separate facts to maintain.
+
+The counterfactuals the review prompt requested were run explicitly:
+
+* *Merge counterfactual:* a merged "helper" family would need one relation
+  model that supports both durable source-column-keyed intent (FK) and
+  explicit output-frame-keyed projection with asymmetric keys (Lookup) inside
+  one shape. No such unified shape exists in the current metadata registry,
+  and `configure_fk_helpers`/`configure_lookup_helpers` do not share a
+  resolution function beyond incidental helpers (`_dedupe`,
+  `_resolve_allowed_helpers`/`_resolve_default_helpers`, which are themselves
+  small enough that shared use is weak evidence per the DMC's "evidence is
+  not ownership proof" section). Merging would not shrink any external
+  reference; it would only make the merged family's internal state space
+  larger and its consumers (schema maintenance, cleanup, validation) harder
+  to reason about, since each would need to re-derive which half of the
+  merged model applies.
+* *Separation counterfactual:* keeping them separate leaves each capability's
+  external contract narrow -- Lookup exposes one policy root and one
+  provenance shape; FK exposes one relation root and one provenance shape.
+  The one place they collide (H5) is exactly one narrow function, which is
+  the strongest possible evidence that separation, not merger, minimizes
+  cross-owner surface.
+
+Lookup's lack of an inverse is semantic, not accidental: `enrich_lookup`
+never reads FK relation Intent, has no relation-declaration step analogous to
+`configure_fk_helpers`/`infer_fk_relations`, and its provenance
+(`_meta.derived.sheets.*.enrich_lookup`) records a one-way output projection
+rather than a durable source-column relation. There is no evidence of an
+abandoned or partially-implemented FK-style declare/materialize/drop
+lifecycle for Lookup that a hardening cycle would be re-inventing; this is a
+different Intent shape by design.
+
+== 4. Review Area 3 -- Derived-cleanup ownership
+
+*Verdict: supported, high confidence, with one scoping correction
+(<<f-002>>).*
+
+`derived_column_policy.py` inspection confirms the "executor with
+feature-aware contracts, not semantic owner" characterization is accurate:
+`apply_derived_column_policy` discovers candidates by reading FK's
+`resolve_v2_fk_relations` (imported, not reimplemented) and Lookup's
+provenance shape (reimplemented locally -- see <<f-002>>), applies a
+caller-selected drop/warn/fail policy, and validates/checks before
+publishing. It does not decide what a mismatch *means* for either feature;
+it decides *when to stop* on one.
+
+The important correction this review adds: the Cycle-0 artifact's "why this
+is the right first slice" section (I) claims the slice "removes the most
+misleading current `_meta` cross-owner knowledge." That is true only for the
+FK-side predicate the slice targets. `derived_column_policy.py` independently
+reimplements Lookup's full provenance interpretation --
+`_resolve_derived_identity`, `_validated_enrich_spec`,
+`_check_enrich_lookup_values`, `_validated_mismatch_keys`,
+`_canonical_value_map` (roughly 180 lines) -- including symmetric/asymmetric
+key resolution and value-mismatch checking, with *zero* import from
+`enrich_lookup`. This is a materially larger instance of the same
+cross-owner-knowledge pattern than the ~15-line predicate in
+`fk_helpers/provenance.py::_clean_helper_provenance` that H5 targets. See
+<<f-002>> for the required wording correction; this does not change the
+executor-not-owner conclusion.
+
+[[review-area-5]]
+== 5. Review Area 4 -- H5 first slice
+
+*Verdict: SLICE ACCEPTED WITH CORRECTION.* Lookup ownership of the
+reconciliation rule is correct and well-evidenced; two concrete
+implementation-readiness gaps must be closed as part of the slice, not after
+it (<<f-001>>, <<f-003>>).
+
+=== 5.1 Ownership: why Lookup (option A), not B/C/D/E
+
+Direct inspection of `_clean_helper_provenance` shows the predicate needs
+exactly two inputs: Lookup's own declared `enrich_lookup.helper_columns` list
+(a shape only Lookup defines and only Lookup's writer,
+`enrich_lookup/operation.py::_write_provenance`, produces) and the current
+frame's column labels after FK's own removal has already run. It needs *no*
+FK-specific knowledge -- not the relation shape, not `target_key`, not
+`value_field`. That is the strongest possible evidence for Lookup ownership
+under the DMC's family test: the fact that is being interpreted ("is my
+provenance record still truthful") is entirely Lookup's own declared
+contract.
+
+* *Option B (derived-cleanup owns it):* rejected. `apply_derived_column_policy`
+  is a different, reimport-time entry point that is never invoked by
+  `remove_fk_helpers`/`drop_helpers`. Routing H5 through it would require a
+  new call path between two currently-independent registered steps for no
+  benefit; the predicate does not need cleanup-policy's drop/warn/fail
+  distinction at all.
+* *Option C (neutral coordinator):* considered and rejected as
+  over-engineering for one call site. `derived_column_policy.py` already is
+  the project's "neutral coordinator" pattern, and it is not the caller here.
+  Introducing a third module solely to mediate one FK-to-Lookup call adds
+  navigation without adding a real shared contract (the DMC's own
+  "extraction that merely adds jumping" caution in the Human Readability
+  guide applies directly).
+* *Option D (FK owns it because FK drop causes the transition):* rejected.
+  Causing a state transition is not the same as owning the semantic
+  truthfulness of another owner's provenance about that transition. FK has no
+  way to decide when Lookup's own record is stale except by consulting
+  Lookup's own declared contract -- which is exactly what moving the
+  predicate into Lookup formalizes, rather than changes.
+* *Option E (current behavior is sediment; change it now):* rejected for this
+  slice, correctly. No evidence surfaced (by the Cycle-0 artifact or this
+  review) that the current conditional-preservation behavior is wrong; the
+  DMC requires evidence to justify breaking a working contract, not merely
+  the opportunity of a refactor.
+
+=== 5.2 Dependency direction and circularity
+
+Verified directly: `fk_helpers/*.py` currently imports nothing from
+`enrich_lookup`, and `enrich_lookup/*.py` currently imports nothing from
+`fk_helpers`. `derived_column_policy.py` imports from `fk_helpers`'s public
+facade only. Adding one narrow `fk_helpers -> enrich_lookup` edge (FK-drop
+composition calling a small Lookup-owned public function) introduces no
+cycle: `enrich_lookup` has no dependency back onto `fk_helpers` or
+`derived_column_policy`, and nothing else in the graph would need to depend
+on `fk_helpers` through `enrich_lookup`. Dependency direction remains legal
+under the DMC's "narrow, explicit, few" cross-family standard.
+
+This review found one implementation-readiness gap the Cycle-0 artifact did
+not surface: the cross-family import guard test
+(`test_no_cross_family_internal_imports.py`) currently protects only
+`fk_helpers` and `discriminator_split` -- its `GUARDED_INTERNAL_PREFIXES`
+dictionary has no entry for `enrich_lookup`. Once the first slice makes
+`fk_helpers` a real cross-family caller into `enrich_lookup`, nothing
+prevents a *future* change from reaching past `enrich_lookup`'s public facade
+into `operation.py`/`policy.py` internals directly, silently widening the
+handoff the slice deliberately narrows. See <<f-003>>.
+
+=== 5.3 Malformed and partial-overlap ownership
+
+The review prompt asked who owns malformed-provenance handling, partial
+overlap, and empty-container pruning. Partial overlap and empty-container
+pruning are already correctly Lookup's concern under the proposed
+disposition (its own `helper_columns` list is the only input that decides
+"still present"), and empty-container pruning after the subkey is removed
+remains a mechanical, shape-independent step that can stay with whichever
+side performs the final mutation (currently FK-drop's `copy_derived_path`
+pattern) without changing meaning.
+
+Malformed-provenance handling is where this review found a genuine,
+previously unflagged gap: current `_clean_helper_provenance` performs *no*
+shape validation on `enrich.get("helper_columns")` before iterating it
+(`{str(c) for c in (enrich.get("helper_columns") or [])}`). If that field is
+present but not a list -- for example a string, an int, or a dict -- the
+predicate either silently misinterprets it (a dict yields its keys as
+"columns") or raises an opaque, untyped `TypeError` from inside FK's private
+helper, with a traceback that names FK code for a defect that is Lookup's
+provenance shape. This contrasts sharply with
+`derived_column_policy.py::_validated_enrich_spec`, which raises a clear,
+path-naming `ValueError` for the identical malformed shape. No test in
+`test_derived_provenance_nested_ownership.py` currently exercises a malformed
+`enrich_lookup.helper_columns` value at this seam. See <<f-001>>; this is the
+review's most important individual finding because the Cycle-0 artifact's own
+completion-evidence bullet ("Lookup tests prove its conditional
+reconciliation for present, absent, malformed-as-currently-specified, and
+repeated states") presumes a "currently-specified" malformed behavior that,
+on inspection, does not actually exist as a deliberate contract -- it is
+undefined, type-dependent behavior that the implementer must consciously
+choose to freeze or correct.
+
+=== 5.4 Behavior, metadata shape, and test evidence
+
+`test_derived_provenance_nested_ownership.py` was read in full and
+independently confirms the artifact's characterization of current behavior
+with concrete, already-passing tests:
+`test_fk_cleanup_preserves_input_and_presence_checked_siblings_on_repeat`
+proves a still-present Lookup helper column (`existing_lookup_helper`)
+preserves the `enrich_lookup` record object identity untouched, while
+`test_fk_cleanup_conditionally_removes_enrich_and_prunes_empty_containers`
+proves an absent one prunes the record and empty containers. These tests
+already pin the exact compatibility baseline the first slice must preserve
+and are a sound starting point for the slice's own before/after test split
+(FK-owned strip proven separately from Lookup-owned reconciliation, per the
+artifact's own completion-evidence bullets).
+
+== 6. Review Area 5 -- Material handoff map
+
+*Verdict: sufficient for this slice; no missing or duplicate edge found among
+the nine.*
+
+H4 and H5 were independently re-derived from code rather than accepted from
+the table, and both hold up: H4's `apply_derived_column_policy` is a genuinely
+different call path from H5's `drop_helpers`/`remove_fk_helpers` (different
+registered steps, different trigger points -- reimport-time policy vs. direct
+mid-pipeline cleanup), so they are not the same edge at two abstraction
+levels, contra a plausible failure mode the review prompt asked about. H9 was
+independently confirmed against `schema_maintenance/meta_update.py`:
+`_handle_fk_policies` and `_handle_lookup_policies` are distinct functions
+with distinct malformed-shape failures, matching the claimed
+feature-owned-reference-consumption pattern. H7 was independently confirmed
+against `pipeline/execution_state/formula_helper.py`: `resolve_trusted_call`
+is scoped to `expected_target=enrich_lookup` only, and the module's own
+docstring explicitly states that reproducing Lookup's policy-resolution logic
+there "would absorb `enrich_lookup`'s own family semantics," which the
+managed-boundary code must not do -- an internal admission that corroborates
+the artifact's asymmetry claim independently.
+
+No missing material edge was found among the areas the review prompt
+specifically asked about (general reference validation, pipeline
+binding/configuration, Workbook View helper identity, formula mode, consumer
+inverse/cleanup ordering, schema-maintenance updates, shared Core mechanics).
+The nine handoffs are proportionate to the bounded scope and do not read as a
+disguised census.
+
+== 7. Review Area 6 -- State/meta lifecycle
+
+*Verdict: accurate; the data/artifact-identity/projection-replay distinction
+is valid and earns its keep.*
+
+The lifecycle diagram in the Cycle-0 artifact (D.1) matches what the
+inspected code actually does: `enrich_helpers` materializes from durable
+relation policy and writes transient provenance
+(`_write_helper_provenance`); `drop_helpers` consumes that provenance with a
+durable-policy fallback and never reads spreadsheet cell values to decide
+what to remove (`_columns_to_drop_by_sheet` uses only metadata). The claim
+that helper-cell edits are intentionally discarded is directly supported: no
+code path in `fk_helpers/` or `enrich_lookup/` reads back a materialized
+helper cell's *value* to update canonical state; `enrich.py` only ever writes
+forward from source FK/lookup data.
+
+The three-way distinction (data reconstruction / artifact-identity
+reconstruction / projection replay) is useful and not merely renamed
+vocabulary: "artifact-identity reconstruction" precisely names what
+`drop_helpers`'s policy fallback does (recover *which columns* to remove
+after transient provenance is gone, from durable relation policy) without
+claiming any data-level inverse exists. This is a real, load-bearing
+distinction the DMC's provisional Projection vocabulary supports without
+being stretched -- the artifact does not claim FK or Lookup are bijective
+projections, and the code confirms neither is.
+
+== 8. Review Area 7 -- Public/compatibility surface
+
+*Verdict: accurate as far as independently checked; no correction required.*
+
+Spot-checked against `registries/pipeline_step_registry.json`: the `on`
+lookup alias is registered with `"source_kind": "deprecated_alias"`
+(confirmed at the exact cited location); `helper_prefix`/`prefix` parameters
+are present on multiple FK steps and documented as binding-compatibility-only
+in `enrich.py`/`drop.py` docstrings, matching the registry's "retained for
+step-binding compatibility only" language. `defaults.detect_fk` is
+independently confirmed reachable and consumed
+(`enrich.py:53`, `pipeline/steps.py:157`) and appears in three example
+pipeline YAML files under `src/spreadsheet_handling/examples/`, which
+strengthens (not weakens) the artifact's "reachable runtime sediment"
+disposition -- it is exercised by shipped examples, not merely latent code.
+
+`core/refs.py` was read in full and independently grepped for consumers
+across `src/` and `tests/`: zero matches. This corroborates the artifact's
+"historical/accidental exposure; removal candidate" disposition at the stated
+medium confidence (the sibling `worldbuilding`/`spreadsheet-handling-demo`
+repositories were not available in this review's workspace to complete the
+external-consumer check the artifact itself says is still needed -- see
+<<f-006>>).
+
+== 9. Review Area 8 -- Trusted Ingress / formula asymmetry
+
+*Verdict: correct, and independently corroborated by the certifying module's
+own reasoning; correctly deferred.*
+
+See <<review-area-5>> H7 discussion above. The asymmetry is real, narrowly
+scoped, and the certifying code itself explains why it must not be widened
+opportunistically (to avoid absorbing Lookup's family semantics into the
+Ingress boundary). This does not undermine the FK-family boundary -- FK
+formula mode remains inside FK's family regardless of certification status --
+and does not undermine the first slice, which touches neither formula mode
+nor certification.
+
+== 10. Review Area 9 -- Domain/Core
+
+*Verdict: the three pilot-local placement directions are adequately
+evidenced for a first-slice decision not to move anything.*
+
+`core.indexing`: `has_level0`/`level0_series` are used generically by
+`validations/fk_helpers.py` without FK-specific meaning beyond the caller
+supplying a column name; "remain Core" is unsurprising and uncontested.
+
+`core.fk`: the guard test
+(`test_fk_helper_primitives_consume_policy.py`) independently confirms the
+claimed boundary -- `detect_fk_columns`/`build_registry`/`FK_PATTERN`
+convention-inference helpers are explicitly forbidden from the primitive
+execution path (`fk_helpers`, `helpers.reorder_helpers_next_to_fk`,
+`validations.fk_helpers`) by an executable architecture guard, while
+`apply_fk_helpers`/`build_id_value_maps`/`FKDef` remain legitimately used as
+deterministic lower-level mechanics. "Do not move in first slice, medium
+confidence" is appropriately cautious given the topology assessment's Review
+001 already flagged the Domain/Core criterion question as unresolved
+authority, not something a bounded FK pilot should settle.
+
+`core.refs`: independently confirmed unused (see Area 7); the "possible
+historical exposure" framing at medium confidence, not "removal candidate
+now," is correctly proportionate since no whole-Core audit was performed and
+no external-consumer check was completed.
+
+None of these placements invalidates the FK family boundary or the first
+slice; the review prompt's own reminder that "family ownership != physical
+package placement" is respected throughout.
+
+== 11. Review Area 10 -- Local Human Readability
+
+*Verdict: correctly applied; `_clean_helper_provenance` is the right hotspot,
+and this review adds one concrete detail the artifact's discussion did not
+reach (<<f-001>>).*
+
+Direct inspection agrees with F.1: `enrich_helpers` (`enrich.py`) is a
+genuinely phase-coherent 36-line body with two non-local-reason comments
+(the `detect_fk` two-key resolution-timing comment, and
+`_preserve_source_flatness`'s replay-safety rationale referencing a named
+historical bug) that a reader could not reconstruct from the code alone.
+Splitting it further would remove exactly the kind of algorithmic locality
+the Human Readability Guide protects.
+
+`_clean_helper_provenance` is correctly identified as the highest-value
+hotspot, and this review's independent reading sharpens *why*: it is not
+merely that the function name/module implies FK-only ownership while
+containing Lookup logic (a naming problem) -- it is that the embedded logic
+has a materially weaker error contract than the equivalent logic living in
+its rightful owner's neighborhood (`derived_column_policy.py`'s
+`_validated_enrich_spec`). A reader auditing `remove_fk_helpers` today must
+notice, without being told, that a bare `.get(...) or []` with no isinstance
+check sits inside an otherwise metadata-driven, well-validated FK module.
+Moving it behind a Lookup-owned function is therefore not "extraction that
+merely adds jumping" (the anti-pattern the guide warns against) -- it
+relocates code to where its error-handling quality can be judged against the
+right sibling logic (Lookup's own provenance validation) instead of against
+FK's unrelated conventions. This satisfies both the ownership test and the
+bounded-reconstruction test simultaneously, which is the strongest
+justification the Human Readability Guide recognizes for `implement` over
+`accept`/`defer`.
+
+`enrich_helpers` (F.3's "topology scattered but locally coherent") point is
+also independently confirmed: the FK lifecycle genuinely spans five files
+plus `core/fk.py`, yet each individual file remains locally readable. This is
+a real, not rhetorical, distinction between family/repository locality and
+Local Human Readability, and the artifact does not conflate the two.
+
+== 12. Review Area 11 -- Contract/registry authority
+
+*Verdict: no accidental duplicate authority found; no correction required.*
+
+`meta_registry.yaml`'s `derived` entry (inspected directly) already documents
+both `helper_columns` and `enrich_lookup` as sibling sub-keys with named
+producers and consumers, and already states that
+`apply_derived_column_policy` "also removed" both subkeys for the frame it
+replaces -- i.e. the registry's current prose already anticipates exactly the
+kind of cross-owner interaction the Cycle-0 artifact analyzes; it does not
+need a new row or a parallel table for the first slice. No new registry,
+taxonomy, or ownership table is proposed by the Cycle-0 artifact, consistent
+with `HRS-009`/`HRS-011` and Review 005's closure lessons.
+
+== 13. Review Area 12 -- DMC application quality
+
+*Verdict: the pilot stayed bounded, followed material edges rather than
+inventorying modules, and correctly avoided both over-fragmentation and
+false unification. Its two self-reported DMC observations are useful
+calibration notes, not wording defects requiring a DMC edit now.*
+
+Evidence for "stayed bounded": the artifact does not classify
+`transformations/helpers.py`'s non-FK content, does not resolve Legend
+Blocks, does not decide the `core.fk`/`core.refs` moves, and does not resolve
+the FK-formula-mode Trusted-Ingress question -- all explicitly deferred as
+non-goals, exactly matching what Review 001 of the topology assessment said a
+first pilot must not attempt.
+
+Evidence the process worked rather than merely reading well: this review's
+own independent code inspection reached the same family/separation/executor
+conclusions from first principles before cross-checking the artifact's
+wording, and found the artifact's concrete evidentiary claims (test names,
+registry entries, guard-test scope, certifying-module docstrings) to be
+accurate everywhere they were spot-checked, with one exception
+(<<f-002>>, a scoping/wording overstatement, not a factual error) and one gap
+the artifact did not reach (<<f-001>>).
+
+The pilot's two self-reported DMC observations are endorsed as useful,
+non-blocking calibration notes:
+
+* "reconstruction owner" reading like an edit inverse is a real, mild wording
+  risk worth watching across a second and third pilot before touching DMC
+  prose; this pilot's own D.4 section shows the distinction can be made
+  correctly without a DMC change.
+* a cohesive one-operation capability not needing the "family" label is
+  already permitted by the DMC's text ("Use existing repository vocabulary
+  where it fits... do not invent a universal replacement owner kind"); Lookup
+  Enrichment is a clean example to keep for future calibration, not evidence
+  the DMC under-specifies this case.
+
+No bureaucratic overreach was found: the artifact does not require every
+Domain production module to receive a disposition, does not propose a new
+registry, and its "unresolved questions" section correctly routes several
+real questions (stale-output pruning, `core.fk`/`core.refs` moves, FK-formula
+certification) to later bounded cycles instead of resolving them here or
+blocking on them.
+
+== 14. Findings
+
+[[f-001]]
+=== FIND-001 -- Malformed Lookup-provenance shape at the H5 seam is undefined, not "currently specified"
+
+Severity:: IMPORTANT
+Affected Cycle-0 conclusion/section:: Section I, "Completion evidence" (the
+malformed-state test bullet); Review Area 4 (H5).
+Current evidence:: `fk_helpers/provenance.py::_clean_helper_provenance` reads
+`enrich.get("helper_columns") or []` with no `isinstance` check, unlike the
+structurally equivalent `derived_column_policy.py::_validated_enrich_spec`,
+which raises a clear path-naming `ValueError` for the same malformed shape.
+No test in `test_derived_provenance_nested_ownership.py` exercises a
+malformed `enrich_lookup.helper_columns` value at this seam.
+Concrete failure mode:: A workbook whose `enrich_lookup` provenance is
+corrupted (e.g. `helper_columns` written as a string or int by a plugin or a
+hand-edited sidecar) causes `remove_fk_helpers`/`drop_helpers` to either
+silently misinterpret the value (dict case: iterates keys as "columns") or
+raise an opaque, untyped `TypeError` from inside FK's private helper with a
+traceback pointing at FK code for a defect that is Lookup's shape.
+Smallest correction:: Before or as part of implementing the slice, the
+implementer must explicitly decide and test-pin one of: (a) preserve today's
+ad hoc coercion verbatim as the frozen compatibility baseline, naming it
+explicitly as intentional non-validation, or (b) adopt fail-clear validation
+consistent with `derived_column_policy.py`'s sibling logic. Either is
+acceptable; silently picking one while writing the "malformed" test is not.
+Disposition:: first-slice correction.
+
+[[f-002]]
+=== FIND-002 -- First-slice benefit is overstated relative to `derived_column_policy.py`'s larger Lookup-shape duplication
+
+Severity:: IMPORTANT
+Affected Cycle-0 conclusion/section:: Section I, "Why this is the right first
+slice" ("removes the most misleading current `_meta` cross-owner
+knowledge").
+Current evidence:: `derived_column_policy.py` independently reimplements
+Lookup's provenance shape, symmetric/asymmetric key resolution, and
+value-mismatch checking in roughly 180 lines
+(`_resolve_derived_identity`, `_validated_enrich_spec`,
+`_check_enrich_lookup_values`, `_validated_mismatch_keys`,
+`_canonical_value_map`) with zero import from `enrich_lookup`, a materially
+larger instance of cross-owner knowledge than the ~15-line predicate H5
+targets.
+Concrete failure mode:: A reader or a future implementer could reasonably
+conclude, after the first slice ships, that "the" Lookup-shape leakage
+problem is solved, and fail to recognize that a larger instance survives
+untouched in the reimport-time cleanup path -- risking premature closure of
+`FTR`-worthy follow-up work that the Cycle-0 artifact itself lists as
+unresolved ("Should Lookup mismatch interpretation ultimately execute in the
+Lookup owner...").
+Smallest correction:: Reword the "why this is the right first slice"
+paragraph to state explicitly that H4's Lookup-shape duplication is larger
+and deliberately out of scope for this slice, not implicitly addressed by it.
+Disposition:: Cycle-0-local correction (wording only); the underlying H4
+duplication remains a later bounded follow-up, as the artifact already notes
+in its unresolved questions.
+
+[[f-003]]
+=== FIND-003 -- Cross-family import guard does not yet cover `enrich_lookup`
+
+Severity:: MINOR
+Affected Cycle-0 conclusion/section:: Section I, first-slice scope
+(implementation readiness for the new FK-to-Lookup handoff).
+Current evidence:: `tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`'s
+`GUARDED_INTERNAL_PREFIXES` covers only `fk_helpers` and
+`discriminator_split`; `enrich_lookup.operation`/`enrich_lookup.policy` are
+absent.
+Concrete failure mode:: After the first slice introduces the first real
+`fk_helpers -> enrich_lookup` edge, a later change could reach past
+`enrich_lookup`'s public facade into `operation.py`/`policy.py` internals
+directly (e.g. calling `_write_provenance` or a private helper), silently
+widening the narrow handoff the slice deliberately establishes, with no guard
+test failing to catch it.
+Smallest correction:: Add `enrich_lookup`'s internal modules to
+`GUARDED_INTERNAL_PREFIXES` as part of the first slice, since the slice is
+what first makes this edge real.
+Disposition:: first-slice correction (small, mechanical, proportionate).
+
+[[f-004]]
+=== FIND-004 -- FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5's "one concept, two routes" framing deserves one clarifying paragraph, not a one-line dismissal
+
+Severity:: MINOR
+Affected Cycle-0 conclusion/section:: "Primary authorities and navigation
+evidence" (the FTR paragraph).
+Current evidence:: The FTR states plainly that `add_fk_helpers` and
+`add_lookup_helpers` are "one helper-column concept" with "two public
+routes... not currently drop-in equivalents," and asks a future assessment to
+"choose ONE canonical public helper surface." The Cycle-0 artifact addresses
+this in one sentence.
+Concrete failure mode:: A future reader who reads the FTR before the Cycle-0
+artifact could perceive a direct contradiction (the FTR implies one concept
+needing unification; the Cycle-0 concludes two separate semantic owners) and
+re-litigate the FK/Lookup separation from a misreading rather than from new
+evidence.
+Smallest correction:: Add one paragraph distinguishing "public surface
+consolidation" (a UX/compatibility question the FTR correctly raises) from
+"semantic ownership merger" (the DMC question this pilot answers), citing the
+DMC's "evidence is not ownership proof" section.
+Disposition:: Cycle-0-local correction (documentation clarity only).
+
+[[f-005]]
+=== FIND-005 -- No action: `check_duplicate_ids` cross-sheet reach is confirmed but already correctly dispositioned
+
+Severity:: NOTE
+Affected Cycle-0 conclusion/section:: F.2.
+Current evidence:: Independently confirmed in `validations/fk_helpers.py`:
+`check_duplicate_ids` iterates every sheet via `iter_data_frames`, not just
+FK-declared ones.
+Concrete failure mode:: none additional; already correctly filed as a Local
+Human Readability hotspot rather than an ownership defect.
+Smallest correction:: none.
+Disposition:: no action / note.
+
+[[f-006]]
+=== FIND-006 -- Worldbuilding/Dino-Insel consumer evidence could not be independently re-verified in this review
+
+Severity:: NOTE
+Affected Cycle-0 conclusion/section:: E.2 (maintained-consumer impact);
+Area 7 (`core.refs`/`core.fk` external-consumer completeness).
+Current evidence:: The `worldbuilding` sibling repository the Cycle-0
+artifact inspected read-only was not present in this review's workspace
+(`/home/stefan/repos/` contains no `worldbuilding` directory).
+Concrete failure mode:: none identified; this is a review-coverage
+limitation, not a defect. The Cycle-0 artifact's own evidence labeling
+("Observed current fact... at the stated baseline," with an explicit HEAD
+commit) is the right evidence class for this kind of claim, and this review
+found no internal inconsistency in how that evidence was used.
+Smallest correction:: none required now. If a later independent review has
+access to the `worldbuilding` repository, it should spot-check the five
+`add_lookup_helpers` steps and the `test_dino_insel_matrix_helper_migration.py`
+guard the artifact cites.
+Disposition:: no action / note; watch-only for a future review with broader
+workspace access.
+
+== 15. Positive findings confirmed
+
+The following properties from the Cycle-0 artifact's "positive findings"
+list were independently checked against code and survive review:
+
+* FK and Lookup are not merged merely because they share `_meta.derived` --
+  confirmed; each owns a distinct sub-key with a distinct writer and no
+  shared resolution logic beyond incidental small helpers.
+* The cleanup executor (`derived_column_policy.py`) is correctly
+  distinguished from the semantic producers -- confirmed; it imports FK's
+  public facade rather than reimplementing FK's relation model, even though
+  it does reimplement Lookup's (see <<f-002>>).
+* Helper cells are correctly treated as non-authoritative -- confirmed; no
+  code path anywhere in `fk_helpers/` or `enrich_lookup/` reads a
+  materialized helper cell's value back into canonical/durable state.
+* Material handoffs are made explicit and match actual code behavior for
+  every handoff this review independently re-derived (H4, H5, H7, H9).
+* A real current consumer was examined (subject to <<f-006>>'s workspace
+  caveat).
+* Compatibility was not decided from pre-1.0 status alone -- confirmed; each
+  disposition in E.1 cites either a maintained consumer, a registry label, or
+  an explicit test, not version number.
+* Package moves are deferred with medium-confidence, evidence-scoped
+  reasoning rather than either forced now or ignored -- confirmed for
+  `core.fk`/`core.refs`.
+* The first slice does not alter public names, YAML parameters, or metadata
+  shapes -- confirmed by code inspection; the proposed change is a pure
+  ownership/location move behind an unchanged registered-step contract.
+* Local Human Readability was applied without mechanical splitting --
+  confirmed; `enrich_helpers` and `enrich_lookup` are correctly left intact,
+  and the one hotspot identified is a genuine cross-owner boundary, not a
+  length complaint.
+* No new registry or taxonomy is proposed -- confirmed against
+  `meta_registry.yaml`'s existing `derived` entry, which already documents
+  the cross-owner fact the slice formalizes in code.
+
+== 16. Required conclusions
+
+=== A. FK family
+
+Yes. FK Relation Helpers are a sufficiently evidenced coherent family for the
+upcoming hardening work, confirmed independently through code (shared v2
+relation shape consumed identically across materialization, validation,
+layout, and both cleanup paths), not merely accepted from the artifact's
+prose.
+
+=== B. Lookup
+
+Yes, correctly separate. Confirmed independently through code: no shared
+Intent shape, no shared resolution function beyond incidental small helpers,
+independent registered surfaces, and an independent third-party confirmation
+of the separation from `schema_maintenance/meta_update.py`'s two distinct
+handler functions.
+
+=== C. Derived cleanup
+
+Yes, correctly modeled as a cross-capability executor/coordinator for FK
+(which it consumes via public API). For Lookup specifically, it currently
+also functions as an unacknowledged *secondary implementer* of Lookup's
+provenance semantics (<<f-002>>), which the artifact should describe more
+precisely without changing the executor-not-owner conclusion.
+
+=== D. H5 ownership
+
+Lookup owns the conditional reconciliation rule. This review independently
+re-derived the same conclusion from the predicate's actual data dependencies
+(only Lookup's own declared shape and post-mutation frame state, no FK
+knowledge) before cross-checking the artifact's reasoning, and rejects
+options B/C/D from the review prompt for the reasons in
+<<review-area-5>> section 5.1. Option E (change the behavior now) remains
+correctly out of scope for lack of evidence.
+
+=== E. First slice
+
+Safe and valuable *with* the two corrections in <<f-001>> and <<f-003>>
+resolved as part of the implementation, not deferred after it. The ownership
+decision, dependency direction, and compatibility-preservation intent are all
+sound; the concrete implementation-readiness gap is the malformed-provenance
+behavior decision, which the artifact's own completion-evidence bullet
+already implicitly requires but does not yet resolve.
+
+=== F. Material handoffs
+
+Sufficient and correct enough for this slice. H4 and H5 were independently
+confirmed as distinct edges (not duplicates at different abstraction
+levels), and no missing material edge was found among the specific areas the
+review prompt asked about.
+
+=== G. DMC feedback
+
+No real DMC wording defect was found. The pilot's own two self-reported
+observations are useful calibration notes for a second and third pilot, not
+corrections the DMC needs now; this review recommends leaving the DMC
+untouched, consistent with the task's constraint not to edit it.
+
+=== H. Implementation readiness
+
+Implementation can begin after this review, under this exact bounded scope:
+
+* Implement exactly the four scope items in the Cycle-0 artifact's Section I
+  ("Scope"), preserving current behavior, public names, YAML parameters, and
+  metadata shapes.
+* Additionally resolve <<f-001>> (make an explicit, tested choice about
+  malformed `enrich_lookup.helper_columns` shape handling at the seam) as
+  part of this slice, not as a follow-up.
+* Additionally extend `GUARDED_INTERNAL_PREFIXES` in
+  `test_no_cross_family_internal_imports.py` to cover `enrich_lookup` as part
+  of this slice (<<f-003>>).
+* Non-goals remain exactly as stated in the Cycle-0 artifact's "Explicit
+  non-goals" list, plus: do not attempt to reduce or touch
+  `derived_column_policy.py`'s independent Lookup-shape reimplementation
+  (<<f-002>>) in this slice -- record it as a named follow-up instead.
+* The Cycle-0-local wording corrections in <<f-002>> and <<f-004>> may be
+  applied to the Cycle-0 artifact by a separate, explicitly authorized edit
+  if the maintainer chooses; this review does not require blocking
+  implementation on them.
+
+== 17. Overall verdicts
+
+Overall Cycle-0 verdict:: *ACCEPT WITH MINOR CORRECTIONS.* The semantic map,
+family/separation conclusions, material handoffs, state/lifecycle analysis,
+compatibility disposition, and DMC process discipline are all independently
+verified as accurate against the actual runtime, tests, and registries. Two
+IMPORTANT and two MINOR findings require correction; none is a factual error
+in the artifact's evidence, and none changes any of its ownership
+conclusions.
+
+First-slice verdict:: *SLICE ACCEPTED WITH CORRECTION.* Implement the slice
+as scoped, additionally resolving <<f-001>> and <<f-003>> within the same
+bounded change.
+
+Finding count by severity:: 0 BLOCKER, 0 MAJOR, 2 IMPORTANT
+(<<f-001>>, <<f-002>>), 2 MINOR (<<f-003>>, <<f-004>>), 2 NOTE
+(<<f-005>>, <<f-006>>).
