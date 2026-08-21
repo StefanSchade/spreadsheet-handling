@@ -1,0 +1,932 @@
+= FK Helper Deletion Authority — Bounded Design
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: DESIGN PHASE, exercised under the narrowed-scope authorization recorded
+by `derived_artifact_claim_lifecycle_assessment_2026-08-21.adoc` (final
+verdict *ACCEPT*) and its independent
+`derived_artifact_claim_lifecycle_assessment_2026-08-21_review_001.adoc`
+(final verdict *ACCEPT*, Design-Gate verdict *DESIGN PHASE AUTHORIZED WITH
+NARROWED SCOPE*). This artifact is a Semantic + Technical + Developer design.
+It selects concrete runtime contracts and a bounded implementation sequence.
+It contains no runtime, test, or canonical-document edits.
+
+Date: 2026-08-21.
+
+Design baseline: `a46c1bc7de5ec592b09e8697aebfbe7fa126bbf6`
+(`docs(domain): close derived artifact lifecycle assessment review`), branch
+`main`, `main...origin/main [ahead 4]`, worktree clean before this design,
+verified with `git status --porcelain=v1 --branch` and `git log -1`.
+
+== A. Executive design decision
+
+[.lead]
+Close the confirmed FK/Lookup deletion-authority defect with the smallest
+rule the accepted research evidences: *a cleanup executor may delete a
+column identified through an FK-attributed name only when truthful, same-run
+transient FK materialization provenance names that column.* Durable FK
+relation policy (`_meta.helper_policies.fk.relations`) is retained as a
+*materialization* input (it still tells `add_fk_helpers` what to build) but is
+permanently removed as a *deletion-candidate* input from both
+`fk_helpers/drop.py` and `derived_column_policy.py`. No value/formula
+equivalence check, no claimant/reliance vocabulary, and no new durable state
+are introduced anywhere in this design.
+
+Two runtime corrections, applied together, close all three reproduced
+variants (same-run collision, durable-policy-only with FK never run, and the
+second `derived_column_policy.py` executor):
+
+. *Truthful FK provenance* (site 1) — `core/fk.py`'s materialization
+  primitive reports, per resolved FK definition, whether it actually wrote
+  the helper column this call or found the label already occupied.
+  `fk_helpers/enrich.py` writes `_meta.derived.sheets.*.helper_columns`
+  entries only for definitions it can truthfully claim (see <<E>>). This
+  alone closes the same-run collision variant, because FK no longer writes a
+  false claim for a column it did not write.
+. *Deletion-authority rule* (sites 2 and 3) — `fk_helpers/drop.py` and
+  `derived_column_policy.py` both stop treating durable FK relation policy as
+  sufficient evidence to delete a physically present column. Each keeps
+  reading FK's own transient provenance (already correct data, already
+  correctly scoped per caller); each simply stops falling back to durable
+  policy when transient provenance is silent. This alone closes both
+  durable-policy-only variants, because "declared but never proven
+  materialized this run" no longer authorizes deletion.
+
+Both corrections are independently necessary and jointly sufficient against
+the accepted evidence in <<repro-recap>>. Neither requires value/formula
+equivalence machinery, a claimant/reliance primitive, or new durable state.
+
+[[repro-recap]]
+== B. Confirmed problem and bounded scope
+
+Recap of the accepted, independently reproduced defect (full detail in the
+cited research and review artifacts; not re-litigated here):
+
+[cols="1,4,3", options="header"]
+|===
+| Repro | Setup | Confirmed outcome (pre-design)
+
+| 1 — same-run collision
+| `configure_fk_helpers` requests `_B_name`; `enrich_lookup` materializes
+  `_B_name` with different values into the same frame; `add_fk_helpers` runs
+  and silently skips (label occupied) but writes FK provenance anyway;
+  `remove_fk_helpers` runs.
+| `_B_name` physically deleted using FK's *false* transient provenance. Real,
+  irretrievable data loss; H5 only reconciles metadata after the fact.
+
+| 2 — durable-policy-only, `add_fk_helpers` never ran
+| `configure_fk_helpers` writes the durable v2 relation; `enrich_lookup` is
+  the *only* producer of `_B_name` this session; no FK
+  `helper_columns` transient record exists at all; `remove_fk_helpers` runs.
+| `_B_name` physically deleted purely from
+  `_meta.helper_policies.fk.relations`'s declared name, with zero FK
+  transient provenance of any kind.
+
+| 3 — second executor, same durable-policy-only setup
+| Identical to repro 2, cleaned up via
+  `apply_derived_column_policy(source="A", policy="drop")` instead of
+  `remove_fk_helpers`.
+| `_B_name` physically deleted by `derived_column_policy.py`'s own,
+  independent `_safe_policy_helper_names` durable-relation fallback.
+|===
+
+Bounded scope of this design (identical to the accepted research's Section N
+and the review's conclusion I, restated here as the binding scope for
+implementation):
+
+* mandatory: `domain/transformations/fk_helpers/enrich.py` and the FK
+  materialization primitive in `core/fk.py`;
+* mandatory: `domain/transformations/fk_helpers/drop.py`;
+* mandatory: the FK-consuming branch of
+  `domain/transformations/derived_column_policy.py`;
+* paired collaborator, not redesigned: Lookup Enrichment
+  (`domain/transformations/enrich_lookup/`), whose existing transient
+  provenance and H5 predicate (`reconcile_enrich_lookup_provenance`) are
+  read-only inputs to this design, unchanged.
+* constraints only, not touched: Discriminator split/merge, XRef/final
+  cleanup, Cell Codec, Workbook View, persistence boundary mechanics,
+  Trusted Ingress, schema maintenance.
+
+== C. Canonical semantic distinctions
+
+This design uses exactly the vocabulary the accepted research converged on
+(Section F of the assessment; Review 001 Area 3 and FIND-007). No broader
+vocabulary is introduced.
+
+[cols="2,4", options="header"]
+|===
+| Term | Meaning in this design
+
+| Physical producer
+| The operation that actually wrote the currently present column/cell state.
+
+| Requested / declared policy
+| A family's transient or durable statement that it *wants* a helper at a
+  named identity. Never sufficient deletion authority by itself.
+
+| Truthful materialization provenance
+| A same-run transient record written only for a definition the writing
+  primitive can affirmatively claim as its own current output (freshly
+  written this call, or self-verified as its own unchanged prior output —
+  <<E>>). This is the *only* thing that can authorize FK-attributed deletion
+  in this design.
+
+| Deletion authority / precondition
+| The verified fact ("truthful materialization provenance names this
+  column") that must hold before a cleanup executor removes a column
+  identified through a requested/declared name.
+
+| Cleanup executor
+| The operation that mutates the physical frame to remove a column:
+  `fk_helpers/drop.py` and `derived_column_policy.py`, the two mandatory
+  sites.
+|===
+
+*Explicitly not introduced:* claimant, current reliance, claim
+registration/release, reference counting, a central claim ledger, stable
+artifact identity, or an adopt/share protocol. <<Q>> restates why each is
+unnecessary against the evidence in <<repro-recap>>.
+
+[[D]]
+== D. FK collision semantics
+
+*Design Question 1 answer.* The smallest sufficient policy is *A: reject on
+collision, no provenance claim* — `core/fk.py`'s materialization primitive
+must never overwrite an existing column at the requested helper label
+(Candidate D — FK overwrites — was independently rejected by Review 001 as
+strictly worse: it trades a wrongful-deletion defect for silent, unwarned
+data corruption of whichever producer's column FK overwrote). On collision,
+the primitive continues to skip the write, exactly as today; what changes is
+that the skip must be *reported*, not silently absorbed, so provenance can be
+truthful (<<E>>).
+
+Policy A alone is *sufficient* to close all three reproduced variants once
+paired with the deletion-authority rule in <<F>> — see <<repro-closure>>. Per
+the design brief's own instruction ("If A or B is sufficient, do not design
+generic adoption"), *Candidate C (value/semantic-equivalence adoption of a
+foreign producer's column) is rejected outright and not designed here* —
+<<L>> gives the full disposition.
+
+*Recommended, separable refinement (narrow B, optional):* within
+`fk_helpers/enrich.py` only (Domain layer, not Core), a definition that
+collided this call may be recognized as FK's own *idempotent prior output* —
+never a foreign producer's — solely by comparing the collided definition's
+shape (`fk_column`, `target`, `target_key`, `value_field` for the same
+`column` label) against FK's *own already-present* transient provenance entry
+for that sheet (read via the existing `derived_helper_columns_by_sheet`
+reader in `fk_helpers/policy.py`). If every field matches, the label is
+FK's own unchanged prior materialization from earlier in the same
+frames-mutation chain (e.g. a second `add_fk_helpers` invocation in one
+pipeline run); its provenance entry is refreshed (kept), not dropped. If any
+field differs, or no matching entry exists, the collision is treated exactly
+as the mandatory Policy A case: no claim, no diagnostic escalation beyond
+<<J>>.
+
+This refinement:
+
+* compares only FK's own previously-written metadata shape, never cell
+  *values* and never a foreign family's provenance — so it cannot become
+  Candidate C by construction;
+* requires no new metadata, no cross-family read, and no new primitive;
+* closes a narrow, currently-unevidenced-as-broken idempotence edge case
+  (re-running `add_fk_helpers` twice in one session) that a pure Policy-A
+  implementation would otherwise quietly regress (today's silent skip
+  already tolerates this; a naive truthful-only rewrite that always drops
+  unmatched provenance on re-run would not);
+* is *not required* to close the confirmed defect (<<repro-closure>> closes
+  without it) — implementers may defer it to a follow-up slice without
+  reopening the mandatory scope.
+
+*Does not help post-persistence.* This self-check only ever matches against
+*transient* provenance, which does not survive persistence
+(`docs/ai_info/agent_rules.adoc`'s persistence-boundary rule: Intent
+survives, Resolution/derived provenance does not). On a freshly reimported
+frame there is no surviving transient record to match against, so a
+physically present FK-shaped column is *always* treated as an unverified
+collision after reimport, regardless of this refinement. That is intentional
+— see <<I>>.
+
+[[E]]
+== E. Truthful FK materialization provenance
+
+*Design Question, site 1 concrete answer.*
+
+*Is the existing return contract sufficient?* No. `core/fk.py::apply_fk_helpers`
+today returns only the resulting `pd.DataFrame`; the per-definition
+materialized/skipped fact is computed (`if helper_col in first_cols:
+continue`) and then discarded. `fk_helpers/enrich.py::enrich_helpers` cannot
+write truthful provenance without that fact.
+
+*Is a narrow result structure needed?* Yes, but it must not change
+`apply_fk_helpers`'s existing signature or return type. `apply_fk_helpers` is
+re-exported from `spreadsheet_handling.core.__init__` (`__all__` includes
+`"apply_fk_helpers"`) and is exercised directly, as a DataFrame-returning
+call, by `tests/unit/domain/transformations/test_fk_helpers_enrich.py` and by
+the primitive-package architecture guard
+(`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`,
+which allow-lists `apply_fk_helpers` by name). Changing its return type is a
+gated public-surface break for no evidenced benefit.
+
+*Proposed shape (design-level, not final naming):*
+
+[source,python]
+----
+class FkHelperMaterializationResult(NamedTuple):
+    frame: pd.DataFrame
+    materialized: list[FKDef]        # definitions this call actually wrote
+    skipped_existing: list[FKDef]    # definitions whose helper_col collided
+                                      # with an already-present column
+
+def materialize_fk_helpers(
+    df, fk_defs, id_value_maps, levels, helper_prefix="_",
+    helper_value_provider=None,
+) -> FkHelperMaterializationResult: ...
+
+def apply_fk_helpers(df, fk_defs, id_value_maps, levels, helper_prefix="_",
+                      helper_value_provider=None) -> pd.DataFrame:
+    """Preserved for compatibility; existing callers unaffected."""
+    return materialize_fk_helpers(
+        df, fk_defs, id_value_maps, levels, helper_prefix,
+        helper_value_provider,
+    ).frame
+----
+
+`materialize_fk_helpers` becomes the real implementation (identical
+materialization logic to today, plus bucket bookkeeping); `apply_fk_helpers`
+becomes a thin compatibility wrapper. No duplicated materialization logic, no
+change to any existing caller's observed behavior or type.
+
+*How `fk_helpers/enrich.py` uses it:* `enrich_helpers` calls
+`materialize_fk_helpers` per frame instead of `apply_fk_helpers`. For each
+frame, it builds the *provable* set passed to `_write_helper_provenance`:
+
+* every definition in `materialized` (freshly written this call); plus,
+  only if the optional refinement in <<D>> is implemented,
+* every definition in `skipped_existing` whose shape matches an existing
+  transient provenance entry for that exact `column` on that sheet.
+
+Definitions in `skipped_existing` that are not matched write *no* provenance
+entry — the direct fix for the confirmed contract violation (FK provenance
+must record only materialized state; three independent maintained sources —
+`docs/semantic_model/12_contract_matrices.adoc`,
+`docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`,
+`docs/ai_info/concepts_fk_helpers.adoc` — already say this; only the runtime
+was wrong).
+
+*Avoiding duplicated physical-materialization decisions in Domain code:*
+Core (`core/fk.py`) remains the *sole* place that decides column-level
+collision (`helper_col in first_cols`); it only gains a reporting
+obligation, not new policy. Domain (`fk_helpers/enrich.py` /
+`fk_helpers/provenance.py`) owns the *meaning* of that report (whether a
+skip may still be claimed via the optional self-check) — this matches the
+existing Core/Domain boundary (Core is a content-free mechanism; Domain owns
+metadata lifecycle, per the Domain Maintainer Contract §8).
+
+*Replay/idempotence:* a single call to `enrich_helpers` is unaffected. A
+second call in the same session against frames that already carry FK's own
+prior output either (a) refreshes provenance via the optional self-check, or
+(b) — without the refinement — writes no provenance for the re-collided
+definitions, which is an accepted, narrow, currently-unevidenced-as-relied-on
+behavior change flagged in <<D>> and <<P>>.
+
+*Pre-existing requested label — final rule:* absent → materialize and claim;
+present and self-verified as FK's own (optional refinement only) →
+no-op and claim; present and unverified/foreign → no-op, no claim, no
+overwrite, no error by default (diagnostic per <<J>>).
+
+[[F]]
+== F. Deletion-authority rule
+
+[.lead]
+*A cleanup executor may delete a column identified through an FK-attributed
+candidate name if and only if that name is currently present in
+`_meta.derived.sheets.<sheet>.helper_columns` (truthful, same-run,
+materialized-only transient provenance, per <<E>>). `_meta.helper_policies.fk`
+(durable v2 relation policy) never independently authorizes deletion — it
+identifies what FK would request, not what FK currently produced.*
+
+[[repro-closure]]
+=== Why this closes all three reproductions
+
+[cols="1,4,3", options="header"]
+|===
+| Repro | Mechanism that closes it | Residual risk
+
+| 1 (same-run collision)
+| <<E>> alone closes it: FK never claims `_B_name` (collision unverified,
+  Lookup's shape does not match any prior FK record), so transient
+  provenance never names it; `remove_fk_helpers` finds no FK evidence and
+  <<F>> then also independently blocks any durable-policy fallback.
+| None evidenced.
+
+| 2 (durable-policy-only, FK never ran)
+| <<F>> alone closes it: no transient provenance exists for the sheet at
+  all; durable policy is no longer consulted for deletion candidates; the
+  column is left in place.
+| None evidenced.
+
+| 3 (second executor, same setup)
+| <<F>> applied identically at the `derived_column_policy.py` site (<<H>>);
+  its own durable-relation fallback (`_safe_policy_helper_names`) is removed
+  as a deletion-candidate source.
+| None evidenced.
+|===
+
+Both corrections are independently sufficient for their respective repro;
+together they are the minimum coherent design (removing only one would leave
+one variant open, per Review 001 Area 6's own smallest-local-repair test).
+
+=== Design Question 2 — what proves current FK production?
+
+*Same-run transient provenance:* sufficient, once truthful (<<E>>), because
+by construction it is written only when FK either wrote the column this
+call or self-verified it as its own unchanged prior output. The one
+invalidating path this design identifies — a later same-run step
+overwriting the physical column's content while leaving FK's transient
+record untouched — is not evidenced as reachable by any accepted
+reproduction or maintained consumer; no supported transformation is known to
+silently overwrite another family's helper column in place without also
+touching its own or the sibling provenance. This is named as an open
+assumption, not a proven invariant — see <<S>>.
+
+*Durable-policy-only path:* does not, and structurally cannot, prove current
+physical production, with or without persistence (<<I>>). This design
+deliberately does *not* build a value-verification override
+(`should cleanup verify the current column against what FK would produce?`
+from the design brief) — see <<L>> for why. It does *not* ask the caller to
+supply a stronger durable declaration — that would be new durable producer
+history, explicitly disallowed (the design brief's own instruction: "Do not
+invent durable producer history merely to preserve old cleanup behavior"). The
+chosen answer is the brief's own named conservative option: *the existing
+persistence/reimport contract intentionally leaves the helper column in
+place rather than risk deleting Lookup- or user-owned data.*
+
+[[G]]
+== G. FK direct-cleanup design
+
+`fk_helpers/drop.py::_columns_to_drop_by_sheet` currently builds its result
+from `provenance_by_sheet` (transient, preferred) with a *fallback* to
+`relations` (durable policy) for any sheet absent from provenance. That
+fallback branch is removed entirely for deletion-candidate purposes.
+
+*New behavior:* `columns_to_drop` is built from `provenance_by_sheet` only —
+i.e. from `derived_helper_columns_by_sheet(frames)`, which is *already*
+truthful once <<E>> lands (no separate new accessor is required; see the
+non-design rationale in <<K>> and <<9-facade>>). `resolve_v2_fk_relations`
+remains called by `drop_helpers` for exactly one *unrelated, unchanged*
+purpose: the existing "was FK helper policy ever configured at all" clear
+error (`missing_fk_policy_error`) when *neither* provenance nor durable
+policy exist for the whole run. That precondition check is not a deletion
+decision and is out of scope for this design; it is left as-is.
+
+*Concrete disposition:*
+
+* sheet has truthful transient provenance naming the column → delete
+  (unchanged happy path);
+* sheet has no transient provenance for that column, durable policy names it
+  → leave in place, no error, no exception raised by default (diagnostic per
+  <<J>>);
+* neither transient provenance nor durable policy exist anywhere in the run
+  → `missing_fk_policy_error` (unchanged, pre-existing behavior, not a
+  deletion-authority question).
+
+H5 (`_clean_helper_provenance` → `reconcile_enrich_lookup_provenance`) is
+unchanged — see <<K>>.
+
+[[H]]
+== H. Derived-column-policy integration design
+
+`derived_column_policy.py::_safe_policy_helper_names` exists *solely* to
+supply FK-attributed deletion candidates from durable v2 relation policy.
+Under <<F>> that source is never authorized, so this function's entire
+purpose is removed: `apply_derived_column_policy` stops calling it, and its
+result is no longer unioned into `durable_helper_names` in
+`apply_derived_column_policy`'s body.
+
+*What remains, and why it is not touched:* `_resolve_derived_identity`'s
+reading of `_meta.derived.sheets[source].helper_columns` (FK's transient
+provenance) is *already correct* — it reads the same truthful subkey
+`fk_helpers/drop.py` reads, with its own (stricter) shape validation that
+raises clear `ValueError`s on malformed entries. This design does *not*
+force that reading through a shared function merely because
+`fk_helpers/policy.py` already has an equivalent reader
+(`derived_helper_columns_by_sheet`) — per the design brief's own caution
+("do not create generic shared infrastructure merely because two callers
+need the same FK-owned answer"), see <<9-facade>>. `_resolve_derived_identity`
+also reads Lookup's own `enrich_lookup` declared names in the same call —
+that half is Lookup's own self-declared identity of its own column and is
+*not* the defect (a family deleting a column via its own declaration of its
+own artifact is not "requested identity borrowed from a different owner");
+it is untouched.
+
+`_safe_durable_helper_names` (`_meta.sheets[source].helper_columns`,
+Workbook-View-owned durable sheet helper declaration) is a *different,
+non-FK-owned* durable declaration and is out of scope for this design (see
+<<repository-boundaries>> in <<Q>>); it is untouched.
+
+*Net effect on `apply_derived_column_policy`:* `durable_helper_names` in the
+function body is fed only by `_safe_durable_helper_names` (Workbook-View,
+unchanged, out of scope); `policy_helper_names` (`_safe_policy_helper_names`,
+FK durable-relation fallback) is deleted. FK-attributed candidate names come
+exclusively from `_resolve_derived_identity`'s transient-provenance read,
+unchanged.
+
+[[9-facade]]
+=== Design Question 9 — why no new shared facade is designed
+
+The two executors do not, in the corrected design, need a shared *data*
+accessor: each already reads FK's transient provenance correctly and
+independently, at acceptably low duplication risk (a short,
+already-well-validated read of one `_meta.derived.sheets[*].helper_columns`
+subkey). The defect-causing logic — the *durable-policy fallback* — is not
+consolidated into a shared function; it is *deleted outright* from both call
+sites, because the answer both sites need ("durable policy never
+authorizes deletion") is a fixed rule, not a computed value. This is the
+smallest design that prevents both executors from "independently
+reimplementing FK authority semantics" (the concern in the design brief):
+after this change, neither module contains *any* FK-authority-adjacent logic
+beyond reading FK's own truthful transient record.
+
+A narrow, optional hygiene improvement (not required for correctness, not
+part of the mandatory scope): `derived_column_policy.py` could call
+`fk_helpers.derived_helper_columns_by_sheet` instead of maintaining its own
+parallel reader, purely to reduce the duplicate-implementation surface
+Review 001's FIND-002 already flagged as a readability/duplication risk one
+cycle earlier. This is left to the implementer's judgment at slice time (see
+<<N>>) and is explicitly not mandated here.
+
+[[I]]
+== I. Persistence/reimport behavior
+
+*Design Question 3 answer.* No special-casing of "before persistence" versus
+"after persistence" is designed or required. <<F>>'s rule is stated once,
+uniformly: *truthful same-run transient provenance is required; durable
+policy alone is never sufficient — regardless of whether a persistence
+boundary was crossed.* Persistence does not change the rule; it only changes
+which evidence is available. Transient `_meta.derived` is stripped at the
+persistence boundary by existing, unchanged, and out-of-scope machinery
+(`pipeline/persistence_boundary.py`; "Persist Intent, discard recomputable
+Resolution" — `docs/ai_info/agent_rules.adoc`); durable
+`_meta.helper_policies.fk.relations` survives.
+
+*Concrete consequence:* after a reimport with no fresh `add_fk_helpers`
+materialization pass in the same session, `remove_fk_helpers` and
+`apply_derived_column_policy` can no longer automatically delete a
+physically present FK-shaped helper column from durable policy alone. This
+is a *deliberate, evidenced* compatibility narrowing, not an oversight — see
+<<P>> for its scope and <<R>> for the recovery path a future, separately
+authorized design could offer. It is consistent with
+`derived_column_policy.py`'s own pre-existing docstring, which already
+hedges that durable fallback declarations "identify columns only" — the
+implementation was out of sync with its own documented contract before this
+design.
+
+*Does running `add_fk_helpers` first restore automatic post-reimport
+cleanup?* No, and this must not be assumed by an implementer. The optional
+self-check in <<D>> only matches against *surviving transient* provenance,
+which does not exist immediately after reimport (it was stripped). Running
+`add_fk_helpers` against a freshly reimported frame therefore still treats
+the physically present column as an unverified collision (no claim). No
+mechanism in this design can regenerate trustworthy same-run evidence for a
+column that already existed before the current run started, short of
+FK genuinely re-materializing it from a state where the label was absent.
+This gap is named explicitly in <<R>>, not silently worked around.
+
+[[J]]
+== J. Failure and diagnostics contract
+
+[cols="3,3,3", options="header"]
+|===
+| Case | Disposition | Diagnostic
+
+| Materialization: requested label already occupied, not FK's own
+  (verified-or-not per <<D>>)
+| No-op: no overwrite, no provenance claim.
+| Non-raising diagnostic (warning/log; exact mechanism left to
+  implementation) naming frame, helper column label, and the FK relation
+  identity (`fk_column`, `target`, `value_field`) that was skipped.
+
+| `drop_helpers`: candidate named only by durable policy, no transient
+  evidence
+| No-op: column left in place, no exception.
+| Non-raising diagnostic naming sheet, helper column label, and "durable
+  policy only, no truthful transient provenance" as the refusal reason. No
+  existing return-shape change (`drop_helpers` has no findings-frame
+  surface today); a log/warning is the only available channel without a
+  gated interface change.
+
+| `drop_helpers`: transient provenance names a label no longer present in
+  the frame (stale record vs. current structure)
+| Safe no-op (unchanged existing behavior — nothing to delete).
+| None required; not a new failure mode introduced by this design.
+
+| `apply_derived_column_policy`, `policy="drop"`
+| Same no-op as `drop_helpers`'s durable-policy-only case.
+| Same non-raising diagnostic channel; `drop`'s documented contract ("no
+  value comparison", no findings-frame output) is preserved unchanged.
+
+| `apply_derived_column_policy`, `policy="warn_on_mismatch"`
+| Column left in place; call succeeds.
+| A new, distinct `DerivedColumnFinding` `rule_type`
+  (e.g. `fk_deletion_unauthorized`), severity `"warn"`, added to the
+  existing findings frame alongside (never merged with) `derived_value_mismatch`
+  findings — per the design brief's explicit instruction not to conflate
+  mismatch with authorization refusal.
+
+| `apply_derived_column_policy`, `policy="fail_on_mismatch"`
+| Raises `ValueError` via the existing
+  `if policy == "fail_on_mismatch" and failures: raise ...` path.
+| Same new `rule_type`, severity `"fail"`. *Flagged for explicit maintainer
+  sign-off* (<<S>>): this gives `fail_on_mismatch` a new class of failure
+  trigger (authorization refusal, not a value mismatch) it did not
+  previously have.
+
+| Durable policy names a column belonging to Lookup or arbitrary user/caller
+  payload
+| Identical to the generic "no transient evidence" case — no special-casing
+  by producer identity (<<D6>>).
+| Identical diagnostic; the reason never names Lookup or any other producer,
+  only "no truthful FK transient provenance."
+|===
+
+Diagnostics never inspect or report unrelated frame contents; they name only
+the frame, the candidate column label, and (where available) the FK relation
+identity that was declined.
+
+[[K]]
+== K. Lookup interaction / H5 relationship
+
+*Design Question 5 answer.* No new Lookup-owned pre-deletion handoff is
+introduced. <<F>>'s rule is decided entirely from FK-owned evidence (FK's
+own transient provenance); it never reads `_meta.derived.sheets.*.enrich_lookup`
+or any other Lookup-owned shape. H5
+(`reconcile_enrich_lookup_provenance`) is unchanged: it remains a stateless,
+recompute-on-demand, *post*-mutation truthfulness predicate over Lookup's own
+declared `helper_columns` and the frame's current columns, called by
+`fk_helpers/provenance.py::_clean_helper_provenance` exactly as today. Its
+scope and contract are unaffected because, with <<F>> in place, FK's own
+mutation that triggers H5 will far less often be the wrongful deletion of a
+Lookup-produced column in the first place — H5's existing job (deciding
+whether Lookup's own sibling record is still truthful) is unchanged and still
+necessary for cases outside this defect's scope (e.g. a *legitimate* FK
+deletion of its own helper that happens to share a sheet entry with an
+unrelated Lookup record).
+
+[[D6]]
+[[L]]
+== L. Formula/value and foreign-artifact equivalence disposition
+
+*Design Question 6 (user/canonical collisions) answer.* <<F>> and <<D>> are
+both stated purely in terms of "does FK have truthful evidence it produced
+this column" — neither ever asks "was the current producer Lookup." A
+caller-supplied ordinary column that happens to collide with FK's requested
+helper label is handled identically to a Lookup-produced collision: skipped
+at materialization (<<D>>), never claimed, never deleted by either cleanup
+executor without truthful transient evidence (<<F>>). This generality is
+structural, not a separately maintained rule — there is no producer-identity
+branch anywhere in this design to keep in sync.
+
+*Design Question 7 answer.* Value/semantic-equivalence adoption of a foreign
+producer's physically present column (Candidate C) is *rejected outright and
+not designed*. Reasons, all evidenced by the accepted research and review:
+
+* Candidate A (reject on collision) is already sufficient to close the
+  confirmed defect (<<repro-closure>>); building equivalence machinery
+  before it is needed contradicts the design brief's explicit "if A or B is
+  sufficient, do not design generic adoption."
+* Review 001 names the concrete risk directly: a Lookup-produced formula and
+  an FK-produced value can display equal current results while carrying
+  different update/lifecycle semantics; current value equality does not
+  imply equivalent producer semantics.
+* The one place this design *does* compare structured state (<<D>>'s
+  optional self-check) deliberately compares only FK's own prior
+  *metadata shape* against itself — never a foreign producer's declared
+  identity, never cell values, never a formula/value distinction. It cannot
+  drift into Candidate C because it has no path to a foreign producer's
+  record at all.
+
+No equivalence/adoption machinery is designed for any site in this document.
+If a future, separately evidenced need for adopting a foreign producer's
+artifact arises, it is out of this design's authorization — see <<R>>.
+
+[[M]]
+== M. Canonical documentation impact
+
+This design *identifies* the following documentation deltas. None are made
+by this artifact.
+
+=== Semantic
+
+`docs/semantic_model/12_contract_matrices.adoc` (FK row, lines ~92-96): add
+the deletion-authority precondition alongside the existing
+"writes transient provenance entries ... per materialized helper column"
+wording — state explicitly that `remove_fk_helpers` and
+`apply_derived_column_policy` require that same materialized-only transient
+record; durable `helper_policies.fk.relations` is a materialization input,
+never a deletion-authority input.
+
+=== Technical
+
+`docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`: update the
+"Derived helper provenance records materialized helper-column state" bullet
+to describe the skip-without-claim contract (<<E>>) precisely, including the
+optional self-verified-reuse case if implemented; add a short subsection
+describing the deletion-authority rule (<<F>>) next to the existing
+primitive-consumption description.
+
+=== Developer
+
+`docs/ai_info/concepts_fk_helpers.adoc` "Key rules": the existing bullet
+"`remove_fk_helpers` removes columns identified by derived provenance or v2
+relation policy; missing both raises clearly" must be corrected —
+`remove_fk_helpers` (and `apply_derived_column_policy`'s FK branch) now
+remove columns identified *only* by truthful derived provenance; v2 relation
+policy alone never authorizes removal. Per Review 001 Area 14, this is a
+legitimate future specialization of the Domain Maintainer Contract's existing
+"Treat material handoffs as first-class contracts" / "Make state, provenance,
+and reconstruction explicit" sections and requires *no new DMC vocabulary* —
+no DMC edit is proposed.
+
+=== Functional / registry
+
+* `docs/functional_model/ch04_use_case_concepts/fk_helpers.adoc` and
+  `derived_frame_views.adoc`: the Functional Model owner should check
+  whether user-facing wording describing automatic helper-column cleanup
+  after reimport needs a caveat naming the new precondition (a real
+  capability narrowing, <<P>>). Not decided or edited here.
+* `registries/meta_registry.yaml`, `derived` entry: `persistence_behavior`
+  and `precedence_notes` should be adjusted to state that
+  `drop_helpers`/`apply_derived_column_policy` consumption requires the
+  entry to reflect FK's own truthful current-run materialization; presence
+  alone (irrespective of source) is not authorization. Not edited here.
+* `docs/release_notes/release_notes.adoc`: both `remove_fk_helpers` and
+  `apply_derived_column_policy` are registered pipeline steps
+  (`registries/pipeline_step_registry.json`); their observable behavior
+  changes for the durable-policy-only case. This is a caller-visible
+  behavior change under the release-notes checkpoint
+  (`docs/ai_info/git_and_workflow.adoc`) and should get an entry, or an
+  explicit "no release note needed" rationale in the implementation FTR's
+  review artifact.
+
+[[N]]
+== N. Runtime implementation slices
+
+DESIGN ONLY — proposed bounded sequence, sized for small reviewable commits
+per `docs/ai_info/agent_rules.adoc`'s working-style rule. An implementer
+should run the FTR Sizing Preflight (`docs/ai_info/agent_rules.adoc`) before
+writing acceptance criteria; this sequencing is a starting proposal, not a
+substitute for it.
+
+[cols="1,5,3", options="header"]
+|===
+| Slice | Scope | Depends on
+
+| 1
+| `core/fk.py`: add `materialize_fk_helpers` /
+  `FkHelperMaterializationResult` (<<E>>); make `apply_fk_helpers` a thin
+  wrapper. No behavior change to any existing caller. Add the new symbol to
+  the primitive architecture guard's `_ALLOWED_CORE_FK_NAMES` allow-list
+  (`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`)
+  and, if it should become part of the supported `core` surface, to
+  `core/__init__.py`'s `__all__` — check `interfaces_and_gates.adoc` first.
+| none
+
+| 2
+| `fk_helpers/enrich.py` + `fk_helpers/provenance.py`: consume Slice 1's
+  report; write provenance only for the provable set (<<E>>). Include the
+  optional self-verified-reuse refinement (<<D>>) in this slice unless the
+  implementer defers it explicitly to slice 2b.
+| 1
+
+| 3
+| `fk_helpers/drop.py`: remove the durable-relation fallback branch from
+  `_columns_to_drop_by_sheet` (<<G>>). Add the diagnostic in <<J>>.
+| 2
+
+| 4
+| `derived_column_policy.py`: remove `_safe_policy_helper_names` and its use
+  in `apply_derived_column_policy` (<<H>>). Add the `fk_deletion_unauthorized`
+  finding `rule_type` and wire it into the three policy modes per <<J>>.
+| 2 (independent of 3; may land in parallel)
+
+| 5 (optional)
+| Documentation slice implementing <<M>>'s identified deltas (Semantic,
+  Technical, Developer, and — pending the relevant owners' sign-off —
+  Functional/registry). Separate from runtime slices per this repo's
+  convention of committing docs and code as distinct, traceable commits.
+| 1-4
+|===
+
+[[O]]
+== O. Required tests / acceptance matrix
+
+[cols="4,4", options="header"]
+|===
+| Test | Closes / protects
+
+| `materialize_fk_helpers` reports a definition as `skipped_existing` (not
+  `materialized`) when its label collides with a pre-existing column; the
+  returned frame is unchanged for that column.
+| <<E>> mechanical contract.
+
+| `enrich_helpers` writes no provenance entry for a collided, unverified
+  definition (repro-1-shaped unit test, FK side only).
+| FIND-003 closure.
+
+| (if slice 2 includes the refinement) `enrich_helpers` re-run in one session
+  against a frame carrying its own prior materialization refreshes, not
+  drops, that provenance entry.
+| <<D>> optional refinement; idempotence regression guard.
+
+| `drop_helpers` does *not* delete a column named only by durable v2
+  relation policy with no transient provenance for that sheet (repro 2,
+  converted to a permanent regression test asserting survival, not loss).
+| <<F>>, <<G>>.
+
+| `drop_helpers` still deletes a column correctly named by truthful,
+  freshly written transient provenance (happy-path regression).
+| Non-regression of the ordinary FK-helper-removal contract.
+
+| `apply_derived_column_policy(policy="drop")` does not delete a column
+  named only by durable FK policy (repro 3, permanent regression test).
+| <<F>>, <<H>>.
+
+| `apply_derived_column_policy(policy="warn_on_mismatch")` emits a
+  `fk_deletion_unauthorized` finding distinct from `derived_value_mismatch`,
+  without raising.
+| <<J>>.
+
+| `apply_derived_column_policy(policy="fail_on_mismatch")` raises when an
+  FK-attributed column cannot be authorized for deletion.
+| <<J>> (pending the sign-off flagged in <<S>>).
+
+| End-to-end: repro 1's full sequence (`configure_fk_helpers` →
+  `enrich_lookup` → `add_fk_helpers` → `remove_fk_helpers`) leaves Lookup's
+  distinct values in the frame.
+| Full-defect closure, matching the accepted research's own reproduction
+  shape.
+
+| A caller-supplied ordinary (non-Lookup) column colliding with FK's
+  requested label is neither claimed nor deleted (Design Question 6
+  generalization test).
+| <<D6>>.
+
+| (recommended, not mandatory) An architecture guard asserting neither
+  `fk_helpers/drop.py` nor `derived_column_policy.py` calls
+  `resolve_v2_fk_relations` for deletion-candidate computation.
+| Guards the boundary decided in <<9-facade>> against regression.
+|===
+
+Full existing suite (`pytest tests/unit tests/integration tests/roundtrip
+tests/architecture`) must remain green; the FK/Lookup-adjacent files listed
+in the accepted research's material test anchors are the minimum re-run set
+during implementation.
+
+[[P]]
+== P. Compatibility assessment
+
+[cols="3,4,2", options="header"]
+|===
+| Change | Impact | Classification
+
+| FK provenance no longer written for skipped/unverified collisions
+| Aligns runtime with already-documented contract (three maintained sources
+  already say "materialized only"). No known consumer relies on the
+  over-inclusive buggy behavior.
+| Bug fix, not a new incompatibility.
+
+| `drop_helpers` / `apply_derived_column_policy` no longer delete
+  FK-attributed columns from durable-policy-only evidence
+| Real, deliberate capability narrowing for reimport pipelines that do not
+  regenerate transient provenance before cleanup. `derived_column_policy.py`'s
+  own docstring already hedged this path as "identify columns only"; the
+  implementation was out of sync with its own contract.
+| Deliberate breaking change, justified by closing a confirmed data-loss
+  defect (DMC §7: "existing behavior is evidence, not an automatic
+  compatibility obligation"). Needs a release note (<<M>>).
+
+| `core/fk.py::apply_fk_helpers` signature/return type
+| Unchanged (compatibility wrapper, <<E>>).
+| No impact.
+
+| `fail_on_mismatch` gains a new failure trigger (authorization refusal)
+| A pipeline currently relying on `fail_on_mismatch` never raising for FK
+  helpers (documented today as "dropped but not value-checked") could start
+  raising.
+| Flagged for explicit sign-off, <<S>>.
+|===
+
+No maintained consumer was inspected as part of this design (none was
+inspected by the underlying research either); if a maintained or credible
+external consumer is later found to depend on durable-policy-only FK-helper
+cleanup, that is new evidence for the follow-up in <<R>>, not a reason to
+reopen this design's fail-closed default.
+
+[[Q]]
+== Q. Explicit non-goals
+
+Restated from the design authorization, confirmed absent from every section
+above:
+
+* claimant / current-reliance as a required primitive;
+* claim registration, claim release, a claim AST, a claim ledger, reference
+  counting, a shared-claim protocol;
+* a generic artifact registry, stable artifact IDs, global artifact
+  identity, or rename-following identity;
+* a central producer registry or whole-Domain materialization census;
+* Trusted-Ingress redesign, persistence redesign, or schema-maintenance
+  redesign;
+* promotion, deprecation, removal, or merge of Lookup Enrichment as a
+  product concept (<<R>>);
+* value/formula equivalence or adoption machinery for a foreign producer's
+  artifact (<<L>>);
+* any new `_meta` root, sub-key, or schema-version bump — this design adds
+  zero new metadata; it only changes which existing, already-registered
+  entries are written or consulted, and for what purpose.
+
+[[repository-boundaries]]
+Also explicitly out of scope: Workbook-View-owned durable sheet helper
+declarations (`_meta.sheets[*].helper_columns`), which are a different,
+non-FK-owned durable authority and are untouched by <<H>>.
+
+[[R]]
+== R. Deferred follow-ups
+
+* *Restoring automatic post-reimport FK-helper cleanup* (named gap, <<I>>):
+  if a real maintained or credible external consumer is later shown to need
+  automatic deletion from durable policy alone after persistence, the
+  necessary follow-up is a *new*, separately authorized design choosing
+  between (a) a narrow, explicitly-scoped, FK-owned physical-production
+  verification performed at cleanup time against current source/target data
+  (weighing the formula/value risk named in <<L>> honestly, not
+  reflexively), or (b) an explicit, opt-in, caller-asserted durable
+  declaration analogous to XRef's guarded `drop_source` flag, which shifts
+  authority to an explicit caller assertion rather than passive name
+  matching. Neither is designed or authorized here.
+* *Registry and Functional wording* identified in <<M>> but not written.
+* *Optional hygiene simplification* in `derived_column_policy.py`
+  (<<9-facade>>): reuse `fk_helpers.derived_helper_columns_by_sheet` instead
+  of a parallel reader, purely to reduce duplication flagged by an earlier
+  review cycle. Not required for correctness.
+* *Lookup Enrichment user-facing publication posture*: a separate maintainer
+  question (not decided here, not decided by this design) is whether Lookup
+  Enrichment's independent user-facing product status should be marked, in a
+  future DMC/publication-posture convention (e.g.
+  `user_facing_documentation: false` with an explicit reason), as
+  not-yet-established rather than promoted or merged with FK Helpers. This
+  design takes no position and does not touch Lookup's user-facing
+  documentation, DMC, or product status. Recorded here only so the intent
+  is not lost.
+* *Architecture guard* for the boundary in <<9-facade>> (recommended in
+  <<O>>, not mandatory).
+
+[[S]]
+== S. Open questions
+
+* Whether `core/fk.py::apply_fk_helpers` (and the proposed new
+  `materialize_fk_helpers`) are covered by `interfaces_and_gates.adoc` as a
+  supported public Python surface, and therefore whether adding
+  `materialize_fk_helpers` to `core/__init__.py`'s `__all__` requires
+  explicit developer approval before implementation (Slice 1).
+* Whether `fail_on_mismatch` should actually raise on an authorization
+  refusal (this design's chosen answer, mirroring the existing mismatch
+  severity ladder) or should remain a non-raising skip even under
+  `fail_on_mismatch`, given it introduces a new failure trigger for a
+  registered pipeline step. Needs explicit maintainer sign-off before Slice
+  4 lands (<<P>>).
+* Whether the optional self-verified-reuse refinement (<<D>>) is worth
+  including in Slice 2 now or is better deferred to a follow-up slice once
+  the mandatory fix is independently verified — both are compatible with
+  this design; the choice is scheduling, not architecture.
+* The "no known invalidating same-run mutation path" assumption in <<F>>'s
+  Design Question 2 discussion is stated as evidenced-absent, not
+  proof-absent; an implementer extending FK/Lookup interaction later should
+  re-check it rather than assume it is permanently closed.
+
+[[T]]
+== T. Design readiness verdict
+
+*READY for implementation planning*, subject to the independent adversarial
+review recommended below and explicit maintainer sign-off on the two items
+flagged in <<S>> (the `interfaces_and_gates` status of the Core return-shape
+change, and the `fail_on_mismatch` new-failure-trigger decision). The design
+closes all three accepted reproductions (<<repro-closure>>) using only
+mechanisms already evidenced as necessary: a truthful provenance report at
+the existing materialization primitive, and the deletion of one unsafe
+fallback branch at each of the two cleanup executors. It introduces no new
+metadata, no claim/reliance infrastructure, and no value/equivalence
+machinery, matching the narrowed-scope authorization exactly.
+
+== Independent review recommendation
+
+Per this task's own closing instruction, an independent adversarial review of
+this design artifact is recommended before any implementation, test, or
+canonical-document change proceeds from it — matching the review discipline
+already applied to the research artifact it builds on
+(`derived_artifact_claim_lifecycle_assessment_2026-08-21.adoc` and its
+`_review_001.adoc`). In particular, a reviewer should independently verify:
+the closure claim in <<repro-closure>> against the actual accepted
+reproduction shapes; that <<Q>>'s non-goals are genuinely absent from every
+section; and that the <<I>> persistence/reimport capability narrowing is
+described accurately and not quietly minimized.
