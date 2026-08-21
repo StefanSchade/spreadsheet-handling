@@ -7,6 +7,7 @@ transformation code must not couple to another family's private submodules.
 from __future__ import annotations
 
 import ast
+import sys
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -70,7 +71,18 @@ def _resolved_imports(module_path: Path) -> list[str]:
             imports.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             relative_name = "." * node.level + (node.module or "")
-            imports.append(resolve_name(relative_name, package_context))
+            resolved_module = resolve_name(relative_name, package_context)
+            imports.append(resolved_module)
+            # `from <family-package> import <internal-module>` (e.g.
+            # `from enrich_lookup import provenance`) imports an internal
+            # module by its bare name rather than a facade symbol. The
+            # imported *name* (not the local alias) may itself be that
+            # submodule, so consider the qualified candidate too -- otherwise
+            # only the family-package import above is checked and the
+            # internal-module import bypasses the guard (IMPL-REV-001).
+            imports.extend(
+                f"{resolved_module}.{alias.name}" for alias in node.names
+            )
     return imports
 
 
@@ -93,3 +105,82 @@ def test_transformations_do_not_import_other_families_internal_modules() -> None
                     )
 
     assert not violations, "Cross-family transformation import violations:\n" + "\n".join(violations)
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage for IMPL-REV-001: `from <family> import <internal>`
+# previously resolved only to the family package, not the qualified internal
+# module, and so bypassed the guard above. These tests exercise
+# `_resolved_imports` directly against a throwaway module written under a
+# fake `SRC_ROOT` that mirrors the real package layout, since `_module_name`
+# resolves paths relative to `SRC_ROOT`.
+# ---------------------------------------------------------------------------
+
+_ENRICH_LOOKUP_ROOT = "spreadsheet_handling.domain.transformations.enrich_lookup"
+_ENRICH_LOOKUP_INTERNAL_PREFIXES = GUARDED_INTERNAL_PREFIXES[_ENRICH_LOOKUP_ROOT]
+
+
+def _write_fake_consumer(tmp_path: Path, import_statement: str) -> Path:
+    """Write a throwaway consumer module under a fake ``SRC_ROOT``.
+
+    The fake root mirrors the real ``transformations`` package layout so
+    ``_resolved_imports`` resolves the import exactly as it would for real
+    repository code.
+    """
+    module_path = (
+        tmp_path
+        / "src"
+        / "spreadsheet_handling"
+        / "domain"
+        / "transformations"
+        / "consumer_family"
+        / "consumer.py"
+    )
+    module_path.parent.mkdir(parents=True, exist_ok=True)
+    module_path.write_text(import_statement + "\n")
+    return module_path
+
+
+def _resolved_imports_with_fake_src_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, import_statement: str,
+) -> list[str]:
+    module_path = _write_fake_consumer(tmp_path, import_statement)
+    monkeypatch.setattr(sys.modules[__name__], "SRC_ROOT", tmp_path / "src")
+    return _resolved_imports(module_path)
+
+
+@pytest.mark.parametrize("internal_module", ["operation", "policy", "provenance"])
+def test_bare_name_import_of_internal_module_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, internal_module: str,
+) -> None:
+    """``from <family> import <internal-module>`` must resolve to the
+    qualified internal-module path, closing the IMPL-REV-001 bypass."""
+    resolved = _resolved_imports_with_fake_src_root(
+        tmp_path, monkeypatch, f"from {_ENRICH_LOOKUP_ROOT} import {internal_module}",
+    )
+    expected = f"{_ENRICH_LOOKUP_ROOT}.{internal_module}"
+    assert expected in resolved
+    assert any(candidate in _ENRICH_LOOKUP_INTERNAL_PREFIXES for candidate in resolved)
+
+
+def test_aliased_bare_name_import_of_internal_module_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard reasons from the imported name, not the local alias."""
+    resolved = _resolved_imports_with_fake_src_root(
+        tmp_path, monkeypatch,
+        f"from {_ENRICH_LOOKUP_ROOT} import provenance as p",
+    )
+    assert f"{_ENRICH_LOOKUP_ROOT}.provenance" in resolved
+    assert any(candidate in _ENRICH_LOOKUP_INTERNAL_PREFIXES for candidate in resolved)
+
+
+def test_facade_symbol_import_remains_permitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The H5-slice facade import must not be flagged as an internal module."""
+    resolved = _resolved_imports_with_fake_src_root(
+        tmp_path, monkeypatch,
+        f"from {_ENRICH_LOOKUP_ROOT} import reconcile_enrich_lookup_provenance",
+    )
+    assert not any(candidate in _ENRICH_LOOKUP_INTERNAL_PREFIXES for candidate in resolved)
