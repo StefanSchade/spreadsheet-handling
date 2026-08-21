@@ -1,0 +1,210 @@
+= FK / Lookup Provenance Handoff (H5): First-Slice Implementation
+:toc:
+:toclevels: 2
+:sectnums:
+
+Status: implementation record for the first authorized DMC hardening slice.
+Read-only for future reference; does not re-litigate Cycle-0 or Review 001.
+
+Implements:: the bounded slice authorized by
+`domain_fk_reference_helper_cycle0_assessment_2026-08-21.adoc` Section I,
+as corrected by
+`domain_fk_reference_helper_cycle0_assessment_2026-08-21_review_001.adoc`
+(overall verdict *ACCEPT WITH MINOR CORRECTIONS*; first-slice verdict
+*SLICE ACCEPTED WITH CORRECTION*, requiring FIND-001 and FIND-003 resolved
+within this same change).
+
+Baseline HEAD:: `8329c90e2ece8c213c0a39070768f1f42643eb57`
+(`docs(domain): review FK reference-helper Cycle 0`), branch `main`, worktree
+clean before implementation, verified with `git status --short --branch` and
+`git rev-parse HEAD`.
+
+== Implemented ownership seam
+
+FK direct cleanup
+(`domain/transformations/fk_helpers/provenance.py::_clean_helper_provenance`)
+previously read and interpreted `enrich_lookup.helper_columns` directly
+(`{str(c) for c in (enrich.get("helper_columns") or [])}`) to decide whether a
+sibling Lookup provenance record was still truthful after FK removed its own
+columns. That interpretation is now Lookup-owned:
+
+* New module `domain/transformations/enrich_lookup/provenance.py` exposes
+  `reconcile_enrich_lookup_provenance(record, *, frame_name, present_columns)
+  -> bool`. It reads only the record's own declared `helper_columns` and the
+  caller-supplied post-mutation column-label set; it accepts no FK relation
+  object, FK policy, or other FK-specific input. Re-exported through the
+  package facade `enrich_lookup/__init__.py` (`from .provenance import
+  reconcile_enrich_lookup_provenance`), alongside the existing `enrich_lookup`
+  export.
+* `fk_helpers/provenance.py::_clean_helper_provenance` now owns only
+  `_meta.derived.sheets.*.helper_columns` removal and structural
+  empty-container pruning. When a sheet entry carries an `enrich_lookup` key,
+  it computes the post-removal visible column-label set (using its own
+  pre-existing `_visible_label`, a generic tuple-header helper, not a Lookup
+  concept) and calls the Lookup-owned facade; it no longer reads
+  `helper_columns` out of the Lookup record itself. FK imports only the
+  package facade (`from ..enrich_lookup import
+  reconcile_enrich_lookup_provenance`), never
+  `enrich_lookup.operation`/`enrich_lookup.policy`/`enrich_lookup.provenance`
+  directly.
+* Copy-on-write, sibling-preservation, and empty-container-pruning mechanics
+  in `_clean_helper_provenance` are unchanged; only the predicate that used to
+  be inlined is now an explicit call across the family boundary.
+
+No new coordinator, registry, cleanup protocol, or plugin mechanism was
+introduced. This is the one H5 edge the Cycle-0 artifact and Review 001
+scoped: `fk_helpers -> enrich_lookup`, one direction, no cycle (`enrich_lookup`
+imports nothing from `fk_helpers` or `derived_column_policy`).
+
+== FIND-001 disposition -- malformed provenance
+
+Adopted fail-clear validation, matching the wording style of
+`derived_column_policy.py::_validated_enrich_spec`:
+
+* `reconcile_enrich_lookup_provenance` raises `ValueError` when `record` is a
+  mapping whose `helper_columns` is present but not a `list`/`tuple`. Message:
+  ``_meta.derived.sheets[<frame_name>].enrich_lookup.helper_columns must be a
+  list``, naming the specific sheet.
+* A non-mapping `record` (e.g. caller passes `None`, a string, or an int) is
+  treated as "retain" and does *not* raise. This preserves the pre-slice
+  pass-through for a malformed `enrich_lookup` *record itself* (as opposed to
+  a malformed `helper_columns` field inside a well-formed record), which
+  Review 001's FIND-001 did not flag and which this slice does not
+  opportunistically change.
+* Previously: `.get("helper_columns") or []` on a string iterated its
+  characters, on a dict iterated its keys, and on other shapes raised an
+  opaque, untyped `TypeError` from inside FK's private helper. All three are
+  now a single clear, path-specific `ValueError` raised by the Lookup-owned
+  boundary before any output/meta mutation is published.
+
+Tests pin this explicitly: `helper_columns` values of a string, an int, and a
+dict all raise with the expected path-specific message
+(`test_enrich_lookup_provenance_reconciliation.py`), and the same shape
+propagates a `ValueError` through `drop_helpers` end-to-end before any
+partial output is returned
+(`test_derived_provenance_nested_ownership.py::test_fk_drop_malformed_enrich_lookup_helper_columns_fails_clearly`).
+
+== FIND-003 disposition -- architecture guard
+
+`tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`'s
+`GUARDED_INTERNAL_PREFIXES` gained an `enrich_lookup` entry covering
+`enrich_lookup.operation`, `enrich_lookup.policy`, and the new
+`enrich_lookup.provenance`. The generic guard (already scanning every module
+under `domain/transformations/`) now fails if any future cross-family caller
+reaches past the `enrich_lookup` package facade into those internals. The
+same test run confirms the new `fk_helpers -> enrich_lookup` edge introduced
+by this slice already complies (it imports the package root only).
+
+== Tests run and results
+
+Files changed/added:
+
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/provenance.py`
+  (new)
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/__init__.py`
+* `src/spreadsheet_handling/domain/transformations/fk_helpers/provenance.py`
+* `tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`
+* `tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py`
+* `tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py`
+  (new)
+
+New/extended test coverage:
+
+* Lookup-owned reconciliation in isolation: still-present helper retained,
+  partial overlap retained, no declared helper remaining dropped, empty
+  `helper_columns` dropped, missing `helper_columns` key dropped, repeated
+  calls idempotent, non-mapping record left to caller (no raise), malformed
+  `helper_columns` (string/int/dict) raises `ValueError` with a path
+  identifying the frame.
+* FK-owned cleanup / composition: a delegation test stubs the Lookup-owned
+  boundary to unconditionally return "not truthful" and observes a
+  still-present, otherwise-retained Lookup helper column's provenance get
+  removed anyway -- proving FK computes no presence/overlap answer of its
+  own. A malformed-provenance test proves the `ValueError` is reachable
+  end-to-end through `drop_helpers`. The three pre-existing nested-ownership
+  tests (copy-on-write, sibling preservation, repeat-safety, conditional
+  removal, empty-container pruning) were preserved unmodified and still pass.
+
+Commands run (all green):
+
+[source,text]
+----
+.venv/bin/python -m pytest \
+  tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py \
+  tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/validations/test_fk_check.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/domain/transformations/test_fk_helpers_domain.py \
+  tests/unit/domain/transformations/test_fk_helper_primitives_policy_driven.py \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py \
+  tests/architecture/dependency_guards/
+# 294 passed
+
+.venv/bin/python -m pytest \
+  tests/unit/pipeline/test_fk_helper_configuration.py \
+  tests/unit/pipeline/test_lookup_helper_configuration.py \
+  tests/unit/pipeline/test_enrich_lookup_registration.py \
+  tests/unit/domain/schema_maintenance/test_metadata_refs.py \
+  tests/architecture/semantic_invariants/test_meta_reference_surfaces.py \
+  tests/integration/pipeline/test_xref_lookup_helper_inbound_binding.py \
+  tests/integration/roundtrip/test_meta_persistence.py \
+  tests/integration/pipeline/test_orchestrator_persistence_boundary.py \
+  tests/unit/domain/validations/test_reference_validations.py
+# 150 passed
+
+.venv/bin/python -m pytest
+# 2847 passed (full default-marker suite)
+----
+
+== Compatibility statement
+
+* No registered step name, YAML parameter, FK metadata shape, or Lookup
+  metadata shape changed.
+* `remove_fk_helpers`/`drop_helpers` observable output is unchanged for every
+  valid current state: still-present Lookup helper columns keep their
+  provenance record (object identity preserved, per the pre-existing nested-
+  ownership tests), fully-absent ones are pruned, repeated cleanup remains a
+  no-op, and empty structural containers are pruned identically.
+* The only observable change is for a previously malformed/undefined
+  `enrich_lookup.helper_columns` shape (see FIND-001): callers relying on the
+  prior accidental character/key iteration or the opaque `TypeError` will now
+  see a clear `ValueError`. No supported producer (`enrich_lookup`'s own
+  writer) ever emits a malformed shape; this is reachable only via a
+  hand-edited or externally corrupted `_meta.derived` sidecar. No release
+  note is added: this does not change behavior for any valid/supported state,
+  and the prior behavior was not a documented or reliable contract (it was
+  either silently wrong or an opaque crash), so hardening it is not a
+  caller-visible change to a supported surface within the meaning of the
+  release-note workflow.
+
+== Explicit non-goals / deferred follow-up
+
+* `derived_column_policy.py`'s independent ~180-line reimplementation of
+  Lookup provenance interpretation (`_resolve_derived_identity`,
+  `_validated_enrich_spec`, `_check_enrich_lookup_values`,
+  `_validated_mismatch_keys`, `_canonical_value_map`) is untouched, per
+  Cycle-0/Review-001 FIND-002. It remains a larger, separately-scoped
+  instance of the same cross-owner-knowledge pattern and is not addressed by
+  this slice.
+* No package/topology migration was performed. `fk_relations.py`,
+  `helper_policies.py`, validation modules, and Core modules were not moved.
+  `enrich_lookup/provenance.py` is the one small new module the existing
+  package structure already supports.
+* No FK-formula certification, Trusted-Ingress, schema-maintenance, Workbook
+  View, or `core.fk`/`core.refs` placement change was made.
+* FIND-002 and FIND-004 (Cycle-0 wording corrections) were left to the
+  Cycle-0 artifact's own maintainer, per this task's explicit instruction not
+  to edit Cycle-0/review artifacts.
+
+== Unexpected implementation evidence
+
+None. The predicate's actual data dependency was exactly as Review 001
+Section 5.1 described: only the record's own `helper_columns` and the
+post-mutation frame's column labels, with no FK relation shape needed. No
+additional cross-owner coupling, hidden third caller of
+`_clean_helper_provenance`, or existing test asserting the old inline
+predicate's *implementation* (as opposed to its *observable behavior*) was
+found; all pre-existing assertions in
+`test_derived_provenance_nested_ownership.py` passed unmodified against the
+refactored composition.

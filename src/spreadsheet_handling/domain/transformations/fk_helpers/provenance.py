@@ -4,10 +4,19 @@ Behavior-preserving split out of the former single ``fk_helpers`` module
 (FTR-DOMAIN-TRANSFORMATION-MODULE-SPLIT-FK-HELPERS-P5). ``_visible_label`` is
 kept local here because both provenance cleanup and ``drop.drop_helpers``
 need it; ``drop`` imports it from this module.
+
+FK cleanup owns only its own ``helper_columns`` subkey. A sibling
+``enrich_lookup`` provenance record may also live under the same
+``_meta.derived.sheets.<sheet>`` entry; whether that record is still
+truthful after FK's column removal is Lookup's own semantic call, not FK's
+(H5 in the FK/Lookup Cycle-0 assessment). ``_clean_helper_provenance`` asks
+the Lookup-owned boundary rather than interpreting the record's shape here.
 """
 from __future__ import annotations
 
 from typing import Any
+
+from ..enrich_lookup import reconcile_enrich_lookup_provenance
 
 
 def _write_helper_provenance(
@@ -111,7 +120,12 @@ def _clean_helper_provenance(
     meta: dict[str, Any],
     derived_sheets: dict[str, Any],
 ) -> None:
-    """Remove helper_columns provenance entries after helpers have been dropped."""
+    """Remove FK-owned ``helper_columns`` provenance after helpers are dropped.
+
+    A sibling ``enrich_lookup`` record on the same sheet entry is handed to
+    the Lookup-owned reconciliation boundary rather than interpreted here;
+    see the module docstring for why.
+    """
     if not derived_sheets:
         return
 
@@ -132,13 +146,9 @@ def _clean_helper_provenance(
     for sheet_name in list(derived_sheets.keys()):
         sheet_entry = derived_sheets.get(sheet_name) or {}
         remove_helper_columns = "helper_columns" in sheet_entry
-        # Narrow enrich_lookup cleanup: drop the subkey only when none of its
-        # helper columns remain in the cleaned frame, so still-present lookup
-        # helper columns are never left without provenance.
-        enrich = sheet_entry.get("enrich_lookup")
+
         remove_enrich_lookup = False
-        if isinstance(enrich, dict):
-            enrich_cols = {str(c) for c in (enrich.get("helper_columns") or [])}
+        if "enrich_lookup" in sheet_entry:
             frame = out.get(sheet_name)
             frame_columns = getattr(frame, "columns", None)
             present = (
@@ -146,8 +156,12 @@ def _clean_helper_provenance(
                 if frame_columns is not None
                 else set()
             )
-            if not (enrich_cols & present):
-                remove_enrich_lookup = True
+            retained = reconcile_enrich_lookup_provenance(
+                sheet_entry["enrich_lookup"],
+                frame_name=sheet_name,
+                present_columns=present,
+            )
+            remove_enrich_lookup = not retained
 
         if not (remove_helper_columns or remove_enrich_lookup or not sheet_entry):
             continue

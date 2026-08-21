@@ -443,6 +443,64 @@ def test_enrich_lookup_repetition_matrix_preserves_current_stale_behavior() -> N
     }
 
 
+def test_fk_drop_delegates_lookup_provenance_reconciliation_to_lookup_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FK cleanup contains no direct Lookup key-shape interpretation.
+
+    ``existing_lookup_helper`` is untouched by FK's own column removal and
+    would be *retained* by the real Lookup reconciliation (its declared
+    helper column is still present). Stubbing the Lookup-owned boundary to
+    unconditionally say "not truthful" and observing the record disappear
+    anyway proves FK-drop defers the decision entirely to that boundary
+    rather than computing its own presence/overlap answer.
+    """
+    import spreadsheet_handling.domain.transformations.fk_helpers.provenance as fk_provenance
+
+    frames = enrich_helpers(_fk_frames(), _FK_DEFAULTS)
+    frames["A"]["existing_lookup_helper"] = ["x", "y"]
+    frames["_meta"]["derived"]["sheets"]["A"]["enrich_lookup"] = {
+        "lookup": "B",
+        "on": ["id_(B)"],
+        "helper_columns": ["existing_lookup_helper"],
+    }
+
+    monkeypatch.setattr(
+        fk_provenance, "reconcile_enrich_lookup_provenance", lambda *a, **k: False
+    )
+
+    out = drop_helpers(frames)
+
+    assert "existing_lookup_helper" in out["A"].columns
+    assert "enrich_lookup" not in out["_meta"].get("derived", {}).get("sheets", {}).get(
+        "A", {}
+    )
+
+
+def test_fk_drop_malformed_enrich_lookup_helper_columns_fails_clearly() -> None:
+    """Malformed Lookup provenance at the FK-drop seam fails before publication.
+
+    FIND-001: previously ``.get("helper_columns") or []`` silently
+    misinterpreted (or opaquely crashed on) a malformed shape. The
+    Lookup-owned boundary now raises a clear, path-specific ``ValueError``
+    reachable through ``drop_helpers``, and no partial output/meta is
+    published.
+    """
+    frames = enrich_helpers(_fk_frames(), _FK_DEFAULTS)
+    frames["_meta"]["derived"]["sheets"]["A"]["enrich_lookup"] = {
+        "lookup": "B",
+        "on": ["id_(B)"],
+        "helper_columns": "not-a-list",
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        drop_helpers(frames)
+
+    message = str(excinfo.value)
+    assert "_meta.derived.sheets['A'].enrich_lookup.helper_columns" in message
+    assert "must be a list" in message
+
+
 @pytest.mark.parametrize("container_case", ["meta", "derived", "sheets"])
 def test_fk_write_and_drop_handle_absent_containers_without_spurious_empty_meta(
     container_case: str,
