@@ -1,0 +1,919 @@
+= Derived Artifact Claim Lifecycle Assessment -- Independent Review 001
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: independent adversarial architecture review. Read-only; authorizes no
+implementation, package move, registry change, DMC change, or Project Memory
+edit.
+
+Reviewed artifact::
+`docs/warm_storage/global_reviews/derived_artifact_claim_lifecycle_assessment_2026-08-21.adoc`
+(the "assessment"), unmodified by this review.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core` only.
+
+Review baseline HEAD:: `e3423aaf93b8946f64fa3f1f97fba8989c5d0b3e`
+(`docs(domain): assess derived artifact claim lifecycle`), branch `main`,
+`main...origin/main [ahead 1]`, worktree clean before this review, verified
+with `git status --short --branch`, `git status --short`, and
+`git rev-parse HEAD`.
+
+Review date:: 2026-08-21.
+
+== 1. Method
+
+This review read, in full, before forming any conclusion:
+
+* `docs/developer_guide/ch06_code_conventions/05_domain_maintainer_contract.adoc`;
+* `docs/developer_guide/ch06_code_conventions/03_human_readability_review.adoc`;
+* `docs/ai_info/review_instructions.adoc` (the mandatory review entry point);
+* the assessment under review, in full;
+* the four cited prior-cycle artifacts: the FK/Reference-Helper Cycle-0
+  assessment, its Review 001, the FK/Lookup provenance-handoff implementation
+  report, and its Review 001.
+
+It then independently read the actual runtime the assessment describes,
+rather than accepting its prose or its reported trace at face value:
+
+* `src/spreadsheet_handling/core/fk.py` (`apply_fk_helpers`, in full);
+* `domain/transformations/fk_helpers/{enrich,drop,provenance,policy}.py`, in
+  full;
+* `domain/transformations/enrich_lookup/{operation,provenance}.py`, in full;
+* `domain/helper_policies.py`, in full;
+* `domain/transformations/derived_column_policy.py` (the FK/Lookup-consuming
+  portion);
+* `domain/transformations/discriminator_split/framecheck.py` and `split.py`
+  (collision behavior only);
+* `domain/transformations/xref_crosstable/operation.py` (`drop_source` guards
+  only);
+* `domain/transformations/cell_codec/frame.py`
+  (`_reject_helper_participating_columns` only);
+* `pipeline/steps.py` (`make_apply_fks_step`, `make_drop_helpers_step`) to
+  confirm the registered-step-to-primitive binding;
+* `registries/pipeline_step_registry.json` (`add_fk_helpers`,
+  `remove_fk_helpers`, `configure_fk_helpers`, `enrich_lookup` entries);
+* `registries/meta_registry.yaml` (the `derived` entry, in full);
+* `docs/functional_model/ch04_use_case_concepts/fk_helpers.adoc`,
+  `helper_columns.adoc`;
+* `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`,
+  `metadata_canonical_vs_derived.adoc`;
+* `docs/semantic_model/12_contract_matrices.adoc`;
+* `docs/ai_info/concepts_fk_helpers.adoc`;
+* `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc`
+  (scope/boundary sections).
+
+[[repro]]
+=== Independent reproduction, not trust-on-report
+
+The assessment's central factual claim -- a supported, reachable FK/Lookup
+collision-then-wrongful-deletion sequence -- was independently re-executed
+from scratch using only registered-step-equivalent Domain calls
+(`configure_fk_helpers`, `enrich_lookup`, `enrich_helpers`/`add_fk_helpers`,
+`drop_helpers`/`remove_fk_helpers`), with no `_meta` hand-construction and no
+internal/unsupported call. Three scripts were run under `.venv/bin/python`:
+
+. `repro_fk_lookup_collision.py` -- the assessment's own same-run trace
+  (configure FK relation requesting helper `_B_name` -> run Lookup
+  Enrichment into the *same* frame, materializing `_B_name` with different
+  values -> run `add_fk_helpers` -> run `remove_fk_helpers`).
+. `repro_fk_lookup_no_runlocal_provenance.py` -- a stricter variant in which
+  `add_fk_helpers`/`enrich_helpers` *never runs at all* in the session; only
+  the durable `configure_fk_helpers` policy and Lookup's materialization
+  exist.
+. `repro_derived_column_policy_second_executor.py` -- the same stricter
+  setup, cleaned up through `apply_derived_column_policy(policy="drop")`
+  instead of `remove_fk_helpers`.
+
+All three were executed against the reviewed baseline and produced the
+following independently observed facts (not reported facts):
+
+[source,text]
+----
+[repro 1 -- same-run collision, both primitives run]
+after Lookup:         _B_name = [lookup-alpha, lookup-beta]
+after add_fk_helpers: _B_name = [lookup-alpha, lookup-beta]   # FK skipped
+                      derived.sheets.A.enrich_lookup.helper_columns = [_B_name]
+                      derived.sheets.A.helper_columns = [{column: _B_name, ...}]
+after remove_fk_helpers: _B_name column PHYSICALLY ABSENT from frame A
+                         meta.derived.sheets.A fully absent (FK + Lookup records both gone)
+FK's own join (id_(B) -> B.name) would have produced [Beta1, Beta2] -- confirmed different from Lookup's values.
+
+[repro 2 -- add_fk_helpers/enrich_helpers NEVER executed this session]
+_meta.helper_policies.fk.relations declares helper "_B_name" (durable, via configure_fk_helpers only)
+Lookup enrich_lookup is the ONLY producer that ever writes `_B_name` this run
+_meta.derived.sheets.A has NO "helper_columns" key at all (sanity-asserted)
+remove_fk_helpers still deletes `_B_name` from frame A, via the v2-relation-policy fallback alone
+
+[repro 3 -- second, independent executor]
+Same setup as repro 2. apply_derived_column_policy(source="A", policy="drop")
+(NOT remove_fk_helpers) ALSO deletes Lookup's `_B_name`, via its own
+`_safe_policy_helper_names` v2-relation fallback, unioned with Lookup's own
+declared helper names.
+----
+
+These reproductions independently confirm reachability at least as strongly
+as the assessment claims, and additionally establish two facts the assessment
+itself did not report (see <<find-001>>, <<find-002>>): the defect is
+reachable (a) with *zero* FK run-local provenance ever having existed, purely
+through the durable v2-relation-policy reconstruction fallback, and (b)
+through a *second*, independent production cleanup executor
+(`apply_derived_column_policy`), not only through `fk_helpers/drop.py`'s H5
+seam. The three scripts were written to this review's ephemeral session
+scratch directory (not part of the repository, and not durable beyond this
+review) and executed as:
+
+[source,text]
+----
+.venv/bin/python <scratch>/repro_fk_lookup_collision.py
+.venv/bin/python <scratch>/repro_fk_lookup_no_runlocal_provenance.py
+.venv/bin/python <scratch>/repro_derived_column_policy_second_executor.py
+----
+
+Their full observed output is transcribed in <<repro>> above verbatim; a
+future reviewer who wants to re-verify can reconstruct each script directly
+from the scenario description and the code cited in <<find-001>> and
+<<find-002>> -- the scripts themselves are not preserved as repository
+artifacts.
+
+A focused regression spot-check was also run to confirm the reviewed baseline
+matches its own test claims:
+
+[source,text]
+----
+.venv/bin/python -m pytest -q \
+  tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py \
+  tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/transformations/test_fk_helpers_domain.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py \
+  tests/unit/domain/transformations/test_discriminator_split.py \
+  tests/unit/domain/transformations/test_xref_crosstable.py \
+  tests/unit/domain/transformations/test_cell_codec.py
+# 495 passed
+----
+
+No test, registry, or runtime file was modified by this review.
+
+== 2. Review Area 1 -- Reproduce the FK/Lookup defect
+
+*Verdict: CONFIRMED, and materially broader than reported.*
+
+The assessment's exact trace (Section D) was independently reproduced without
+any `_meta` mutation, legacy shape, or unsupported internal call -- see
+<<repro>> above. Values genuinely differ (`lookup-alpha`/`lookup-beta` vs.
+what FK's own join would have produced, `Beta1`/`Beta2`), so this is not a
+same-value coincidence that would make the defect cosmetic.
+
+Beyond the reported trace, this review found the defect is *also* reachable:
+
+* with the FK materialization primitive (`add_fk_helpers`/`enrich_helpers`)
+  never having executed at all in the session -- deletion happens purely
+  through the durable `_meta.helper_policies.fk.relations` fallback that
+  `drop_helpers`/`_columns_to_drop_by_sheet` and
+  `derived_column_policy.py::_safe_policy_helper_names` both implement
+  (<<find-001>>);
+* through a second, independent production executor,
+  `apply_derived_column_policy(policy="drop")`, not only through
+  `fk_helpers/drop.py` (<<find-002>>).
+
+Reachability classification confirmed: this is *supported current runtime*,
+using only `configure_fk_helpers`, `enrich_lookup` (the exact registered
+`enrich_lookup:enrich_lookup` target), `add_fk_helpers`
+(`make_apply_fks_step` delegates directly to `enrich_helpers`), and
+`remove_fk_helpers` (`make_drop_helpers_step` delegates directly to
+`drop_helpers`) -- confirmed against `pipeline/steps.py` and
+`registries/pipeline_step_registry.json`. It is not a synthetic-state,
+historical-compatibility, or theoretical-unsupported case.
+
+== 3. Review Area 2 -- Is this really a deletion-authority defect?
+
+*Verdict: G (research's interpretation) is best supported; A, B, E, F are
+rejected by direct evidence; C and D are each insufficient/worse, not
+disproven-as-worthless.*
+
+* *A (reserved FK namespace).* Rejected. No maintained document reserves the
+  `_<target>_<field>` shape (or any shape) to FK. `enrich_lookup` accepts an
+  arbitrary caller-chosen helper field name with no namespace check, and this
+  review's repro used that name only to reproduce the collision -- nothing in
+  `enrich_lookup/operation.py` or `helper_policies.py` special-cases labels
+  that look FK-shaped. `docs/ai_info/concepts_fk_helpers.adoc` calls the
+  underscore prefix "a naming convention," not an authority claim.
+* *B (pipeline-ordering contract forbids overlap).* Rejected. No maintained
+  document orders FK relative to Lookup; the FK/Lookup Cycle-0 assessment
+  (accepted, `ACCEPT WITH MINOR CORRECTIONS`) explicitly treats them as fully
+  independent capabilities with no anti-overlap rule, and
+  `docs/semantic_model/12_contract_matrices.adoc`'s FK matrix says nothing
+  about Lookup at all.
+* *C (skip is merely a bug; fix to reject).* Insufficient alone, not
+  worthless. Rejecting the same-run collision inside `enrich_helpers` would
+  close the same-run variant this review reproduced, but does *not* close the
+  durable-policy-fallback variant (<<find-001>>) or the second-executor
+  variant (<<find-002>>), because neither of those ever calls the
+  collision-checking code path (`core/fk.py::apply_fk_helpers`) at all.
+* *D (FK should overwrite/recompute, becoming the physical producer).*
+  Rejected as worse, not merely insufficient. If FK silently overwrote
+  Lookup's materialized values, FK would indeed become the true physical
+  producer -- but Lookup's *own* provenance record would then be the false
+  one (it would still claim to have produced a column FK just overwrote),
+  and a live, human-edited/consumed value would be silently destroyed with no
+  warning. This trades a wrongful-deletion defect for a silent-corruption
+  defect and does not resolve the authority question; it only moves the false
+  claim to the other producer.
+* *E (provenance means "requested projection shape"; cleanup entitled to
+  enforce it).* Rejected. No maintained document authorizes this reading;
+  `12_contract_matrices.adoc:94-96`, `fk_helper_metadata.adoc`, and
+  `concepts_fk_helpers.adoc` all say the opposite -- provenance records
+  *materialized* state, not requested shape (<<find-003>>).
+* *F (solely a provenance-wording problem).* Rejected by direct
+  reproduction. Repro 2 and repro 3 delete the column with *zero* provenance
+  of any kind existing for it under the FK subkey -- there is no wording to
+  correct in that path, because no FK provenance entry is ever written in
+  that scenario. The defect survives even where the wording claim in
+  <<find-003>> does not apply.
+* *G (research's interpretation: production/request/reliance/deletion are
+  distinct; the missing decision is real).* Best supported, with the
+  refinements in <<find-001>>, <<find-002>>, and <<find-007>> (below):
+  "reliance" is not the missing concept -- "verified current physical
+  producer, as a precondition for deletion" is.
+
+== 4. Review Area 3 -- Does "claimant/current reliance" add real value?
+
+*Verdict: not evidenced as necessary; premature as a named primitive.*
+
+See <<find-007>>. The reproduced defect, in all three variants, is fully
+described and would be fully fixed using only: *physical producer* (who
+actually wrote the column this run, if anyone), *requested/declared policy*
+(what a family's configuration says it wants, transient or durable), and a
+*deletion precondition* ("before removing a column identified by a
+requested/declared name, verify the requesting family is its current
+physical producer"). No case in the reproduced evidence requires modeling
+"this capability currently relies on the artifact continuing to exist" as a
+concept distinct from "did this capability physically write it." H5 itself is
+not a reliance/registration/release protocol -- it is a stateless,
+recompute-on-demand truthfulness check
+(`reconcile_enrich_lookup_provenance`) with no registration call, no release
+call, and no enforcement obligation on any other owner. A "claimant" concept
+would become necessary only under a *future* adopt/share design (Section I's
+own "Unresolved" question), which is not evidenced as required by any current
+supported flow.
+
+== 5. Review Area 4 -- Four-family evidence claim
+
+*Verdict: the assessment's own count is accurate and not inflated; this
+review adds a within-family refinement.*
+
+Independently confirmed in code:
+
+* Discriminator split (`framecheck.py:28`) raises
+  `ValueError(f"Generated target frame(s) already exist: ...")` -- a hard,
+  pre-mutation reject, not a silent skip-and-claim. This is a genuine
+  counterexample (proves "reject" is a workable, already-used pattern), not a
+  second instance of the FK/Lookup defect.
+* XRef (`xref_crosstable/operation.py:80-142`) gates `drop_source` behind
+  explicit distinctness and loss-check `ValueError`s *before* contributing a
+  deletion command. This is a genuine counterexample (an explicit,
+  caller-asserted, guarded deletion authority), not a second defect instance.
+* Cell Codec (`cell_codec/frame.py::_reject_helper_participating_columns`)
+  reads helper provenance only to *exclude* those labels from participating
+  payload; it writes no claim and requires no continued existence. Genuine
+  counterexample for "consumer != claimant."
+
+The assessment's own closing sentence in Section E ("Only the FK/Lookup case
+currently proves multiple simultaneous owner records over one physical
+derived column. The other three establish necessary limits on any
+generalization") is independently confirmed accurate. This review's
+refinement: within the *one* evidenced defect family, this review found (not
+merely one reachable path but) up to four reachable combinations -- two
+executors (`drop_helpers`, `apply_derived_column_policy`) times two authority
+layers (same-run transient provenance, durable-policy fallback) -- all
+reducing to one root cause. This sharpens, but does not change, the
+assessment's "one evidenced defect, three constraints" count.
+
+== 6. Review Area 5 -- Framework contract vs. local FK rule
+
+*Verdict: a bounded FK-only patch is evidenced as insufficient; the smallest
+sufficient fix already spans two DMC-distinct modules.*
+
+Constructing the smallest candidate local repair -- "FK must reject any
+pre-existing requested helper column unless FK can prove it is its own
+already-materialized helper" -- and testing it against this review's own
+reproductions:
+
+* It would close repro 1 (same-run collision through `enrich_helpers`).
+* It would *not* close repro 2, because no call to `enrich_helpers`/
+  `apply_fk_helpers` (the code containing the collision check) occurs in that
+  scenario at all; the deletion happens entirely inside
+  `drop_helpers::_columns_to_drop_by_sheet`'s durable-relation fallback.
+* It would *not* close repro 3, because `apply_derived_column_policy` never
+  calls `fk_helpers/enrich.py` or `fk_helpers/drop.py`; it has its own
+  independent `_safe_policy_helper_names` fallback reading the same durable
+  relation list.
+
+Therefore the answer to the assessment's own question ("Could we safely fix
+FK locally and stop?") is *no*, more concretely than the assessment itself
+demonstrates: not because other materializing families need the same
+vocabulary (Discriminator/XRef/Cell Codec do not exhibit the defect), but
+because *this one* defect already requires a coordinated precondition across
+two modules that the DMC's own family/executor model treats as separately
+owned (`fk_helpers` is a family; `derived_column_policy.py` is "a
+cross-capability executor with feature-aware contracts, not semantic owner,"
+per the accepted FK/Lookup Cycle-0 assessment). A single-function patch
+cannot be "local" in the DMC sense once it must be duplicated, consistently,
+across an owner and an independent executor that already reimplements that
+owner's fallback logic once (Cycle-0 Review 001's FIND-002, previously
+characterized only as a readability/duplication concern) -- see <<find-002>>.
+
+== 7. Review Area 6 -- Current authority contradictions
+
+Each of the assessment's four flagged tensions was independently checked
+against the cited maintained authority and classified:
+
+[cols="1,4,2",options="header"]
+|===
+| # | Claimed tension | This review's classification
+
+| 1
+| `_meta.derived` called "non-authoritative over workbook structure"
+  (registry `precedence_notes`) while FK cleanup uses it as first-choice
+  physical deletion input
+| *Not a contradiction* (<<find-004>>) -- the same registry entry's own
+  `persistence_behavior`/`consumer` fields explicitly name `drop_helpers` as
+  the sanctioned consumer that removes columns using this data. "Not
+  authoritative over structure" scopes to canonical-schema assertions, not to
+  the already-documented operational cleanup role. The real gap is
+  provenance *accuracy* (row 2), not authorization to *use* accurate
+  provenance for cleanup.
+
+| 2
+| FK provenance documented as recording each *materialized* helper; runtime
+  records every *resolved* FK definition even when materialization was
+  skipped
+| *Genuine, confirmed contradiction* (<<find-003>>) -- independently verified
+  against three separate maintained documents and against the runtime call
+  graph (`enrich.py`'s `fk_defs_by_frame` feeds `_write_helper_provenance`
+  with no feedback from `apply_fk_helpers`'s per-definition skip decision).
+  Stronger than the assessment's own "ambiguous or incompatible wording"
+  framing: this is an outright violation of a repeatedly-stated contract,
+  independent of any Design Phase.
+
+| 3
+| Older "meta does not enter from outside" wording vs. current Trusted
+  Ingress admitting caller/plugin/persisted meta
+| *Different authority scopes, no contradiction* (<<find-005>>) -- the cited
+  sentence sits directly beside "`_meta.yaml` is gitignored by design -- does
+  not cross repository boundaries," i.e. it scopes to cross-repository/
+  cross-machine git import, not to same-process caller/plugin/config-supplied
+  meta within one running app instance, which Trusted Ingress governs
+  separately.
+
+| 4
+| Older FK v1 pruning/persistence prose superseded by durable v2 relations
+| *Stale documentation, already correctly tracked* (<<find-006>>) --
+  `fk_helper_metadata.adoc`'s own "Retired v1 -> v2 bridge" section and
+  `audit/fk_helper_slice2_v1_retirement_review.adoc` already state this
+  plainly. No live contradiction remains to correct.
+|===
+
+Two of the assessment's four claimed tensions are downgraded (rows 1, 3);
+one is confirmed and *sharpened* into a definite, non-Design-Phase-dependent
+defect (row 2); one is confirmed as already fully resolved (row 4). This
+matters because it means the research's L-section evidence for "documentation
+drift contributed to manufacturing a missing concept" is weaker than
+presented -- only one of four claimed tensions actually shows drift, but that
+one (row 2) is real and independent of the framework-contract question.
+
+== 8. Review Area 7 -- Provenance semantics
+
+*Verdict: confirmed and strengthened, not merely documented imprecisely.*
+
+FK provenance's contract, per three independent maintained sources
+(`12_contract_matrices.adoc:94-96`, `fk_helper_metadata.adoc` "Derived helper
+provenance records materialized helper-column state," `concepts_fk_helpers.adoc`
+"Derived helper-column provenance ... is materialized state, not the
+policy"), is unambiguous: one entry per column FK actually wrote. Runtime
+(`enrich.py::enrich_helpers` -> `_write_helper_provenance`) writes one entry
+per *resolved relation definition*, independent of whether
+`core/fk.py::apply_fk_helpers`'s `if helper_col in first_cols: continue`
+fired for that specific definition. This is directly confirmed by repro 1:
+after `add_fk_helpers` runs and skips (because Lookup's column already
+occupies the label), the FK provenance entry for `_B_name` exists anyway.
+
+Lookup provenance is comparatively accurate: it is written only for fields
+`enrich_lookup` actually projected into the named output, and the operation
+rejects a colliding *source*-frame helper before merging
+(`_check_column_conflict`). It does not, however, name a release contract
+(the assessment's own observation, confirmed).
+
+[[review-area-8]]
+== 9. Review Area 8 -- Deletion authority
+
+*Verdict: confirmed empirically, not merely by document reading.* Repro 1
+directly demonstrates that H5's post-mutation reconciliation
+(`reconcile_enrich_lookup_provenance`) does not, and structurally cannot,
+undo the physical loss: after `remove_fk_helpers` runs, Lookup's actual
+materialized values (`lookup-alpha`, `lookup-beta`) are irretrievably gone
+from frame `A`, and H5 only makes the *metadata* consistent with that loss
+(both provenance records disappear together) -- it does not gate, prevent, or
+even flag the deletion beforehand. The assessment's claim that "post-deletion
+reconciliation cannot substitute for pre-deletion authority" is therefore not
+just plausible prose; it is directly observable data loss in this review's
+own reproduction.
+
+Comparing cleanup contracts confirms the assessment's framing: XRef's
+`drop_source` requires an explicit caller flag plus guarded loss checks
+*before* contributing a command (pre-deletion authority, explicit); FK direct
+cleanup and `derived_column_policy.py` both delete based on a requested-label
+match with no physical-producer check (pre-deletion authority, absent). A
+canonical concept is warranted (see <<conclusions>>, conclusion G) but it should be
+scoped narrowly -- "verified current physical producer" -- not a general
+reference-counted claim system.
+
+== 10. Review Area 9 -- Collision policy vocabulary
+
+*Verdict: only "create" and "reject" are evidenced as required today;
+"adopt," "shared reliance," and "release" remain speculative.*
+
+No current supported flow requires FK and Lookup (or any two families) to
+legitimately *share* one physical column with both relying on its continued
+existence. The reproduced defect is exactly the opposite of a legitimate
+sharing case: Lookup never expected or wanted FK to have any claim on
+`_B_name`, and FK's request collided by coincidence of label choice, not by
+design. The minimum vocabulary the evidence requires is: absent -> create;
+present -> reject unless the requester can prove (via a same-run
+materialization check, or by direct verification against source/target data,
+never via label-match alone) that it is the artifact's own prior output.
+"Adopt"/"replace"/"shared reliance"/"release" should remain named as *future*
+cases in the Design Phase, not built into the first canonical contract.
+
+== 11. Review Area 10 -- Artifact identity
+
+*Verdict: confirmed as out of scope, and the reproduced defect independently
+proves why.* All three reproductions resolve column identity correctly and
+without ambiguity throughout -- `_visible_label` and flat-label matching work
+exactly as intended in every case; the wrongfully-deleted column is
+*correctly identified* as `_B_name` by every consumer. The defect is entirely
+about deletion *authorization*, never about misidentifying which physical
+column a name refers to. This independently confirms the assessment's own
+restraint (Section H) in not proposing a global identity model, and sharpens
+it: identity mechanics are not implicated by the evidenced defect at all, so
+a Design Phase that spent effort on artifact identity generalization would be
+solving a problem this review's evidence does not show exists.
+
+[[review-area-11]]
+== 12. Review Area 11 -- Persistence and replay
+
+*Verdict: this review's own reproduction reinforces "durable claim ledger
+unnecessary," rather than merely failing to contradict it.* Repro 2 and
+repro 3 show the defect is reachable *without* any transient claim/provenance
+existing at all, purely from durable Intent (`_meta.helper_policies.fk`)
+already present. This means the missing precondition ("verify current
+physical producer") does not need new durable storage to be evaluated -- it
+needs to be evaluated *at cleanup time*, from signals already available then
+(has this exact primitive materialized this column in this run; or can it
+independently verify, from current source/target data, that its own
+projection currently occupies that label). No new persisted claim record
+would add information a correctly-scoped runtime check could not already
+supply on demand. This directly supports the assessment's own conclusion (not
+merely leaves it unrefuted).
+
+[[review-area-12]]
+== 13. Review Area 12 -- Central claim ledger hypothesis
+
+*Verdict: unjustified now, confirmed from both directions.* Attempting to
+prove a central ledger already necessary: it is not -- both reproduced
+cleanup executors are statically known, in-repository, same-process code
+paths; no case required *discovering* an unknown owner, only *verifying* a
+known one's claim before trusting it. Attempting to prove even discussing one
+is premature busywork: also not quite -- the assessment's own architecture
+comparison (Section M) is proportionate, does not select a storage
+architecture, and is explicitly framed as ranking among options rather than
+adopting one. The assessment's own ranking (D smallest, A closest to current
+runtime, B premature, C needs more evidence) is confirmed reasonable by this
+review's evidence and is not revised.
+
+[[review-area-13]]
+== 14. Review Area 13 -- Design-phase scope
+
+*Verdict: AUTHORIZED WITH NARROWED / CORRECTED SCOPE.* The assessment's
+Section N scope (FK Helpers + Lookup Enrichment mandatory; XRef, Discriminator,
+Cell Codec, Workbook View, persistence, Trusted Ingress, schema maintenance
+as constraints) is directionally correct but under-specifies one concrete
+element this review found necessary: `derived_column_policy.py`'s FK-branch
+(`_safe_policy_helper_names`, `_resolve_derived_identity`) must be named as a
+*second mandatory concrete executor*, not left implicit as part of "FK
+Helpers," because it is a DMC-distinct cross-capability executor (not FK's
+own family) that independently reproduces the identical defect through its
+own, separately-written fallback logic (<<find-002>>). A Design Phase that
+fixes only `fk_helpers/{enrich,drop}.py` and treats
+`derived_column_policy.py` as an unrelated readability/duplication
+follow-up (as Cycle-0 Review 001's FIND-002 characterized it) would ship
+believing the defect closed while it remains open through the second
+executor. No broader scope than the assessment's own Section N is
+independently justified by this review's evidence; cells, arbitrary sheets,
+rendered/backend artifacts, and a whole-Domain census remain correctly out of
+scope.
+
+== 15. Review Area 14 -- DMC feedback
+
+*Verdict: not a DMC defect; a legitimate future specialization point, and
+this review narrows the assessment's own proposed wording.* The assessment
+proposes a fairly open DMC clarification menu ("create / prove compatible /
+adopt / replace / decline?"). Given this review's evidence, the load-bearing
+question is narrower and should be preferred if the DMC is ever amended: *"Before
+a cleanup executor deletes physical state it identified via a requested or
+declared name (transient provenance or durable policy), has it verified that
+the requesting owner is that state's current physical producer -- not merely
+that the name matches?"* This is consistent with, and a specialization of,
+the DMC's existing "Treat material handoffs as first-class contracts" and
+"Make state, provenance, and reconstruction explicit" sections
+(`docs/developer_guide/ch06_code_conventions/05_domain_maintainer_contract.adoc`);
+it does not require new DMC vocabulary. No DMC edit is proposed or performed
+by this review.
+
+[[review-area-15]]
+== 16. Review Area 15 -- Research quality / bias
+
+*Verdict: the core factual claim was not merely well-supported but
+under-stated in reach; the one place this review found reach for
+sophistication beyond the evidence is the "claimant/current reliance"
+concept (<<find-007>>).* Two independent from-scratch reproductions
+confirmed reachability at least as strongly as claimed and found a durable-
+policy-only variant and a second executor the assessment itself did not
+report -- the opposite of confirmation-bias inflation on the central claim.
+The assessment's own discipline against inflating the family count (Section
+E's closing paragraph explicitly limits the count to one), against assuming a
+central ledger, and against standardizing artifact identity is independently
+confirmed, not merely unrefuted. The one area where this review disagrees is
+Section F's assertion that "claimant/current reliance" is "necessary to
+describe the motivating shared helper" -- the reproduced evidence does not
+require it; a simpler producer/requested-policy/deletion-precondition
+vocabulary fully explains and would fully fix every reproduced variant. This
+reads as one instance of reaching for an available, evocative vocabulary item
+(from the maintainer's own particle-accelerator/claims framing) slightly
+beyond what the concrete evidence in hand requires -- not confirmation bias
+about the defect's existence, but mild vocabulary over-fitting on one
+concept.
+
+[[findings]]
+== 17. Findings
+
+[[find-001]]
+=== FIND-001 -- MAJOR -- Durable-policy fallback reproduces the defect with zero run-local FK provenance
+
+Severity:: MAJOR
+Affected assessment conclusion:: Section D (motivating trace, described only
+as a same-run collision through `enrich_helpers`); Section I ("Could we
+safely fix FK locally and stop?").
+Evidence:: `repro_fk_lookup_no_runlocal_provenance.py`, independently executed
+at HEAD `e3423aa`. `configure_fk_helpers` writes the durable v2 relation only;
+`enrich_helpers`/`add_fk_helpers` is never called; `enrich_lookup` is the sole
+producer of `_B_name` this session (asserted: no `helper_columns` key exists
+under `_meta.derived.sheets.A`). `drop_helpers` still deletes `_B_name`,
+through `_columns_to_drop_by_sheet`'s `relations` fallback
+(`fk_helpers/drop.py:83-100`), which reads only `relation.get("helper_columns")`
+from the durable policy -- never checking whether FK ever materialized
+anything in this run.
+Concrete failure mode:: A pipeline that persists FK relation policy in one
+run, then in a later run only performs Lookup enrichment and an inbound
+`remove_fk_helpers` cleanup pass (no FK materialization step in that later
+run), silently deletes a Lookup-produced column matching FK's declared helper
+name, with *no* FK provenance of any kind ever having existed to be
+inaccurate.
+Smallest correction:: None to the assessment's factual claims (they remain
+true); the assessment should be understood as *understating* reach. A Design
+Phase must treat the durable-policy fallback as an independently reachable
+authority layer requiring its own precondition, not assume that fixing
+same-run provenance accuracy (<<find-003>>) closes the defect.
+Disposition:: Design-Phase constraint (mandatory scope item; see
+<<review-area-13>> conclusion).
+
+[[find-002]]
+=== FIND-002 -- MAJOR -- `derived_column_policy.py` is a second, independent executor reproducing the identical defect
+
+Severity:: MAJOR
+Affected assessment conclusion:: Section N (scope names `apply_derived_column_policy`
+implicitly as background/counterexample context, not as a mandatory concrete
+case); the FK/Lookup Cycle-0 Review 001's FIND-002 (which characterized
+`derived_column_policy.py`'s ~180-line independent Lookup-shape
+reimplementation only as a readability/duplication risk).
+Evidence:: `repro_derived_column_policy_second_executor.py`, independently
+executed at HEAD `e3423aa`. With the identical zero-run-local-FK-provenance
+setup as <<find-001>>, calling `apply_derived_column_policy(source="A",
+policy="drop")` -- a distinct registered step from `remove_fk_helpers`,
+never invoked by it -- also deletes Lookup's `_B_name`, through its own
+`derived_column_policy.py::_safe_policy_helper_names` (lines ~271-296), which
+independently re-reads `_meta.helper_policies.fk` relations and unions their
+declared `helper_columns` with Lookup's own declared names
+(`_resolve_derived_identity`) before computing `drop_cols`.
+Concrete failure mode:: Fixing only `fk_helpers/drop.py`'s H5 seam (the
+assessment's own recommended first slice pattern, and Cycle-0's own recommended
+scope) leaves this second executor's identical exposure completely open. A
+maintainer or reviewer who reads only the FK-helper cleanup fix could
+reasonably, and wrongly, believe the wrongful-deletion class is closed.
+Smallest correction:: Name `derived_column_policy.py`'s FK-branch as a
+mandatory second concrete case in the Design Phase scope, not an
+implicit background constraint; any accepted precondition rule must be
+verified against both executors, not one.
+Disposition:: Design-Phase constraint (mandatory scope item).
+
+[[find-003]]
+=== FIND-003 -- IMPORTANT -- FK provenance-accuracy contradiction is confirmed, and is stronger than "ambiguous wording"
+
+Severity:: IMPORTANT
+Affected assessment conclusion:: Section L, bullet 2 ("Technical and
+contract-matrix wording says FK provenance records each *materialized*
+helper; runtime records every requested FK definition even when
+materialization skipped an existing label" -- filed there as "ambiguous or
+incompatible wording").
+Evidence:: `docs/semantic_model/12_contract_matrices.adoc:94-96` ("writes
+transient provenance entries ... per materialized helper column");
+`docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` ("Derived helper
+provenance records materialized helper-column state ... It is what the
+primitive wrote when it last enriched the source frame"); and
+`docs/ai_info/concepts_fk_helpers.adoc` ("Derived helper-column provenance
+... is materialized state, not the policy") -- three independent maintained
+sources, all stating the same contract. Runtime: `enrich.py::enrich_helpers`
+builds `fk_defs_by_frame` purely from resolved relation definitions whose
+source column is present (lines 96-107), with no feedback from
+`core/fk.py::apply_fk_helpers`'s per-definition `if helper_col in first_cols:
+continue` (line 309); `_write_helper_provenance` (line 131) writes an entry
+for every definition in `fk_defs_by_frame` regardless. Directly confirmed by
+repro 1: after `add_fk_helpers` skips materializing `_B_name` (because
+Lookup's column already occupies the label), the FK provenance entry for
+`_B_name` is written anyway.
+Concrete failure mode:: FK provenance is not merely imprecisely worded; it
+actively misreports physical reality whenever a requested helper collides
+with a pre-existing label, in a way that is independent of the Lookup
+scenario specifically (any pre-existing column with a colliding label, from
+any source, triggers the same false-provenance write).
+Smallest correction:: `enrich.py`/`_write_helper_provenance` should record an
+entry only for definitions that `apply_fk_helpers` actually materialized this
+run (requiring the skip decision to be surfaced back to the caller). This is
+a clear, already-documented-contract-aligned fix, independent of any Design
+Phase decision -- but per <<find-001>>/<<find-002>>, it is *not* sufficient
+by itself to close the reachable defect class, only to close the
+same-run-provenance-accuracy dimension of it.
+Disposition:: local FK follow-up (should be corrected regardless of Design
+Phase outcome); also feeds Design-Phase scope as the transient-layer half of
+the precondition rule.
+
+[[find-004]]
+=== FIND-004 -- IMPORTANT -- The `_meta.derived` "non-authoritative" tension is not a genuine contradiction
+
+Severity:: IMPORTANT
+Affected assessment conclusion:: Section L, bullet 1 and Section B's
+"Maintained authority" / "Observed runtime fact" pair (framed as a live
+tension between the registry calling `_meta.derived` "non-authoritative over
+workbook structure" and FK cleanup using it as deletion input).
+Evidence:: `registries/meta_registry.yaml`'s `derived` entry, read in full.
+Its own `persistence_behavior` field states: "Consumed and removed by
+`drop_helpers`; also removed by `apply_derived_column_policy` for the source
+frame it replaces" and its `consumer` list explicitly names both. The
+`precedence_notes` field ("not canonical and not authoritative over workbook
+structure. Pipeline execution must not infer routing or rendering policy
+from sub-key names, shapes, or values") sits in the same entry as the
+sentence that authorizes exactly the operational cleanup-consumption role the
+assessment treats as being in tension with it.
+Concrete consequence if left uncorrected:: A Design Phase reader could
+conclude the registry itself is internally contradictory and needs
+correction, when the real, actionable gap is narrower and already identified
+correctly elsewhere in the same assessment (provenance *accuracy*,
+<<find-003>>) -- not registry wording about *use* authorization.
+Smallest correction:: Reframe Section L bullet 1 (or drop it) to state that
+the registry already authorizes provenance-driven cleanup; the open question
+is whether the provenance being consumed is *accurate*, not whether consuming
+it is *authorized*.
+Disposition:: research-artifact correction (wording/scoping only; does not
+change the Design Phase authorization).
+
+[[find-005]]
+=== FIND-005 -- MINOR -- "Meta does not enter from outside" is a different authority scope, not stale documentation
+
+Severity:: MINOR
+Affected assessment conclusion:: Section L, bullet 4 ("older Functional meta
+lifecycle wording... may predate current Trusted Ingress").
+Evidence:: `docs/functional_model/ch05_problem_space_overview/03_meta_lifecycle_framework.adoc:20-24`:
+"Scoped to a single app instance and a single user... `_meta.yaml` is
+gitignored by design -- does not cross repository boundaries... Meta does not
+enter from outside; no external import of meta." The cited sentence is
+adjacent to, and reads consistently with, the git/repository-boundary framing
+of the same bullet list, not with same-process caller/plugin/config-supplied
+meta within one running app instance (which Trusted Ingress and the DMC's
+"Respect established boundaries" section govern as a *different* boundary).
+Concrete consequence if left uncorrected:: Minor risk of a future reader
+treating this as settled evidence of documentation drift and spending Design
+Phase effort reconciling documents that do not actually conflict.
+Smallest correction:: Classify as "different authority scope," not "may
+predate."
+Disposition:: research-artifact correction (classification only).
+
+[[find-006]]
+=== FIND-006 -- NOTE -- FK v1/v2 persistence wording sediment is already correctly tracked
+
+Severity:: NOTE
+Affected assessment conclusion:: Section L, bullet 5.
+Evidence:: `fk_helper_metadata.adoc`'s own "Retired v1 -> v2 bridge" section
+states plainly that the v1 dict is inert with "no runtime reader," and
+references `audit/fk_helper_slice2_v1_retirement_review.adoc` as the
+disposition record.
+Concrete consequence:: none; already correctly filed as historical sediment
+with an existing tracking artifact.
+Smallest correction:: none.
+Disposition:: no action / note.
+
+[[find-007]]
+=== FIND-007 -- IMPORTANT -- "Claimant / current reliance" is not evidenced as a necessary distinct concept
+
+Severity:: IMPORTANT
+Affected assessment conclusion:: Section F ("Claimant / current reliance ...
+Necessary to describe the motivating shared helper").
+Evidence:: All three reproductions are fully explained without any reliance
+concept: Lookup never registers, releases, or asserts continued need for
+`_B_name`; it simply materializes a projection and later records what it
+projected. `reconcile_enrich_lookup_provenance`
+(`enrich_lookup/provenance.py:18-59`) is a pure, stateless, recompute-on-demand
+predicate over the record's own declared `helper_columns` and the current
+frame's columns -- it has no registration call, no release call, and imposes
+no obligation on any other capability. A minimal vocabulary of *physical
+producer*, *requested/declared policy*, and *deletion precondition* fully
+accounts for every reproduced variant and would fully fix each one (verify
+current physical producer before deleting; do not trust a label match alone).
+Concrete consequence if left uncorrected:: A Design Phase primed to build
+"claimant registration and release" machinery for a case that does not need
+it risks exactly the "central claim ledger" overreach the assessment itself
+warns against in Section M -- ironically motivated by vocabulary the same
+assessment introduces for a scenario that does not require it.
+Smallest correction:: Narrow Section F to state that a claimant/reliance
+concept is a plausible *future* vocabulary item for a not-yet-evidenced
+adopt/share design, not a conclusion required by the current motivating
+case.
+Disposition:: Design-Phase constraint (vocabulary should start smaller: producer,
+requested/declared policy, deletion precondition; do not canonize
+"claimant/reliance" as a required primitive of the first canonical contract).
+
+== 18. Positive findings confirmed
+
+The following properties from the assessment's own "positive findings"
+framing were independently checked against code, tests, and registries, and
+survive this adversarial review:
+
+* Supported FK/Lookup reachability -- confirmed, and shown broader than
+  reported (<<find-001>>, <<find-002>>).
+* The distinction between post-mutation H5 truthfulness and pre-deletion
+  authority -- confirmed *empirically*: repro 1 shows real, irretrievable
+  data loss that H5 does not prevent, only reconciles metadata around.
+* Refusal to infer shared ownership from shared `_meta` -- confirmed;
+  `registries/meta_registry.yaml`'s `derived` entry explicitly states "each
+  producer updates only its own sub-key ... must not overwrite another
+  producer's sub-key," independently corroborating the assessment's stance.
+* Rejection of a universal "metadata reference means claim" rule -- confirmed
+  via direct inspection of XRef's explicit, guarded `drop_source` contract
+  and Cell Codec's exclusion-only consumption of helper provenance.
+* Central ledger not assumed as necessary -- confirmed, and this review's own
+  evidence (<<review-area-11>>, <<review-area-12>>) independently reinforces
+  rather than merely fails to contradict that conclusion.
+* Artifact identity not prematurely standardized -- confirmed, and sharpened:
+  this review found identity resolution is not implicated by the reproduced
+  defect at all (every reproduction correctly identifies the physical column
+  in question; the failure is purely one of deletion authorization).
+* Persistence and Trusted-Ingress implications kept as constraints, not
+  redesigned -- confirmed.
+* Use of Discriminator/XRef/Cell Codec as counterexamples rather than forced
+  common implementation -- confirmed by independent code inspection of all
+  three.
+* The assessment's own family-count discipline (Section E's closing
+  paragraph limiting the evidenced defect to one family) -- confirmed
+  accurate, not inflated.
+
+[[conclusions]]
+== 19. Required conclusions
+
+=== A. Concrete defect
+
+*Yes, confirmed, and broader than reported.* Independently reproduced twice
+via fully supported, registered-step-equivalent calls with no synthetic
+`_meta` state, plus a third reproduction through a second independent
+executor. Real materialized data is destroyed with no supported recovery
+path; H5 only restores metadata truthfulness after the loss has already
+occurred.
+
+=== B. Local fix
+
+*Only partially.* A same-run FK collision-reject fix
+(<<find-003>>'s materialized-only provenance correction, or an
+outright reject-on-collision change to `enrich_helpers`) closes the same-run
+variant this review reproduced in repro 1, but leaves open both the
+durable-policy-fallback variant (<<find-001>>, repro 2) and the second
+independent executor (<<find-002>>, repro 3). A safe local repair already
+requires a coordinated precondition across two DMC-distinct modules
+(`fk_helpers` and `derived_column_policy.py`), which is itself evidence for,
+not against, naming the precondition canonically once rather than
+re-discovering and re-implementing it per call site.
+
+=== C. Framework contract
+
+*Yes, warranted, narrowly.* Not a general derived-artifact lifecycle
+ontology; specifically: "a cleanup executor that identifies a physical
+column/frame via a requested or declared name (transient provenance or
+durable policy) must verify the requesting owner is that state's current
+physical producer before deleting it; a name match alone is not sufficient
+deletion authority." State this once canonically and apply it confirmedly to
+both reproduced executors.
+
+=== D. Claim / reliance
+
+*Not necessary now* (this review narrows the assessment's own Section F
+position; see <<find-007>>). Sufficient vocabulary: physical producer,
+requested/declared policy, deletion precondition. Reserve "claimant/reliance"
+for a future adopt/share design that no current supported flow requires.
+
+=== E. Provenance
+
+*Confirmed overloaded, and confirmed as an outright existing-contract
+violation* -- not merely documented imprecisely (<<find-003>>). Three
+independent maintained sources agree FK provenance should record only
+materialized state; runtime does not. This should be corrected regardless of
+the Design Phase, though correcting it alone is insufficient
+(<<find-001>>, <<find-002>>).
+
+=== F. Other families
+
+*One genuinely evidenced defect family* (FK + Lookup), reachable through (at
+least) two independent executors times two independent authority layers.
+Discriminator split/merge, XRef + final cleanup, and Cell Codec remain valid
+constraints/counterexamples, not additional defect instances -- confirmed
+independently in code, matching the assessment's own (accurate,
+non-inflated) self-assessment.
+
+=== G. Deletion authority
+
+*Yes, deserves an explicit canonical concept* -- narrowly scoped to
+"verified current physical producer," empirically confirmed necessary by
+this review's own reproductions of real, unrecoverable data loss (<<review-area-8>>).
+
+=== H. Central ledger
+
+*Unjustified now*, and this review's own evidence actively reinforces that
+conclusion (<<review-area-11>>, <<review-area-12>>): every reproduced variant
+is resolvable by a same-process, on-demand check requiring no new durable
+cross-owner registry.
+
+=== I. Design scope
+
+Narrow to exactly: `fk_helpers/enrich.py`'s provenance-write-only-when-
+materialized fix, `fk_helpers/drop.py`'s H5-and-fallback deletion
+precondition, and `derived_column_policy.py`'s FK-branch deletion
+precondition -- three concrete sites implementing one canonical precondition
+-- with Lookup Enrichment as the paired collaborator supplying the
+truthfulness-check pattern worth generalizing (H5). This corrects the
+assessment's Section N by explicitly promoting `derived_column_policy.py`'s
+FK-branch from implicit background to a mandatory concrete case
+(<<find-002>>). Discriminator, XRef, Cell Codec, Workbook View, persistence,
+Trusted Ingress, and schema maintenance remain constraints, exactly as
+Section N already states.
+
+=== J. Design gate
+
+*DESIGN PHASE AUTHORIZED WITH NARROWED SCOPE.* The concrete defect is real,
+independently reproduced, and broader in reach than the assessment itself
+demonstrated -- which reinforces rather than weakens authorization to
+proceed. Proceed using: the two-executor, two-layer mandatory case (I); the
+narrower vocabulary (D -- no claimant/reliance primitive in the first
+canonical contract); and the corrected evidence disposition of the four
+claimed documentation tensions (<<find-004>>, <<find-005>>, <<find-006>>,
+confirming only one of four is a genuine, already-independent-of-Design-Phase
+defect).
+
+=== K. DMC
+
+*No DMC defect exposed; a legitimate future specialization point*, narrower
+than the assessment's own proposed clarification menu (<<review-area-15>>
+gives the preferred load-bearing question if the DMC is ever amended). No DMC
+edit is proposed or performed here.
+
+== 20. Overall verdicts
+
+Overall assessment verdict:: *ACCEPT WITH MINOR CORRECTIONS.* The central
+factual claim, the refusal to assume a central ledger, the refusal to
+standardize artifact identity, and the accurate (non-inflated) family count
+are all independently verified -- in the case of the central factual claim,
+independently *strengthened* by two additional reproductions the assessment
+itself did not report. Two IMPORTANT corrections narrow claimed documentation
+tensions that this review found are not genuine (<<find-004>>, downgraded
+from Section L bullet 1) or are already fully tracked
+(<<find-006>>); one IMPORTANT correction narrows a semantic-vocabulary claim
+(<<find-007>>, "claimant/reliance" not yet necessary); one IMPORTANT finding
+sharpens a wording-only claim into a confirmed contract violation
+(<<find-003>>). None of these corrections changes whether the framework
+contract is warranted; two MAJOR findings (<<find-001>>, <<find-002>>)
+*expand* the evidenced reach of the concrete defect and the required Design
+Phase scope beyond what the assessment itself demonstrated.
+
+Design-Gate verdict:: *DESIGN PHASE AUTHORIZED WITH NARROWED SCOPE* (see
+<<conclusions>>, conclusions I and J).
+
+Finding count by severity:: 0 BLOCKER, 2 MAJOR (<<find-001>>, <<find-002>>),
+3 IMPORTANT (<<find-003>>, <<find-004>>, <<find-007>>), 1 MINOR
+(<<find-005>>), 1 NOTE (<<find-006>>).
