@@ -12,6 +12,7 @@ from spreadsheet_handling.domain.transformations.derived_column_policy import (
     apply_derived_column_policy,
     enforce_derived_column_policy_frame,
 )
+from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
 from spreadsheet_handling.domain.transformations.fk_helpers import drop_helpers
 from spreadsheet_handling.pipeline import REGISTRY, build_steps_from_config, run_pipeline
 from spreadsheet_handling.pipeline.types import StepRegistration
@@ -135,7 +136,15 @@ def test_durable_helper_cleanup_preserves_non_helper_columns() -> None:
 
 
 @pytest.mark.ftr("BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A")
-def test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary() -> None:
+def test_durable_fk_policy_alone_does_not_authorize_deletion_after_persistence_boundary() -> None:
+    """Slice 5 (deletion-authority design): inverted from the pre-Slice-5
+    behavior. Durable v2 FK relation policy alone -- no truthful transient
+    provenance for the sheet -- never authorizes deletion, regardless of
+    whether the durable declaration was written before or after a simulated
+    persistence boundary. The column must survive; see accepted design
+    ``derived_artifact_deletion_authority_design_2026-08-21.adoc`` Section
+    F/H and Section I's disposition of this test.
+    """
     frames = {
         "_meta": {
             "helper_policies": {
@@ -172,16 +181,21 @@ def test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary() 
 
     out = apply_derived_column_policy(frames, source="groups", policy="drop")
 
-    assert list(out["groups"].columns) == ["id", "home_place_id", "_manual_note"]
+    assert list(out["groups"].columns) == [
+        "id", "home_place_id", "_places_name", "_manual_note",
+    ]
     assert "_places_name" in frames["groups"].columns
 
 
 @pytest.mark.ftr("BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A")
-def test_durable_fk_policy_fallback_drops_declared_helpers() -> None:
-    # FK Helper Slice 2 (v1 retirement): the durable v2 relation model is the
-    # policy fallback for cleanup. With no runtime provenance and no
-    # `sheets.<frame>.helper_columns`, the v2 relation's `helper_columns`
-    # identify which columns to drop.
+def test_durable_fk_policy_alone_does_not_authorize_deletion() -> None:
+    """Slice 5: inverted from the pre-Slice-5 behavior.
+
+    With no runtime provenance and no `sheets.<frame>.helper_columns`, the
+    v2 relation's `helper_columns` identify what FK *would* request, not
+    what FK currently produced, so they no longer authorize deletion; the
+    column survives.
+    """
     frames = {
         "_meta": {
             "helper_policies": {
@@ -216,7 +230,9 @@ def test_durable_fk_policy_fallback_drops_declared_helpers() -> None:
 
     out = apply_derived_column_policy(frames, source="groups", policy="drop")
 
-    assert list(out["groups"].columns) == ["id", "home_place_id", "_manual_note"]
+    assert list(out["groups"].columns) == [
+        "id", "home_place_id", "_places_name", "_manual_note",
+    ]
 
 
 def test_unchanged_lookup_helper_warn_mode_emits_no_findings() -> None:
@@ -847,3 +863,351 @@ def test_absent_enrich_lookup_record_is_still_a_safe_noop(policy) -> None:
     assert list(out["orders"].columns) == ["order_id", "amount"]
     if policy == "warn_on_mismatch":
         assert len(out["derived_column_findings"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 (FK Helper Deletion Authority design,
+# derived_artifact_deletion_authority_design_2026-08-21.adoc): durable FK
+# relation policy is removed as DCP deletion authority (Section F/H), and DCP
+# enforces the write-time publication-lifecycle rule over its own complete
+# publication inventory -- the primary payload write (effective target
+# `payload_target = output or source`) and the independent findings write
+# (effective target `findings`, only under `warn_on_mismatch`).
+# ---------------------------------------------------------------------------
+
+def _durable_fk_policy_frames(*, extra_columns: dict | None = None):
+    """A sheet whose FK-attributed helper is named only by durable v2 relation
+    policy -- no transient `_meta.derived` provenance of any kind."""
+    row = {
+        "id": "GROUP-0001",
+        "home_place_id": "PLACE-0007",
+        "_places_name": "Microraptorenwald",
+    }
+    row.update(extra_columns or {})
+    return {
+        "_meta": {
+            "helper_policies": {
+                "fk": {
+                    "schema_version": 2,
+                    "relations": [
+                        {
+                            "source_frame": "groups",
+                            "source_column": "home_place_id",
+                            "target_frame": "places",
+                            "target_key": "id",
+                            "helper_columns": [
+                                {"column": "_places_name", "target_field": "name"}
+                            ],
+                        }
+                    ],
+                }
+            }
+        },
+        "groups": pd.DataFrame([row]),
+    }
+
+
+def test_durable_policy_only_unauthorized_drop_emits_finding_under_warn_on_mismatch() -> None:
+    """Durable-policy-only case #2 (required test matrix): the column is left
+    in place, and `fk_deletion_unauthorized` is reported distinct from
+    `derived_value_mismatch`."""
+    frames = _durable_fk_policy_frames()
+
+    out = apply_derived_column_policy(frames, source="groups", policy="warn_on_mismatch")
+
+    assert "_places_name" in out["groups"].columns
+    findings = out["derived_column_findings"]
+    unauthorized = findings[findings["rule_type"] == "fk_deletion_unauthorized"]
+    assert len(unauthorized) == 1
+    row = unauthorized.iloc[0]
+    assert row["columns"] == "_places_name"
+    assert row["frame"] == "groups"
+    assert row["severity"] == "warn"
+
+
+def test_durable_policy_only_unauthorized_drop_does_not_raise_under_fail_on_mismatch() -> None:
+    """Required test matrix #3: `fail_on_mismatch` must not gain permission to
+    delete, and the authorization refusal itself must not become a new
+    strictness exception."""
+    frames = _durable_fk_policy_frames()
+
+    out = apply_derived_column_policy(frames, source="groups", policy="fail_on_mismatch")
+
+    assert "_places_name" in out["groups"].columns
+
+
+def test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelated_durable_fk_policy() -> None:
+    """Required test matrix #4: the separate, explicit Workbook-View
+    `helper_columns` carrier still authorizes its own cleanup, unaffected by
+    the durable FK relation policy's removal as deletion authority --
+    proven here with both carriers present on the same sheet."""
+    frames = _durable_fk_policy_frames()
+    frames["_meta"]["sheets"] = {"groups": {"helper_columns": ["_places_name"]}}
+
+    out = apply_derived_column_policy(frames, source="groups", policy="drop")
+
+    assert "_places_name" not in out["groups"].columns
+
+
+def test_payload_decoupled_target_invalidates_preexisting_provenance() -> None:
+    """Repro 6 closure (FIND-D10): `apply_derived_column_policy(source=A,
+    output=B, policy="drop")` where `B` already carries an FK
+    `helper_columns` entry (and `A` carries its own, independently-sourced
+    column under the same label) removes `B`'s stale entry as part of the
+    same call; a subsequent cleanup pass over `B` leaves the (now
+    `A`-owned) replacement column in place."""
+    frames = {
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "B": {
+                        "helper_columns": [
+                            {
+                                "column": "_Target_name",
+                                "fk_column": "target_id",
+                                "target": "targets",
+                                "value_field": "name",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "A": pd.DataFrame([{"id": 1, "_Target_name": "A-owned"}]),
+        "B": pd.DataFrame([{"id": 1, "_Target_name": "B-fk-value"}]),
+    }
+
+    out = apply_derived_column_policy(frames, source="A", output="B", policy="drop")
+
+    # Direct assertion: B's stale FK record is gone immediately.
+    assert "B" not in out["_meta"].get("derived", {}).get("sheets", {})
+    assert list(out["B"]["_Target_name"]) == ["A-owned"]
+
+    # End-to-end: a later cleanup pass leaves the replacement's own values.
+    cleaned = apply_derived_column_policy(out, source="B", policy="drop")
+    assert "_Target_name" in cleaned["B"].columns
+    assert list(cleaned["B"]["_Target_name"]) == ["A-owned"]
+
+
+def test_payload_decoupled_new_frame_target_is_true_noop() -> None:
+    """Over-invalidation guard (DCP): a brand-new `output` frame name has no
+    pre-existing entry to invalidate and must not gain a meaningless
+    `_meta` entry."""
+    frames = {
+        "_meta": {"derived": {"sheets": {}}},
+        "A": pd.DataFrame([{"id": 1, "amount": 5}]),
+    }
+
+    out = apply_derived_column_policy(frames, source="A", output="brand_new", policy="drop")
+
+    assert "brand_new" not in out["_meta"].get("derived", {}).get("sheets", {})
+
+
+@pytest.mark.parametrize("output_value", ["", None])
+def test_payload_output_empty_string_and_none_both_alias_to_source_target(output_value) -> None:
+    """FIND-D13 Variant A closure: `output=""` must behave identically to
+    `output=None` -- both resolve `payload_target = output or source` to
+    `source` and strip source's own consumed provenance, unlike the pre-D13
+    behavior which keyed lifecycle handling to raw `output`."""
+    frames = {
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "A": {
+                        "helper_columns": [
+                            {
+                                "column": "_B_name",
+                                "fk_column": "b_id",
+                                "target": "B",
+                                "value_field": "name",
+                            }
+                        ]
+                    }
+                }
+            },
+            # Durable v2 policy is also present, matching a real
+            # `configure_fk_helpers`/`add_fk_helpers` setup; it satisfies
+            # `drop_helpers`'s unrelated "was FK policy configured at all"
+            # precondition below and is never itself deletion authority.
+            "helper_policies": {
+                "fk": {
+                    "schema_version": 2,
+                    "relations": [
+                        {
+                            "source_frame": "A",
+                            "source_column": "b_id",
+                            "target_frame": "B",
+                            "target_key": "id",
+                            "helper_columns": [{"column": "_B_name", "target_field": "name"}],
+                        }
+                    ],
+                }
+            },
+        },
+        "A": pd.DataFrame([{"id": 1, "b_id": 10, "_B_name": "fk-value"}]),
+    }
+
+    out = apply_derived_column_policy(frames, source="A", output=output_value, policy="drop")
+
+    assert "_B_name" not in out["A"].columns
+    # Direct assertion: A's own stale FK record is invalidated too, not left
+    # behind because the raw `output` value didn't equal `source` literally.
+    assert "A" not in out["_meta"].get("derived", {}).get("sheets", {})
+
+    # End-to-end wrongful-deletion sequence: a same-source enrich_lookup call
+    # materializes Lookup's distinct values under the same label, writing its
+    # own fresh, truthful `enrich_lookup` provenance for it; a later FK-only
+    # cleanup pass (`drop_helpers`, which never reads the `enrich_lookup`
+    # sibling subkey) must leave Lookup's values in place, not delete them
+    # using A's now-invalidated FK record. (`apply_derived_column_policy`
+    # itself would legitimately also remove this column at this point --
+    # Lookup's own current, truthful declaration of its own artifact is
+    # separately, intentionally droppable by DCP and is not part of this
+    # defect's scope; `drop_helpers` isolates the FK-only claim.)
+    lookup_frames = dict(out)
+    lookup_frames["Lookup"] = pd.DataFrame([{"id": 1, "_B_name": "lookup-value"}])
+    rebound = enrich_lookup(
+        lookup_frames,
+        source="A",
+        lookup="Lookup",
+        output="A",
+        on="id",
+        helpers={"fields": ["_B_name"]},
+    )
+    assert list(rebound["A"]["_B_name"]) == ["lookup-value"]
+
+    cleaned = drop_helpers(rebound)
+    assert "_B_name" in cleaned["A"].columns
+    assert list(cleaned["A"]["_B_name"]) == ["lookup-value"]
+
+
+def test_findings_publication_invalidates_preexisting_provenance_at_target() -> None:
+    """FIND-D13 Variant B closure: the independent `findings` publication
+    under `warn_on_mismatch` invalidates a pre-existing `_meta.derived.sheets`
+    entry at its own target -- here `findings == source`, so the findings
+    frame (with its own canonical `rule_type` column) physically replaces
+    `A`, and a later cleanup pass must leave that canonical column alone
+    rather than delete it using `A`'s stale FK record."""
+    frames = {
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "A": {
+                        "helper_columns": [
+                            {
+                                "column": "rule_type",
+                                "fk_column": "b_id",
+                                "target": "B",
+                                "value_field": "type",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "A": pd.DataFrame([{"id": 1, "b_id": 10, "rule_type": "fk-value", "amount": 5}]),
+    }
+
+    out = apply_derived_column_policy(
+        frames, source="A", output="payload", findings="A", policy="warn_on_mismatch",
+    )
+
+    # payload is a brand-new target: no prior entry to invalidate there.
+    assert "payload" in out
+    # Direct assertion: A's stale FK record is invalidated by the findings
+    # write, even though the payload write's own branch had no reason to
+    # touch A (payload_target="payload" != source="A" != A's own name here).
+    assert "A" not in out["_meta"].get("derived", {}).get("sheets", {})
+    assert list(out["A"].columns) == FINDING_COLUMNS
+
+    cleaned = apply_derived_column_policy(out, source="A", policy="drop")
+    assert "rule_type" in cleaned["A"].columns
+
+
+def test_findings_equals_payload_target_publication_order_leaves_no_stale_provenance() -> None:
+    """Publication-order boundary case: `findings == payload_target`. The
+    payload write's own invalidation strips the shared target first; the
+    findings write then physically overwrites it a second time and its own
+    invalidation re-checks the now-current metadata, finding nothing left
+    (a safe, idempotent no-op). The findings frame is the final physical
+    writer, and no stale provenance survives either way."""
+    frames = {
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "B": {
+                        "enrich_lookup": {
+                            "lookup": "Other",
+                            "on": ["id"],
+                            "helper_columns": ["foreign_col"],
+                        }
+                    }
+                }
+            }
+        },
+        "A": pd.DataFrame([{"id": 1, "amount": 5}]),
+        "B": pd.DataFrame([{"id": 1, "foreign_col": "keep-me-if-bug"}]),
+    }
+
+    out = apply_derived_column_policy(
+        frames, source="A", output="B", findings="B", policy="warn_on_mismatch",
+    )
+
+    assert "B" not in out["_meta"].get("derived", {}).get("sheets", {})
+    assert list(out["B"].columns) == FINDING_COLUMNS
+
+
+def test_decoupled_payload_invalidation_preserves_unrelated_meta_and_sheets() -> None:
+    """No unrelated provenance damage: a sibling sheet's own provenance and
+    unrelated top-level `_meta` roots survive target-local invalidation
+    untouched."""
+    frames = {
+        "_meta": {
+            "derived": {
+                "sheets": {
+                    "B": {
+                        "helper_columns": [
+                            {
+                                "column": "_Target_name",
+                                "fk_column": "target_id",
+                                "target": "targets",
+                                "value_field": "name",
+                            }
+                        ]
+                    },
+                    "C": {
+                        "enrich_lookup": {
+                            "lookup": "Other",
+                            "on": ["id"],
+                            "helper_columns": ["sibling_col"],
+                        }
+                    },
+                }
+            },
+            "helper_policies": {"fk": {"schema_version": 2, "relations": []}},
+        },
+        "A": pd.DataFrame([{"id": 1, "_Target_name": "A-owned"}]),
+        "B": pd.DataFrame([{"id": 1, "_Target_name": "B-fk-value"}]),
+        "C": pd.DataFrame([{"id": 1, "sibling_col": "keep"}]),
+    }
+
+    out = apply_derived_column_policy(frames, source="A", output="B", policy="drop")
+
+    assert "B" not in out["_meta"]["derived"]["sheets"]
+    assert out["_meta"]["derived"]["sheets"]["C"] == frames["_meta"]["derived"]["sheets"]["C"]
+    assert out["_meta"]["helper_policies"] == frames["_meta"]["helper_policies"]
+    assert list(out["C"]["sibling_col"]) == ["keep"]
+
+
+def test_dcp_and_drop_helpers_agree_durable_policy_alone_is_not_authority() -> None:
+    """Direct executor parity (required test matrix #14): DCP and
+    `drop_helpers` now agree that durable FK relation intent alone is never
+    deletion authority."""
+    def _frames():
+        return _durable_fk_policy_frames()
+
+    dcp_out = apply_derived_column_policy(_frames(), source="groups", policy="drop")
+    drop_out = drop_helpers(_frames())
+
+    assert "_places_name" in dcp_out["groups"].columns
+    assert "_places_name" in drop_out["groups"].columns
