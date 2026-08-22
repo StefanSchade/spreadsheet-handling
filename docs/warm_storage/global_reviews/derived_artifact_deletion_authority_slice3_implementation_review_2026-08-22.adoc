@@ -1,0 +1,310 @@
+= FK Helper Deletion Authority -- Slice 3 Implementation Review
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded, independent code review of Slice 3 only (write-time
+provenance invalidation in `enrich_lookup`). Read-only. This artifact
+authorizes no further implementation, redesign, or Slice 4/5 change.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core`.
+
+Baseline commit (Slice 2, pre-Slice-3):: `d66ae9c4b8b65747eb84c1ec3b616f8a0c4fed28`
+(`fix(fk): write provenance only for materialized helpers`).
+
+Reviewed commit (Slice 3):: `c570db233e578ffa4a20d2b80bd66a7e66e0d4f7`
+(`fix(lookup): invalidate provenance on decoupled rebind`).
+
+Accepted design:: `docs/warm_storage/global_reviews/derived_artifact_deletion_authority_design_2026-08-21.adoc`,
+Section K, and its reference `_write_provenance` implementation
+(design lines 1825-1871).
+
+Final design review used as gate authority::
+`docs/warm_storage/global_reviews/derived_artifact_deletion_authority_design_2026-08-21_review_001.adoc`
+S16.3 -- all findings FIND-D1 through FIND-D13 *CLOSED*, Implementation gate
+*OPEN*.
+
+Review date:: 2026-08-22.
+
+== 1. Review goal and method
+
+Determine whether `c570db2` faithfully implements the accepted write-time
+invalidation contract for `enrich_lookup` (Section K) without over-invalidating
+legitimate same-source provenance and without leaving any supported bypass,
+per the eleven-area attack list in the review brief.
+
+Method: read the diff against the design's own reference code; trace the
+current `operation.py` implementation statement-by-statement against the
+`output == source` / `output != source` contract; re-run the changed and
+adjacent test suites; construct direct runtime repros for the specific shapes
+the design's Repro 4/5 and the review brief flag as historically dangerous
+(fields-bearing decoupled rebind, `helpers=None` decoupled rebind, same-owner
+stale record, same-source preservation, brand-new-output no-op, and a
+genuine same-label collision). No production or test code was modified.
+
+== 2. Area-by-area findings
+
+=== Area 1 -- physical write / invalidation order
+
+`operation.py:210-212`: `out[output] = enriched` executes unconditionally,
+immediately followed, on every call path, by
+`_write_provenance(out, output, source, lookup, resolved, fields)` -- no
+branch sits between the physical publish and the provenance call, and no
+early return in `enrich_lookup` occurs after `out[output]` is set. Inside
+`_write_provenance` (`operation.py:520`), `decoupled = output != source` is
+the function's first statement, evaluated before the `fields is None` guard
+on line 521. No supported call path physically replaces `output` while
+bypassing `_write_provenance`, and `decoupled` cannot be short-circuited by
+`fields`. Matches the accepted design's reference code exactly.
+
+=== Area 2 -- FIND-D1 fields-bearing rebind
+
+Direct repro (`test_enrich_lookup_fields_bearing_decoupled_rebind_invalidates_stale_fk_provenance`
+and independent manual repro): `B` carries truthful FK `helper_columns`
+provenance; `enrich_lookup(source=A, output=B, helpers={"fields": [...]})`
+rebinds `B`. Confirmed: `sheet_entry` starts from `{}` on the decoupled
+branch (`operation.py:529-534`), so neither the old `helper_columns` subkey
+nor any old `enrich_lookup` subkey survives; the fresh record is written into
+that clean entry; `out_meta["keep"]`, `out_derived["other_namespace"]`, and
+sibling sheet entries (`out_sheets["untouched"]`) are preserved by identity in
+the parametrized regression test. No finding.
+
+=== Area 3 -- FIND-D9 `helpers=None`
+
+Direct repro and `test_enrich_lookup_helpers_none_decoupled_rebind_invalidates_stale_fk_provenance`:
+`enrich_lookup(source=A, output=B, helpers=None)` against a `B` with
+pre-existing producer provenance. Confirmed: `decoupled=True` bypasses the
+`not decoupled and fields is None` short-circuit; `had_entry=True`; the
+`fields is None` branch pops `output` from the copied `derived_sheets` and
+commits `out["_meta"] = meta` (`operation.py:538-547`). No fresh
+`enrich_lookup` record is invented (the function returns immediately after
+the pop, before the record-construction code). For a brand-new `output` with
+no prior entry (`had_entry=False`), the function returns before any
+`out["_meta"]` assignment -- confirmed by
+`test_enrich_lookup_brand_new_output_decoupled_rebind_is_a_no_op`'s
+`assert "_meta" not in out_no_fields`. No finding.
+
+=== Area 4 -- same-owner stale record
+
+`test_enrich_lookup_decoupled_rebind_invalidates_stale_own_lookup_record`:
+a first same-source-shaped `enrich_lookup` call establishes Lookup's own
+`enrich_lookup` record at `B`; a second, decoupled, `helpers=None` call
+rebinds `B`. The old record disappears (`"B" not in
+out["_meta"]["derived"]["sheets"]`). The invalidation branch
+(`derived_sheets.pop(output, None)`) discards the *entire* prior sheet entry
+regardless of which subkey(s) it holds -- confirmed generic by inspection,
+not special-cased to `helper_columns`. No finding.
+
+=== Area 5 -- same-source over-invalidation
+
+`output == source` for both `helpers={"fields": [...]}` and `helpers=None`,
+tested directly against a real FK-materialized sibling
+(`test_enrich_lookup_same_source_preserves_sibling_fk_provenance_helpers_*`).
+`decoupled=False` in both cases: the `helpers=None` case hits the unchanged
+`not decoupled and fields is None: return` short-circuit before touching
+`_meta` at all (true no-op, confirmed by `out_sheet["helper_columns"] is
+fk_entry` and `"enrich_lookup" not in out_sheet`); the fields-bearing case
+takes `sheet_entry = dict(derived_sheets.get(output, {}))` (the merge branch,
+unchanged from pre-Slice-3 behavior) and only overwrites its own
+`enrich_lookup` subkey, leaving the FK sibling's `helper_columns` list
+identity-preserved (`out_sheet["helper_columns"] is fk_entry`) and the
+physical FK-owned column (`_B_name`) untouched. No supported same-source mode
+was found where the physical operation is a wholesale replacement rather than
+continuity -- `_check_column_conflict` inspects `source_df` (identical to
+`output`'s pre-existing frame in this mode) before either merge or formula
+construction, and this guard is unchanged by Slice 3. No finding.
+
+=== Area 6 -- meta copy / mutation discipline
+
+`_write_provenance` builds a fresh top-level `meta`, `derived`, and
+`derived_sheets` dict at every reachable branch that writes
+(`dict(out.get("_meta") or {})` etc.), and either a fresh `{}` or a copied
+`dict(derived_sheets.get(output, {}))` for `sheet_entry` -- the caller's
+original `_meta` object graph is never mutated in place; only new objects are
+assigned back into the *local* `out` dict built by `enrich_lookup`'s own
+`out = dict(frames)` (`operation.py:210`). Verified directly:
+`test_enrich_lookup_provenance_write_invalidates_stale_output_on_decoupled_rebind`
+snapshots `frames["_meta"]` (and its `derived`/`sheets`/`result` sub-dicts) by
+deep copy before the call and asserts byte-for-byte equality afterward, while
+also asserting `out_meta is not input_meta`, `out_derived is not
+input_derived`, `out_sheets is not input_sheets`, `out_sheet is not
+input_sheet`, and that unrelated siblings survive by object identity
+(`out_meta["keep"] is keep`, `out_derived["other_namespace"] is
+unrelated_derived`, `out_sheets["untouched"] is untouched_sheet`). Deleting
+`output`'s entry via `derived_sheets.pop(output, None)` operates on the
+copied `derived_sheets` dict and cannot reach sibling entries. All 22 tests
+in the file pass. No finding.
+
+=== Area 7 -- empty-container semantics
+
+Direct repro: invalidating the sole entry in `derived_sheets` via
+`helpers=None` leaves `out["_meta"]["derived"]["sheets"] == {}` and
+`"derived" in out["_meta"]` still `True` -- no pruning of the now-empty
+`sheets`/`derived` containers. This is an *exact* match to the accepted
+design's own reference code (design doc lines 1853-1862), which likewise
+does not prune. It differs from the sibling convention in
+`fk_helpers/provenance.py::_write_helper_provenance` (lines 97-104), which
+does prune an empty `derived["sheets"]` and empty `meta["derived"]` after its
+own cleanup. No test or consumer in the current suite asserts the pruned
+shape for `enrich_lookup`'s own write path -- the only assertion made is
+`"A" not in out["_meta"]["derived"]["sheets"]`, which holds either way. Per
+the review brief's own instruction not to demand cosmetic pruning absent a
+consumer/test contract, this is a *minor*, non-blocking observation
+(implementation matches the accepted design faithfully; the design's own
+reference code, not the implementer, is the source of the asymmetry), not a
+material finding.
+
+=== Area 8 -- test quality
+
+The new regression tests directly assert the `_meta`-level contract (entry
+gone / entry clean / sibling subkey preserved by identity), which is the
+right level to prove Slice 3's actual obligation. One weaker spot: in
+`test_enrich_lookup_fields_bearing_decoupled_rebind_invalidates_stale_fk_provenance`,
+the closing `drop_helpers(out); assert "name" in cleaned["A"].columns`
+assertion does not exercise the genuine Repro-4 hazard, because the new
+Lookup output column is named `"name"` while FK's stale provenance names a
+different column (`"_B_name"`) that no longer physically exists after the
+rebind -- `drop_helpers` would trivially "succeed" at leaving `"name"` alone
+even under the pre-Slice-3 (buggy) behavior, since its provenance-driven drop
+set would target a column absent from the frame. This is explicitly
+acknowledged in the test's own comment ("full removal of the durable-policy
+fallback is Slices 4/5's job") and does not weaken the test file's actual
+proof of Slice 3's contract, which is carried by the direct `_meta`
+assertions immediately above it (`"helper_columns" not in out_sheet`,
+`out_sheet["enrich_lookup"] == {...}`). Classified as a *minor* test-quality
+gap (decorative rather than load-bearing), not material -- consistent with
+the review brief's own guidance that the direct provenance assertion is
+sufficient for Slice 3.
+
+A confirmatory manual repro using a genuinely colliding label (new Lookup
+output also named `_B_name`, `helpers=None`) shows the `_meta` entry is
+correctly invalidated (`"A" not in out["_meta"]["derived"]["sheets"]`) by
+Slice 3, but a subsequent `drop_helpers` call still deletes the column --
+via the *durable v2-policy fallback* branch in
+`fk_helpers/drop.py::_columns_to_drop_by_sheet` (not via stale provenance,
+which Slice 3 already removed). This is exactly the deferred defect the
+design assigns to Slice 4 (`docs/.../derived_artifact_deletion_authority_design_2026-08-21.adoc`
+Section N, Slice 4: "remove the durable-relation fallback branch ... 2, 3").
+It is not evidence against Slice 3 and is out of this review's bound
+(explicit instruction: do not review Slice 4/5 functionality); recorded here
+only so a Slice 4 reviewer has a concrete confirming repro on hand.
+
+The renamed test
+(`test_enrich_lookup_provenance_write_invalidates_stale_output_on_decoupled_rebind`,
+formerly `..._preserves_nested_caller_ownership`) correctly inverts its sole
+changed assertion (`"helper_columns" not in out_sheet` in place of
+`out_sheet["helper_columns"] is fk_entries`) while leaving its
+mutation-discipline and `enrich_lookup`-subkey assertions unchanged, matching
+the design's Slice 3 disposition instruction verbatim (design doc, Section N,
+Slice 3 row).
+
+=== Area 9 -- H5 separation
+
+`c570db2` touches only `enrich_lookup/operation.py` and the nested-ownership
+test file (confirmed via `git show --name-only`). `enrich_lookup/provenance.py`
+(home of `reconcile_enrich_lookup_provenance`, H5) and
+`fk_helpers/provenance.py` (home of `_clean_helper_provenance`, H5's caller)
+are both untouched since `c933551` (a prior, unrelated commit), predating
+this slice. H5 answers "is Lookup's own record still truthful after FK's
+cleanup"; Slice 3 answers "should Lookup discard a foreign/stale record
+because Lookup itself just replaced the frame." The two remain structurally
+independent: H5 never runs inside `enrich_lookup`'s own write path, and
+Slice 3's invalidation never runs inside FK's cleanup path. No finding.
+
+=== Area 10 -- scope / YAGNI
+
+The diff is confined to one function's body (`_write_provenance`, plus
+threading one new `source` parameter through its single call site) and one
+test file. No shared lifecycle service, producer registry, claim system,
+refcount, generation/frame identity, cross-family invalidation helper,
+value/formula equivalence machinery, or new `_meta` schema was introduced.
+The mechanism reuses the existing `_meta.derived.sheets.<sheet>` shape and
+the existing `helper_columns` / `enrich_lookup` subkeys. No finding.
+
+=== Area 11 -- regression against Slice 1/2
+
+`git log` confirms no commits touched `core/fk.py` or
+`fk_helpers/enrich.py`/`fk_helpers/provenance.py` since Slice 2
+(`d66ae9c`); Slice 3 touches a disjoint file. `enrich_lookup`'s public
+signature is unchanged (only the private `_write_provenance` gained a
+parameter, used solely at its one internal call site). No durable-policy
+deletion behavior changed (`fk_helpers/drop.py` untouched by this commit,
+confirmed above). No finding.
+
+== 3. Tests / repros run
+
+[cols="3,1", options="header"]
+|===
+| Command | Result
+
+| `pytest tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py -v`
+| 22 passed
+
+| `pytest tests/unit/domain/transformations/test_fk_helpers_enrich.py test_fk_helpers_domain.py test_enrich_lookup.py test_enrich_lookup_provenance_reconciliation.py test_fk_helper_primitives_policy_driven.py test_fk_helper_policies.py test_enrich_lookup_registration.py test_fk_helper_configuration.py` + 3 architecture guard files
+| all passed
+
+| `pytest tests/architecture -q`
+| all passed
+
+| `pytest tests/unit/domain/transformations -q`
+| all passed
+
+| Manual repro: FIND-D1 fields-bearing decoupled rebind (`operation.py` invoked directly)
+| stale `helper_columns` gone; fresh `enrich_lookup` record present; `_B_name` absent; `name` present
+
+| Manual repro: FIND-D9 `helpers=None` decoupled rebind, same-label collision (`_B_name` reused)
+| `_meta` entry correctly invalidated; physical deletion still occurs via the *durable-policy fallback* in `drop_helpers` (Slice 4 scope, not Slice 3 -- see Area 8)
+
+| Manual repro: Area 7 empty-container shape
+| `derived["sheets"] == {}`; `"derived"` key retained in `meta` -- matches design's own reference code
+|===
+
+No production or test files were modified; the two manual-repro scripts were
+run from a scratch file outside the tracked repository tree and are not
+included in this commit.
+
+== 4. Findings summary
+
+No MATERIAL finding. Two MINOR, non-blocking observations:
+
+* Area 7 -- `_write_provenance` leaves an empty `derived.sheets: {}` /
+  `meta.derived` container behind when the sole invalidated entry had no
+  fresh record to replace it, unlike the sibling `_write_helper_provenance`
+  convention which prunes fully-empty containers. Matches the accepted
+  design's own reference code exactly; no consumer/test currently requires
+  pruning.
+* Area 8 -- the `drop_helpers` follow-on assertion in the fields-bearing
+  decoupled-rebind test does not exercise a genuine label collision, so it
+  would pass even without Slice 3's fix; the direct `_meta`-level assertions
+  in the same test already carry the proof and are sufficient for Slice 3.
+
+== 5. Verdict
+
+*ACCEPT.*
+
+* FIND-D1 (fields-bearing decoupled rebind) implementation: *correct.*
+* FIND-D9 (`helpers=None` decoupled-rebind bypass) implementation: *correct.*
+* Same-source preservation: *correct* -- verified no-op for `helpers=None`,
+  verified sibling-preserving merge for fields-bearing.
+* Metadata-copy/mutation discipline: *correct* -- no caller-input mutation,
+  siblings preserved by identity, deletion scoped to the copied path only.
+* Test quality: *adequate for Slice 3* -- direct `_meta`-level assertions
+  prove the contract; one decorative assertion noted as minor, not
+  load-bearing.
+* H5 separation: *intact* -- disjoint files, disjoint trigger conditions,
+  neither commit touches the other's home module.
+
+*Slice 4 may proceed.* Slice 3 is independently green, matches the accepted
+design's Section K reference implementation, and closes FIND-D1/FIND-D9 at
+the provenance-invalidation layer that is its bounded scope. The durable
+v2-policy fallback in `fk_helpers/drop.py` remains a separately tracked,
+already-scheduled Slice 4 concern (design Section N) and is unaffected,
+positively or negatively, by this commit.
+
+== 6. Lifecycle cleanup check
+
+Not applicable at this granularity: this is a bounded slice-implementation
+review within an active, multi-slice FTR workstream, not a final review
+declaring the workstream green. No FTR/BUG status change, backlog removal, or
+cold-storage move is indicated by this review; the workstream remains open
+pending Slices 4-6.
