@@ -276,19 +276,30 @@ def build_id_sets(
     return id_sets
 
 
-def apply_fk_helpers(
+class _FkHelperMaterializationResult(NamedTuple):
+    frame: pd.DataFrame
+    materialized: list[FKDef]  # definitions this call actually wrote
+    skipped_existing: list[FKDef]  # definitions whose helper_col collided
+    # with an already-present column
+
+
+def _materialize_fk_helpers(
     df: pd.DataFrame,
     fk_defs: List[FKDef],
     id_value_maps: Dict[str, Any],
     levels: int,
     helper_prefix: str = "_",
     helper_value_provider: HelperValueProvider | None = None,
-) -> pd.DataFrame:
+) -> _FkHelperMaterializationResult:
     if not fk_defs:
-        return df
+        return _FkHelperMaterializationResult(
+            frame=df, materialized=[], skipped_existing=[]
+        )
 
     first_cols = _first_level_columns(df)
     new_df = df.copy()
+    materialized: list[FKDef] = []
+    skipped_existing: list[FKDef] = []
 
     for fk in fk_defs:
         # Support FKDef and legacy dict inputs.
@@ -307,6 +318,7 @@ def apply_fk_helpers(
 
         # Avoid duplicates.
         if helper_col in first_cols:
+            skipped_existing.append(fk)
             continue
 
         target_maps = id_value_maps.get(target_key, {})
@@ -356,5 +368,33 @@ def apply_fk_helpers(
         # Add a new column as a MultiIndex tuple of matching length.
         col_tuple = (helper_col,) + ("",) * (levels - 1)
         new_df[col_tuple] = values
+        materialized.append(fk)
 
-    return new_df
+    return _FkHelperMaterializationResult(
+        frame=new_df, materialized=materialized, skipped_existing=skipped_existing
+    )
+
+
+def apply_fk_helpers(
+    df: pd.DataFrame,
+    fk_defs: List[FKDef],
+    id_value_maps: Dict[str, Any],
+    levels: int,
+    helper_prefix: str = "_",
+    helper_value_provider: HelperValueProvider | None = None,
+) -> pd.DataFrame:
+    """Preserved for compatibility; existing callers unaffected.
+
+    The actual materialization logic lives in ``_materialize_fk_helpers``,
+    which also reports which FK definitions were materialized versus skipped
+    due to a pre-existing helper column. See that function for the mechanical
+    contract.
+    """
+    return _materialize_fk_helpers(
+        df,
+        fk_defs,
+        id_value_maps,
+        levels,
+        helper_prefix,
+        helper_value_provider,
+    ).frame

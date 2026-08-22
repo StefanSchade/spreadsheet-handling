@@ -15,6 +15,7 @@ from spreadsheet_handling.core.fk import (
     build_id_value_maps,
     detect_fk_columns,
     apply_fk_helpers,
+    _materialize_fk_helpers,
 )
 from spreadsheet_handling.core.indexing import level0_series
 from spreadsheet_handling.domain.fk_relations import infer_fk_relations
@@ -113,6 +114,111 @@ class TestApplyFkHelpers:
         assert lvl0 == ["id", "id_(B)", "_B_category", "_B_name"]
         assert level0_series(result, "_B_category").tolist() == ["x", "y"]
         assert level0_series(result, "_B_name").tolist() == ["alpha", "beta"]
+
+
+class TestMaterializeFkHelpersReport:
+    """FK Helper Deletion Authority design, Slice 1 (<<E>>, <<N>>, <<O>>).
+
+    ``_materialize_fk_helpers`` is the private reporting primitive backing
+    ``apply_fk_helpers``. It must report, per requested FK definition,
+    whether this call actually materialized the helper column or skipped it
+    because the requested label already existed -- the mechanical fact
+    Slice 2 needs for truthful provenance. This slice only proves the
+    mechanical report; it does not touch Domain provenance behavior.
+    """
+
+    def test_absent_label_is_materialized_and_not_skipped(self):
+        frames = _frames()
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = _materialize_fk_helpers(
+            frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_"
+        )
+
+        assert "_B_name" in [
+            c[0] if isinstance(c, tuple) else c for c in result.frame.columns
+        ]
+        assert result.materialized == fk_defs
+        assert result.skipped_existing == []
+
+    def test_pre_existing_label_is_skipped_and_not_materialized(self):
+        frames = _frames()
+        # Pre-occupy the requested helper label exactly as a caller-supplied
+        # column would; the existing collision behavior must leave it
+        # untouched and claim nothing.
+        frames["A"]["_B_name"] = ["preexisting", "values"]
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        result = _materialize_fk_helpers(
+            frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_"
+        )
+
+        helper_col = [
+            c for c in result.frame.columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        assert result.frame[helper_col].tolist() == ["preexisting", "values"]
+        assert result.materialized == []
+        assert result.skipped_existing == fk_defs
+
+    def test_mixed_definitions_report_each_independently(self):
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]}),
+            "B": pd.DataFrame(
+                {
+                    "id": [1, 2],
+                    "name": ["alpha", "beta"],
+                    "category": ["x", "y"],
+                }
+            ),
+        }
+        # Pre-occupy only one of the two requested helper labels.
+        frames["A"]["_B_category"] = ["pre-x", "pre-y"]
+        defaults = {
+            **DEFAULTS,
+            "helper_fields_by_fk": {"id_(B)": ["category", "name"]},
+        }
+        reg = build_registry(frames, defaults)
+        fk_defs = detect_fk_columns(
+            frames["A"], reg, helper_prefix="_", defaults=defaults
+        )
+        id_maps = build_id_value_maps(
+            frames, reg, fields_by_sheet={"B": ["category", "name"]}
+        )
+        category_def = next(fk for fk in fk_defs if fk.value_field == "category")
+        name_def = next(fk for fk in fk_defs if fk.value_field == "name")
+
+        result = _materialize_fk_helpers(
+            frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_"
+        )
+
+        assert result.materialized == [name_def]
+        assert result.skipped_existing == [category_def]
+        assert level0_series(result.frame, "_B_category").tolist() == [
+            "pre-x",
+            "pre-y",
+        ]
+        assert level0_series(result.frame, "_B_name").tolist() == ["alpha", "beta"]
+
+    def test_apply_fk_helpers_wrapper_returns_same_frame_as_report(self):
+        frames = _frames()
+        reg = build_registry(frames, DEFAULTS)
+        id_maps = build_id_label_maps(frames, reg)
+        fk_defs = detect_fk_columns(frames["A"], reg, helper_prefix="_")
+
+        wrapped = apply_fk_helpers(
+            frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_"
+        )
+        reported = _materialize_fk_helpers(
+            frames["A"], fk_defs, id_maps, levels=1, helper_prefix="_"
+        ).frame
+
+        assert isinstance(wrapped, pd.DataFrame)
+        pd.testing.assert_frame_equal(wrapped, reported)
 
 
 class TestApplyFkHelpersUnresolvedCarrier:

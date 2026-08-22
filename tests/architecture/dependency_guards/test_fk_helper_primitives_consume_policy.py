@@ -42,11 +42,19 @@ _FORBIDDEN_NAMES = frozenset(
 # ``apply_fk_helpers`` and ``build_id_value_maps`` are deterministic
 # materialization helpers that work on already-resolved FKDef rows;
 # ``FKDef`` and ``normalize_sheet_key`` are shared structural utilities.
+# ``_materialize_fk_helpers`` is the private reporting primitive
+# (FK Helper Deletion Authority design, Slice 1): it performs the same
+# materialization as ``apply_fk_helpers`` but also reports, per FK
+# definition, whether this call materialized it or skipped it due to a
+# pre-existing helper column -- the fact Slice 2 needs to write truthful
+# provenance. It is intentionally private (not re-exported from
+# ``core.__init__``); this allow-list is the sanctioned consumption path.
 _ALLOWED_CORE_FK_NAMES = frozenset(
     {
         "FKDef",
         "HelperValueProvider",
         "apply_fk_helpers",
+        "_materialize_fk_helpers",
         "assert_no_parentheses_in_columns",
         "build_id_label_maps",
         "build_id_sets",
