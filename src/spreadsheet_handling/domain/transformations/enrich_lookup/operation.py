@@ -209,7 +209,7 @@ def enrich_lookup(
 
     out = dict(frames)
     out[output] = enriched
-    _write_provenance(out, output, lookup, resolved, fields)
+    _write_provenance(out, output, source, lookup, resolved, fields)
     return out
 
 
@@ -495,15 +495,57 @@ def _reorder_helpers_before_key(
 def _write_provenance(
     out: Frames,
     output: str,
+    source: str,
     lookup: str,
     resolved: _ResolvedKeys,
     fields: list[str] | None,
 ) -> None:
-    if fields is None:
-        return
+    """Write Lookup's own provenance record, invalidating stale prior state.
+
+    ``output != source`` is a *decoupled rebind*: the physical content just
+    published at ``output`` (``out[output] = enriched``, already done by the
+    caller) is derived entirely from ``source``, so whatever provenance was
+    previously attached to ``output`` -- a foreign sibling (e.g. FK's
+    ``helper_columns``), or a stale prior ``enrich_lookup`` record of this
+    same family -- no longer describes the frame's current content and is
+    discarded unconditionally, before and independently of whether *this*
+    call has fresh helper provenance of its own to record (closes
+    FIND-D1/FIND-D9, Repro 4/5 in the accepted deletion-authority design).
+
+    ``output == source`` is the ordinary self-extension case: the merge
+    provably preserves every pre-existing column, so the existing sibling
+    entry is preserved and only Lookup's own sub-key is updated, exactly as
+    before this change.
+    """
+    decoupled = output != source
+    if not decoupled and fields is None:
+        return  # unchanged: ordinary same-source, no-helper call is a no-op
+
     meta: dict[str, Any] = dict(out.get("_meta") or {})
     derived: dict[str, Any] = dict(meta.get("derived", {}))
     derived_sheets: dict[str, Any] = dict(derived.get("sheets", {}))
+    had_entry = output in derived_sheets
+
+    if decoupled:
+        # Decoupled rebind: nothing already attached to `output` -- foreign,
+        # or this family's own prior record -- describes the content just
+        # published there. Start from a clean slate unconditionally, before
+        # deciding whether this call has a fresh record of its own to write.
+        sheet_entry: dict[str, Any] = {}
+    else:
+        sheet_entry = dict(derived_sheets.get(output, {}))
+
+    if fields is None:
+        # No helper projection this call: nothing of Lookup's own to record.
+        # The branch above has already discarded whatever was there in
+        # memory; commit that removal only if there was something to remove.
+        if decoupled and had_entry:
+            derived_sheets.pop(output, None)
+            derived["sheets"] = derived_sheets
+            meta["derived"] = derived
+            out["_meta"] = meta
+        return
+
     record: dict[str, Any] = {"lookup": lookup}
     if resolved.is_asymmetric:
         # Asymmetric mode: record the distinct source/lookup keys additively
@@ -516,7 +558,6 @@ def _write_provenance(
         # Symmetric mode: preserve the original observable provenance shape.
         record["on"] = list(resolved.source_keys)
     record["helper_columns"] = list(fields)
-    sheet_entry = dict(derived_sheets.get(output, {}))
     sheet_entry["enrich_lookup"] = record
     derived_sheets[output] = sheet_entry
     derived["sheets"] = derived_sheets

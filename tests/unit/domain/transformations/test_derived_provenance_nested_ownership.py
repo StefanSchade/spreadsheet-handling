@@ -286,10 +286,21 @@ def test_enrich_lookup_creates_only_missing_provenance_containers(
         ),
     ],
 )
-def test_enrich_lookup_provenance_write_preserves_nested_caller_ownership(
+def test_enrich_lookup_provenance_write_invalidates_stale_output_on_decoupled_rebind(
     join_args: dict,
     expected: dict,
 ) -> None:
+    """Decoupled rebind (``source != output``) discards stale prior provenance.
+
+    ``result`` here is not this call's own ``source``, so the physical
+    content ``enrich_lookup`` just published there has no provable
+    relationship to whatever ``result`` held before -- a foreign FK sibling
+    (``fk_entries``) or Lookup's own prior ``enrich_lookup`` record. Per the
+    accepted deletion-authority design (Section K), both are invalidated
+    unconditionally as part of this write, before the fresh record (if any)
+    is established. This inverts the pre-Slice-3 characterization, which
+    asserted the foreign entry survived untouched.
+    """
     frames = _lookup_frames()
     keep = {"token": "top-level sibling"}
     unrelated_derived = {"token": "derived sibling"}
@@ -352,8 +363,215 @@ def test_enrich_lookup_provenance_write_preserves_nested_caller_ownership(
     assert out_meta["keep"] is keep
     assert out_derived["other_namespace"] is unrelated_derived
     assert out_sheets["untouched"] is untouched_sheet
-    assert out_sheet["helper_columns"] is fk_entries
+    assert "helper_columns" not in out_sheet
     assert out_sheet["enrich_lookup"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Slice 3: decoupled-rebind write-time invalidation (accepted deletion-
+# authority design, Section K). FIND-D1/Repro 4, FIND-D9/Repro 5, the
+# same-owner stale-record variant, the same-source over-invalidation guard,
+# and the brand-new-output no-op are each proven directly against a real
+# FK-materialized sibling, not only against a hand-built fixture.
+# ---------------------------------------------------------------------------
+
+
+def _fk_enriched_frames() -> dict:
+    """``A`` truthfully carries FK's own materialized ``_B_name`` helper."""
+    return enrich_helpers(_fk_frames(), _FK_DEFAULTS)
+
+
+def test_enrich_lookup_fields_bearing_decoupled_rebind_invalidates_stale_fk_provenance() -> None:
+    """FIND-D1 / Repro 4: a fields-bearing decoupled rebind drops FK's stale record.
+
+    ``A`` already carries truthful FK helper provenance for ``_B_name`` from a
+    prior ``add_fk_helpers`` call. An ordinary ``enrich_lookup(source="C",
+    output="A", ...)`` call -- ``source != output`` -- physically replaces
+    ``A`` with content derived from ``C``. FK's stale record must not survive
+    that rebind, and a subsequent cleanup pass must not delete the
+    replacement column on the strength of it.
+    """
+    fk_frames = _fk_enriched_frames()
+    assert fk_frames["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+
+    frames = dict(fk_frames)
+    frames["C"] = pd.DataFrame({"id": [1, 2], "note": ["x", "y"]})
+
+    out = enrich_lookup(
+        frames,
+        source="C",
+        lookup="B",
+        output="A",
+        on="id",
+        helpers={"fields": ["name"]},
+    )
+
+    out_sheet = out["_meta"]["derived"]["sheets"]["A"]
+    assert "helper_columns" not in out_sheet
+    assert out_sheet["enrich_lookup"] == {
+        "lookup": "B",
+        "on": ["id"],
+        "helper_columns": ["name"],
+    }
+    assert "_B_name" not in out["A"].columns
+    assert list(out["A"]["name"]) == ["alpha", "beta"]
+
+    # A later cleanup does not delete the replacement column due to stale FK
+    # provenance -- direct proof this slice's own contract holds; full
+    # removal of the durable-policy fallback is Slices 4/5's job, not this
+    # one's, so this assertion does not depend on that later change.
+    cleaned = drop_helpers(out)
+    assert "name" in cleaned["A"].columns
+
+
+def test_enrich_lookup_helpers_none_decoupled_rebind_invalidates_stale_fk_provenance() -> None:
+    """FIND-D9 / Repro 5: a ``helpers=None`` decoupled rebind still invalidates.
+
+    Identical setup to the fields-bearing case above, except this call
+    requests no helper projection at all. The physical rebind still occurs
+    (``out[output] = enriched``), so FK's stale record must still be removed
+    even though this call itself has no fresh provenance to establish.
+    """
+    fk_frames = _fk_enriched_frames()
+
+    frames = dict(fk_frames)
+    frames["C"] = pd.DataFrame({"id": [1, 2], "note": ["x", "y"]})
+
+    out = enrich_lookup(
+        frames,
+        source="C",
+        lookup="B",
+        output="A",
+        on="id",
+        helpers=None,
+    )
+
+    assert "A" not in out["_meta"]["derived"]["sheets"]
+    assert "_B_name" not in out["A"].columns
+
+
+def test_enrich_lookup_decoupled_rebind_invalidates_stale_own_lookup_record() -> None:
+    """Same-owner stale-record variant (Review 002 Section 5).
+
+    A first ``enrich_lookup`` call establishes Lookup's own provenance at
+    ``B``. A later, decoupled ``enrich_lookup(source="C", output="B",
+    helpers=None)`` call has no fresh record to re-establish it with, so the
+    prior *own* record must be removed too, not only a foreign FK sibling.
+    """
+    frames = _lookup_frames()
+    first = enrich_lookup(
+        frames,
+        source="src",
+        lookup="lookup",
+        output="B",
+        on="id",
+        helpers={"fields": ["title"]},
+    )
+    assert first["_meta"]["derived"]["sheets"]["B"]["enrich_lookup"]["helper_columns"] == [
+        "title"
+    ]
+
+    frames2 = dict(first)
+    frames2["C"] = pd.DataFrame({"id": [1, 2], "note": ["x", "y"]})
+
+    out = enrich_lookup(
+        frames2,
+        source="C",
+        lookup="lookup",
+        output="B",
+        on="id",
+        helpers=None,
+    )
+
+    assert "B" not in out["_meta"]["derived"]["sheets"]
+
+
+def test_enrich_lookup_same_source_preserves_sibling_fk_provenance_helpers_present() -> None:
+    """Over-invalidation guard: ``output == source`` never discards siblings.
+
+    Self-extension (``source == output``) must remain a true no-op for prior
+    sibling provenance and physical FK-owned values, whether or not this
+    call itself carries fresh helper fields.
+    """
+    fk_frames = _fk_enriched_frames()
+    fk_entry = fk_frames["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+    original_b_name = list(fk_frames["A"]["_B_name"])
+
+    frames = dict(fk_frames)
+    frames["extra_lookup"] = pd.DataFrame({"id": [10, 20], "title": ["t1", "t2"]})
+
+    out = enrich_lookup(
+        frames,
+        source="A",
+        lookup="extra_lookup",
+        output="A",
+        on="id",
+        helpers={"fields": ["title"]},
+    )
+
+    out_sheet = out["_meta"]["derived"]["sheets"]["A"]
+    assert out_sheet["helper_columns"] is fk_entry
+    assert out_sheet["enrich_lookup"] == {
+        "lookup": "extra_lookup",
+        "on": ["id"],
+        "helper_columns": ["title"],
+    }
+    assert list(out["A"]["_B_name"]) == original_b_name
+    assert list(out["A"]["title"]) == ["t1", "t2"]
+
+
+def test_enrich_lookup_same_source_preserves_sibling_fk_provenance_helpers_none() -> None:
+    fk_frames = _fk_enriched_frames()
+    fk_entry = fk_frames["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+    original_b_name = list(fk_frames["A"]["_B_name"])
+
+    frames = dict(fk_frames)
+    frames["extra_lookup"] = pd.DataFrame({"id": [10, 20], "title": ["t1", "t2"]})
+
+    out = enrich_lookup(
+        frames,
+        source="A",
+        lookup="extra_lookup",
+        output="A",
+        on="id",
+        helpers=None,
+    )
+
+    out_sheet = out["_meta"]["derived"]["sheets"]["A"]
+    assert out_sheet["helper_columns"] is fk_entry
+    assert "enrich_lookup" not in out_sheet
+    assert list(out["A"]["_B_name"]) == original_b_name
+
+
+def test_enrich_lookup_brand_new_output_decoupled_rebind_is_a_no_op() -> None:
+    """Brand-new distinct output: behavior is unchanged from today.
+
+    ``helpers=None`` into a brand-new output must not manufacture a `_meta`
+    tree merely to represent an invalidation that has nothing to discard.
+    """
+    frames = _lookup_frames()
+
+    out_with_fields = enrich_lookup(
+        frames,
+        source="src",
+        lookup="lookup",
+        output="brand_new",
+        on="id",
+        helpers={"fields": ["title"]},
+    )
+    assert out_with_fields["_meta"]["derived"]["sheets"]["brand_new"]["enrich_lookup"][
+        "helper_columns"
+    ] == ["title"]
+
+    out_no_fields = enrich_lookup(
+        frames,
+        source="src",
+        lookup="lookup",
+        output="brand_new_2",
+        on="id",
+        helpers=None,
+    )
+    assert "_meta" not in out_no_fields
 
 
 def test_enrich_lookup_repetition_matrix_preserves_current_stale_behavior() -> None:
