@@ -1,0 +1,320 @@
+= FK Helper Deletion Authority -- Slice 4 Implementation Review
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded, independent code review of Slice 4 only (removal of durable
+v2 relation policy as physical deletion authority from
+``fk_helpers/drop.py``). Read-only. This artifact authorizes no further
+implementation, redesign, or Slice 5 change.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core`.
+
+Baseline commit (Slice 3, pre-Slice-4):: `cd5746cb3a54c6ecf25152d06604c4576ba6db12`
+(`docs(domain): review deletion authority slice 3`; production code
+identical to `c570db233e578ffa4a20d2b80bd66a7e66e0d4f7`, Slice 3).
+
+Reviewed commit (Slice 4):: `6d4caeadeff550f2284bef3518cc0d7d532cefbd`
+(`fix(fk): require provenance for helper deletion`).
+
+Accepted design:: `docs/warm_storage/global_reviews/
+derived_artifact_deletion_authority_design_2026-08-21.adoc`, Sections F, G,
+I, J, N (Slice 4 row), O.
+
+Gate authority:: `derived_artifact_deletion_authority_design_2026-08-21_review_001.adoc`
+S16.3 -- FIND-D1 through FIND-D13 *CLOSED*, implementation gate *OPEN*.
+Slice-3 independent review:: `derived_artifact_deletion_authority_slice3_implementation_review_2026-08-22.adoc`
+-- *ACCEPT*, Area 8 confirmatory same-label repro identified as Slice 4's
+concrete acceptance test.
+
+Review date:: 2026-08-22.
+
+== 1. Review goal and method
+
+Determine whether `6d4caea` correctly removes durable v2 FK relation policy
+as independent physical deletion authority from
+`fk_helpers/drop.py::_columns_to_drop_by_sheet`, while preserving the
+transient-provenance happy path, the missing-policy precondition/error,
+safe absent-column behavior, and Slice-3 composition, per the accepted
+design's Sections F/G/I/J/N/O and the twelve-area brief for this review.
+
+Method: read the diff against the design's Section G/J text; trace
+`drop_helpers`'s full call graph (not only the edited lines) for any
+remaining durable-policy-to-drop-set path; re-run the changed and adjacent
+test suites; construct a direct empirical repro by running the new/inverted
+tests against the pre-Slice-4 production code in an isolated git worktree
+to confirm they would have failed before this commit. No production or
+test code was modified.
+
+== 2. Area-by-area findings
+
+=== Area 1 -- deletion-candidate source
+
+`_columns_to_drop_by_sheet` (`drop.py:84-96`) now takes only
+`provenance_by_sheet` and returns
+`{sheet: {entry["column"] for entry in entries if entry.get("column")}}` --
+built exclusively from `derived_helper_columns_by_sheet(frames)` (transient
+provenance). `resolve_v2_fk_relations`'s only two call sites in the module
+are the pre-existing `missing_fk_policy_error` precondition
+(`relations is None and not provenance_by_sheet`) and the new
+`_log_durable_policy_only_survivors` diagnostic, which reads `relations` but
+never writes into `columns_to_drop` -- it is a separate function invoked
+after `columns_to_drop` is already fully computed. No path reconstructs
+candidates from durable policy, physical column-name pattern, or
+value/formula shape. No finding.
+
+=== Area 2 -- transient-provenance happy path
+
+`TestDropHelpersWithProvenance` (4 tests: single/multiple helper removal,
+provenance cleanup, non-helper `_`-prefixed column retention) is untouched
+by the diff and passes unmodified. `_clean_helper_provenance`'s call site
+and signature (`drop.py:80`) are unchanged from Slice 3. No finding.
+
+=== Area 3 -- durable-policy-only fail-closed path
+
+`test_drop_survives_v2_policy_only_column_when_provenance_missing`
+(inverted from `test_drop_removes_columns_from_v2_policy_when_provenance_missing`)
+asserts `_B_name` survives when only v2 policy exists (no transient
+provenance). Confirmed empirically: running this test (and the file's other
+8 tests) against the pre-Slice-4 production code
+(`6d4caea^` == `cd5746c`, verbatim Slice 3 code) in an isolated worktree,
+this test *fails* (`AssertionError: assert '_B_name' in ['id']` --
+i.e. the old code deleted it), while the other 7 pre-existing tests still
+pass unchanged. The inversion is genuine, not merely renamed. No finding.
+
+=== Area 4 -- genuine same-label replacement
+
+`test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind`
+(`TestDropHelpersDeletionAuthority`) reproduces the Slice-3-review Area 8
+confirmatory repro end-to-end: FK materializes `_B_name` on `A` with
+matching transient provenance; `enrich_lookup(source="C", output="A",
+helpers=None)` decoupled-rebinds `A` with caller-owned content from `C`
+that happens to reuse the literal label `_B_name` (traced through
+`operation.py`: `helpers=None` with no lookup-side fields projects only the
+join key, so `enriched` reduces to `C`'s own columns -- confirmed by the
+test's own `list(rebound["A"]["_B_name"]) == ["caller-x", "caller-y"]`
+assertion, `C`'s original values, not `B`'s). Slice 3 strips `A`'s stale FK
+record as part of that write (`"A" not in
+rebound["_meta"]["derived"]["sheets"]`, asserted directly). Durable v2
+policy still names `_B_name` for `source_frame="A"` (untouched by
+`enrich_lookup`). `drop_helpers` is then run over `rebound`.
+
+Confirmed empirically in the same pre-Slice-4 worktree run: this test also
+*fails* against pre-Slice-4 code (same assertion shape, caller's `_B_name`
+deleted via the durable-policy fallback), and passes against `6d4caea`.
+This is the composition the Slice-3 review flagged as "exactly the deferred
+defect... assigned to Slice 4" -- now closed, verified against the actual
+historical failure mode rather than a merely similar shape. No finding.
+
+=== Area 5 -- missing-policy error
+
+`test_no_policy_and_no_provenance_raises_with_actionable_message` is
+untouched by the diff. The precondition
+(`relations is None and not provenance_by_sheet: raise
+missing_fk_policy_error(...)`, `drop.py:54-55`) is unchanged from Slice 3;
+`resolve_v2_fk_relations`'s two call sites (precondition and diagnostic) are
+its only uses in this module, per Area 1. No finding.
+
+=== Area 6 -- diagnostic
+
+`_log_durable_policy_only_survivors` (`drop.py:99-132`): no exception is
+raised (log-only); public `drop_helpers`/`Frames` return contract is
+unchanged; the function runs after `columns_to_drop` is finalized and
+cannot influence it; the message ("durable FK policy names it but no
+truthful transient provenance authorizes deletion") does not claim FK
+ownership of the surviving column; it is skipped for any sheet present in
+`provenance_by_sheet` (`if ... source_frame in provenance_by_sheet:
+continue`), so it does not fire on the ordinary transient-provenance
+deletion path; it is guarded by both frame presence
+(`frame_by_name.get(source_frame)` is `None` -> skip) and physical-column
+presence (`source_frame_has_column(df, column)`), so a durable relation for
+a sheet that never materialized, or no longer carries, the column produces
+no warning. Logger name `logging.getLogger("sheets.fk_helpers")` matches
+the repository's existing `sheets.<module>` convention (`sheets.ods`,
+`sheets.cleanup`, `sheets.column_roles`, `sheets.pipeline`,
+`sheets.validation`). No finding.
+
+=== Area 7 -- `_columns_to_drop_by_sheet` contract
+
+Signature reduced to `provenance_by_sheet` only (the `frames`/`relations`
+parameters are gone); the durable-fallback branch (`known_sheets` /
+relation-bucket accumulation) is removed entirely, not relocated --
+confirmed by the diagnostic function's independent, additive shape rather
+than a call from within `_columns_to_drop_by_sheet`. Returned sets
+correspond exactly to `{entry["column"] for entry in entries if
+entry.get("column")}` per sheet with transient provenance; a sheet with no
+provenance entries and no relations produces an empty `columns_to_drop`,
+which the main loop's `if not drop_columns: out[sheet] = df; continue`
+already treats as a safe no-op. The function only reads `entries` (dicts)
+and builds new local containers; no provenance/meta structure is mutated.
+No finding.
+
+=== Area 8 -- stale provenance, absent physical column
+
+`test_drop_is_safe_noop_when_provenance_names_absent_column`: transient
+provenance names `_B_name`; the column is removed from the physical frame
+before `drop_helpers` runs. The main loop's `keep = [c for c in df.columns
+if _visible_label(c) not in drop_columns]` is a no-op against an already-
+absent label (nothing to filter out, no error). `_clean_helper_provenance`'s
+call site and body are untouched by this diff (not present in the Slice-4
+diff at all), so metadata cleanup behavior is exactly the pre-Slice-4/
+Slice-3 behavior -- this test is a stability regression, not a new-behavior
+proof, and correctly confirms Slice 4 did not destabilize it. No finding.
+
+=== Area 9 -- test quality
+
+Per-test "would this have failed before Slice 4?" check, verified by
+running the current test file against the pre-Slice-4 worktree
+(`6d4caea^`):
+
+[cols="4,2,3", options="header"]
+|===
+| Test | Fails on pre-Slice-4 code? | Assessment
+
+| `test_drop_survives_v2_policy_only_column_when_provenance_missing`
+| Yes (empirically confirmed)
+| Genuine inversion; proves Area 3.
+
+| `test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind`
+| Yes (empirically confirmed)
+| Genuine Slice-3-review Area-8 composition repro; proves Area 4 against the
+  actual historical defect shape, not a look-alike.
+
+| `test_drop_is_safe_noop_when_provenance_names_absent_column`
+| No (unaffected by Slice 4; pre-existing behavior)
+| Correctly a stability/non-regression test, not a new-behavior proof; the
+  review brief's Area 8 asks for exactly this coverage.
+
+| `test_no_policy_and_no_provenance_raises_with_actionable_message`
+| N/A, untouched by the diff
+| Confirms the missing-policy error is unaffected.
+
+| `TestDropHelpersWithProvenance` (4 tests)
+| N/A, untouched by the diff
+| Confirms the transient-provenance happy path is unaffected.
+|===
+
+All 9 tests in the file pass against `6d4caea`; 7 of 9 also pass against
+pre-Slice-4 code, and the 2 that must change behavior demonstrably do.
+No finding.
+
+=== Area 10 -- scope / no Slice 5 leakage
+
+`git diff --stat cd5746c 6d4caea` touches exactly two files:
+`fk_helpers/drop.py` and `test_drop_helpers_provenance.py`.
+`derived_column_policy.py` (`_safe_policy_helper_names`,
+`_safe_durable_helper_names`) is unmodified and still present --
+confirmed by direct inspection, Slice 5's fallback removal has not landed.
+No changes touch persistence, Workbook View, Lookup runtime, H5
+(`_clean_helper_provenance` call site/body unchanged), core FK reporting,
+FK materialization/provenance writing, or `_meta` schema. No finding.
+
+=== Area 11 -- compatibility narrowing
+
+The behavior change is exactly the intended one: before, durable policy
+alone (with no transient provenance) could authorize `drop_helpers`
+deletion of a matching column; after, it cannot -- the column survives with
+a non-raising diagnostic. No broader behavior change was found (Areas 2, 5,
+8 confirm the surrounding contract is otherwise unchanged). This narrowing
+is the accepted design's own deliberate safety fix (Section I), not a
+regression. No finding.
+
+=== Area 12 -- concrete contradiction check
+
+Searched all non-test callers of `drop_helpers` / `remove_fk_helpers` /
+`make_drop_helpers_step` (`pipeline/steps.py`, `pipeline/registry.py`,
+`pipeline/__init__.py`, `pipeline/description_authorization.py`,
+`domain/validations/fk_helpers.py`); none treat durable relation policy as
+independent caller-authorized deletion evidence -- `registry.py` maps the
+step name to the function, `steps.py` delegates unchanged
+(`drop_helpers(fr, prefix=cfg["prefix"])`), and
+`domain/validations/fk_helpers.py` only reads `resolve_v2_fk_relations`/
+`derived_helper_columns_by_sheet` for its own (unrelated) validation
+findings, not for cleanup authorization. No maintained caller or documented
+contract contradicts the accepted design. No finding.
+
+== 3. Tests / repros run
+
+[cols="3,1", options="header"]
+|===
+| Command | Result
+
+| `pytest tests/unit/domain/transformations/test_drop_helpers_provenance.py -v`
+| 9 passed
+
+| `pytest tests/unit tests/integration tests/roundtrip tests/architecture -q`
+| full suite green (exit 0, no failures/errors)
+
+| `pytest tests/architecture -q`
+| all passed
+
+| Worktree repro: same test file run against pre-Slice-4 production code
+  (`git worktree add --detach <tmp> 6d4caea^`, copy current test file in)
+| 2 failed (`test_drop_survives_v2_policy_only_column_when_provenance_missing`,
+  `test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind`),
+  7 passed -- confirms both key tests exercise a genuine, previously-real
+  defect, not a vacuous shape. Worktree removed after the run
+  (`git worktree remove --force`); no tracked files modified.
+|===
+
+== 4. Findings summary
+
+No MATERIAL finding. No MINOR finding against the Slice 4 diff itself.
+
+*Release-notes checkpoint (observation, not a Slice-4 finding).* The
+accepted design's Section M already identifies that
+`docs/release_notes/release_notes.adoc` needs an entry (or an explicit
+"none needed" rationale) for `remove_fk_helpers`'s and
+`apply_derived_column_policy`'s durable-policy-only behavior change, and
+Section N assigns all documentation deltas -- including this one -- to the
+separate, optional Slice 6, landing after both mandatory executor sites
+(Slices 4 and 5) are complete. `docs/release_notes/release_notes.adoc` has
+no entry for this change yet, consistent with that plan; this is not a
+Slice-4 gap. Recorded here so a Slice-5/6 reviewer does not lose track of
+it, per the release-notes checkpoint in
+`docs/ai_info/review_instructions.adoc`.
+
+== 5. Verdict
+
+*ACCEPT.*
+
+* Deletion-candidate source: *correct* -- transient provenance only; no
+  durable-policy-to-drop-set path remains anywhere in `drop_helpers`'s call
+  graph.
+* Transient-provenance happy path: *correct* -- unaffected, unchanged tests
+  green.
+* Durable-policy-only path: *correct* -- fails closed (survives); verified
+  by an inverted test that demonstrably fails against pre-Slice-4 code.
+* Genuine same-label composition (Slice-3-review Area 8): *correct* --
+  the replacement column survives; verified against the actual historical
+  defect shape, not a look-alike, and demonstrably fails against
+  pre-Slice-4 code.
+* Missing-policy error: *correct* -- unchanged, still raises.
+* Diagnostic: *correct* -- non-raising, scoped, does not influence
+  deletion, does not claim FK ownership, no excessive false positives.
+* Test quality: *good* -- both load-bearing new/inverted tests empirically
+  proven to exercise the real pre-Slice-4 defect; the third new test is
+  correctly a stability check, not overclaimed as a new-behavior proof.
+* Scope: *clean* -- exactly two files touched; no Slice 5
+  (`derived_column_policy.py`) leakage; no persistence, Workbook View,
+  Lookup runtime, H5, core FK, or `_meta`-schema changes.
+
+*Slice 5 may proceed.* Slice 4 is independently green, matches the accepted
+design's Section G/J text, and closes the durable-fallback deletion-authority
+gap at the `fk_helpers/drop.py` executor -- the Slice-3-review Area 8
+confirmatory repro that was explicitly deferred to this slice is now
+verified closed. `derived_column_policy.py`'s own durable-fallback removal
+and generalized decoupled-rebind invalidation (Section H) remain Slice 5's
+separately tracked, unaffected scope.
+
+== 6. Lifecycle cleanup check
+
+Not applicable at this granularity: this is a bounded slice-implementation
+review within an active, multi-slice FTR workstream (no formal FTR/BUG
+backlog ID was found tracking this workstream; it is tracked via the
+`docs/warm_storage/global_reviews/derived_artifact_deletion_authority_*`
+design/review series itself), not a final review declaring the workstream
+green. No status change, backlog removal, or cold-storage move is indicated
+by this review; the workstream remains open pending Slice 5 (and the
+optional documentation Slice 6, which owns the release-notes entry noted in
+Section 4 above).
