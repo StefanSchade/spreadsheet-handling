@@ -1,0 +1,1187 @@
+= FK Helper Deletion Authority Design -- Independent Review 001
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: independent adversarial design review. Read-only; authorizes no
+implementation, runtime change, test change, registry change, or canonical
+document change.
+
+Reviewed artifact::
+`docs/warm_storage/global_reviews/derived_artifact_deletion_authority_design_2026-08-21.adoc`
+(the "design"), unmodified by this review.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core` only.
+
+Review baseline HEAD:: `752e4019513dba8384a5670c4c15a5a51c3fdf88`
+(`docs(domain): design FK helper deletion authority`), branch `main`,
+`main...origin/main [ahead 5]`, worktree clean before this review, verified
+with `git status --porcelain=v1 --branch` and `git log -1 --format='%H %s'`.
+
+Review date:: 2026-08-22.
+
+Accepted baseline this design is authorized against::
+`derived_artifact_claim_lifecycle_assessment_2026-08-21.adoc` (final verdict
+*ACCEPT*) and its independent
+`derived_artifact_claim_lifecycle_assessment_2026-08-21_review_001.adoc`
+(final Design-Gate verdict *DESIGN PHASE AUTHORIZED WITH NARROWED SCOPE*).
+Both were read in full before forming any conclusion below.
+
+== 1. Executive verdict
+
+[.lead]
+The design's *diagnosis and mandatory mechanism are correct and necessary*:
+durable FK relation policy must stop authorizing deletion at both executors,
+and FK transient provenance must become write-only-for-what-was-materialized.
+Implemented exactly as specified, the design closes all three accepted,
+independently reproduced repros (same-run collision; durable-policy-only,
+FK never ran; second executor).
+
+The design is *not implementation-ready as written*, for two reasons this
+review independently reproduced against the current runtime, not merely
+inferred from prose:
+
+. Section F's central claim -- "truthful, same-run, materialized-only
+  transient provenance is *sufficient* deletion authority" -- is false as
+  stated. This review constructed and ran a fourth, previously
+  unidentified, fully supported reproduction in which FK's transient
+  provenance is genuinely truthful *at the moment FK writes it*, and later,
+  in the *same run*, a distinct `enrich_lookup` call (ordinary
+  `source != output` usage, output reusing the sheet name FK already
+  enriched) physically replaces the column's content while FK's provenance
+  entry for that sheet is left untouched. Both cleanup executors then
+  delete the -- now foreign -- physical column, trusting FK's stale
+  provenance. See <<find-d1>>.
+. The design's own *optional* self-verified-reuse refinement (<<design-D>>
+  in the reviewed design) compounds finding 1: it can re-affirm the exact
+  stale claim from finding 1 purely from definition-*shape* matching,
+  without ever inspecting physical column identity or values, and in doing
+  so defeats the one incidental self-healing property the design's own
+  provenance-rewrite mechanics would otherwise provide. See <<find-d2>>.
+
+A third, independently material finding: the persistence/reimport
+capability narrowing (<<design-I>>) is under-classified. It will silently
+invert three currently green, maintained regression tests -- one of them a
+CLI-driven roundtrip test explicitly tagged to a historical release-blocking
+bug (`BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A`) -- and the design
+does not name them, does not connect its own preserved Workbook-View
+carrier as the apparent migration path, and does not propose a disposition
+for any of the three. See <<find-d4>>.
+
+None of these findings requires reopening the narrowed-scope authorization,
+reintroducing claim/reliance vocabulary, a claim ledger, global artifact
+identity, or value/formula equivalence machinery. All three are resolvable
+within the design's own owner-local, on-demand architecture family (Family
+A, per the accepted research's own ranking). See <<required-corrections>>.
+
+Full severity/verdict summary in <<required-verdicts>> and <<findings>>.
+
+[[review-2]]
+== 2. Review method / evidence
+
+This review, before forming any conclusion:
+
+* read the design under review in full;
+* read `derived_artifact_claim_lifecycle_assessment_2026-08-21.adoc` and its
+  `_review_001.adoc` in full (the accepted research baseline and its closed
+  independent review that authorized this Design Phase);
+* read `docs/ai_info/review_instructions.adoc` (mandatory review entry
+  point) and the `core/CLAUDE.md` review-completion contract;
+* independently read the actual runtime the design describes and proposes
+  to change, in full or in the cited relevant part:
+  `src/spreadsheet_handling/core/fk.py`;
+  `domain/transformations/fk_helpers/{enrich,drop,provenance,policy}.py`;
+  `domain/transformations/enrich_lookup/operation.py`;
+  `domain/transformations/derived_column_policy.py`;
+  `domain/workbook_views.py`;
+  `domain/helper_policies.py`;
+  `core/__init__.py`;
+  `registries/meta_registry.yaml` (the `derived` and `helper_columns`
+  entries);
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`;
+  `docs/ai_info/interfaces_and_gates.adoc`;
+  `tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py`;
+  `tests/unit/domain/transformations/test_derived_column_policy.py`;
+  `tests/roundtrip/test_cleanup_invariants.py`;
+  `docs/cold_storage/backlog/ftrs_done/BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc`
+  and `BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A.adoc` (the historical
+  tickets that produced the durable-carrier fallback mechanics the design
+  now proposes to remove or leave untouched).
+
+=== Independent reproduction, not trust-on-prose
+
+The design's central sufficiency claim in <<design-F>> was attacked, not
+merely read, by constructing a fourth reproduction using only registered
+step-equivalent Domain calls (`configure_fk_helpers`, `enrich_helpers`
+(`add_fk_helpers`), `enrich_lookup`, `drop_helpers` (`remove_fk_helpers`),
+`apply_derived_column_policy`), with no `_meta` hand-construction and no
+internal/unsupported call -- the same methodology the accepted review used
+for repros 1-3. The script
+(`repro_stale_same_run_provenance.py`, run from this review's ephemeral
+scratch directory, not part of the repository) was executed as:
+
+[source,text]
+----
+.venv/bin/python <scratch>/repro_stale_same_run_provenance.py
+----
+
+Observed output (verbatim):
+
+[source,text]
+----
+after add_fk_helpers:
+  orders._B_name = ['fk-alpha', 'fk-beta']
+  FK provenance   = [{'column': '_B_name', 'fk_column': 'id_(B)', 'target': 'B', 'target_key': 'id', 'value_field': 'name'}]
+
+after enrich_lookup(source=orders_supplemental, output=orders):
+  orders._B_name = ['lookup-alpha', 'lookup-beta']
+  FK provenance (unchanged?) = [{'column': '_B_name', 'fk_column': 'id_(B)', 'target': 'B', 'target_key': 'id', 'value_field': 'name'}]
+  Lookup provenance          = {'lookup': 'B_lookup2', 'on': ['id'], 'helper_columns': ['_B_name']}
+
+after drop_helpers: _B_name present?  False
+*** DATA LOSS: Lookup's _B_name values deleted via FK's stale provenance ***
+after apply_derived_column_policy(drop): _B_name present?  False
+*** DATA LOSS (second executor): Lookup's _B_name values deleted ***
+----
+
+Full detail, why this is *not* closed by the design as specified, and why
+it is an ordinary (not contrived) pipeline shape: <<find-d1>>.
+
+=== Regression baseline confirmed green
+
+No repository file was modified by this review. A focused re-run confirms
+the reviewed baseline matches its own test claims and that this review's
+findings are about a *gap*, not a *currently failing* test:
+
+[source,text]
+----
+.venv/bin/python -m pytest \
+  tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py \
+  tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/transformations/test_fk_helpers_domain.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py \
+  tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py \
+  tests/roundtrip/test_cleanup_invariants.py
+# 216 passed
+----
+
+`git status --porcelain=v1 --branch` and `git rev-parse HEAD` were re-checked
+after these runs; the worktree remained clean and HEAD unchanged throughout.
+
+== 3. Defect-closure verification
+
+[[design-F]]
+The design's mandatory mechanism (<<design-F>> = design Section F; truthful
+provenance at write time, plus removal of the durable-policy fallback at
+both `fk_helpers/drop.py` and `derived_column_policy.py`) was checked
+mechanically against each of the three accepted reproductions by tracing the
+actual code it proposes to change:
+
+* *Repro 1 (same-run collision).* At the time `enrich_helpers` runs,
+  `core/fk.py::apply_fk_helpers`'s existing collision check
+  (`if helper_col in first_cols: continue`, `core/fk.py:309`) already fires
+  correctly on the physical collision; only the *reporting* is missing
+  today (`fk_helpers/enrich.py:95-131` builds `fk_defs_by_frame` from
+  resolved relation definitions with no feedback from the skip decision,
+  confirmed by reading `enrich.py` and `core/fk.py` together). Under the
+  design's Slice 1/2 change, this collision would be reported as
+  `skipped_existing`, not `materialized`; with no optional-refinement match
+  possible (no prior FK record exists for a first-run collision), no
+  provenance entry would be written. `drop_helpers`
+  (`fk_helpers/drop.py:38-51`) and `apply_derived_column_policy`
+  (`derived_column_policy.py:76-92`) would then find no FK-owned evidence
+  and leave the column in place. *Closed*, confirmed by code trace.
+* *Repro 2 (durable-policy-only, FK never runs).* `fk_helpers/drop.py`'s
+  `_columns_to_drop_by_sheet` (lines 73-100) currently falls back to
+  `relations` (durable policy) for any sheet absent from
+  `provenance_by_sheet`; the design removes that fallback branch entirely.
+  With it removed, no candidate name exists for the sheet at all, and the
+  column survives. *Closed*, confirmed by code trace.
+[[design-repro-closure-check]]
+* *Repro 3 (second executor, same setup).*
+  `derived_column_policy.py::_safe_policy_helper_names`
+  (lines 271-295) independently re-reads
+  `_meta.helper_policies.fk.relations` and unions the result into
+  `durable_helper_names`; the design deletes this function and its call
+  site (`derived_column_policy.py:77,91`) entirely. *Closed*, confirmed by
+  code trace.
+
+*Verdict A (Confirmed defect closure): ACCEPT for the three originally
+accepted reproductions.* This is a genuine, independently verified closure
+of the exact evidence base the Design Phase was authorized against.
+However, see <<find-d1>>: this review independently constructed and ran a
+*fourth* reachable variant, adjacent to but distinct from the three accepted
+repros, that the design's mechanism as specified does *not* close. Verdict A
+is scoped to the originally accepted evidence; it is not a general safety
+verdict -- that is <<verdict-b>>.
+
+[[review-4]]
+== 4. Transient-provenance authority review
+
+[[verdict-b]]
+Design Question 2 (<<design-F>>, "what proves current FK production?")
+answers: same-run transient provenance is sufficient "because by
+construction it is written only when FK either wrote the column this call
+or self-verified it as its own unchanged prior output," and names the one
+invalidating path it considers -- "a later same-run step overwriting the
+physical column's content while leaving FK's transient record untouched" --
+as "not evidenced as reachable by any accepted reproduction or maintained
+consumer... named as an open assumption, not a proven invariant."
+
+This review searched exactly that path, across transformations beyond
+Lookup as instructed (frame replacement, column mutation, schema
+operations, projection operations, repeated enrichment), and found it
+reachable through the single most ordinary use of `enrich_lookup`.
+
+=== The mechanism
+
+1. `add_fk_helpers` (`fk_helpers/enrich.py` -> `core/fk.py::apply_fk_helpers`)
+   materializes `_B_name` on sheet `orders` and truthfully records it in
+   `_meta.derived.sheets.orders.helper_columns` (this write is genuinely
+   truthful under the design's own Section E rule -- no collision occurred
+   at FK's own write time).
+2. `enrich_lookup(source="orders_supplemental", lookup="B_lookup2",
+   output="orders", ...)` runs later in the *same* run. Its own collision
+   guard, `_check_column_conflict`
+   (`domain/transformations/enrich_lookup/operation.py:236-248`), checks
+   only `source_df` (here, `orders_supplemental`, which never had
+   `_B_name`) -- it never inspects the pre-existing frame already bound to
+   `output`. The call succeeds and produces a wholly new `orders` frame
+   object via full-frame replacement (`out[output] = enriched`,
+   `operation.py:210-211`), containing `_B_name` sourced entirely from
+   `B_lookup2`'s own values.
+3. `enrich_lookup`'s own provenance writer, `_write_provenance`
+   (`operation.py:495-524`), only ever sets `sheet_entry["enrich_lookup"]`;
+   it merges into, and therefore preserves, whatever `sheet_entry` already
+   held -- including FK's `helper_columns` entry, left byte-identical
+   (confirmed by the repro's diff-free "FK provenance (unchanged?)" line).
+4. Both `drop_helpers` and `apply_derived_column_policy` read FK's
+   still-present, still-shape-valid, still-"truthful-when-written"
+   provenance entry, and delete the current (now Lookup's) `_B_name`
+   column.
+
+Every step is an ordinary, independently documented use of a registered
+primitive: reusing an existing frame name as `enrich_lookup`'s `output` is
+not a misuse. The *accepted research itself* already catalogues this exact
+operation semantic as legitimate, unremarkable behavior (Section C,
+"Lookup named output" row: "Output frame name already exists -> Assign the
+newly enriched frame to that name, replacing the prior mapping. Explicit
+output replacement by operation semantics; not equivalence-based reuse.").
+`source != output` is, if anything, the *typical* `enrich_lookup` shape --
+confirmed by the package's own test fixtures
+(`tests/unit/domain/transformations/test_enrich_lookup.py:49-56`:
+`source="variable_usage_matrix_raw"`, `output="variable_usage_matrix"`).
+Nothing about this repro requires FK and Lookup to race, requires an
+unusual pipeline, or requires hand-constructed `_meta`.
+
+The registry's own stated invariant for this namespace --
+`registries/meta_registry.yaml:942-945`, "each producer updates only its
+own sub-key within the sheet entry and must not overwrite another
+producer's sub-key" -- is fully honored by both producers individually.
+The gap is that this per-sub-key locality has no mechanism for
+invalidating a *sibling's* provenance when the underlying frame object it
+was written against is wholesale replaced. This is a real gap in the
+*existing* contract, not a violation of it, and the design inherits it
+unexamined.
+
+=== Why this survives full implementation of the design, not just today's runtime
+
+Slice 1 (truthful-at-write reporting) makes no difference here: FK's write
+in step 1 above genuinely was a fresh materialization, with no collision at
+FK's own write time -- the report would be `materialized`, not
+`skipped_existing`, under the proposed `materialize_fk_helpers`, and the
+provenance entry the design would write is byte-identical to what current
+runtime already writes. Slices 3/4 (removing the durable-policy fallback)
+make no difference either, because this repro's provenance entry was never
+sourced from durable policy at all -- it is exactly the *transient*,
+same-run, was-truthful-when-written record the design defines as sufficient
+authority. The design's mechanism, fully implemented, would still delete
+Lookup's data in this scenario.
+
+=== Classification
+
+Per this review's required classification (Review Area 1 instructions):
+*real reachable defect*, independently reproduced against the actual
+runtime, not a synthetic or theoretical state. It is not "sufficiently
+guarded by current architecture" -- no guard exists on this path -- and it
+is not a proven invariant; the design's own hedged "open assumption"
+language should be read as correctly cautious, but the design's *operative*
+text in <<design-F>> states the sufficiency claim unconditionally
+("sufficient... because by construction"), which is the text an
+implementer will actually build against.
+
+*Verdict B (Transient-provenance sufficiency): NOT READY / MATERIAL
+CORRECTION REQUIRED.* See <<find-d1>> for the finding and the smallest
+available correction directions (deliberately not a full redesign; this
+review does not select one).
+
+[[review-5]]
+== 5. Collision/self-reuse review
+
+=== Mandatory Policy A (reject on collision)
+
+The mechanical choice -- FK's materialization primitive must never
+overwrite an existing column at the requested label, and Candidate D (FK
+overwrites) is correctly rejected as strictly worse (it would relocate the
+false-claim risk onto Lookup's own provenance while silently destroying
+live data) -- is sound and matches Review 001's own disposition of
+Candidate D. No finding against the mandatory policy choice itself.
+
+=== Terminology: "reject" vs. what the code actually does
+
+The design labels this "Policy A: reject on collision" (<<design-D>>
+heading), but its own concrete disposition table
+(<<design-J>>, first row) is unambiguous: "No-op: no overwrite, no
+provenance claim... Non-raising diagnostic." This is category B in this
+review's own required distinction (decline/skip while continuing), not
+category A (fail/reject the operation).
+
+This is not merely stylistic, because "reject"/"collision" already has an
+*established, different, raising* meaning inside this same subsystem's own
+maintained vocabulary that a reader is likely to carry over:
+
+* Discriminator split's actual reject: `framecheck.py:28` raises
+  `ValueError(f"Generated target frame(s) already exist: ...")` -- a hard,
+  pre-mutation failure, cited by the accepted research itself (Section C)
+  and by Review 001 (Review Area 4) as the canonical example of "reject" in
+  this codebase.
+* `apply_v2_relations`' own policy-configuration collision handling:
+  `docs/semantic_model/12_contract_matrices.adoc:146` and
+  `docs/ai_info/concepts_fk_helpers.adoc:165` both state "cross-producer
+  collisions on the same key fail" for the *durable relation policy write
+  path* -- a different collision than the one this design's Policy A
+  governs, but sharing both the word "collision" and, now, the word
+  "reject," with the opposite (raising) behavior.
+* `enrich_lookup`'s own existing collision guards
+  (`_check_column_conflict`, `_check_key_helper_collision`,
+  `operation.py:236-248,282-341`) *do* raise `ValueError` on their
+  respective collisions.
+
+A reader who knows any one of these three existing "reject = raise"
+precedents, and then reads the design's "Policy A: reject on collision" for
+FK materialization, is likely to assume `add_fk_helpers` now raises on a
+label collision. It does not, and by the design's own choice, will not.
+See <<find-d3>>.
+
+[[design-D]]
+=== Optional self-verified-reuse refinement -- unsafe as specified
+
+The design's own framing of the check is precise and appropriately
+cautious in prose ("compares only FK's own previously-written metadata
+shape, never cell *values*"), and its stated non-goal (it "cannot become
+Candidate C by construction") is correctly reasoned *for the direct
+question it was built to answer* (it cannot adopt a *foreign* producer's
+column, because it never reads a foreign producer's record). But that is
+not the only way this check can be wrong, and the review brief's own
+question is sharper: does "prior FK provenance + same definition shape +
+currently present column" prove "the currently present column is still
+FK's unchanged prior materialization"? It does not, and this review
+constructed the disproof directly from finding <<find-d1>>'s own state:
+
+Continue the <<find-d1>> repro with one more supported step: run
+`add_fk_helpers` a *second* time in the same session, after `enrich_lookup`
+has already silently replaced `orders._B_name` with Lookup's values.
+`core/fk.py`'s materialization primitive sees `_B_name` already present in
+`first_cols` (now Lookup's), reports it as `skipped_existing`. The optional
+self-check (`fk_helpers/enrich.py`, per <<design-D>>) then compares the
+collided definition's shape (`fk_column`, `target`, `target_key`,
+`value_field` for `column=_B_name`) against FK's *own* existing transient
+record for that sheet -- which, per <<find-d1>>, was never invalidated and
+still describes exactly that shape. The shapes match. The refinement
+concludes this is "FK's own unchanged prior materialization" and *refreshes
+(keeps)* the claim -- even though the physical values under that label are
+now Lookup's, not FK's.
+
+This is worse than merely "not helping." Absent the optional refinement,
+`_write_helper_provenance`'s existing (unchanged by this design) per-sheet
+semantics already provide an incidental, structural mitigation for exactly
+this staleness: it *replaces*, not merges, a sheet's `helper_columns` list
+from the current call's provable set every time it runs
+(`fk_helpers/provenance.py:51-68`, `sheet_entry["helper_columns"] =
+entries`, verified by direct reading). Under the design's Section E
+provable-set construction, a *second* `add_fk_helpers` run over an
+unverified collision would, *without* the optional refinement, write *no*
+provenance entry for that definition -- naturally clearing the stale claim
+the moment FK happens to be re-run before cleanup. The optional refinement
+defeats exactly this incidental self-healing, because it re-includes the
+collided-but-shape-matching definition in the provable set instead of
+letting it drop out.
+
+The refinement is explicitly separable and explicitly deferrable in the
+design's own text (<<design-D>>, design Section S item 3), which limits the
+blast radius of this finding to "must not ship as currently specified," not
+"the whole design is unsound." See <<find-d2>>.
+
+*Verdict C (Collision policy): ACCEPT WITH MINOR CORRECTIONS.* The
+mandatory Policy A mechanism is sound and implementation-ready subject to
+the naming correction in <<find-d3>>. The *optional* refinement is *not*
+implementation-ready and must not be built as specified; see
+<<find-d2>>'s smallest correction (remove from the first implementation
+slice; do not schedule it as a mere "slice 2b" follow-up without also
+resolving <<find-d1>>).
+
+== 6. Persistence/reimport review
+
+[[design-I]]
+The design's Section I correctly identifies the *shape* of the narrowing
+("after a reimport with no fresh `add_fk_helpers` materialization pass in
+the same session, `remove_fk_helpers` and `apply_derived_column_policy` can
+no longer automatically delete a physically present FK-shaped helper column
+from durable policy alone") and correctly rules out the two escape hatches
+a naive implementer might reach for (re-running `add_fk_helpers` does not
+help, per the design's own Section I; a value-verification override is
+correctly rejected in design Section L as reopening Candidate C). The *direction*
+of the narrowing is right. The *classification of its impact* is not
+adequately grounded in what this repository already maintains.
+
+=== What the design's own compatibility framing misses
+
+Section P states: "No maintained consumer was inspected as part of this
+design (none was inspected by the underlying research either); if a
+maintained or credible external consumer is later found to depend on
+durable-policy-only FK-helper cleanup, that is new evidence for the
+follow-up in design Section R." This is true only in the narrow sense of "no
+cross-repository consumer was inspected." Within `core` itself, this review
+found three currently green, maintained, and in two cases explicitly
+bug-tagged regression tests whose entire purpose is to pin exactly the
+capability the design proposes to remove:
+
+* `tests/unit/domain/transformations/test_derived_column_policy.py:180-219`,
+  `test_durable_fk_policy_fallback_drops_declared_helpers` (tagged
+  `BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A`): asserts
+  `apply_derived_column_policy(policy="drop")` drops a column named *only*
+  by durable FK relation policy, with a `_manual_note` sibling column
+  surviving as a control.
+* `test_derived_column_policy.py:137-176`,
+  `test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary`
+  (same tag): the same assertion via a slightly different durable-policy
+  shape.
+* `tests/roundtrip/test_cleanup_invariants.py:53-127`,
+  `test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`
+  (same tag): a full CLI-driven, real-XLSX-write-then-reimport roundtrip
+  test. Its forward pipeline's `configure_workbook_view` step
+  (`tests/roundtrip/test_cleanup_invariants.py:96-102`) deliberately does
+  *not* declare `helper_columns` for the `items` sheet, so the *only*
+  surviving identity source after persistence is the durable FK relation
+  policy. The docstring is explicit: "the durable FK helper policy still
+  identifies the generated helper column, so promotion-facing JSON must be
+  canonicalized without it."
+
+The design's own required-tests list (design Section O) asks for a test that
+`apply_derived_column_policy(policy="drop")` does *not* delete a column
+named only by durable FK policy -- the literal opposite assertion. All
+three tests above will need to be inverted or retired as part of Slice 4.
+None of the three is named anywhere in the design.
+
+This is not academic. The historical ticket behind the tag,
+`BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc` (release relevance: "`0.2.0`
+blocker"), records that this exact fallback closed a real,
+consumer-adoption-discovered regression: a canonical reimport pipeline
+declaring `apply_derived_column_policy ... policy: drop` silently no-op'd
+after the persistence boundary stripped transient `_meta.derived`, leaking
+generated helper columns (`_places_name`, `_regions_name`, `_regions_kind`)
+into tracked canonical JSON. The companion ticket
+`BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A.adoc` records the same
+symptom surfacing again through a promotion workflow. The fix explicitly
+added *both* the workbook-view carrier fallback and the FK-relation-policy
+fallback together as "a durable carrier resolved inside the cleanup step"
+(`BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc:302-345`).
+
+Shipping this design as specified, without further mitigation, resurrects
+that exact class of symptom for any reimport pipeline that does not also
+separately declare `helper_columns` via `configure_workbook_view` for every
+FK-helper-bearing sheet -- which is precisely the scenario the roundtrip
+test above was purpose-built to guard, and which the design's own Section I
+confirms has *no* recovery path even if the pipeline author re-runs
+`add_fk_helpers` first.
+
+=== The design's own preserved carrier is the apparent mitigation, but the design never says so
+
+Section H deliberately preserves `_meta.sheets[source].helper_columns`
+(the Workbook-View durable declaration) untouched and out of scope. This
+carrier is, on the evidence in <<review-area-5>> below, the intended and
+already-supported mechanism for a pipeline author to get durable,
+persistence-surviving helper-cleanup identity without relying on the now-
+removed FK-relation-policy fallback. The design never connects this dot:
+it neither recommends declaring `helper_columns` via `configure_workbook_view`
+as the supported migration path, nor updates
+`fk_helper_metadata.adoc`'s "Reimport cleanup" section (already
+generically flagged for a documentation delta in design Section M, but not with
+this specific, actionable content) to say so.
+
+*Verdict D (Persistence/reimport compatibility): NOT READY / MATERIAL
+CORRECTION REQUIRED.* The underlying decision (durable policy alone must
+stop authorizing deletion) is correct and should not be reversed to
+preserve these tests' current behavior -- that would reopen the confirmed
+data-loss defect. The design is not ready because it has not named, or
+proposed a disposition for, the three tests above, and has not connected
+its own preserved carrier to the migration story the historical tickets'
+own evidence shows is needed. See <<find-d4>>.
+
+== 7. Other durable helper-authority review
+
+[[review-area-5]]
+Section H's stated reasoning for leaving `_meta.sheets[source].helper_columns`
+untouched is "a different, non-FK-owned durable declaration" and therefore
+out of scope. Per this review's brief, "different owner" is not, by itself,
+sufficient reasoning, so this review inspected the actual contract for this
+declaration rather than accepting the label.
+
+=== Is it a deletion authorization, or just another declared identity?
+
+Mechanically, it is both, and unconditionally so: `_safe_durable_helper_names`
+(`derived_column_policy.py:244-268`) reads
+`_meta.sheets[source].helper_columns` and feeds it directly into
+`durable_helper_names`, which `apply_derived_column_policy` unions into the
+drop set with *no* physical-producer check whatsoever
+(`derived_column_policy.py:76-91,132,145`). This is confirmed by an
+existing, currently green test,
+`test_drop_uses_durable_workbook_helper_columns_when_derived_is_absent`
+(`test_derived_column_policy.py:81-100`): a column is dropped purely
+because its label appears in this durable list, regardless of what
+currently produced its content. Structurally, this is the *same* pattern --
+"requested/declared identity, unverified against current physical
+production" -- that this design otherwise eliminates for FK's durable
+relation policy.
+
+=== Is "different owner" the right justification anyway?
+
+Partially, and the design should say what it actually is rather than
+leaving "different owner" to carry the weight alone. Three genuine,
+citable distinctions exist:
+
+* *Producer.* FK's durable relation policy is auto-generated machine
+  intent ("what FK would build"), written by a configuration step from a
+  target-relation description. `_meta.sheets[source].helper_columns` is
+  written only by `configure_workbook_view`
+  (`domain/workbook_views.py:55-165,349-379`), a step whose entire
+  parameter surface is a human pipeline author's explicit sheet-shape
+  declaration -- closer in kind to XRef's guarded, caller-asserted
+  `drop_source` flag (already accepted by the underlying research as a
+  legitimate, different pattern) than to FK's auto-derived "what I want to
+  build" intent.
+* *Canonical contract on the label's content.* `fk_helper_metadata.adoc`'s
+  "First conservative policy" section (lines 176-190) states, as
+  maintained authority, not merely as narrative: "manual edits to helper
+  *values* are not treated as source truth; helper values may be ignored or
+  overwritten on re-enrichment." A column *declared* a helper by workbook-
+  view configuration is canonically defined as never-authoritative content,
+  independent of who currently produced it.
+* *Origin of this exact carrier's purpose.* `BUG-HELPER-CLEANUP-CONTRACT-P4A`
+  built this carrier, together with the (now-removed) FK-relation fallback,
+  *specifically* to serve as durable cleanup identity across the
+  persistence boundary. It is not an accidental byproduct being repurposed;
+  it is the carrier this repository already chose for this exact job.
+
+This is a real, defensible distinction -- but it does not make the residual
+risk zero. Nothing prevents a caller from repurposing a historically-FK-
+derived column label for genuine hand-entered data without also updating
+the (separately maintained, easy to forget) `configure_workbook_view`
+declaration; nothing enforces that the label is non-editable in the
+rendered workbook. The distinction is about *why the risk is smaller and
+differently justified*, not about the risk being absent.
+
+=== Disposition
+
+The design correctly leaves this carrier untouched -- the accepted
+research's own narrowed-scope authorization treats Workbook View as a
+constraint/boundary, not a mandatory Design-Phase site, and this review
+found no evidence forcing that boundary open. But Section H's one-clause
+"different owner" dismissal should be replaced with the actual distinction
+(explicit caller declaration plus the canonical "helper values are not
+source truth" contract), and the residual staleness risk should be named
+explicitly as a recorded, deferred, out-of-authorization item rather than
+implied away. See <<find-d5>>.
+
+== 8. Core/Domain boundary review
+
+Section E proposes two new Core-layer symbols --
+`FkHelperMaterializationResult` and `materialize_fk_helpers` -- and flags in
+its own Open Questions (design Section S, item 1) whether adding them to
+`core/__init__.py`'s `__all__` requires explicit developer sign-off under
+`interfaces_and_gates.adoc`'s "Any reshape of consumer-visible function
+signatures" gate.
+
+This review checked whether the public-surface question is even necessary
+to resolve. `apply_fk_helpers`'s existing public signature and return type
+are untouched either way (the design's own compatibility wrapper
+guarantees this), so the interfaces-and-gates concern only bites if the
+*new* symbol is itself added to the public barrel. Two facts argue this is
+avoidable:
+
+* `fk_helpers/enrich.py` already imports directly from the `core.fk`
+  *submodule*, bypassing `core`'s `__all__`-gated barrel entirely
+  (`from ....core.fk import apply_fk_helpers, build_id_value_maps`,
+  `fk_helpers/enrich.py:16`). `interfaces_and_gates.adoc` itself
+  distinguishes "Python import surface... keep intentionally small... do
+  not treat every internal module or barrel export as public API" from
+  the CLI/YAML/plugin surfaces it actually gates
+  (`docs/ai_info/interfaces_and_gates.adoc:37-41`).
+* The architecture guard that must be updated regardless
+  (`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py:44-53`,
+  `_ALLOWED_CORE_FK_NAMES`) operates on names imported from the `core.fk`
+  submodule via AST inspection, not on `core/__init__.py`'s `__all__`. Adding
+  the new symbol there satisfies the guard regardless of public-barrel
+  status.
+
+Nothing about `fk_helpers/enrich.py`'s actual, sole consumer need for this
+reporting primitive requires it to be public. A private (or leading-
+underscore) symbol in `core/fk.py`, allow-listed in the existing
+architecture guard and never added to `core/__init__.py`'s `__all__`,
+satisfies design Section E's stated need exactly, and makes Open Question
+design Section S item 1 moot rather than something requiring a maintainer
+decision before Slice 1.
+
+*Verdict for this section:* private/internal reporting primitive is
+sufficient; the proposed public split is not unjustified in principle
+(Core remaining the sole collision-decision site, Domain owning the
+claim-worthiness meaning, is the right boundary), but making the new
+symbol *public* is more surface than the evidenced need requires. See
+<<find-d8>> (minor simplification, not a correctness finding).
+
+== 9. Derived-column-policy review
+
+=== Second-executor consistency
+
+Both executors now implement the same deletion-authority *rule* --
+truthful transient provenance required, durable policy never sufficient --
+confirmed by the code trace in <<design-repro-closure-check>> above (repro
+3 closure). This review specifically searched for shape-validation,
+fallback, sheet/frame-identity, and Workbook-View-phase divergences per the
+review brief, and found exactly one, already partially acknowledged by the
+design itself (Section H: "with its own (stricter) shape validation"):
+
+* `fk_helpers/policy.py::derived_helper_columns_by_sheet`
+  (lines 159-179), used by `drop_helpers`, silently filters out
+  non-mapping entries in `helper_columns` (`[dict(entry) for entry in
+  entries if isinstance(entry, dict)]`) -- fail-open toward inaction on
+  malformed metadata.
+* `derived_column_policy.py::_validated_fk_helper_names`
+  (lines 179-196), used by `apply_derived_column_policy`, raises a clear
+  `ValueError` on the identical malformed shape -- fail-closed.
+
+This is a genuine operational divergence, but it is *not* a
+deletion-authority divergence: both directions are conservative toward
+"don't wrongly delete on bad data" (one silently proceeds without that
+candidate, one aborts the whole call). Per this repository's own stated
+domain-boundary-robustness policy ("do not demand shared helpers without
+shared semantics... require extraction only when two consumers prove the
+same accepted/rejected vocabulary... and diagnostics"), this divergence
+does not, by itself, justify a shared facade -- but Section H's one-clause
+dismissal should be upgraded to an explicit statement that the divergence
+is deliberate and non-safety-relevant, closing the loop the review brief
+asks for. See <<find-d6>> (minor).
+
+No Workbook-View-phase divergence was found: neither executor depends on
+whether it runs before or after `apply_workbook_view_sheet_mappings`: both
+operate generically on whatever `frames` mapping and `source`/sheet key
+they are given, matching the accepted research's classification of
+Workbook View as an orthogonal boundary constraint. No finding.
+
+*Verdict E (Second executor consistency): ACCEPT WITH MINOR CORRECTIONS.*
+
+=== Diagnostic feasibility (durable-policy-only diagnostics without reintroducing authority)
+
+The requested diagnostics ("durable policy only, no truthful transient
+provenance") can be produced purely by reading `relations` for comparison
+after the (unchanged, already-necessary) `resolve_v2_fk_relations(frames)`
+call each executor already performs for its own precondition checks
+(`fk_helpers/drop.py:38`, `derived_column_policy.py`'s `_safe_policy_helper_names`
+site before its removal) -- no new state, no new resolution pass, no
+duplicated candidate-resolution logic. This is cheap relative to its
+operator value and does not need simplification. The design's own
+"recommended, not mandatory" architecture guard (design Section O, last row,
+asserting neither executor calls `resolve_v2_fk_relations` for
+deletion-candidate computation) is the correct control to prevent a
+diagnostic-only read from silently regressing into a deletion-authority
+read over time; this review recommends it be made *mandatory*, given how
+directly it guards the central claim in <<design-F>>. No blocking finding;
+folded into <<find-d1>>'s smallest-correction guidance.
+
+=== `fail_on_mismatch` coupling (<<design-J>>, flagged for sign-off in design Section S)
+
+[[design-J]]
+Authorization refusal ("we cannot prove FK currently produced this column")
+and value mismatch ("FK's value differs from what the canonical lookup
+would produce") are different failure classes; the design's own instruction
+not to conflate them in the *findings* frame is correct, but its proposal
+to route `fk_deletion_unauthorized` through the *same* `fail_on_mismatch`
+raise path
+(`derived_column_policy.py`'s `if policy == "fail_on_mismatch" and
+failures: raise ...`) re-conflates them at the control-flow level, one step
+later than the findings frame.
+
+This repository already has a purpose-built, separately composable
+mechanism for exactly the need a "strict" caller would actually want here
+-- "fail loudly if a helper column that should have been cleaned up is
+still present." `BUG-HELPER-CLEANUP-CONTRACT-P4A` added the
+`validate_references` rule type `no_helper_columns` explicitly so that
+cleanup strictness would be *opt-in and separately composable*, not baked
+into the cleanup step's own severity ladder
+(`BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc:302-359`, "Architectural direction");
+`tests/roundtrip/test_cleanup_invariants.py:130-174`,
+`test_no_helper_columns_validation_reports_bypassed_cleanup`, exercises it
+today. Wiring `fk_deletion_unauthorized` into `fail_on_mismatch`'s raise
+path duplicates this already-established, cleaner mechanism and gives a
+registered pipeline step (`apply_derived_column_policy`) a genuinely new
+class of failure trigger it did not previously have, for a reason unrelated
+to value mismatch.
+
+*Recommendation (resolving design Section S item 2, not merely repeating it):*
+`fk_deletion_unauthorized` should always be a conservative, non-raising
+diagnostic -- emit it under both `warn_on_mismatch` and `fail_on_mismatch`,
+but never route it into the `raise` path. Point callers who want fail-fast
+"deletion definitely happened" enforcement at the existing
+`no_helper_columns` validation rule instead of growing `fail_on_mismatch`'s
+own failure surface. See <<find-d7>>.
+
+== 10. YAGNI/scope review
+
+A full-text check of the design for claimant/reliance, claim
+registration/release, reference counting, a claim ledger, a shared/central
+registry, stable/global artifact identity, and value/formula equivalence
+machinery found none reintroduced; every place the design touches these
+concepts is to explicitly name and reject them (design Section L, design Section Q),
+consistent with the accepted research's narrowed authorization. No finding.
+
+The one candidate this review identifies for "smaller speculative mechanism
+introduced without current evidence" is the optional self-verified-reuse
+refinement already covered in <<find-d2>>: it is not merely unevidenced
+(the design itself already says this, offering deferral), it is actively
+unsafe once combined with <<find-d1>>. This review's YAGNI recommendation
+is accordingly stronger than the design's own "may be deferred" framing:
+*remove it from the first implementation slice*, not merely make it
+optional, until <<find-d1>> has a resolution it can be safely re-evaluated
+against.
+
+Lookup Enrichment's publication/promotion posture is confirmed untouched:
+the design explicitly declines to take a position (design Section R, final
+bullet) and never proposes promoting, merging, or deprecating Lookup as a
+product concept anywhere in the document. No finding.
+
+*Verdict F (YAGNI/scope): ACCEPT WITH MINOR CORRECTIONS* (the correction
+being the escalation from "optional/deferrable" to "remove" for the
+self-reuse refinement, per <<find-d2>>).
+
+[[findings]]
+== 11. Findings
+
+Findings are ordered most-severe first. "Blocks implementation" answers
+whether Slice 1-4 as currently scoped should proceed before the finding is
+addressed.
+
+[[find-d1]]
+=== FIND-D1 -- BLOCKER -- Truthful same-run transient provenance is not sufficient deletion authority; the design's central claim is falsified by an ordinary, supported mutation sequence
+
+Design claim:: <<design-F>>, "Same-run transient provenance: sufficient,
+once truthful... The one invalidating path this design identifies... is not
+evidenced as reachable by any accepted reproduction or maintained
+consumer." Section F's operative header states the rule unconditionally:
+"a cleanup executor may delete a column identified through an FK-attributed
+candidate name if and only if that name is currently present in
+`_meta.derived.sheets.<sheet>.helper_columns`."
+
+Repository evidence:: Independently reproduced against HEAD `752e401`,
+detailed in <<review-4>> above. `core/fk.py:309` (collision check scoped to
+the calling primitive's own `first_cols` snapshot, not any cross-call
+identity); `enrich_lookup/operation.py:236-248` (`_check_column_conflict`
+checks only `source_df`, never the pre-existing frame at `output`);
+`enrich_lookup/operation.py:210-211` (`out[output] = enriched`, full-frame
+replacement); `enrich_lookup/operation.py:495-524` (`_write_provenance`
+merges into, and thereby preserves, a sibling family's pre-existing
+`helper_columns` entry); `fk_helpers/provenance.py:22-104`
+(`_write_helper_provenance`, unchanged by this design, has no mechanism to
+detect that the frame object it is describing has since been replaced by a
+different producer's write); `registries/meta_registry.yaml:942-945`
+("each producer updates only its own sub-key," confirming this is a gap in
+the existing contract, not a violation of it).
+
+Consequence:: A pipeline that (a) FK-enriches a frame, then (b) runs an
+ordinary `enrich_lookup` call from a *different* source frame into the
+*same* output sheet name (a documented, unremarkable operation semantic,
+confirmed as the typical `enrich_lookup` usage shape), then (c) runs either
+cleanup executor, loses Lookup's freshly-materialized data to a stale-but-
+was-truthful-when-written FK provenance record -- with the design fully
+implemented exactly as specified. This is the same class of data loss the
+design exists to close, reachable through a path the design does not
+close.
+
+Smallest correction:: Do not invent a claim ledger or global identity.
+Extend the existing owner-local, per-sub-key write mechanics
+(`_write_helper_provenance`'s existing "remove stale provenance for sheets
+without current FK defs" behavior, `fk_helpers/provenance.py:69-95`, already
+proves this kind of write-time invalidation is an established, cheap
+pattern in this codebase) with a symmetric trigger: a transformation that
+*replaces* (not incrementally extends) the DataFrame object bound to an
+existing sheet name, and is not itself the owner of a pre-existing sibling
+`helper_columns`/`enrich_lookup` sub-key for that sheet, must invalidate
+that sibling sub-key as part of the same write, unless it can affirmatively
+show the replacement still carries the sibling's claimed column unchanged.
+This keeps the mechanism owner-local and on-demand (Architecture Family A,
+the accepted research's own closest-fit ranking), requires no new `_meta`
+root or claim vocabulary, and is scoped to the write path(s) already being
+touched by this design's own Slice 2. This review does not select the
+exact implementation between locating the trigger in `enrich_lookup`'s
+writer versus a shared FK-owned invalidation check; that choice belongs to
+the design, not this review.
+
+Blocks implementation:: Yes, for <<design-F>>'s sufficiency claim as
+currently stated. Slices 1, 3, and 4 as specified are otherwise sound and
+may proceed once <<design-F>> is corrected with an explicit invalidation
+precondition (or an equally evidenced argument for why this repro's
+specific pattern is out of scope, which this review does not find
+supportable given the accepted research explicitly authorizes FK/Lookup
+interaction as the mandatory Design-Phase pairing).
+
+[[find-d2]]
+=== FIND-D2 -- BLOCKER -- The optional self-verified-reuse refinement can re-affirm a stale, foreign claim from metadata shape alone, and defeats the one incidental self-healing property the design otherwise has
+
+Design claim:: <<design-D>>, "a definition that collided this call may be
+recognized as FK's own idempotent prior output... solely by comparing the
+collided definition's shape... against FK's own already-present transient
+provenance entry for that sheet. If every field matches... its provenance
+entry is refreshed (kept), not dropped." And: "This refinement... cannot
+become Candidate C by construction."
+
+Repository evidence:: Direct continuation of the <<find-d1>> repro (see
+<<review-5>> above): re-running `add_fk_helpers` after `enrich_lookup` has
+replaced `orders._B_name` produces a `skipped_existing` report whose shape
+(`fk_column`, `target`, `target_key`, `value_field`, `column`) matches FK's
+own untouched-since-<<find-d1>> transient record exactly, because
+<<find-d1>> already established that record is never invalidated by
+Lookup's write. `fk_helpers/provenance.py:51-68` (`_write_helper_provenance`
+replaces, not merges, a sheet's `helper_columns` list from the current
+call's provable set every call) is the mechanism this finding shows the
+refinement defeats.
+
+Consequence:: The refinement's own stated safety argument ("cannot become
+Candidate C") is correct but answers a narrower question than the one that
+matters: it does not need to read a *foreign* producer's record to produce
+an unsafe outcome, because it never verifies that FK's *own* prior record
+is still describing the physical column currently at that label. Once
+<<find-d1>>'s staleness exists, the refinement actively perpetuates it
+across FK re-runs that would otherwise have let it lapse.
+
+Smallest correction:: Remove the refinement from the first implementation
+slice entirely (the design already frames it as separable and deferrable;
+this finding escalates that to "must not ship as specified"). It may be
+reconsidered once <<find-d1>> has a resolution establishing that FK's own
+prior transient record can be trusted to still describe the physical
+column -- at which point the refinement's shape-comparison approach may
+become sound, since it would then be comparing against a record no longer
+subject to <<find-d1>>'s staleness.
+
+Blocks implementation:: Yes, for the refinement specifically. Does not
+block the mandatory Policy A mechanism (<<find-d3>> aside), which does not
+depend on this refinement.
+
+[[find-d4]]
+=== FIND-D4 -- MAJOR -- Persistence/reimport capability narrowing is under-classified: three maintained, currently green regression tests -- one CLI-driven and explicitly tagged to a historical release-blocking bug -- pin exactly the capability being removed, and none is named or dispositioned
+
+Design claim:: <<design-I>>/design Section P, "No maintained consumer was
+inspected as part of this design (none was inspected by the underlying
+research either)... Deliberate breaking change, justified by closing a
+confirmed data-loss defect... Needs a release note."
+
+Repository evidence:: `tests/unit/domain/transformations/test_derived_column_policy.py:137-176,180-219`
+(`test_policy_fallback_drops_declared_fk_helpers_after_persistence_boundary`,
+`test_durable_fk_policy_fallback_drops_declared_helpers`, both tagged
+`BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A`);
+`tests/roundtrip/test_cleanup_invariants.py:53-127`
+(`test_helper_cleanup_uses_fk_policy_when_view_helper_metadata_is_absent`,
+same tag, full CLI roundtrip, forward pipeline deliberately omits the
+Workbook-View `helper_columns` declaration to isolate the FK-relation-policy
+fallback as the sole surviving identity source); all three currently pass
+(confirmed by this review's own focused re-run, <<review-2>>, 216 passed).
+`docs/cold_storage/backlog/ftrs_done/BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc:1-18`
+(release relevance "`0.2.0` blocker"; the original consumer-adoption-
+discovered symptom this fallback was built to close) and
+`BUG-REIMPORT-PROMOTION-HELPER-COLUMN-LEAKAGE-P4A.adoc:1-32` (the companion
+ticket the currently-passing roundtrip test is named after).
+
+Consequence:: Implementing Slice 3/4 as specified inverts or retires all
+three tests, and, absent an accompanying migration story, resurrects the
+exact class of symptom (generated helper columns leaking into canonical
+reimport output) those two historical tickets were opened, and previously
+fixed, to close -- for any reimport pipeline that materializes FK helpers
+without separately declaring them via `configure_workbook_view`. The
+design's own Section I confirms there is no recovery path even if the
+pipeline author re-runs `add_fk_helpers` first.
+
+Smallest correction:: Do not invent durable producer history to preserve
+the removed fallback -- that would reopen the confirmed defect this design
+exists to close. Instead: (1) name and disposition all three tests
+explicitly in the implementation plan (convert them to prove the *new*
+contract -- durable FK policy alone is insufficient, and, where a
+`configure_workbook_view` `helper_columns` declaration is present,
+cleanup still succeeds via that carrier); (2) make the already-preserved
+Workbook-View `helper_columns` carrier (<<find-d5>>) the explicitly
+documented, recommended migration path in `fk_helper_metadata.adoc`'s
+"Reimport cleanup" section (already generically flagged for a delta in
+design Section M, but needs this specific content, not just "identify the
+deltas"); (3) record, as a named design Section R candidate (not mandated
+here), whether `configure_fk_helpers`/`infer_fk_relations` should also
+populate the Workbook-View durable carrier so pipeline authors are not
+forced into fragile dual configuration to retain today's reimport-cleanup
+guarantee.
+
+Blocks implementation:: Yes, for Slice 4 (and the reimport-affecting parts
+of Slice 3) until the three tests have an explicit, reviewed disposition
+and the migration path is documented. Does not block Slices 1-2.
+
+[[find-d5]]
+=== FIND-D5 -- IMPORTANT -- "Different owner" is not, by itself, sufficient justification for leaving `_meta.sheets[source].helper_columns` untouched; the actual authority distinction should be named, and the residual risk recorded
+
+Design claim:: design Section H/design Section Q, "`_safe_durable_helper_names`
+(`_meta.sheets[source].helper_columns`, Workbook-View-owned durable sheet
+helper declaration) is a *different, non-FK-owned* durable declaration and
+is out of scope for this design."
+
+Repository evidence:: `derived_column_policy.py:76-91,132,145,244-268`
+(unconditional name-based deletion with no physical-producer check, same
+structural pattern as the FK durable-policy fallback this design removes);
+`test_derived_column_policy.py:81-100`
+(`test_drop_uses_durable_workbook_helper_columns_when_derived_is_absent`,
+confirms this today); `domain/workbook_views.py:55-165` (`configure_workbook_view`
+is the sole, human-authored producer of this carrier);
+`fk_helper_metadata.adoc:176-190` ("First conservative policy": "manual
+edits to helper values are not treated as source truth");
+`BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc:225-249` (this carrier's designed
+purpose is durable cleanup identity across the persistence boundary).
+
+Consequence:: A reader could reasonably conclude "different owner" means
+"therefore safe," when the actual reason this is a smaller and differently
+justified risk (explicit caller declaration, a canonical "not source truth"
+contract, and a carrier purpose-built for this exact job) is nowhere stated.
+The residual risk (a caller repurposing a declared-helper label for real
+data without updating the declaration) is real, structurally identical in
+shape to the defect this design fixes for FK, and currently unrecorded
+anywhere in the design.
+
+Smallest correction:: Rewrite design Section H's out-of-scope paragraph (and
+the corresponding bullet in design Section Q) to name the actual distinguishing
+authority instead of "different owner," and add the residual staleness
+risk as a named, explicitly out-of-authorization item in design Section R. This
+is a documentation-only correction; it does not require touching
+`derived_column_policy.py` or `workbook_views.py`, and does not reopen the
+research's narrowed-scope authorization (Workbook View remains a
+constraint boundary, not a mandatory site).
+
+Blocks implementation:: No. Recommended before Slice 5 (documentation) or
+alongside it.
+
+[[find-d3]]
+=== FIND-D3 -- IMPORTANT -- "Reject on collision" mislabels a silent, non-raising skip, conflicting with this codebase's own established alternate meaning of "reject"
+
+Design claim:: <<design-D>>, "Policy A: reject on collision, no provenance
+claim." Concrete behavior per <<design-J>>: "No-op: no overwrite, no
+provenance claim... Non-raising diagnostic."
+
+Repository evidence:: `domain/transformations/discriminator_split/framecheck.py:28`
+(actual reject: raises `ValueError`); `docs/semantic_model/12_contract_matrices.adoc:146`
+and `docs/ai_info/concepts_fk_helpers.adoc:165` ("cross-producer collisions
+on the same key fail" for `apply_v2_relations`); `enrich_lookup/operation.py:236-248,282-341`
+(`_check_column_conflict`, `_check_key_helper_collision`, both raise).
+
+Consequence:: A reader or implementer familiar with any of these three
+existing "collision -> raise" precedents in the same subsystem is likely to
+assume `add_fk_helpers` now fails fast on a label collision. It does not,
+and the design's own chosen behavior (continue successfully, no claim, log
+only) is deliberately the opposite. This is a comprehension/observable-
+contract-communication risk, not a runtime defect.
+
+Smallest correction:: Rename throughout <<design-D>>, the Section C repro
+table, and the eventual Semantic/Technical/Developer deltas in
+design Section M -- "decline materialization on collision" (or equivalent),
+reserving "reject" for operations that actually raise, matching this
+repository's own existing usage.
+
+Blocks implementation:: No. Should land with the canonical-documentation
+slice (design Section M/Slice 5) before it, not after.
+
+[[find-d7]]
+=== FIND-D7 -- IMPORTANT -- Routing deletion-authorization refusal through `fail_on_mismatch`'s raise path duplicates an existing, purpose-built mechanism and conflates two different failure classes
+
+Design claim:: <<design-J>>, `fail_on_mismatch` "Raises `ValueError` via the
+existing `if policy == "fail_on_mismatch" and failures: raise ...` path,"
+flagged in design Section S for maintainer sign-off.
+
+Repository evidence:: `BUG-HELPER-CLEANUP-CONTRACT-P4A.adoc:302-359`
+("Architectural direction" -- cleanup step stays a safe no-op; strictness
+is opt-in via a separate `validate_references` rule, deliberately not
+folded into the cleanup step); `tests/roundtrip/test_cleanup_invariants.py:130-174`
+(`test_no_helper_columns_validation_reports_bypassed_cleanup`, the
+`no_helper_columns` rule exercised today for exactly this purpose).
+
+Consequence:: `apply_derived_column_policy` gains a genuinely new class of
+failure trigger (authorization refusal, unrelated to value mismatch) for a
+registered pipeline step, duplicating a mechanism this repository already
+built and documented specifically to keep this kind of strictness
+separately composable and opt-in.
+
+Smallest correction:: `fk_deletion_unauthorized` should always be a
+conservative, non-raising diagnostic under every policy mode (including
+`fail_on_mismatch`); point callers wanting fail-fast enforcement at the
+existing `no_helper_columns` validation rule instead. This resolves
+design Section S's open sign-off question with a concrete recommendation rather
+than leaving it open.
+
+Blocks implementation:: Gated by the design's own required maintainer
+sign-off (design Section S) regardless of this review; this review's
+recommendation, if adopted, resolves that gate without further discussion.
+
+[[find-d6]]
+=== FIND-D6 -- MINOR -- Shape-validation asymmetry between the two transient-provenance readers is real but not safety-relevant; the design's dismissal should be made explicit rather than a passing aside
+
+Design claim:: design Section H, "`_resolve_derived_identity`'s reading of
+`_meta.derived.sheets[source].helper_columns`... is already correct -- it
+reads the same truthful subkey `fk_helpers/drop.py` reads, with its own
+(stricter) shape validation that raises clear `ValueError`s on malformed
+entries."
+
+Repository evidence:: `fk_helpers/policy.py:159-179`
+(`derived_helper_columns_by_sheet`, silently filters malformed entries);
+`derived_column_policy.py:179-196` (`_validated_fk_helper_names`, raises on
+the same malformed shape).
+
+Consequence:: Given identical malformed metadata, one executor silently
+proceeds while the other hard-fails -- an operational (not
+deletion-authority) inconsistency. Not itself unsafe, but not analyzed as a
+deliberate choice in the design text either.
+
+Smallest correction:: Expand the one-clause aside into an explicit
+statement that the divergence is deliberate, does not affect
+deletion-authority safety (both directions are conservative against
+wrongful deletion), and is not a consolidation target -- closing the loop
+Review Area 9 asks for.
+
+Blocks implementation:: No.
+
+[[find-d8]]
+=== FIND-D8 -- MINOR -- The proposed new Core-layer public symbols are more surface than the evidenced need requires
+
+Design claim:: design Section E, `FkHelperMaterializationResult` and
+`materialize_fk_helpers` proposed with a conditional path to
+`core/__init__.py`'s `__all__`, flagged in design Section S item 1.
+
+Repository evidence:: `fk_helpers/enrich.py:16` (Domain already imports
+directly from the `core.fk` submodule, bypassing the public barrel);
+`tests/architecture/dependency_guards/test_fk_helper_primitives_consume_policy.py:44-53`
+(`_ALLOWED_CORE_FK_NAMES` operates at the submodule-import level, not the
+`__all__` level); `docs/ai_info/interfaces_and_gates.adoc:37-41`.
+
+Consequence:: None safety-relevant; this is a process/simplicity finding.
+Making the new symbol public invites an `interfaces_and_gates` sign-off
+step that a private symbol would not require, for no evidenced external
+caller need.
+
+Smallest correction:: Implement the reporting primitive as a private (or
+leading-underscore) symbol in `core/fk.py`, allow-listed in the existing
+architecture guard, and do not add it to `core/__init__.py`'s `__all__`
+unless a real external need for `materialize_fk_helpers` as a first-class
+Core primitive later emerges.
+
+Blocks implementation:: No.
+
+[[required-corrections]]
+== 12. Required corrections
+
+Before Slice 1 begins:
+
+* Correct <<design-F>>'s sufficiency claim to state the invalidation
+  precondition from <<find-d1>> explicitly (either as a required
+  same-run-replacement invalidation trigger, or an equally rigorous,
+  evidenced argument this review's specific reproduction is out of the
+  authorized scope -- this review does not find that argument available
+  given the accepted research's own mandatory FK/Lookup pairing).
+* Remove the optional self-verified-reuse refinement from the first
+  implementation slice (<<find-d2>>); do not schedule it as a deferred
+  "slice 2b" without first resolving <<find-d1>>.
+
+Before Slice 4 lands:
+
+* Name and disposition the three tests in <<find-d4>>; document the
+  Workbook-View `helper_columns` migration path in
+  `fk_helper_metadata.adoc`'s reimport-cleanup section.
+* Resolve the `fail_on_mismatch` sign-off question per <<find-d7>>'s
+  recommendation (or an explicit, reasoned alternative).
+
+Before Slice 5 (documentation) / alongside canonical-doc updates:
+
+* Rename "reject on collision" per <<find-d3>>.
+* Rewrite design Section H's Workbook-View out-of-scope justification and
+  record the residual risk per <<find-d5>>.
+* Make Section H's shape-validation-divergence aside explicit per
+  <<find-d6>>.
+
+Non-blocking, implementer's discretion:
+
+* Implement the new Core reporting primitive as a private symbol per
+  <<find-d8>>.
+* Promote the "recommended, not mandatory" architecture guard in
+  design Section O (no durable-policy call for deletion candidates) to
+  mandatory, given how directly it now also guards <<find-d1>>'s
+  corrected precondition.
+
+[[required-verdicts]]
+== 13. Implementation-gate verdict
+
+[cols="2,3", options="header"]
+|===
+| Verdict | Disposition
+
+| A. Confirmed defect closure
+| *ACCEPT* (for the three originally accepted reproductions; scope-limited,
+  see <<find-d1>>).
+
+| B. Transient-provenance sufficiency
+| *NOT READY / MATERIAL CORRECTION REQUIRED* (<<find-d1>>).
+
+| C. Collision policy
+| *ACCEPT WITH MINOR CORRECTIONS* (mandatory Policy A sound subject to
+  <<find-d3>>; optional refinement not ready, <<find-d2>>).
+
+| D. Persistence/reimport compatibility
+| *NOT READY / MATERIAL CORRECTION REQUIRED* (<<find-d4>>).
+
+| E. Second executor consistency
+| *ACCEPT WITH MINOR CORRECTIONS* (<<find-d6>>).
+
+| F. YAGNI/scope
+| *ACCEPT WITH MINOR CORRECTIONS* (<<find-d2>>, <<find-d5>>).
+
+| G. Implementation readiness (overall)
+| *NOT READY / MATERIAL CORRECTION REQUIRED.*
+|===
+
+Per this review's own instruction, the design's own claim of readiness
+(Section T: "READY for implementation planning") cannot stand while its
+own central deletion-authority evidence (<<design-F>>) is not proven
+sufficient. Findings <<find-d1>> and <<find-d2>> are both independently
+reproduced against the actual runtime, not inferred from prose, and both
+are resolvable within the design's own owner-local architecture family
+without reopening claim/reliance vocabulary, a claim ledger, or global
+artifact identity. Finding <<find-d4>> is resolvable by naming and
+dispositioning three already-identified, already-passing tests and
+documenting a migration path the design already, silently, relies on
+(<<find-d5>>'s carrier). None of the findings in this review requires
+widening the narrowed-scope authorization from the accepted research;
+several (<<find-d2>>, <<find-d3>>, <<find-d7>>, <<find-d8>>) narrow the
+design further, consistent with that authorization's own bias.
+
+*Design Phase status:* remains authorized under the accepted research's
+narrowed scope. This review's findings are corrections *within* that scope,
+not a request to reopen it.
+
+*Lifecycle cleanup check:* not applicable. This is a design review, not an
+FTR/BUG workstream closure; no backlog status change, `_ftrs_open.adoc`
+removal, or cold-storage move is implicated by this review.
+
+*Release-notes checkpoint:* not applicable to this artifact (no runtime,
+test, or release-relevant change is made by this review). The design's own
+design Section M/design Section P already correctly flag a release-notes obligation
+for the eventual implementation; <<find-d4>> sharpens what that note must
+disclose (a previously-fixed leakage symptom's recovery path is narrowing,
+not merely "a durable-policy fallback is removed").
