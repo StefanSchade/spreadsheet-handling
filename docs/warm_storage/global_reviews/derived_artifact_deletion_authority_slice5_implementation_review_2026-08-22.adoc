@@ -1,0 +1,613 @@
+= FK Helper Deletion Authority -- Slice 5 Implementation Review
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded, independent code review of Slice 5 only (removal of durable
+v2 FK relation policy as physical deletion authority from
+``derived_column_policy.py``, plus that module's generalized decoupled-rebind
+publication-lifecycle invalidation). Read-only. This artifact authorizes no
+further implementation, redesign, or Slice 6 documentation work.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core`.
+
+Baseline commit (Slice 4, pre-Slice-5):: `a4a160a398b74b1f78b9d4da08cd83531eee60c0`
+(`docs(domain): review deletion authority slice 4`; production code
+identical to `6d4caeadeff550f2284bef3518cc0d7d532cefbd`, Slice 4).
+
+Reviewed commit (Slice 5):: `2afb9f46be0e6fb3fb34d3262b7df70e66452117`
+(`fix(domain): enforce DCP deletion authority`).
+
+Accepted design:: `docs/warm_storage/global_reviews/
+derived_artifact_deletion_authority_design_2026-08-21.adoc`, Sections F, H,
+I, J, N (Slice 5 row), O.
+
+Gate authority:: `derived_artifact_deletion_authority_design_2026-08-21_review_001.adoc`
+S16.3 -- FIND-D1 through FIND-D13 *CLOSED*, implementation gate *OPEN*.
+
+Slice-4 independent review:: `derived_artifact_deletion_authority_slice4_implementation_review_2026-08-22.adoc`
+-- *ACCEPT*; `derived_column_policy.py`'s own durable-fallback removal and
+generalized decoupled-rebind invalidation were explicitly left as Slice 5's
+separately tracked scope.
+
+Review date:: 2026-08-22.
+
+== 1. Review goal and method
+
+Determine whether `2afb9f4` faithfully implements both accepted Slice-5
+obligations: (A) `apply_derived_column_policy` no longer treats durable v2 FK
+relation policy as physical deletion authority, and (B) it correctly
+maintains producer-provenance truth across its complete physical `DataFrame`
+publication inventory (payload, and findings under `warn_on_mismatch`), per
+the accepted design's Sections F/H/I/J/N/O and the twenty-area brief for this
+review.
+
+Method: read the diff against the design's Section H/I/J text; trace
+`apply_derived_column_policy`'s full call graph (not only the edited lines)
+for any remaining durable-policy-to-drop-set path and for every `out[...] =
+<DataFrame>` publication; re-run the changed and adjacent test suites and the
+full repository suite; construct direct repros against the current code for
+untested interaction shapes (Areas 4/5); use an isolated git worktree against
+the pre-Slice-5 baseline (`a4a160a` / `2afb9f4^`, verbatim Slice 4 code) to
+confirm each new/inverted test genuinely fails there. No production or test
+file in the active worktree was modified.
+
+== 2. Publication inventory (Area 1)
+
+A direct grep of every `out[...] =` write in `derived_column_policy.py`
+finds exactly three: `out[payload_target] = cleaned` (`:181`, unconditional),
+`out[findings] = findings_to_frame(...)` (`:209`, only under
+`policy == "warn_on_mismatch"`), and `out[META_KEY] = new_meta` (`:216`,
+metadata, not a `DataFrame`). `enforce_derived_column_policy_frame` returns a
+`(DataFrame, list[Finding])` tuple and writes into no mapping itself. No
+other function in the module writes into any `frames`/`out` mapping.
+
+*ACCEPT -- exactly two `DataFrame` publications*, matching the accepted
+design's own inventory (design Section H, "Complete local publication
+inventory") and Review 001 S16.1's "no third physical frame publication
+exists."
+
+== 3. Area-by-area findings
+
+=== Area 2 -- durable FK policy is no longer deletion authority
+
+`apply_derived_column_policy` no longer calls `_safe_policy_helper_names`
+(deleted; confirmed absent by repository-wide grep). `durable_helper_names`
+(`:118`) is fed only by `_safe_durable_helper_names` (Workbook-View). The
+renamed `_durable_fk_policy_helper_names` (`:378`, ex-`_safe_policy_helper_names`)
+has exactly one caller, `_fk_deletion_unauthorized_candidates` (`:479`), which
+itself has exactly one caller, `_fk_deletion_unauthorized_findings` (`:438`),
+which only appends to the findings list or logs -- it never contributes to
+`durable_helper_names`, `helper_names`, or `drop_cols` anywhere in the module.
+`resolve_v2_fk_relations` has exactly one call site in the module (`:395`,
+inside `_durable_fk_policy_helper_names`). No hidden durable-policy-to-delete
+path exists anywhere in the call graph from `apply_derived_column_policy` to
+`enforce_derived_column_policy_frame`'s `drop_cols` computation. *ACCEPT.*
+
+=== Area 3 -- transient FK provenance still authorizes the ordinary case
+
+`_resolve_derived_identity` (unchanged by this diff) still reads
+`derived_meta.get("helper_columns")` as the FK-attributed identity source,
+unioned with Lookup's own `enrich_lookup` declaration. The pre-existing
+`test_drop_removes_fk_and_lookup_helper_columns` (unmodified, still present)
+and the parity test in Area 15 confirm the ordinary same-run
+materialize-then-cleanup path is unaffected. *ACCEPT.*
+
+=== Area 4 -- Workbook-View authority remains distinct
+
+`test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelated_durable_fk_policy`
+(`test_derived_column_policy.py:939`) constructs exactly the attack this area
+asks for: `_places_name` is named by both durable v2 FK relation policy
+*and* Workbook-View `_meta.sheets.groups.helper_columns`, with no transient
+FK provenance at all; `policy="drop"` still removes the column. Because
+`durable_helper_names` (`:118`) is fed only by `_safe_durable_helper_names`
+and durable FK policy contributes nothing to any deletion set (Area 2), the
+removal in this test is necessarily attributable to Workbook-View authority
+alone -- confirmed by code reading, not merely by the assertion. *ACCEPT for
+the deletion outcome.* (The same fixture under `policy="warn_on_mismatch"`
+is not exercised by this test and surfaces the Area 5 finding below.)
+
+=== Area 5 -- unauthorized-FK-deletion diagnostic: MATERIAL false positive
+
+*Finding FIND-S5-01 (MATERIAL).* `_fk_deletion_unauthorized_findings`
+(`:134-136`) is called with `payload=payload` -- the frame *before*
+`enforce_derived_column_policy_frame`'s own drop (`payload =
+_require_frame(frames, source)` at `:114`; `cleaned` is the post-drop frame,
+never passed to the diagnostic). `_fk_deletion_unauthorized_candidates`
+(`:471-492`) computes `present_labels` from that pre-drop `payload` and
+excludes only `truthful_fk_names` (FK's own transient provenance). It does
+*not* exclude columns authorized by `durable_helper_names` (Workbook-View)
+or by Lookup's own `enrich_lookup` identity -- both of which are legitimate,
+documented, non-FK deletion-identity sources (design Section H) that can
+name the same physical label a durable FK relation also names.
+
+Consequence: whenever durable FK relation policy names a column that is
+*validly* removed by one of those other authorities, with no truthful
+transient FK provenance for it, `apply_derived_column_policy` still emits
+`fk_deletion_unauthorized` (`policy="warn_on_mismatch"`) or the equivalent
+log warning (`fail_on_mismatch`/`drop`), falsely stating the column "has no
+truthful, current transient provenance authorizing deletion; left in
+place" -- even though the column both had a different, valid authorization
+and is, in fact, no longer present in the returned frame at all.
+
+Two independent, directly reproduced repros (both run against the reviewed
+commit, not hypothetical):
+
+* *Workbook-View variant* (Area 4's own fixture under `warn_on_mismatch`
+  instead of `drop`): durable FK policy and `_meta.sheets.groups.helper_columns`
+  both name `_places_name`, no transient FK provenance.
+  `apply_derived_column_policy(..., policy="warn_on_mismatch")` returns
+  `out["groups"].columns == ["id", "home_place_id"]` (the column *is*
+  removed) yet `derived_column_findings` contains one
+  `fk_deletion_unauthorized` row naming `_places_name` on `groups`.
+* *Lookup-identity variant* (no Workbook-View involved at all): `groups` has
+  a truthful, current `enrich_lookup` provenance record naming
+  `_places_name` as its own helper column, and durable FK relation policy
+  separately names the same label with no transient FK provenance. The
+  column is legitimately dropped via Lookup's own declaration of its own
+  artifact -- design Section H states plainly that this case "is not the
+  defect... it is untouched" -- yet the same run still emits
+  `fk_deletion_unauthorized` for `_places_name` alongside the genuine
+  `derived_value_mismatch` finding.
+
+This directly contradicts the accepted design's own Section J disposition
+for `warn_on_mismatch`/`fail_on_mismatch` ("Column left in place; call
+succeeds" is the stated precondition/effect paired with the diagnostic) and
+the function's own docstring claim ("the column is left in place... the
+caller never adds it to the drop set") -- false whenever a non-FK-transient
+authority is the one doing the adding. The false positive is not confined to
+an exotic edge case: the Lookup-identity variant is the ordinary
+FK/Lookup-label-collision shape this whole multi-slice FTR was built around
+(design Section D), and the Workbook-View variant is the accepted,
+recommended migration path from Section I, whenever a pipeline author uses
+`warn_on_mismatch`/`fail_on_mismatch` rather than `drop` for post-persistence
+cleanup.
+
+No existing test (Slice 5's own new matrix or pre-existing) exercises
+`warn_on_mismatch`/`fail_on_mismatch` together with a durable-FK-named label
+that is also authorized by Workbook-View or by Lookup's own identity;
+Area 4's own required test (`test_workbook_view_helper_columns_still_authorizes...`)
+uses `policy="drop"`, which has no findings-frame surface and so cannot
+observe this defect -- this is precisely why it was not caught by the
+maintained suite.
+
+Impact is confined to the diagnostic surface: `_fk_deletion_unauthorized_findings`
+never contributes to `drop_cols`, `durable_helper_names`, or any deletion
+decision (confirmed in Area 2), so no wrongful deletion, wrongful survival,
+or incorrect raise results from this defect (Area 6 remains a clean ACCEPT;
+see below). No other production code currently reads
+`fk_deletion_unauthorized`/`derived_column_findings` (repository-wide grep),
+so no other maintained behavior regresses today. The defect is nonetheless a
+concrete correctness bug in a diagnostic contract this slice itself
+introduces, reproducible without any hypothetical construction, and it
+directly undermines the "warnings are semantically accurate" property this
+review area was asked to verify -- classified *MATERIAL*, not MINOR, on that
+basis. A smallest-local-repair direction (not implemented, per this review's
+read-only scope): compare `present_labels` against the *final* returned
+columns (`cleaned.columns`) rather than the pre-drop `payload.columns`, or
+equivalently exclude `durable_helper_names`/Lookup's own declared names from
+`_fk_deletion_unauthorized_candidates` alongside `truthful_fk_names`.
+
+No other false-positive shape was found: absent-column, wrong-source, and
+duplicate-relation attacks against `_fk_deletion_unauthorized_candidates`
+all behave correctly (verified by code reading -- `present_labels` correctly
+excludes physically absent columns, `source_frame` filtering correctly
+excludes unrelated sheets' relations, and set-union over multiple relations
+does not double-report).
+
+=== Area 6 -- `fail_on_mismatch` separation remains intact
+
+`_fk_deletion_unauthorized_findings` returns severity-`"warn"` `Finding`
+objects only under `policy == "warn_on_mismatch"`; under `drop` and
+`fail_on_mismatch` it returns `[]` unconditionally (routing through
+`log.warning` instead). `failures = [f for f in found if f.severity ==
+"fail"]` therefore can never contain an authorization-refusal entry under
+any policy -- the diagnostic structurally cannot reach the `raise
+ValueError(...)` path (`:139-140`). Ordinary value-mismatch findings
+(`enforce_derived_column_policy_frame`'s own `_check_enrich_lookup_values`)
+are computed independently and unaffected by this addition; their
+`fail_on_mismatch` raise behavior is unchanged. Confirmed by
+`test_durable_policy_only_unauthorized_drop_does_not_raise_under_fail_on_mismatch`
+and by the unmodified fail-mode value-mismatch tests
+(`test_edited_lookup_helper_fail_mode_raises`, etc.) both passing. FIND-S5-01
+above is a diagnostic-accuracy defect, not a strictness-separation defect --
+it never risks becoming a `fail`. *ACCEPT.*
+
+=== Area 7 -- payload-target normalization
+
+`payload_target = output or source` (`:180`) is the only place raw `output`
+feeds a lifecycle decision anywhere in the module (confirmed by grep: every
+other `output` reference is a parameter declaration, a docstring, or the
+pass-through at the call site). `test_payload_output_empty_string_and_none_both_alias_to_source_target`
+(parametrized `["", None]`) and the pre-existing, unmodified
+`test_default_replacement_removes_consumed_fk_and_enrich_provenance`
+(`output` omitted, defaults to `None`) jointly exercise all three aliases
+(`None`, `""`, and omission, which is `None`); `output=source` is not given
+its own dedicated test but is structurally identical to the `None`/`""`
+cases through the same `payload_target == source` branch and is exercised
+implicitly by the "replacing" tests carried over unmodified from before this
+slice. *ACCEPT*, with the observation that a fourth parametrize case
+(`output=source` literally) would make the equivalence proof textually
+complete rather than structurally implied; this is a test-completeness nit,
+not a functional gap.
+
+=== Area 8 -- same-target payload continuity
+
+`if payload_target == source: if sheet_meta: strip(source)`. `sheet_meta` is
+`_safe_sheet_meta(meta, source)`, `None` when absent and a non-empty mapping
+whenever either maintained sub-key (`helper_columns`, `enrich_lookup`) is
+present -- the schema's only two maintained sub-keys (Area 12). No supported
+shape was found where real producer provenance requiring cleanup exists
+while `sheet_meta` is falsy: a mapping containing either sub-key is
+necessarily non-empty and therefore truthy. *ACCEPT.*
+
+=== Area 9 -- decoupled payload publication
+
+`test_payload_decoupled_target_invalidates_preexisting_provenance`,
+`test_payload_decoupled_new_frame_target_is_true_noop`, and the unmodified
+`test_distinct_output_preserves_original_source_provenance` jointly confirm:
+a pre-existing entry at a decoupled `payload_target` is removed; a brand-new
+`payload_target` gains no meaningless `_meta` entry; and `source`'s own
+provenance is untouched when `payload_target` is a distinct, brand-new name.
+The design's own Repro-6 fixture shape (source physically owns an
+independently-sourced column under the same label, with no separate
+provenance entry of its own) is reproduced exactly as specified; no
+maintained test requires source's *own* transient-provenance entry to
+survive a decoupled `output` while also existing (the design's own inventory
+never requires this, since the decoupled branch only ever touches
+`payload_target`'s entry, never `source`'s). *ACCEPT.*
+
+=== Area 10 -- findings publication / FIND-D13 B
+
+`out[findings] = findings_to_frame(found, ...)` runs unconditionally under
+`warn_on_mismatch` regardless of `found`'s length, and its own invalidation
+(`findings_meta = _safe_sheet_meta(new_meta, findings); if findings_meta:
+strip`) is gated only on the metadata slot's presence, never on `found`'s
+size. `test_findings_publication_invalidates_preexisting_provenance_at_target`
+happens to exercise `found == []` (no `enrich_lookup` spec on the fixture's
+sheet, and no durable-FK-named candidate present), so the zero-row
+synthesized-findings-frame case is exercised, not merely asserted in the
+abstract. *ACCEPT.*
+
+=== Area 11 -- `findings == payload_target` ordering
+
+`test_findings_equals_payload_target_publication_order_leaves_no_stale_provenance`
+directly asserts the physical final state: `out["B"].columns ==
+FINDING_COLUMNS` (the findings frame, not the payload, is what
+`out["B"]` holds at return) and `"B" not in
+out["_meta"]["derived"]["sheets"]`. Code reading confirms the runtime order
+matches: payload publish-and-invalidate (`:181,193-201`) executes strictly
+before findings publish-and-invalidate (`:208-213`), both writing into the
+same `out`/`new_meta` locals sequentially, so the findings write is
+necessarily the last physical writer and its invalidation runs against
+already-updated `new_meta`. This is a genuine physical-final-writer proof,
+not merely a provenance-only check. *ACCEPT.*
+
+=== Area 12 -- `_strip_consumed_provenance` completeness
+
+`registries/meta_registry.yaml`'s `derived` entry (`:917-923`) states the
+schema's only two maintained sub-keys under `derived.sheets.*` are
+`helper_columns` and `enrich_lookup`; `cell_codec/frame.py::_helper_columns_for_frame`
+(an independent consumer) reads exactly the same two sub-keys, corroborating
+the registry text against actual runtime usage. `_strip_consumed_provenance`
+removes both, preserves unrelated sub-keys within an entry (none currently
+exist per the schema), preserves sibling sheet entries and unrelated
+top-level `_meta` roots (`test_decoupled_payload_invalidation_preserves_unrelated_meta_and_sheets`
+asserts sibling `C` and top-level `helper_policies` both survive
+byte-identical), prunes empty `sheets`/`derived` containers, and copies
+rather than mutates its input (`dict(meta)`/`dict(derived)`/`dict(sheets)` at
+each level). No third maintained sub-key was found; no hypothetical one is
+invented. *ACCEPT.*
+
+=== Area 13 -- `sheet_meta` source of truth
+
+`sheet_meta = _safe_sheet_meta(meta, source)` is computed once from the
+untouched input `meta` and passed unchanged into
+`enforce_derived_column_policy_frame`, `_fk_deletion_unauthorized_findings`,
+and `_publish_with_lifecycle`'s same-target branch -- all three uses are
+correctly scoped to `source`'s own pre-publication state, which nothing
+before publication mutates. The decoupled and findings branches inside
+`_publish_with_lifecycle` correctly re-derive their own `_safe_sheet_meta`
+reads against the accumulating `new_meta` rather than reusing the
+`source`-scoped `sheet_meta` snapshot, because their targets are (in
+general) different keys. No sequential-publication case was found where a
+stale snapshot is used where accumulated state was required, or vice versa.
+*ACCEPT.*
+
+=== Area 14 -- persistence/reimport contract
+
+`test_cleanup_invariants.py`'s two roundtrip tests share one
+`_reverse_pipeline_config` function verbatim (`apply_workbook_view_sheet_mappings`
+then `apply_derived_column_policy policy: drop`; no `add_fk_helpers` or any
+materialization step), differing *only* in the forward pipeline's
+`configure_workbook_view` `declare_helper_columns` flag -- confirmed by
+reading both call sites, which pass identical arguments except that one
+boolean. This isolates the migration-path/fail-closed-default difference to
+exactly the declared variable, satisfying "the paired roundtrip tests
+genuinely isolate only this difference." The fail-closed test
+(`test_helper_column_survives_reimport_when_only_durable_fk_policy_names_it`)
+has durable FK relation policy (written by the forward pipeline's
+`configure_fk_helpers`/`add_fk_helpers`, surviving the persistence boundary
+by design) as its only remaining deletion-identity carrier for `items`, with
+no Workbook-View declaration and no fresh materialization pass in the
+reverse pipeline -- confirmed by the shared `_reverse_pipeline_config`
+containing no `add_fk_helpers`/`enrich_helpers`/`configure_fk_helpers` step
+at all. *ACCEPT.*
+
+=== Area 15 -- direct executor parity
+
+`test_dcp_and_drop_helpers_agree_durable_policy_alone_is_not_authority`
+asserts *both* `apply_derived_column_policy` (`policy="drop"`) and
+`drop_helpers` leave `_places_name` in place from the same
+durable-policy-only fixture, over independently constructed frame copies
+(`_frames()` called fresh for each). It checks only the shared authority
+rule (column survives at both sites), not diagnostic/interface identity
+between the two executors, matching the design's explicit "do not require
+identical diagnostics" instruction. *ACCEPT.*
+
+=== Area 16 -- test quality / pre-fix failure verification
+
+An isolated detached worktree was created at `2afb9f4^` (== `a4a160a`,
+verbatim Slice 4 code), and the current (Slice 5) `test_derived_column_policy.py`
+and `test_cleanup_invariants.py` were copied in and run there with
+`PYTHONPATH` pointed at the worktree's own `src` (confirmed, via
+`spreadsheet_handling.__file__`, that this shadows the main repo's editable
+install rather than silently exercising post-Slice-5 code). Results:
+
+[cols="4,2,3", options="header"]
+|===
+| Test | Fails on pre-Slice-5 code? | Assessment
+
+| `test_durable_fk_policy_alone_does_not_authorize_deletion_after_persistence_boundary`
+| Yes
+| Genuine inversion (durable-policy-only, post-persistence-boundary shape).
+
+| `test_durable_fk_policy_alone_does_not_authorize_deletion`
+| Yes
+| Genuine inversion (durable-policy-only, no persistence simulation).
+
+| `test_durable_policy_only_unauthorized_drop_emits_finding_under_warn_on_mismatch`
+| Yes
+| New-behavior proof (diagnostic did not exist pre-Slice-5).
+
+| `test_durable_policy_only_unauthorized_drop_does_not_raise_under_fail_on_mismatch`
+| Yes
+| New-behavior proof; pre-Slice-5 code deleted the column outright under this
+  fixture, so the survival assertion fails there too.
+
+| `test_payload_decoupled_target_invalidates_preexisting_provenance`
+| Yes
+| Genuine FIND-D10 closure proof.
+
+| `test_payload_output_empty_string_and_none_both_alias_to_source_target[""]`
+| Yes
+| Genuine FIND-D13 Variant A closure proof. The `[None]` parametrize case
+  passes on both baseline and current code (the `None` alias was already
+  correct pre-Slice-5); this is the expected, narrower scope of the fix.
+
+| `test_findings_publication_invalidates_preexisting_provenance_at_target`
+| Yes
+| Genuine FIND-D13 Variant B closure proof.
+
+| `test_findings_equals_payload_target_publication_order_leaves_no_stale_provenance`
+| Yes
+| New ordering-boundary proof.
+
+| `test_decoupled_payload_invalidation_preserves_unrelated_meta_and_sheets`
+| Yes
+| New-behavior proof (the decoupled-invalidation mechanism itself did not
+  exist pre-Slice-5).
+
+| `test_dcp_and_drop_helpers_agree_durable_policy_alone_is_not_authority`
+| Yes
+| Genuine parity proof.
+
+| `test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelated_durable_fk_policy`
+| No
+| Correctly a stability/non-regression check (Workbook-View authority
+  predates this slice); not overclaimed as new-behavior.
+
+| `test_helper_column_survives_reimport_when_only_durable_fk_policy_names_it`
+| Yes
+| Genuine fail-closed-default inversion at the roundtrip layer.
+
+| `test_helper_cleanup_survives_reimport_when_workbook_view_declares_helper_columns`
+| No
+| Correctly a stability/non-regression check (the `_safe_durable_helper_names`
+  path is untouched by this slice).
+|===
+
+10 of the 12 direct-DCP-unit tests inspected fail against the verbatim
+pre-Slice-5 baseline (91 of 101 tests in the unit file pass unchanged;
+`test_payload_output_empty_string_and_none_both_alias_to_source_target[]`
+counted as the failing half of its own parametrize pair), and 1 of the 3
+roundtrip tests inspected fails there -- all in the direction the design
+predicts. No test was found to be vacuous (asserting something already true
+pre-Slice-5 while being presented as a new-behavior proof). Worktree removed
+after the run (`git worktree remove --force`); no tracked file in the active
+worktree was modified. *ACCEPT.*
+
+=== Area 17 -- scope / no generic lifecycle infrastructure
+
+The diff introduces `_publish_with_lifecycle`, `_fk_deletion_unauthorized_findings`,
+and `_fk_deletion_unauthorized_candidates` -- all private, owner-local to
+`derived_column_policy.py`, all reusing the module's own pre-existing
+`_strip_consumed_provenance`/`_safe_sheet_meta` primitives. No registry,
+claim/refcount, generation/frame-identity ID, central invalidation bus, or
+cross-family shared primitive was introduced; `resolve_v2_fk_relations`
+remains the only cross-module import, used exactly as before (Area 2).
+*ACCEPT.*
+
+=== Area 18 -- no Slice-6 leakage
+
+`git show --stat 2afb9f4` touches exactly three files:
+`derived_column_policy.py`, `test_cleanup_invariants.py`,
+`test_derived_column_policy.py`. No canonical architecture doc, DMC,
+release-notes file, Project Memory artifact, or roadmap/backlog file is
+touched. *ACCEPT.*
+
+=== Area 19 -- release-notes checkpoint (observation, not a Slice-5 finding)
+
+`docs/release_notes/release_notes.adoc` has no entry for
+`apply_derived_column_policy`'s durable-policy-only behavior change (grep
+confirms no mention of `fk_deletion_unauthorized` or this design series).
+This is consistent with the accepted design's own Section M/N, which assigns
+the release-note entry (alongside the canonical-doc rewrites named below) to
+the optional, separate Slice 6, landing after both mandatory executor sites
+(Slices 4 and 5) are complete. Recorded here, as the Slice-4 review also
+recorded it, so a Slice-6 reviewer does not lose track of it. The active
+`0.2.0`-era unreleased section is the correct placement per the repository's
+own placement rule once written.
+
+=== Area 20 -- concrete design contradictions
+
+* *Third DCP publication:* none found (Area 1).
+* *Uninvalidated maintained sub-key:* none found; the schema has exactly two
+  (Area 12).
+* *Uncaptured `output` spelling:* none found beyond the documented
+  `None`/`""`/`source` aliasing; a non-empty, non-`source` string is, and is
+  meant to be, the decoupled case (Area 7/9).
+* *Findings continuity contract:* none found; `findings_to_frame(found,
+  ...)` is always freshly synthesized, never a continuation (Area 10).
+* *Durable FK relation policy documented elsewhere as caller-authorized
+  deletion:* found, but *already known and tracked, not new.*
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc` (~lines
+  130-133, 195-197) still states, as current canonical text, that
+  `remove_fk_helpers` "uses the v2 relation list as a fallback when
+  provenance is absent" -- the exact behavior Slice 4 removed. This is
+  precisely the "Reimport cleanup" rewrite the accepted design's Section M
+  already names as required, explicitly deferred to the optional
+  documentation Slice 6 (Section N). Not a Slice-5 implementation defect;
+  recorded so the Slice-6 reviewer does not have to rediscover it. (The
+  same doc's own separate "Reimport cleanup" paragraph at ~lines 144-151
+  already correctly names the Workbook-View carrier, not the FK relation
+  policy, as the durable fallback -- only the `remove_fk_helpers`-focused
+  passage is stale.)
+
+Beyond the above, no evidence was found that the accepted lifecycle rule
+itself needs reopening; FIND-S5-01 (Area 5) is a defect in this slice's own
+new diagnostic-accuracy contract, not a design contradiction.
+
+== 4. Tests / repros run
+
+[cols="3,1", options="header"]
+|===
+| Command | Result
+
+| `pytest tests/unit/domain/transformations/test_derived_column_policy.py tests/roundtrip/test_cleanup_invariants.py tests/unit/domain/transformations/test_drop_helpers_provenance.py -q`
+| all passed
+
+| `pytest tests/unit/domain/transformations/test_enrich_lookup.py tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py tests/architecture -q`
+| all passed
+
+| `pytest tests/unit tests/integration tests/roundtrip tests/architecture`
+| 2879 passed in 14.86s
+
+| Direct repro (Area 5, Workbook-View variant): durable FK policy + Workbook-View
+  both name `_places_name`, no transient FK provenance, `policy="warn_on_mismatch"`
+| Column removed from `out["groups"]`; `fk_deletion_unauthorized` still
+  emitted for it -- confirms FIND-S5-01
+
+| Direct repro (Area 5, Lookup-identity variant): durable FK policy names
+  `_places_name`; `groups`' own truthful `enrich_lookup` provenance also
+  names it; no transient FK provenance; `policy="warn_on_mismatch"`
+| Column removed from `out["groups"]`; `fk_deletion_unauthorized` still
+  emitted alongside the genuine `derived_value_mismatch` finding -- confirms
+  FIND-S5-01 is not confined to the Workbook-View interaction
+
+| Worktree repro (Area 16): current test files run against pre-Slice-5
+  production code (`git worktree add --detach <tmp> 2afb9f4^`,
+  `PYTHONPATH=<tmp>/src`, copy current test files in)
+| 10 of 12 inspected `test_derived_column_policy.py` tests fail (91 of 101
+  total pass unchanged); 1 of 3 inspected `test_cleanup_invariants.py` tests
+  fails (see Area 16 table for the per-test breakdown). Worktree removed
+  after the run; no tracked files modified.
+|===
+
+== 5. Findings summary
+
+*MATERIAL:*
+
+* *FIND-S5-01* (Area 5) -- `_fk_deletion_unauthorized_findings` is called
+  with the pre-drop `payload` rather than the post-drop `cleaned` frame (or
+  equivalently fails to exclude `durable_helper_names`/Lookup-declared
+  identity from its candidate set), so it emits a false
+  `fk_deletion_unauthorized` finding/log warning for a column that a
+  non-FK-transient authority (Workbook-View or Lookup's own declared
+  identity) validly and correctly removed in the same call. Confirmed by two
+  independent direct repros against the reviewed commit. Does not affect any
+  deletion decision (Area 2/6 remain clean); confined to the accuracy of a
+  new diagnostic surface this slice introduces. No other production consumer
+  reads this surface today.
+
+*MINOR (non-blocking, recorded for completeness):*
+
+* Area 7 -- `output=source` (the literal string, as opposed to `None`/`""`)
+  has no dedicated parametrize case; the equivalence is structurally implied
+  by the shared `payload_target == source` branch but not textually proven
+  by its own assertion.
+
+*Non-findings, recorded for the Slice-6 reviewer, not gaps in this slice:*
+
+* Area 19 -- release-notes entry deferred to the optional Slice 6, per the
+  design's own plan; not present yet, as expected.
+* Area 20 -- `fk_helper_metadata.adoc`'s `remove_fk_helpers`-focused passage
+  still documents the pre-Slice-4 durable-fallback behavior; already named
+  in the design's Section M as Slice-6 scope.
+
+== 6. Verdict
+
+*MATERIAL CORRECTION REQUIRED.*
+
+* Publication inventory: *exactly two* physical `DataFrame` publications;
+  no third publication bypasses lifecycle handling.
+* Durable-policy deletion-authority: *correct* -- durable v2 FK relation
+  policy contributes to no deletion set anywhere in the module's call graph.
+* Transient-provenance authorization: *correct* -- the ordinary same-run
+  materialize-then-cleanup path is unaffected.
+* Workbook-View authority: *correct* for the deletion outcome; its
+  interaction with the new diagnostic under `warn_on_mismatch`/`fail_on_mismatch`
+  is where FIND-S5-01 lives.
+* Authorization diagnostic / `fail_on_mismatch` separation: strictness
+  separation is *correct* (never raises); diagnostic *accuracy* is
+  *MATERIALLY defective* (FIND-S5-01).
+* `payload_target`/`output=""`: *correct*, generalizes cleanly to all three
+  aliases.
+* Decoupled payload invalidation: *correct*, including unrelated-provenance
+  and sibling-sheet preservation.
+* Findings publication (including the zero-row case): *correct*.
+* `findings == payload_target` ordering: *correct*, proven against the
+  physical final writer, not merely provenance state.
+* `_strip_consumed_provenance` completeness: *correct* against the schema's
+  two maintained sub-keys; no third sub-key exists to be missed.
+* Persistence/reimport contract: *correct*; the paired migration-path/fail-closed
+  tests genuinely isolate only the intended variable.
+* Test quality: *good* -- 10 of 12 inspected direct-DCP tests and 1 of 3
+  inspected roundtrip tests empirically confirmed to fail against the
+  verbatim pre-Slice-5 baseline; the remainder are correctly-classified
+  stability checks, not overclaimed new-behavior proofs.
+* Scope: *clean* -- exactly three files touched; no generic lifecycle
+  infrastructure; no Slice-6 documentation leakage.
+
+*Slices 1-5 integration review should not proceed yet.* FIND-S5-01 is a
+narrowly-scoped, well-localized defect (a single call site's argument choice,
+or equivalently a missing exclusion set, inside a private helper with no
+external caller) that does not require reopening the accepted design, any
+production behavior outside this one diagnostic's accuracy, or any test
+already reviewed as correct above. A follow-up correction limited to
+`_fk_deletion_unauthorized_findings`/`_fk_deletion_unauthorized_candidates`
+(and the untested interaction shapes named in Area 5), re-reviewed as a
+targeted fix, should be sufficient to clear this verdict without a new
+design pass.
+
+== 7. Lifecycle cleanup check
+
+Not applicable at this granularity: this is a bounded slice-implementation
+review within an active, multi-slice FTR workstream (tracked via the
+`docs/warm_storage/global_reviews/derived_artifact_deletion_authority_*`
+design/review series itself, no separate formal FTR/BUG backlog ID), not a
+final review declaring the workstream green. No status change, backlog
+removal, or cold-storage move is indicated. The workstream remains open:
+FIND-S5-01 must be corrected and re-reviewed before Slice 5 can be considered
+closed, and the optional documentation Slice 6 (release notes, canonical-doc
+rewrites named in Area 19/20) remains outstanding regardless.
