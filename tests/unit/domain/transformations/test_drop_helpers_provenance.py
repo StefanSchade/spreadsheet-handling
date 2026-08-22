@@ -12,6 +12,7 @@ import pandas as pd
 
 from spreadsheet_handling.domain.fk_relations import infer_fk_relations
 from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
+from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
 from spreadsheet_handling.pipeline.steps import make_apply_fks_step, make_drop_helpers_step
 
 pytestmark = pytest.mark.ftr("FTR-FK-HELPER-PROVENANCE-CLEANUP")
@@ -102,10 +103,20 @@ class TestDropHelpersRequiresPolicy:
         with pytest.raises(ValueError, match="infer_fk_relations"):
             step.fn(frames)
 
-    def test_drop_removes_columns_from_v2_policy_when_provenance_missing(self):
-        """When only v2 policy is present (no per-sheet provenance), the
-        declared helper columns are still removed; this is the post-reimport
-        cleanup path."""
+    def test_drop_survives_v2_policy_only_column_when_provenance_missing(self):
+        """Durable v2 relation policy alone is not deletion authority.
+
+        When only v2 policy is present (no per-sheet transient provenance),
+        the declared helper column is left in place: the policy names what
+        FK would request, not what FK currently produced on this frame. This
+        was previously the post-reimport cleanup path (durable-policy
+        fallback); Slice 4 removes that fallback because it permits deleting
+        a physically present column -- possibly owned by another producer by
+        now (Lookup, or a genuine same-label replacement) -- with no
+        truthful evidence FK itself produced it in this run. See accepted
+        design ``derived_artifact_deletion_authority_design_2026-08-21.adoc``
+        Section F/G.
+        """
         frames = infer_fk_relations({
             "A": pd.DataFrame(
                 {"id": [10, 20], "id_(B)": [1, 2], "_B_name": ["alpha", "beta"]}
@@ -117,6 +128,69 @@ class TestDropHelpersRequiresPolicy:
 
         step = make_drop_helpers_step(prefix="_")
         out = step.fn(frames)
+
+        cols_a = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
+        assert "_B_name" in cols_a
+        assert "id_(B)" in cols_a
+
+
+class TestDropHelpersDeletionAuthority:
+    """Slice 4: durable v2 relation policy is never independent deletion
+    authority; only truthful, current transient provenance authorizes
+    ``drop_helpers`` to delete a helper column. See accepted design
+    ``derived_artifact_deletion_authority_design_2026-08-21.adoc`` Section
+    F/G and the Slice-3 implementation review's Area 8 confirmatory repro.
+    """
+
+    def test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind(self):
+        """Slice-3-review Area 8 confirmatory repro, now closed by Slice 4.
+
+        FK truthfully materializes ``_B_name`` on ``A`` and writes matching
+        transient provenance. A decoupled ``enrich_lookup(source="C",
+        output="A", ...)`` rebind then physically replaces ``A`` with
+        caller-owned content that happens to reuse the exact same label
+        ``_B_name`` -- Slice 3 already strips FK's now-stale provenance for
+        ``A`` as part of that write, so no transient FK provenance survives
+        for ``A``. Durable v2 FK relation policy still names ``_B_name`` for
+        ``A`` (unaware of the replacement); before Slice 4 that policy alone
+        let ``drop_helpers`` delete the caller's replacement column. Slice 4
+        must leave it untouched.
+        """
+        enriched = _enriched_frames()
+        assert enriched["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+
+        frames = dict(enriched)
+        frames["C"] = pd.DataFrame({"id": [1, 2], "_B_name": ["caller-x", "caller-y"]})
+
+        rebound = enrich_lookup(
+            frames,
+            source="C",
+            lookup="B",
+            output="A",
+            on="id",
+            helpers=None,
+        )
+        # Slice 3: the decoupled rebind discards FK's stale record for "A".
+        assert "A" not in (rebound.get("_meta", {}).get("derived", {}).get("sheets", {}))
+        assert list(rebound["A"]["_B_name"]) == ["caller-x", "caller-y"]
+
+        out = make_drop_helpers_step(prefix="_").fn(rebound)
+
+        cols_a = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
+        assert "_B_name" in cols_a
+        assert list(out["A"]["_B_name"]) == ["caller-x", "caller-y"]
+
+    def test_drop_is_safe_noop_when_provenance_names_absent_column(self):
+        """Truthful transient provenance naming a column no longer present
+        on the frame is a safe no-op, not an error -- unchanged existing
+        behavior, unrelated to the durable-policy-only case above (here
+        provenance is still trusted; there simply is nothing left to drop).
+        """
+        enriched = _enriched_frames()
+        frames = dict(enriched)
+        frames["A"] = frames["A"].drop(columns=["_B_name"])
+
+        out = make_drop_helpers_step(prefix="_").fn(frames)
 
         cols_a = [c[0] if isinstance(c, tuple) else c for c in out["A"].columns]
         assert "_B_name" not in cols_a
