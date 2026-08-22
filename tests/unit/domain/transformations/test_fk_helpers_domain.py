@@ -194,6 +194,87 @@ class TestEnrichHelpers:
         assert all(isinstance(v, LookupFormulaSpec) for v in values)
 
 
+class TestEnrichHelpersProvenanceTruthfulness:
+    """FK Helper Deletion Authority design, Slice 2 (<<E>>, <<F>>, <<N>>, <<O>>).
+
+    FK helper provenance under ``_meta.derived.sheets.<sheet>.helper_columns``
+    must describe only helper columns this call actually materialized, never
+    a definition Core skipped because its requested label already existed.
+    ``TestEnrichHelpers.test_provenance_written`` above already proves the
+    fresh-materialization case; these tests prove the collision, mixed, and
+    replay cases the design requires.
+    """
+
+    def test_collision_writes_no_provenance_and_leaves_values_untouched(self):
+        # Pre-occupy the requested helper label exactly as a caller-supplied
+        # or other producer's column would.
+        frames = _frames()
+        frames["A"]["_B_name"] = ["preexisting", "values"]
+
+        out = enrich_helpers(frames, DEFAULTS)
+
+        helper_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        assert out["A"][helper_col].tolist() == ["preexisting", "values"]
+
+        derived_sheets = out.get("_meta", {}).get("derived", {}).get("sheets", {})
+        assert "helper_columns" not in derived_sheets.get("A", {})
+
+    def test_mixed_definitions_provenance_contains_only_materialized(self):
+        frames = {
+            "A": pd.DataFrame({"id": [10, 20], "id_(B)": [1, 2]}),
+            "B": pd.DataFrame(
+                {"id": [1, 2], "name": ["alpha", "beta"], "category": ["x", "y"]}
+            ),
+        }
+        # Pre-occupy only one of the two requested helper labels.
+        frames["A"]["_B_category"] = ["pre-x", "pre-y"]
+        configured = configure_fk_helpers(
+            frames,
+            target="B",
+            key="id",
+            allowed_helpers=["category", "name"],
+            default_helpers=["category", "name"],
+        )
+
+        out = enrich_helpers(configured, DEFAULTS)
+
+        prov = out["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+        assert [entry["column"] for entry in prov] == ["_B_name"]
+
+        cat_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_category"
+        ][0]
+        name_col = [
+            c for c in out["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        assert out["A"][cat_col].tolist() == ["pre-x", "pre-y"]
+        assert out["A"][name_col].tolist() == ["alpha", "beta"]
+
+    def test_second_call_does_not_reaffirm_provenance_from_collision(self):
+        # Accepted, deliberately conservative replay behavior (<<E>>): a
+        # second call against a frame that already carries the helper
+        # column from a prior call sees a collision, not a fact it can
+        # re-claim, even though the column is FK's own earlier output.
+        once = enrich_helpers(_frames(), DEFAULTS)
+        assert once["_meta"]["derived"]["sheets"]["A"]["helper_columns"]
+
+        twice = enrich_helpers(once, DEFAULTS)
+
+        helper_col = [
+            c for c in twice["A"].columns
+            if (c[0] if isinstance(c, tuple) else c) == "_B_name"
+        ][0]
+        assert twice["A"][helper_col].tolist() == ["alpha", "beta"]
+
+        derived_sheets = twice.get("_meta", {}).get("derived", {}).get("sheets", {})
+        assert "helper_columns" not in derived_sheets.get("A", {})
+
+
 # ---------------------------------------------------------------------------
 # drop_helpers
 # ---------------------------------------------------------------------------

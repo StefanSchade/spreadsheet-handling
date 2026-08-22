@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from ....core.fk import apply_fk_helpers, build_id_value_maps
+from ....core.fk import _materialize_fk_helpers, build_id_value_maps
 from ....frame_keys import copy_reserved_frames, iter_data_frames
 
 from .formula_provider import build_lookup_formula_value_provider
@@ -113,12 +113,20 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
 
     out: dict[str, Any] = {}
     copy_reserved_frames(frames, out)
+    # Provenance must describe only helper columns this call actually
+    # materialized, not the full requested set (FK Helper Deletion
+    # Authority design, Slice 2, <<E>>/<<F>>): a definition whose label
+    # collided with a pre-existing column was never physically written, so
+    # it must not be claimed here either -- there is no self-verified-reuse
+    # fallback (<<D>>, FIND-D2).
+    materialized_by_frame: dict[str, list[Any]] = {}
     for frame_name, df in iter_data_frames(frames):
         frame_fk_defs = fk_defs_by_frame[frame_name]
         if not frame_fk_defs:
             out[frame_name] = df
+            materialized_by_frame[frame_name] = []
             continue
-        enriched = apply_fk_helpers(
+        result = _materialize_fk_helpers(
             df,
             frame_fk_defs,
             id_maps,
@@ -126,9 +134,10 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
             helper_prefix="_",
             helper_value_provider=helper_value_provider,
         )
-        out[frame_name] = _preserve_source_flatness(df, enriched)
+        out[frame_name] = _preserve_source_flatness(df, result.frame)
+        materialized_by_frame[frame_name] = result.materialized
 
-    _write_helper_provenance(out, fk_defs_by_frame)
+    _write_helper_provenance(out, materialized_by_frame)
     return out
 
 
