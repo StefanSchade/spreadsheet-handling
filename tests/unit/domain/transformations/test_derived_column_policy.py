@@ -949,6 +949,105 @@ def test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelat
     assert "_places_name" not in out["groups"].columns
 
 
+def test_workbook_view_authorized_removal_emits_no_false_fk_deletion_unauthorized() -> None:
+    """FIND-S5-01 regression (independent Slice-5 review, Workbook-View
+    variant): durable FK relation policy and Workbook-View
+    `_meta.sheets[source].helper_columns` both name `_places_name`, with no
+    transient FK provenance. Workbook-View authority correctly removes the
+    column (as `test_workbook_view_helper_columns_still_authorizes_cleanup_...`
+    already proves under `policy="drop"`), but under `warn_on_mismatch` the
+    diagnostic used to be computed against the pre-drop payload and so fired
+    a false `fk_deletion_unauthorized` for a column that was, in fact, no
+    longer present in the returned frame at all. This fixture has no other
+    unauthorized FK columns, so no findings of any kind are expected.
+
+    This test fails against 2afb9f4 (the reviewed Slice-5 commit).
+    """
+    frames = _durable_fk_policy_frames()
+    frames["_meta"]["sheets"] = {"groups": {"helper_columns": ["_places_name"]}}
+
+    out = apply_derived_column_policy(frames, source="groups", policy="warn_on_mismatch")
+
+    assert "_places_name" not in out["groups"].columns
+    findings = out["derived_column_findings"]
+    assert len(findings) == 0
+
+
+def _durable_fk_policy_and_lookup_identity_frames():
+    """`groups` where durable v2 FK relation policy and `groups`' own
+    truthful, current `enrich_lookup` provenance both name `_places_name`,
+    with no transient FK (`helper_columns`) provenance at all. The lookup
+    values deliberately differ so the fixture also exercises a genuine
+    `derived_value_mismatch` finding alongside the (absent, post-fix)
+    authorization-refusal diagnostic."""
+    groups = pd.DataFrame([
+        {
+            "id": "GROUP-0001",
+            "home_place_id": "PLACE-0007",
+            "_places_name": "Microraptorenwald",
+        }
+    ])
+    places = pd.DataFrame([{"id": "PLACE-0007", "_places_name": "Old Forest"}])
+    meta = {
+        "helper_policies": {
+            "fk": {
+                "schema_version": 2,
+                "relations": [
+                    {
+                        "source_frame": "groups",
+                        "source_column": "home_place_id",
+                        "target_frame": "places",
+                        "target_key": "id",
+                        "helper_columns": [
+                            {"column": "_places_name", "target_field": "name"}
+                        ],
+                    }
+                ],
+            }
+        },
+        "derived": {
+            "sheets": {
+                "groups": {
+                    "enrich_lookup": {
+                        "lookup": "places",
+                        "source_key": "home_place_id",
+                        "lookup_key": "id",
+                        "helper_columns": ["_places_name"],
+                    }
+                }
+            }
+        },
+    }
+    return {"_meta": meta, "groups": groups, "places": places}
+
+
+def test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized() -> None:
+    """FIND-S5-01 regression (independent Slice-5 review, Lookup-identity
+    variant): durable FK relation policy names `_places_name`; `groups`' own
+    truthful, current `enrich_lookup` provenance separately names the same
+    physical label as its own helper column; no transient FK provenance
+    exists at all. The column is legitimately dropped via Lookup's own
+    declared identity, and the mismatched lookup value produces a genuine
+    `derived_value_mismatch` finding -- but the diagnostic used to also
+    falsely emit `fk_deletion_unauthorized` for the same, already-removed
+    column because it checked the pre-drop payload rather than the returned
+    frame.
+
+    This test fails against 2afb9f4 (the reviewed Slice-5 commit).
+    """
+    frames = _durable_fk_policy_and_lookup_identity_frames()
+
+    out = apply_derived_column_policy(frames, source="groups", policy="warn_on_mismatch")
+
+    assert "_places_name" not in out["groups"].columns
+    findings = out["derived_column_findings"]
+    assert (findings["rule_type"] == "fk_deletion_unauthorized").sum() == 0
+    mismatch = findings[findings["rule_type"] == "derived_value_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch.iloc[0]["columns"] == "_places_name"
+    assert mismatch.iloc[0]["frame"] == "groups"
+
+
 def test_payload_decoupled_target_invalidates_preexisting_provenance() -> None:
     """Repro 6 closure (FIND-D10): `apply_derived_column_policy(source=A,
     output=B, policy="drop")` where `B` already carries an FK

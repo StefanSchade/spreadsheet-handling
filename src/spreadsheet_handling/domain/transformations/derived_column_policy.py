@@ -132,7 +132,7 @@ def apply_derived_column_policy(
         durable_helper_names=durable_helper_names,
     )
     found = found + _fk_deletion_unauthorized_findings(
-        frames, source=source, payload=payload, sheet_meta=sheet_meta, policy=policy
+        frames, source=source, cleaned=cleaned, sheet_meta=sheet_meta, policy=policy
     )
 
     failures = [finding for finding in found if finding.severity == "fail"]
@@ -411,18 +411,24 @@ def _fk_deletion_unauthorized_findings(
     frames: Mapping[str, Any],
     *,
     source: str,
-    payload: pd.DataFrame,
+    cleaned: pd.DataFrame,
     sheet_meta: Any,
     policy: str,
 ) -> list[DerivedColumnFinding]:
     """Report FK-attributed columns durable policy names but cannot authorize.
 
     Accepted design Section F/J: durable FK relation policy never
-    independently authorizes deletion. When it names a column that is
-    physically present on ``payload`` but not currently named by truthful
-    transient FK provenance (``sheet_meta.helper_columns``), the column is
-    left in place (the caller never adds it to the drop set) and the refusal
-    is reported through a non-raising diagnostic.
+    independently authorizes deletion. When it names a column that is still
+    physically present on ``cleaned`` -- the frame *after*
+    ``enforce_derived_column_policy_frame``'s own drop, i.e. after every
+    currently accepted deletion authority (transient FK provenance, durable
+    Workbook-View ``helper_columns``, and Lookup's own declared identity) has
+    already had its chance to remove it -- and not currently named by
+    truthful transient FK provenance (``sheet_meta.helper_columns``), the
+    column is genuinely left in place and the refusal is reported through a
+    non-raising diagnostic. A column any of those other authorities validly
+    removed is, by construction, absent from ``cleaned`` and therefore never
+    a candidate here.
 
     ``warn_on_mismatch`` is the only mode with a findings-frame output
     surface, so it alone gets an ``fk_deletion_unauthorized`` finding,
@@ -436,7 +442,7 @@ def _fk_deletion_unauthorized_findings(
     under any policy, for this reason.
     """
     candidates = _fk_deletion_unauthorized_candidates(
-        frames, source=source, payload=payload, sheet_meta=sheet_meta
+        frames, source=source, cleaned=cleaned, sheet_meta=sheet_meta
     )
     if not candidates:
         return []
@@ -472,10 +478,19 @@ def _fk_deletion_unauthorized_candidates(
     frames: Mapping[str, Any],
     *,
     source: str,
-    payload: pd.DataFrame,
+    cleaned: pd.DataFrame,
     sheet_meta: Any,
 ) -> list[str]:
-    """Durable-policy-named FK helper labels present but not transient-authorized."""
+    """Durable-policy-named FK helper labels still present in ``cleaned`` but
+    not transient-authorized.
+
+    Presence is checked against the post-drop ``cleaned`` frame, not the
+    pre-drop payload: any column a different, currently accepted deletion
+    authority (Workbook-View, Lookup's own identity, or transient FK
+    provenance) has already removed is physically gone from ``cleaned`` and
+    therefore correctly excluded here, rather than requiring this function to
+    separately enumerate every non-FK deletion-authority source.
+    """
     durable_fk_names = _durable_fk_policy_helper_names(frames, source)
     if not durable_fk_names:
         return []
@@ -484,7 +499,7 @@ def _fk_deletion_unauthorized_candidates(
         truthful_fk_names = _validated_fk_helper_names(
             sheet_meta.get("helper_columns"), frame_name=source
         )
-    present_labels = {_visible_label(col) for col in payload.columns}
+    present_labels = {_visible_label(col) for col in cleaned.columns}
     return sorted(
         name
         for name in durable_fk_names
