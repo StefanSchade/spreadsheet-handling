@@ -611,3 +611,163 @@ removal, or cold-storage move is indicated. The workstream remains open:
 FIND-S5-01 must be corrected and re-reviewed before Slice 5 can be considered
 closed, and the optional documentation Slice 6 (release notes, canonical-doc
 rewrites named in Area 19/20) remains outstanding regardless.
+
+== 8. FIND-S5-01 closure review (2026-08-23)
+
+Status: targeted, independent closure review of a single correction commit.
+Read-only over everything outside this section; the historical text in
+Sections 1-7 above is left intact and unrevised. Scope is deliberately
+narrow: verify that the correction commit closes FIND-S5-01 truthfully and
+disturbs none of the six previously-ACCEPTED Slice-5 areas. This section does
+not redo the full twenty-area review, does not open Slice 6, and does not
+authorize the Slices 1-5 integration review beyond the explicit disposition
+stated at the end of this section.
+
+Correction commit under review:: `86eebab0fcaa65996431c906169406446adb421e`
+(`fix(domain): make DCP deletion refusal diagnostic truthful`).
+
+=== 8.1 Correction shape
+
+The diff touches exactly two files: `derived_column_policy.py` (the single
+call site at what was `:134-136`, plus `_fk_deletion_unauthorized_findings`
+and `_fk_deletion_unauthorized_candidates`) and
+`test_derived_column_policy.py` (two new regression tests). No other
+function, and in particular neither `_publish_with_lifecycle` nor
+`_strip_consumed_provenance` nor the `payload_target = output or source`
+line, appears in the diff at all -- confirmed directly via `git diff 2afb9f4
+86eebab -- .../derived_column_policy.py`, which shows only the four hunks
+named above.
+
+The fix replaces the pre-drop `payload` argument with the post-policy
+`cleaned` frame as the presence check in
+`_fk_deletion_unauthorized_candidates` (`present_labels = {_visible_label(col)
+for col in cleaned.columns}`, was `payload.columns`), and renames the
+corresponding parameter through `_fk_deletion_unauthorized_findings` and its
+one call site accordingly. This is exactly the correction shape specified for
+this closure review: a single presence-check substitution, not a parallel
+enumeration of Workbook-View/Lookup-identity as a second exclusion set. Any
+column a different accepted deletion authority already removed is, by
+construction, absent from `cleaned` and therefore never reaches the candidate
+set -- so the fix generalizes to that whole class of authority rather than
+special-casing the two variants the original review reproduced.
+
+=== 8.2 Required closure checks
+
+*1. Pure durable-policy-only case.* Re-run `test_durable_policy_only_unauthorized_drop_emits_finding_under_warn_on_mismatch`
+and `test_durable_policy_only_unauthorized_drop_does_not_raise_under_fail_on_mismatch`
+(both pre-existing, unedited by this commit): both pass against `86eebab`.
+`cleaned` and `payload` are identical in this fixture (nothing else removes
+the column), so switching the presence check to `cleaned` cannot have
+silenced this diagnostic -- confirmed empirically, not just by
+construction. *Verdict: correct.*
+
+*2. Workbook-View collision.* `test_workbook_view_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+reproduces the original review's exact first variant: durable FK policy and
+Workbook-View `helper_columns` both name `_places_name`, no transient FK
+provenance, `warn_on_mismatch`. Read the test body directly
+(`test_derived_column_policy.py:952-974`): it asserts both
+`"_places_name" not in out["groups"].columns` (physical removal still
+happens) and `len(findings) == 0` (no diagnostic of any kind, since this
+fixture has no other unauthorized FK columns). Confirmed to fail against
+`2afb9f4` and pass against `86eebab` (reproduced independently below in
+8.3, not merely taken from the commit message's claim). *Verdict: correct.*
+
+*3. Lookup-identity collision.* `test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+reproduces the second variant: durable FK policy and `groups`' own current,
+truthful `enrich_lookup` identity both name `_places_name`, no transient FK
+provenance, and the fixture's lookup values deliberately differ so a genuine
+`derived_value_mismatch` also fires. Read directly
+(`test_derived_column_policy.py:1024-1049`): asserts physical removal,
+exactly zero `fk_deletion_unauthorized` findings, and exactly one
+`derived_value_mismatch` finding for the same column/frame -- proving the
+fix suppresses only the false diagnostic and does not collaterally suppress
+the genuine one. Confirmed to fail against `2afb9f4` and pass against
+`86eebab`. *Verdict: correct.*
+
+*4. Physical deletion behavior.* Traced independently of the commit's own
+description: `enforce_derived_column_policy_frame` (the function that
+actually builds the drop set and produces `cleaned`) is not in the diff at
+all, and neither are `_resolve_derived_identity`, `_safe_durable_helper_names`,
+or `_validated_fk_helper_names`. The corrected functions
+(`_fk_deletion_unauthorized_findings`/`_candidates`) are diagnostic-only --
+their return value feeds `found`/the findings frame, never the drop set
+computed earlier at `:126-133`. *Verdict: no deletion-authority or drop-set
+logic changed; confirmed by absence from the diff plus the unedited call
+graph, not merely asserted.*
+
+*5. Strictness.* `_fk_deletion_unauthorized_findings`'s emit-vs-log branch on
+`policy` (findings-frame entry only under `warn_on_mismatch`, log-only
+otherwise) is untouched by the diff -- only the candidate-computation
+argument changed inside the function body above that branch. The
+`fail_on_mismatch` raise condition at `:138-140` (`failures = [f for f in
+found if f.severity == "fail"]`) is unedited, and `fk_deletion_unauthorized`
+findings are still constructed with `severity="warn"` unconditionally
+(function body, unedited). *Verdict: authorization refusal remains
+non-raising under all policies; unchanged by this commit.*
+
+*6. Publication lifecycle.* Per 8.1, `_publish_with_lifecycle`,
+`payload_target`, the findings publication, and `_strip_consumed_provenance`
+do not appear in the diff. *Verdict: no previously-ACCEPTED lifecycle area
+reopened.*
+
+=== 8.3 Pre-fix regression proof (independently reproduced)
+
+The two new tests were copied into an isolated detached worktree at
+`2afb9f4` (`git worktree add --detach <tmp> 2afb9f4`), run there with
+`PYTHONPATH` pointed at that worktree's source against the active `.venv`,
+and removed afterward (`git worktree remove`; `git worktree list` confirms
+only the main worktree remains). Both fail at `2afb9f4` exactly as the commit
+message claims:
+
+* Workbook-View variant: `assert len(findings) == 0` fails with
+  `AssertionError: assert 1 == 0`, the one finding being
+  `fk_deletion_unauthorized` on `_places_name`.
+* Lookup-identity variant: `assert (findings["rule_type"] ==
+  "fk_deletion_unauthorized").sum() == 0` fails with `AssertionError: assert
+  np.int64(1) == 0`, the finding set containing both
+  `derived_value_mismatch` and the false `fk_deletion_unauthorized`.
+
+Both pass against `86eebab` in the active worktree (Section 8.4). This
+independently confirms the commit message's regression claim rather than
+merely trusting it.
+
+=== 8.4 Tests run
+
+* `tests/unit/domain/transformations/test_derived_column_policy.py` -- full
+  file, `103 passed`.
+* Targeted subset (`-k "durable_policy_only or durable_fk_policy_alone or
+  dcp_and_drop_helpers_agree or workbook_view or lookup_identity_authorized"`,
+  covering both new FIND-S5-01 regressions, the pure durable-only pair, the
+  pre-existing Workbook-View-authority test, and the DCP/drop-helpers
+  agreement test) -- `8 passed, 95 deselected`.
+* `tests/roundtrip/test_cleanup_invariants.py` -- full file, `4 passed`.
+* `tests/unit/domain/transformations/test_drop_helpers_provenance.py` -- full
+  file, `9 passed`.
+* `tests/architecture/` -- full directory, `172 passed`.
+* Full repository suite (`pytest`, no filters) -- `2881 passed`, exit code
+  `0`, no failures, no errors (2 more than the 2879 recorded at the original
+  Slice-5 review, matching the two new regressions added by this commit).
+* Pre-fix reproduction of both new regressions against `2afb9f4` in an
+  isolated, since-removed detached worktree (Section 8.3).
+
+=== 8.5 Closure disposition
+
+FIND-S5-01: *CLOSED*. The correction computes candidate presence against the
+post-policy `cleaned` frame rather than the pre-drop `payload`, exactly as
+specified; both reproduced variants from the original review now correctly
+emit no false diagnostic while the genuine pure-durable-only diagnostic and
+the genuine co-occurring `derived_value_mismatch` finding are both
+independently confirmed still present; no deletion-authority, drop-set,
+strictness, or publication-lifecycle logic was touched; the full repository
+suite is green.
+
+*Final Slice-5 verdict: ACCEPT.* All six areas previously accepted in
+Sections 2-6 remain undisturbed (confirmed by diff absence, not
+re-asserted from memory), and the sole MATERIAL finding blocking that
+verdict is now closed. The MINOR finding recorded in Section 5 (missing
+`output=source` literal parametrize case) remains open but does not block
+ACCEPT.
+
+*Slices 1-5 integration review: AUTHORIZED* to proceed, on the basis of this
+closure alone. This section does not itself perform that integration review
+and does not open Slice 6.
