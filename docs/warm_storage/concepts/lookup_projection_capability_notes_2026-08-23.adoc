@@ -101,23 +101,60 @@ already-closed Deletion Authority subroutine). The underlying join is still
 a key lookup; the user-facing contract spans a relation's whole lifecycle,
 not one call.
 
-*Correction to the original sketch (Current fact, re-derived this session).*
-The original note attributed FK's output-naming capability to
-`helper_prefix`. Independently checked this session:
-`fk_helpers/enrich.py` calls `core.fk._materialize_fk_helpers` with a
-*hardcoded literal* `helper_prefix="_"`, which that function only falls back
-to when a relation's `helper_columns[]` entry has no explicit
-`helper_column` (`core/fk.py:311`,
-`fk.get("helper_column") or f"{helper_prefix}{target_key}_{value_field}"`).
-The pipeline-step-facing `helper_prefix` parameters on `remove_fk_helpers`
-and `reorder_fk_helpers` are separately confirmed dead (`drop.py`: `del
-prefix  # retained for backwards-compatible step binding only`). So: FK's
-real output-naming mechanism is the *declared `helper_columns[].column`
-field in relation policy* -- config-schema data belonging to the relation,
-not a live `helper_prefix` knob at any layer. This matches the Cycle-1
-assessment's independent finding (its Section 4 naming-asymmetry row) and is
-restated here because it changes what "FK's naming capability" actually
-*is*: a fact carried by the durable relation, not a separate mechanism.
+*Correction to the original sketch, itself corrected after independent
+review (Current fact, re-derived this session).* An earlier revision of this
+note claimed FK output naming is "not a live `helper_prefix` knob at any
+layer." That overgeneralized from the *materialization/lifecycle* layer to
+the whole FK family and is corrected here; the underlying distinction is
+between two different layers of the FK family, not between "live" and
+"dead" absolutely:
+
+* *Materialization/reorder/remove primitives -- `helper_prefix` is inert
+  here.* `fk_helpers/enrich.py` calls `core.fk._materialize_fk_helpers` with
+  a hardcoded literal `helper_prefix="_"`; that parameter only feeds a
+  dict-input fallback branch (`core/fk.py:311`,
+  `fk.get("helper_column") or f"{helper_prefix}{target_key}_{value_field}"`)
+  that the actual `add_fk_helpers` call path never reaches -- every relation
+  entry is built into an `FKDef` namedtuple by `iter_relation_fk_defs`
+  (`fk_helpers/policy.py:119-144`, reading the entry's `column` field into
+  `FKDef.helper_column`), and `_materialize_fk_helpers` reads that resolved
+  field directly (`helper_col = fk.helper_column`, `core/fk.py:314-316`),
+  never the prefix fallback. So at this layer the hardcoded `"_"` is not
+  merely unused-but-present, it is unreachable. Separately, the
+  pipeline-step-facing dead compatibility parameters are: `remove_fk_helpers`'s
+  `prefix` keyword (`fk_helpers/drop.py:37,49`: `del prefix  # retained for
+  backwards-compatible step binding only`), and, in a *different* file with a
+  *different* parameter name, `reorder_fk_helpers`'s `helper_prefix` keyword
+  (`domain/transformations/helpers.py:201,219`: `del helper_prefix  #
+  retained for backwards-compatible step binding only`). Both are confirmed
+  dead, but they are two distinct facts in two distinct files, not one.
+* *Configuration/inference -- `helper_prefix` is live.* `configure_fk_helpers`
+  (`domain/helper_policies.py:100`, `helper_prefix: str = "_"`) and
+  `infer_fk_relations` (`domain/fk_relations.py:36`, same signature shape)
+  each expose a live, test-exercised `helper_prefix` parameter that is
+  currently the *sole* mechanism either producer has for computing a helper
+  column's default name: `domain/helper_policies.py:162-166`
+  (`_v2_relations_from_explicit_policies`) builds
+  `{"column": f"{helper_prefix}{target_frame}_{field}", "target_field":
+  field}` for each `configure_fk_helpers` relation, and
+  `domain/fk_relations.py` builds the equivalent `column` value the same way
+  for `infer_fk_relations`. Neither producer exposes any other way to name a
+  helper column -- no per-field literal-alias parameter exists on either.
+
+*Net correction.* Once a relation is declared, the *durable* fact downstream
+FK lifecycle operations consume is the resolved `helper_columns[].column`
+value (normalized at runtime to `FKDef.helper_column`) -- `helper_prefix`
+itself is not stored as a relation field and has no further effect once
+`configure_fk_helpers`/`infer_fk_relations` has run. But `helper_prefix` is
+very much live *as an input* at the point a relation is declared or
+inferred: it is the only default-naming lever either producer step
+currently has. "FK's naming capability lives in config-schema data, not a
+prefix mechanism" is therefore true only *after* configuration/inference has
+already resolved that data -- at configuration/inference time itself, a
+prefix parameter is exactly how that data gets computed. This matches the
+Cycle-1 assessment's Section 4 finding about the *materialization* layer and
+sharpens it by adding the configuration-layer half that finding did not
+cover.
 
 === 3.2 Lookup Projection
 
@@ -125,16 +162,25 @@ restated here because it changes what "FK's naming capability" actually
 per call: `source`, `lookup`, `output`, an explicit join-key pair (symmetric
 `key`/`keys`/legacy `on`, or opt-in asymmetric `source_key`/`lookup_key`,
 mutually exclusive, no partial fallback between them), `helpers` (fields to
-project, optionally `"default"` against an optional non-durable helper
-policy), `order`, `missing`, and `helper_value_mode`. There is no relation
-declaration: an optional `_meta.helper_policies.lookup.<lookup>` policy may
-supply defaults, but it is *reconciled* against the call's inline arguments
-(conflicting values raise) rather than centrally merged across calls the way
-`apply_v2_relations` merges FK relations. Each call's `output` is the unit of
-provenance authority; `_write_provenance` explicitly discards whatever was
-previously attached to `output` when `output != source` ("decoupled
-rebind"), including a foreign sibling's provenance -- there is no
-cross-call relation identity to preserve.
+project, optionally `"default"` against a resolved helper policy -- see
+below), `order`, `missing`, and `helper_value_mode`. There is no *relation*
+declaration, but there can be a *policy*: `configure_lookup_helpers`
+persists one dict per lookup name to `_meta.helper_policies.lookup.<lookup>`
+(`domain/helper_policies.py:80-88`) by the same `_meta`-persistence
+mechanism FK's relation policy uses -- it is not "non-durable" in the
+codebase's own persisted-vs-transient sense; it survives across pipeline
+steps exactly as FK's relation list does. What differs from FK is not
+durability but *merge discipline*: `configure_lookup_helpers` writes with
+plain overwrite (`lookup_policies[lookup] = policy`, no conflict detection,
+no cross-call identity keyed like `(source_frame, source_column)`), and at
+call time the policy is *reconciled* against inline arguments (a conflicting
+value raises) rather than centrally merged across producer calls the way
+`apply_v2_relations` merges FK relations. Each call's `output` is still the
+unit of provenance authority; `_write_provenance` explicitly discards
+whatever was previously attached to `output` when `output != source`
+("decoupled rebind"), including a foreign sibling's provenance -- there is
+no cross-call *relation* identity (as opposed to policy) for Lookup to
+preserve.
 
 *Maintainer hypothesis, refined.* This may justify Lookup Projection as an
 independently coherent capability: "given explicitly a source frame, a
@@ -152,6 +198,29 @@ FK-specific connotations (durable relation + `helper_columns[]`), while
 editing/presentation surface from canonical state and defines the
 authority... by which edits are mapped back"). This note uses "Lookup
 Projection" as descriptive label only; it does not canonicalize the name.
+
+*Terminology tension (Open terminology question, explicitly unresolved).*
+The DMC quote just cited is not a neutral synonym for "one-way derivation" --
+it structurally bakes in edit-mapping-back/inverse semantics ("defines the
+authority, precedence, conflict, and reconstruction semantics by which edits
+are mapped back toward canonical state"). Current `enrich_lookup` has no
+data-level inverse or writeback contract at all (<<6>>): it is one-way with
+respect to every projected value. By DMC's own stricter internal vocabulary,
+today's Lookup capability may be closer to what the DMC elsewhere calls "a
+one-way extraction" (`05_domain_maintainer_contract.adoc`,
+<<dmc-state-lifecycle>>: "A one-way extraction needs no invented inverse. A
+non-projection needs no fake projection precedence contract") than to a
+"projection" in DMC's full sense. So "Lookup
+Projection" may ultimately prove too strong a name for today's read-only
+capability -- "Lookup Extraction," "one-way lookup projection," or another
+term may fit better if future DMC/FTR work concludes that inverse/edit
+mapping is constitutive of what "projection" means in this repository's
+vocabulary. The future Writable Lookup hypothesis (<<6>>) is one reason
+"Projection" remains a term worth continuing to explore for this
+capability, but Writable Lookup is *not* accepted design and must not be
+used to retroactively justify calling today's read-only capability a
+"projection." This tension is recorded as open; no vocabulary is
+canonicalized by this note.
 
 *Missing-feature vs missing-semantics (Architecture inference, matches
 Cycle-1 Section 6).* The Worldbuilding forcing case
