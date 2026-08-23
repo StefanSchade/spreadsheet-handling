@@ -1,0 +1,655 @@
+= FK Helper / DCP Deletion Authority -- Slices 1-5 Integration Review
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: independent, read-only integration review of the combined runtime
+state produced by Slices 1-5 of the accepted Derived Artifact / FK Helper
+Deletion Authority workstream. This is not a sixth local slice review; each
+slice was already independently reviewed and accepted (Slice 3, Slice 4,
+Slice 5 including its FIND-S5-01 closure). The question answered here is
+whether the five accepted local changes *compose* into one coherent, closed
+deletion-authority lifecycle, with no gap or contradiction that exists only
+through their combination. No runtime, test, or canonical-document edit was
+made by this review.
+
+Repository under review:: `/home/stefan/repos/spreadsheet-handling/core`.
+
+Design baseline (pre-Slice-1):: `a46c1bc7de5ec592b09e8697aebfbe7fa126bbf6`
+(`docs(domain): close derived artifact lifecycle assessment review`).
+
+Reviewed commit range (Slices 1-5, inclusive of finding closure):: `3b507011d5c37e38b7f141905a4aa7c5e1c4f9f4`
+(`refactor(fk): report helper materialization results`) through
+`b52f8ca190e28f9d2e1dd3757ee8139dd0f5388e`
+(`docs(domain): close Slice 5 diagnostic finding`) == current `HEAD`.
+
+Accepted design:: `docs/warm_storage/global_reviews/derived_artifact_deletion_authority_design_2026-08-21.adoc`.
+
+Final design review (gate authority):: `docs/warm_storage/global_reviews/derived_artifact_deletion_authority_design_2026-08-21_review_001.adoc`
+S16.3 -- FIND-D1 through FIND-D13 *CLOSED*, implementation gate *OPEN*.
+
+Local slice reviews consulted::
+* `derived_artifact_deletion_authority_slice3_implementation_review_2026-08-22.adoc` -- *ACCEPT*.
+* `derived_artifact_deletion_authority_slice4_implementation_review_2026-08-22.adoc` -- *ACCEPT*.
+* `derived_artifact_deletion_authority_slice5_implementation_review_2026-08-22.adoc` -- initial verdict *MATERIAL CORRECTION REQUIRED* (FIND-S5-01), Section 8 closure -- *Final Slice-5 verdict: ACCEPT*, *Slices 1-5 integration review: AUTHORIZED*.
+
+Review date:: 2026-08-23.
+
+== 1. Scope / reviewed commits
+
+Five production commits and their disposed tests, in dependency order:
+
+[cols="1,3,3", options="header"]
+|===
+| Slice | Commit | Files
+
+| 1
+| `3b50701` refactor(fk): report helper materialization results
+| `core/fk.py`, `test_fk_helper_primitives_consume_policy.py`
+
+| 2
+| `d66ae9c` fix(fk): write provenance only for materialized helpers
+| `fk_helpers/enrich.py`, `test_fk_helpers_enrich.py`, `test_fk_helpers_domain.py`
+
+| 3
+| `c570db2` fix(lookup): invalidate provenance on decoupled rebind
+| `enrich_lookup/operation.py`, `test_derived_provenance_nested_ownership.py`
+
+| 4
+| `6d4caea` fix(fk): require provenance for helper deletion
+| `fk_helpers/drop.py`, `test_drop_helpers_provenance.py`
+
+| 5 + correction
+| `2afb9f4` fix(domain): enforce DCP deletion authority; `86eebab` fix(domain): make DCP deletion refusal diagnostic truthful
+| `derived_column_policy.py`, `test_derived_column_policy.py`, `test_cleanup_invariants.py`
+|===
+
+Cumulative runtime/test diff (`git diff --stat 3b50701^..b52f8ca -- src/ tests/`):
+12 files changed, 1498 insertions(+), 148 deletions(-), touching exactly the
+six files the accepted design names as mandatory
+(`core/fk.py`, `fk_helpers/enrich.py`, `fk_helpers/provenance.py` (indirectly,
+via its already-correct, unmodified read/clean primitives),
+`fk_helpers/drop.py`, `enrich_lookup/operation.py`,
+`derived_column_policy.py`) plus their test files and one architecture-guard
+allow-list. No file outside this set appears in the cumulative diff.
+
+Method: independently re-read the accepted design end-to-end (all sections
+A-T), the final design review's closure sections (13, 14, 15, 16), and all
+three local slice reviews including the FIND-S5-01 closure; then
+independently re-read the *current* HEAD state of all six mandatory files and
+`pipeline/persistence_boundary.py` line-by-line against the design's own
+reference mechanisms, rather than trusting the slice reviews' quoted
+snippets; cross-checked `registries/meta_registry.yaml`'s `derived` entry and
+`_meta.derived.sheets.*` writers repository-wide by grep; ran the full
+targeted and active test suites; searched for name-based deletion heuristics
+and claim/ledger architecture creep across the touched modules; inventoried
+current documentation drift. No production or test file was modified.
+
+== 2. Accepted integrated contract
+
+Restated once, as the composed system the rest of this review verifies
+against (accepted design Section F, as corrected through FIND-D13 and
+FIND-S5-01):
+
+A cleanup executor may delete a column identified through an FK-attributed
+name if and only if that name is currently present in
+`_meta.derived.sheets.<sheet>.helper_columns` -- truthful, same-run,
+materialized-only transient provenance that has not since been invalidated
+by a decoupled rebind of that sheet. Durable `_meta.helper_policies.fk`
+never independently authorizes deletion. Two other, structurally distinct,
+non-FK deletion identities remain untouched and legitimate: Workbook-View's
+explicit `_meta.sheets[*].helper_columns` declaration, and Lookup's own
+`enrich_lookup` provenance over its own artifact. Diagnostics must describe
+the executor's *actual final* behavior, not merely its intent.
+
+== 3. Materialization + provenance lifecycle (Invariant 1)
+
+`core/fk.py:279-375` -- `_FkHelperMaterializationResult` /
+`_materialize_fk_helpers` is exactly the design's Section E reference shape:
+per-definition, `helper_col in first_cols` (line 320) routes to
+`skipped_existing`, absence routes to `materialized`; `apply_fk_helpers`
+(line 378) is an unchanged-signature compatibility wrapper returning only
+`.frame`. `fk_helpers/enrich.py:122-140` builds
+`materialized_by_frame[frame_name] = result.materialized` -- exactly the
+provable set, never `skipped_existing` -- and passes it to
+`_write_helper_provenance`, which (`fk_helpers/provenance.py:51-68`) writes a
+`helper_columns` entry only for sheets with a non-empty materialized list and
+removes stale entries (lines 69-95) for sheets with none. No
+self-verified-reuse fallback exists anywhere in this path (grep for
+`skipped_existing` confirms its only consumer is the diagnostic list built
+alongside `materialized`, never merged into it).
+
+Attacks re-verified directly against this code, all independently confirmed
+correct: all-new helpers (both land in `materialized`); all-collision (both
+land in `skipped_existing`, no provenance entry, physical values from the
+pre-existing column untouched); mixed fresh/collision
+(`test_mixed_definitions_report_each_independently`,
+`test_mixed_definitions_provenance_contains_only_materialized`); repeated FK
+enrichment call over an already-materialized frame
+(`test_second_call_does_not_reaffirm_provenance_from_collision` -- the second
+call's own re-collision lands in `skipped_existing`, so provenance is *not*
+reaffirmed, matching the design's explicitly accepted, deliberately
+conservative replay behavior, not a regression). "Requested artifact
+identity != physical production" holds throughout: nothing in `core/fk.py`
+or `enrich.py` ever treats a durable relation's mere existence as evidence of
+this run's physical write.
+
+*Verdict: intact, no gap.*
+
+== 4. Replacement/rebind lifecycle (Invariant 2)
+
+`enrich_lookup/operation.py:495-566` matches the design's Section K
+reference implementation statement-for-statement: `decoupled = output !=
+source` (line 520) is evaluated first, unconditionally, before the `fields is
+None` short-circuit (line 521) -- so `helpers=None` decoupled rebinds reach
+invalidation exactly like fields-bearing ones (closes FIND-D9). On
+`decoupled`, `sheet_entry` starts from `{}` (line 534) regardless of what
+subkeys the prior entry held -- generic, not FK-specific, and correct for a
+replacement column that happens to reuse a formerly FK-produced label. On
+`not decoupled` (`output == source`), `sheet_entry` is the *merge* branch
+(`dict(derived_sheets.get(output, {}))`, line 536) -- the existing sibling
+`helper_columns` entry is preserved by identity, matching
+`test_enrich_lookup_same_source_preserves_sibling_fk_provenance_helpers_*`.
+
+Composition with Slices 1-2 verified directly: FK truthfully claims a helper
+(Section 3 above) -> Lookup's `output != source` call replaces the physical
+frame -> `_write_provenance`'s `decoupled` branch discards the entire prior
+sheet entry, including FK's `helper_columns`, before this call's own record
+(or nothing, if `fields is None`) is written -- confirmed by
+`test_enrich_lookup_fields_bearing_decoupled_rebind_invalidates_stale_fk_provenance`
+and `test_enrich_lookup_helpers_none_decoupled_rebind_invalidates_stale_fk_provenance`.
+No later executor can reconstruct the stale claim: neither `drop_helpers` nor
+`apply_derived_column_policy` reads anything but the current
+`_meta.derived.sheets` state at call time, and that state no longer contains
+it. The `helpers=None` case, `same-label` collision case, and brand-new
+`output` no-op case (`out.get("_meta")` untouched,
+`test_enrich_lookup_brand_new_output_decoupled_rebind_is_a_no_op`) all
+independently re-verified against the current file.
+
+*Verdict: intact, no gap.*
+
+== 5. Deletion-authority parity (Invariants 3, 4, 5)
+
+=== 5.1 Direct FK cleanup (`fk_helpers/drop.py`)
+
+`_columns_to_drop_by_sheet` (lines 84-96) takes only `provenance_by_sheet`
+and is the function's *only* deletion-candidate source; `resolve_v2_fk_relations`
+has exactly two call sites in the module (line 51, the
+missing-both-provenance-and-policy precondition; and inside
+`_log_durable_policy_only_survivors`, lines 99-133, whose return type is
+`None` and which is invoked *after* `columns_to_drop` is already finalized
+(`drop_helpers`, lines 57-62) -- it cannot feed the drop set even by
+accident. Confirmed by direct reading of the full call graph, not merely by
+absence-from-diff.
+
+=== 5.2 DCP cleanup (`derived_column_policy.py`)
+
+`apply_derived_column_policy` builds its drop set exclusively from
+`helper_names` (`enforce_derived_column_policy_frame`, lines 238-252):
+`_resolve_derived_identity`'s transient-provenance read (FK's
+`helper_columns` + Lookup's own `enrich_lookup` declaration) unioned with
+`durable_helper_names`, which is fed *only* by `_safe_durable_helper_names`
+(Workbook-View, line 118). `_durable_fk_policy_helper_names` (lines 378-407)
+-- the durable v2 FK relation reader -- has exactly one caller,
+`_fk_deletion_unauthorized_candidates` (line 494), which itself only feeds
+the findings/log diagnostic (`_fk_deletion_unauthorized_findings`, lines
+410-474) and never contributes to `helper_names`, `drop_cols`, or any value
+computed before `enforce_derived_column_policy_frame` runs (line 126). Two
+independently constructed executors -- `drop_helpers` and
+`apply_derived_column_policy` -- therefore agree on exactly one FK authority
+rule (truthful, current transient provenance; durable relation policy never
+independently authorizes), confirmed at runtime by the still-green
+`test_dcp_and_drop_helpers_agree_durable_policy_alone_is_not_authority`,
+which asserts survival at both sites from one shared fixture.
+
+=== 5.3 Genuine Slice-3 + Slice-4 composition attack
+
+Re-traced directly: durable FK policy requests `_B_name`; FK once produced it
+(truthful `materialized` provenance written); a decoupled `enrich_lookup`
+rebind replaces the physical frame at that sheet and Section K's
+invalidation removes the stale FK record (Section 4 above); the replacement
+frame still carries a column physically labeled `_B_name`, now owned by the
+rebind's caller; `drop_helpers` runs. `_columns_to_drop_by_sheet` reads
+`provenance_by_sheet`, which no longer has an entry for that sheet (Section
+4), so `_B_name` is absent from `columns_to_drop` and the replacement
+survives -- independently confirmed by
+`test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind`,
+which the Slice-4 review additionally proved fails against pre-Slice-4 code
+in an isolated worktree (not merely a look-alike test).
+
+=== 5.4 Distinct non-FK authorities (Invariant 5)
+
+Workbook-View (`_safe_durable_helper_names`) and Lookup's own declared
+identity (`_resolve_derived_identity`'s `enrich_lookup` half) remain
+independent deletion sources, structurally untouched by the durable-FK-policy
+removal -- confirmed by direct reading (neither reads
+`_durable_fk_policy_helper_names` or `resolve_v2_fk_relations`) and by the
+still-green same-label-collision attacks:
+`test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelated_durable_fk_policy`
+(deletion outcome) and the FIND-S5-01 closure pair,
+`test_workbook_view_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+and `test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+(deletion *and* no false diagnostic). Both attacks construct a column named
+by durable FK relation policy *and* by one of these other authorities, with
+no truthful FK transient provenance -- deletion succeeds via the other
+authority, and (post-`86eebab`) no `fk_deletion_unauthorized` finding fires.
+
+*Verdict: intact, no gap. This is the review's most composition-sensitive
+area and it holds.*
+
+== 6. DCP publication lifecycle (Invariant 6)
+
+Direct grep of every `out[...] =` write in the current
+`derived_column_policy.py` finds exactly three: `out[payload_target] =
+cleaned` (line 181, unconditional), `out[findings] =
+findings_to_frame(...)` (line 209, `warn_on_mismatch` only), and
+`out[META_KEY] = new_meta` (line 216, metadata, not a `DataFrame`). No fourth
+publication exists; `enforce_derived_column_policy_frame` returns a tuple and
+writes into no mapping. This independently reproduces the design's own and
+Review 001 S16.1's inventory.
+
+* *A -- `payload_target == source`* (`output` is `None`, `""`, or literally
+  `source`): same-target branch (lines 193-196), strips `source`'s own
+  consumed provenance -- continuation semantics, unchanged in effect from
+  pre-Slice-5 `replacing` behavior. All three aliases confirmed to resolve
+  identically by `payload_target = output or source` (line 180), the single
+  place raw `output` feeds a lifecycle decision in the module (grep
+  confirms).
+* *B -- `payload_target != source`*: decoupled branch (lines 197-201),
+  invalidates any pre-existing entry at `payload_target` only if one exists
+  (`test_payload_decoupled_target_invalidates_preexisting_provenance`,
+  `test_payload_decoupled_new_frame_target_is_true_noop`); `source`'s own
+  entry is never touched by this branch.
+* *C/D -- `output=None` / `output=""`*: both alias to `payload_target =
+  source`, same-target branch, per A --
+  `test_payload_output_empty_string_and_none_both_alias_to_source_target`
+  (parametrized) confirms both.
+* *E -- findings publication*: unconditional under
+  `policy == "warn_on_mismatch"` (lines 208-213), always freshly synthesized,
+  its own invalidation runs regardless of what `findings` equals --
+  `test_findings_publication_invalidates_preexisting_provenance_at_target`.
+* *F -- `findings == payload_target`*: payload publish-and-invalidate runs
+  first (lines 193-201) against `new_meta`, findings publish-and-invalidate
+  second (lines 208-213) against the *same, already-updated* `new_meta` local
+  -- the findings write is the last physical writer to that name and its own
+  invalidation re-checks accumulated state, a safe no-op if payload's branch
+  already stripped it. Directly confirmed physically, not merely at the
+  provenance level, by
+  `test_findings_equals_payload_target_publication_order_leaves_no_stale_provenance`
+  (`out["B"].columns == FINDING_COLUMNS`).
+
+`_strip_consumed_provenance` (lines 510-549) is the single reused primitive
+at all three invalidation call sites; it copies rather than mutates its
+input at every level (`dict(meta)`/`dict(derived)`/`dict(sheets)`) and prunes
+empty containers.
+
+*Verdict: intact, no gap. No third publication bypasses lifecycle handling.*
+
+== 7. Persistence/reimport behavior (Invariant 8)
+
+`pipeline/persistence_boundary.py:112-114`:
+`RUNTIME_ONLY_TOP_LEVEL_META_KEYS = {"derived", "frame_lifecycle",
+"pipeline_cleanup"}` -- top-level `_meta.derived` (the transient
+`helper_columns` / `enrich_lookup` namespace both cleanup executors read) is
+unconditionally pruned before persistence; `helper_policies` (durable FK
+relations) and `sheets[*].helper_columns` (Workbook-View) are not in this
+set and survive unchanged (`project_meta_to_persistable_contract`, lines
+130-158, passes through anything not explicitly matched).
+
+Consequence, independently re-derived: after a reimport with no fresh
+`add_fk_helpers` pass in the same session, `_meta.derived` is empty for that
+sheet in both executors, so neither `drop_helpers` nor
+`apply_derived_column_policy` can authorize FK-attributed deletion from
+durable policy alone -- both fail closed (leave the column in place,
+non-raising diagnostic). The explicit, supported migration route,
+`_meta.sheets[*].helper_columns` declared via `configure_workbook_view`,
+remains available and unaffected by the pruning rule, confirmed at the
+roundtrip layer by the paired
+`test_helper_column_survives_reimport_when_only_durable_fk_policy_names_it`
+(fails closed) and
+`test_helper_cleanup_survives_reimport_when_workbook_view_declares_helper_columns`
+(succeeds via the declared carrier) in `tests/roundtrip/test_cleanup_invariants.py`,
+which the Slice-5 review confirmed differ by exactly the one declared
+boolean.
+
+*Verdict: intact, no gap. Both executors behave consistently; the
+Workbook-View migration route remains available.*
+
+== 8. Diagnostics/failure semantics (Invariants 9, 10)
+
+=== 8.1 Diagnostic truthfulness (FIND-S5-01 re-verification)
+
+`_fk_deletion_unauthorized_candidates` (lines 477-507) computes
+`present_labels` from `cleaned.columns` (line 502) -- the frame *after*
+`enforce_derived_column_policy_frame`'s own drop, i.e. after every
+currently accepted deletion authority (transient FK provenance,
+Workbook-View, Lookup's own identity) has already had its chance to remove
+the column. A column any of those authorities validly removed is, by
+construction, absent from `cleaned` and therefore never reaches the
+candidate set. This is the exact post-fix shape the Slice-5 closure review
+verified against `86eebab`; independently re-confirmed here by reading the
+current file directly (not by re-trusting the prior review's quoted diff)
+and by the still-passing
+`test_workbook_view_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+/ `test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+pair in this run's own full-suite execution (Section 12).
+
+`fk_helpers/drop.py`'s `_log_durable_policy_only_survivors` (lines 99-133) is
+independently gated the same way: it only fires for a sheet *absent* from
+`provenance_by_sheet` and only when the named column is still physically
+present (`source_frame_has_column`) -- symmetric truthfulness discipline at
+the sibling executor, though log-only (no findings-frame surface exists for
+`drop_helpers`).
+
+=== 8.2 Failure/strictness semantics
+
+`_fk_deletion_unauthorized_findings` (lines 410-474) constructs findings with
+`severity="warn"` unconditionally and returns `[]` under any policy other
+than `warn_on_mismatch` (routing instead through `log.warning`, lines
+466-473). `failures = [finding for finding in found if finding.severity ==
+"fail"]` (line 138) can therefore never contain an authorization-refusal
+entry under any policy, including `fail_on_mismatch` -- the diagnostic is
+structurally incapable of reaching the `raise ValueError(...)` path (line
+139-140). Ordinary genuine `severity == "fail"` value-mismatch findings
+(from `_check_enrich_lookup_values`) are computed independently and their
+raise behavior is untouched.
+
+`drop_helpers`'s `missing_fk_policy_error` precondition (`relations is None
+and not provenance_by_sheet`, line 54) remains distinct from, and unaffected
+by, the fail-closed deletion-refusal path: after a reimport with surviving
+durable FK relations, `relations is not None`, so no precondition error
+fires even though provenance is absent -- the column simply survives with a
+diagnostic, matching Section G's disposition exactly. No accidental coupling
+was found between deletion authorization and mismatch strictness anywhere in
+either executor.
+
+*Verdict: intact, no gap.*
+
+== 9. Original defect reproductions / closure (Invariant 17)
+
+Both originally confirmed dangerous shapes independently re-traced end to
+end against current `HEAD`:
+
+*1 -- existing-label collision.* FK requests a label Lookup/caller already
+owns -> `_materialize_fk_helpers` reports `skipped_existing`, not
+`materialized` (Section 3) -> `enrich.py` writes no provenance for it -> no
+executor has FK deletion authority for that label -> the foreign column
+survives any cleanup pass. Closed by Slices 1-2 alone, unregressed by
+Slices 3-5.
+
+*2 -- durable-policy-only replacement/reimport.* Durable FK relation names a
+helper; no current truthful FK provenance exists (never materialized this
+run, or stripped by persistence); a same-label physical column exists ->
+neither `_columns_to_drop_by_sheet` (Slice 4) nor `helper_names` in DCP
+(Slice 5) is fed by durable policy -> the column survives, with a
+non-raising diagnostic naming the real reason. Independently reconfirmed by
+this review's own test run of
+`test_durable_fk_policy_alone_does_not_authorize_deletion(_after_persistence_boundary)`,
+`test_drop_survives_v2_policy_only_column_when_provenance_missing`, and the
+roundtrip pair in Section 7.
+
+*Verdict: both original defect families remain closed through the combined
+system.*
+
+== 10. Test matrix (Invariant 14)
+
+Every required cell has at least one maintained, currently-passing test;
+none is a lower-layer-only proof standing in for a required integration
+proof.
+
+[cols="4,4", options="header"]
+|===
+| Semantic invariant | Maintained test(s)
+
+| Materialized vs `skipped_existing`
+| `test_absent_label_is_materialized_and_not_skipped`, `test_pre_existing_label_is_skipped_and_not_materialized`
+
+| No false FK provenance on collision
+| `test_collision_writes_no_provenance_and_leaves_values_untouched`, `test_mixed_definitions_provenance_contains_only_materialized`
+
+| No self-reuse on replay
+| `test_second_call_does_not_reaffirm_provenance_from_collision`
+
+| Lookup decoupled-rebind invalidation (fields-bearing)
+| `test_enrich_lookup_fields_bearing_decoupled_rebind_invalidates_stale_fk_provenance`
+
+| Lookup decoupled-rebind invalidation, `helpers=None`
+| `test_enrich_lookup_helpers_none_decoupled_rebind_invalidates_stale_fk_provenance`
+
+| Same-owner stale-record invalidation
+| `test_enrich_lookup_decoupled_rebind_invalidates_stale_own_lookup_record`
+
+| Same-source over-invalidation guard
+| `test_enrich_lookup_same_source_preserves_sibling_fk_provenance_helpers_present/_none`
+
+| Direct durable-policy-only fail-closed (`drop_helpers`)
+| `test_drop_survives_v2_policy_only_column_when_provenance_missing`
+
+| Genuine Slice-3+4 composition (same-label replacement survives)
+| `test_drop_survives_genuine_same_label_replacement_after_decoupled_rebind`
+
+| DCP durable-policy-only fail-closed
+| `test_durable_fk_policy_alone_does_not_authorize_deletion`, `..._after_persistence_boundary`
+
+| Workbook-View authority (alongside unrelated durable FK policy)
+| `test_workbook_view_helper_columns_still_authorizes_cleanup_alongside_unrelated_durable_fk_policy`
+
+| Lookup authority, same-label FK-policy collision
+| `test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+
+| `output=""` alias
+| `test_payload_output_empty_string_and_none_both_alias_to_source_target`
+
+| Decoupled payload publication
+| `test_payload_decoupled_target_invalidates_preexisting_provenance`, `..._new_frame_target_is_true_noop`
+
+| Findings fresh publication
+| `test_findings_publication_invalidates_preexisting_provenance_at_target`
+
+| `findings == payload_target`
+| `test_findings_equals_payload_target_publication_order_leaves_no_stale_provenance`
+
+| Persistence/reimport fail-closed
+| `test_helper_column_survives_reimport_when_only_durable_fk_policy_names_it`
+
+| Explicit Workbook-View migration path
+| `test_helper_cleanup_survives_reimport_when_workbook_view_declares_helper_columns`
+
+| FIND-S5-01 Workbook-View collision (no false diagnostic)
+| `test_workbook_view_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+
+| FIND-S5-01 Lookup collision (no false diagnostic, genuine mismatch preserved)
+| `test_lookup_identity_authorized_removal_emits_no_false_fk_deletion_unauthorized`
+
+| Direct-executor parity (`drop_helpers` vs DCP agree)
+| `test_dcp_and_drop_helpers_agree_durable_policy_alone_is_not_authority`
+
+| Meta-copy / caller-input mutation discipline
+| `test_enrich_lookup_provenance_write_invalidates_stale_output_on_decoupled_rebind`, `test_decoupled_payload_invalidation_preserves_unrelated_meta_and_sheets`
+|===
+
+No genuinely uncovered integration boundary was found. One pre-existing,
+already-recorded, non-blocking test-completeness nit remains open from the
+Slice-5 review (Area 7): `output=source` as a *literal string* has no
+dedicated parametrize case alongside `None`/`""`, though the equivalence is
+structurally implied by the shared `payload_target == source` branch. Not
+reopened as a new finding here (see Section 12).
+
+== 11. Documentation/registry drift inventory for Slice 6 (Invariant 15)
+
+Inspected `docs/user_guide/`, `docs/functional_model/`,
+`docs/technical_model/`, `docs/developer_guide/`,
+`docs/ai_info/concepts_fk_helpers.adoc`, `docs/semantic_model/12_contract_matrices.adoc`,
+`registries/meta_registry.yaml`, `registries/pipeline_step_registry.json`,
+and `docs/release_notes/release_notes.adoc`. No edits made.
+
+[cols="4,2,5", options="header"]
+|===
+| Item | Classification | Note
+
+| `docs/ai_info/concepts_fk_helpers.adoc:60-61` -- "`remove_fk_helpers`
+  removes columns identified by derived provenance or v2 relation policy;
+  missing both raises clearly"
+| MUST UPDATE IN SLICE 6
+| States the pre-Slice-4 durable-fallback behavior as current. Already named
+  by the design's own Section M.
+
+| `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc:130-133` --
+  "`remove_fk_helpers` ... uses the v2 relation list as a fallback when
+  provenance is absent"
+| MUST UPDATE IN SLICE 6
+| Same stale claim; already flagged by the Slice-5 review (Area 20) as known,
+  not a Slice-5 defect.
+
+| `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc:184-188` --
+  "Cleanup direction: `remove_fk_helpers` follows the derived helper
+  provenance per sheet and uses the v2 relation policy as a fallback when
+  provenance is missing"
+| MUST UPDATE IN SLICE 6
+| Second instance of the same stale claim in the same file.
+
+| `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc:144-151`
+  ("Reimport cleanup" paragraph naming the Workbook-View carrier, not FK
+  relation policy)
+| ALREADY CURRENT
+| Correctly names `_meta.sheets.<frame>.helper_columns` as the durable
+  reimport-cleanup path for `apply_derived_column_policy`; unaffected by
+  this workstream. The Slice-5 review already noted only the
+  `remove_fk_helpers`-focused passage is stale, not this one.
+
+| `docs/semantic_model/12_contract_matrices.adoc:99-103` (`remove_fk_helpers`
+  row) and `:169-172` (`remove_fk_helpers` Matrix-2 row's missing-metadata
+  column, less severe -- already says "must not use prefix-based fallback")
+| Row at 99-103: MUST UPDATE IN SLICE 6; row at 169-172: ALREADY CURRENT
+| The Matrix-1 row still lists `helper_policies.fk.relations (v2)` as a
+  "fallback only, when per-sheet provenance is absent" input to
+  `remove_fk_helpers`. The Matrix-2 row already correctly states the
+  prefix-fallback removal and is unaffected.
+
+| `docs/semantic_model/12_contract_matrices.adoc` `reorder_fk_helpers` rows
+  (durable-policy "fallback" language)
+| HISTORICAL ARTIFACT -- DO NOT REWRITE (out of this workstream's scope)
+| `reorder_fk_helpers` is not one of the design's mandatory executor sites
+  and was not touched by any of Slices 1-5; this text describes unrelated,
+  unmodified behavior for that primitive and must not be conflated with the
+  `remove_fk_helpers` drift above.
+
+| `docs/functional_model/ch04_use_case_concepts/fk_helpers.adoc`, "Drop FK
+  Helpers" step: "*FK relation declaration* -- optional; last-resort
+  reconstruction of expected column names from declared relations" (consumed
+  inputs list), and `fk_relations` in its "Semantic Model Reference"
+| MUST UPDATE IN SLICE 6
+| Durable FK relation policy is no longer consulted by either cleanup
+  executor for deletion-candidate identity at all, at any priority --
+  "last-resort" is now false, not merely reordered. Already anticipated by
+  the design's Section M functional-model note (owner sign-off deferred, not
+  decided there).
+
+| `docs/user_guide/ch03_transformation_catalog/03_supporting_steps.adoc`
+  (`remove_fk_helpers`, `apply_derived_column_policy` catalog entries)
+| ALREADY CURRENT
+| Neither entry claims durable FK relation policy authorizes deletion; the
+  `apply_derived_column_policy` entry already correctly names only the
+  Workbook-View fallback.
+
+| `registries/meta_registry.yaml` `derived` entry (`persistence_behavior`,
+  `scope`)
+| OPTIONAL CLARIFICATION
+| Correctly lists the schema's exactly two maintained sub-keys
+  (`helper_columns`, `enrich_lookup`, independently re-confirmed against the
+  current writer grep in Section 12) and correct `persistence_behavior`
+  wording; does not yet state the deletion-authority freshness precondition
+  the design's Section M recommends adding. Non-blocking: the registry text
+  is not contradicted, only incomplete.
+
+| `registries/pipeline_step_registry.json`, `apply_derived_column_policy`
+  entry (`meta_contract.writes: []`; static `frame_contract.writes`)
+| OPTIONAL CLARIFICATION
+| Pre-existing gap the design's own Section M explicitly identifies as
+  already stale *before* this workstream and not required for correctness
+  (registry contracts are documentation, not runtime-enforced). Not
+  introduced or worsened by Slices 1-5.
+
+| `docs/release_notes/release_notes.adoc`
+| MUST UPDATE IN SLICE 6
+| No entry exists for the durable-policy-only deletion-authority narrowing.
+  Active unreleased section is confirmed to be `== unknown -- planned`
+  (line 17); the most recent frozen section is `== 0.2.1 (released)`
+  (line 547) -- any Slice-6 bullet belongs under the former per the
+  repository's placement rule. Already flagged as outstanding by both the
+  Slice-4 and Slice-5 reviews; not a new observation.
+|===
+
+No documentation item found here is new; every MUST-UPDATE item was already
+named, or directly predicted, by the accepted design's own Section M or by
+the Slice-4/Slice-5 reviews' Area 19/20 observations. This review adds
+independent re-confirmation against current file content and line numbers,
+and one previously unlisted instance (the `12_contract_matrices.adoc` Matrix-1
+row).
+
+== 12. Findings
+
+No MATERIAL finding. No new MINOR finding.
+
+One pre-existing, already-recorded MINOR item is carried forward, not
+reopened: the Slice-5 review's Area 7 observation that `output=source` (the
+literal string) lacks its own dedicated parametrize case, structurally
+implied but not textually proven. Unaffected by, and orthogonal to,
+composition across slices.
+
+Independent verification performed for this review, beyond re-reading the
+three slice reviews' own conclusions:
+
+* Re-ran the full active suite fresh against current `HEAD`
+  (`pytest tests/unit tests/integration tests/roundtrip tests/architecture`):
+  **2881 passed**, exit code 0 -- the identical count the Slice-5 closure
+  review recorded, confirming no drift since that review.
+* Independently re-read all six mandatory files' current bodies end to end
+  (not diffs), confirming each matches the design's own reference mechanism
+  section by section.
+* Repository-wide grep for every writer of `_meta.derived.sheets[*]`
+  sub-keys: exactly two (`enrich_lookup/operation.py:560-562`,
+  `fk_helpers/provenance.py:67-68`), matching the registry's and the
+  Slice-5 review's "exactly two maintained sub-keys" claim independently.
+* Repository-wide grep for name/prefix/shape-based deletion heuristics
+  (`startswith`, value/formula equality, "claimed"/"self-reused" logic) in
+  the touched modules: none found beyond the accepted `helper_prefix`
+  materialization-label parameter, which is never consulted for deletion.
+* Repository-wide grep for claim/ledger/refcount/generation-ID/lifecycle-bus
+  vocabulary in the touched modules: none found in production code (one
+  docstring comment in `enrich.py` uses "claimed" in the design's own,
+  already-accepted sense of "provenance recorded").
+* `git diff --check`: clean. Worktree unchanged except for this artifact
+  (confirmed by `git status --porcelain=v1 --branch` before and after).
+
+== 13. Final verdict
+
+*ACCEPT.*
+
+Slices 1-5 compose into one coherent, closed deletion-authority lifecycle
+with no gap or contradiction found through their combination. Both original
+confirmed data-loss shapes (existing-label collision; durable-policy-only
+replacement/reimport) remain closed end to end through the combined system.
+The two mandatory cleanup executors (`drop_helpers`,
+`apply_derived_column_policy`) agree on exactly one FK deletion-authority
+rule and no other. Workbook-View and Lookup-owned deletion identities remain
+distinct, functioning, and correctly diagnosed (FIND-S5-01's fix holds under
+independent re-verification). The persistence boundary consistently narrows
+both executors' authority the same way, with the documented Workbook-View
+migration route intact. DCP's publication lifecycle covers its complete,
+independently re-confirmed two-publication inventory. No claim/ledger
+architecture creep and no name-based deletion heuristic was reintroduced
+anywhere in the touched modules. The full active test suite is green at the
+exact count the last local review recorded, and the targeted test matrix
+covers every required integration boundary. Documentation drift exists but
+is entirely pre-identified, correctly bounded to the optional Slice 6, and
+not material to runtime correctness.
+
+== 14. Next-step authorization
+
+    Mandatory Slices 1-5 runtime work: INTEGRATED
+    Slice 6 documentation/lifecycle closure: AUTHORIZED
+
+Return to the interrupted DMC FK-helper hardening cycle is *not* authorized
+by this review. Per this review's own brief, that return occurs only after
+Slice 6 / project-memory-roadmap closure.
