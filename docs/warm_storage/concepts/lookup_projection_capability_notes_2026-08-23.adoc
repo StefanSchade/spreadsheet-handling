@@ -1,0 +1,394 @@
+= Lookup Projection — Capability Concept Notes
+:toc:
+:toclevels: 2
+
+Status: non-binding architecture concept note. Future design input only.
+Authorizes no source, test, registry, model, Trusted-Ingress, FTR, or Cycle-1
+assessment change.
+
+Date: 2026-08-23.
+
+== 1. Status and purpose
+
+This note matures an initial maintainer/ChatGPT sketch of a possible
+conceptual distinction between two capabilities that currently share
+join/projection mechanics in the `core` runtime:
+
+* *FK Relation Helpers* (`add_fk_helpers` / `domain/transformations/fk_helpers/`)
+* *Lookup Projection* (`add_lookup_helpers` / `domain/transformations/enrich_lookup/`)
+
+and a possible future third capability, *Writable Lookup Projection*, whose
+semantics are not accepted and whose MVP may deliberately stay read-only.
+
+It exists to preserve a maintainer insight before it is lost, not to decide
+it. It is explicitly *not*:
+
+* a canonical DMC decision;
+* an FTR commitment;
+* a new public API;
+* a requirement that Lookup remain separate from FK;
+* a requirement that FK and Lookup merge; or
+* an implementation plan.
+
+Where the note draws a line, it labels the line as one of:
+
+`Current fact` (independently re-derived from runtime this session) ·
+`Historical evidence` (from prior review artifacts) ·
+`Maintainer hypothesis` (the insight under test) ·
+`Architecture inference` (this note's own reasoning) ·
+`Open question` (unresolved, needs future evidence).
+
+== 2. Evidence base / relationship to current DMC work
+
+*Historical evidence.* The active backlog item
+`docs/backlog/FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5.adoc` frames
+FK Relation Helpers and Lookup Projection as one overlapping helper-column
+concept with two public routes, and records a *working hypothesis* (not a
+decision) that `add_fk_helpers` is the likely surviving canonical surface.
+The independent `docs/warm_storage/global_reviews/domain_fk_reference_helper_cycle1_reentry_assessment_2026-08-23.adoc`
+(awaiting its own separate review; not altered by this note) re-derived a
+current-runtime capability matrix, reconfirmed Cycle-0/Review-001's
+separate-semantic-ownership conclusion, and recommended F-002 (closing a
+`derived_column_policy.py` cross-owner knowledge leak) as the next bounded
+slice -- explicitly *not* surface consolidation.
+
+*This note's evidence.* Independently re-read for this note, not accepted
+from prior prose alone:
+`domain/transformations/fk_helpers/{enrich,drop,policy,provenance}.py`,
+`domain/transformations/enrich_lookup/{operation,policy,provenance}.py`,
+relevant sections of `derived_column_policy.py`, and
+`docs/ai_info/concepts_fk_helpers.adoc` /
+`docs/ai_info/architecture_primer.adoc` (`meta_canonical` vs `meta_rendering`,
+the transient `_meta.derived` channel). Findings below match the Cycle-1
+capability matrix; where this note adds detail, it is marked.
+
+This note takes no position on, and does not alter, the Cycle-1 assessment's
+F-002 recommendation or its "not yet authorized" status. It is deliberately
+upstream of that recommendation: a possible future re-test of the
+surface-consolidation FTR's premise, not a substitute for the currently
+recommended next slice.
+
+== 3. Working capability distinction
+
+=== 3.1 FK Relation Helpers
+
+*Current fact.* `add_fk_helpers` (`fk_helpers/enrich.py::enrich_helpers`)
+reads a *durable* relation list from `_meta.helper_policies.fk.relations`
+(schema_version 2), written by one of two producer steps
+(`configure_fk_helpers`, `infer_fk_relations`) that centrally
+conflict-resolve entries keyed by `(source_frame, source_column)`
+(`apply_v2_relations`). The primitive itself never infers relation identity
+from column names; missing policy is a clear error. It groups relations by
+source frame, skips a relation whose target frame is absent from the current
+run (explicit replay-safety rule, not a silent inference), and writes
+transient materialization provenance
+(`_meta.derived.sheets.<sheet>.helper_columns[]`) only for definitions
+actually materialized this call -- a label that collides with an existing
+column is silently not materialized and not claimed in provenance.
+`remove_fk_helpers`, `reorder_fk_helpers`, and `validate_fk_helpers` are
+separate registered steps that consume this same durable relation
+policy/provenance rather than local per-call state.
+
+*Maintainer hypothesis, reconfirmed.* A user of FK Relation Helpers is not
+merely requesting one join. A durable relation is part of the model and
+supplies a channelled lifecycle: declaration (by a producer step), helper
+availability/defaults (the relation's `helper_columns[]`), materialization
+(`add_fk_helpers`), naming (the relation's own declared `column` field --
+see the correction below), provenance, validation (`validate_fk_helpers`),
+ordering (`reorder_fk_helpers`), and cleanup (`remove_fk_helpers`, whose
+deletion authority is scoped to current transient provenance only, per the
+already-closed Deletion Authority subroutine). The underlying join is still
+a key lookup; the user-facing contract spans a relation's whole lifecycle,
+not one call.
+
+*Correction to the original sketch (Current fact, re-derived this session).*
+The original note attributed FK's output-naming capability to
+`helper_prefix`. Independently checked this session:
+`fk_helpers/enrich.py` calls `core.fk._materialize_fk_helpers` with a
+*hardcoded literal* `helper_prefix="_"`, which that function only falls back
+to when a relation's `helper_columns[]` entry has no explicit
+`helper_column` (`core/fk.py:311`,
+`fk.get("helper_column") or f"{helper_prefix}{target_key}_{value_field}"`).
+The pipeline-step-facing `helper_prefix` parameters on `remove_fk_helpers`
+and `reorder_fk_helpers` are separately confirmed dead (`drop.py`: `del
+prefix  # retained for backwards-compatible step binding only`). So: FK's
+real output-naming mechanism is the *declared `helper_columns[].column`
+field in relation policy* -- config-schema data belonging to the relation,
+not a live `helper_prefix` knob at any layer. This matches the Cycle-1
+assessment's independent finding (its Section 4 naming-asymmetry row) and is
+restated here because it changes what "FK's naming capability" actually
+*is*: a fact carried by the durable relation, not a separate mechanism.
+
+=== 3.2 Lookup Projection
+
+*Current fact.* `add_lookup_helpers` (`enrich_lookup/operation.py`) takes,
+per call: `source`, `lookup`, `output`, an explicit join-key pair (symmetric
+`key`/`keys`/legacy `on`, or opt-in asymmetric `source_key`/`lookup_key`,
+mutually exclusive, no partial fallback between them), `helpers` (fields to
+project, optionally `"default"` against an optional non-durable helper
+policy), `order`, `missing`, and `helper_value_mode`. There is no relation
+declaration: an optional `_meta.helper_policies.lookup.<lookup>` policy may
+supply defaults, but it is *reconciled* against the call's inline arguments
+(conflicting values raise) rather than centrally merged across calls the way
+`apply_v2_relations` merges FK relations. Each call's `output` is the unit of
+provenance authority; `_write_provenance` explicitly discards whatever was
+previously attached to `output` when `output != source` ("decoupled
+rebind"), including a foreign sibling's provenance -- there is no
+cross-call relation identity to preserve.
+
+*Maintainer hypothesis, refined.* This may justify Lookup Projection as an
+independently coherent capability: "given explicitly a source frame, a
+lookup frame, a source key, a lookup key, projected fields, optional
+projected output names, and an output frame/representation, produce a
+projection -- without requiring that the key relationship be durable
+FK-domain knowledge."
+
+*Naming question (Open question, not decided here).* Is "free join" too
+broad a name? "Lookup Projection" reads better than "Lookup Helper" for this
+note's purpose, because "helper" in this repo's vocabulary already carries
+FK-specific connotations (durable relation + `helper_columns[]`), while
+"Projection" is existing DMC working vocabulary (`05_domain_maintainer_contract.adoc`,
+<<dmc-working-model>>: "a transformation that derives a domain-suitable...
+editing/presentation surface from canonical state and defines the
+authority... by which edits are mapped back"). This note uses "Lookup
+Projection" as descriptive label only; it does not canonicalize the name.
+
+*Missing-feature vs missing-semantics (Architecture inference, matches
+Cycle-1 Section 6).* The Worldbuilding forcing case
+(`places.region_id -> regions.id`, required `_regions_name`/`_regions_kind`,
+`places` already owning `name`/`kind`) is real: `add_lookup_helpers` has no
+per-field output-alias/prefix mapping today and correctly raises
+`_check_column_conflict` rather than silently shadowing. But this is a
+*config-schema gap* in Lookup's `helpers` shape (no alias field), not
+evidence that output aliasing requires FK's durable-relation lifecycle. A
+hypothetical alias field on `helpers` could close this gap without adopting
+FK's relation-Intent shape. This note takes no position on whether/when to
+add such a field -- doing so is explicitly surface-consolidation-FTR scope,
+not this note's.
+
+*`output == source` (Current fact).* `output` has no default and nothing
+special-cases `output == source`; passing them equal already yields
+in-place-equivalent decoration of the source frame's own name. The real gap
+versus FK is that FK has no way to target a *different* output frame at all,
+not that Lookup lacks an in-place mode. Separate-output has independent
+semantic value beyond "same as FK but can also do more": it lets a
+projection publish a new, separately named representation (e.g.
+`story_group_matrix_view`) without any relation ever being declared over the
+source frame at all -- a shape FK's model does not have a way to express,
+because FK's Intent is anchored to a source-frame relation, not to an
+independent output identity.
+
+== 4. Shared mechanism does not imply shared semantics
+
+*Architecture inference, consistent with DMC <<dmc-working-model>>
+("evidence is not ownership proof").* Both capabilities ultimately perform a
+key-based frame join and column projection, and both share the
+`LookupFormulaSpec` backend-neutral formula carrier
+(`core/formulas.py`) in formula mode. Neither fact is ownership evidence.
+What differs is the *Intent* each call is answering:
+
+* FK: "materialize the currently declared, durable relation's helper
+  columns for this run" -- the call is subordinate to standing relation
+  policy that outlives any one call and is itself centrally
+  conflict-resolved.
+* Lookup: "produce this one explicit projection from these keys and fields,
+  now" -- the call is authoritative for its own output identity; an
+  optional helper policy supplies defaults but never accumulates
+  cross-call relation state the way FK's policy does.
+
+This reconfirms, rather than newly proves, the Cycle-0/Review-001/Cycle-1
+separate-ownership conclusion; this note found no runtime evidence this
+session that weakens it, and one further piece of runtime detail (the
+relation-vs-per-call policy-merge asymmetry above) that sharpens it.
+
+== 5. Projection lifecycle vs editability
+
+*Maintainer hypothesis, restated carefully.* Editability and lifecycle are
+different questions. A projected column may be:
+
+* (A) a derived projection artifact expected to disappear on inverse/cleanup
+  (FK's and Lookup's current helper columns are both this today -- neither
+  has a data-level inverse; "cleanup" removes/reconciles provenance-tracked
+  *columns*, it does not reconstruct edited *values*); or
+* (B) part of a newly materialized representation state that a later stage
+  of a pipeline now treats as ordinary data, with no expectation of ever
+  being cleaned up as a "helper."
+
+Neither is inferable from surface signals alone: same frame name (in-place
+decoration), a separate output frame, or the physical presence of a column
+in a sheet are all consistent with either (A) or (B). Today, current
+runtime evidence supports only (A) for both FK and Lookup: `remove_fk_helpers`
+and Lookup's provenance-rebind-on-`output`-change both exist to *undo*
+projection, and nothing in the current codebase promotes a projected helper
+column into a capability the pipeline treats as canonical going forward.
+Case (B) is not evidenced as implemented anywhere today; it is preserved
+here only as a distinct possible future shape, so that a later writable
+extension (<<6>>) is not designed as if (A) were the only possible outcome.
+
+*Illustrative-only vocabulary, not canonical.* This note uses "derived
+projection artifact," "materialized representation state," and a pipeline
+shorthand `R0 -> R1 -> R2` for successive representation stages purely to
+name the (A)/(B) distinction above. None of this is established repository
+vocabulary: `R0`/`R1`/`R2` do not appear anywhere else in this repository,
+and "representation state" is not a term owned by the Semantic or Technical
+Model. The only canonical adjacent vocabulary is `meta_canonical` /
+`meta_rendering` and the transient `_meta.derived` channel
+(`docs/ai_info/architecture_primer.adoc`), which already distinguishes
+*persisted source-of-truth* from *derived-for-this-run* state at the
+metadata layer -- this note's (A)/(B) split is a candidate finer-grained
+question about *column data*, not a restatement of that existing metadata
+split, and should not be conflated with it.
+
+== 6. Writable Lookup Projection — exploratory only
+
+*Not accepted design.* The maintainer's stronger case: a projected Lookup
+value could optionally write back to the lookup *target* (e.g. an edited
+`regions.name` value flows back into `regions.name`), not merely become an
+ordinary source-frame column. No implementation, schema, or API is proposed
+here.
+
+=== 6.1 Target writeback
+
+The minimal shape under exploration: writeback would need to be explicitly
+opted into (never implied by the current read-only projection contract), and
+would need an explicit, documented conflict policy wherever multiple
+projected rows can target the same lookup entity (<<6.2>>) and an explicit
+rule for detecting a stale projection before it writes (<<6.3>>).
+
+=== 6.2 Multi-source conflict
+
+*Maintainer hypothesis, illustrative only.* Example: `Place A` and
+`Place B` both reference `Region 7` ("Bayern"). If a user edits A's
+projected name to "Bayern Süd" and B's to "Bayern Nord", a future writable
+projection might use an explicit deterministic priority rule -- e.g. "last
+projected/source row wins" -- so `Region 7.name` becomes "Bayern Nord" and
+A's edit is overwritten. That overwrite is not itself an error *if* the
+priority rule is explicit and documented; it is an error if the rule is
+implicit or accidental (e.g. incidental DataFrame row order). This note
+records only the open design requirement -- *conflict/writeback priority
+must be explicit if writable projection is ever accepted* -- and treats
+`last_row_wins` / `priority` / `conflict policy` as illustrative vocabulary
+only. No API or precedence rule is authorized by this note.
+
+=== 6.3 Binding stability / key changes
+
+*Open question, the critical unresolved case.* Forward state: `Place A`
+projects `region_name = "Bayern"` from `region_id = 7`. The user then
+changes `region_id` to `8`, but the sheet still physically shows
+`region_name = "Bayern"` (no re-projection has run yet). A naive inverse
+using the *current* key would write stale Region-7 data into Region 8 --
+unsafe.
+
+Emerging possible rule (not accepted): a writable projected value is bound
+to the lookup entity from which it was originally projected; if the current
+join identity differs from that original binding at writeback time, the
+projected value is stale and must not silently write into the newly
+referenced entity. This resembles binding-stability / optimistic-lock
+semantics, but neither term is canonicalized by this note.
+
+Three sub-cases, to be explored separately in any future design, not
+resolved here:
+
+. *Helper changed, key unchanged* -- potentially unambiguous writeback (the
+  binding target didn't move).
+. *Key changed, helper unchanged* -- likely relation reassignment only; the
+  old projected value becomes stale and should not write into the new
+  target.
+. *Key changed, helper changed* -- intent is ambiguous; likely requires an
+  explicit failure or forced re-projection rather than an inferred
+  writeback.
+
+== 7. Read-only minimum capability
+
+*Maintainer hypothesis, recorded as the likely near-term posture.* Writable
+Lookup is *not* required to justify Lookup Projection as an independently
+coherent framework capability. A deliberately read-only first semantic
+contract -- explicit keyed projection, aliases, output selection, ordering,
+and a well-defined projection lifecycle (<<5>>) -- may be preferable,
+letting the free-projection capability stabilize before the considerably
+stronger writable/inverse contract (<<6>>) is attempted. This matches the
+Cycle-1 assessment's independent observation that Lookup currently has *no*
+owned validation capability at all (Section 4/7 of that assessment) --
+strengthening a read-only-first capability's own contract (e.g. an owned
+mismatch/validation surface) is separable from, and arguably prerequisite
+to, ever accepting writeback.
+
+== 8. Implication for future surface consolidation
+
+*Architecture inference, explicitly deferred.* The active FTR
+(`FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5`) currently asks for
+exactly one canonical public helper surface. This note does not reopen or
+edit that FTR, and does not alter the Cycle-1 assessment's recommendation
+that F-002 -- not surface consolidation -- is the next bounded slice. It
+records, as future input for whenever surface consolidation *is* taken up,
+that the working-hypothesis capability distinction in <<3>>-<<5>> may mean
+the FTR's binary framing ("choose ONE canonical surface") is not the only
+coherent outcome. Possible future consolidation outcomes, none decided here:
+
+[cols="1,4",options="header"]
+|===
+| Outcome | Sketch
+
+| A. One surface
+| FK and Lookup collapse into a single public capability; the losing
+  surface's genuinely distinct semantics (durable relation lifecycle, or
+  free per-call projection) would need to be absorbed without loss.
+
+| B. Two intentional surfaces
+| FK Relation Helpers and Lookup Projection remain distinct public
+  capabilities sharing mechanism underneath, with today's *accidental*
+  capability gaps (Lookup's missing alias field, Lookup's missing owned
+  validation, FK's silent-vs-Lookup's-loud collision handling) removed so
+  neither gap looks like a forced reason to prefer one surface over the
+  other.
+
+| C. One vocabulary, multiple capabilities
+| A single user-facing verb/name fronts what remain two differently-shaped
+  Domain capabilities underneath -- a UX/compatibility question distinct
+  from the semantic-ownership question this and prior cycles already
+  answered.
+
+| D. Other
+| A design supported by evidence not yet available.
+|===
+
+Consolidation by *clarification and accidental-entanglement removal* (gap
+closure, vocabulary alignment, F-002-style ownership-boundary fixes) can
+succeed even if two capabilities remain afterward; "consolidation" need not
+mean "merger." This is itself a hypothesis this note offers for the later
+FTR assessment, not a decision now.
+
+== 9. Explicit non-decisions
+
+This note does not decide, and nothing above should be read as deciding:
+
+* whether FK Relation Helpers and Lookup Projection should ever merge,
+  stay separate, or share one public vocabulary;
+* the FTR's working hypothesis about which surface (if any) is canonical;
+* whether/when Lookup gains an output-alias config field or an owned
+  validation entry point;
+* whether Writable Lookup Projection is ever accepted, in any form;
+* any conflict-priority rule, binding-stability rule, or API shape for a
+  future writable projection;
+* the F-002 recommendation, its scoping, or its "not yet authorized" status
+  in the Cycle-1 re-entry assessment;
+* whether "derived projection artifact" / "materialized representation
+  state" / `R0 -> R1 -> R2` ever become canonical vocabulary; and
+* anything about F-002 implementation, Trusted-Ingress certification, or
+  consumer migration.
+
+== 10. Questions requiring future evidence
+
+* Does any current or planned consumer actually need target-frame
+  writeback, or is it purely a hypothetical extension so far?
+* What would an owned Lookup validation/mismatch-checking surface look like
+  once F-002 moves that logic out of `derived_column_policy.py` -- and would
+  it change the read-only-MVP posture in <<7>> at all?
+* Is there a real forcing case (beyond Worldbuilding's Places -> Regions)
+  that would test whether an output-alias field on Lookup's `helpers`
+  config is sufficient, or whether some case genuinely needs FK's durable
+  relation lifecycle instead?
+* If Writable Lookup Projection is ever explored further, which of the
+  three binding-stability sub-cases (<<6.3>>) turns out to be the common
+  case in real spreadsheet editing workflows, and does that change which
+  sub-case deserves the simplest first-cut rule?
