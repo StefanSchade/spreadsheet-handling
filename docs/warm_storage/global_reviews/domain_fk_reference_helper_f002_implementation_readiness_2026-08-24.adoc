@@ -1,0 +1,969 @@
+= FK / Reference-Helper Family: F-002 Implementation-Readiness / Design
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded implementation-readiness / design step. Non-binding
+architecture/evidence-based design. Authorizes no source, test, registry,
+model, Trusted-Ingress, consumer, or topology change. Independent review of
+this artifact is required before any source change begins.
+
+Date: 2026-08-24.
+
+Repository baseline: `51d9cb5` (`docs(domain): review FK helper cycle 1
+re-entry`), branch `main`, worktree clean before this task,
+`main...origin/main [ahead 25]`.
+
+== 1. Status / gate
+
+This task is the explicitly authorized next step after:
+
+* `7393438` -- `docs(domain): reassess FK helper cycle 1 re-entry`
+  (`domain_fk_reference_helper_cycle1_reentry_assessment_2026-08-23.adoc`):
+  recommended next slice F-002, implementation *NOT YET AUTHORIZED*.
+* `51d9cb5` -- `docs(domain): review FK helper cycle 1 re-entry`
+  (`..._review_001.adoc`): verdict *ACCEPT WITH MINOR CORRECTIONS*; **F-002
+  selection: AUTHORIZED**; **F-002 implementation: NOT YET AUTHORIZED**,
+  pending exactly this bounded implementation-readiness/design step, with two
+  MATERIAL findings (FIND-C1-001 formula-mode defect, FIND-C1-002 FK-side
+  sibling) that this document must resolve.
+
+This document does not reopen whether F-002 exists or is the next Cycle-1
+work item -- both gates are closed by the artifacts above. Its job is to
+decide exactly how to implement F-002 safely, including the two mandatory
+findings, and to reach an explicit implementation-ready/not-ready verdict.
+It implements nothing.
+
+== 2. Evidence
+
+=== 2.1 Canonical guidance read in full
+
+`docs/developer_guide/ch06_code_conventions/05_domain_maintainer_contract.adoc`
+(DMC), `docs/backlog/roadmap_domain_hardening_sequence.adoc` (Family cycle 1
+scope, Phase F status), `docs/ai_info/{agent_rules,conventions,git_and_workflow,
+architecture_primer,concepts_fk_helpers,interfaces_and_gates}.adoc`.
+
+=== 2.2 Program-state artifacts read in full
+
+* `domain_fk_reference_helper_cycle1_reentry_assessment_2026-08-23.adoc` and
+  its independent `..._review_001.adoc` (ACCEPT WITH MINOR CORRECTIONS;
+  authorizes F-002 selection; findings FIND-C1-001/002/003).
+* `dmc_hardening/provenance_handoff/domain_fk_lookup_provenance_handoff_implementation_2026-08-21.adoc`
+  -- the accepted H5 pattern this design mirrors one level up in size
+  (package-facade delegation, fail-clear hardening, explicit non-goals
+  naming F-002 as untouched).
+* `dmc_hardening/deletion_authority/sequence_summary.adoc` -- confirms the
+  deletion-authority subroutine is closed and that F-002 is the named
+  return-address item; confirms nothing in that subroutine touched
+  value-mismatch or provenance-shape interpretation.
+
+=== 2.3 Current runtime read in full (not accepted from prose)
+
+`domain/transformations/derived_column_policy.py` (829 lines);
+`domain/transformations/enrich_lookup/{__init__,policy,operation,provenance}.py`;
+`domain/transformations/fk_helpers/{__init__,policy,provenance,drop,enrich}.py`;
+`domain/validations/fk_helpers.py` (first 120 lines plus targeted reads);
+`core/formulas.py`; `tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`;
+`tests/unit/domain/transformations/test_derived_column_policy.py` (all test
+names enumerated; malformed-provenance, duplicate-key, and asymmetric test
+bodies read in full).
+
+=== 2.4 Independent empirical reproduction of FIND-C1-001 [[sec2-4]]
+
+The formula-mode defect was independently reproduced in this task, not
+merely accepted from Review 001's Area 9, via a read-only script through the
+installed package (no source/test file touched):
+
+[source,text]
+----
+enrich_lookup(source="matrix", lookup="stories", output="matrix_view",
+              source_key="story_id", lookup_key="id",
+              helpers={"fields": ["title"]},
+              helper_value_mode="formula", missing="empty")
+  -> cell value: LookupFormulaSpec(source_key_column='story_id',
+     lookup_sheet='stories', lookup_key_column='id',
+     lookup_value_column='title', missing='')
+
+apply_derived_column_policy(source="matrix_view", policy="warn_on_mismatch")
+  -> 1 finding: rule_type='derived_value_mismatch', columns='title',
+     row_index='0, 1', message="2 row(s) differ from canonical lookup
+     'stories' for helper column 'title'." (both rows are correctly
+     enriched; the "mismatch" is spurious)
+
+apply_derived_column_policy(source="matrix_view", policy="fail_on_mismatch")
+  -> raises ValueError: "Derived column policy failed:
+       - derived_value_mismatch: 2 row(s) differ from canonical lookup
+       'stories' for helper column 'title'."
+----
+
+*Current fact, independently confirmed:* root cause is `_norm()`
+(`derived_column_policy.py:820-828`), which calls `str(value).strip()` on
+whatever cell value it receives. `LookupFormulaSpec` is a frozen dataclass
+with no custom `__str__`, so `str()` yields its dataclass-generated `repr()`,
+which will essentially never equal `_norm()` of the plain scalar canonical
+value pulled from the lookup frame. `_write_provenance`
+(`enrich_lookup/operation.py:495-565`) writes the identical provenance record
+regardless of `helper_value_mode` -- the provenance shape carries no
+`helper_value_mode` field, so DCP cannot know from provenance alone that it
+is looking at formula-mode cells; it can only know from the cell value's own
+Python type at check time.
+
+Repository-wide grep confirms zero existing tests exercise this
+combination. This finding is independently CONFIRMED, not merely inherited.
+
+== 3. Responsibility decomposition
+
+[cols="1,4,2",options="header"]
+|===
+| # | Responsibility | Classification
+
+| 1
+| Lookup provenance-record shape validation (`_validated_enrich_spec`)
+| Lookup-owned primitive semantics
+
+| 2
+| Symmetric/asymmetric key-form interpretation from the *written* record
+  (`_validated_mismatch_keys`, `_validated_symmetric_on`, `_validated_single_key`)
+| Lookup-owned primitive semantics
+
+| 3
+| Lookup key resolution from written provenance (selecting `payload_keys`/
+  `lookup_keys` per the shape above)
+| Lookup-owned primitive semantics
+
+| 4
+| Target-value / canonical-map construction from the current lookup frame
+  (`_canonical_value_map`)
+| Lookup-owned primitive semantics
+
+| 5
+| Duplicate-key semantics (current: DCP-invented "first occurrence wins";
+  correct: reuse Lookup's own duplicate-key contract)
+| Lookup-owned primitive semantics (currently a DCP-invented, unowned policy
+  -- see <<sec6>>)
+
+| 6
+| Missing-key semantics (unresolved payload rows against the lookup frame)
+| DCP correctly declines to reproduce Lookup's `missing` contract at all
+  (see <<sec6>>) -- classified *not applicable* to this delegation, not a
+  gap to close
+
+| 7
+| Cell-value normalization/comparison, including formula-mode cell values
+| Lookup-owned primitive semantics ("what does a mismatch mean" -- DMC
+  composite/primitive contract)
+
+| 8
+| Mismatch-row calculation (iterating payload rows against the canonical map)
+| Lookup-owned primitive semantics, invoked once per DCP call
+
+| 9
+| Finding construction (`DerivedColumnFinding`/`Finding` objects, `rule_type`,
+  `severity`, `message` wording)
+| DCP-owned composition/policy -- `Finding` is DCP's own findings-frame
+  contract (`domain/finding_frame.py`, tied to `FINDING_COLUMNS`/
+  `findings_to_frame`), not a generic cross-domain type (confirmed distinct
+  from `domain/validations/findings.py::Finding`, a different dataclass)
+
+| 10
+| Severity / warn / fail behavior (which policy triggers what)
+| DCP-owned composition/policy
+
+| 11
+| DCP sequencing/atomicity (`_publish_with_lifecycle`, two-physical-
+  publication invalidation, `fk_deletion_unauthorized` diagnostic)
+| DCP-owned composition/policy -- explicitly *not* touched by F-002 (already
+  confirmed correct by Review 001 Area 8)
+
+| 12
+| FK transient-provenance shape validation sibling (`_validated_fk_helper_names`
+  reading `_meta.derived.sheets[frame].helper_columns`)
+| FK-owned primitive semantics (mirror-image of #1-3, smaller scale,
+  FIND-C1-002) -- see <<sec7>>
+|===
+
+Item 6 is listed for completeness per the task's own enumeration; it is
+resolved as *not applicable* (DCP does not, and should not, attempt to
+reproduce it) rather than as a responsibility to relocate. No item was moved
+merely because it is physically adjacent to another; each classification
+above is grounded in the DMC's composite/primitive contract ("composite owns
+composition; dependencies retain primitive semantics") applied to the actual
+current code, matching Review 001 Area 8's independently-verified table.
+
+== 4. Desired owner boundary [[sec4]]
+
+*Design decision.* Task 2's Option C -- "one small immutable
+interpreted-provenance value object plus a mismatch evaluator" -- is
+selected over Option A (one big function) and Option B (three separate
+free functions). Rationale:
+
+* An interpreted-provenance value object (shape/key-form already resolved)
+  is reusable by both the shape/key-interpretation concern and the
+  mismatch-evaluation concern without re-parsing the raw record twice
+  in one call, and it gives the two slices (<<sec8>>) a clean, typed
+  interface boundary instead of a wide parameter list.
+* A single mismatch evaluator (rather than three-plus free functions
+  mirroring every private helper 1:1) matches the actual cohesion of the
+  current code: shape validation, key resolution, canonical-map
+  construction, and row comparison are one behavior unit today
+  (`_check_enrich_lookup_values` already calls all of them internally) and
+  splitting them into separately-exported functions would expose internal
+  sequencing as public API for no consumer benefit.
+* This avoids inventing a larger framework: no "projection engine", no new
+  global provenance schema, no generic domain-validation framework, no
+  producer IDs/ledgers, no registry change, no new public pipeline step --
+  matching the task's explicit constraints and the roadmap's own "new
+  infrastructure is justified only when it removes repeated complexity from
+  supported paths" principle.
+
+*Concrete shape:*
+
+* `enrich_lookup/provenance.py` (existing module, already the package's
+  provenance-interpretation home since H5) gains a new function, working
+  name `interpret_written_enrich_lookup_provenance(record, *, frame_name) ->
+  InterpretedEnrichLookupProvenance`. It performs exactly what
+  `_validated_enrich_spec` + `_validated_mismatch_keys` +
+  `_validated_symmetric_on` + `_validated_single_key` do today: validate the
+  record shape, resolve the symmetric/asymmetric key form, and return an
+  immutable value object exposing `lookup_name: str`, `payload_keys: tuple[str, ...]`,
+  `lookup_keys: tuple[str, ...]`, `helper_columns: tuple[str, ...]`. Raises
+  the identical `ValueError` messages/paths the current DCP code raises
+  (compatibility, <<sec9>>).
+* A new sibling module `enrich_lookup/mismatch.py` (kept separate from
+  `provenance.py` to avoid overloading the write/reconcile module with
+  ~150-200 lines of comparison logic, and separate from the already-large
+  `operation.py`, 566 lines) exposes
+  `evaluate_lookup_mismatches(payload, *, interpreted, lookup_frames) ->
+  LookupMismatchReport` -- the owner-local mismatch evaluator. It performs
+  what `_check_enrich_lookup_values` + `_canonical_value_map` +
+  `_column_mismatch_indices` do today, corrected per <<sec5>> and <<sec6>>.
+  `LookupMismatchReport` is a small immutable value carrying enough
+  structured information for DCP to build its own findings (never a
+  DCP `Finding`/`DerivedColumnFinding` itself -- see <<sec10>>).
+* Both are re-exported through `enrich_lookup/__init__.py`'s `__all__`,
+  alongside the existing `enrich_lookup` and
+  `reconcile_enrich_lookup_provenance` exports -- identical mechanism to H5.
+* FK side (<<sec7>>): `fk_helpers/policy.py` gains a new function, working
+  name `validated_helper_columns_by_sheet(frames, *, frame_name) ->
+  tuple[dict, ...]`, re-exported through `fk_helpers/__init__.py`'s
+  `__all__` alongside the existing `derived_helper_columns_by_sheet`.
+
+`derived_column_policy.py` imports only these package-facade symbols from
+`enrich_lookup` and `fk_helpers`, never their internal modules -- the
+identical discipline H5 already established and the existing architecture
+guard already enforces (<<sec11>>).
+
+== 5. Formula-mode defect and semantic decision [[sec5]]
+
+*Existing defect, confirmed (FIND-C1-001, <<sec2-4,Section 2.4>>).*
+
+*Design decision on the mandatory A/B/C/D:* **(B) explicitly correct
+formula-mode mismatch semantics as part of F-002.** Not (A): silently
+carrying a confirmed, empirically-reproduced, zero-coverage defect forward
+into the new Lookup-owned owner contract would formalize a bug as the
+newly-canonical semantics -- exactly the risk Review 001 names. Not (C):
+splitting the fix into a separate prerequisite slice means writing the new
+Lookup-owned mismatch evaluator twice (once preserving the bug, to satisfy a
+"preserve exactly" instruction, then again to fix it) for no coherence
+benefit, since the evaluator is being newly authored in Slice 2 regardless
+(<<sec8>>) -- Review 001 Area 16 independently reached the same conclusion
+("better handled as the first explicit sub-step... than as a whole separate
+Cycle-1 slice").
+
+*Semantic decision (Task 4's A-E), reasoned from the questions posed:*
+
+* *What is being validated?* Not "current displayed value" -- formula-mode
+  helper cells never carry a copied scalar inside the Domain layer; they
+  carry a `LookupFormulaSpec` *intent* object that a spreadsheet backend
+  later renders as a live formula (e.g. XLOOKUP). The evaluated result
+  exists only after a spreadsheet application recalculates the opened
+  workbook -- a stage the Domain pipeline never reaches and does not control.
+* *Is scalar comparison fundamentally unsuitable?* Yes. Even within one
+  supported backend (XLSX), the Domain-layer `Frames` never hold a
+  recalculated value for a formula cell. Across backends (ODS may not
+  auto-calculate on open, and no backend recalculates during Domain
+  pipeline execution), there is no pipeline stage at which a "current
+  evaluated scalar" for a formula-mode helper is reliably available.
+  Candidate (C) -- evaluate against cached/calculated scalars -- is
+  therefore rejected as architecturally unsupportable, not merely
+  inconvenient.
+* *Is `LookupFormulaSpec` already sufficient to validate formula intent?*
+  Yes, precisely. Its four identity fields --
+  `source_key_column`, `lookup_sheet`, `lookup_key_column`,
+  `lookup_value_column` -- are exactly the four facts DCP's own already-
+  resolved provenance interpretation independently carries: `payload_keys[0]`,
+  `lookup_name`, `lookup_keys[0]`, and the helper column name being checked.
+  (Formula mode is structurally single-key only:
+  `enrich_lookup/operation.py::_build_formula_enrichment` uses
+  `source_keys[0]`/`lookup_keys[0]` regardless of how many symmetric keys
+  were configured -- an existing, unrelated `enrich_lookup` characteristic
+  this design does not change, and reuses as-is for the structural
+  comparison's key-index selection.)
+* *Should validation check structural intent rather than evaluated result?*
+  Yes -- Candidate A/E. `warn_on_mismatch`/`fail_on_mismatch` for a
+  formula-mode helper cell means: does this cell's `LookupFormulaSpec`
+  still point at the *declared* lookup relationship (same lookup frame,
+  same source/lookup key columns, same value column)? A structural mismatch
+  means the formula was built against, or hand-edited into, a different
+  relationship than provenance declares -- exactly analogous in spirit to
+  what values-mode detects (a cell whose content no longer matches what
+  the declared relationship would produce), but evaluated on the intent
+  object instead of an unavailable evaluated scalar.
+* *Does provenance encode `helper_value_mode`? Should it?* No, and no --
+  rejected. Adding a metadata field is an out-of-scope, unjustified
+  metadata-shape change (the task's own explicit caution). The existing
+  cell value already carries sufficient type information:
+  `isinstance(cell_value, LookupFormulaSpec)` unambiguously identifies a
+  formula-mode cell; a plain scalar unambiguously identifies a values-mode
+  cell. This satisfies the task's own preference ("prefer a small semantic
+  rule over new metadata if current cell values already carry enough type
+  information").
+* Candidate (B) (skip value-mismatch checking entirely for formula-mode
+  helpers) is rejected: it would make `fail_on_mismatch` a silent no-op
+  guarantee for every formula-mode helper column, removing verification
+  entirely rather than correcting it, and it discards information the cell
+  value already carries for free.
+* Candidate (D) (reject formula-mode mismatch policies as unsupported) is
+  rejected: no currently-passing pipeline relies on this combination (it
+  has never worked correctly), so rejecting it outright would remove a
+  currently-reachable, intended combination of two independently
+  documented, registered features (`helper_value_mode="formula"` and
+  `policy="warn_on_mismatch"`/`"fail_on_mismatch"`) rather than making it
+  correct.
+
+*Concrete rule (per-cell, not per-column):* for each row's helper-column
+cell, branch on the cell's own runtime type -- not on any new provenance
+field, not on a whole-column mode assumption:
+
+* If the cell value is a `LookupFormulaSpec`: compare the 4-tuple
+  `(lookup_sheet, source_key_column, lookup_key_column, lookup_value_column)`
+  against the expected tuple derived from the interpreted provenance
+  `(lookup_name, payload_keys[0], lookup_keys[0], helper_col)`. Unequal ->
+  structural mismatch.
+* Otherwise (a plain scalar, the values-mode case): unchanged existing
+  behavior -- compare against the canonical scalar value from the lookup
+  frame.
+
+Branching per-cell rather than per-column is deliberate: it requires no new
+metadata, degrades gracefully for a hand-mixed column (e.g. one formula
+cell manually overwritten with a literal value), and costs nothing extra
+over the existing per-row iteration `_column_mismatch_indices` already
+performs.
+
+*New finding vocabulary, explicit compatibility decision:* structural
+formula-mode mismatches are reported under a **new** `rule_type`,
+`derived_formula_mismatch`, distinct from `derived_value_mismatch`. This is
+additive, not breaking: the combination has never produced a true positive
+under the current defect (100% false-positive rate), so no consumer can be
+relying on any specific `rule_type` for this case. Keeping it distinct
+avoids conflating two different mismatch kinds (content divergence vs.
+formula-intent divergence) under one label and keeps
+`derived_value_mismatch`'s existing meaning and message wording completely
+unchanged for the values-mode path it was always about. No canonical
+documentation currently enumerates DCP `rule_type` strings (grepped;
+none found outside the review artifact itself), so this addition requires
+no registry/model update -- test coverage is the compatibility record.
+
+*Open question (explicitly out of scope, noted not silently ignored):*
+`_build_formula_enrichment` only ever uses index `[0]` of `source_keys`/
+`lookup_keys`, silently ignoring any additional symmetric keys if a caller
+configured `keys: [a, b]` together with `helper_value_mode="formula"`. This
+is a pre-existing `enrich_lookup` characteristic, not something F-002
+introduces or is asked to fix; it is noted here only so a future maintainer
+does not mistake the single-key structural comparison above for a new
+limitation this design invented.
+
+== 6. Duplicate/missing-key semantics [[sec6]]
+
+=== 6.1 Duplicate-key semantics
+
+*Existing defect, independently confirmed.* `_canonical_value_map`
+(`derived_column_policy.py:776-790`) resolves duplicate lookup keys with
+"first occurrence wins" -- a DCP-invented tie-break with no counterpart in
+Lookup's own contract. `enrich_lookup/operation.py::_check_duplicate_lookup_keys`
+instead *rejects* a lookup frame with duplicate keys outright at enrichment
+time (`lookup_df.duplicated(subset=join_keys, keep=False).any()` ->
+`ValueError`). A currently-*pinned* test,
+`test_asymmetric_duplicate_lookup_keys_first_occurrence_wins`
+(`test_derived_column_policy.py:727-746`), asserts the permissive DCP
+behavior today.
+
+*Design decision:* DCP must not invent a more permissive duplicate-key
+contract than Lookup. Reasoning through the task's own questions: a lookup
+frame can legitimately have unique keys at enrichment time (Lookup's own
+gate enforces this) and later carry duplicate keys by the time a
+`warn_on_mismatch`/`fail_on_mismatch` pass runs against current pipeline
+state (a later step replaced or edited the lookup frame). At that point,
+"first occurrence wins" *silently certifies* a value as canonical when the
+current data cannot actually support that certification -- structurally the
+same unsoundness DCP's own existing "cannot verify" pattern already refuses
+to accept for missing key *columns* (`_check_enrich_lookup_values`'s
+`missing_payload`/`missing_lookup` branch, "certifying zero mismatches...
+would be unsound").
+
+*Resolution:* extend that same fail-closed pattern to duplicate lookup
+keys, reusing Lookup's own duplicate-detection logic (a non-raising
+variant of the boolean condition `_check_duplicate_lookup_keys` already
+computes) inside the new `evaluate_lookup_mismatches` evaluator. When the
+current lookup frame has duplicate values on `lookup_keys`, the whole
+check for that call is reported through the *existing*
+`unverifiable_enrich_lookup` `rule_type` (no new vocabulary needed here,
+unlike <<sec5>>) with an added reason string ("lookup frame `{lookup}`
+contains duplicate keys on `{lookup_keys}`; cannot verify enrich_lookup
+helpers"), following the exact severity-scaled behavior the missing-key-
+column path already has: a warning under `warn_on_mismatch`, a failure
+that raises under `fail_on_mismatch`.
+
+*Compatibility consequence, explicit:* this changes observable behavior for
+the one pinned test above. `test_asymmetric_duplicate_lookup_keys_first_occurrence_wins`
+must be renamed and its assertion corrected to expect an
+`unverifiable_enrich_lookup` finding (or, under `fail_on_mismatch`, a raise)
+instead of zero findings, as part of Slice 2 (<<sec8>>). This is recorded
+here as a deliberate, reviewed compatibility change, not an incidental
+side effect.
+
+=== 6.2 Missing-key semantics
+
+*Current fact, confirmed correct -- no change.* `_column_mismatch_indices`
+treats an unresolved payload row (`canonical_row is None`, i.e. the
+payload's join-key value has no match in the current canonical map) as
+"a separate concern" and skips it entirely -- it neither enforces
+Lookup's `missing="fail"` contract (would require raising) nor its
+`missing="empty"` contract (would require asserting the helper cell is
+blank). Tracing why: `_write_provenance` never records the `missing` mode
+used at enrichment time -- the provenance shape carries only
+`lookup`/key-form/`helper_columns`, so DCP structurally cannot know which
+contract was in force even if it wanted to reproduce it.
+
+Per the task's explicit instruction not to invent hidden inference and to
+say plainly when mismatch checking cannot fully reproduce the original
+enrichment contract: it cannot, for `missing`, because the required policy
+is absent from provenance by design, and adding it would be an unjustified
+metadata-shape change out of this slice's scope (same reasoning as
+<<sec5>>'s rejection of a new `helper_value_mode` field). DCP's current
+behavior -- silently declining to check unresolved rows rather than
+guessing which `missing` contract applied -- is the only sound option given
+that gap, and is independently judged correct, not a gap to close. This
+responsibility is *not* moved to Lookup and is *not* changed by F-002.
+
+== 7. FK-side sibling disposition [[sec7]]
+
+*Existing defect, confirmed (FIND-C1-002).*
+`_validated_fk_helper_names` (`derived_column_policy.py:286-303`)
+independently parses and validates `_meta.derived.sheets[frame].helper_columns`
+-- FK's own writer's own shape (`fk_helpers/provenance.py::_write_helper_provenance`)
+-- with zero delegation to any FK-owned reader, mirroring F-002's larger
+pattern at roughly 18 lines. FK's package already exports a reader for this
+exact metadata root, `fk_helpers/policy.py::derived_helper_columns_by_sheet`
+(re-exported via `fk_helpers/__init__.py`), but it is deliberately *lenient*
+-- it silently skips malformed entries (`if not isinstance(sheet_entry, dict):
+continue`) rather than raising.
+
+*Would reusing the existing lenient reader break current callers?* This
+question was checked directly, not assumed: `derived_helper_columns_by_sheet`
+has five existing callers beyond DCP --
+`domain/transformations/helpers.py::reorder_helpers_next_to_fk`,
+`fk_helpers/drop.py::drop_helpers`, `domain/column_roles/resolver.py`, and
+`domain/validations/fk_helpers.py` (twice). Retrofitting fail-clear
+behavior onto the existing function would be a materially larger, riskier
+change touching reorder/drop/column-role-resolution/validation behavior all
+at once -- explicitly rejected. DCP's own fail-clear contract, in turn, is
+directly test-pinned
+(`test_malformed_helper_columns_entry_raises_clear_value_error`) and must
+not be silently loosened to match the lenient reader either.
+
+*Design decision:* two owner-local readers for two genuinely distinct
+contracts (Task 7's third listed option). Add a new function,
+`fk_helpers/policy.py::validated_helper_columns_by_sheet(frames, *,
+frame_name)`, that performs exactly what DCP's `_validated_fk_helper_names`
+does today (fail-clear, identical `ValueError` message/path), re-exported
+through `fk_helpers/__init__.py`'s `__all__`. `derived_helper_columns_by_sheet`
+is left completely unchanged for its five existing lenient callers.
+
+*Disposition (Task 7's required A/B/C choice):* **INCLUDE IN SAME
+IMPLEMENTATION** -- specifically folded into Slice 1 (<<sec8>>), not its
+own follow-up slice and not deferred. Rationale: it is the same seam
+(FK-owned shape parsed inside DCP), the same low-risk/formula-agnostic
+profile as Slice 1's other content, the same package-facade mechanism, and
+Review 001 itself calls it "naturally absorbable as a companion item within
+F-002's own implementation-readiness scope" and warns that leaving it
+silently unaddressed risks a milder recurrence of the exact "reader
+mistakes a smaller fix for the whole problem" risk Section 7 of the
+Cycle-1 assessment already names for H5. Bundling it into Slice 1 (rather
+than deferring) closes that risk instead of reproducing it a third time.
+
+== 8. Slice decomposition [[sec8]]
+
+*Design decision: TWO SLICES* (Task 3's Option B, refined with the formula-
+mode and duplicate-key decisions resolved explicitly here rather than left
+open at implementation time).
+
+[cols="1,4,4",options="header"]
+|===
+| Criterion | Slice 1 (shape/key interpretation) | Slice 2 (mismatch delegation)
+
+| Semantic coherence
+| Shape validation + key-form resolution is one coherent, formula-agnostic
+  concern; folding in the FK-side sibling is the same concern at FK's
+  provenance shape
+| Value comparison, duplicate-key handling, and formula-mode structural
+  comparison are one coherent "what does a mismatch mean" concern
+
+| Reversibility
+| High -- pure relocation behind a facade, byte-identical error paths
+| Medium -- two intentional, separately tested behavior corrections bundled
+  with the ownership move; each is independently revertable in principle
+  but authored together since the function is rewritten once, not twice
+
+| Reviewability
+| Small, mechanical, easy to diff against current private helpers
+| Larger, requires reviewing two explicit behavior-change decisions plus
+  the ownership move together, matching how the review itself reasoned
+  about the defect
+
+| Blast radius
+| `derived_column_policy.py`, `enrich_lookup/provenance.py`,
+  `fk_helpers/policy.py`, both `__init__.py` facades
+| `derived_column_policy.py`, new `enrich_lookup/mismatch.py`, one pinned
+  test rename/behavior update, new formula-mode tests
+
+| Risk of mixing bugfix with refactor
+| None -- no behavior change intended in this slice at all
+| Present but explicit and reviewed: bundling the formula-mode and
+  duplicate-key corrections into the same slice that moves ownership is
+  the deliberate choice (see rationale below), not an accident
+
+| Preserving current behavior intentionally
+| Fully preserved (see <<sec9>>)
+| Two named exceptions, both explicit and separately tested (<<sec9>>)
+
+| Risk of leaving duplicated semantics half-fixed
+| Low on its own; would be *complete* only once Slice 2 lands
+| Closes the pattern F-002 targets; after both slices, zero Lookup-owned
+  interpretation remains reimplemented in DCP
+|===
+
+*Why not Option A (one slice)?* A single slice moving both shape
+interpretation and mismatch evaluation together is architecturally
+coherent, but review-sizing evidence (Review 001 Area 10/16) shows the two
+halves carry materially different risk: shape/key-form resolution is
+formula-agnostic and low-risk; value comparison is exactly where the
+empirically-confirmed defect lives and where two explicit behavior
+corrections must be reviewed on their own merits. Splitting lets a reviewer
+accept the low-risk relocation quickly and spend its attention on the
+higher-risk behavior corrections in Slice 2, mirroring H5's own discipline
+of keeping FIND-001-class hardening decisions visible and separately
+reviewable.
+
+*Why not Option C (formula decision/fix first, entirely separate from the
+ownership move)?* Because the formula-mode and duplicate-key fixes are
+naturally expressed *inside* the new Lookup-owned mismatch evaluator being
+authored in Slice 2 regardless. Fixing them first inside the old DCP
+private functions, then deleting those functions and re-authoring the
+corrected logic again inside the new evaluator, means writing the same
+correction twice for no benefit -- exactly the "wasted churn" risk Review
+001's own gate decision and Area 16 independently flagged. Resolving the
+semantics explicitly in *this* document (<<sec5>>, <<sec6>>) and
+implementing them once, at the point the evaluator is newly authored,
+achieves the review's real requirement (an explicit, first-class, reviewed
+decision, not a silent side effect) without the double-authoring cost.
+
+== 9. Compatibility contract [[sec9]]
+
+=== 9.1 Preserved unless explicitly listed as changed below
+
+* Registered pipeline step name (`apply_derived_column_policy` is unchanged;
+  no new registered step is added).
+* YAML parameters of `apply_derived_column_policy`
+  (`source`/`output`/`policy`/`findings`/`name`) and of `enrich_lookup`.
+* All existing `_meta` shapes: `_meta.derived.sheets.*.enrich_lookup`,
+  `_meta.derived.sheets.*.helper_columns`, `_meta.helper_policies.fk`,
+  `_meta.sheets[*].helper_columns`. No new metadata field is introduced
+  (explicitly rejected in <<sec5>> and <<sec6>>).
+* Finding `rule_type` values `missing_lookup_frame`, `unverifiable_enrich_lookup`
+  (values-mode uses unchanged), `derived_value_mismatch` (values-mode uses
+  unchanged), `fk_deletion_unauthorized` -- unchanged meaning and message
+  wording for every path except the two named below.
+* `DerivedColumnFinding`/`Finding` shape (`domain/finding_frame.py`) --
+  unchanged; Lookup's new evaluator does not construct these (<<sec10>>).
+* DCP's severity/warn/fail policy wiring, `_publish_with_lifecycle`
+  two-physical-publication invalidation, and the `fk_deletion_unauthorized`
+  diagnostic -- entirely untouched (DCP-owned per Section 3, item 11).
+* Safe/non-safe failure boundaries: malformed-provenance `ValueError`s
+  remain raised unconditionally (never fail open under any policy),
+  matching the existing `_validated_mismatch_keys` discipline.
+* H5/deletion-authority behavior -- untouched; F-002 does not read or write
+  anything H5/deletion-authority already owns.
+* `enforce_derived_column_policy_frame`'s pure-function signature and
+  return shape.
+* Error message text and `_meta` path wording for every existing
+  `ValueError` raised by shape/key-form validation (Slice 1 is a pure
+  relocation).
+* No public rename, no config-schema addition, no new registered step, no
+  surface-consolidation decision -- matching the Cycle-1 assessment's
+  explicit non-goals for this slice.
+
+=== 9.2 Intentional behavior changes
+
+[cols="2,3,3,2",options="header"]
+|===
+| # | Old behavior | New behavior | Why / tests
+
+| 1 (<<sec5>>)
+| Formula-mode helper cells are compared via `str(LookupFormulaSpec)` vs.
+  the plain canonical scalar -- always mismatches, spuriously, under both
+  `warn_on_mismatch` (false finding) and `fail_on_mismatch` (unconditional
+  raise)
+| Formula-mode cells are compared structurally: the cell's
+  `(lookup_sheet, source_key_column, lookup_key_column, lookup_value_column)`
+  tuple against the expected tuple from provenance. A structural
+  divergence is reported as a **new** `rule_type`,
+  `derived_formula_mismatch`; a structurally-correct formula cell produces
+  no finding
+| Corrects an empirically-confirmed, zero-coverage defect (FIND-C1-001); no
+  release note required in the H5 sense (no valid/supported prior state
+  relied on the old behavior -- it never worked), but this correction is
+  release-note-worthy as a genuine bug fix per the git-and-workflow
+  release-notes checkpoint (user-facing: `apply_derived_column_policy`
+  behavior for formula-mode Lookup helpers). New tests: valid/invalid
+  formula-mode cells under both `warn_on_mismatch` and `fail_on_mismatch`
+  (<<sec12>>)
+
+| 2 (<<sec6>>)
+| Duplicate lookup keys on the current lookup frame: DCP's own
+  `_canonical_value_map` silently picks "first occurrence wins" and
+  certifies a canonical value from it
+| Duplicate lookup keys are treated as unverifiable, reusing the existing
+  `unverifiable_enrich_lookup` `rule_type` with an added reason string
+  (warns under `warn_on_mismatch`; raises under `fail_on_mismatch`)
+| Removes a DCP-invented, unowned tie-break that has already
+  independently drifted from Lookup's own duplicate-key contract
+  (Review 001's own corroborating evidence). One existing pinned test,
+  `test_asymmetric_duplicate_lookup_keys_first_occurrence_wins`, is renamed
+  and its assertion updated as part of Slice 2
+|===
+
+No other behavior is authorized to change. Both changes above are
+implemented, tested, and reviewable as explicit line items inside Slice 2 --
+never silently, never as an incidental side effect of the ownership move.
+
+== 10. Error/finding ownership [[sec10]]
+
+*Design decision, per Task 9:* Lookup's `evaluate_lookup_mismatches`
+returns a small immutable `LookupMismatchReport` value -- owner-local
+semantic information, not `Finding`/`DerivedColumnFinding` objects. Its
+exact shape (non-binding on naming, binding on the information it must
+carry):
+
+* `missing_lookup_frame: bool` (the named lookup frame is absent from
+  `lookup_frames`);
+* `unverifiable_reason: str | None` (a combined reason string covering
+  missing payload/lookup key columns and, per <<sec6>>, duplicate lookup
+  keys -- reusing the existing `reasons` list-and-join pattern
+  `_check_enrich_lookup_values` already uses, extended with the new
+  duplicate-key reason);
+* `value_mismatches: Mapping[str, tuple[RowIndex, ...]]` (per helper
+  column, row indices whose value diverges from canonical -- values-mode
+  path, unchanged semantics);
+* `formula_mismatches: Mapping[str, tuple[RowIndex, ...]]` (per helper
+  column, row indices whose `LookupFormulaSpec` structurally diverges --
+  the new formula-mode path, <<sec5>>).
+
+DCP (`_check_enrich_lookup_values`'s replacement body) translates this
+report into `DerivedColumnFinding`s exactly as it does today: it supplies
+`severity` (from `policy`), constructs `missing_lookup_frame`/
+`unverifiable_enrich_lookup`/`derived_value_mismatch` findings with their
+existing message templates for the first three report fields, and
+constructs the new `derived_formula_mismatch` finding for the fourth.
+Nothing about `rule_type` selection, severity, or `fail_on_mismatch`
+raise/collect behavior moves into Lookup -- DCP retains 100% of that
+policy, matching the DMC's composite/primitive contract (Section 3, items
+9-11) and Review 001 Area 8's independently-verified table.
+
+Where current exact error wording is user-visible/test-pinned (every
+`ValueError` message in `_validated_mismatch_keys`/`_validated_symmetric_on`/
+`_validated_single_key`/`_validated_enrich_spec`, and the `missing_lookup_frame`/
+`unverifiable_enrich_lookup`/`derived_value_mismatch` finding `message`
+strings), Slice 1 and the unchanged paths of Slice 2 preserve it verbatim;
+only the two named changes in <<sec9>> introduce new wording, and only for
+cases that previously had no sound wording at all (formula-mode) or an
+unowned wording (duplicate-key "first occurrence wins" was never wording,
+it was silent).
+
+== 11. Package/import boundary [[sec11]]
+
+*Current fact, independently confirmed.* `GUARDED_INTERNAL_PREFIXES` in
+`tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`
+already includes both `enrich_lookup` (`operation`, `policy`, `provenance`)
+and `fk_helpers` (`drop`, `enrich`, `formula_provider`, `policy`,
+`provenance`) as guarded families, added by H5 and earlier package-split
+work respectively. The guard scans every module under
+`domain/transformations/`, which already includes `derived_column_policy.py`
+as an importer -- so DCP-as-caller is structurally covered today, with **no
+new guard infrastructure required** for either seam this design adds.
+
+* `enrich_lookup/mismatch.py` (new) is automatically covered by the
+  existing `enrich_lookup` guard entry once it exists as a module inside
+  that package (the guard is directory-scanning, not an enumerated
+  allowlist of files) -- no edit to `GUARDED_INTERNAL_PREFIXES` is strictly
+  required, but adding `enrich_lookup.mismatch` to the tuple explicitly is
+  a one-line, low-risk clarity improvement worth making in Slice 2 to keep
+  the guard's own documentation of guarded internals in sync (matching the
+  existing entries' style, all of which name their modules explicitly).
+* `derived_column_policy.py` continues to import only
+  `enrich_lookup.{interpret_written_enrich_lookup_provenance,
+  evaluate_lookup_mismatches}` and `fk_helpers.{resolve_v2_fk_relations,
+  validated_helper_columns_by_sheet}` -- all package-facade symbols, never
+  an internal submodule path.
+
+No new guard, registry, or cross-family coordination mechanism is
+introduced. This exactly repeats H5's own accepted pattern for both seams.
+
+== 12. Test plan [[sec12]]
+
+=== 12.1 Lookup -- values mode (moved/adapted from existing DCP tests)
+
+Existing coverage in `test_derived_column_policy.py` (symmetric and
+asymmetric variants of: unchanged/edited helper under warn and fail;
+malformed key forms fail closed; missing payload/lookup key columns;
+malformed sheet-level/derived-container provenance) is retained and
+re-targeted to exercise `derived_column_policy.py` calling the new
+`enrich_lookup`-owned functions, preserving assertions on `apply_derived_column_policy`'s
+observable output (findings frame contents, raised messages) unchanged.
+New/updated:
+
+* duplicate lookup keys -> `unverifiable_enrich_lookup` under
+  `warn_on_mismatch`, raise under `fail_on_mismatch` (replaces
+  `test_asymmetric_duplicate_lookup_keys_first_occurrence_wins`).
+
+=== 12.2 Lookup -- formula mode (new; zero prior coverage)
+
+* valid formula-mode helper (structurally correct `LookupFormulaSpec`)
+  under `warn_on_mismatch` -> no finding.
+* valid formula-mode helper under `fail_on_mismatch` -> no raise.
+* structurally incorrect formula spec (e.g. `lookup_value_column` naming
+  the wrong field) under `warn_on_mismatch` -> `derived_formula_mismatch`
+  finding.
+* structurally incorrect formula spec under `fail_on_mismatch` -> raises,
+  naming `derived_formula_mismatch`.
+* formula targeting the wrong lookup sheet/key column -> same as above,
+  distinct assertion per field to pin exactly which structural facet is
+  compared.
+* missing lookup target combined with formula-mode cells ->
+  `missing_lookup_frame` (unchanged path, formula-mode-agnostic).
+* duplicate lookup keys combined with formula-mode cells ->
+  `unverifiable_enrich_lookup` (unchanged path, formula-mode-agnostic).
+* mixed column (one row formula, one row plain scalar, e.g. after a manual
+  edit) -> each row evaluated per its own type; no cross-row leakage.
+* explicit no-spurious-mismatch regression test reproducing the exact
+  scenario from <<sec2-4,Section 2.4>>'s empirical repro, asserting zero
+  findings.
+
+=== 12.3 DCP policy
+
+* `warn_on_mismatch` emits the expected finding set (values-mode,
+  formula-mode, unverifiable) with unchanged `rule_type`/severity for
+  every preserved path.
+* `fail_on_mismatch` raises at the same orchestration boundary
+  (`apply_derived_column_policy`, not inside the evaluator).
+* Severity/`rule_type` compatibility for every preserved path (regression
+  assertions against current test expectations, unchanged).
+* Atomicity/publication (`_publish_with_lifecycle`) behavior unchanged --
+  rerun existing publication-lifecycle tests (`test_payload_decoupled_*`,
+  `test_findings_publication_*`, `test_decoupled_payload_invalidation_*`)
+  unmodified.
+
+=== 12.4 Architecture
+
+* `test_no_cross_family_internal_imports.py` stays green; add
+  `enrich_lookup.mismatch` to `GUARDED_INTERNAL_PREFIXES` (<<sec11>>) and
+  confirm the new `derived_column_policy -> enrich_lookup`/`fk_helpers`
+  edges resolve to package-facade imports only.
+* No new guard infrastructure test is needed.
+
+=== 12.5 FK sibling
+
+* malformed transient FK provenance (`helper_columns` not a list; an
+  entry not a mapping) retains fail-clear behavior through
+  `validated_helper_columns_by_sheet`, with the identical message/path
+  DCP raises today (regression-preserving rename of
+  `test_malformed_helper_columns_entry_raises_clear_value_error`'s
+  target, not its assertion).
+* valid provenance returns the same helper names DCP resolves today.
+* DCP no longer parses `_meta.derived.sheets[frame].helper_columns` itself
+  -- verified by removing `_validated_fk_helper_names` and confirming the
+  test suite above still passes unchanged.
+* `derived_helper_columns_by_sheet`'s five existing callers and their
+  existing tests are untouched and rerun unmodified as a regression check
+  that the new strict reader did not alter the lenient one.
+
+Private-implementation-detail tests (e.g. asserting the internal call
+sequence inside the evaluator) are not added; tests target observable
+`apply_derived_column_policy` behavior, matching the task's own instruction
+and existing test-file style.
+
+== 13. Implementation sequence [[sec13]]
+
+*Slice 1 -- owner-local shape/key interpretation (Lookup) + FK sibling*
+
+* Semantic purpose: relocate provenance-shape validation and key-form
+  resolution to their respective owners; zero behavior change.
+* Files: `enrich_lookup/provenance.py` (new function),
+  `enrich_lookup/__init__.py` (facade export), `fk_helpers/policy.py` (new
+  function), `fk_helpers/__init__.py` (facade export),
+  `derived_column_policy.py` (call sites updated, `_validated_enrich_spec`/
+  `_validated_mismatch_keys`/`_validated_symmetric_on`/`_validated_single_key`/
+  `_validated_fk_helper_names` removed).
+* Behavior preserved: every `ValueError` message/path, every resolved key
+  tuple, `enforce_derived_column_policy_frame`'s return shape.
+* Behavior intentionally changed: none.
+* Tests: <<sec12>> 12.1 (shape/malformed-provenance subset, re-targeted
+  unmodified in assertion), 12.4, 12.5.
+* Review gate: independent review confirming byte-identical observable
+  behavior (a diff-only relocation), architecture guard green, full active
+  suite green.
+
+*Slice 2 -- Lookup-owned mismatch evaluation, formula-mode correction,
+duplicate-key correction*
+
+* Semantic purpose: transfer ownership of "what a Lookup mismatch means"
+  to Lookup, including the two named, explicit, reviewed corrections.
+* Files: new `enrich_lookup/mismatch.py`, `enrich_lookup/__init__.py`
+  (facade export), `derived_column_policy.py` (`_check_enrich_lookup_values`/
+  `_canonical_value_map`/`_column_mismatch_indices` removed, replaced by a
+  call to `evaluate_lookup_mismatches` plus DCP's own Finding-construction
+  translation), `test_no_cross_family_internal_imports.py`
+  (`GUARDED_INTERNAL_PREFIXES` gains `enrich_lookup.mismatch`).
+* Behavior preserved: values-mode comparison semantics, `missing_lookup_frame`/
+  `unverifiable_enrich_lookup`/`derived_value_mismatch` message wording for
+  every path except the two changes below, DCP severity/policy wiring,
+  publication lifecycle.
+* Behavior intentionally changed: formula-mode structural comparison
+  replacing spurious scalar comparison (new `derived_formula_mismatch`
+  `rule_type`); duplicate-lookup-key fail-closed behavior replacing
+  "first occurrence wins" (reuses `unverifiable_enrich_lookup`).
+* Tests: <<sec12>> 12.1 (duplicate-key subset), 12.2 (all formula-mode,
+  new), 12.3, 12.4.
+* Review gate: independent review explicitly evaluating both named
+  behavior changes on their own merits (not merely "does the suite pass"),
+  confirming the empirical repro from <<sec2-4,Section 2.4>> now produces
+  zero spurious findings, confirming
+  `test_asymmetric_duplicate_lookup_keys_first_occurrence_wins`'s
+  replacement is correctly reasoned, full active suite green.
+
+Each slice is its own Conventional Commit naming this readiness artifact's
+governing assessment (F-002), consistent with `git_and_workflow.adoc`'s
+"one logical change per commit" and the H5 precedent's commit granularity.
+
+== 14. Exit criteria
+
+* DCP no longer independently interprets Lookup's provenance/key shape
+  (Slice 1) or independently defines Lookup mismatch semantics (Slice 2).
+* Lookup owns its primitive semantics (shape, key-form, canonical-map
+  construction, mismatch evaluation including formula-mode) behind its
+  package facade; FK owns its transient-provenance shape validation behind
+  its package facade (<<sec7>>).
+* DCP retains only composition/policy/severity/atomicity -- unchanged from
+  today (Section 3, items 9-11).
+* Formula-mode behavior is explicitly corrected, not merely dispositioned
+  (<<sec5>>) -- FIND-C1-001 fully closed, not deferred.
+* Duplicate-key semantics no longer drift between DCP and Lookup (<<sec6>>).
+* FK-side sibling (FIND-C1-002) is closed within the same implementation
+  sequence (<<sec7>>), not left as an unnamed residual.
+* Architecture guard (`test_no_cross_family_internal_imports.py`) passes,
+  with `enrich_lookup.mismatch` named explicitly.
+* Full active suite (`make test`) green after each slice.
+* No public-surface consolidation decision is made -- `add_fk_helpers` vs.
+  `add_lookup_helpers` vs. any merged name remains entirely undecided by
+  this work, per <<sec15>>.
+
+*Family-Cycle-1 closure consequence:* completing both slices as scoped
+closes the roadmap's own named blocker for this family's Family-cycle-1
+exit criterion ("remove remaining ontology... hidden cross-family
+knowledge") for the FK/Lookup pair specifically. It does **not** itself
+declare Family cycle 1 closed for the whole family (Review 001 Area 20
+already makes this distinction) and does **not** trigger a separate
+Family-Cycle-1 closure assessment automatically -- that remains a
+deliberate next step, to be requested explicitly once Slice 2 is
+independently accepted, matching the roadmap's own "Cycle-1 exit itself
+should receive its own closing assessment when reached, not be
+self-declared inside the F-002 implementation."
+
+== 15. Explicit non-goals / non-decisions [[sec15]]
+
+This document does not decide, and none of the above should be read as
+deciding:
+
+* whether `add_fk_helpers` or `add_lookup_helpers` (or a merged name)
+  survives any future surface consolidation -- entirely out of scope,
+  per the task's explicit instruction and the still-open
+  `FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5`;
+* the non-binding Lookup Projection concept note or its findings -- not
+  read, not used, not reopened;
+* any config-schema addition (output aliasing, a `validate_lookup_helpers`
+  registered step, `helper_value_mode` in provenance) -- all considered
+  and explicitly rejected above as out of scope for this slice, not
+  silently dropped;
+* Trusted-Ingress FK-formula certification, or any change to
+  `LookupFormulaSpecRole`/the controlled-role model in
+  `pipeline/execution_state/` -- untouched; this design's formula-mode
+  comparison reads `LookupFormulaSpec`'s own declared fields, the same
+  fields Trusted Ingress's own role model already treats as the certified
+  shape, and introduces no new admission or certification logic;
+* `core/refs.py` disposition, FK `defaults` config-surface cleanup, or any
+  other item in the Cycle-1 assessment's Section 9 inventory beyond F-002
+  and its FK-side sibling;
+* whether Lookup Enrichment should gain a formal "family" label -- untouched;
+* Family cycles 2-7 for this family -- untouched, remain entirely
+  unstarted.
+
+== 16. Implementation authorization recommendation
+
+Both mandatory findings (FIND-C1-001, FIND-C1-002) are resolved above with
+explicit, reasoned, independently-reviewable decisions:
+
+* formula-mode: **explicitly corrected** (Decision B), not preserved, not
+  silently fixed, structural-intent semantics decided and specified
+  (<<sec5>>);
+* FK-side sibling: **included in the same implementation sequence**,
+  folded into Slice 1 (<<sec7>>);
+* duplicate-key drift, raised by Task 5 as a required decision even though
+  not itself a numbered FIND-C1 finding: **explicitly corrected** to a
+  fail-closed contract, bundled into Slice 2 with its own compatibility
+  record (<<sec6>>).
+
+The owner boundary (<<sec4>>), package/import mechanism (<<sec11>>), test
+plan (<<sec12>>), and two-slice implementation sequence (<<sec8>>,
+<<sec13>>) are concrete and bounded: no new framework, registry, public
+surface, or metadata shape is introduced; the mechanism repeats the
+already-twice-accepted H5 package-facade pattern one level up in size,
+exactly as the Cycle-1 assessment and its review anticipated.
+
+== 17. Independent review gate
+
+**IMPLEMENTATION READY -- INDEPENDENT REVIEW REQUIRED**
+
+First implementation slice, if this readiness design is independently
+accepted: *Slice 1 -- owner-local shape/key interpretation (Lookup) + FK
+sibling*, exactly as scoped in <<sec13>>. It is allowed to change only:
+
+* `enrich_lookup/provenance.py` (add
+  `interpret_written_enrich_lookup_provenance`);
+* `enrich_lookup/__init__.py` (facade export);
+* `fk_helpers/policy.py` (add `validated_helper_columns_by_sheet`);
+* `fk_helpers/__init__.py` (facade export);
+* `derived_column_policy.py` (remove `_validated_enrich_spec`,
+  `_validated_mismatch_keys`, `_validated_symmetric_on`,
+  `_validated_single_key`, `_validated_fk_helper_names`; call the two new
+  facade functions instead; no other change to this module in this slice);
+* the corresponding test files named in <<sec12>>.
+
+It must not touch `_check_enrich_lookup_values`, `_canonical_value_map`,
+`_column_mismatch_indices`, or any formula-mode/duplicate-key behavior --
+that is Slice 2's exclusive scope, gated on its own independent review
+after Slice 1 is accepted.
+
+This artifact does not itself authorize implementation to begin.
+Independent review of this readiness design is required first, per the
+governing gate in `domain_fk_reference_helper_cycle1_reentry_assessment_2026-08-23_review_001.adoc`
+Section 21.
