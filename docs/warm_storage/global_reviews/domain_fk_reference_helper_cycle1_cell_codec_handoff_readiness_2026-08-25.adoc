@@ -1,0 +1,1140 @@
+= FK / Reference-Helper Family: Cycle-1 Cell Codec Handoff -- Implementation-Readiness Design
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status:: bounded implementation-readiness / design assessment for the sole
+remaining Family Cycle-1 blocker (FINDING-001, R-001). Read-only
+investigation plus this design artifact only. Does not implement source or
+test changes, does not close Family Cycle 1, does not begin an independent
+closure review, and does not self-authorize implementation -- see <<sec18>>.
+
+Date:: 2026-08-25.
+
+Repository baseline:: `013288f` (`docs(domain): assess FK helper family
+cycle 1 closure`), branch `main`, `main...origin/main [ahead 37]`, clean
+worktree before and after this assessment.
+
+Governing artifact:: `docs/warm_storage/global_reviews/domain_fk_reference_helper_family_cycle1_closure_assessment_2026-08-24.adoc`
+(commit `013288f`). Verdict: *FAMILY CYCLE 1 -- MATERIAL BLOCKER REMAINS*,
+exactly one Class-A item (FINDING-001 / R-001).
+
+== 1. Status / gate
+
+This is the bounded implementation-readiness / design step named as the
+"exact next action" by the Cycle-1 closure assessment (its Section 19). It
+follows the F-002 precedent chain exactly: *design/readiness -> independent
+review -> implementation authorization*. No source or test file is modified
+here. All empirical claims below are backed by read-only probes run against
+the current worktree (`.venv/bin/python`, no `src/`/`tests/` edits); the
+probe script and its full output are reproduced inline where they support a
+claim.
+
+Only this artifact is added by this task. `git diff --check` is clean (see
+<<sec20>>).
+
+== 2. Governing finding
+
+Restated from the closure assessment's `FINDING-001` (its Section 16) and
+`R-001` (its Section 10), current-source-verified in this task:
+
+Affected code:: `src/spreadsheet_handling/domain/transformations/cell_codec/frame.py`
+-- `_helper_columns_for_frame` (lines 730-750), `_column_name_set` (lines
+753-762), called by `_reject_helper_participating_columns` (lines 716-727),
+itself called from exactly one site: `_encode_position_based` (line 535),
+reached only through the public `encode_cell_values(..., codec_intent=...)`
+path.
+
+Claim:: Cell Codec directly opens the FK `_meta.derived.sheets[frame].helper_columns`
+carrier and the Lookup `_meta.derived.sheets[frame].enrich_lookup.helper_columns`
+carrier and applies one locally invented, family-blind shape normalizer
+(`_column_name_set`) to both, plus to the unrelated Workbook-View
+`_meta.sheets[frame].helper_columns` carrier. This is foreign primitive
+interpretation, not an owner handoff, and one of the two foreign shapes it
+assumes (FK's) is currently wrong.
+
+This task independently re-derives that claim from current source (<<sec3>>),
+sharpens its severity (<<sec3>>, <<sec11>>), and designs the smallest
+owner-delegating correction (<<sec6>>-<<sec8>>).
+
+== 3. Current Cell Codec behavior [[sec3]]
+
+=== 3.1 Current algorithm
+
+[source,python]
+----
+def _reject_helper_participating_columns(
+    frames: Mapping[str, Any],
+    frame_name: str,
+    participating_columns: list[Any],
+) -> None:
+    helper_columns = _helper_columns_for_frame(_meta_from_frames(frames), frame_name)
+    rejected = [column for column in participating_columns if column in helper_columns]
+    if rejected:
+        raise ValueError(
+            "helper or derived columns must not participate in Cell Codec "
+            f"contraction by default: {rejected!r}"
+        )
+
+
+def _helper_columns_for_frame(meta: Mapping[str, Any], frame_name: str) -> set[Any]:
+    helper_columns: set[Any] = set()
+
+    sheets = meta.get("sheets")                                  # Workbook View
+    if isinstance(sheets, Mapping):
+        sheet_meta = sheets.get(frame_name)
+        if isinstance(sheet_meta, Mapping):
+            helper_columns.update(_column_name_set(sheet_meta.get("helper_columns")))
+
+    derived = meta.get("derived")                                 # FK + Lookup
+    if isinstance(derived, Mapping):
+        derived_sheets = derived.get("sheets")
+        if isinstance(derived_sheets, Mapping):
+            sheet_meta = derived_sheets.get(frame_name)
+            if isinstance(sheet_meta, Mapping):
+                helper_columns.update(_column_name_set(sheet_meta.get("helper_columns")))       # FK
+                enrich_lookup = sheet_meta.get("enrich_lookup")
+                if isinstance(enrich_lookup, Mapping):
+                    helper_columns.update(_column_name_set(enrich_lookup.get("helper_columns")))  # Lookup
+
+
+def _column_name_set(value: Any) -> set[Any]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, Mapping):
+        return set(value)
+    if isinstance(value, Iterable):
+        return set(value)
+    return set()
+----
+
+One generic parser is applied to three carriers with two genuinely different
+owner shapes (plus the Workbook-View shape):
+
+[cols="2,4",options="header"]
+|===
+| Carrier | Owner shape
+
+| `_meta.sheets[frame].helper_columns`
+| Workbook View, durable: `list[str] \| None` (`workbook_views.py::_optional_string_list`)
+
+| `_meta.derived.sheets[frame].helper_columns`
+| FK, transient: `list[{column, fk_column, target, target_key, value_field}] \| None`
+  (`fk_helpers/provenance.py::_write_helper_provenance`, confirmed against
+  `docs/technical_model/ch04_concepts/fk_helper_metadata.adoc`)
+
+| `_meta.derived.sheets[frame].enrich_lookup.helper_columns`
+| Lookup, transient: `list[str] \| None` (`enrich_lookup/operation.py:561`,
+  `record["helper_columns"] = list(fields)`)
+|===
+
+`_column_name_set`'s `Iterable` branch (`set(value)`) is semantically valid
+only for the two `list[str]` shapes (Workbook View, Lookup). For FK's
+`list[dict]` shape it calls `set([{...}, ...])`, which raises
+`TypeError: unhashable type: 'dict'` before Cell Codec's own domain
+`ValueError` can ever run.
+
+=== 3.2 Empirical reproduction (read-only, current worktree)
+
+A probe script was run through the public `encode_cell_values` path with
+current writer-shaped rich FK provenance
+(`.venv/bin/python`, no source/test file touched):
+
+[source,python]
+----
+frames_fk = {
+    "desks": pd.DataFrame([{"id": "d1", "note": "N1", "_employees_first_name": "Ann"}]),
+    "_meta": {"derived": {"sheets": {"desks": {"helper_columns": [
+        {"column": "_employees_first_name", "fk_column": "id_(employees)",
+         "target": "employees", "target_key": "id", "value_field": "first_name"},
+    ]}}}},
+}
+encode_cell_values(frames_fk, source="desks", output="out",
+                    codec_intent={"participating_columns": ["note"], ...})   # NON-helper column
+----
+
+[source,console]
+----
+=== 1a. encode_cell_values on NON-helper column, frame carries rich FK provenance ===
+RAISED TypeError: unhashable type: 'dict'
+
+=== 1b. encode_cell_values targeting the FK helper column itself, rich FK provenance ===
+RAISED TypeError: unhashable type: 'dict'
+----
+
+This confirms and *sharpens* the closure assessment's finding: the crash is
+not scoped to selecting the FK helper column as a participating column. It
+fires inside `_helper_columns_for_frame` while building the frame-wide
+helper-identity set, *before* `_reject_helper_participating_columns` ever
+filters by `participating_columns`. Consequence: today, `encode_cell_values`
+cannot process *any* column -- helper or not -- on a frame that merely
+carries current rich FK provenance, i.e. any frame that has ever had
+`add_fk_helpers` run on it in the current pipeline invocation. This is a
+correctness defect wider than "the helper column cannot be rejected
+correctly"; it is "the frame cannot be encoded at all."
+
+Lookup provenance does *not* currently crash (its `helper_columns` is
+`list[str]`, which is hashable):
+
+[source,console]
+----
+=== 3a. encode_cell_values on NON-helper column, frame carries Lookup provenance ===
+SUCCEEDED: [{'id': 'd1', '_dept_name': 'Eng', 'compact': 'N1'}]
+
+=== 3b. encode_cell_values targeting the Lookup helper column itself ===
+RAISED ValueError: helper or derived columns must not participate in Cell Codec
+contraction by default: ['_dept_name']
+----
+
+This does not make the Lookup branch of `_column_name_set` correct --
+`_column_name_set` still privately assumes Lookup's shape rather than being
+told it by Lookup -- it only means the current unsoundness happens not to
+manifest as a crash for Lookup *today*, and would if Lookup's written
+provenance shape ever changed (exactly the DMC's "one-sided representation
+change would silently break the other side" material-handoff test, DMC
+Section 5).
+
+=== 3.3 A second, independent latent defect (informational, not the blocker)
+
+`_column_name_set`'s `Mapping` branch (`set(value)` on a raw `Mapping`) and
+its generic `Iterable` fallback (identical for a `dict`, since `dict` is
+itself `Iterable`) both silently reinterpret a bare mapping's *keys* as
+column names, rather than raising or returning empty:
+
+[source,console]
+----
+=== 9. Current shadow _column_name_set behavior for comparison ===
+  dict (workbook-view malformed hand-authored): OK -> {'a', 'b'}
+----
+
+No current producer of any of the three carriers ever writes a bare mapping
+at the `helper_columns`/`enrich_lookup` leaf (FK and Lookup always write
+lists; Workbook View always writes `list[str] | None`), so this is not
+currently reachable through any accepted production path -- it is latent,
+not the Cycle-1 blocker, and is noted here only as corroborating evidence
+that `_column_name_set` is an unsound generic parser rather than a
+deliberately-designed multi-shape reader. See <<sec17>> (F-2) for its
+disposition.
+
+== 4. Owner facades available [[sec4]]
+
+Both facades were read in full from current source (not from the assessment's
+prose) and independently exercised.
+
+=== 4.1 FK: `fk_helpers.validated_helper_columns`
+
+`fk_helpers/policy.py:183-231`, exported via `fk_helpers/__init__.py`:
+
+[source,python]
+----
+def validated_helper_columns(raw_helper_columns: Any, *, frame_name: str) -> set[str]:
+----
+
+* `None` -> `set()` (safe no-op).
+* Not a `list`/`tuple` -> `ValueError("_meta.derived.sheets[{frame_name!r}].helper_columns must be a list")`.
+* Any entry not a `Mapping` -> `ValueError("...helper_columns[{index}] must be a mapping, got {type}")`.
+* Entry present but without a truthy `column` key -> silently skipped (matches its own documented, deliberate leniency for that one sub-field, "matching prior behavior").
+* Takes only the already-extracted per-sheet raw value -- it does not walk
+  `frames`/`_meta.derived`/`_meta.derived.sheets[frame_name]` itself. Container-shape
+  validation above the leaf stays the caller's (F-CORR-1, confirmed unchanged
+  and independently re-verified by the F-002 Slice-1 implementation review at
+  the byte level).
+
+Empirical confirmation against the identical raw value that crashed Cell Codec:
+
+[source,console]
+----
+=== 2. fk_helpers.validated_helper_columns on the identical raw FK value ===
+Result: {'_employees_first_name'} <class 'set'>
+----
+
+=== 4.2 Lookup: `enrich_lookup.validated_enrich_lookup_helper_columns`
+
+`enrich_lookup/provenance.py:66-88`, exported via `enrich_lookup/__init__.py`:
+
+[source,python]
+----
+def validated_enrich_lookup_helper_columns(record: Any, *, frame_name: str) -> tuple[str, ...]:
+----
+
+* `None` -> `()` (safe no-op).
+* Not a `Mapping` -> `ValueError("..._meta.derived.sheets[{frame_name!r}].enrich_lookup must be a mapping, got {type}")`.
+* `helper_columns` member present but not `list`/`tuple` -> `ValueError("...enrich_lookup.helper_columns must be a list")`.
+* `helper_columns` absent or empty -> `()`.
+* Every element is coerced with `str(...)`, never inspected for join-key form.
+* *Deliberately does not resolve or validate `on`/`source_key`/`lookup_key`* --
+  confirmed both by direct read of `_validated_enrich_record_shape` (which
+  never inspects those members) and empirically:
+
+[source,console]
+----
+=== 5. validated_enrich_lookup_helper_columns on a record with NO join-key form ({}) ===
+Result (should not raise): ('_dept_name',)
+
+=== 5b. interpret_written_enrich_lookup_provenance on the SAME malformed-key-form record ===
+RAISED ValueError: _meta.derived.sheets['desks'].enrich_lookup has no join-key
+form; a value-checked enrich_lookup record must declare either a symmetric
+`on` list or an asymmetric `source_key`/`lookup_key` pair
+----
+
+This is the required empirical basis for Key Design Issue 4: Cell Codec must
+call `validated_enrich_lookup_helper_columns`, never
+`interpret_written_enrich_lookup_provenance`. The latter would make Cell
+Codec spuriously raise `ValueError` for any record whose join-key form is
+absent or malformed even though its helper *identity* is perfectly
+resolvable and Cell Codec has no legitimate interest in key form at all --
+turning today's silent-but-correct behavior into a *new, incorrect* failure
+Cell Codec would own by mistake. `validated_enrich_lookup_helper_columns` is
+exactly and only the shape/identity half F-002 Slice 1 split out for this
+reason (`enrich_lookup/provenance.py`'s own module docstring, quoted in
+<<sec7>>).
+
+=== 4.3 Both facades are sufficient
+
+No facade change is required. Both already return exactly what Cell Codec
+needs (helper-column identity), already accept exactly the shape Cell Codec
+can extract without interpretation (the already-extracted raw per-sheet
+value), and already have independently-reviewed, byte-pinned failure
+semantics (F-002 Slice 1 implementation review, Sections 4-7). Per this
+task's own stop condition: *no facade change appears necessary; this design
+does not widen the closure slice.*
+
+== 5. Desired ownership boundary
+
+Target local algorithm (mirrors the assessment's Section 14 sketch, now
+concretized against actual signatures):
+
+[source,text]
+----
+navigate shared _meta / _meta.derived / _meta.derived.sheets containers (lenient, Cell-Codec-local)
+    -> ask FK owner for FK helper identity     (fk_helpers.validated_helper_columns)
+    -> ask Lookup owner for Lookup helper identity  (enrich_lookup.validated_enrich_lookup_helper_columns)
+    -> read explicit Workbook-View helper identity  (Cell-Codec-local, no owner facade exists)
+    -> union names
+    -> enforce Cell Codec's own no-helper-participation invariant (unchanged)
+----
+
+This is structurally identical to the already-accepted
+`derived_column_policy.py::_resolve_derived_identity`, read in full in this
+task (`derived_column_policy.py:263-305`):
+
+[source,python]
+----
+def _resolve_derived_identity(derived_meta, *, frame_name):
+    """...
+    `_meta.derived.sheets[frame_name]` container-shape validation (this
+    function's own `isinstance` check below, and `_safe_sheet_meta`'s
+    equivalent checks one level up) stays here -- generic, shared by both
+    sub-keys. Each sub-key's *own* shape and identity ... is owned by its
+    respective package facade (F-002 Slice 1) ...
+    """
+    if derived_meta is None:
+        return set(), None
+    if not isinstance(derived_meta, Mapping):
+        raise ValueError(...)
+
+    helper_names = validated_helper_columns(derived_meta.get("helper_columns"), frame_name=frame_name)
+    enrich_spec = derived_meta.get("enrich_lookup")
+    enrich_names = validated_enrich_lookup_helper_columns(enrich_spec, frame_name=frame_name)
+    helper_names |= set(enrich_names)
+    return helper_names, enrich_spec
+----
+
+DCP's own docstring states the F-CORR-1 boundary in exactly the terms this
+task asks Cell Codec to follow. This is not a new design decision for Cell
+Codec; it is the same accepted seam, applied to a second consumer.
+
+DCP also independently confirms Key Design Issue 5 (return-type
+normalization): DCP explicitly writes `helper_names |= set(enrich_names)`
+because Python's `set.__ior__` requires a set-like right-hand operand and
+rejects a plain `tuple` (`enrich_names` is `tuple[str, ...]`) -- proving the
+FK/Lookup return-type difference is real and DCP already had to normalize
+it locally, at its own call site, with no shared protocol. See <<sec10>>.
+
+== 6. FK handoff [[sec6]]
+
+Extraction stays Cell-Codec-local (composite navigates the shared
+container); interpretation delegates:
+
+[source,python]
+----
+derived = meta.get("derived")
+if isinstance(derived, Mapping):
+    derived_sheets = derived.get("sheets")
+    if isinstance(derived_sheets, Mapping):
+        sheet_meta = derived_sheets.get(frame_name)
+        if isinstance(sheet_meta, Mapping):
+            helper_columns.update(
+                validated_helper_columns(sheet_meta.get("helper_columns"), frame_name=frame_name)
+            )
+----
+
+`sheet_meta.get("helper_columns")` is the raw, already-extracted per-sheet
+FK value -- exactly `validated_helper_columns`'s documented input contract
+(<<sec4>>). No re-walk of `frames`/`_meta.derived` inside the facade; no FK
+rich-entry key (`column`, `fk_column`, `target`, `target_key`,
+`value_field`) is ever named in Cell Codec.
+
+Import (see <<sec13>> for why this exact form, not a relative import):
+
+[source,python]
+----
+from spreadsheet_handling.domain.transformations.fk_helpers import validated_helper_columns
+----
+
+== 7. Lookup handoff [[sec7]]
+
+[source,python]
+----
+                helper_columns.update(
+                    validated_enrich_lookup_helper_columns(
+                        sheet_meta.get("enrich_lookup"), frame_name=frame_name
+                    )
+                )
+----
+
+`sheet_meta.get("enrich_lookup")` -- the whole raw record, `None` or
+otherwise -- is handed to the facade unopened; Cell Codec never itself
+checks `isinstance(enrich_lookup, Mapping)` or reads
+`enrich_lookup.get("helper_columns")` (both currently done locally at
+`frame.py:746-748`). The facade's own module docstring
+(`enrich_lookup/provenance.py:12-39`) states exactly why this is the correct
+function to call, independent of this task's own framing:
+
+[quote, enrich_lookup/provenance.py module docstring]
+____
+`validated_enrich_lookup_helper_columns` -- shape-only validation of an
+already-extracted `enrich_lookup` record, returning only its declared
+helper-column identity. DCP calls this unconditionally, for every policy
+including `drop`... It deliberately does *not* resolve or validate join-key
+form.
+____
+
+Cell Codec's need (helper identity only, unconditionally, regardless of any
+value-comparison concern it does not have) is structurally identical to
+DCP's `drop`-policy need that motivated this exact function's existence in
+F-002 Slice 1. Cell Codec is simply DCP's second, independently-motivated
+consumer of the same already-accepted narrow facade -- not a reason to widen
+or duplicate it.
+
+Import:
+
+[source,python]
+----
+from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    validated_enrich_lookup_helper_columns,
+)
+----
+
+== 8. Workbook-View handoff [[sec8]]
+
+=== 8.1 Classification
+
+The assessment's own three-way question: is Cell Codec's current read of
+`_meta.sheets[frame].helper_columns`
+
+. an intentionally simple public/durable handoff it may legitimately read;
+. another private foreign-shape parser that should delegate; or
+. something else?
+
+*Answer: (C), refined.* There is no owner facade to delegate to --
+`workbook_views.py` only *produces* this carrier
+(`configure_workbook_view` -> `_normalize_sheet_specs` ->
+`_merge_sheet_options`, via `_optional_string_list`/`_string_list`); it
+exposes no reader. Concrete source evidence, read in full in this task,
+that every current consumer of this exact carrier already implements its
+*own* small local reader rather than sharing one:
+
+[cols="3,5",options="header"]
+|===
+| Consumer | Local reader
+
+| `column_roles/resolver.py::_view_helper_columns` (lines 225-240)
+| own `isinstance(sheet_options, Mapping)` / `isinstance(entry, Mapping)` /
+  `isinstance(helpers, list)` walk, no shared facade
+
+| `derived_column_policy.py::_safe_durable_helper_names` (lines 332-356)
+| own walk, **stricter than Cell Codec's current one** -- see <<sec8-2>>
+
+| `rendering/passes/_base.py::_helper_column_names_from_value` (lines 19-45)
+| own walk (also tolerates FK's rich-entry shape locally -- the already-
+  dispositioned H6 handoff, R-012 class D in the closure assessment;
+  rendering is a downstream layer this fix must not import from -- `domain/`
+  imports no `rendering` module anywhere, confirmed by repo-wide grep)
+
+| Cell Codec (current)
+| own walk, most permissive of the three
+|===
+
+Disposition: (A)-like in substance (a genuinely simple, owner-facade-free,
+directly-read carrier), but the specific existing Cell Codec implementation
+is not the only, nor the strictest, precedent for *how* to read it locally.
+
+=== 8.2 A concrete, more direct precedent than Cell Codec's own history [[sec8-2]]
+
+DCP's `_safe_durable_helper_names` (read in full, `derived_column_policy.py:332-356`)
+reads the *identical* carrier and is already independently reviewed and
+accepted (F-002 Slice 1, unmodified by that slice, pre-existing DCP code):
+
+[source,python]
+----
+def _safe_durable_helper_names(meta: Mapping[str, Any], source: str) -> set[str]:
+    sheets = meta.get("sheets")
+    if sheets is None:
+        return set()
+    if not isinstance(sheets, Mapping):
+        raise ValueError(f"_meta.sheets must be a mapping, got {type(sheets).__name__}")
+    sheet_entry = sheets.get(source)
+    if sheet_entry is None:
+        return set()
+    if not isinstance(sheet_entry, Mapping):
+        raise ValueError(f"_meta.sheets[{source!r}] must be a mapping, got {type(sheet_entry).__name__}")
+    raw_helper_columns = sheet_entry.get("helper_columns")
+    if raw_helper_columns is None:
+        return set()
+    if not isinstance(raw_helper_columns, (list, tuple)):
+        raise ValueError(f"_meta.sheets[{source!r}].helper_columns must be a list")
+    return {str(column) for column in raw_helper_columns if str(column)}
+----
+
+This raises `ValueError` for a non-mapping container or a non-`list`/`tuple`
+leaf, and never special-cases a bare string. Cell Codec's current
+`_column_name_set`, applied to the same carrier, never raises for any of
+those and additionally mishandles a bare `Mapping` (<<sec3>>, 3.3).
+
+*This does not mean Workbook View is redesigned in this task* -- `workbook_views.py`
+itself (the producer and only owner of this carrier's contract) is untouched,
+and no consumer-facing behavior of that module changes. It means Cell
+Codec's own *local* choice of how strictly to read this one carrier has a
+closer, better precedent available than its own pre-existing code. This is
+presented as an explicit open option for the implementer/independent
+reviewer, not mandated here (<<sec17>>, OQ-1):
+
+[cols="1,4,3",options="header"]
+|===
+| Option | Description | Recommendation
+
+| W1
+| Keep the current `_column_name_set` body verbatim, re-scoped to this one
+  remaining call site (optionally renamed for Local Human Readability, since
+  it now serves exactly one carrier, not three).
+| *Default for this slice.* Zero behavior change for the one carrier that is
+  not the Cycle-1 blocker; smallest possible diff; Workbook View is
+  explicitly out of scope for redesign.
+
+| W2
+| Align with DCP's `_safe_durable_helper_names` tail (raise for non-mapping
+  container / non-list leaf; `str()`-coerce and drop falsy elements; no
+  bare-string sugar).
+| Precedent-backed, closes the dict-keys latent hazard (<<sec3>>, 3.3) using
+  an already-accepted sibling pattern rather than a new one. Reasonable if
+  the independent reviewer prefers cross-consumer consistency over minimal
+  diff. *Not required for Cycle-1 closure either way.*
+|===
+
+Either option keeps all navigation above the leaf (`isinstance(sheets, Mapping)`,
+`isinstance(sheet_meta, Mapping)`) exactly as it is today; only the leaf-value
+interpretation differs between W1 and W2.
+
+== 9. Failure compatibility matrix [[sec9]]
+
+Every row below was independently run against current source in this task
+(full script in <<sec20>>). "Current" = today's `_column_name_set`
+reachable through `_helper_columns_for_frame`. "New" = the relevant owner
+facade (FK/Lookup) or the local reader (Workbook View, per <<sec8>>).
+
+=== 9.1 FK raw `helper_columns`
+
+[cols="3,3,4,4",options="header"]
+|===
+| State | Current | New (`validated_helper_columns`) | Disposition
+
+| absent / `None`
+| `set()`
+| `set()`
+| unchanged
+
+| empty list `[]`
+| `set()`
+| `set()`
+| unchanged
+
+| legacy `list[str]` (e.g. `["b"]"`)
+| `{"b"}`, no raise
+| `ValueError(...must be a mapping, got str)`
+| **changed, accept.** This shape was never a valid FK-provenance writer
+  output (FK always writes `list[dict]`). It is exactly the obsolete
+  existing-test-fixture shape the closure assessment names; the fixture
+  *must* be updated as a direct, required consequence of this fix, not a
+  side effect to silently absorb (<<sec12>>).
+
+| current rich `list[dict]`
+| `TypeError: unhashable type: 'dict'` (frame-wide crash, <<sec3>>)
+| `{'<col>', ...}`, no raise
+| **changed (fixed).** This is FINDING-001 itself.
+
+| non-list (e.g. bare `dict`)
+| silently returns the dict's own *keys* as pseudo column names (3.3)
+| `ValueError(...must be a list)`
+| **changed, accept (fixes a second, previously-undocumented latent hazard).**
+  No real FK producer ever emits this shape.
+
+| list entry present but missing `column`
+| crash (any list containing *any* dict crashes the current parser,
+  regardless of that dict's keys)
+| entry silently skipped, contributes nothing
+| **changed (fixed), matches the facade's own documented, pre-existing
+  leniency for this one sub-field ("matching prior behavior") -- not a new
+  rule Cell Codec invents.**
+|===
+
+=== 9.2 Lookup raw `enrich_lookup` record
+
+[cols="3,3,4,4",options="header"]
+|===
+| State | Current | New (`validated_enrich_lookup_helper_columns`) | Disposition
+
+| absent (`sheet_meta.get("enrich_lookup")` is `None`)
+| outer `isinstance(..., Mapping)` guard skips silently
+| `()`
+| unchanged
+
+| non-mapping present (e.g. a list)
+| outer guard silently treats as absent
+| `ValueError(...must be a mapping, got list)`
+| **changed, accept as intentional hardening.** No real Lookup producer
+  (`enrich_lookup/operation.py:550-562`) ever writes a non-mapping value
+  here. DCP's own `_resolve_derived_identity` already raises identically for
+  this same malformed shape via the same facade (<<sec5>> excerpt) -- Cell
+  Codec inherits the posture DCP already has for the identical owner value,
+  rather than remaining the one inconsistent lenient reader of it.
+
+| mapping present, `helper_columns` absent
+| `set()`
+| `()`
+| unchanged
+
+| `helper_columns` empty list
+| `set()`
+| `()`
+| unchanged
+
+| `helper_columns` = `list[str]` (real shape)
+| correct set
+| correct tuple (erased to set by `.update`, <<sec10>>)
+| unchanged (both correct)
+
+| `helper_columns` non-list (e.g. bare `dict`)
+| silently returns the dict's own keys (3.3)
+| `ValueError(...must be a list)`
+| **changed, accept (fixes the same latent hazard as the FK case).**
+
+| `helper_columns` list with non-str/`None` element
+| kept as a raw, non-string pseudo "column name" (`123`, `None` objects) --
+  inert, can never match a real string column label
+| coerced via `str(...)` (Lookup's own established, F-002-inherited rule;
+  e.g. `123 -> "123"`, `None -> "None"`)
+| **changed but inert either way; not Cell Codec's decision** -- it is the
+  Lookup facade's own pre-existing coercion contract (already flagged
+  non-blocking in the F-002 Slice-1 implementation review, FINDING-002).
+  Cell Codec must not second-guess it.
+
+| malformed/absent key form (`on`/`source_key`/`lookup_key` missing, `None`,
+  mixed, blank) that helper-identity-only validation deliberately ignores
+| never inspected (current parser never reads these fields at all)
+| never inspected -- **empirically confirmed** (<<sec4>>, 5/5b): a record
+  with *no* join-key form at all still yields correct helper identity,
+  no raise
+| unchanged, and this is precisely why `validated_enrich_lookup_helper_columns`
+  (not `interpret_written_enrich_lookup_provenance`) is the correct facade
+  (<<sec4>>).
+|===
+
+=== 9.3 Workbook View raw `_meta.sheets[frame].helper_columns`
+
+[cols="3,3,4,4",options="header"]
+|===
+| State | Current (= Option W1) | Option W2 (DCP-aligned) | Disposition
+
+| absent / `None`
+| `set()`
+| `set()`
+| unchanged either way
+
+| bare string
+| `{value}`
+| `ValueError` (W2 has no bare-string branch; see <<sec8-2>> -- the
+  producer-side bare-string sugar is authoring-time-only and never survives
+  into the persisted carrier as a bare string)
+| **W1 unchanged / W2 changed.** No currently-persisted, normally-produced
+  metadata ever carries a bare string here (`_string_list` always
+  normalizes to a list before persistence); only a hand-authored sidecar
+  could. Non-blocking either way (<<sec17>>, OQ-1).
+
+| `list[str]`
+| `set(value)`
+| `{str(c) for c in value if str(c)}`
+| unchanged in practice (real values are already non-empty strings)
+
+| empty list
+| `set()`
+| `set()`
+| unchanged
+
+| malformed (bare `dict`, arbitrary iterable)
+| silently wrong (3.3)
+| `ValueError`
+| **W1: unchanged, pre-existing, out of scope. W2: fixed.** Not currently
+  reachable via any accepted producer path; not the Cycle-1 blocker either
+  way.
+|===
+
+No malformed state anywhere in this section is silently reinterpreted as a
+*different* correct-looking helper-identity result after this fix except
+where explicitly marked "inert" above (the Lookup non-string-element case,
+which is unowned by Cell Codec and was already latent-inert before this
+fix). Every other changed row moves from *silent wrong answer* or *crash*
+to *explicit, clearly-worded `ValueError`* -- never the reverse.
+
+== 10. Return normalization [[sec10]]
+
+FK facade returns `set[str]`; Lookup facade returns `tuple[str, ...]`; the
+Workbook-View local reader returns `set[Any]`/`set[str]`. Cell Codec needs
+only membership testing (`column in helper_columns`,
+`_reject_helper_participating_columns`'s only use of the result) -- ordering
+is never observed, never returned to any caller, never serialized (Key
+Design Issue 6: confirmed no ordering dependency anywhere in the file by
+direct read of every remaining use).
+
+*Decision: Option A (normalize locally, at the Cell Codec boundary), and no
+new code is even required to do it.* Cell Codec's existing accumulation
+idiom is `set.update(...)`, which -- unlike the `|=` operator DCP had to use
+at its own analogous call site (<<sec5>>, `helper_names |= set(enrich_names)`,
+required because `set.__ior__` rejects a plain `tuple`) -- already accepts
+any iterable, `set` or `tuple` alike, with no wrapping:
+
+[source,python]
+----
+helper_columns.update(validated_helper_columns(raw_fk, frame_name=frame_name))          # set[str]  -- fine
+helper_columns.update(validated_enrich_lookup_helper_columns(raw_lk, frame_name=frame_name))  # tuple[str, ...] -- also fine
+----
+
+DCP's own call site is direct proof the type difference is real and matters
+in general (DCP had to write `set(enrich_names)` explicitly); Cell Codec's
+pre-existing `.update()` idiom happens to erase it for free. No shared
+protocol, dataclass, or normalization helper is needed (<<sec15>>).
+
+== 11. Public behavior correction [[sec11]]
+
+Cell Codec's own public rule does not change: *helper/derived columns may
+not participate in Cell Codec contraction by default*, raised as
+`ValueError("helper or derived columns must not participate in Cell Codec "
+f"contraction by default: {rejected!r}")` -- Cell Codec's own existing
+error, unchanged vocabulary, per this task's instruction not to invent a new
+one.
+
+What changes is *which inputs can reach that rule at all*:
+
+[cols="3,4,4",options="header"]
+|===
+| Scenario | Before | After
+
+| Non-helper column, frame has current rich FK provenance anywhere
+| `TypeError: unhashable type: 'dict'` (frame-wide denial, <<sec3>>)
+| succeeds, unchanged output
+
+| FK helper column selected as participating, current rich FK provenance
+| `TypeError: unhashable type: 'dict'`
+| `ValueError("helper or derived columns must not participate...: ['_employees_first_name']")`
+  -- Cell Codec's own existing, unchanged error, now correctly reachable
+
+| Lookup helper column selected as participating
+| already correctly `ValueError(...)` (accidentally, via a shape that
+  happens to be hashable)
+| identically `ValueError(...)`, now *because* Lookup told Cell Codec its
+  identity, not because Cell Codec guessed correctly by luck
+|===
+
+The correction is strictly a widening of correct behavior (a crash and a
+silent-Mapping-hazard become either success or a clear, pre-existing
+domain error) -- never a narrowing of what previously succeeded, except for
+the two disclosed, evidence-backed strictness changes in <<sec9>> (obsolete
+`list[str]` FK shape; non-mapping Lookup record), both explicitly
+dispositioned as accept.
+
+== 12. Tests [[sec12]]
+
+All new/changed tests go through the public `encode_cell_values` surface, in
+`tests/unit/domain/transformations/test_cell_codec.py`, alongside the
+existing helper-participation test. Per this task's instruction, owner
+facade contracts are not re-tested exhaustively here (that coverage already
+exists in `test_fk_helpers_helper_columns_validation.py` and
+`test_enrich_lookup_provenance_interpretation.py`, F-002 Slice 1); Cell
+Codec's tests prove the *handoff and composition* behavior only.
+
+[cols="1,5,3",options="header"]
+|===
+| # | Test | Proves
+
+| 1
+| **Fixture correction (required, not additive):** update
+  `test_position_based_contract_rejects_helper_or_derived_participating_columns`'s
+  `_meta.derived.sheets.expanded.helper_columns` from `["b"]` to a
+  writer-shaped `[{"column": "b", "fk_column": ..., "target": ..., "target_key": ...,
+  "value_field": ...}]` literal (matching `fk_helper_metadata.adoc`'s
+  documented shape, consistent with the F-002 Slice-1 precedent of
+  hand-authored owner-shaped fixtures rather than full pipeline runs).
+| The existing test currently passes for the wrong reason (an obsolete shape
+  that predates the current FK writer contract); left unchanged it would
+  keep silently protecting the shadow assumption rather than the real one
+  (per <<sec9>>, 9.1, the un-updated fixture's `list[str]` shape now raises
+  a *different* `ValueError` from the FK facade, which the test's loose
+  `match="helper\|derived"` regex would still accidentally match --
+  a meaningless pass for the wrong reason if left as-is).
+
+| 2
+| Non-helper column succeeds on a frame carrying current rich FK provenance.
+| The sharper, frame-wide-denial form of the bug (<<sec3>>) is fixed, not
+  only the directly-targeted-column form.
+
+| 3
+| FK helper column rejected, current rich FK provenance: `ValueError`
+  matching Cell Codec's existing message; explicitly assert **no**
+  `TypeError`.
+| FINDING-001's headline defect is closed through the public surface.
+
+| 4
+| Non-helper column succeeds / Lookup helper column rejected, writer-shaped
+  Lookup provenance (`{"lookup": ..., "on": [...], "helper_columns": [...]}`).
+| Lookup path is unchanged and now delegated rather than accidentally
+  correct.
+
+| 5
+| FK helper identity and Lookup helper identity coexist as sibling subkeys
+  under the same `_meta.derived.sheets[frame]` entry (a reachable state --
+  confirmed by `enrich_lookup/operation.py`'s and
+  `fk_helpers/provenance.py`'s shared, sibling-preserving write paths);
+  union correctly rejects either.
+| Test Plan item 3 (both owners present).
+
+| 6
+| Workbook-View durable helper column (`_meta.sheets[frame].helper_columns`)
+  still rejected.
+| Regression: the one legitimately-unrelated carrier is untouched by this
+  fix (<<sec8>>).
+
+| 7
+| Malformed FK state: a bare non-list value (e.g. a dict) at
+  `_meta.derived.sheets[frame].helper_columns` raises a clear `ValueError`,
+  not a silent wrong answer and not a `TypeError`.
+| The disclosed, accepted strictness change in <<sec9>>, 9.1.
+
+| 8
+| Malformed Lookup state: a non-mapping `enrich_lookup` value raises a clear
+  `ValueError` instead of being silently treated as absent.
+| The disclosed, accepted strictness change in <<sec9>>, 9.2.
+
+| 9
+| Absent `_meta` entirely (no `_meta` key on `frames`) still succeeds
+  unchanged.
+| Test Plan item 7 (existing no-metadata path unchanged).
+|===
+
+`tests/integration/pipeline/test_cell_codec_carrier_roundtrip.py` was read
+in full: it exercises only the string-oriented carrier roundtrip contract
+(XLSX/ODS), never constructs FK/Lookup/Workbook-View helper metadata, and is
+not a natural or required home for any of the above -- it needs no change.
+
+== 13. Architecture / import boundary [[sec13]]
+
+`tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`
+was read in full and confirmed to already, automatically cover Cell Codec as
+an importer:
+
+* it walks every `*.py` under `TRANSFORMATIONS_ROOT` = `domain/transformations/`
+  (`cell_codec/frame.py` included, no allowlist or opt-in required);
+* `GUARDED_INTERNAL_PREFIXES` already lists
+  `fk_helpers.{drop,enrich,formula_provider,policy,provenance}` and
+  `enrich_lookup.{mismatch,operation,policy,provenance}` as guarded internal
+  submodules -- unchanged since before F-002 Slice 1, which added no new
+  entry either (confirmed by that slice's own implementation record and
+  independent review, both read in full in this task);
+* it resolves both `from x import y` and relative-import forms to fully
+  qualified module names before checking, so it is insensitive to whether
+  the new Cell Codec imports use the relative or absolute form.
+
+As long as the implementation imports only
+`spreadsheet_handling.domain.transformations.fk_helpers.validated_helper_columns`
+and `spreadsheet_handling.domain.transformations.enrich_lookup.validated_enrich_lookup_helper_columns`
+via each package's `__init__.py` facade -- never `fk_helpers.policy` or
+`enrich_lookup.provenance` directly -- the *existing* guard passes with zero
+new lines, exactly as it did for DCP in F-002 Slice 1.
+
+*No new guard test is warranted.* The existing guard is generic across the
+whole `transformations` tree, not scoped per importer family; it will
+already fail loudly if a future edit reaches into either internal submodule
+directly.
+
+Import-style recommendation (not itself a correctness question):
+`cell_codec/frame.py` already imports its *other* cross-package
+dependencies absolutely (`from spreadsheet_handling.domain._cell_primitives
+import ...`, `from spreadsheet_handling.domain.tabular import ...`),
+reserving the relative form (`from .scalar import ...`) for same-package
+siblings only. `derived_column_policy.py`'s own accepted F-002 Slice 1
+import block uses the identical fully-qualified absolute form for these
+same two facades. Matching both precedents:
+
+[source,python]
+----
+from spreadsheet_handling.domain.transformations.fk_helpers import validated_helper_columns
+from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    validated_enrich_lookup_helper_columns,
+)
+----
+
+== 14. Source scope
+
+[cols="1,4",options="header"]
+|===
+| File | Change
+
+| `src/spreadsheet_handling/domain/transformations/cell_codec/frame.py`
+| Two new absolute imports; `_helper_columns_for_frame` delegates its FK and
+  Lookup subkey interpretation to the two facades (<<sec6>>, <<sec7>>);
+  `_column_name_set` narrows to the one remaining Workbook-View call site
+  (<<sec8>>, W1 or W2); `_reject_helper_participating_columns` is untouched.
+
+| `tests/unit/domain/transformations/test_cell_codec.py`
+| One required fixture correction plus the additive tests in <<sec12>>.
+|===
+
+No FK, Lookup, or Workbook-View *owner* source file is touched (confirmed
+sufficient in <<sec4>>). No registry, YAML surface, `_meta` shape, or public
+Python surface changes. No stale docstring was found naturally in scope to
+touch opportunistically (the one known stale docstring, FINDING-002 of the
+closure assessment, lives in `enrich_lookup/provenance.py` and is
+unaffected by a Cell-Codec-only change).
+
+== 15. Rejected abstractions
+
+Per this task's explicit instruction, each rejected without further
+consideration unless the evidence above forced otherwise -- it did not:
+
+[cols="3,5",options="header"]
+|===
+| Rejected | Why
+
+| Generic `HelperIdentity` protocol
+| The two return shapes (`set[str]`, `tuple[str, ...]`) already fully erase
+  at the Cell Codec boundary via plain `set.update(...)` (<<sec10>>); no
+  third shape or consumer exists to justify a protocol.
+
+| Generic provenance registry
+| Exactly three fixed, known carriers exist; no dynamic registration need
+  was found anywhere in this investigation.
+
+| Global helper-carrier parser
+| This *is* the defect being removed (`_column_name_set` was exactly this).
+
+| New metadata ontology
+| No new `_meta` root, key, or shape is introduced anywhere in this design.
+
+| Shared FK/Lookup helper dataclass
+| Neither owner needs richer structure at this seam than plain name
+  identity; `InterpretedEnrichLookupProvenance` already exists for the
+  *different*, key-form-aware need Cell Codec explicitly does not have
+  (<<sec4>>).
+
+| Surface consolidation (`add_fk_helpers` vs. `add_lookup_helpers`, etc.)
+| Explicitly `R-002`, later-family-cycle work, owned by the still-open
+  `FTR-FK-REFERENCE-HELPER-SURFACE-CONSOLIDATION-P5`; untouched by this
+  design.
+
+| Package re-layout / new `cell_codec` submodule
+| `frame.py` stays one file; two new imports and one narrowed local
+  function do not justify a physical split.
+
+| A shared Workbook-View helper-identity facade (unifying `resolver.py`,
+  DCP, Cell Codec, rendering)
+| Concrete candidate for a *future*, separately-scoped, deliberately
+  reviewed hardening item (three-plus independent local readers of one
+  simple carrier is mild but real duplication) -- but Workbook View is not
+  the Cycle-1 blocker, doing it now would silently widen this slice into a
+  Workbook-View-touching change the task explicitly excludes, and no
+  concrete current-source evidence forces it. Left as an observation only
+  (<<sec17>>), not a decision, and not recorded in any backlog/roadmap
+  surface per this task's explicit instruction not to touch those.
+|===
+
+== 16. Cycle-1 classification
+
+Re-applying the closure assessment's own A/B/C/D rule (its Section 11) to
+this specific finding, with this task's own additional evidence:
+
+* *A -- current, concrete cross-owner semantic/parser dependency belonging
+  to Cycle 1.* Confirmed, not weakened, by this task: Cell Codec currently
+  contains hidden foreign ontology (FK's five rich-entry keys, none of
+  which Cell Codec has any legitimate interest in) and demonstrably breaks
+  -- more broadly than previously documented (<<sec3>>) -- when the FK
+  owner's current representation is present at all, not merely selected.
+* Not *B* (later-cycle/public/topology/compatibility/documentation work):
+  the fix requires no public surface, registry, or configuration decision.
+* Not *C* (owner-local defect / separate bug): the defect is in the
+  *consumer* (Cell Codec), not in FK's or Lookup's own representation,
+  which are both already correct and already have sufficient, accepted
+  facades (<<sec4>>).
+* Not *D* (harmless residue / already-explicit legitimate handoff): unlike
+  the Workbook-View carrier (<<sec8>>) or the renderer's H6 handoff, Cell
+  Codec's current read is not an accepted explicit contract -- it
+  demonstrably crashes on real current-writer output.
+
+No evidence surfaced in this task's investigation reclassifies this as
+Cycle 2 (security/defensive cleanup), Cycle 3 (type review), Cycle 4
+(structural refactoring), or surface-consolidation work. *Classification
+confirmed: A.*
+
+== 17. Findings / open questions [[sec17]]
+
+[cols="1,5",options="header"]
+|===
+| ID | Finding
+
+| F-1
+| (Sharpens FINDING-001, not a new defect.) The current `TypeError` denies
+  *any* `encode_cell_values` call on a frame carrying rich FK provenance,
+  regardless of which columns participate -- not only calls that select the
+  FK helper column. See <<sec3>>, 3.2.
+
+| F-2
+| (Pre-existing, out of scope, non-blocking.) `_column_name_set`'s `Mapping`
+  branch and its generic `Iterable` fallback both silently reinterpret a
+  bare mapping's keys as column names for any of the three carriers. Not
+  reachable via any current accepted producer. Naturally narrows away for
+  FK/Lookup as a side effect of delegation (<<sec6>>, <<sec7>>); remains
+  possible for Workbook View only under Option W1 (<<sec8>>, 8.2), and is
+  exactly what Option W2 would close, at the implementer/reviewer's
+  discretion.
+
+| F-3
+| (Required, not optional.) The existing test fixture
+  `_meta.derived.sheets.expanded.helper_columns: ["b"]` becomes invalid
+  under the FK facade's contract (raises, for the wrong conceptual reason,
+  a `ValueError` its own loose regex would still accidentally match) and
+  *must* be replaced with a writer-shaped fixture as a direct consequence of
+  closing FINDING-001, not a discretionary cleanup (<<sec9>>, 9.1; <<sec12>>, #1).
+
+| F-4
+| (Disclosed strictness change, recommended accept.) Delegating to the
+  Lookup facade changes Cell Codec's tolerance for a non-mapping
+  `enrich_lookup` record from silent-skip to explicit `ValueError`,
+  matching DCP's own already-accepted posture for the identical value
+  (<<sec9>>, 9.2).
+
+| OQ-1
+| (Open, non-blocking either way.) Workbook-View leaf-reader strictness:
+  keep Cell Codec's current permissive body verbatim, re-scoped (W1,
+  recommended default), or align it with DCP's stricter, already-accepted
+  `_safe_durable_helper_names` pattern (W2, precedent-backed alternative).
+  See <<sec8>>, 8.2. Does not gate Cycle-1 closure or implementation
+  authorization; the independent reviewer may pick either, or explicitly
+  defer the question.
+|===
+
+No open question above requires a facade change, a Workbook-View contract
+change, or widening this slice beyond `cell_codec/frame.py` and its own
+test file.
+
+== 18. Implementation-readiness verdict [[sec18]]
+
+. *Is the smallest seam clear?* Yes -- <<sec6>>, <<sec7>>, <<sec8>>; two
+  absolute imports, two `.update()` calls replacing two `_column_name_set`
+  calls, one local function narrowed to one carrier.
+. *Are failure semantics dispositioned?* Yes, exhaustively, for every state
+  this task's own instruction enumerated -- <<sec9>>, plus F-1 through F-4
+  and OQ-1 (<<sec17>>) for the material differences, each with an explicit
+  accept/default recommendation and reasoning, none silent.
+. *Are facade return types sufficient?* Yes -- <<sec4>>, confirmed
+  empirically against the exact crashing input and against a deliberately
+  malformed-key-form Lookup record; no facade change needed or proposed.
+. *Are tests sufficient?* Yes -- <<sec12>>, nine cases through the public
+  surface, including the required fixture correction, without duplicating
+  owner-facade unit coverage.
+. *Is source scope bounded?* Yes -- <<sec14>>, exactly one source file and
+  one test file; no owner-family source touched.
+. *Is implementation now authorized by this design review?* **No.**
+  Following the F-002 precedent this task explicitly names as governing
+  (design/readiness -> independent review -> implementation authorization),
+  and per `docs/ai_info/review_instructions.adoc`'s review-artifact
+  discipline, this design artifact does not self-authorize the next step.
+
+*Implementation NOT YET AUTHORIZED. Independent readiness review REQUIRED.*
+
+== 19. Next action
+
+The next action is an independent review of this readiness design --
+structurally analogous to `c7f205c`'s review of the F-002 readiness design
+-- before any source or test file under <<sec14>> is touched. That review
+should in particular evaluate:
+
+* whether OQ-1 (<<sec17>>) should be resolved now (and if so, which of W1/W2)
+  or left to the implementer's judgment within the stated bound;
+* whether the disclosed strictness changes (F-3, F-4) are correctly
+  dispositioned as accept rather than requiring a different compatibility
+  resolution;
+* whether the empirical basis in <<sec3>> and <<sec4>> is sufficient to
+  proceed directly to implementation, or whether additional current-source
+  reproduction is warranted first.
+
+This design does not begin Family Cycle 2, does not resolve the
+surface-consolidation FTR, does not fix the multi-key formula producer
+(R-008, Class C, explicitly out of scope), does not redesign Workbook View,
+and introduces no global helper/provenance ontology (<<sec15>>).
+
+== 20. Validation performed [[sec20]]
+
+[source,console]
+----
+git status --short --branch
+  -> ## main...origin/main [ahead 37], clean, before and after this task
+
+git diff --check
+  -> exit 0, clean (before this artifact and after)
+
+.venv/bin/python -m pytest -q tests/unit/domain/transformations/test_cell_codec.py
+  -> 83 passed in 0.15s (current baseline, unmodified by this task)
+
+Read-only public-path + facade repro (full script and output; no src/tests
+file touched):
+  1a/1b. encode_cell_values with current rich FK provenance
+      -> TypeError: unhashable type: 'dict' (both non-helper and helper-column targets)
+  2.  fk_helpers.validated_helper_columns on the identical raw value
+      -> {'_employees_first_name'} (set[str], no raise)
+  3a/3b. encode_cell_values with writer-shaped Lookup provenance
+      -> non-helper succeeds; helper column raises the existing Cell Codec ValueError
+  4.  enrich_lookup.validated_enrich_lookup_helper_columns on the identical raw record
+      -> ('_dept_name',) (tuple[str, ...], no raise)
+  5.  validated_enrich_lookup_helper_columns on a record with no join-key form
+      -> ('_dept_name',), no raise
+  5b. interpret_written_enrich_lookup_provenance on the same record
+      -> ValueError: ...has no join-key form...
+  6.  encode_cell_values targeting the Workbook-View helper column
+      -> existing ValueError, ordinary Cell Codec rejection
+  7.  FK facade malformed-shape inventory (absent/empty/legacy-list[str]/
+      non-list/list-with-non-mapping-entry/list-with-column-less-mapping)
+      -> matches section 9.1 exactly
+  8.  Lookup facade malformed-shape inventory (absent/non-mapping/missing/
+      empty/non-list/non-str-elements)
+      -> matches section 9.2 exactly
+  9.  Current _column_name_set direct-unit comparison (None/str/list[str]/
+      list[dict]/bare dict)
+      -> matches sections 3.1/3.3 exactly
+
+asciidoctor -o /dev/null <this file>
+  -> 0 errors, 0 warnings
+----
+
+Only this readiness artifact was added by this task. No source, test,
+registry, Project Memory, roadmap, DMC, FTR, or prior-artifact file was
+modified.
