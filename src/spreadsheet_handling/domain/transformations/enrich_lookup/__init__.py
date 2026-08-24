@@ -1,3 +1,4 @@
+from .mismatch import LookupMismatchReport, evaluate_lookup_mismatches
 from .operation import enrich_lookup
 from .provenance import (
     InterpretedEnrichLookupProvenance,
@@ -12,4 +13,6 @@ __all__ = [
     "InterpretedEnrichLookupProvenance",
     "interpret_written_enrich_lookup_provenance",
     "validated_enrich_lookup_helper_columns",
+    "LookupMismatchReport",
+    "evaluate_lookup_mismatches",
 ]

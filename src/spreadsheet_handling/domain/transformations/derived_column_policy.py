@@ -49,6 +49,7 @@ from spreadsheet_handling.domain.finding_frame import (
     simple_failure_message,
 )
 from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    evaluate_lookup_mismatches,
     interpret_written_enrich_lookup_provenance,
     validated_enrich_lookup_helper_columns,
 )
@@ -546,12 +547,19 @@ def _check_enrich_lookup_values(
     # R002-IMP-002). This call site is unchanged in *when* it runs (only
     # under a value-checking policy) relative to the relocated code.
     interpreted = interpret_written_enrich_lookup_provenance(spec, frame_name=frame_name)
-    lookup_name = interpreted.lookup_name
-    payload_keys, lookup_keys = list(interpreted.payload_keys), list(interpreted.lookup_keys)
     helper_cols = list(interpreted.helper_columns)
 
-    lookup_df = lookup_frames.get(lookup_name)
-    if lookup_df is None:
+    # Mismatch evaluation itself is Lookup-owned (F-002 Slice 2): canonical
+    # lookup-map construction, duplicate-key validity, values-mode scalar
+    # comparison, and LookupFormulaSpec structural comparison all live behind
+    # the package facade. DCP retains everything below this call: when the
+    # check runs, warn/fail severity, Finding construction, rule_type
+    # selection, and aggregation.
+    report = evaluate_lookup_mismatches(
+        payload, interpreted=interpreted, lookup_frames=lookup_frames
+    )
+
+    if report.missing_lookup_frame:
         return [DerivedColumnFinding(
             rule_type="missing_lookup_frame",
             frame=frame_name,
@@ -559,31 +567,14 @@ def _check_enrich_lookup_values(
             row_index=None,
             value=None,
             severity=severity,
-            message=f"Lookup frame {lookup_name!r} not available; cannot verify enrich_lookup helpers.",
+            message=(
+                f"Lookup frame {interpreted.lookup_name!r} not available; "
+                f"cannot verify enrich_lookup helpers."
+            ),
         )]
 
-    if not payload_keys or not helper_cols:
-        return []
-
-    # Fail closed when the named key columns are absent: without them no row can
-    # be verified, so certifying zero mismatches (and then dropping the helper
-    # under fail_on_mismatch) would be unsound. Emit a severity-appropriate
-    # inability-to-verify finding — a warning under warn_on_mismatch, and a
-    # failure that makes apply_derived_column_policy raise under
-    # fail_on_mismatch (review R002-IMP-002).
-    provenance_path = f"_meta.derived.sheets[{frame_name!r}].enrich_lookup"
-    missing_payload = [key for key in payload_keys if key not in payload.columns]
-    missing_lookup = [key for key in lookup_keys if key not in lookup_df.columns]
-    if missing_payload or missing_lookup:
-        reasons: list[str] = []
-        if missing_payload:
-            reasons.append(
-                f"payload key column(s) {missing_payload} absent from frame {frame_name!r}"
-            )
-        if missing_lookup:
-            reasons.append(
-                f"lookup key column(s) {missing_lookup} absent from lookup frame {lookup_name!r}"
-            )
+    if report.unverifiable_reason is not None:
+        provenance_path = f"_meta.derived.sheets[{frame_name!r}].enrich_lookup"
         return [DerivedColumnFinding(
             rule_type="unverifiable_enrich_lookup",
             frame=frame_name,
@@ -592,77 +583,40 @@ def _check_enrich_lookup_values(
             value=None,
             severity=severity,
             message=(
-                "Cannot verify enrich_lookup helpers: "
-                + "; ".join(reasons)
-                + f". Provenance {provenance_path}."
+                f"Cannot verify enrich_lookup helpers: {report.unverifiable_reason}. "
+                f"Provenance {provenance_path}."
             ),
         )]
 
-    # The lookup frame is keyed by its own key column(s) (``lookup_keys``) and
-    # the payload by the source-side key column(s) (``payload_keys``). In the
-    # symmetric case these are the same name; in the asymmetric case they
-    # differ, but the join-key *values* line up, so the normalized value tuples
-    # match across frames.
-    canonical = _canonical_value_map(lookup_df, on_keys=lookup_keys, helper_cols=helper_cols)
-
     findings: list[DerivedColumnFinding] = []
-    for helper_col in helper_cols:
-        if helper_col not in payload.columns:
-            continue
-        mismatching = _column_mismatch_indices(
-            payload, helper_col=helper_col, on_keys=payload_keys, canonical=canonical
-        )
-        if mismatching:
-            findings.append(DerivedColumnFinding(
-                rule_type="derived_value_mismatch",
-                frame=frame_name,
-                columns=[helper_col],
-                row_index=tuple(mismatching),
-                value=None,
-                severity=severity,
-                message=(
-                    f"{len(mismatching)} row(s) differ from canonical lookup "
-                    f"{lookup_name!r} for helper column {helper_col!r}."
-                ),
-            ))
+    for helper_col, row_indices in report.value_mismatches.items():
+        findings.append(DerivedColumnFinding(
+            rule_type="derived_value_mismatch",
+            frame=frame_name,
+            columns=[helper_col],
+            row_index=tuple(row_indices),
+            value=None,
+            severity=severity,
+            message=(
+                f"{len(row_indices)} row(s) differ from canonical lookup "
+                f"{interpreted.lookup_name!r} for helper column {helper_col!r}."
+            ),
+        ))
+    for helper_col, row_indices in report.formula_mismatches.items():
+        findings.append(DerivedColumnFinding(
+            rule_type="derived_formula_mismatch",
+            frame=frame_name,
+            columns=[helper_col],
+            row_index=tuple(row_indices),
+            value=None,
+            severity=severity,
+            message=(
+                f"{len(row_indices)} row(s) hold a formula that no longer matches "
+                f"the declared enrich_lookup relationship for lookup "
+                f"{interpreted.lookup_name!r}, helper column {helper_col!r}."
+            ),
+        ))
     return findings
-
-
-def _column_mismatch_indices(
-    payload: pd.DataFrame,
-    *,
-    helper_col: str,
-    on_keys: list[str],
-    canonical: dict[tuple[Any, ...], dict[str, Any]],
-) -> list[Any]:
-    mismatching: list[Any] = []
-    for row_index, row in payload.iterrows():
-        key = tuple(_norm(row[k]) for k in on_keys if k in payload.columns)
-        if len(key) != len(on_keys):
-            continue
-        canonical_row = canonical.get(key)
-        if canonical_row is None:
-            continue  # unresolved reference is a separate concern
-        if _norm(row[helper_col]) != _norm(canonical_row.get(helper_col)):
-            mismatching.append(row_index)
-    return mismatching
-
-
-def _canonical_value_map(
-    lookup_df: pd.DataFrame,
-    *,
-    on_keys: list[str],
-    helper_cols: list[str],
-) -> dict[tuple[Any, ...], dict[str, Any]]:
-    canonical: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for _, row in lookup_df.iterrows():
-        if any(k not in lookup_df.columns for k in on_keys):
-            break
-        key = tuple(_norm(row[k]) for k in on_keys)
-        if key in canonical:
-            continue  # first occurrence wins (deterministic)
-        canonical[key] = {col: row[col] for col in helper_cols if col in lookup_df.columns}
-    return canonical
 
 
 def _valid_policy(policy: str) -> str:
@@ -690,14 +644,3 @@ def _visible_label(col: Any) -> str:
                 return label
         return ""
     return str(col)
-
-
-def _norm(value: Any) -> str | None:
-    if value is None:
-        return None
-    try:
-        if bool(pd.isna(value)):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return str(value).strip()

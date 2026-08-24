@@ -12,6 +12,7 @@ from spreadsheet_handling.domain.transformations.derived_column_policy import (
     apply_derived_column_policy,
     enforce_derived_column_policy_frame,
 )
+from spreadsheet_handling.core.formulas import LookupFormulaSpec, lookup_formula
 from spreadsheet_handling.domain.transformations.enrich_lookup import enrich_lookup
 from spreadsheet_handling.domain.transformations.fk_helpers import drop_helpers
 from spreadsheet_handling.pipeline import REGISTRY, build_steps_from_config, run_pipeline
@@ -723,8 +724,7 @@ def test_asymmetric_null_key_valid_and_edit_detected() -> None:
     assert findings.iloc[0]["rule_type"] == "derived_value_mismatch"
 
 
-@_asym
-def test_asymmetric_duplicate_lookup_keys_first_occurrence_wins() -> None:
+def _frames_with_duplicate_lookup_keys():
     stories = pd.DataFrame([
         {"id": "s1", "title": "First"},
         {"id": "s1", "title": "Dup"},
@@ -740,10 +740,32 @@ def test_asymmetric_duplicate_lookup_keys_first_occurrence_wins() -> None:
             "helper_columns": ["title"],
         }}}}
     }
-    frames = {"_meta": meta, "stories": stories, "matrix": matrix}
+    return {"_meta": meta, "stories": stories, "matrix": matrix}
+
+
+@_asym
+def test_asymmetric_duplicate_lookup_keys_warn_mode_emits_unverifiable_finding() -> None:
+    """F-002 Slice 2 (intentional behavior correction): duplicate lookup keys
+    on the current lookup frame make mismatch verification unverifiable,
+    replacing DCP's former unowned "first occurrence wins" tie-break
+    (formerly ``test_asymmetric_duplicate_lookup_keys_first_occurrence_wins``,
+    which pinned the now-corrected permissive behavior).
+    """
+    frames = _frames_with_duplicate_lookup_keys()
     out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
-    # First occurrence (First) wins deterministically -> unchanged row passes.
-    assert len(out["derived_column_findings"]) == 0
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "unverifiable_enrich_lookup"
+    assert "duplicate" in row["message"]
+    assert row["severity"] == "warn"
+
+
+@_asym
+def test_asymmetric_duplicate_lookup_keys_fail_mode_raises() -> None:
+    frames = _frames_with_duplicate_lookup_keys()
+    with pytest.raises(ValueError, match="unverifiable_enrich_lookup"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +885,209 @@ def test_absent_enrich_lookup_record_is_still_a_safe_noop(policy) -> None:
     assert list(out["orders"].columns) == ["order_id", "amount"]
     if policy == "warn_on_mismatch":
         assert len(out["derived_column_findings"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# F-002 Slice 2: Lookup-owned formula-mode structural mismatch evaluation.
+# Formula-mode helper cells (LookupFormulaSpec) are compared structurally
+# against the declared enrich_lookup relationship, replacing the former
+# defective str(LookupFormulaSpec)-vs-scalar comparison (FIND-C1-001).
+# ---------------------------------------------------------------------------
+
+
+def _frames_with_formula_lookup_helper(*, formula: LookupFormulaSpec | None = None):
+    """Single-key, asymmetric matrix/stories pair with a formula-mode helper.
+
+    ``formula`` overrides the shared cell value for both rows (mirroring
+    production, where ``_build_formula_enrichment`` writes the identical
+    ``LookupFormulaSpec`` into every row of a formula-mode helper column);
+    defaults to a structurally correct spec matching the declared provenance.
+    """
+    stories = pd.DataFrame([
+        {"id": "s1", "title": "First"},
+        {"id": "s2", "title": "Second"},
+    ])
+    valid_formula = lookup_formula(
+        source_key_column="story_id",
+        lookup_sheet="stories",
+        lookup_key_column="id",
+        lookup_value_column="title",
+        missing="",
+    )
+    cell = formula if formula is not None else valid_formula
+    matrix = pd.DataFrame([
+        {"story_id": "s1", "title": cell, "dyn": "a"},
+        {"story_id": "s2", "title": cell, "dyn": "b"},
+    ])
+    meta = {
+        "derived": {"sheets": {"matrix": {"enrich_lookup": {
+            "lookup": "stories", "source_key": "story_id", "lookup_key": "id",
+            "helper_columns": ["title"],
+        }}}}
+    }
+    return {"_meta": meta, "stories": stories, "matrix": matrix}
+
+
+def test_formula_helper_structurally_valid_warn_mode_emits_no_findings() -> None:
+    frames = _frames_with_formula_lookup_helper()
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    assert len(out["derived_column_findings"]) == 0
+
+
+def test_formula_helper_structurally_valid_fail_mode_does_not_raise() -> None:
+    frames = _frames_with_formula_lookup_helper()
+    apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")  # no raise
+
+
+@pytest.mark.parametrize(
+    "field, bad_value",
+    [
+        ("lookup_sheet", "wrong_sheet"),
+        ("source_key_column", "wrong_key"),
+        ("lookup_key_column", "wrong_key"),
+        ("lookup_value_column", "wrong_column"),
+    ],
+)
+def test_formula_helper_structural_divergence_warn_mode_emits_formula_mismatch(field, bad_value) -> None:
+    base = lookup_formula(
+        source_key_column="story_id", lookup_sheet="stories",
+        lookup_key_column="id", lookup_value_column="title", missing="",
+    )
+    bad_formula = LookupFormulaSpec(**{**base.__dict__, field: bad_value})
+    frames = _frames_with_formula_lookup_helper(formula=bad_formula)
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "derived_formula_mismatch"
+    assert row["columns"] == "title"
+    assert row["severity"] == "warn"
+
+
+@pytest.mark.parametrize(
+    "field, bad_value",
+    [
+        ("lookup_sheet", "wrong_sheet"),
+        ("source_key_column", "wrong_key"),
+        ("lookup_key_column", "wrong_key"),
+        ("lookup_value_column", "wrong_column"),
+    ],
+)
+def test_formula_helper_structural_divergence_fail_mode_raises(field, bad_value) -> None:
+    base = lookup_formula(
+        source_key_column="story_id", lookup_sheet="stories",
+        lookup_key_column="id", lookup_value_column="title", missing="",
+    )
+    bad_formula = LookupFormulaSpec(**{**base.__dict__, field: bad_value})
+    frames = _frames_with_formula_lookup_helper(formula=bad_formula)
+    with pytest.raises(ValueError, match="derived_formula_mismatch"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+def test_formula_helper_missing_lookup_frame_is_formula_mode_agnostic() -> None:
+    frames = _frames_with_formula_lookup_helper()
+    del frames["stories"]
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    assert findings.iloc[0]["rule_type"] == "missing_lookup_frame"
+
+
+def test_formula_helper_duplicate_lookup_keys_is_formula_mode_agnostic() -> None:
+    frames = _frames_with_formula_lookup_helper()
+    frames["stories"] = pd.concat(
+        [frames["stories"], pd.DataFrame([{"id": "s1", "title": "Dup"}])], ignore_index=True,
+    )
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    assert findings.iloc[0]["rule_type"] == "unverifiable_enrich_lookup"
+    assert "duplicate" in findings.iloc[0]["message"]
+
+
+def test_formula_helper_mixed_scalar_and_formula_rows_evaluated_per_cell() -> None:
+    """Per-cell dispatch: a manually overwritten formula cell containing a
+    scalar is checked as a scalar edit; the other row's untouched formula
+    cell is checked structurally. No cross-row leakage between the two modes.
+    """
+    frames = _frames_with_formula_lookup_helper()
+    matrix = frames["matrix"].copy()
+    matrix.loc[0, "title"] = "EDITED"  # row 0: manually overwritten scalar edit
+    frames["matrix"] = matrix
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "derived_value_mismatch"
+    assert row["row_index"] == "0"
+
+
+def test_formula_helper_exact_find_c1_001_repro_produces_zero_findings() -> None:
+    """Explicit no-spurious-mismatch regression test for FIND-C1-001: the
+    formerly defective str(LookupFormulaSpec)-vs-scalar comparison reported a
+    spurious derived_value_mismatch (warn) / raised (fail) for every
+    correctly-enriched formula-mode row. Reproduces the exact scenario
+    empirically confirmed by the governing design record's Section 2.4.
+    """
+    stories = pd.DataFrame([{"id": "s1", "title": "Alpha"}, {"id": "s2", "title": "Beta"}])
+    matrix = pd.DataFrame([{"story_id": "s1"}, {"story_id": "s2"}])
+    frames = {"stories": stories, "matrix": matrix}
+    frames = enrich_lookup(
+        frames, source="matrix", lookup="stories", output="matrix_view",
+        source_key="story_id", lookup_key="id",
+        helpers={"fields": ["title"]},
+        helper_value_mode="formula", missing="empty",
+    )
+    out = apply_derived_column_policy(frames, source="matrix_view", policy="warn_on_mismatch")
+    assert len(out["derived_column_findings"]) == 0
+    apply_derived_column_policy(frames, source="matrix_view", policy="fail_on_mismatch")  # no raise
+
+
+# --- Multi-key formula-mode carve-out (F-CORR-2), mandatory ----------------
+
+
+def _frames_with_multi_key_formula_lookup_helper():
+    """Symmetric multi-key provenance (``keys=["id", "part"]``) combined with
+    a formula-mode helper cell. Production's own ``_build_formula_enrichment``
+    truncates to ``[0]`` and silently drops ``part`` from the formula's own
+    identity (a pre-existing, untouched write-path defect); the interpreted
+    provenance, by contrast, correctly retains both keys. The Slice-2
+    evaluator must not certify this as structurally valid by independently
+    truncating to ``[0]`` on both sides.
+    """
+    stories = pd.DataFrame([
+        {"id": "s1", "part": "a", "title": "First"},
+        {"id": "s1", "part": "b", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([
+        {"id": "s1", "part": "a", "dyn": "x"},
+        {"id": "s1", "part": "b", "dyn": "y"},
+    ])
+    frames = {"stories": stories, "matrix": matrix}
+    return enrich_lookup(
+        frames, source="matrix", lookup="stories", output="matrix_view",
+        keys=["id", "part"], helpers={"fields": ["title"]},
+        helper_value_mode="formula", missing="empty",
+    )
+
+
+def test_multi_key_formula_helper_warn_mode_is_unverifiable_not_certified() -> None:
+    frames = _frames_with_multi_key_formula_lookup_helper()
+    out = apply_derived_column_policy(frames, source="matrix_view", policy="warn_on_mismatch")
+    findings = out["derived_column_findings"]
+    # Never zero findings (would silently certify a broken multi-key formula
+    # as structurally correct) and never derived_formula_mismatch (the
+    # relationship is unverifiable, not "wrong").
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "unverifiable_enrich_lookup"
+    assert row["rule_type"] != "derived_formula_mismatch"
+
+
+def test_multi_key_formula_helper_fail_mode_fails_at_dcp_boundary() -> None:
+    frames = _frames_with_multi_key_formula_lookup_helper()
+    with pytest.raises(ValueError, match="unverifiable_enrich_lookup"):
+        apply_derived_column_policy(frames, source="matrix_view", policy="fail_on_mismatch")
 
 
 # ---------------------------------------------------------------------------

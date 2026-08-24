@@ -14,6 +14,7 @@ from spreadsheet_handling.core.formulas import lookup_formula
 from .policy import (
     _FORMULA_MODES,
     _ResolvedKeys,
+    _lookup_frame_has_duplicate_keys,
     _resolve_allowed,
     _resolve_fields,
     _resolve_join_keys,
@@ -227,7 +228,7 @@ def _require_frame(frames: Frames, name: str) -> pd.DataFrame:
 def _check_duplicate_lookup_keys(
     lookup_df: pd.DataFrame, join_keys: list[str], lookup: str,
 ) -> None:
-    if lookup_df.duplicated(subset=join_keys, keep=False).any():
+    if _lookup_frame_has_duplicate_keys(lookup_df, join_keys):
         raise ValueError(
             f"Lookup frame {lookup!r} contains duplicate keys on {join_keys}"
         )

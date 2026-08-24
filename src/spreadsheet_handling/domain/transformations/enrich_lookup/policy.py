@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pandas as pd
+
 Frames = dict[str, Any]
 
 _VALUE_MODES = {"value", "values"}
@@ -54,6 +56,20 @@ class _ResolvedKeys:
     @property
     def lookup_key(self) -> str:
         return self.lookup_keys[0]
+
+
+def _lookup_frame_has_duplicate_keys(lookup_df: pd.DataFrame, join_keys: list[str]) -> bool:
+    """Non-raising predicate: does ``lookup_df`` have duplicate rows on ``join_keys``?
+
+    Shared, same-family, single source of truth for "does this lookup frame
+    currently have duplicate keys" (F-002 Slice 2). Consumed by both
+    ``operation.py``'s existing raising ``_check_duplicate_lookup_keys`` (at
+    enrichment time) and ``mismatch.py``'s new non-raising unverifiable-
+    duplicate-keys check (at mismatch-evaluation time, against whatever the
+    lookup frame currently looks like, which may differ from enrichment
+    time). Private; never exported through the package facade.
+    """
+    return bool(lookup_df.duplicated(subset=join_keys, keep=False).any())
 
 
 def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:

@@ -37,6 +37,7 @@ GUARDED_INTERNAL_PREFIXES = {
         "spreadsheet_handling.domain.transformations.discriminator_split.values",
     ),
     "spreadsheet_handling.domain.transformations.enrich_lookup": (
+        "spreadsheet_handling.domain.transformations.enrich_lookup.mismatch",
         "spreadsheet_handling.domain.transformations.enrich_lookup.operation",
         "spreadsheet_handling.domain.transformations.enrich_lookup.policy",
         "spreadsheet_handling.domain.transformations.enrich_lookup.provenance",
