@@ -97,13 +97,13 @@ def evaluate_lookup_mismatches(
     lookup_name = interpreted.lookup_name
     payload_keys = list(interpreted.payload_keys)
     lookup_keys = list(interpreted.lookup_keys)
-    helper_cols = [col for col in interpreted.helper_columns if col in payload.columns]
+    declared_helper_cols = list(interpreted.helper_columns)
 
     lookup_df = lookup_frames.get(lookup_name)
     if lookup_df is None:
         return LookupMismatchReport(missing_lookup_frame=True)
 
-    if not payload_keys or not helper_cols:
+    if not payload_keys or not declared_helper_cols:
         return LookupMismatchReport()
 
     # Fail closed when the named key columns are absent: without them no row
@@ -119,6 +119,10 @@ def evaluate_lookup_mismatches(
         )
     if reasons:
         return LookupMismatchReport(unverifiable_reason="; ".join(reasons))
+
+    present_helper_cols = [col for col in declared_helper_cols if col in payload.columns]
+    if not present_helper_cols:
+        return LookupMismatchReport()
 
     # Duplicate lookup keys on the *current* lookup frame make verification
     # unverifiable (intentional correction, replacing DCP's former unowned
@@ -139,7 +143,7 @@ def evaluate_lookup_mismatches(
     # for the whole call rather than truncating to index [0] and certifying a
     # (possibly broken) multi-key formula as structurally correct.
     multi_key = len(payload_keys) != 1 or len(lookup_keys) != 1
-    if multi_key and _contains_formula_cell(payload, helper_cols):
+    if multi_key and _contains_formula_cell(payload, present_helper_cols):
         return LookupMismatchReport(
             unverifiable_reason=(
                 f"enrich_lookup for lookup {lookup_name!r} declares a multi-key "
@@ -151,11 +155,13 @@ def evaluate_lookup_mismatches(
             )
         )
 
-    canonical = _canonical_value_map(lookup_df, on_keys=lookup_keys, helper_cols=helper_cols)
+    canonical = _canonical_value_map(
+        lookup_df, on_keys=lookup_keys, helper_cols=present_helper_cols
+    )
 
     value_mismatches: dict[str, tuple[RowIndex, ...]] = {}
     formula_mismatches: dict[str, tuple[RowIndex, ...]] = {}
-    for helper_col in helper_cols:
+    for helper_col in present_helper_cols:
         value_rows, formula_rows = _column_mismatch_indices(
             payload,
             helper_col=helper_col,

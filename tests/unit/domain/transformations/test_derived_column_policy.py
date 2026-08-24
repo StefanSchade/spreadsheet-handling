@@ -646,6 +646,42 @@ def test_asymmetric_missing_payload_key_column_warn_emits_unverifiable_finding()
 
 
 @_asym
+def test_missing_payload_key_is_not_masked_when_every_helper_is_absent_warn() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+    frames["matrix"] = frames["matrix"].drop(columns=["story_id", "title"])
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+    findings = out["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "unverifiable_enrich_lookup"
+    assert row["columns"] == "title"
+    assert row["severity"] == "warn"
+    assert "story_id" in row["message"]
+
+
+@_asym
+def test_missing_payload_key_is_not_masked_when_every_helper_is_absent_fail() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+    frames["matrix"] = frames["matrix"].drop(columns=["story_id", "title"])
+
+    with pytest.raises(ValueError, match="unverifiable_enrich_lookup"):
+        apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+@_asym
+def test_absent_helper_with_valid_payload_key_remains_a_safe_noop() -> None:
+    frames = _frames_with_asymmetric_lookup_helper()
+    frames["matrix"] = frames["matrix"].drop(columns=["title"])
+
+    out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
+
+    assert len(out["derived_column_findings"]) == 0
+    apply_derived_column_policy(frames, source="matrix", policy="fail_on_mismatch")
+
+
+@_asym
 def test_asymmetric_missing_lookup_key_column_fail_raises() -> None:
     frames = _frames_with_asymmetric_lookup_helper(edited=True)
     frames["stories"] = frames["stories"].drop(columns=["id"])
@@ -1088,6 +1124,39 @@ def test_multi_key_formula_helper_fail_mode_fails_at_dcp_boundary() -> None:
     frames = _frames_with_multi_key_formula_lookup_helper()
     with pytest.raises(ValueError, match="unverifiable_enrich_lookup"):
         apply_derived_column_policy(frames, source="matrix_view", policy="fail_on_mismatch")
+
+
+def test_multi_key_values_mode_uses_the_full_key_tuple() -> None:
+    stories = pd.DataFrame([
+        {"id": "s1", "part": "a", "title": "First"},
+        {"id": "s1", "part": "b", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([
+        {"id": "s1", "part": "a", "dyn": "x"},
+        {"id": "s1", "part": "b", "dyn": "y"},
+    ])
+    frames = enrich_lookup(
+        {"stories": stories, "matrix": matrix},
+        source="matrix", lookup="stories", output="matrix_view",
+        keys=["id", "part"], helpers={"fields": ["title"]},
+        helper_value_mode="values", missing="empty",
+    )
+
+    valid = apply_derived_column_policy(
+        frames, source="matrix_view", policy="warn_on_mismatch"
+    )
+    assert len(valid["derived_column_findings"]) == 0
+
+    frames["matrix_view"].loc[1, "title"] = "EDITED"
+    edited = apply_derived_column_policy(
+        frames, source="matrix_view", policy="warn_on_mismatch"
+    )
+    findings = edited["derived_column_findings"]
+    assert len(findings) == 1
+    row = findings.iloc[0]
+    assert row["rule_type"] == "derived_value_mismatch"
+    assert row["columns"] == "title"
+    assert row["row_index"] == "1"
 
 
 # ---------------------------------------------------------------------------
