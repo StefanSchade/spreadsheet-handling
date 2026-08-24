@@ -1,0 +1,306 @@
+= FK / Reference-Helper Family: F-002 Slice 1 -- Implementation Record
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded source implementation record. Implements exactly Slice 1 of
+the accepted F-002 readiness design, as corrected by its independent review.
+Does not implement Slice 2. Independent review of this implementation is
+required before Slice 2 may be authorized.
+
+Date: 2026-08-24.
+
+== 1. Governing design / review chain
+
+* `7393438` -- `docs(domain): reassess FK helper cycle 1 re-entry`.
+* `51d9cb5` -- `docs(domain): review FK helper cycle 1 re-entry` (F-002
+  selection authorized; F-002 implementation not yet authorized).
+* `2a8ff36` -- `docs(domain): design FK helper F-002 closure` --
+  `docs/warm_storage/global_reviews/domain_fk_reference_helper_f002_implementation_readiness_2026-08-24.adoc`.
+* `c7f205c` -- `docs(domain): review FK helper F-002 readiness` --
+  `docs/warm_storage/global_reviews/domain_fk_reference_helper_f002_implementation_readiness_2026-08-24_review_001.adoc`.
+  Verdict: ACCEPT WITH MINOR CORRECTIONS. Slice 1 implementation:
+  AUTHORIZED, conditioned on the F-CORR-1 signature correction (<<sec3>>).
+  Slice 2 implementation: NOT AUTHORIZED (pending F-CORR-2 through
+  F-CORR-6, out of scope for this record).
+
+This implementation follows the review's explicit correction over the
+readiness artifact's literal sketch wherever the two differ, per this task's
+own instruction.
+
+== 2. Slice 1 scope actually implemented
+
+Files changed, matching the review's Section 18 authorized list exactly:
+
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/provenance.py`
+* `src/spreadsheet_handling/domain/transformations/enrich_lookup/__init__.py`
+* `src/spreadsheet_handling/domain/transformations/fk_helpers/policy.py`
+* `src/spreadsheet_handling/domain/transformations/fk_helpers/__init__.py`
+* `src/spreadsheet_handling/domain/transformations/derived_column_policy.py`
+* Test files (new; no existing test file's assertions were changed):
+  ** `tests/unit/domain/transformations/test_enrich_lookup_provenance_interpretation.py`
+  ** `tests/unit/domain/transformations/test_fk_helpers_helper_columns_validation.py`
+
+No other source or test file was touched. No registry, YAML, `_meta` shape,
+Trusted-Ingress, or public-surface change was made.
+
+== 3. F-CORR-1 signature correction -- followed [[sec3]]
+
+The review's binding correction rejects the readiness artifact's literal
+`validated_helper_columns_by_sheet(frames, *, frame_name)` sketch. This
+implementation follows the correction: the new FK reader takes only the
+already-extracted per-sheet raw `helper_columns` value, exactly mirroring
+the signature of the `_validated_fk_helper_names` it replaces, and does not
+re-walk or re-validate `frames`/`_meta.derived`/`_meta.derived.sheets[frame]`
+-- that generic container-shape validation remains solely
+`derived_column_policy.py`'s (`_safe_sheet_meta`/`_resolve_derived_identity`).
+
+Per the review's own guidance ("choose a source-consistent name if the
+literal name would be misleading"), the function is named
+`validated_helper_columns` -- not `validated_helper_columns_by_sheet` --
+because it never receives "all sheets"; it receives one sheet's
+already-extracted value, same as its predecessor.
+
+[source,python]
+----
+def validated_helper_columns(raw_helper_columns: Any, *, frame_name: str) -> set[str]:
+    ...
+----
+
+== 4. Lookup owner-local seam implemented
+
+`enrich_lookup/provenance.py` gains:
+
+* `InterpretedEnrichLookupProvenance` -- frozen dataclass, fields
+  `lookup_name: str`, `payload_keys: tuple[str, ...]`,
+  `lookup_keys: tuple[str, ...]`, `helper_columns: tuple[str, ...]`, exactly
+  as specified by the readiness design.
+* `interpret_written_enrich_lookup_provenance(record, *, frame_name) ->
+  InterpretedEnrichLookupProvenance` -- the full interpretation (shape
+  validation + symmetric/asymmetric key-form resolution), performing exactly
+  what the former `_validated_enrich_spec` + `_validated_mismatch_keys` +
+  `_validated_symmetric_on` + `_validated_single_key` did together. Called
+  from `derived_column_policy.py::_check_enrich_lookup_values`, replacing
+  that function's own former call to `_validated_mismatch_keys` plus its
+  manual `spec.get("lookup")` / `spec.get("helper_columns")` extraction --
+  the identical call site, unchanged in *when* it runs (only under
+  `warn_on_mismatch`/`fail_on_mismatch`).
+* `validated_enrich_lookup_helper_columns(record, *, frame_name) ->
+  tuple[str, ...]` -- a second, narrower entry point, described in
+  <<sec6>> below. This is a deliberate, documented extension beyond the
+  readiness design's literal one-function sketch, made to preserve a
+  test-pinned behavior the sketch would otherwise have silently broken.
+  Flagged here explicitly for independent review, not folded in silently.
+
+Both are exported through `enrich_lookup/__init__.py`'s `__all__`, alongside
+the existing `enrich_lookup` and `reconcile_enrich_lookup_provenance`
+exports -- the identical H5 mechanism.
+
+== 5. FK owner-local strict-reader seam implemented
+
+`fk_helpers/policy.py` gains `validated_helper_columns(raw_helper_columns,
+*, frame_name) -> set[str]` (<<sec3>>), exported through
+`fk_helpers/__init__.py`'s `__all__` alongside the existing
+`derived_helper_columns_by_sheet`. The existing lenient
+`derived_helper_columns_by_sheet` and its five callers outside DCP
+(`domain/transformations/helpers.py`, `fk_helpers/drop.py`,
+`domain/column_roles/resolver.py`, `domain/validations/fk_helpers.py` x2)
+are untouched, unchanged, and re-run unmodified as part of the full suite
+(<<sec8>>).
+
+== 6. Design deviation recorded for independent review: two Lookup entry points, not one [[sec6]]
+
+The readiness design (Section 4) and the review's own F-CORR-1 discussion
+describe exactly *one* new Lookup function performing shape validation and
+key-form resolution together. Implementing it that way and calling it from
+`derived_column_policy.py::_resolve_derived_identity` -- the function that
+resolves helper *identity* for the drop step, run unconditionally for every
+policy including `drop` -- would have eagerly triggered join-key-form
+validation for every policy, not only the value-checking ones.
+
+This is a real, concrete, currently test-pinned behavior conflict, not a
+hypothetical one: `test_malformed_key_form_drop_is_value_blind`
+(`test_derived_column_policy.py:823-828`) asserts that `policy="drop"` never
+invokes key-form validation, even for a record with no join-key form at all
+(`{}`) or an explicitly null one (`{"on": None}`, `{"source_key": None}`).
+Today this laziness exists because DCP's `_resolve_derived_identity` only
+ever called the *shape*-only `_validated_enrich_spec` unconditionally;
+`_validated_mismatch_keys` (key-form resolution) was called lazily, only
+from `_check_enrich_lookup_values`, itself only reached under
+`warn_on_mismatch`/`fail_on_mismatch`.
+
+Folding shape validation and key-form resolution into one function, and
+calling that one function from `_resolve_derived_identity`, would have
+collapsed this laziness and broken the pinned test above -- an
+unauthorized, unintended behavior change, explicitly against Slice 1's own
+"zero intended behavior change" contract and against this task's explicit
+instruction to stop rather than fold in a behavior change discovered during
+implementation.
+
+*Resolution applied:* keep the full interpretation
+(`interpret_written_enrich_lookup_provenance`) at exactly the call site
+where key-form resolution already ran lazily today
+(`_check_enrich_lookup_values`), and add a second, narrower, still
+Lookup-owned entry point, `validated_enrich_lookup_helper_columns`, that
+performs only the shape-validation half (mirroring the former
+`_validated_enrich_spec`) for `_resolve_derived_identity`'s unconditional
+identity-resolution use. Both share the same internal shape-validation step
+(`_validated_enrich_record_shape`), so the record is never re-validated
+twice from scratch in one call. No new metadata, no new inference, no
+change to which policy triggers which raise -- only where the parsing
+*that already existed* now lives.
+
+This mirrors the review's own F-CORR-1 correction in spirit: a function's
+signature (here, which of two ownership boundaries it belongs behind) must
+match its actual call site's timing requirements, not a literal design
+sketch that did not fully trace every call site. Flagged explicitly here,
+as instructed, rather than resolved silently.
+
+== 7. DCP helpers removed / delegated
+
+Removed from `derived_column_policy.py`:
+
+* `_validated_enrich_spec` -- removed; shape validation now lives in
+  `enrich_lookup/provenance.py` (`_validated_enrich_record_shape`, reached
+  via both new exported functions).
+* `_validated_mismatch_keys`, `_validated_symmetric_on`,
+  `_validated_single_key` -- removed; relocated verbatim (messages/paths
+  unchanged) into `enrich_lookup/provenance.py`, reached via
+  `interpret_written_enrich_lookup_provenance`.
+* `_validated_fk_helper_names` -- removed; relocated verbatim into
+  `fk_helpers/policy.py` as `validated_helper_columns` (<<sec3>>). Both of
+  its former call sites (`_resolve_derived_identity` and
+  `_fk_deletion_unauthorized_candidates`) now call the facade function.
+
+Retained, unchanged, in `derived_column_policy.py`: `_safe_sheet_meta`,
+`_resolve_derived_identity`'s own container-shape checks,
+`_check_enrich_lookup_values`'s comparison/finding-construction body (only
+its provenance-extraction lines were updated to call the new facade),
+`_canonical_value_map`, `_column_mismatch_indices`, `_norm`,
+`_publish_with_lifecycle`, `_fk_deletion_unauthorized_findings`, all
+mismatch/severity/policy wiring.
+
+DCP imports only package-facade symbols:
+
+[source,python]
+----
+from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    interpret_written_enrich_lookup_provenance,
+    validated_enrich_lookup_helper_columns,
+)
+from spreadsheet_handling.domain.transformations.fk_helpers import (
+    resolve_v2_fk_relations,
+    validated_helper_columns,
+)
+----
+
+No import of `enrich_lookup.provenance` or `fk_helpers.policy` directly.
+
+== 8. Behavior-preservation evidence
+
+* Full existing `test_derived_column_policy.py` suite (symmetric/asymmetric
+  valid records, malformed key forms under both warn/fail, mixed
+  symmetric/asymmetric rejection, partial asymmetric pairs, blank/non-string
+  keys, malformed `helper_columns` container/entry, malformed sheet-level/
+  derived-container provenance, `drop`-policy value-blindness including
+  `test_malformed_key_form_drop_is_value_blind` and
+  `test_asymmetric_drop_mode_is_value_blind`, publication-lifecycle tests)
+  passes unmodified -- no assertion was changed.
+* `derived_helper_columns_by_sheet`'s existing callers/tests (FK enrich,
+  drop, column-role resolution, FK validations) pass unmodified.
+* Architecture guard
+  (`tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py`)
+  passes unmodified; no new `GUARDED_INTERNAL_PREFIXES` entry was added
+  (`enrich_lookup.provenance` and `fk_helpers.policy` were already guarded,
+  confirmed by the review -- Slice 1 adds no new submodule).
+* `git diff --check`: clean.
+* Source-style guards (`make source-style-guards`): no new warnings in any
+  touched file; `_check_enrich_lookup_values`'s branch-complexity warning
+  *improved* (18 -> 15) since inline key-form parsing moved out.
+
+== 9. Tests
+
+New, added to prove the delegation is behavior-preserving and to pin the
+owner-local contracts directly (not only transitively through DCP):
+
+* `test_enrich_lookup_provenance_interpretation.py` -- symmetric/asymmetric
+  valid records resolve identical key tuples/helper columns; malformed
+  record/`helper_columns` shape raises with identical wording; mixed
+  symmetric+asymmetric, partial asymmetric pair, absent join-key form, and
+  blank/non-string key members all raise with identical wording; the
+  shape-only `validated_enrich_lookup_helper_columns` extracts helper
+  columns without raising for a malformed/absent key form (the invariant
+  <<sec6>> depends on) while still raising for a genuinely malformed
+  record/`helper_columns` shape.
+* `test_fk_helpers_helper_columns_validation.py` -- valid transient helper
+  provenance returns declared names; entries without a `column` are
+  skipped (matching prior behavior); malformed container/entry shapes raise
+  with identical wording; absent value is a safe no-op.
+
+Both use the `FTR-DERIVED-PROVENANCE-NESTED-OWNERSHIP-P4A` marker,
+following the H5 precedent (`c933551`, `refactor(domain): separate FK and
+Lookup provenance ownership`), which reused the same closed FTR marker for
+its own new `enrich_lookup`-provenance-ownership test file rather than
+opening a new FTR for a non-FTR-tracked hardening slice.
+
+Existing tests exercising the relocated behavior via
+`apply_derived_column_policy` (Section 12.1/12.5 of the readiness design)
+were re-targeted implicitly -- unmodified in assertion, now exercising the
+new facades transitively through DCP's delegation -- and all pass.
+
+== 10. Validation performed
+
+[source,console]
+----
+.venv/bin/python -m pytest -q \
+  tests/unit/domain/transformations/test_derived_column_policy.py \
+  tests/unit/domain/transformations/test_enrich_lookup.py \
+  tests/unit/domain/transformations/test_enrich_lookup_provenance_reconciliation.py \
+  tests/unit/domain/transformations/test_enrich_lookup_provenance_interpretation.py \
+  tests/unit/domain/transformations/test_fk_helpers_domain.py \
+  tests/unit/domain/transformations/test_fk_helpers_helper_columns_validation.py \
+  tests/unit/domain/transformations/test_fk_helper_primitives_policy_driven.py \
+  tests/unit/domain/transformations/test_derived_provenance_nested_ownership.py \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py \
+  tests/architecture/dependency_guards/
+  -> all green
+
+make test
+  -> 2904 passed, 1 deselected
+
+git diff --check
+  -> exit 0
+
+make source-style-guards
+  -> no new warnings in any touched file (see Section 8)
+----
+
+== 11. Explicit Slice-2 exclusions -- not implemented
+
+Untouched, unaltered: `_check_enrich_lookup_values`'s comparison/finding
+logic, `_canonical_value_map`, `_column_mismatch_indices`, `_norm`,
+formula-mode behavior, `LookupFormulaSpec` handling, duplicate-key
+"first occurrence wins" behavior, missing-key semantics,
+`derived_value_mismatch`/`unverifiable_enrich_lookup`/`missing_lookup_frame`
+finding `rule_type`/severity/message semantics beyond the relocation itself,
+`warn_on_mismatch`/`fail_on_mismatch` raise/collect behavior, publication
+lifecycle, `_publish_with_lifecycle`, `fk_deletion_unauthorized`, all
+metadata/YAML/registered-step surfaces. No `derived_formula_mismatch`, no
+formula structural validation, no `LookupMismatchReport`, no
+`enrich_lookup/mismatch.py` -- none of Slice 2 was implemented or partially
+implemented.
+
+== 12. Independent review gate
+
+Slice 1 implementation: COMPLETE
+
+Behavior change: NONE INTENDED
+
+Independent review: REQUIRED
+
+Slice 2 implementation: NOT AUTHORIZED
+
+This implementation does not self-accept. Independent review must in
+particular evaluate the deviation recorded in <<sec6>> (a second Lookup
+entry point beyond the readiness design's literal sketch) on its own
+merits before Slice 1 is considered accepted.

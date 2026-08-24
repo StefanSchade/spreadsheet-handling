@@ -10,6 +10,7 @@ Refactored from the previous v1 consumption path by
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ....core.fk import FKDef, normalize_sheet_key
@@ -177,6 +178,57 @@ def derived_helper_columns_by_sheet(
         if isinstance(entries, list) and entries:
             out[str(sheet_name)] = [dict(entry) for entry in entries if isinstance(entry, dict)]
     return out
+
+
+def validated_helper_columns(raw_helper_columns: Any, *, frame_name: str) -> set[str]:
+    """Validate an already-extracted transient FK ``helper_columns`` value.
+
+    ``raw_helper_columns`` is
+    ``_meta.derived.sheets[frame_name].helper_columns`` (or ``None`` when
+    absent -- a safe no-op). F-002 Slice 1 (FK / Reference-Helper
+    Domain-family hardening, FIND-C1-002) relocates this fail-clear reader
+    here from ``derived_column_policy.py``'s former ``_validated_fk_helper_names``,
+    replacing only that private helper's own two call sites.
+
+    This is deliberately a distinct, owner-local sibling of
+    :func:`derived_helper_columns_by_sheet`, not a stricter mode of it:
+    ``derived_helper_columns_by_sheet`` is lenient (silently skips malformed
+    sheet/entry shapes) and has five existing callers outside DCP that
+    depend on that leniency; retrofitting fail-clear behaviour onto it would
+    change all of their behaviour at once. This function instead takes only
+    the single already-extracted per-sheet raw value a caller has already
+    resolved (mirroring the record-taking shape of Lookup's own
+    ``interpret_written_enrich_lookup_provenance`` sibling), so it does not
+    itself re-walk or re-validate the shared ``_meta.derived``/
+    ``_meta.derived.sheets[frame_name]`` container -- that generic
+    container-shape validation remains the caller's own responsibility
+    (``derived_column_policy.py``'s ``_safe_sheet_meta``/
+    ``_resolve_derived_identity``).
+
+    Raises
+    ------
+    ValueError
+        If ``raw_helper_columns`` is present but not a list/tuple, or any
+        entry is present but not a mapping. Message/path wording is
+        identical to the relocated ``_validated_fk_helper_names``.
+    """
+    if raw_helper_columns is None:
+        return set()
+    if not isinstance(raw_helper_columns, (list, tuple)):
+        raise ValueError(
+            f"_meta.derived.sheets[{frame_name!r}].helper_columns must be a list"
+        )
+    names: set[str] = set()
+    for index, entry in enumerate(raw_helper_columns):
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                f"_meta.derived.sheets[{frame_name!r}].helper_columns[{index}] "
+                f"must be a mapping, got {type(entry).__name__}"
+            )
+        column = entry.get("column")
+        if column:
+            names.add(str(column))
+    return names
 
 
 def known_data_frame_names(frames: Frames) -> set[str]:

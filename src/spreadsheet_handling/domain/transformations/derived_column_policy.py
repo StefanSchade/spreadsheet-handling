@@ -48,8 +48,13 @@ from spreadsheet_handling.domain.finding_frame import (
     findings_to_frame,
     simple_failure_message,
 )
+from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    interpret_written_enrich_lookup_provenance,
+    validated_enrich_lookup_helper_columns,
+)
 from spreadsheet_handling.domain.transformations.fk_helpers import (
     resolve_v2_fk_relations,
+    validated_helper_columns,
 )
 
 Frames = dict[str, Any]
@@ -264,6 +269,21 @@ def _resolve_derived_identity(
     Missing provenance is a safe no-op. Malformed provenance fails with a
     clear ``ValueError`` naming the bad ``_meta.derived`` path rather than
     raising a raw ``AttributeError`` or silently treating it as valid.
+
+    ``_meta.derived.sheets[frame_name]`` container-shape validation (this
+    function's own ``isinstance`` check below, and ``_safe_sheet_meta``'s
+    equivalent checks one level up) stays here -- generic, shared by both
+    sub-keys. Each sub-key's *own* shape and identity (FK's
+    ``helper_columns`` list, Lookup's ``enrich_lookup`` record) is owned by
+    its respective package facade (F-002 Slice 1): FK's
+    :func:`validated_helper_columns` and Lookup's
+    :func:`validated_enrich_lookup_helper_columns`. The Lookup call here is
+    deliberately the shape-only sibling, not
+    :func:`interpret_written_enrich_lookup_provenance`: identity resolution
+    runs unconditionally for every policy including ``drop``, and must not
+    trigger join-key-form validation, which stays scoped to the
+    value-checking policies alone (see ``enrich_lookup/provenance.py``'s
+    module docstring).
     """
     if derived_meta is None:
         return set(), None
@@ -273,55 +293,15 @@ def _resolve_derived_identity(
             f"got {type(derived_meta).__name__}"
         )
 
-    helper_names = _validated_fk_helper_names(
+    helper_names = validated_helper_columns(
         derived_meta.get("helper_columns"), frame_name=frame_name
     )
-    enrich_spec, enrich_names = _validated_enrich_spec(
-        derived_meta.get("enrich_lookup"), frame_name=frame_name
+    enrich_spec = derived_meta.get("enrich_lookup")
+    enrich_names = validated_enrich_lookup_helper_columns(
+        enrich_spec, frame_name=frame_name
     )
-    helper_names |= enrich_names
+    helper_names |= set(enrich_names)
     return helper_names, enrich_spec
-
-
-def _validated_fk_helper_names(raw_helper_columns: Any, *, frame_name: str) -> set[str]:
-    if raw_helper_columns is None:
-        return set()
-    if not isinstance(raw_helper_columns, (list, tuple)):
-        raise ValueError(
-            f"_meta.derived.sheets[{frame_name!r}].helper_columns must be a list"
-        )
-    names: set[str] = set()
-    for index, entry in enumerate(raw_helper_columns):
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                f"_meta.derived.sheets[{frame_name!r}].helper_columns[{index}] "
-                f"must be a mapping, got {type(entry).__name__}"
-            )
-        column = entry.get("column")
-        if column:
-            names.add(str(column))
-    return names
-
-
-def _validated_enrich_spec(
-    enrich_spec: Any,
-    *,
-    frame_name: str,
-) -> tuple[Mapping[str, Any] | None, set[str]]:
-    if enrich_spec is None:
-        return None, set()
-    if not isinstance(enrich_spec, Mapping):
-        raise ValueError(
-            f"_meta.derived.sheets[{frame_name!r}].enrich_lookup must be a mapping, "
-            f"got {type(enrich_spec).__name__}"
-        )
-    raw_cols = enrich_spec.get("helper_columns")
-    if raw_cols is not None and not isinstance(raw_cols, (list, tuple)):
-        raise ValueError(
-            f"_meta.derived.sheets[{frame_name!r}].enrich_lookup.helper_columns "
-            f"must be a list"
-        )
-    return enrich_spec, {str(column) for column in raw_cols or []}
 
 
 def _safe_sheet_meta(meta: Mapping[str, Any], source: str) -> Any:
@@ -496,7 +476,7 @@ def _fk_deletion_unauthorized_candidates(
         return []
     truthful_fk_names: set[str] = set()
     if isinstance(sheet_meta, Mapping):
-        truthful_fk_names = _validated_fk_helper_names(
+        truthful_fk_names = validated_helper_columns(
             sheet_meta.get("helper_columns"), frame_name=source
         )
     present_labels = {_visible_label(col) for col in cleaned.columns}
@@ -557,14 +537,18 @@ def _check_enrich_lookup_values(
     lookup_frames: Mapping[str, pd.DataFrame],
     severity: str,
 ) -> list[DerivedColumnFinding]:
-    lookup_name = str(spec.get("lookup") or "")
-    # Validate the provenance key shape *before* any coercion. Malformed
-    # provenance (wrong types, blanks, partial or mixed forms, bad symmetric
-    # ``on``) raises a clear ValueError regardless of severity — it is a broken
-    # contract, not a data mismatch, and must never fail open under
-    # ``fail_on_mismatch`` (review R002-IMP-002).
-    payload_keys, lookup_keys = _validated_mismatch_keys(spec, frame_name=frame_name)
-    helper_cols = [str(col) for col in (spec.get("helper_columns") or [])]
+    # Shape/key-form interpretation is Lookup-owned (F-002 Slice 1): validate
+    # the provenance record and resolve its join-key form *before* any
+    # coercion via the package facade. Malformed provenance (wrong types,
+    # blanks, partial or mixed forms, bad symmetric ``on``) raises a clear
+    # ValueError regardless of severity — it is a broken contract, not a data
+    # mismatch, and must never fail open under ``fail_on_mismatch`` (review
+    # R002-IMP-002). This call site is unchanged in *when* it runs (only
+    # under a value-checking policy) relative to the relocated code.
+    interpreted = interpret_written_enrich_lookup_provenance(spec, frame_name=frame_name)
+    lookup_name = interpreted.lookup_name
+    payload_keys, lookup_keys = list(interpreted.payload_keys), list(interpreted.lookup_keys)
+    helper_cols = list(interpreted.helper_columns)
 
     lookup_df = lookup_frames.get(lookup_name)
     if lookup_df is None:
@@ -642,115 +626,6 @@ def _check_enrich_lookup_values(
                 ),
             ))
     return findings
-
-
-def _validated_mismatch_keys(
-    spec: Mapping[str, Any],
-    *,
-    frame_name: str,
-) -> tuple[list[str], list[str]]:
-    """Resolve and *validate* ``(payload_keys, lookup_keys)`` from a spec.
-
-    The join-key form is selected from mapping-member *presence*, not from the
-    truthiness or non-null value of a member (review R003-IMP-001). This keeps
-    an absent member, a present ``None`` member, and a present record with no
-    key form distinct — the earlier value-based detection conflated all three
-    and let a degraded record fail open.
-
-    Supports both provenance shapes written by ``enrich_lookup`` and validates
-    the selected shape strictly before any coercion:
-
-    * *symmetric* — a present ``on`` member selects the symmetric form and is
-      always validated: ``on`` must be a non-empty list/tuple of non-empty
-      strings (the writer's multi-key shape), so ``{"on": None}`` is rejected.
-      The payload and lookup share the key name(s); ``payload_keys == lookup_keys``.
-    * *asymmetric* — the presence of either ``source_key`` or ``lookup_key``
-      selects the asymmetric form; both members must be present and each must be
-      a single non-empty string, so a null half is rejected. The payload is
-      keyed by ``source_key`` and the lookup frame by ``lookup_key``.
-
-    Malformed provenance is rejected with a clear ``ValueError`` naming the
-    ``_meta.derived`` path: a record must not carry ``on`` together with an
-    asymmetric member (even when a value is ``None``), an asymmetric record must
-    carry both non-empty halves, and no key value may be blank or a non-string.
-    A *present* record with no join-key form at all is likewise malformed for a
-    value-checking policy and is rejected (distinct from the absence of the
-    whole ``enrich_lookup`` record, which the caller never routes here and which
-    stays a safe no-op).
-    """
-    path = f"_meta.derived.sheets[{frame_name!r}].enrich_lookup"
-    has_on = "on" in spec
-    has_source_key = "source_key" in spec
-    has_lookup_key = "lookup_key" in spec
-
-    if has_on and (has_source_key or has_lookup_key):
-        raise ValueError(
-            f"{path} mixes symmetric `on` with asymmetric "
-            f"`source_key`/`lookup_key`; provide exactly one join-key form"
-        )
-
-    if has_on:
-        on_keys = _validated_symmetric_on(spec.get("on"), path=path)
-        return on_keys, on_keys
-
-    if has_source_key or has_lookup_key:
-        missing = [
-            name
-            for name, present in (
-                ("source_key", has_source_key),
-                ("lookup_key", has_lookup_key),
-            )
-            if not present
-        ]
-        if missing:
-            raise ValueError(
-                f"{path} asymmetric provenance requires both `source_key` and "
-                f"`lookup_key`; missing {missing}"
-            )
-        return (
-            [_validated_single_key(spec.get("source_key"), path=path, field="source_key")],
-            [_validated_single_key(spec.get("lookup_key"), path=path, field="lookup_key")],
-        )
-
-    raise ValueError(
-        f"{path} has no join-key form; a value-checked enrich_lookup record must "
-        f"declare either a symmetric `on` list or an asymmetric "
-        f"`source_key`/`lookup_key` pair"
-    )
-
-
-def _validated_symmetric_on(on: Any, *, path: str) -> list[str]:
-    if not isinstance(on, (list, tuple)):
-        raise ValueError(
-            f"{path}.on must be a non-empty list of key names; "
-            f"got {type(on).__name__}"
-        )
-    if len(on) == 0:
-        raise ValueError(f"{path}.on must be a non-empty list of key names; got an empty list")
-    keys: list[str] = []
-    for index, element in enumerate(on):
-        if not isinstance(element, str):
-            raise ValueError(
-                f"{path}.on[{index}] must be a non-empty string key name; "
-                f"got {type(element).__name__}"
-            )
-        if not element.strip():
-            raise ValueError(f"{path}.on[{index}] must be a non-empty string key name; got a blank value")
-        keys.append(element)
-    return keys
-
-
-def _validated_single_key(value: Any, *, path: str, field: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(
-            f"{path}.{field} must be a single non-empty string key name; "
-            f"got {type(value).__name__}"
-        )
-    if not value.strip():
-        raise ValueError(
-            f"{path}.{field} must be a single non-empty string key name; got a blank value"
-        )
-    return value
 
 
 def _column_mismatch_indices(

@@ -24,6 +24,7 @@ from .policy import (
     derived_helper_columns_by_sheet,
     missing_fk_policy_error,
     resolve_v2_fk_relations,
+    validated_helper_columns,
 )
 from .provenance import _write_helper_provenance
 
@@ -35,4 +36,5 @@ __all__ = [
     "derived_helper_columns_by_sheet",
     "missing_fk_policy_error",
     "resolve_v2_fk_relations",
+    "validated_helper_columns",
 ]
