@@ -1,0 +1,321 @@
+= FK / Reference-Helper Family: Cycle 1 -- Cell Codec Helper Handoff Implementation Record
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status: bounded source implementation record for the final currently-known
+Family-Cycle-1 blocker. Does not self-accept, does not claim Family Cycle 1
+closed.
+
+Date: 2026-08-25.
+
+== 1. Governing chain
+
+* `013288f` -- `docs(domain): assess FK helper family cycle 1 closure` --
+  identified the remaining Cycle-1 blocker: Cell Codec privately
+  reconstructs FK / Lookup helper provenance instead of delegating to the
+  owning families.
+* `216a999` -- `docs(domain): design Cell Codec helper handoff` --
+  implementation-readiness design for the bounded handoff implemented here.
+* `f011d0c` -- `docs(domain): review Cell Codec helper handoff` -- independent
+  readiness review. Verdict: **ACCEPT -- IMPLEMENTATION AUTHORIZED**. Resolved
+  OQ-1 as **W1** (keep Cell Codec's existing permissive Workbook-View
+  helper-column reader unchanged; do not align it with DCP's stricter
+  reader; do not redesign Workbook View in this slice).
+
+This record documents the implementation authorized by `f011d0c`. It does
+not perform the required independent implementation review itself.
+
+== 2. Original ownership defect
+
+`_helper_columns_for_frame` in
+`cell_codec/frame.py` applied one generic parser
+(`_column_name_set`) uniformly to three distinct provenance owners:
+
+. Workbook-View helper columns (`_meta.sheets[frame].helper_columns`);
+. FK transient helper provenance (`_meta.derived.sheets[frame].helper_columns`);
+. Lookup provenance (`_meta.derived.sheets[frame].enrich_lookup.helper_columns`).
+
+`_column_name_set` attempted `set(list_of_dicts)` against current FK
+provenance and raised `TypeError: unhashable type: 'dict'`, because current
+FK writer provenance is a list of rich mappings
+(`column`/`fk_column`/`target`/`target_key`/`value_field`; see
+`fk_helpers/provenance.py::_write_helper_provenance`), not the obsolete
+`list[str]` pseudo-shape the generic parser assumed.
+
+== 3. Frame-wide TypeError repro (before fix)
+
+Reproduced directly against the pre-change source: an ordinary,
+non-helper-selecting `encode_cell_values` call raised
+`TypeError: unhashable type: 'dict'` merely because current rich FK
+provenance was present anywhere on the frame's derived-sheet metadata --
+independent of which columns were selected to participate. This is the
+defect Cycle 1 authorized fixing.
+
+== 4. Owner facade delegation (the fix)
+
+`_helper_columns_for_frame` now navigates the shared metadata containers and
+unions the returned helper identities, without interpreting FK's or
+Lookup's own provenance shape itself:
+
+[source,python]
+----
+derived = meta.get("derived")
+if isinstance(derived, Mapping):
+    derived_sheets = derived.get("sheets")
+    if isinstance(derived_sheets, Mapping):
+        sheet_meta = derived_sheets.get(frame_name)
+        if isinstance(sheet_meta, Mapping):
+            helper_columns.update(
+                validated_helper_columns(
+                    sheet_meta.get("helper_columns"), frame_name=frame_name
+                )
+            )
+            helper_columns.update(
+                validated_enrich_lookup_helper_columns(
+                    sheet_meta.get("enrich_lookup"), frame_name=frame_name
+                )
+            )
+----
+
+FK delegation:: the raw, already-extracted
+`_meta.derived.sheets[frame].helper_columns` value is handed unopened to
+`fk_helpers.validated_helper_columns(raw_helper_columns, frame_name=frame_name)`
+(imported from the package facade, `spreadsheet_handling.domain.transformations.fk_helpers`).
+Cell Codec never names or interprets any FK rich-entry field
+(`fk_column`/`target`/`target_key`/`value_field`); it only reads back the
+returned `set[str]` of helper column identities.
+
+Lookup delegation:: the raw, already-extracted
+`_meta.derived.sheets[frame].enrich_lookup` record is handed unopened to
+`enrich_lookup.validated_enrich_lookup_helper_columns(record, frame_name=frame_name)`
+(imported from the package facade, `spreadsheet_handling.domain.transformations.enrich_lookup`).
+Per the binding design decision, Cell Codec deliberately does **not** use
+`interpret_written_enrich_lookup_provenance`: it needs helper identity only
+and stays blind to Lookup's join-key form (`on` /
+`source_key`/`lookup_key`), which `validated_enrich_lookup_helper_columns`
+never resolves or validates.
+
+Return normalization:: the FK facade returns `set[str]`; the Lookup facade
+returns `tuple[str, ...]`. Cell Codec's existing
+`helper_columns.update(...)` call is sufficient local normalization for
+both -- no shared dataclass, protocol, or normalization helper was added
+(<<sec11>>).
+
+== 5. Workbook-View W1 preservation
+
+`_column_name_set` is unchanged in its own body and is now used for exactly
+one call site: `_meta.sheets[frame].helper_columns` (Workbook View's durable
+carrier). It remains permissive (accepts a bare string, a `Mapping`'s keys,
+or any other `Iterable`, with no shape validation) -- not aligned with DCP's
+stricter Workbook-View reader, and Workbook View itself was not touched or
+redesigned, exactly as `f011d0c`'s W1 disposition requires. Both functions'
+docstrings now state this scoping explicitly so a future reader does not
+mistake `_column_name_set` for a general-purpose reader again.
+
+== 6. Failure-semantic changes
+
+FK (via `fk_helpers.validated_helper_columns`):
+
+* absent (`None`) or empty list -> empty identity, no error;
+* current rich `list[mapping]` -> correctly returns helper identity
+  (previously: `TypeError`, frame-wide, regardless of column selection);
+* obsolete `list[str]` -> `ValueError` (from the FK owner facade: a string
+  entry is not a `Mapping`);
+* bare non-list/mapping leaf (e.g. a plain string) -> `ValueError` (not a
+  list/tuple);
+* mapping entry without `column` -> the owner facade's existing documented
+  skip behavior (no identity contributed for that entry, no error).
+
+Lookup (via `enrich_lookup.validated_enrich_lookup_helper_columns`):
+
+* absent -> empty identity, no error;
+* mapping with `helper_columns: list[str]` -> correct identity;
+* `helper_columns` absent on an otherwise-present record -> empty identity,
+  no error;
+* non-mapping `enrich_lookup` record (e.g. a list) -> `ValueError`
+  (previously: silently misread through `_column_name_set`'s permissive
+  `Iterable` branch);
+* malformed `helper_columns` leaf (present but not list/tuple) ->
+  `ValueError`;
+* malformed/absent Lookup join-key form -- **not checked**, by design:
+  `validated_enrich_lookup_helper_columns` never resolves key form, so a
+  record missing `on`/`source_key`/`lookup_key` entirely still yields its
+  declared helper identity without error. This is the explicitly accepted
+  disposition, not an oversight.
+
+Workbook View -- unchanged permissive behavior (<<sec5>>); no new hardening.
+
+No new public error vocabulary was introduced anywhere: every raised error
+is the pre-existing `ValueError` from the respective owner facade (FK's
+`.helper_columns must be a list` / entry-shape messages; Lookup's
+`.enrich_lookup must be a mapping` / `.helper_columns must be a list`
+messages), or Cell Codec's own pre-existing
+`"helper or derived columns must not participate..."` rejection.
+
+== 7. Obsolete test-fixture correction
+
+`test_position_based_contract_rejects_helper_or_derived_participating_columns`
+previously used the obsolete pseudo-FK shape `"helper_columns": ["b"]`. This
+would have kept passing after the fix for the wrong reason: the FK owner
+facade rejects a `list[str]` with `ValueError` before Cell Codec's own
+participation policy (`_reject_helper_participating_columns`) ever runs, so
+the test's `pytest.raises(ValueError, match="helper|derived")` would still
+match even though the assertion no longer exercised the intended
+participation-rejection path. The fixture is corrected to current
+writer-shaped rich FK provenance (via a new `_rich_fk_helper_columns`
+helper mirroring `fk_helpers/provenance.py`'s actual output shape), so the
+test now genuinely exercises Cell Codec's own rejection of a validly
+identified FK helper column.
+
+== 8. Tests
+
+All additions are in
+`tests/unit/domain/transformations/test_cell_codec.py`, exercised only
+through the public `encode_cell_values` entry point (no private-helper
+calls), in a new `TestHelperProvenanceOwnerHandoff` class plus the corrected
+existing test (<<sec7>>):
+
+* `test_rich_fk_provenance_with_ordinary_column_participation_succeeds` --
+  current rich FK provenance present (naming a non-participating column),
+  ordinary-column participation succeeds. Proves the frame-wide `TypeError`
+  is gone.
+* `test_rich_fk_helper_selected_as_participating_column_rejected` -- the FK
+  helper column itself selected to participate raises Cell Codec's existing
+  `ValueError`, not a `TypeError`.
+* `test_lookup_provenance_with_ordinary_column_participation_succeeds` --
+  writer-shaped Lookup provenance present, ordinary-column participation
+  succeeds.
+* `test_lookup_helper_selected_as_participating_column_rejected` -- the
+  Lookup helper column itself selected to participate raises the existing
+  `ValueError`.
+* `test_fk_and_lookup_helper_identity_unions_and_either_owner_is_rejected`
+  -- both FK and Lookup provenance records on the same derived-sheet entry;
+  either owner's declared helper column is independently rejected when
+  selected.
+* `test_workbook_view_helper_identity_still_rejected` -- W1 preservation:
+  `_meta.sheets[frame].helper_columns` durable identity is still rejected,
+  via the unchanged permissive `_column_name_set` path.
+* `test_malformed_fk_helper_provenance_raises_value_error_not_type_error`
+  -- a bare non-list FK `helper_columns` leaf raises a clear `ValueError`,
+  not a `TypeError` and not a silent dict-key misinterpretation.
+* `test_malformed_lookup_provenance_raises_value_error_not_silent_skip` --
+  a non-mapping `enrich_lookup` record raises a clear `ValueError` rather
+  than being silently skipped.
+* `test_absent_metadata_leaves_ordinary_path_unchanged` -- no `_meta` at
+  all: the ordinary Cell Codec path is unaffected.
+
+Exhaustive owner-facade shape validation is not duplicated here; it remains
+covered by the FK/Lookup families' own unit test suites
+(`test_fk_helpers_helper_columns_validation.py`,
+`test_enrich_lookup_provenance_interpretation.py`, and siblings), per the
+governing design's scope.
+
+== 9. Focused test results
+
+[source,console]
+----
+.venv/bin/python -m pytest -q tests/unit/domain/transformations/test_cell_codec.py
+  -> 92 passed
+----
+
+== 10. Architecture guard
+
+[source,console]
+----
+.venv/bin/python -m pytest -q \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py
+  -> 6 passed
+----
+
+`GUARDED_INTERNAL_PREFIXES` was **not** modified. Both new imports in
+`cell_codec/frame.py` are package-facade symbol imports
+(`from spreadsheet_handling.domain.transformations.fk_helpers import
+validated_helper_columns` and
+`from spreadsheet_handling.domain.transformations.enrich_lookup import
+validated_enrich_lookup_helper_columns`), never `fk_helpers.policy` or
+`enrich_lookup.provenance` directly; the guard's existing scan (which
+already covers Cell Codec as an importer) confirms zero violations.
+
+== 11. Source scope [[sec11]]
+
+Exactly two files changed, matching the authorized scope precisely:
+
+* `src/spreadsheet_handling/domain/transformations/cell_codec/frame.py` --
+  two new facade imports; `_helper_columns_for_frame` rewritten to delegate
+  FK/Lookup identity to the owner facades instead of the generic
+  `_column_name_set` parser; `_column_name_set` narrowed (by removed call
+  sites, not by body change) to the single Workbook-View call site, plus
+  docstrings on both functions.
+* `tests/unit/domain/transformations/test_cell_codec.py` -- obsolete
+  fixture correction, two fixture helpers
+  (`_rich_fk_helper_columns`/`_enrich_lookup_record`), and the new
+  `TestHelperProvenanceOwnerHandoff` class (<<sec8>>).
+
+No other source or test file was touched. No file appeared necessary beyond
+these two.
+
+== 12. Rejected abstractions (confirmed not introduced)
+
+Per the binding design and its explicit rejection list, none of the
+following were introduced: a `HelperIdentity` protocol; a generic
+helper/provenance parser (the removed `_column_name_set` two-owner usage is
+not replaced by a more elaborate generic parser -- each owner's raw value
+now goes straight to that owner's own facade function); a provenance
+registry; a shared FK/Lookup helper dataclass; a new metadata ontology; a
+Workbook-View facade; a package re-layout; or public-surface consolidation.
+`helper_columns.update(...)`'s pre-existing set-union call is the entire
+"normalization" mechanism (<<sec4>>).
+
+== 13. Validation
+
+[source,console]
+----
+.venv/bin/python -m pytest -q tests/unit/domain/transformations/test_cell_codec.py
+  -> 92 passed
+
+.venv/bin/python -m pytest -q \
+  tests/architecture/domain_transformations/test_no_cross_family_internal_imports.py
+  -> 6 passed
+
+make test
+  -> 2934 passed, 1 deselected
+
+make source-style-guards
+  -> 0 errors, 84 warnings, 2 allowlisted findings (unchanged from the
+     pre-change baseline; no new warning attributable to cell_codec/frame.py
+     or test_cell_codec.py)
+
+git diff --check
+  -> exit 0
+----
+
+Original public-path rich-FK repro (<<sec3>>) re-run against the fixed
+source: the same call that previously raised `TypeError: unhashable type:
+'dict'` now succeeds and returns the expected encoded frame.
+
+Full diff manually inspected. Confirmed:
+
+* source changes are confined to exactly one source file
+  (`cell_codec/frame.py`), plus the one authorized test file;
+* `_reject_helper_participating_columns` semantics and error vocabulary are
+  unchanged;
+* position-based codec semantics are unchanged;
+* FK's and Lookup's own owner source (`fk_helpers/*`, `enrich_lookup/*`) is
+  untouched;
+* Workbook-View source (`workbook_views.py`) is untouched;
+* DCP (`derived_column_policy.py`) is untouched;
+* no `_meta` shape change; no public transformation surface change; no
+  registry, Trusted-Ingress, deletion-authority, or F-002 change; no
+  surface-consolidation decision made.
+
+== 14. Implementation gate
+
+Cell Codec Cycle-1 blocker implementation: **COMPLETE**
+
+Cell Codec Cycle-1 blocker: **AWAITING INDEPENDENT IMPLEMENTATION REVIEW**
+
+Family Cycle 1: **STILL OPEN**
+
+Independent implementation review: **REQUIRED**. This record does not
+self-accept and does not perform that review.

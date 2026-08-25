@@ -33,6 +33,12 @@ from spreadsheet_handling.domain.tabular import (
     ensure_unique_physical_column_labels,
     is_scalar_addressable_label,
 )
+from spreadsheet_handling.domain.transformations.enrich_lookup import (
+    validated_enrich_lookup_helper_columns,
+)
+from spreadsheet_handling.domain.transformations.fk_helpers import (
+    validated_helper_columns,
+)
 
 from .scalar import parse_cell_value, serialize_cell_value
 
@@ -728,6 +734,29 @@ def _reject_helper_participating_columns(
 
 
 def _helper_columns_for_frame(meta: Mapping[str, Any], frame_name: str) -> set[Any]:
+    """Union of helper/derived column identities Cell Codec must not contract.
+
+    Cell Codec navigates the shared metadata containers and unions the
+    returned helper identities; it does not itself interpret any owner's
+    provenance shape:
+
+    * Workbook View (``_meta.sheets[frame].helper_columns``) is read with
+      Cell Codec's own existing permissive local reader
+      (:func:`_column_name_set`), unchanged (W1: Workbook View realignment is
+      out of scope for this slice).
+    * FK transient helper provenance
+      (``_meta.derived.sheets[frame].helper_columns``) is handed, raw and
+      unopened, to the FK owner facade
+      (:func:`fk_helpers.validated_helper_columns`); Cell Codec never names
+      or interprets FK's rich per-entry fields.
+    * Lookup provenance (``_meta.derived.sheets[frame].enrich_lookup``) is
+      handed, raw and unopened, to the Lookup owner facade
+      (:func:`enrich_lookup.validated_enrich_lookup_helper_columns`); Cell
+      Codec stays blind to Lookup's join-key form.
+
+    Each owner facade raises its own ``ValueError`` on malformed provenance;
+    Cell Codec adds no new error vocabulary here.
+    """
     helper_columns: set[Any] = set()
 
     sheets = meta.get("sheets")
@@ -742,15 +771,28 @@ def _helper_columns_for_frame(meta: Mapping[str, Any], frame_name: str) -> set[A
         if isinstance(derived_sheets, Mapping):
             sheet_meta = derived_sheets.get(frame_name)
             if isinstance(sheet_meta, Mapping):
-                helper_columns.update(_column_name_set(sheet_meta.get("helper_columns")))
-                enrich_lookup = sheet_meta.get("enrich_lookup")
-                if isinstance(enrich_lookup, Mapping):
-                    helper_columns.update(_column_name_set(enrich_lookup.get("helper_columns")))
+                helper_columns.update(
+                    validated_helper_columns(
+                        sheet_meta.get("helper_columns"), frame_name=frame_name
+                    )
+                )
+                helper_columns.update(
+                    validated_enrich_lookup_helper_columns(
+                        sheet_meta.get("enrich_lookup"), frame_name=frame_name
+                    )
+                )
 
     return helper_columns
 
 
 def _column_name_set(value: Any) -> set[Any]:
+    """Permissive local reader for Workbook-View helper-column declarations.
+
+    Used only for ``_meta.sheets[frame].helper_columns`` (W1: kept exactly as
+    it was, not aligned with DCP's stricter Workbook-View reader). FK and
+    Lookup transient provenance are validated by their own owner facades
+    instead (see :func:`_helper_columns_for_frame`).
+    """
     if value is None:
         return set()
     if isinstance(value, str):

@@ -135,8 +135,35 @@ def test_position_based_contract_rejects_wrong_token_count() -> None:
         )
 
 
+def _rich_fk_helper_columns(column: str = "b") -> list[dict[str, object]]:
+    """Current writer-shaped FK helper provenance (see ``fk_helpers.provenance``).
+
+    A rich list of mappings, not the obsolete ``list[str]`` shape.
+    """
+    return [
+        {
+            "column": column,
+            "fk_column": f"{column}_id",
+            "target": "targets",
+            "target_key": "id",
+            "value_field": "name",
+        }
+    ]
+
+
+def _enrich_lookup_record(helper_columns: list[str]) -> dict[str, object]:
+    """Current writer-shaped Lookup provenance (see ``enrich_lookup.operation``)."""
+    return {"lookup": "targets", "on": ["id"], "helper_columns": helper_columns}
+
+
 def test_position_based_contract_rejects_helper_or_derived_participating_columns() -> None:
-    """Given a helper column is selected, when contracted, then the failure is hard."""
+    """Given a helper column is selected, when contracted, then the failure is hard.
+
+    Uses current writer-shaped rich FK provenance (list of mappings), not the
+    obsolete ``list[str]`` pseudo-shape: otherwise this test would still pass,
+    but for the wrong reason (the FK owner facade rejecting the obsolete
+    shape before Cell Codec's own participation policy ever runs).
+    """
     # Given
     frames = {
         "expanded": pd.DataFrame([
@@ -146,7 +173,7 @@ def test_position_based_contract_rejects_helper_or_derived_participating_columns
             "derived": {
                 "sheets": {
                     "expanded": {
-                        "helper_columns": ["b"],
+                        "helper_columns": _rich_fk_helper_columns("b"),
                     },
                 },
             },
@@ -161,6 +188,239 @@ def test_position_based_contract_rejects_helper_or_derived_participating_columns
             output="compact",
             codec_intent=_position_codec_intent(),
         )
+
+
+@pytest.mark.ftr("FTR-DOMAIN-TRANSFORMATION-PACKAGE-BOUNDARY-GUARDS-P5")
+class TestHelperProvenanceOwnerHandoff:
+    """Cell Codec delegates FK/Lookup helper-identity interpretation to their
+    owner facades instead of privately reconstructing provenance shape.
+
+    Covers the Family Cycle 1 Cell Codec helper-handoff blocker: before this
+    handoff, current rich FK provenance crashed frame-wide with
+    ``TypeError: unhashable type: 'dict'`` even for encodes that never select
+    an FK/Lookup helper column. These tests exercise only the public
+    ``encode_cell_values`` path; exhaustive owner-facade shape validation is
+    covered by the FK/Lookup families' own unit tests, not duplicated here.
+    """
+
+    @staticmethod
+    def _frame(columns: list[str] | None = None) -> pd.DataFrame:
+        cols = columns if columns is not None else ["a", "b", "c"]
+        return pd.DataFrame([{"id": "row-1", **{c: c.upper() for c in cols}}])
+
+    def test_rich_fk_provenance_with_ordinary_column_participation_succeeds(self) -> None:
+        """Given rich FK provenance naming a non-participating column, when an
+        ordinary column participates, then encoding succeeds (the frame-wide
+        TypeError is gone)."""
+        frames = {
+            "expanded": self._frame(["a", "b", "c", "d"]),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"helper_columns": _rich_fk_helper_columns("d")},
+                    },
+                },
+            },
+        }
+
+        out = encode_cell_values(
+            frames,
+            source="expanded",
+            output="compact",
+            codec_intent=_position_codec_intent(),
+        )
+
+        assert out["compact"].to_dict(orient="records") == [
+            {"id": "row-1", "d": "D", "abc": "A/B/C"},
+        ]
+
+    def test_rich_fk_helper_selected_as_participating_column_rejected(self) -> None:
+        """Given rich FK provenance, when the FK helper column itself is
+        selected to participate, then Cell Codec's existing ValueError fires
+        (not a TypeError)."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"helper_columns": _rich_fk_helper_columns("b")},
+                    },
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="helper|derived"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent=_position_codec_intent(),
+            )
+
+    def test_lookup_provenance_with_ordinary_column_participation_succeeds(self) -> None:
+        """Given writer-shaped Lookup provenance naming a non-participating
+        column, when an ordinary column participates, then encoding
+        succeeds."""
+        frames = {
+            "expanded": self._frame(["a", "b", "c", "d"]),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"enrich_lookup": _enrich_lookup_record(["d"])},
+                    },
+                },
+            },
+        }
+
+        out = encode_cell_values(
+            frames,
+            source="expanded",
+            output="compact",
+            codec_intent=_position_codec_intent(),
+        )
+
+        assert out["compact"].to_dict(orient="records") == [
+            {"id": "row-1", "d": "D", "abc": "A/B/C"},
+        ]
+
+    def test_lookup_helper_selected_as_participating_column_rejected(self) -> None:
+        """Given writer-shaped Lookup provenance, when the Lookup helper
+        column itself is selected to participate, then Cell Codec's existing
+        ValueError fires."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"enrich_lookup": _enrich_lookup_record(["b"])},
+                    },
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="helper|derived"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent=_position_codec_intent(),
+            )
+
+    def test_fk_and_lookup_helper_identity_unions_and_either_owner_is_rejected(self) -> None:
+        """Given both FK and Lookup provenance on the same derived sheet
+        entry, when either owner's helper column participates, then it is
+        rejected."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {
+                            "helper_columns": _rich_fk_helper_columns("b"),
+                            "enrich_lookup": _enrich_lookup_record(["c"]),
+                        },
+                    },
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="helper|derived"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent={**_position_codec_intent(), "participating_columns": ["a", "b"]},
+            )
+
+        with pytest.raises(ValueError, match="helper|derived"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent={**_position_codec_intent(), "participating_columns": ["a", "c"]},
+            )
+
+    def test_workbook_view_helper_identity_still_rejected(self) -> None:
+        """W1: Workbook-View durable helper-column declarations
+        (``_meta.sheets[frame].helper_columns``) remain permissively read and
+        still reject participation, unchanged from before the handoff."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "sheets": {
+                    "expanded": {"helper_columns": ["b"]},
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="helper|derived"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent=_position_codec_intent(),
+            )
+
+    def test_malformed_fk_helper_provenance_raises_value_error_not_type_error(self) -> None:
+        """Given a bare non-list FK helper-columns leaf, when encoding any
+        column, then a clear ValueError fires -- not a TypeError and not a
+        silent dict-key misinterpretation."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"helper_columns": "not-a-list"},
+                    },
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="helper_columns"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent=_position_codec_intent(),
+            )
+
+    def test_malformed_lookup_provenance_raises_value_error_not_silent_skip(self) -> None:
+        """Given a non-mapping ``enrich_lookup`` record, when encoding any
+        column, then a clear ValueError fires rather than a silent skip."""
+        frames = {
+            "expanded": self._frame(),
+            "_meta": {
+                "derived": {
+                    "sheets": {
+                        "expanded": {"enrich_lookup": ["not", "a", "mapping"]},
+                    },
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="enrich_lookup"):
+            encode_cell_values(
+                frames,
+                source="expanded",
+                output="compact",
+                codec_intent=_position_codec_intent(),
+            )
+
+    def test_absent_metadata_leaves_ordinary_path_unchanged(self) -> None:
+        """Given no ``_meta`` at all, when encoding, then the ordinary Cell
+        Codec path is unaffected by the helper-handoff change."""
+        frames = {"expanded": self._frame()}
+
+        out = encode_cell_values(
+            frames,
+            source="expanded",
+            output="compact",
+            codec_intent=_position_codec_intent(),
+        )
+
+        assert out["compact"].to_dict(orient="records") == [
+            {"id": "row-1", "abc": "A/B/C"},
+        ]
 
 
 @pytest.mark.ftr("FTR-META-ONTOLOGY-REMOVAL-WORKBOOK-PROJECTION-EPIC-P4A")
