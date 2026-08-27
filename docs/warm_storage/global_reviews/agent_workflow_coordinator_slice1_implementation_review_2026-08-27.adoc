@@ -1,0 +1,402 @@
+= Agent Workflow Coordinator -- Independent Slice 1 Implementation Review
+:toc:
+:toclevels: 2
+
+Review kind:: Independent *implementation / code review* of accepted Slice 1
+(reducer / model / replay). Not an architecture-readiness review.
+Review status:: *COMPLETED*.
+Verdict:: *MATERIAL CORRECTION REQUIRED* (2 Important, 3 Minor; 0 Blocking).
+Architecture/FTR reopening required:: *NO* -- all corrections are
+implementation-local.
+Date:: 2026-08-27.
+Reviewer independence:: Fresh Opus 4.8 context. Not the implementation author's
+context; conclusions were derived by reading the code and re-deriving behavior,
+not from the evidence artifact.
+
+[IMPORTANT]
+====
+This artifact is a *review*. It records findings and a verdict. It does not
+accept Slice 1, does not authorize Slice 2, does not authorize any live agent
+adapter or autonomous multi-Hop execution, does not start DMC Family Cycle 2,
+and does not change the FTR lifecycle/status. Those remain maintainer-owned
+steps. The reviewed implementation was treated as read-only and is unchanged by
+this review.
+====
+
+== 1. Scope and independence
+
+Authority: `docs/backlog/FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc` section 11.1
+(Slice 1 acceptance) and the accepted
+`docs/warm_storage/concepts/agent_workflow_coordinator_proposed_architecture_2026-08-25.adoc`.
+The review is bounded to Slice 1: minimal typed model, strict YAML/JSON trust
+boundary, five route effects, deterministic reducer, Finding lifecycle, autonomy
+accounting, common reconcile/resume, atomic anchors/checkpoint, and the A--J
+replays. It does not implement Slice 2, design an adapter/prompt system, or
+review the spreadsheet runtime.
+
+Independence method: each contract was checked against source, and the two
+high-priority falsification questions (outcome semantics; whether a human stop
+can be bypassed) plus every reported finding were *reproduced by executing the
+real reducer/persistence code*, not by trusting assertions or the evidence
+artifact.
+
+== 2. Reviewed baseline and commits
+
+[cols="1,3",options="header"]
+|===
+|Role |Commit
+
+|Accepted baseline (FTR/architecture) |`a93ed12` docs(workflow): accept coordinator FTR for slice 1
+|Slice-1 implementation (under review) |`9097ceb` feat(workflow): implement coordinator reducer slice 1
+|Implementation evidence |`251ab4db` docs(workflow): record coordinator slice 1 evidence
+|===
+
+Verified: branch `main`; HEAD `251ab4db` (clean worktree); `a93ed12` and
+`9097ceb` are ancestors of HEAD. `git diff a93ed12..9097ceb` touches only
+`scripts/workflow_coordinator/` and `tests/`; *no* file under
+`src/spreadsheet_handling/` and nothing outside `scripts/`+`tests/` changed. The
+reviewed implementation commit is byte-for-byte unchanged by this review.
+
+== 3. Implementation-shape assessment
+
+Faithful to the accepted reduction. `model.py` is frozen dataclasses plus finite
+string-enums; `serialization.py` is explicit fail-closed decoding with no schema
+framework and no second human-authoring format; `reducer.py` is a linear
+`preemption -> Finding authority -> budget/supervisor -> finite route`; and
+`persistence.py` provides same-directory-temp + `fsync` + `os.replace` +
+directory-`fsync` atomic writes for the two trusted anchors, with a generated
+checkpoint view. Route keys are derived, never persisted (`Run` has no
+`next_route*` field -- asserted by tests). This matches WFC-MODEL/PROFILE/AUTH
+and the two-wave falsification in architecture section 2.
+
+== 4. Findings
+
+[cols="1,1,4,1",options="header"]
+|===
+|ID |Severity |Summary |Reopen arch?
+
+|S1-R1 |IMPORTANT
+|`require_reconcile` is the only state transition without an input-status guard;
+it accepts an `AWAITING_HUMAN` semantic/escalation stop, overwrites the
+escalation's `human_question`, and (via `resume_after_reconcile`) returns the Run
+to `READY` with the semantic question unresolved -- undercutting the mandatory
+human-authority stop (WFC-AUTH-02/06; the corrected R1 invariant) and the
+architecture promise that the checkpoint "retains the question".
+|No
+
+|S1-R2 |IMPORTANT
+|`permitted_route_keys` (checkpoint `next_permitted_route_keys`) returns *all*
+phase routes for `awaiting_human`, `awaiting_human_budget`, and
+`reconcile_required`, though no route is executable until a human
+resumes/authorizes. Inconsistent with the terminal/`suspended` handling (which
+correctly returns `()`) and with WFC-OBS-02 "recomputed from ... preemption
+state". Observability only; no routing/safety impact.
+|No
+
+|S1-R3 |MINOR
+|The reducer never reads `RoutingResult.outcome`; `outcome=failed` or `blocked`
+with a valid `complete`/`goto` requested route routes autonomously. This is
+*contract-consistent* for Slice 1 (requested_route mediated by the finite profile
+table is the routing signal; preemption is outcome-independent per architecture
+9.2), but is a fail-closed hardening opportunity once real agent results exist.
+|No
+
+|S1-R4 |MINOR
+|Finding-authority operation vocabulary is asymmetric: for a *new* Finding
+`_operation(None, state)` returns the state *value* (`"resolved"`,
+`"superseded"`), while transitions use operation *names* (`"resolve"`,
+`"supersede"`), and serialization only permits the names. A gate granted
+`resolve`/`supersede` therefore still cannot create a Finding directly as
+`resolved`/`superseded` (fail-closed, safe), whereas `residual` works purely by
+incidental string equality. Latent maintainability trap, not a safety defect.
+|No
+
+|S1-R5 |MINOR
+|The compact `HopSummary` stored in `Run` drops the Hop's `finding_delta_ids` and
+`evidence_refs`, so the generated checkpoint's per-Hop rows cannot show the
+"finding delta, evidence" columns enumerated in architecture 10.3; the data is
+only indirectly recoverable via Finding origins and the separate observation
+list.
+|No
+
+|===
+
+== 5. Detailed material findings
+
+=== S1-R1 (IMPORTANT) -- reconcile path can launder a human/semantic stop
+
+Location:: `scripts/workflow_coordinator/reducer.py` `require_reconcile`
+(lines 382--406, esp. the `human_question` overwrite at line 404) and
+`resume_after_reconcile` (lines 409--426).
+
+Invariant:: WFC-AUTH-02/06 make a non-null unresolved escalation / `requires_human`
+a *mandatory* human-authority stop; architecture case I states the checkpoint
+"retains the question" and the human must "decide the semantic question". The
+common reconcile mechanism (WFC-FAIL-04/07, R4) is scoped to `interruption` and
+`prerequisite_return` provenance -- both arising from non-semantic states.
+
+Evidence (reproduced):: An agent result with `requires_human=true` +
+`escalation=semantic_authority` correctly yields `AWAITING_HUMAN` with
+`human_question="Who may accept this contract?"`. Calling
+`require_reconcile(reason="interruption")` on that Run overwrites the question
+with the generic "Validate current reality and explicitly authorize resume." and
+sets `RECONCILE_REQUIRED`; `resume_after_reconcile` then returns it to `READY`.
+Every *other* transition (`record_hop`, `confirm_supervisor_route`,
+`authorize_prerequisite`, `resume_after_reconcile`) guards its input status;
+`require_reconcile` does not.
+
+Consequence:: The reducer -- the Slice-1 acceptance surface for exactly this
+invariant -- permits `AWAITING_HUMAN (semantic) -> RECONCILE_REQUIRED -> READY`
+without the semantic question being resolved, and erases the escalation text from
+the record. Not agent-reachable (agents cannot call these mechanics; input is
+only the `RoutingResult`), so this is trusted-caller misuse, not an external
+exploit -- which is why it is Important, not Blocking. But it is a latent hole in
+the central corrected invariant, and Slice 1 provides no other resolver for a
+non-prerequisite semantic escalation, so `require_reconcile` is the accidental
+escape hatch.
+
+Smallest correction:: Guard `require_reconcile` to reject entry states that
+represent an unresolved human/semantic stop (i.e. restrict it to the
+interruption/prerequisite provenance states such as `RUNNING`/`READY`/
+`AWAITING_SUPERVISOR`/`SUSPENDED`), and/or preserve an existing
+`human_question`/escalation rather than overwriting it. Implementation-local; the
+architecture already scopes reconcile correctly.
+
+=== S1-R2 (IMPORTANT) -- checkpoint route keys are untruthful for paused states
+
+Location:: `reducer.py` `permitted_route_keys` (lines 429--439, the fall-through
+`return tuple(sorted(phase.routes))`), surfaced by `persistence.py`
+`checkpoint_projection` `next_permitted_route_keys` (line 185).
+
+Invariant:: WFC-OBS-02 -- "finite next permitted routes ... recomputed from
+pinned profile, phase, *and preemption state*."
+
+Evidence (reproduced):: For a Run in `AWAITING_HUMAN_BUDGET`
+(`stop_reason=autonomous_hop_budget_exhausted`) the checkpoint lists
+`('again','ask','done')` -- including a `goto` and a `complete` -- although no
+invocation can run. Same for `RECONCILE_REQUIRED` (requires explicit resume
+first) and `AWAITING_HUMAN`. `COMPLETED`, `STOPPED`, `SUSPENDED`, and
+`AWAITING_SUPERVISOR` are handled correctly; the three human-pause states are
+not.
+
+Consequence:: Observability only -- the reducer never consults
+`permitted_route_keys` for routing, so no unsafe route can execute. But the named
+contract output overstates what is permitted for roughly a third of the status
+space, including the common budget-exhaustion and reconcile cases, and is
+untested for those states.
+
+Smallest correction:: Return `()` for `AWAITING_HUMAN`, `AWAITING_HUMAN_BUDGET`,
+and `RECONCILE_REQUIRED` (mirroring the terminal/`suspended` handling), and add a
+focused test.
+
+=== S1-R3 (MINOR) -- `outcome` is validated but never enforced
+
+Location:: `reducer.py` `reduce_result` (lines 232--333) reads
+`schema_version`, `scope_changed`, `requires_human`, `escalation`,
+`requested_route`, and `findings`, but never `result.outcome`; `Outcome`
+(`model.py` 59--64) is validated at `serialization.py:417`.
+
+Assessment:: Read against the accepted contract, this is *correct* for Slice 1.
+The FTR pins routing to the finite profile route table keyed by `requested_route`
+(WFC-AUTH-03) and pins preemption as outcome-independent (architecture 9.2:
+"regardless of `outcome`"; replay I). No accepted A--J case requires `outcome` to
+gate a route. The required mediation (requested_route validated against
+`phase.routes`) exists. Reproduced: `outcome in {failed, blocked}` +
+`requested_route=done(complete)` completes autonomously.
+
+Consequence / recommendation:: When real agent results arrive (Slice 3+), a
+contradictory result (`failed`/`blocked` yet requesting completion) will route
+successfully. Consider a fail-closed cross-check then (e.g. `failed`/`blocked`
+incompatible with autonomous `complete`/`goto`, or profile-declared
+outcome-to-route compatibility). Not required for Slice-1 acceptance and no
+architecture reopening.
+
+=== S1-R4 (MINOR) -- new-vs-existing Finding operation vocabulary
+
+Location:: `reducer.py` `_operation` (79--89) new-Finding branch returns
+`proposed.value`; creation authority check at 121--128; permitted operations
+constrained to `{resolve, residual, supersede, reopen}` at `serialization.py:218`.
+
+Evidence (reproduced):: A gate granted `("resolve","residual","supersede",
+"reopen")` can create a new `residual` Finding but is rejected creating a new
+`resolved` or `superseded` Finding ("gate cannot create Finding ... as
+resolved"); `residual` succeeds only because its state value equals its
+operation token. Behaviour is fail-closed (safe); the concern is that the same
+conceptual grant maps to transitions but silently not to creation, by incidental
+string equality rather than a stated rule.
+
+Smallest correction:: Unify the operation vocabulary so a gate's granted
+operations map deterministically to both creation and transition (or state
+explicitly that direct creation as `resolved`/`superseded` is disallowed and make
+that intentional rather than string-incidental).
+
+=== S1-R5 (MINOR) -- checkpoint per-Hop rows lose finding-delta/evidence
+
+Location:: `model.py` `HopSummary` (214--227) and `Hop.compact` (198--211) omit
+`finding_delta_ids` and `evidence_refs`; `persistence.py` checkpoint hop rows
+(152--163) therefore cannot present them.
+
+Assessment:: Architecture 10.3 enumerates the Hop row as "(role, outcome,
+commits, finding delta, evidence, route)". The compaction is defensible under
+"compact Hop summaries" (WFC-MODEL-02) and the data is cross-referenceable via
+Finding `introduced_by_hop`/`changed_by_hop` and the observation list, so this is
+Minor. If exact per-Hop fidelity is intended, carry the two fields into
+`HopSummary`.
+
+== 6. A--J replay adequacy
+
+The replays exercise the *real* reducer surface (`reduce_result`,
+`apply_finding_deltas`, `confirm_supervisor_route`, `authorize_prerequisite`,
+`require_reconcile`, `resume_after_reconcile`, and `record_hop` via
+`charge_hop`), not a parallel fixture reducer. Each can fail if its invariant
+breaks. All 11 collected replay cases pass (A--J, with I parametrized over
+`complete` and `goto`).
+
+[cols="1,4",options="header"]
+|===
+|Case |Adequacy
+
+|A |Genuine. 4 real productive loops (reviewer + supervisor + corrector Hops =
+12 charged Hops, budget 13); asserts F001 stays `open` across >3 loops, F002
+stays `resolved`, F001 accrues 5 evidence refs, and no review-count stop -- so it
+is real convergence, not looped fixture assignment.
+|C |Genuine. Advisory phase can add a Finding and `goto` a formal gate, but its
+`complete` route fails closed with `advisory_review_cannot_accept_or_complete`.
+The engine correctly blocks only acceptance/`complete`, matching the
+architecture's own advisory `return: {goto: ...}` example.
+|G |Genuine. Declared gate with `finding_authority:[residual]` records one
+non-blocking residual and completes; a companion unit test proves a `SUPERVISOR`
+authority raises rather than disposing.
+|I |Strong. Uses `outcome=completed` + valid `complete`/`goto` +
+`requires_human=true` + non-null `semantic_authority` escalation; asserts
+`AWAITING_HUMAN`, no autonomous route, and `supervisor_required is False`, so
+`outcome=blocked` cannot mask the stop and the supervisor cannot be reached. This
+is the R1 regression exactly as FTR 11.1(3) demands.
+|J |Genuine. Full `bug_investigation -> fix -> independent_review -> correction
+-> rereview -> complete` converges through the real reducer with one stable
+Finding identity; greps generic source for `dmc`/`trusted_ingress` (absent).
+|===
+
+Adequacy gaps (not blocking): J's grep checks only `dmc`/`trusted_ingress`, not
+the full WFC-SYS-03 set (`family`/`cycle`/`slice`). I independently grepped the
+generic source: `dmc`/`family`/`cycle`/`trusted_ingress`/`e-phase` are absent;
+`slice` appears only in three docstrings referencing the *implementation* slice,
+which is not a workflow primitive. So WFC-SYS-03 holds in substance; the test
+merely under-asserts.
+
+== 7. Model / reducer / authority assessment
+
+* *Model* (WFC-MODEL-01..06): WorkItem is input data; Run/Hop/Finding carry the
+required fields with no issue-tracker growth; next routes derived, not persisted.
+`Finding` states are exactly `open|resolved|residual|superseded`.
+* *Reducer ordering* (WFC-AUTH-01..03): reconstructed manually. Order is
+schema/correlation + mechanical facts -> `scope_changed` -> human/escalation ->
+unknown route -> advisory-complete block -> Finding authority -> budget ->
+supervisor -> route. No later step can bypass an earlier stop; the
+`outcome=completed`+`requires_human`+escalation combination always stops before
+route lookup and before any supervisor path (verified).
+* *Finding authority* (WFC-FIND-01..03, WFC-AUTH-04/05): agents create only
+`open`; `SUPERVISOR` deltas raise; gate operations are limited to the phase's
+declared `finding_authority`; invariant rewrite, unauthorized blocking downgrade,
+reopen without new material evidence, non-blocking-residual, and
+superseded-without-successor all fail closed. Blocking downgrade is bound to
+`residual` disposition only. Solid, apart from S1-R4's creation-vocabulary quirk.
+* *Supervisor* (section 7 probes): consumes exactly one Hop (via `record_hop`,
+which keeps `AWAITING_SUPERVISOR`), cannot mutate Findings
+(`confirm_supervisor_route` has no delta surface), cannot select an
+undeclared/non-`supervisor` route, and is budget-checked before invocation and
+again on a `goto` after its own Hop.
+
+== 8. Persistence / reconcile assessment
+
+* *Atomic anchors* (WFC-PERSIST-01/06): `atomic_write_text` uses a
+same-directory temp, `flush`+`fsync`, `os.replace`, then directory `fsync`, with
+temp cleanup on any `BaseException`. Interrupted-before-replace preserves the old
+file and leaks no temp (tested). Judged against the explicit same-checkout V1
+promise this is sufficient; a directory-`fsync` failure after a successful
+`replace` surfaces as an exception while the (atomic) new content is in place --
+acceptable for V1, not a data-loss path.
+* *Crash charging* (WFC-AUTO-02): no marker -> no Hop; marker present -> exactly
+one conservative `uncertain_dispatch` Hop then `reconcile_required`; re-running
+recovery is idempotent (still one Hop). `budget_reserved != 1` and Run-identity /
+base-HEAD / sequence mismatches fail closed.
+* *Reconcile/resume* (WFC-FAIL-04/07, R4): one `require_reconcile` serves
+`interruption` and `prerequisite_return`, discards stale next action, records
+reason+anchor, and resume requires clean unchanged HEAD, zero anomalies, and
+`limit >= used`. The shared-path proof (replay B) is real. The one defect here is
+S1-R1 (missing entry-state guard).
+
+== 9. Complexity / readability assessment
+
+Proportionate; the author's anti-overengineering conclusion largely holds. ~1,555
+implementation LOC is dominated by explicit strict decoding (`serialization.py`,
+564) and accepted model fields (`model.py`, 354), both mandated by the "no schema
+framework / fail-closed" contract. No deletable service/factory/registry layer
+was found; enums are used where a bare string would lose safety; `Hop` vs
+`HopSummary` is a justified full-record/stored-summary split (see S1-R5). Test
+helpers (180 LOC) are constructors, not a mini-framework, and route through the
+real `new_run`/`record_hop`. No speculative Slice 2--5 machinery. The only
+readability concern is S1-R4 (authority vocabulary that depends on incidental
+string equality).
+
+== 10. Slice-boundary assessment
+
+No premature Slice 2--5 leakage: no Git transaction engine, tracked-ignore
+preflight, prompt assembler, fake/real adapter, live invocation, autonomous
+loop, evidence plugin framework, production/DMC profile, Sonar/retrieval, or
+product-runtime change. Repository/Git facts enter as typed `Observation`/
+`MechanicalFacts` inputs -- the correct Slice-1 seam. Conversely, all mechanics
+present (reducer, model, strict serialization, atomic anchors, checkpoint,
+reconcile) are Slice-1-required, not leakage.
+
+== 11. Validation performed
+
+* Focused suite `tests/unit/workflow_coordinator` +
+`tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py`:
+*45 passed* (reducer 15, serialization 12, persistence 7, replays 11),
+reproduced locally via `.venv`.
+* Source purity: `git diff a93ed12..9097ceb -- src/` empty; nothing changed
+outside `scripts/workflow_coordinator/` and `tests/`.
+* Generic-vocabulary grep over `scripts/workflow_coordinator/*.py`: no
+`dmc`/`family`/`cycle`/`trusted_ingress`/`e-phase` primitive.
+* Findings S1-R1..R4 reproduced by executing the real reducer/persistence code
+(read-only probes; no repository file modified).
+* Release-notes checkpoint: Slice 1 is repository-local developer tooling under
+`scripts/` with no `src/spreadsheet_handling`, public CLI/YAML, package/import,
+or demo surface change, so no release note is required -- consistent with the
+evidence artifact and FTR section 14.
+* The unrelated LibreOffice sandbox failure noted in the evidence is a managed
+sandbox TCP-socket denial and remains unrelated to this change.
+
+== 12. Verdict
+
+*MATERIAL CORRECTION REQUIRED.* No Blocking finding; the safety/authority core
+(R1 preemption in `reduce_result`, gate-only Finding disposition, budget
+accounting, atomic anchors, strict trust boundary) is sound and the A--J replays
+meaningfully prove their contracts. Two Important findings should be corrected
+before Slice-1 acceptance: S1-R1 (reconcile entry-state guard, because it touches
+the central human-authority invariant) and S1-R2 (checkpoint route truthfulness).
+Three Minor findings are recorded. No finding requires reopening the accepted
+architecture or FTR; a *HUMAN / ARCHITECTURE DECISION* verdict is therefore not
+warranted.
+
+Lifecycle: the FTR remains *Open / active* (Slice 1 only, not accepted). Nothing
+moves to cold storage and no backlog include is removed; this is not a
+workstream-green final review, so no full lifecycle-cleanup action applies.
+
+== 13. Bounded correction scope if pursued
+
+. `require_reconcile`: add an input-status guard rejecting unresolved
+human/semantic stops; do not overwrite an existing `human_question`/escalation
+(S1-R1). Add a negative test: reconcile must refuse an `AWAITING_HUMAN` semantic
+stop.
+. `permitted_route_keys`: return `()` for `AWAITING_HUMAN`,
+`AWAITING_HUMAN_BUDGET`, `RECONCILE_REQUIRED`; add a focused checkpoint test
+(S1-R2).
+. Optional (Minor, may defer): unify Finding operation vocabulary (S1-R4);
+decide per-Hop checkpoint fidelity for finding-delta/evidence (S1-R5); record the
+`outcome` cross-check as a Slice-3 hardening item (S1-R3).
+
+Corrections are implementation-local and should not touch `src/spreadsheet_handling`,
+add dependencies, or introduce any Slice 2--5 capability. Re-run the focused
+suite and re-verify A--J after correction.
