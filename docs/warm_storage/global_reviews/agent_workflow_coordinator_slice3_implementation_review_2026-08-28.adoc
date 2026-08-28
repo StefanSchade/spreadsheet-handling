@@ -1,0 +1,289 @@
+= Agent Workflow Coordinator -- Slice 3 Implementation Review (Independent, Broad)
+:toc:
+
+Status:: *MATERIAL CORRECTION REQUIRED -- SLICE 3 NOT INDEPENDENTLY VERIFIED; NOT MAINTAINER-ACCEPTED.*
+Date:: 2026-08-28
+Reviewer context:: Fresh independent implementation reviewer (frontier-model context).
+Reviewed baseline:: `a9d234a` -- `docs(workflow): record coordinator slice 3 evidence`.
+Implementation under review:: `fb2c012` -- `feat(workflow): implement coordinator slice 3`.
+Evidence under review:: `docs/warm_storage/global_reviews/agent_workflow_coordinator_slice3_implementation_evidence_2026-08-28.adoc`.
+Authority:: `FTR-AGENT-WORKFLOW-COORDINATOR-P5` (WFC-PROMPT/OUTPUT/OBS/GIT/AUTO/FAIL/EVID, section 11.3, WFC-RRQ-01),
+the accepted proposed architecture, and the RRQ-01 calibration
+`docs/warm_storage/concepts/agent_workflow_coordinator_slice3_rrq01_calibration_2026-08-28.adoc`.
+
+This review inspected the implementation and tests, not only the evidence claim.
+It reruns the focused coordinator/replay suites and adds temporary read-only
+reproductions. It maintainer-accepts nothing and authorizes no later slice or
+live adapter.
+
+== Scope reviewed
+
+* `scripts/workflow_coordinator/prompt.py`, `adapter.py`, `vertical.py`;
+* `tests/unit/workflow_coordinator/test_slice3_vertical.py`;
+* reused Slice-1/2 mechanics necessary to judge integration truth:
+  `model.py`, `reducer.py`, `git_facts.py`, `evidence.py`, `persistence.py`,
+  `serialization.py`, and `tests/utils/workflow_coordinator.py`.
+
+Accepted Slice-1/2 design was not reopened except where Slice 3 consumes it.
+
+== Verdict
+
+*MATERIAL CORRECTION REQUIRED.*
+
+The core Slice-3 proofs are present and pass: per-phase prompt selection with
+deterministic ordering; always-present routing-critical header/policy/task/output
+contract; exact RRQ-01 omission bounds with a usable reference for every omitted
+item; strict correlated structured-result validation; the WFC-GIT-08 commit-subject
+postcondition; `durable_artifact` required/none behaviour; independent Git
+observation with the adapter supplying no route/profile/Git authority; and a
+concise checkpoint/terminal projection. However, one *IMPORTANT* divergence in the
+post-acceptance failure path (S3-R1) contradicts WFC-AUTO-02, WFC-FAIL-01, and
+WFC-OBS-01 and is baked into the tests as intended behaviour, so it must be
+corrected rather than watched. Two MINOR findings accompany it. The required
+correction is small and localized; it needs no human architecture decision because
+the accepted architecture already provides the correct path (the same
+anomaly -> reduce -> checkpoint route the scope check already uses).
+
+== Findings
+
+=== S3-R1 (IMPORTANT) -- Post-acceptance postcondition failures bypass Hop accounting and the checkpoint/reconcile contract
+
+Violated authority:: WFC-AUTO-02 ("Every invocation accepted by the agent adapter
+consumes one Hop whether it succeeds, fails, or yields malformed output"),
+WFC-FAIL-01 ("Invocation failure or malformed structured result after adapter
+acceptance consumes a Hop; coordinator reconciles Git/evidence, records diagnostic,
+and stops without hidden retry or inferred route"), and WFC-OBS-01 ("Every
+autonomous stop/completion ... shall render a compact report"). The coordinator's
+central promise -- every repository mutation is attributable to a recorded Hop --
+is also at stake.
+
+Evidence:: In `scripts/workflow_coordinator/vertical.py::run_one_hop`, both the
+WFC-GIT-08 subject check (`_validate_subjects`, line 54) and the
+`durable_artifact=required` check (lines 55-57) raise `VerticalRunError` *before*
+`record_hop` (line 60). A reproduction with an adapter that makes a real commit and
+returns a valid, correctly correlated structured result, but whose commit subject
+lacks WorkItem/Hop identity, produced:
+
+[source,text]
+----
+raised VerticalRunError: WFC-GIT-08 commit subject lacks WorkItem/Hop identity: feat: no identity
+hop_used=0 (no Hop recorded, no checkpoint, no reconcile)
+repo now has 2 commits (the accepted invocation DID create a commit)
+----
+
+By contrast, an out-of-scope changed path -- also a post-acceptance anomaly --
+flows correctly through `observe_hop` -> `record_hop` -> `reduce_result` and yields
+a charged Hop plus a rendered checkpoint:
+
+[source,text]
+----
+OUT-OF-SCOPE change: status=awaiting_human  hop_used=1  hops_recorded=1
+stop_reason=mechanical_preemption:out-of-scope changed path: docs/leak
+checkpoint rendered with 1 hop(s), next_permitted_route_keys=[]
+----
+
+So two classes of post-acceptance anomaly are handled inconsistently: scope
+anomalies charge the Hop and render a checkpoint, while subject and durable-artifact
+failures throw a bare `RuntimeError` with no Hop record, no budget charge, no
+diagnostic checkpoint, and no `reconcile_required` state.
+
+Why it matters:: An accepted invocation that already mutated the repository leaves a
+commit that no Run/Hop record accounts for -- the exact attribution the coordinator
+exists to preserve. At N=1 the run still fails closed (no second invocation), so
+this is not a safety hole today, but budget accounting, resume, and checkpoint
+reconstruction all depend on the recorded-Hop model, and this path silently
+discards it. The tests
+(`test_git_subject_postcondition_requires_human_readable_workitem_and_hop`,
+`test_durable_artifact_required_rejects_missing...`) assert the exception, so the
+divergent behaviour is codified, not accidental.
+
+Bounded correction:: Express the subject and durable-artifact postcondition failures
+as mechanical anomalies fed into `reduce_result` (via `MechanicalFacts`, exactly as
+the scope check already is), so the accepted invocation is charged one Hop, a
+diagnostic stop reason is recorded, and a checkpoint renders -- instead of raising
+before `record_hop`. Reserve `VerticalRunError` for genuine pre-acceptance / local
+failures (e.g. `preflight_hop`), which correctly consume no Hop under WFC-AUTO-03.
+
+=== S3-R2 (MINOR) -- WFC-GIT-08 subject validation is substring-based and shape-weak
+
+Violated authority:: WFC-GIT-08 (human-readable projection of WorkItem/Hop identity,
+Conventional-Commits-compatible), and the review's explicit request to check
+"false positives/substring collisions or subject-shape weaknesses".
+
+Evidence:: `vertical.py::_validate_subjects` accepts a subject when
+`":" in subject and run.work_item_id in subject and hop_id in subject`. A
+reproduction with a subject about *different* identities passed the check:
+
+[source,text]
+----
+ACCEPTED colliding subject 'feat(x): touch WI-100 and H0012 refs'
+  ("WI-1" and "H001" are substrings of the unrelated WI-100 / H0012)
+----
+
+The colon test also treats any subject containing a colon anywhere as
+"Conventional-Commits-shaped".
+
+Why it matters:: Under the V1 trust model (workflow-produced commits, not hostile
+input) the practical risk is low, but the postcondition can attest identity for a
+commit that is really about a different WorkItem/Hop, weakening the human-readable
+projection the contract promises.
+
+Bounded correction:: Match `work_item_id` and `hop_id` as delimited whole tokens
+(word-boundary / separator-anchored) and validate a `type(scope): ` prefix shape
+rather than "contains a colon". No trailer and no hook is required.
+
+=== S3-R3 (MINOR / watch) -- Required-evidence `fail` and `error` are conflated into one hard stop
+
+Violated authority:: WFC-AUTH-02 lists only "required evidence-provider *error*" as a
+mechanical-preemption trigger; WFC-FAIL-02 states "A failed deterministic guard is
+recorded. A profile-declared failed gate may route to correction; evidence-provider
+error or hard invariant stops."
+
+Evidence:: `vertical.py` line 59:
+`required_error = next((item.summary for item in observations if item.status in {"fail", "error"}), None)`.
+Both `fail` and `error` become `MechanicalFacts.required_evidence_error`, which
+`reduce_result` treats as mechanical preemption to human.
+
+Why it matters:: With the two currently registered providers this is inert
+(`git_version` always passes; `diff_hygiene` can report `fail` only on a dirty tree
+that `observe_hop` already flags as an anomaly). But when a test-runner evidence
+callable -- which legitimately returns `fail` on a clean tree -- and profile-declared
+correction routing arrive (Slice 5), a required-evidence `fail` should be recordable
+and routable to correction, not forced to an unconditional human stop.
+
+Bounded correction:: When correction routing is introduced, separate `error`
+(hard stop) from `fail` (recorded; routed per profile). Non-blocking for Slice 3;
+flagged so it is not silently inherited.
+
+== Question-by-question assessment
+
+. *Prompt authority / selection* -- PASS. `_selected_ids` composes role, then
+  modifier, then repository-policy components in that fixed order; unselected
+  components in the map are never emitted (verified). The generated header
+  (identity/base HEAD/phase/scope/permitted routes/evidence/output contract) and the
+  workflow-policy, task, and result-contract blocks are always present and never
+  subject to size bounds, so routing-critical material cannot disappear through
+  bounding. Task payload, context, diff, and selected components are classified and
+  bounded consistently with RRQ-01. Boundary tests exist at +/-1 byte and 12/13 files.
+. *RRQ-01 omission / reference contract* -- PASS. Exact thresholds
+  (65,536 / 196,608 / 65,536 bytes, 12 files) with strict `>` semantics; every
+  omission carries `reason`, size, and a usable retrieval reference
+  (`git show REV:path`, the context reference, or `git diff base..head`);
+  ordering is deterministic (components, then context, then diff); no silent
+  truncation; routing-critical structured data is outside the optional pool.
+  Minor observation: a single *context item* is bounded only by the total, not by a
+  per-item limit; and the diff retrieval string is only as pinned as the caller's
+  `diff_base`/`diff_head` (the vertical never passes a diff, so this is latent).
+. *Structured result / S1-R3 hardening* -- PASS for the fake/subprocess boundary.
+  `validated_result` requires the exact envelope key set, `schema_version == 1`,
+  and `(run_id, hop_id, invocation_id)` correlation, then revalidates the inner
+  result through `routing_result_from_data` (unknown/missing fields fail closed).
+  Malformed/truncated JSON and identity mismatch fail closed. No prose path can
+  supply routing-critical fields. Real-provider transport correctly stays out of
+  Slice 3.
+. *Fake / subprocess adapter boundary* -- PASS. `FakeAdapter` is a pure seam;
+  `SubprocessAdapter` runs a trusted local argv, fails closed on non-zero exit, and
+  contains no provider SDK. Adapter output supplies no Git facts, profile, policy, or
+  routes; those come from `observe_hop` and the pinned profile.
+. *N=1 vertical composition* -- PARTIAL. The happy path
+  (preflight -> prompt -> invoke -> validated result -> independent Git observation
+  -> WFC-GIT-08 -> durable policy -> evidence -> record_hop -> reduce -> checkpoint
+  -> terminal) is correct and ordered. Authority inversion in the *failure* path is
+  S3-R1.
+. *WFC-GIT-08* -- PARTIAL. Commits are independently observed; validation is a
+  coordinator postcondition (no hook, no trailer); zero-commit Hops pass vacuously;
+  N commits are each checked. Subject-shape/substring weakness is S3-R2, and the
+  failure-path accounting is S3-R1.
+. *Durable artifact policy* -- MOSTLY PASS. `required` demands a committed, in-scope,
+  changed, operator-identified artifact (`durable_artifacts` is a coordinator input,
+  not agent-supplied, so the agent cannot weaken it); `none` imposes no obligation.
+  In N=1 the aggregate `base..head` delta is exactly this Hop's contribution, so
+  "coincidentally present" is not a live risk. "In scope" is enforced transitively
+  via the scope anomaly rather than re-checked in the durable block; the evidence
+  doc's "out-of-scope artifact rejection" claim relies on that transitive path (no
+  dedicated test). The failure manifestation is S3-R1.
+. *Evidence / checkpoint / reducer integration* -- MOSTLY PASS. Profile-selected
+  providers are executed; observations are coordinator-observed (not agent claims);
+  the checkpoint recomputes next routes from the pinned profile and status and does
+  not trust a persisted route cache. `fail`/`error` conflation is S3-R3.
+. *Git / repository reality* -- PASS. Slice-2 `git_facts` remains authoritative:
+  base-anchor existence, ancestry, merge, dirty/untracked, submodule, scope, and
+  pinned-path checks feed anomalies; claimed commits are hints only. Slice 3 consumes
+  these facts without regression.
+. *Human readability / proportionality* -- ACCEPTABLE (see below).
+. *Slice boundary* -- CLEAN (see below).
+
+== Tests and reproductions
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py -rA`
+  -> *90 passed* at `a9d234a`.
+* `ruff check` on the four Slice-3 files -> clean (ruff 0.15.12).
+* Temporary read-only reproductions (not committed) confirmed: (1) the WFC-GIT-08
+  substring collision (S3-R2); (2) an accepted-invocation-with-commit whose
+  postcondition fails leaves `hop_used=0` and renders no checkpoint (S3-R1); and
+  (3) that an out-of-scope change, by contrast, charges the Hop and renders a
+  checkpoint -- establishing the handling inconsistency.
+* `black` could not run: its venv executable's interpreter file is absent
+  (`cannot execute: required file not found`). This is an accurate environment
+  observation, not a formatting finding; ruff is clean and the code reads as
+  hand-formatted in the surrounding style.
+
+== Human-readability judgment
+
+The three new modules are small, single-purpose, and read in bounded time: `prompt.py`
+is one linear assembly function with explicit blocks; `adapter.py` is a thin seam;
+`vertical.py` is one ordered Hop. Naming (`omissions`, `reference()`, `_validate_subjects`)
+communicates intent. No speculative abstraction, DSL, or plugin surface was introduced.
+The one readability-relevant defect is the *inconsistent* failure handling in
+`run_one_hop` (S3-R1): a reader reasonably expects all post-acceptance anomalies to
+converge on the same reduce/checkpoint path, and two of them instead short-circuit
+with an exception. Correcting S3-R1 also improves readability. No abstraction is
+demanded merely to reduce LOC.
+
+== Slice-boundary judgment
+
+CLEAN. No live OpenAI/Codex/Claude integration, provider authentication,
+session/`continuing` context, provider/model selection, quota/5h-window logic,
+autonomous multi-Hop loop, Slice 4/5 facility, DMC Cycle 2 vocabulary, or generic
+DSL/plugin framework appears. `fresh` is the only context value. The single
+`record_hop` call and absence of any loop confirm N=1. No product runtime under
+`src/spreadsheet_handling/` is touched.
+
+== External environment note
+
+The Codex-local implementation commit left an empty (0-byte) `.git/logs/HEAD.lock`
+timestamped with `fb2c012`. Git is fully operable and no Slice-3 code creates or
+manipulates lock files. Per the review charter this is the known external
+environment issue, not a coordinator defect.
+
+== Lifecycle cleanup check
+
+Not applicable as a green closure: this review does *not* declare the FTR workstream
+green. `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains *Open* and active; Slice 3 is not
+verified or accepted; Slices 4-5, the live adapter, autonomous multi-Hop, and DMC
+Family Cycle 2 remain unauthorized. No include removal, no cold-storage movement, and
+no status change to `Done`/`Superseded` is warranted. WFC-LIFE-01/02 closure remains a
+future obligation. Residual scope is the S3-R1/R2/R3 corrections above.
+
+== Release-notes checkpoint
+
+No release note is required: Slice 3 is internal developer tooling under
+`scripts/workflow_coordinator/` with no change to public CLI/YAML, package/import,
+plugin, demo, spreadsheet, or migration surface. This matches the FTR section-14
+internal-tooling disposition.
+
+== Disposition
+
+[cols="1,2,1",options="header"]
+|===
+|ID |Summary |Severity / disposition
+
+|S3-R1 |Post-acceptance subject/durable failures bypass Hop accounting and
+checkpoint/reconcile; inconsistent with the scope-anomaly path |IMPORTANT -- correct
+before verification
+|S3-R2 |WFC-GIT-08 subject check is substring-based and shape-weak |MINOR -- correct
+with S3-R1
+|S3-R3 |Required-evidence `fail` conflated with `error` into a hard stop |MINOR /
+watch -- separate when correction routing (Slice 5) lands
+|===
