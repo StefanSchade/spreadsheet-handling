@@ -21,10 +21,13 @@ Read-only inspection on this machine established the following facts:
   prompt `-`, reads instructions from stdin; `--json` writes events as JSONL to
   stdout; `--output-schema FILE` constrains the final response; and
   `--output-last-message FILE` writes the final agent message to a file.
-* The same help documents `--ephemeral`, `--sandbox workspace-write`, and
-  `--ask-for-approval never`; its exact promise for the latter is that execution
-  failures are returned to the model immediately. It also documents
-  `--add-dir`, which this proposal deliberately does not use.
+* `codex --help` documents the top-level `-a, --ask-for-approval` option;
+  `codex exec --help` does *not*. `codex --ask-for-approval never exec --help`
+  exits successfully, while placing the option after `exec` is a parse error.
+  The documented approval policy promise is that execution failures are returned
+  to the model immediately. `exec --help` also documents `--ephemeral`,
+  `--sandbox workspace-write`, and `--add-dir`, which this proposal deliberately
+  does not use.
 * The active local configuration selects `model = "gpt-5.6-terra"` and
   `model_reasoning_effort = "medium"`. `codex login status` reports ChatGPT
   login. No credential value was read. `codex doctor` reports configured
@@ -38,8 +41,9 @@ bracket paths supplied by trusted coordinator mechanics:
 
 [source,bash]
 ----
-codex exec --ephemeral --json --color never \
-  --sandbox workspace-write --ask-for-approval never \
+codex --ask-for-approval never exec \
+  --ephemeral --json --color never \
+  --sandbox workspace-write \
   --model gpt-5.6-terra -c 'model_reasoning_effort="medium"' \
   --cd <repository> --output-schema <result-schema.tmp> \
   --output-last-message <result-message.tmp> -
@@ -50,7 +54,9 @@ captures stdout and stderr separately, waits with a finite deadline, and never
 allocates a TTY. Stdin closes after the prompt. `--json` stdout is transient
 JSONL diagnostics/events, not the routing result; stderr is likewise transient
 diagnostic material. The final-message file is the sole proposed result
-transport. The process exit status is independently recorded.
+transport. The process exit status is independently recorded. The command and
+all shown `exec` options were parse-checked through `--help` only; no provider
+connection was attempted.
 
 This deliberately uses one executable and one subcommand, not an SDK or a
 generic provider layer. Pinning the currently configured model and reasoning
@@ -84,9 +90,12 @@ the profile's authorized path is narrower still and is checked from Git after
 the Hop. No `--add-dir` is supplied.
 
 |`.git`
-|No separate denial is proven by the selected CLI surface. For agent-owned
-commits this necessarily includes normal index/object/ref/lock mutation. The
-coordinator observes it through Git; it never repairs or deletes locks.
+|No separate denial is proven by the selected CLI surface. A writable repository
+under `workspace-write` effectively grants the entire `.git` directory: refs and
+`packed-refs`, reflogs, object database, lock files, and `.git/hooks`. Existing
+post-Hop checks detect important HEAD/range/scope/history anomalies, but do not
+establish integrity of all Git metadata, especially hooks and reflogs. The
+coordinator observes facts and never repairs or deletes locks.
 
 |External filesystem
 |No additional writable directory is granted. The existing OS/Codex sandbox is
@@ -111,16 +120,26 @@ WFC-OUTPUT-04 requires a successful mutating Hop to commit its required
 artifact; WFC-GIT-08 validates the WorkItem/Hop-shaped commit subject after the
 fact. Slice-3 fixtures already prove that validation shape.
 
-However, the Slice-3 implementation evidence records a reproducible Codex-local
-interactive-path observation: a successful commit left an empty `.git/HEAD.lock`.
-No lock workaround is proposed or implemented here.
+However, the Slice-3 evidence records a reproducible Codex-local interactive-path
+observation: a successful commit may leave a stale empty Git lock. The source
+artifacts do not establish one stable path, so the future post-Hop observation
+must scan `.git/**/*.lock` and treat *any* residue as an anomaly requiring human
+inspection. No lock workaround, automatic deletion, or cleanup is proposed or
+implemented here.
 
 Option A is the contract-preserving V1 ownership model: the real agent edits and
 creates its own in-scope workflow commit, and the coordinator only observes and
 validates the range/subject. It keeps semantic authorship and section 11.4's
-prohibition on coordinator-created semantic commits, but the stale-lock hazard
-must be explicitly accepted for a disposable proof or eliminated by further
-evidence before routine use.
+prohibition on coordinator-created semantic commits. But it has the full `.git`
+authority stated above, not merely ordinary `git add`/`git commit`; range/scope
+observation cannot establish integrity of hooks or reflogs.
+
+*Option A -- disposable proof* is acceptable because the repository is
+disposable, the budget is N=1, and every observed anomaly stops. *Option A --
+routine real repository* is *not yet accepted* as safe merely from that proof.
+It would later require stronger isolation that restricts `.git` authority,
+materially expanded Git-integrity verification, or explicit maintainer acceptance
+of the broader `.git` trust.
 
 Option B, trusted coordinator mechanics committing an agent-authored worktree,
 could avoid exposing Git write to the agent but changes the accepted ownership
@@ -128,17 +147,27 @@ model and conflicts with the section-11.4 wording against coordinator-created
 semantic commits. It must not be implemented as an incidental adapter detail.
 
 Decision required:: A maintainer must choose either (A) agent-owned commit for
-the disposable proof with the stale-lock observation treated as a blocking
-post-Hopf anomaly, or explicitly amend the accepted architecture/FTR before
-any coordinator-owned commit mechanism is designed. This proposal recommends
-*Option A for the disposable proof only*, subject to that explicit decision.
+the disposable proof with any lock residue treated as a blocking post-Hopf
+anomaly, or explicitly amend the accepted architecture/FTR before any
+coordinator-owned commit mechanism is designed. This proposal recommends
+*Option A for the disposable proof only*, subject to that explicit decision; it
+makes no routine-repository safety decision.
 
 == 4. Result transport and fresh context
 
 The trusted coordinator creates `<result-schema.tmp>` as a JSON-Schema rendering
 of the existing authoritative strict `structured_result_v1` validation contract,
-and a private transient
-`<result-message.tmp>` path before launch. The prompt generated by Slice 3
+and a private transient `<result-message.tmp>` path before launch. Both paths,
+the dispatch marker, Run snapshot, and all coordinator transient state must be
+outside the agent-writable repository/workspace; no `--add-dir` is supplied for
+any of them. `--output-schema` and `--output-last-message` are parent-Codex I/O
+paths and do not require those files to be inside the agent workspace. This is a
+mechanical adapter boundary, not an agent policy assertion.
+
+The accepted WFC-PERSIST-02 repository-local state-root contract must be
+reconciled with this required external adapter state placement before runtime
+implementation; this proposal changes neither FTR nor architecture and does not
+redesign persistence. The prompt generated by Slice 3
 already states `output_contract=structured_result_v1`, includes Run/Hop identity,
 and requires exactly one JSON envelope. Codex receives the prompt on stdin.
 The CLI writes its schema-constrained final message to the transient result file;
@@ -169,43 +198,61 @@ asserts nor implements `continuing`.
 == 5. Acceptance, Hop accounting, cancellation, and timeout
 
 Before attempting process creation, the coordinator atomically publishes the
-existing correlated dispatch marker with base HEAD and one reserved Hop
-(WFC-FAIL-04). The following is the V1 accounting rule. It deliberately does
-not infer acceptance from prose or retry any outcome.
+existing correlated dispatch marker with base HEAD and a pending one-Hop budget
+reservation (WFC-FAIL-04). The reservation is not itself proof that a Hop was
+consumed. Before spawn it completes command construction and parse validity,
+executable availability, login-status, repository/HEAD/clean-state preflight,
+and required external schema/temp preparation. A positively established local
+failure at any of those points consumes no Hop under WFC-AUTO-03.
+
+The following is the V1 accounting rule. It does not equate child-process start
+with provider acceptance, does not infer acceptance from prose, and does not
+retry any outcome. The exact provider-acceptance event is not proven without a
+live invocation, and no undocumented JSONL event semantics are used.
 
 [cols="2,2,3,3",options="header"]
 |===
 |Observation |Hop |Required state/action |Reason
 
-|Child process was not started (`Popen`/local executable failure)
+|Pre-spawn command/parse, executable, login-status, repository/HEAD, or required
+external schema/temp preparation failure
 |No Hop
 |Record local launch failure; remove/close the pre-launch marker only after
 proving no child existed; `awaiting_human` if human action is needed.
 |WFC-AUTO-03 local pre-acceptance failure.
 
-|Child started; JSONL explicitly proves provider acceptance
+|After spawn, a local failure positively establishes that provider/model
+acceptance did not occur
+|No Hop
+|Record the local pre-acceptance failure, reconcile any process-local facts, and
+stop without replay; do not convert process start into acceptance.
+|WFC-AUTO-03. This row applies only when non-acceptance is actually established.
+
+|Provider/model acceptance is positively observed
 |Charged
 |Reconcile Git/evidence after exit; valid result may reduce, otherwise stop.
 |WFC-AUTO-02.
 
-|Child started but provider acceptance is absent or cannot be disproved
+|Provider/model acceptance cannot be disproved after the remaining runtime
+outcome
 |Charged
 |Conservative one-Hop record; never replay automatically.
-|The installed help does not document event acceptance semantics; WFC-AUTO-02
-requires conservative charging once non-acceptance cannot be proved.
+|WFC-AUTO-02 requires conservative charging for genuinely uncertain acceptance.
 
 |Exit 0 and valid, correlated final-message result
 |Charged
 |Observe Git/evidence; reduce once under existing Slice-3 rules.
-|Normal accepted Hop.
+|A valid model result is positive acceptance evidence.
 
 |Nonzero exit, explicit provider/unavailable/capacity failure, or invalid,
-missing, truncated result after child start
-|Charged
-|Reconcile Git/evidence, retain concise diagnostic, stop `awaiting_human`; no
-route inference or hidden retry.
-|WFC-FAIL-01. A capacity error is ordinary explicit unavailability for now;
-there is no quota waiting or routing.
+missing, truncated result
+|No Hop only if pre-acceptance failure is positively established; otherwise
+charged
+|For a charged outcome, reconcile Git/evidence, retain concise diagnostic, and
+stop `awaiting_human`; no route inference or hidden retry.
+|WFC-AUTO-03 or, where acceptance cannot be disproved, WFC-FAIL-01. A capacity
+error is ordinary explicit unavailability for now; there is no quota waiting or
+routing.
 
 |Cancellation, deadline expiry, forced kill, parent interruption, or unreadable
 process/result state
@@ -216,12 +263,14 @@ and require explicit resume/human authority.
 |===
 
 The parent sets one bounded wall-clock timeout in the authorized profile/run;
-no provider quota window is modelled. At expiry it first requests graceful child
-termination, waits only a short fixed grace interval, then kills if necessary.
-Either path is uncertain unless the process has already produced an observed,
-validated result and clean post-Hopf facts. The parent itself never waits
-indefinitely. User cancellation follows the same uncertain, charged,
-`reconcile_required` path once a child may have started.
+no provider quota window is modelled. It launches the subprocess in its own
+process group/session (for example Python `start_new_session=True`). At timeout
+or cancellation, the parent signals the *process group* for graceful
+termination, waits one fixed short grace period, then kills that group if any
+descendant remains. Descendants therefore cannot silently survive a parent
+timeout. Any timeout/cancellation/kill is uncertain unless a valid result and
+clean post-Hopf facts were already observed, and enters charged
+`reconcile_required`. The parent itself never waits indefinitely.
 
 No hidden retry exists. `max_autonomous_hops=1` is checked before spawn and
 after all safe post-Hopf observation; it cannot issue a second local invocation.
@@ -229,11 +278,12 @@ after all safe post-Hopf observation; it cannot issue a second local invocation.
 == 6. First eventual live proof -- separately authorized, not executed
 
 The first proof shall use a newly initialized disposable Git repository, not
-this product repository. It has a tracked `.gitignore` for its coordinator-state
-root, one tracked `PROOF.md` containing a known initial line, and no remote,
-submodule, product code, or Domain material. Its pinned profile authorizes only
-`PROOF.md`, one `durable_artifact=none` routine documentation/tooling phase,
-and one trusted `git diff --check` observation.
+this product repository. It has one tracked `PROOF.md` containing a known initial
+line, no agent-writable coordinator state root, and no remote, submodule, product
+code, or Domain material. Coordinator schema/result/marker/snapshot paths are in
+a separate parent-owned location outside this workspace, with no `--add-dir`.
+Its pinned profile authorizes only `PROOF.md`, one `durable_artifact=none` routine
+documentation/tooling phase, and one trusted `git diff --check` observation.
 
 The sole deterministic task is: replace the known line in `PROOF.md` with a
 specified replacement, run `git diff --check`, create exactly one commit whose
@@ -247,11 +297,15 @@ one descendant commit, only `PROOF.md` changed, the required subject identity,
 a valid result file correlated to Run/H001/invocation, clean post-Hopf Git,
 passing `git diff --check`, transient redacted process diagnostics, and a compact
 checkpoint. Any permission prompt, nonzero exit, bad result, extra path/commit,
-lock residue, dirty state, timeout, cancellation, or provider failure stops.
-There is no automatic second invocation, cleanup, lock workaround, reset, or
-routine-repository follow-up. Only after independent acceptance and separate
-maintainer authorization may a narrow routine documentation/tooling task be
-considered.
+any `.git/**/*.lock` residue, dirty state, timeout, cancellation, or provider
+failure stops. The observed Codex-local environment means this first proof may
+produce a correct deterministic commit and valid structured result *plus* a
+stale empty Git lock. That is an expected possible human-inspected outcome: it
+blocks continuation and requires inspection, but alone is not proof that adapter
+logic failed. There is no automatic second invocation, cleanup, lock workaround,
+reset, or routine-repository follow-up. Only after independent acceptance and
+separate maintainer authorization may a narrow routine documentation/tooling task
+be considered.
 
 == 7. Unresolved decisions and recommendation
 
@@ -263,7 +317,13 @@ An authorized disposable proof must record its own provider reachability result;
 this proposal neither fixes connectivity nor authorizes a retry.
 * `--json` event names and semantics were not empirically observed because that
 would require a provider invocation. The adapter therefore does not depend on
-an undocumented acceptance event and conservatively charges any started child.
+an undocumented acceptance event: a started child is charged only on positive
+acceptance evidence or genuinely uncertain acceptance, never merely because it
+started.
+* External coordinator state required by this adapter boundary and the accepted
+repository-local WFC-PERSIST-02 root require an explicit authority reconciliation
+before runtime implementation. This correction records the conflict; it changes
+neither contract and authorizes no persistence redesign.
 * The exact timeout/grace values are an authorized-run configuration decision;
 the required property is bounded parent waiting and uncertain-outcome reconcile.
 
