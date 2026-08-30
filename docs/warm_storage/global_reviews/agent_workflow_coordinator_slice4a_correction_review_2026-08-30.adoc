@@ -1,0 +1,154 @@
+= Agent Workflow Coordinator -- Slice 4A Correction Bounded Re-Review
+:toc:
+
+Status:: *MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION. S4A-R1/R2/R5/R6/R7 CLOSED; S4A-R3 PARTIALLY CLOSED; S4A-R4 NOT FULLY CLOSED (tied to R3). NO CODEX/PROVIDER INVOCATION PERFORMED. NO NEW LIVE INVOCATION AUTHORIZED.*
+Date:: 2026-08-30
+Reviewer context:: Same independent reviewer that authored `5b09ea01` (`docs(workflow): review slice 4a implementation`). Bounded correction re-review, read-only.
+Correction under review:: `ecc133ca` -- `fix(workflow): correct slice 4a review findings` (`scripts/workflow_coordinator/slice4.py`, `tests/unit/workflow_coordinator/test_slice4.py`).
+Correction evidence:: `8c457e31` -- `docs(workflow): record slice 4a correction evidence`.
+Baseline:: `8c457e31` (HEAD). Known unrelated worktree modification `tools/repo_snapshot_multi.sh` left untouched and unstaged.
+Scope:: Only S4A-R1..R7 and direct regressions introduced by `ecc133ca`. No broad Slice-4 re-review; no reopened Slice-1..3 design; no Slice-4B design; no live-proof authorization.
+Provider invocation:: *None.*
+
+== Verdict
+
+*(B) MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION.*
+
+The correction closes the pre-write authority defect (S4A-R1), the acceptance-conflation defect (S4A-R2), and the minor/watch items (S4A-R5/R6/R7), and it commits and tests the *happy-path* vertical composition (part of S4A-R3). But the single remaining problem is exactly the one the re-review bound flags: the committed real driver `run_real_one_hop` integrates only the happy path. On any post-spawn uncertainty -- no result, malformed result, uncorrelated result, timeout, or nonzero exit without a valid result -- `_CodexAdapter.invoke()` raises `ResultValidationError`, which escapes `vertical.run_one_hop()` (its only `try/except` guards `GitPreflightError`) and therefore escapes `run_real_one_hop()` uncaught. No committed code publishes a dispatch marker before invocation or routes the escape into the existing `recover_uncertain_dispatch` / `require_reconcile` + checkpoint semantics. That transition -- the exact failure shape the first live proof already produced -- still requires uncommitted/manual glue.
+
+Per the review bound, when the only remaining problem is that the committed real driver lacks the post-spawn uncertain -> reconcile composition, the disposition is (B) with the smallest deterministic correction prescribed and no live retry. That is the situation here.
+
+== Finding dispositions
+
+=== S4A-R1 -- pre-write external authority -- CLOSED
+
+`_require_external_state_root(state_root, repository)` (slice4.py:64) resolves `state_root` and derives the canonical checkout from `_facts(repository)[0]` (`rev-parse --show-toplevel`, resolved), then rejects `root == checkout`, `checkout in root.parents` (state root below checkout), and `root in checkout.parents` (checkout below state root). It is invoked:
+
+* in `register_checkout()` *before* the first write (slice4.py:75, ahead of the mapping write at :81);
+* at the top of `validate_checkout()` (:89);
+* in `invoke_codex()` before per-Hop state writes (:127).
+
+Because the guard precedes every write, a rejected first registration leaves no trusted files. `test_state_root_nesting_is_rejected_before_any_trusted_write` proves both the equal/under-checkout case (`repository/"bad-state"`) and the checkout-under-root case (`tmp_path`), and asserts neither `checkout-association.json` nor `checkouts/` exists after rejection. The normal external topology (sibling `state_root` and `repository` under a shared `tmp_path`) is *not* rejected -- neither is an ancestor of the other -- and the remaining tests register successfully against it. *CLOSED.* Pre-write external authority sound: *YES*.
+
+=== S4A-R2 -- strict result authority -- CLOSED
+
+`invoke_codex` no longer derives acceptance from transport length. It computes `validated = validated_result(result_text, expected) if result_text else None`, catching `ResultValidationError` to `None`, and sets `acceptance = "established" if validated is not None else "uncertain"` (slice4.py:161-167). Every non-established path is therefore covered by the accepted Slice-3 validator: malformed JSON, malformed envelope, wrong `run_id/hop_id/invocation_id` (correlation check in `adapter.validated_result`), and invalid `RoutingResult` (via `routing_result_from_data`) all yield `None` -> `uncertain`. `test_nonempty_invalid_result_is_not_established` (malformed JSON and wrong `run_id`) and `test_nonzero_without_result_is_uncertain` confirm the return-value behavior.
+
+Double validation -- `invoke_codex` then `vertical.run_one_hop` -- is harmless redundancy, not competing authority: both call the same `validated_result` with the same `Invocation(run.run_id, hop_id, invocation_id)` (`run_real_one_hop` builds the adapter's `expected` from the same `hop_id = f"H{run.hop_used + 1:03d}"` that `run_one_hop` recomputes), so the two checks are identical. *CLOSED.* Strict result authority sound: *YES*.
+
+=== S4A-R3 -- real vertical composition -- PARTIALLY CLOSED
+
+*Happy path -- CLOSED.* `run_real_one_hop` (slice4.py:192) constructs a `_CodexAdapter` and calls the sole accepted `vertical.run_one_hop`, so a valid correlated result flows through the established `prompt -> adapter -> validated_result -> observe_hop -> subject/durable checks -> run_evidence -> record_hop -> reduce_result -> checkpoint_projection` path with no duplicated reduction logic. `test_real_vertical_composition_uses_fake_cli_and_existing_reducer` exercises this committed composition end-to-end with a fake CLI that commits an in-scope change and writes a correlated result; it asserts `status == "completed"`, `hop_used == 1`, real `actual_commits`, the committed `PROOF.md` mutation, and the reviewed argv/`--cd`/external-path shape. This is a genuine single-path integration, not a second contract.
+
+*Uncertain / failure path -- NOT CLOSED.* `_CodexAdapter.invoke()` raises `ResultValidationError("real adapter result is absent, malformed, or uncorrelated")` whenever `invoke_codex` returns no valid result (slice4.py:187-188). In `vertical.run_one_hop`, `adapter.invoke(...)` is called on the line that feeds `validated_result`, *outside* the sole `try/except GitPreflightError` (vertical.py:90). The `ResultValidationError` therefore propagates out of `run_one_hop` and out of `run_real_one_hop` unhandled. Consequently, for a real process that *started* and then produced no/malformed/uncorrelated result, timed out, or exited nonzero:
+
+* no atomic dispatch marker is published before invocation;
+* no Hop is conservatively charged;
+* Git is not independently observed by the driver on this path;
+* there is no `recover_uncertain_dispatch` / `require_reconcile` transition, no `reconcile_required` status, no `stop_reason` requiring explicit resume, and no checkpoint;
+* the caller receives a bare exception.
+
+`invoke_codex` itself correctly reports `acceptance == "uncertain"`, but that signal is discarded when `_CodexAdapter.invoke` converts it into a raised exception, and no committed outer boundary owns the recovery. The reusable machinery (`persistence.recover_uncertain_dispatch`, `reducer.require_reconcile`, `checkpoint_projection`) exists but is called by no committed real-execution code (only tests reference it). This is precisely the failure shape the first live proof produced, so the gap is material.
+
+*Smallest deterministic correction (no live retry).* Make the committed real driver own post-spawn uncertainty end-to-end:
+
+. before `adapter.invoke`, atomically publish the correlated dispatch marker (base HEAD, `budget_reserved=1`) and Run snapshot to the external state root, so an uncertain outcome has an anchor to charge (WFC-FAIL-04);
+. on the adapter's uncertain outcome / `ResultValidationError` escape, independently observe current Git and route through the existing `recover_uncertain_dispatch` -> `require_reconcile` and `checkpoint_projection`, yielding `reconcile_required` + explicit-resume + one charged Hop + no retry -- rather than letting the exception escape;
+. do *not* require `vertical.run_one_hop` itself to own uncertainty; a thin committed outer boundary in `run_real_one_hop` (or a sibling) owning it is acceptable, provided there is *one* committed, testable path where post-spawn uncertainty becomes the existing reconcile semantics.
+
+*PARTIALLY CLOSED.* Real happy-path vertical composition sound: *YES*. Post-spawn uncertain path committed end-to-end: *NO*.
+
+=== S4A-R4 -- deterministic coverage -- NOT FULLY CLOSED (tied to R3)
+
+Newly covered and adequate: external-state pre-write rejection (both nesting directions); malformed/corrupt association and Git-mismatch fail-closed; linked-worktree `git_dir != common_dir` fact recording and revalidation; malformed/non-correlated nonempty result non-establishment; valid correlated result; nonzero/no-result uncertainty at the `invoke_codex` boundary; exact reviewed command shape and external schema/result path ownership; process-group *descendant* (grandchild) termination after timeout; and the full happy-path vertical composition through the committed driver.
+
+Missing item, tied to S4A-R3: there is *no* test that drives the post-spawn uncertain -> charged `reconcile_required` path *through the committed real driver*. The uncertain cases are asserted only at `invoke_codex()` return-value level (`acceptance == "uncertain"`); none exercises `run_real_one_hop` with a fake executable that starts and yields no/malformed result to prove one charged Hop, `reconcile_required`, explicit-resume `stop_reason`, no retry, and no unobserved mutation. Add that single deterministic test alongside the S4A-R3 correction. *NOT FULLY CLOSED*, for the same reason as R3; no separate new finding is manufactured.
+
+=== S4A-R5 -- FTR marker -- CLOSED
+
+`test_slice4.py:22` sets module-level `pytestmark = pytest.mark.ftr("FTR-AGENT-WORKFLOW-COORDINATOR-P5")`, matching every sibling test module. *CLOSED.*
+
+=== S4A-R6 -- transport schema watch -- CLOSED
+
+The broad `"result": {"type": "object"}` transport schema is retained deliberately. It is now safe: strict semantic and correlation authority is guaranteed downstream by `validated_result()` on every path that can establish a result (`invoke_codex`, and again `vertical.run_one_hop` on the happy path). No schema duplication is requested for defense in depth. *CLOSED.*
+
+=== S4A-R7 -- containment watch -- CLOSED
+
+`_require_external_state_root` rejects both ambiguous nesting directions with a single canonical-path predicate and introduces no generic filesystem/sandbox machinery. *CLOSED.*
+
+== Direct regression check
+
+* *`_CodexAdapter.invoke()` ignores its `repository` parameter* in favor of `self.repository`. In the committed composition this cannot create an authority mismatch: `run_real_one_hop` passes the *same* `repository` object to both `_CodexAdapter(repository, ...)` and `run_one_hop(..., repository, ...)`, so `self.repository` and the vertical's observed repository are identical, and `invoke_codex`'s checkout-fact validation and `observe_hop` operate on the same checkout. It is a latent trap only if a future caller wired a different repository into the two, which the committed path does not. *No regression* (noted as a benign latent coupling, not a finding).
+* *Malformed checkout mapping validation* is strengthened (exact key set, `schema_version == 1`, non-empty string fields, `uuid.UUID` well-formedness) and remains fail-closed; tested. *No regression.*
+* *UUID remains identifier, not authority*: `validate_checkout` parses the UUID only for well-formedness; authority still requires the canonical-path/git-dir/common-dir facts to match. *No regression.*
+* *Linked-worktree handling* records and rechecks `git_dir`/`common_dir` facts only; it introduces no multi-worktree orchestration. *No regression.*
+* *Fake executable* is a local `#!/usr/bin/env python3` fixture script; it cannot be confused with a live/provider proof. *No regression.*
+* *No provider-specific acceptance semantics* were invented; acceptance is purely "a `validated_result` exists." *No regression.*
+* *No retry path* was introduced. *No regression.*
+* *No Slice-4B / bwrap / commit-broker / event-store scaffolding* was introduced. *No regression.*
+
+*NEW MATERIAL DIRECT REGRESSION FOUND: NO.*
+
+== First live failure remains factual evidence
+
+Unrelitigated and unchanged: one live invocation consumed; nested-Codex environment non-representative; app-server init failed read-only; no repository mutation; no result; no Git lock; uncertain conservatively charged; `reconcile_required`; no retry. No new live invocation occurred in the correction. The residual concern is that the *committed* code does not yet reproduce that charged-reconcile transition end-to-end (S4A-R3), which is a deterministic-code gap, not a reason to retry live.
+
+== Lifecycle cleanup check
+
+Not a green-closure review. `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains *Open* and active. Coarse lifecycle truth is unchanged: Slices 1--3 accepted; the single authorized disposable proof consumed and failed pre-mutation; routine use, Slice 5, autonomous multi-Hop, and DMC Cycle 2 unauthorized. No FTR status change, backlog include removal, or cold-storage movement is warranted. WFC-LIFE-01/02 closure remains a future obligation.
+
+== Project Memory
+
+No Project Memory update. Per WFC-PM-03, individual re-reviews are not routine PM events, and coarse lifecycle truth has not changed (Slices 1--3 accepted; Slice 4 one-proof consumed/failed; still unauthorized; correction advances a within-readiness refinement, not a lifecycle transition). This bounded disposition is durably recorded by this artifact.
+
+== Release-notes checkpoint
+
+No release note required. This re-reviews an unauthorized-slice correction under `scripts/workflow_coordinator/` (internal developer tooling); no public CLI/YAML, package/import, plugin, demo, spreadsheet, or migration surface changes. Matches the FTR section-14 internal-tooling disposition.
+
+== Validation (read-only; no provider invocation)
+
+[source,text]
+----
+git rev-parse HEAD                                              # 8c457e31 (expected baseline)
+.venv/bin/pytest -q tests/unit/workflow_coordinator            # 90 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed
+asciidoctor -o /dev/null <this artifact>                       # renders without error
+git diff --check <review commit>                               # no whitespace errors
+git status --short                                             # only known unrelated tools/repo_snapshot_multi.sh (unstaged)
+----
+
+== Residual risks
+
+* S4A-R3/R4 remain open: the committed real driver lacks the post-spawn uncertain -> `recover_uncertain_dispatch`/`require_reconcile` composition and its deterministic test; closable without a live invocation via the prescribed thin outer boundary + one test.
+* After that correction, a new disposable proof additionally requires a *non-nested* host; the nested-Codex read-only failure is unresolved for the nested environment (out of this correction's scope).
+* Option A's full `.git` authority for routine use remains out of scope (a Git-ownership decision, not persistence).
+
+None of these authorizes Slice 4, routine use, or any live invocation.
+
+== Final report
+
+[cols="2,1",options="header"]
+|===
+|Question |Answer
+
+|S4A-R1 CLOSED |YES
+|S4A-R2 CLOSED |YES
+|S4A-R3 CLOSED |PARTIAL
+|S4A-R4 CLOSED |NO (tied to R3)
+|S4A-R5 CLOSED |YES
+|S4A-R6 STATUS |CLOSED
+|S4A-R7 STATUS |CLOSED
+|PRE-WRITE EXTERNAL AUTHORITY SOUND |YES
+|STRICT RESULT AUTHORITY SOUND |YES
+|REAL HAPPY-PATH VERTICAL COMPOSITION SOUND |YES
+|POST-SPAWN UNCERTAIN PATH COMMITTED END-TO-END |NO
+|POST-SPAWN UNCERTAIN PATH DETERMINISTICALLY TESTED |NO
+|FAILURE-PATH RECONCILE AUTHORITY PRESERVED |YES (machinery intact and correct; simply not yet wired into the committed real driver)
+|DIRECT CORRECTION REGRESSION FOUND |NO
+|REAL CODEX/PROVIDER INVOCATIONS PERFORMED |0
+|NEW LIVE INVOCATION AUTHORIZED |NO
+|===
+
+REVIEW VERDICT:: *(B) MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION* -- wire the committed real driver's post-spawn uncertainty into the existing `recover_uncertain_dispatch`/`require_reconcile` + checkpoint semantics (dispatch marker before invocation; catch the adapter's uncertain/`ResultValidationError` escape; charge one Hop; observe Git; `reconcile_required`; explicit resume; no retry) and add one deterministic test driving that path through `run_real_one_hop`. No live retry.
+
+READY FOR MAINTAINER REPLACEMENT-PROOF AUTHORIZATION DECISION:: NO.
