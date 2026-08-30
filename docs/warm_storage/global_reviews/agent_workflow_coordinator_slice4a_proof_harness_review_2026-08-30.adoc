@@ -1,0 +1,452 @@
+= Agent Workflow Coordinator -- Slice 4A Proof-Harness Independent Review
+:toc:
+:toclevels: 3
+
+Status:: *INDEPENDENT REVIEW -- READ-ONLY. NO LIVE CODEX/PROVIDER INVOCATION.
+FAKE-EXECUTABLE DETERMINISTIC TESTS ONLY.*
+Date:: 2026-08-30
+Reviewer authority:: Reconstructed from repository artifacts, not conversation
+history.
+Baseline reviewed:: `367ee166` -- `docs(workflow): record slice 4a proof harness
+evidence`.
+Implementation reviewed:: `fc53be37` -- `feat(workflow): harden slice 4a proof
+harness`.
+Evidence reviewed:: `367ee166` proof-harness evidence artifact.
+Immediate lifecycle basis:: `648d29ed` (authorize hardening), `ca31a8e0` (review
+of the consumed replacement proof).
+Authority:: `docs/backlog/FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc` sections 11.4
+and 11.4.1; accepted architecture
+`docs/warm_storage/concepts/agent_workflow_coordinator_proposed_architecture_2026-08-25.adoc`.
+
+== 1. Scope and method
+
+This is one bounded review of the complete Slice-4A proof-harness implementation
+(`scripts/workflow_coordinator/proof_harness.py`) and its deterministic tests
+(`tests/unit/workflow_coordinator/test_proof_harness.py`). It is *not* another
+broad Slice-4A review; `S4A-R1..R9` remain closed and are not reopened, as no
+direct regression to accepted Slice-4A runtime (`slice4.py`) was found.
+
+No corrections were implemented. No provider was invoked. No real proof was
+executed. Only fake-executable deterministic tests and read-only inspection were
+used.
+
+Authority recap (section 11.4.1): the maintainer authorized *only* deterministic
+implementation and testing of the smallest disposable proof harness that
+composes the accepted Slice-4A APIs, prepares a fresh disposable fixture,
+persists durable operator-facing evidence and bounded diagnostics/provenance,
+preserves Slice-4A semantics, and is tested with fake executables only. No live
+invocation, routine repository use, Slice 4B, `bwrap`, commit broker, Slice 5,
+autonomous multi-Hop, or authorization-consumption machinery is authorized.
+
+== 2. Validation performed
+
+[source,text]
+----
+.venv/bin/pytest -q tests/unit/workflow_coordinator            # 97 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed
+git diff --check                                               # clean
+----
+
+Additional deterministic check (character-vs-byte bounding, no provider):
+
+[source,text]
+----
+python -c "s='ä'*20000; t=s[-16384:]; print(len(t), len(t.encode()))"
+# 16384 32768   -> a 16,384-CHARACTER tail can be 32,768 bytes
+----
+
+== 3. Central questions
+
+=== 3.1 Thin-harness boundary (Q1) -- PASS
+
+`proof_harness.py` is a genuine composition/fixture/evidence layer. It delegates
+invocation, dispatch publication and retirement, result validation, reduction,
+Git reconciliation, and Hop accounting to the accepted `run_real_one_hop`
+(`slice4.py`). It does *not* re-implement dispatch semantics, result authority,
+Git authority, the reducer, or reconciliation.
+
+Its own `_git`/`_git_facts` perform *read-only* observation for the operator
+summary -- the "Git/result/state inspection summary" the authority explicitly
+authorizes. The authoritative reconciliation observation remains inside
+`slice4.observe_hop`/`preflight_hop`. This reporting read is distinct from
+authority and does not constitute a second coordinator. The fixed disposable
+fixture and evidence collector are exactly what section 11.4.1 authorizes.
+
+There is minor private duplication (`_git`, `_bounded`) with `slice4.py`, but it
+stays read-only and does not duplicate authority; extraction is optional, not
+required.
+
+=== 3.2 Operator contract (Q2) -- PASS
+
+The documented file-based contract is a single short command:
+
+[source,text]
+----
+.venv/bin/python scripts/workflow_coordinator/proof_harness.py \
+  --proof-root /path/to/new/disposable-proof-root
+----
+
+`main()` requires a *new* proof root (`run_disposable_proof` raises
+`Slice4Error` if it exists), prepares `repo/` and a disjoint `trusted-state/`,
+runs the fixed setup, and prints the durable `proof-summary.json` path. The
+`sys.path` shim (lines 19-20) makes the file runnable directly as the documented
+launcher. The operator can run one separately-authorized proof and later
+reconstruct the outcome from `proof-summary.json` and `launch-provenance.json`
+without terminal scrollback. This satisfies the authorized file-based contract.
+
+Residual: durable artifacts are a post-hoc aggregation (see 3.3); the *authority*
+correctly designates the durable files, not the exit code, as authoritative.
+
+=== 3.3 Durable failure evidence and write ordering (Q3) -- PASS with WATCH
+
+Ordering of durable operator artifacts relative to state transitions:
+
+[cols="1,3",options="header"]
+|===
+|Stage |Durable operator artifact
+
+|`_prepare_repository` (repo setup, baseline commit) |*before* the guarded
+region; a failure here writes no `proof-summary.json`
+|`register_checkout` |*before* the guarded region; a failure here writes no
+`proof-summary.json`
+|`run_real_one_hop`: dispatch publication, process spawn, completion,
+validation, reconciliation |performed by Slice-4A; writes `run.json`,
+`dispatch.json`, `checkpoint.json` into `trusted-state/`
+|`_git_facts` + summary dict build |*after* the guarded region; not itself
+wrapped
+|`launch-provenance.json`, then `proof-summary.json` |written last, only after
+the summary dict (including `_git_facts`) is built
+|===
+
+All *three* in-scope outcomes write durable `proof-summary.json`:
+
+* *Authoritative success* -- summary with `final_run_status="completed"`,
+  `hop_used=1`, `dispatch_marker_present=false`, one expected-subject commit
+  (verified by `test_successful_fake_proof_writes_self_contained_durable_evidence`).
+* *Post-spawn unresolved/no-result* -- `run_real_one_hop` returns a
+  `RealHopRun` (no exception); summary with `acceptance="uncertain"`,
+  `final_run_status="reconcile_required"`, `hop_used=1`,
+  `dispatch_marker_present=true`, bounded tails (verified by
+  `test_post_spawn_fake_failure_is_charged_and_diagnosable_with_bounded_tails`).
+* *Pre-spawn executable launch failure* -- `Slice4Error` caught, `operator_error`
+  recorded, `hop_used=0`, `dispatch_marker_present=false` (verified by
+  `test_pre_spawn_failure_writes_summary_without_charging_a_hop`).
+
+*WATCH (S4H-R3).* The operator summary is a post-hoc aggregation. Two realistic
+in-scope gaps exist between an important state transition and the durable
+operator write:
+
+. Setup (`_prepare_repository`, `register_checkout`) runs *outside* the
+  `try/except`. A failure there raises before any `proof-summary.json`. No Hop is
+  charged and no dispatch is published at that point, so the coordinator invariant
+  is intact, but the docstring claim "persist evidence for every outcome" is
+  slightly stronger than the code (setup failures are an exception).
+. `_git_facts` is evaluated while building the summary dict *after* the guarded
+  region and is itself unguarded. A `_git_facts` failure after a charged Hop would
+  lose `proof-summary.json` *and* `launch-provenance.json`. This is
+  low-probability (git on an existing repo with commits) and is *mitigated*: the
+  authoritative coordinator state (`run.json`, `dispatch.json`, `checkpoint.json`)
+  is already written into `trusted-state/` by Slice-4A, so the outcome remains
+  reconstructable from trusted state even without the operator summary.
+
+This is a WATCH, not a correction requirement: section 11.4.1 does not demand
+crash-proofing, and the authoritative state survives. But the summary must not be
+described as strictly atomic per outcome.
+
+=== 3.4 Terminal-disconnect claim (Q4) -- TRUTHFUL (not overclaimed)
+
+The evidence artifact claims only "TERMINAL SCROLLBACK REQUIRED FOR EVIDENCE::
+NO" and "make terminal scrollback unnecessary". It does *not* claim the runner
+survives terminal/session disconnect. That distinction is respected:
+
+* "Scrollback unnecessary" is true for any run that *completes*: all outcome
+  facts land in durable files, not terminal history.
+* The runner is a plain *foreground* process. On session disconnect during the
+  live window it can receive `SIGHUP` and die before writing
+  `proof-summary.json`. The Codex child is launched `start_new_session=True`
+  (Slice-4A), so it is orphaned rather than reaped, but the parent harness does
+  not survive to collect it. Reconstruction then falls back to the pre-spawn
+  `trusted-state/` markers (`run.json`, `dispatch.json`).
+
+Because section 11.4.1 preferred a simple runner over `nohup`/session management
+"unless that complexity is actually required", the foreground runner is
+acceptable and the documentation is honest. No daemon/session requirement is
+added. Recorded as WATCH (S4H-R4): the "scrollback unnecessary" guarantee is
+conditional on run completion; a mid-live-window disconnect still loses the
+operator summary (but not trusted-state markers).
+
+=== 3.5 CLI exit semantics (Q5) -- CLI EXIT NOT TRUTHFUL FOR `reconcile_required`
+
+Traced (no provider): for a post-spawn uncertain outcome (process exits nonzero,
+no valid result, `RealHopRun` returned, `final_run_status="reconcile_required"`),
+`run_real_one_hop` catches `ResultValidationError` and *returns* a `RealHopRun`
+rather than raising. In `run_disposable_proof`, `error` therefore stays `None`.
+`main()` executes `return 0 if result.error is None else 1` and returns *0*.
+
+Confirmed by `test_post_spawn_fake_failure_...`: `result.error is None` while
+`summary["final_run_status"] == "reconcile_required"`.
+
+So the CLI can exit `0` while the proof itself is *unresolved* -- and this is
+precisely the outcome the prior real replacement proof (`ca31a8e0`) actually
+produced (`reconcile_required`, no retry). An operator who gates a script on
+`$?` would read that real-world outcome as success.
+
+Severity: *MINOR* (S4H-R2), not blocking. Rationale: section 11.4.1 explicitly
+makes the *durable artifacts* authoritative ("whose durable artifacts are
+authoritative"), the summary records `reconcile_required` correctly and durably,
+and the exit code is not an authorized signal. A future one-shot live *happy
+path* exits `0` truthfully; a pre-spawn failure exits `1` truthfully; only the
+unresolved path is misleading, and only for a caller trusting the exit code
+instead of the file. It does not make the proof evidence untrustworthy.
+Recommended (not required before authorization): map `reconcile_required` /
+`acceptance != "established"` to a distinct nonzero exit, or document that the
+exit reflects "harness completed" not "proof succeeded".
+
+=== 3.6 Diagnostic persistence (Q6) -- BOUNDED, but "byte" claim untrue
+
+`stdout_tail`/`stderr_tail` are copied from `CodexOutcome.stdout`/`.stderr`,
+which Slice-4A already bounded, are durable in the summary, are available on
+post-spawn failure, and do not depend on terminal history. `test_post_spawn_...`
+proves oversized (20,000-char) tails are truncated.
+
+However the bound is a *character* bound, mislabelled as a *byte* bound
+(S4H-R1). `slice4._bounded` uses `value[-16_384:]` (a string slice = characters);
+`proof_harness._bounded` does the same; the constant is `DIAGNOSTIC_LIMIT_BYTES`,
+the summary field is `diagnostic_limit_bytes`, and the evidence artifact claims
+"16,384-byte tails" and "16 KiB diagnostic tails". The ASCII test
+(`len(str(...).encode()) == DIAGNOSTIC_LIMIT_BYTES`) passes only because ASCII
+chars are one byte each. Demonstrated above: a 16,384-character tail of `ä` is
+32,768 bytes -- double the claimed byte bound. The output is still bounded and
+safe (never unbounded), so this is a truthful-vocabulary/overclaim defect, not a
+resource risk.
+
+Attribution: the underlying character bound is *pre-existing accepted Slice-4A
+behavior* (`slice4._bounded`, neutral `limit`). The *misnomer and the "byte"
+claim* are *new to this harness/evidence* (the `_BYTES` name, the
+`diagnostic_limit_bytes` field, the "16 KiB"/"byte" wording). No Slice-4A
+runtime defect is reopened.
+
+=== 3.7 Diagnostic security (Q7) -- NO MATERIAL EXPOSURE
+
+Persisting bounded raw stdout/stderr tails is *explicitly authorized* by section
+11.4.1 ("bounded stdout/stderr tails"). The context is a disposable, no-remote,
+fresh repository and disjoint trusted state; the environment is not dumped, argv
+is not dumped, and only bounded tails are retained. No project convention
+requires sanitization of these authorized tails. Risk is low and authorized; no
+correction is required. WATCH-only observation: an operator should treat the
+disposable proof root as disposable and not archive it into a shared location
+without a glance, but this is not a harness defect.
+
+=== 3.8 Launch provenance (Q8) -- ADEQUATE, appropriately weak
+
+`collect_launch_provenance()`:
+
+* bounds ancestry to `ANCESTOR_LIMIT = 8` records;
+* traverses PPID correctly: `/proc/<pid>/stat` parsed as
+  `rsplit(") ", 1)[1].split()` then field index `1` is PPID (robust to spaces in
+  `comm`);
+* records truthful process names from `/proc/<pid>/comm`;
+* records *no* argv (`argv_recorded: false`);
+* records *no* environment values (`environment_values_recorded: false`), only
+  three boolean presence hints (`codex_related`, `claude_related`,
+  `openai_related`);
+* bounds every field.
+
+The `scope` string honestly states "bounded host/operator launch context; not
+cryptographic attestation", and the presence booleans are correctly weak hints,
+not proof of nesting. `test_provenance_is_bounded_and_never_records_environment_values`
+proves the ancestry chain, the presence hint, and that a `SECRET_TOKEN` value is
+never rendered. This is sufficient for a future reviewer to distinguish an
+ordinary host/operator launch from a visibly agent/provider-nested launch
+without overclaiming.
+
+=== 3.9 Disposable fixture truth (Q9) -- VERIFIED
+
+`run_disposable_proof` establishes: fresh proof root (rejects an existing path);
+fresh disposable Git repo via `git init`; no remote (never added, summary reports
+`remotes`); only tracked `PROOF.md`; deterministic baseline commit
+("docs(workflow): WFC-S4-PROOF baseline"); fresh checkout association via
+`register_checkout` (which enforces a disjoint external state root); fresh
+`run_id`/`invocation_id` (`uuid4`); `WORK_ITEM_ID = "WFC-S4-PROOF"`; `H001`;
+`max_autonomous_hops=1` (`WorkItem(..., 1)` -> `hop_limit=1`, mechanically
+preventing a second invocation); and fixed `EXPECTED_SUBJECT`. The task/result
+contract routes through the accepted `run_real_one_hop` boundary unchanged.
+
+Minor cosmetic note (not a finding): `WorkItem.repository` is the label
+`"disposable-proof"` rather than the concrete path; execution is unaffected
+because `run_real_one_hop` receives the real `repository` explicitly.
+
+=== 3.10 Git / result / run summary (Q10) -- FACTS, sufficient
+
+`proof-summary.json` reports observed facts, not agent claims: `actual_commits`,
+`actual_commit_subjects`, `changed_paths`, `tracked_paths`, `initial_head`,
+`final_head`, `actual_commit_range`, `git_status`, `remotes`, `git_lock_paths`,
+`proof_md_final_content`, `process_returncode`, `timed_out`, `acceptance`,
+`vertical_success`, `final_run_status`, `hop_used`, `stop_reason`,
+`dispatch_marker_present`, and `unexpected_mutation_or_anomaly_facts`. It records
+both `expected_commit_subject` and `actual_commit_subjects`, letting a reviewer
+compare rather than trust a self-asserted match. This is sufficient for
+independent future disposition. Minor: `hop_id` is emitted as the fixed constant
+`"H001"` (an expectation) rather than the observed marker/run hop id; harmless at
+N=1 but it is a stated expectation, not an observed fact. WATCH-level only.
+
+=== 3.11 Failure semantics (Q11) -- PRESERVED
+
+The harness preserves, and does not override, the accepted invariants:
+
+* *Pre-spawn local failure* -> no Hop charged (`hop_used=0`), dispatch removed
+  (`dispatch_path.unlink` when `adapter.outcome is None`), summary written.
+* *Post-spawn unresolved* -> one Hop charged (`hop_used=1`), dispatch retained,
+  `reconcile_required`.
+* *Authoritative success* -> `completed` durable, dispatch retired.
+
+All three are asserted by the fake-executable tests and match Slice-4A behavior.
+
+=== 3.12 Test adequacy (Q12) -- ADEQUATE
+
+The four fake-executable tests prove behavioral substance, not line coverage:
+successful real-adapter composition with the expected mutation/commit/result and
+retired dispatch; post-spawn uncertainty with charged Hop, retained dispatch, and
+durable bounded diagnostics; diagnostic bounding (oversized tail truncated);
+pre-spawn failure with no Hop and no retained marker; and provenance
+privacy/bounding. Gap (tied to S4H-R1): no non-ASCII diagnostic test, so the
+`byte`-labelled bound is only exercised for ASCII, where characters equal bytes,
+which is why the misnomer passes CI. Adding a non-ASCII tail test would expose
+the labelling defect. This is a test-completeness observation, not a blocker.
+
+== 4. Human readability
+
+Applying `docs/developer_guide/ch06_code_conventions/03_human_readability_review.adoc`
+(provisional, non-binding), a future maintainer can reconstruct fixture creation,
+the authority boundary, execution, evidence capture, and final disposition from
+the module and its evidence artifact without undue archaeology. The module
+docstring correctly states it is not a second coordinator and grants no live
+authorization.
+
+Two truthful-vocabulary / reconstruction notes:
+
+* *Truthful vocabulary (S4H-R1).* `DIAGNOSTIC_LIMIT_BYTES` /
+  `diagnostic_limit_bytes` name a character bound as a byte bound; the guide's
+  "names should state current semantics" applies. Rename to a character/tail
+  bound (or actually bound bytes) and align the evidence wording.
+* *Reconstruction cost (S4H-R5, WATCH).* `WorkItem`, `RepositoryPolicy`,
+  `PromptComponent`, and `DispatchMarker` are built with long positional argument
+  lists (e.g. lines 189-193), forcing the reader to count positions against the
+  dataclass definition. Keyword arguments would reduce that reconstruction cost.
+  Per the guide this is a contextual signal, not a mandated change.
+
+Neither note requires abstraction merely to reduce LOC.
+
+== 5. Findings
+
+[cols="1,1,4,2",options="header"]
+|===
+|ID |Priority |Finding |Recommended action
+
+|S4H-R1 |MINOR |Character bound mislabelled as a byte bound: `DIAGNOSTIC_LIMIT_BYTES`,
+summary field `diagnostic_limit_bytes`, and evidence "16,384-byte"/"16 KiB"
+tails. A 16,384-char non-ASCII tail is up to ~65 KiB. Output is still bounded and
+safe; the misnomer/overclaim is new to the harness (underlying char bound is
+accepted Slice-4A behavior). |Rename to a character/tail bound (or bound encoded
+bytes), align the evidence wording, add a non-ASCII tail test. Read-only review:
+recorded, not fixed.
+
+|S4H-R2 |MINOR |CLI `main()` returns exit `0` for a post-spawn
+`reconcile_required` (unresolved) proof, because that path returns a `RealHopRun`
+with `error=None`. Shell-level success can falsely signal proof success for
+exactly the outcome the prior real proof produced. Durable summary remains
+authoritative and correct. |Optionally map non-`established`/`reconcile_required`
+to a distinct nonzero exit, or document that exit reflects "harness completed",
+not "proof succeeded". Not required before authorization.
+
+|S4H-R3 |WATCH |Operator summary is a post-hoc aggregation: setup runs outside
+the guarded region and `_git_facts` is unguarded, so a setup failure or a rare
+`_git_facts` failure after a charged Hop yields no `proof-summary.json`.
+Mitigated: trusted-state `run.json`/`dispatch.json`/`checkpoint.json` survive.
+Docstring "persist evidence for every outcome" is slightly stronger than the
+code. |Optionally guard the summary write / write provenance earlier, and soften
+the "every outcome" wording. No crash-proofing demanded.
+
+|S4H-R4 |WATCH |"Terminal scrollback unnecessary" holds only for completed runs;
+the foreground runner does not survive a mid-live-window session disconnect, so
+that window still loses the operator summary (trusted-state markers survive). Not
+overclaimed by the evidence. |None required; simple runner is authorized. Keep
+the claim scoped to completed runs.
+
+|S4H-R5 |WATCH |Long positional dataclass construction (`WorkItem`,
+`RepositoryPolicy`, `PromptComponent`, `DispatchMarker`) raises local
+reconstruction cost. |Prefer keyword arguments. Non-binding readability signal.
+|===
+
+No new BLOCKING or IMPORTANT findings. No historical `S4A-R*` finding is reopened
+(no direct regression found).
+
+== 6. Verdict
+
+*A. ACCEPT -- SLICE-4A PROOF HARNESS VERIFIED; READY FOR MAINTAINER
+LIVE-HAPPY-PATH AUTHORIZATION DECISION.*
+
+The harness is a genuine thin composition/fixture/evidence layer over the
+accepted Slice-4A APIs; it does not become a second coordinator. Durable
+operator evidence exists for authoritative success, post-spawn unresolved, and
+pre-spawn launch failure. The disposable fixture is fresh and disjoint, the
+accepted Slice-4A runtime semantics and failure invariants are preserved, launch
+provenance is bounded/private/appropriately weak, diagnostics are bounded and
+terminal-independent, and the fake-executable tests are behaviorally adequate.
+
+The residuals are bounded MINOR/WATCH items that do not make a future one-shot
+live proof untrustworthy: the durable `proof-summary.json` -- the artifact the
+authority designates as authoritative -- records every in-scope outcome
+correctly, including `reconcile_required`. S4H-R1 (byte/char label) and S4H-R2
+(exit code for the unresolved path) are truthfulness refinements worth applying
+but do not corrupt the durable proof record and do not gate the live *happy-path*
+authorization decision, which remains a separate maintainer gate.
+
+== 7. Lifecycle cleanup check
+
+Not applicable as a workstream-green declaration. This review does not declare
+`FTR-AGENT-WORKFLOW-COORDINATOR-P5` complete: section 11.4's happy-path
+`WFC-OUTPUT` live proof remains unproven, the FTR remains an active backlog item,
+and no live authorization exists or is granted here. No FTR status change, no
+`_ftrs_open.adoc` include removal, and no cold-storage move is warranted. Residual
+scope (the future live happy-path proof, and the deferred
+authorization-consumption capability noted in 11.4.1) stays open under the
+existing FTR; no follow-up FTR is required by this review.
+
+== 8. Release notes checkpoint
+
+No release note required. The proof harness is developer tooling under
+`scripts/workflow_coordinator/` (per WFC placement rules, explicitly not
+`src/spreadsheet_handling/`); it changes no user-facing behavior, public
+CLI/YAML/config, package/import/plugin surface, demo behavior, or migration
+semantics, and adds/changes no *Known limitations*.
+
+== 9. Final report
+
+[source,text]
+----
+THIN HARNESS / NO SECOND COORDINATOR:                        YES
+SHORT FILE-BASED OPERATOR CONTRACT:                          YES
+TERMINAL SCROLLBACK REQUIRED:                                NO
+SESSION-DISCONNECT SURVIVAL CLAIM:                           NOT CLAIMED
+DURABLE SUCCESS EVIDENCE:                                    YES
+DURABLE POST-SPAWN FAILURE EVIDENCE:                         YES
+DURABLE PRE-SPAWN FAILURE EVIDENCE:                          YES
+CLI EXIT STATUS TRUTHFUL FOR RECONCILE_REQUIRED:            NO
+BOUNDED STDOUT/STDERR VERIFIED:                              YES
+BYTE-BOUND SEMANTICS TRUTHFUL:                               NO
+DIAGNOSTIC SECRET EXPOSURE ISSUE:                            NONE
+HOST/ANCESTOR PROVENANCE ADEQUATE:                           YES
+ENVIRONMENT VALUES RECORDED:                                 NO
+FULL ARGV RECORDED:                                          NO
+FRESH DISPOSABLE FIXTURE VERIFIED:                           YES
+ACCEPTED SLICE-4A SEMANTICS PRESERVED:                       YES
+FAKE-EXECUTABLE TESTS ADEQUATE:                              YES
+NEW BLOCKING FINDINGS:                                       NONE
+NEW IMPORTANT FINDINGS:                                      NONE
+NEW MINOR/WATCH FINDINGS:                                    S4H-R1, S4H-R2, S4H-R3, S4H-R4, S4H-R5
+REAL CODEX/PROVIDER INVOCATIONS PERFORMED:                   0
+NEW LIVE INVOCATION AUTHORIZED:                              NO
+REVIEW VERDICT:                                              A
+READY FOR MAINTAINER LIVE-HAPPY-PATH AUTHORIZATION DECISION: YES
+----
