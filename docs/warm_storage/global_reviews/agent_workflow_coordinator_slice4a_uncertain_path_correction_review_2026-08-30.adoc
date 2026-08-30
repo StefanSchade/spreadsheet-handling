@@ -1,0 +1,142 @@
+= Agent Workflow Coordinator -- Slice 4A Uncertain-Path Correction Bounded Re-Review
+:toc:
+
+Status:: *MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION. R3/R4 UNCERTAIN-RECOVERY MECHANICS CLOSED, BUT TWO DIRECT DISPATCH-MARKER-LIFECYCLE REGRESSIONS OPEN A REAL ACCOUNTING/RESUME HOLE. NO CODEX/PROVIDER INVOCATION PERFORMED. NO NEW LIVE INVOCATION AUTHORIZED.*
+Date:: 2026-08-30
+Reviewer context:: Same independent reviewer that authored `5daeaa46`. Final bounded re-review of the remaining Slice-4A correction, read-only.
+Correction under review:: `dd3d73d1` -- `fix(workflow): wire slice 4a uncertain recovery`.
+Evidence:: `fdbb8dbd` -- `docs(workflow): record slice 4a uncertain recovery evidence`.
+Baseline:: `fdbb8dbd` (HEAD). Known unrelated worktree modification `tools/repo_snapshot_multi.sh` left untouched and unstaged.
+Scope:: Only S4A-R3, S4A-R4, and *direct* regressions introduced by `dd3d73d1`. R1/R2/R5/R6/R7 not reopened (no direct regression found in them). No broad re-review; no Slice-4B design; no live-proof authorization.
+Provider invocation:: *None.*
+
+== Verdict
+
+*(B) MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION.*
+
+The post-spawn uncertain-recovery mechanics that S4A-R3/R4 required are now genuinely committed and deterministically proven: a real process that starts and yields no valid result is charged exactly one Hop, Git is independently observed, the Run enters `reconcile_required` with an explicit-resume stop, external anchors are persisted, and no retry occurs. On those mechanics R3 and R4 are closed.
+
+However, `dd3d73d1` introduces the dispatch-marker publication into `run_real_one_hop` for the first time, and its *lifecycle* has two direct regressions that create a real accounting/resume hole -- exactly the class the review bound says forces (B):
+
+* *S4A-R8 (BLOCKING, marker timing)* -- the in-progress marker is published *before* `run_one_hop`'s own pre-spawn work (repeated preflight, prompt assembly). A deterministic local failure there (e.g. `assemble_prompt` raising `ValueError`, or the inner `preflight_hop` raising `VerticalRunError`) is neither `Slice4Error` nor `ResultValidationError`, so it escapes uncaught and *leaves the marker on disk* for a process that never started -- a phantom Hop on restart, violating WFC-AUTO-03.
+* *S4A-R9 (BLOCKING, marker retirement)* -- the success path never retires `dispatch.json`, so a fully reduced completed Run retains a stale in-progress anchor; the committed `recover_uncertain_dispatch` forces `reconcile_required` whenever a correlated marker is present, so restart would spuriously reconcile completed work.
+
+Per the bound ("If dispatch timing or stale-marker retirement creates a real resume/accounting hole, choose B even if original R3/R4 mechanics are otherwise closed"), the verdict is (B). Both fixes are deterministic and need no live invocation.
+
+== S4A-R3 -- post-spawn uncertain recovery & Git reality -- CLOSED (mechanics)
+
+*One committed end-to-end path.* `run_real_one_hop` (slice4.py:210) now: takes `hop_id`; runs pre-spawn `preflight_hop` and `validate_checkout` (no marker yet); publishes `run.json` + `dispatch.json`; runs the sole accepted `vertical.run_one_hop`; and on the adapter's `ResultValidationError` *with an outcome present* (`adapter.outcome is not None`), independently observes Git and routes through `recover_uncertain_dispatch` -> `require_reconcile` -> `checkpoint_projection`, persisting `run.json` + `checkpoint.json` and returning an unreduced `RealHopRun`.
+
+*Git reality authoritative.* The recovery calls `observe_hop(repository, base_head=run.current_head, allowed_paths=phase.authorized_scope)` with *no* claimed commits, so actual end HEAD, actual commits, and anomalies come from independent observation, not from any agent/result claim (there is no valid result). `delta.anomalies` are appended to the recovered Run. No reset/revert/cleanup occurs.
+
+*Applies to the required cases without inventing acceptance semantics.* Any invalid outcome yields `CodexOutcome.result is None`, so `_CodexAdapter.invoke` raises the same `ResultValidationError`, driving the same recovery for nonzero/no-result, malformed result, uncorrelated result, and timeout (empty transport file). The deterministic no-result fake-executable test stands as the representative end-to-end proof because the other cases reduce through the identical mechanism.
+
+`test_real_driver_recovers_post_spawn_uncertainty_with_external_anchors` proves: `vertical is None`; `hop_used == 1`; `status == reconcile_required`; `stop_reason == reconcile_requires_explicit_resume`; checkpoint status `reconcile_required`; exactly one fake execution (`executions == "1"`, no retry); `PROOF.md` and HEAD unchanged; `dispatch.json`, `run.json`, `checkpoint.json` present.
+
+*Disposition:* the R3 uncertain-recovery mechanic and its Git reality are *CLOSED*. (Marker-lifecycle regressions are recorded separately below.)
+
+== S4A-R4 -- deterministic closure -- CLOSED (for the R3 mechanic)
+
+* `test_real_driver_recovers_post_spawn_uncertainty_with_external_anchors` drives `run_real_one_hop` and proves: one fake execution only; one Hop charged; unchanged HEAD in the no-mutation fixture; `reconcile_required`; explicit-resume stop; external `dispatch/run/checkpoint` anchors; no retry.
+* `test_real_driver_preserves_no_hop_for_unlaunchable_executable` proves the *launch-failure* pre-spawn path: `Slice4Error` (match `pre-acceptance`), `hop_used == 0`, and no residual `dispatch.json`.
+
+Both required tests exist and pass. *CLOSED* for the R3 mechanic. (The pre-spawn coverage gap for the *non-`Slice4Error`* failure classes is recorded under S4A-R8, not as an R4 reopen.)
+
+== Direct regressions introduced by `dd3d73d1`
+
+=== S4A-R8 -- BLOCKING -- dispatch marker published too early (pre-spawn failures leave a phantom-Hop anchor)
+
+*Violated authority.* WFC-AUTO-03 ("Local failure before adapter/provider acceptance, ... prompt assembly ... do not consume Hops"); WFC-AUTO-02 ("once the atomic dispatch marker exists, acceptance that cannot be disproved is conservatively charged"); WFC-FAIL-04 (marker published *before invocation*).
+
+*Mechanism.* `run_real_one_hop` writes `dispatch.json` at slice4.py:228, then calls `run_one_hop`, which performs its *own* pre-spawn work before the real `Popen`: `phase = profile.phases[run.phase]`, a repeated `preflight_hop` (`vertical.py`, raising `VerticalRunError` on `GitPreflightError`), and `assemble_prompt` (`prompt.py:97`, raising `ValueError("selected prompt component is unavailable: ...")`). `run_real_one_hop` catches only `Slice4Error` (unlink + reraise) and `ResultValidationError` (recover). A `ValueError` from prompt assembly, a `VerticalRunError` from the inner preflight, or a `KeyError` from a missing phase is none of those, so it escapes uncaught with `dispatch.json` still on disk -- for a process that never started. On restart, `recover_uncertain_dispatch` treats the correlated marker as an uncertain invocation and charges one phantom Hop plus `reconcile_required`. A misconfigured profile (a phase selecting an unprovided component) triggers this every run; it is not a contrived race.
+
+*Failure scenario.* A phase selects a component absent from `components` -> `assemble_prompt` raises `ValueError` after the marker is written -> `run_real_one_hop` does not catch it -> `dispatch.json` remains -> next restart charges H001 as an uncertain Hop although no Codex process ever spawned.
+
+*Smallest correction.* Classify by *factual execution state*, not exception class: replace the two narrow `except` clauses with one that inspects `adapter.outcome`. If `adapter.outcome is None` (no `CodexOutcome` was ever produced, i.e. nothing spawned), `dispatch_path.unlink(missing_ok=True)` and re-raise (no Hop); only when `adapter.outcome is not None` with an invalid result run the uncertain recovery. `invoke_codex` returns a `CodexOutcome` whenever `Popen` succeeded (it never re-raises post-spawn), so `adapter.outcome is None` reliably marks pre-spawn/local failure. Add a deterministic test forcing a post-marker pre-spawn failure (e.g. a phase selecting a missing component) and assert no residual `dispatch.json` and `hop_used == 0`.
+
+*Live invocation needed to close:* No.
+
+=== S4A-R9 -- BLOCKING -- successful Hop never retires the in-progress dispatch marker
+
+*Violated authority.* WFC-PERSIST-01 (the dispatch/in-progress marker is a *trusted resume anchor*); WFC-AUTO-02 marker semantics; WFC-PERSIST-06 (atomic publication and correlation of resume-advancing state).
+
+*Mechanism.* The success branch (slice4.py:257-259) atomically writes the completed `run.json` and `checkpoint.json` but does not remove `dispatch.json`; the only `unlink` is in the `Slice4Error` branch (:239). A fully reduced, completed Run therefore retains an in-progress dispatch anchor. The committed consumer `recover_uncertain_dispatch` (`persistence.py`), given a present correlated marker whose Hop already exists in the completed snapshot, does not double-charge (it matches `existing.sequence`) but still returns `require_reconcile(..., reason="interruption")`, forcing `reconcile_required`. So any restart/resume path built on the accepted anchor semantics would spuriously reconcile a completed Run. The persisted state is itself untruthful: completed work carrying an "in-progress" anchor.
+
+*Failure scenario.* `run_real_one_hop` completes successfully (Run `completed`, H001 reduced), `dispatch.json` remains; a later restart observes the correlated in-progress marker and forces the completed Run into `reconcile_required` instead of recognizing accepted completion.
+
+*Smallest correction (crash-safe).* On the success path, after atomically writing the completed `run.json` and `checkpoint.json`, retire the marker: `dispatch_path.unlink(missing_ok=True)`. Ordering is crash-safe: the durable completed snapshot is the authority before removal; a crash in the residual gap leaves a marker whose Hop already exists in the completed snapshot (no double-charge; the only residual is the pre-existing `recover_uncertain_dispatch` "reconcile a completed Hop" behavior, which is out of this bounded scope and fails safe toward a human). Add a deterministic test asserting `dispatch.json` does not exist after a successful `run_real_one_hop`. No event log or additional persistence machinery is required.
+
+*Live invocation needed to close:* No.
+
+== Pre-spawn vs post-spawn classification (section 6)
+
+The recovery branch already keys on factual state (`adapter.outcome is None -> raise`, else recover), which is correct. The defect (S4A-R8) is that the *outer* dispatch is still by exception *class*, so a truthful pre-spawn failure whose Python type is not `Slice4Error` is neither cleaned up nor recovered. The prescribed S4A-R8 fix generalizes the existing factual discriminator to all failures, keeping classification truthful without a generic exception taxonomy.
+
+== RealHopRun truthfulness (section 7)
+
+`RealHopRun` truthfully represents both outcomes. Success: `RealHopRun(vertical, vertical.reduction.run, vertical.checkpoint, outcome)`, with `.reduction` returning the real `VerticalRun.reduction`. Uncertain: `RealHopRun(None, recovered, checkpoint, outcome)`, with `.reduction` returning `None` -- no fabricated `RoutingResult`, no false reduction; `recovered` is the `require_reconcile` Run (`reconcile_required`, one charged uncertain Hop) and the checkpoint reflects it. The small dataclass + `reduction` property wraps the existing `VerticalRun`/`Run` and does not create a second coordinator contract. *Sound.*
+
+== Direct regression check (other)
+
+* R1/R2/R5/R6/R7: no direct regression -- `_require_external_state_root`, `validated_result`-gated acceptance, the FTR marker, the broad-but-guarded transport schema, and symmetric containment are unchanged by `dd3d73d1`.
+* `DispatchMarker(1, run.run_id, hop_id, run.hop_used + 1, invocation_id, run.current_head, 1)` matches the model field order (`schema_version, run_id, hop_id, sequence, invocation_id, base_head, budget_reserved`); `budget_reserved == 1` and `base_head == run.current_head` satisfy `recover_uncertain_dispatch` preconditions. Correct.
+* No retry path introduced; no Slice-4B/bwrap/commit-broker/event-store scaffolding introduced.
+
+== First live failure remains factual evidence
+
+Unchanged and unrelitigated: one live invocation consumed; nested-Codex environment non-representative; app-server init failed read-only; no repository mutation; no result; no Git lock; uncertain conservatively charged; `reconcile_required`; no retry. No new live invocation occurred in this correction.
+
+== Lifecycle cleanup check
+
+Not a green-closure review. `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains *Open* and active. Coarse lifecycle truth unchanged: Slices 1--3 accepted; the single disposable proof consumed and failed pre-mutation; routine use, Slice 5, autonomous multi-Hop, and DMC Cycle 2 unauthorized. No FTR status change, backlog include removal, or cold-storage movement is warranted. WFC-LIFE-01/02 closure remains a future obligation.
+
+== Project Memory
+
+No Project Memory update. Per WFC-PM-03, individual re-reviews are not routine PM events, and coarse lifecycle truth has not changed. This bounded disposition is durably recorded by this artifact.
+
+== Release-notes checkpoint
+
+No release note required. Internal developer tooling under `scripts/workflow_coordinator/`; no public CLI/YAML, package/import, plugin, demo, spreadsheet, or migration surface changes. Matches the FTR section-14 internal-tooling disposition.
+
+== Validation (read-only; no provider invocation)
+
+[source,text]
+----
+git rev-parse HEAD                                              # fdbb8dbd (expected baseline)
+.venv/bin/pytest -q tests/unit/workflow_coordinator            # 92 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed
+asciidoctor -o /dev/null <this artifact>                       # renders without error
+git diff --check <review commit>                               # no whitespace errors
+git status --short                                             # only known unrelated tools/repo_snapshot_multi.sh (unstaged)
+----
+
+== Residual risks
+
+* S4A-R8/R9 remain open: a phantom Hop from a retained marker after a pre-spawn local failure, and a spurious reconcile of a completed Run from an unretired success marker; both closable without a live invocation via the prescribed fixes + tests.
+* After that correction, a new disposable proof additionally requires a *non-nested* host (nested-Codex read-only failure unresolved for that environment; out of scope here).
+* Option A's full `.git` authority for routine use remains out of scope (a Git-ownership decision).
+
+None of these authorizes Slice 4, routine use, or any live invocation.
+
+== Final report
+
+[cols="2,1",options="header"]
+|===
+|Question |Answer
+
+|S4A-R3 CLOSED |YES (uncertain-recovery mechanics)
+|S4A-R4 CLOSED |YES (for the R3 mechanic)
+|POST-SPAWN UNCERTAIN RECOVERY SOUND |YES
+|UNCERTAIN GIT REALITY AUTHORITATIVE |YES
+|PRE-SPAWN LOCAL FAILURE REMAINS NO-HOP |NO (S4A-R8: non-`Slice4Error` pre-spawn failures leave the marker)
+|DISPATCH MARKER TIMING SOUND |NO (S4A-R8)
+|SUCCESSFUL DISPATCH MARKER LIFECYCLE SOUND |NO (S4A-R9)
+|REALHOPRUN SEMANTICS SOUND |YES
+|DIRECT REGRESSION FOUND |YES (S4A-R8, S4A-R9)
+|REAL CODEX/PROVIDER INVOCATIONS PERFORMED |0
+|NEW LIVE INVOCATION AUTHORIZED |NO
+|===
+
+REVIEW VERDICT:: *(B) MATERIAL CORRECTION STILL REQUIRED BEFORE NEW PROOF AUTHORIZATION* -- close S4A-R8 (classify pre/post-spawn by `adapter.outcome`; remove the marker on every pre-spawn failure) and S4A-R9 (retire `dispatch.json` after the atomic successful snapshot/checkpoint), each with one deterministic test. No live retry.
+
+READY FOR MAINTAINER REPLACEMENT-PROOF AUTHORIZATION DECISION:: NO.
