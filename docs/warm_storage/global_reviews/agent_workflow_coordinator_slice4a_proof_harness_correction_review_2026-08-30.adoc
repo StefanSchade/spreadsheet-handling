@@ -1,0 +1,168 @@
+= Agent Workflow Coordinator -- Slice 4A Proof-Harness Correction Re-Review (S4H-R1/R2)
+:toc:
+:toclevels: 2
+
+Status:: *BOUNDED RE-REVIEW -- READ-ONLY. NO LIVE CODEX/PROVIDER INVOCATION.
+FAKE/DETERMINISTIC VALIDATION ONLY.*
+Date:: 2026-08-30
+Scope:: Closure of `S4H-R1` and `S4H-R2` only, plus direct regressions from
+`0b950dc4`. `S4H-R3/R4/R5` remain WATCH residuals and are not reopened;
+`S4A-R1..R9` are not reopened.
+Baseline reviewed:: `eb5a5037` -- `docs(workflow): record slice 4a proof harness
+correction`.
+Correction implementation:: `0b950dc4` -- `fix(workflow): correct slice 4a proof
+harness truthfulness`.
+Original review:: `8cea13df` -- `docs(workflow): review slice 4a proof harness`.
+
+== 1. Method
+
+Read-only inspection of the full `0b950dc4` diff (`proof_harness.py`,
+`test_proof_harness.py`, and the evidence artifact), deterministic fake-executable
+tracing of the success / uncertain / pre-spawn exit paths, and a stale-wording
+search over the harness surfaces. No corrections were implemented, no FTR /
+architecture / Project Memory edits were made, and no provider was invoked.
+
+== 2. Validation performed
+
+[source,text]
+----
+.venv/bin/pytest -q tests/unit/workflow_coordinator            # 97 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed
+git diff --check                                               # clean
+grep -rniE "byte|kib|_BYTES|limit_bytes" <harness .py + test + evidence>  # no matches
+git show 0b950dc4 --name-only  # slice4.py NOT present -> Slice-4A runtime untouched
+----
+
+Independent fake-executable trace (no provider):
+
+[source,text]
+----
+[SUCCESS]   exit=0 error=None vertical=True  acceptance=established run_status=completed        hop_used=1 dispatch=False
+[UNCERTAIN] exit=1 error=None vertical=False acceptance=uncertain  run_status=reconcile_required hop_used=1 dispatch=True
+[PRE-SPAWN] exit=1 error_present=True                              hop_used=0                   dispatch=False
+----
+
+== 3. S4H-R1 -- character-bound terminology -- CLOSED
+
+The correction aligns harness terminology with the actual (pre-existing)
+character-bounding semantics:
+
+* constant renamed `DIAGNOSTIC_LIMIT_BYTES` -> `DIAGNOSTIC_LIMIT_CHARS`;
+* summary field renamed `diagnostic_limit_bytes` -> `diagnostic_limit_chars`;
+* evidence artifact "16,384-byte tails" -> "16,384-character tails" and "16 KiB
+  diagnostic tails" -> "bounded 16,384-character diagnostic tails".
+
+Confirmed:
+
+* *Slice-4A runtime bounding unchanged.* `slice4.py` is not in the `0b950dc4`
+  diff; `slice4._bounded` (the accepted character slice `value[-16_384:]`) is
+  untouched. `proof_harness._bounded` still performs the same character slice,
+  now truthfully named. No accepted Slice-4A behavior was changed or reopened.
+* *No false byte/KiB claim remains.* A grep for `byte`/`kib`/`_BYTES`/
+  `limit_bytes` across `proof_harness.py`, `test_proof_harness.py`, and the
+  evidence artifact returns no matches.
+* *Non-ASCII deterministic test proves the character contract.* The post-spawn
+  test now emits `ä`*20000 / `ß`*20000 and asserts
+  `len(str(tail)) == DIAGNOSTIC_LIMIT_CHARS` (exactly 16,384 characters) *and*
+  `len(str(tail).encode()) > DIAGNOSTIC_LIMIT_CHARS` (bytes exceed the character
+  count) -- directly proving the bound is characters, not bytes. It also asserts
+  `summary["diagnostic_limit_chars"] == DIAGNOSTIC_LIMIT_CHARS`.
+* *Diagnostics remain bounded and durable.* Tails are still truncated and
+  persisted in `proof-summary.json`; `proof_md_final_content` still round-trips.
+* *No new ambiguity.* Constant, summary field, test, and evidence wording are now
+  consistently "character/chars". No inconsistent naming was introduced.
+
+`S4H-R1` is closed.
+
+== 4. S4H-R2 -- operator exit semantics -- CLOSED
+
+`proof_exit_status(result)` returns `0` only when the proof is an established,
+completed Hop:
+
+[source,python]
+----
+result.error is None
+and real_hop is not None
+and real_hop.vertical is not None
+and real_hop.outcome is not None
+and real_hop.outcome.acceptance == "established"
+and real_hop.run.status.value == "completed"
+----
+
+otherwise `1`; `main()` now returns `proof_exit_status(result)`.
+
+Traced (fake, no provider), matching the required operator semantics:
+
+* *Authoritative success* -> `vertical` present, `acceptance=established`,
+  `run_status=completed` -> exit *0*.
+* *Post-spawn uncertain / `reconcile_required`* -> `vertical` is `None`
+  (short-circuits before the `acceptance` check) -> exit *1*, while the durable
+  summary still records `reconcile_required`, `hop_used=1`, retained dispatch.
+* *Pre-spawn / local failure* -> `result.error` set -> exit *1*, durable summary
+  with `hop_used=0`, no retained marker.
+
+Confirmed this is *only* an operator signal:
+
+* *Durable files remain authoritative.* The summary/provenance write path is
+  unchanged (apart from the field rename); the exit code is derived read-only from
+  the already-computed `ProofHarnessResult`.
+* *Coordinator Run/reducer/result semantics unchanged.* In the uncertain path
+  `result.error` is still `None`; the nonzero exit comes from inspecting
+  `vertical`/`acceptance`/`run.status`, not from altering the reducer, the
+  recovered Run, or `error`. `slice4.py` is untouched.
+* *No retry behavior added.* `run_disposable_proof` still runs exactly one Hop;
+  `proof_exit_status` performs no execution.
+* *No new route/authority semantics.* The helper only maps an existing outcome to
+  a shell code.
+
+`S4H-R2` is closed.
+
+== 5. Direct regression check -- NONE
+
+* Success path still returns `0` (traced + `test_successful_..._durable_evidence`
+  asserts `proof_exit_status(result) == 0`).
+* `reconcile_required` still persists truthful durable state (`hop_used=1`,
+  retained dispatch, `final_run_status=reconcile_required`).
+* Pre-spawn failure still produces a durable summary with no Hop charge and no
+  retained marker.
+* Summary schema naming matches implementation and evidence
+  (`diagnostic_limit_chars` throughout; evidence wording consistent).
+* Fake tests still exercise the accepted Slice-4A path via `run_real_one_hop`.
+* No live-provider path was added.
+* `S4H-R3/R4/R5` behavior is unaffected: `proof_exit_status` is a pure read that
+  does not touch summary write-ordering (R3), the foreground runner (R4), or
+  dataclass construction (R5).
+
+Full suite: 97 passed; ruff clean; `git diff --check` clean; evidence and this
+artifact render under `asciidoctor`.
+
+== 6. Verdict
+
+*A. ACCEPT -- S4H-R1/R2 CORRECTIONS VERIFIED; PROOF HARNESS READY FOR MAINTAINER
+LIVE-HAPPY-PATH AUTHORIZATION DECISION.*
+
+This re-review does not reinterpret the original A-level harness review; it
+confirms only that `S4H-R1` and `S4H-R2` are closed and that `0b950dc4`
+introduced no direct regression. `S4H-R3/R4/R5` remain the previously recorded
+WATCH residuals.
+
+== 7. Final report
+
+[source,text]
+----
+S4H-R1 CLOSED:                                               YES
+S4H-R2 CLOSED:                                               YES
+CHARACTER-BOUND TERMINOLOGY TRUTHFUL:                        YES
+NON-ASCII REGRESSION TEST ADEQUATE:                          YES
+SUCCESS EXIT ZERO VERIFIED:                                  YES
+RECONCILE_REQUIRED EXIT NONZERO VERIFIED:                    YES
+PRE-SPAWN FAILURE EXIT NONZERO VERIFIED:                     YES
+DURABLE FILES REMAIN AUTHORITATIVE:                          YES
+SLICE-4A RUNTIME SEMANTICS CHANGED:                          NO
+S4H-R3/R4/R5 REOPENED:                                       NO
+DIRECT REGRESSION FOUND:                                     NO
+REAL CODEX/PROVIDER INVOCATIONS PERFORMED:                   0
+NEW LIVE INVOCATION AUTHORIZED:                              NO
+REVIEW VERDICT:                                              A
+READY FOR MAINTAINER LIVE-HAPPY-PATH AUTHORIZATION DECISION: YES
+----
