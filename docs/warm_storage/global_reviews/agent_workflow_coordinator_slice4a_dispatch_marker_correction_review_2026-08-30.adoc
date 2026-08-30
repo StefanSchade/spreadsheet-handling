@@ -1,0 +1,158 @@
+= Agent Workflow Coordinator -- Slice 4A Dispatch-Marker Correction Bounded Re-Review
+:toc:
+
+Status:: *ACCEPT -- S4A-R8/R9 CORRECTION VERIFIED. SLICE 4A IMPLEMENTATION READY FOR MAINTAINER REPLACEMENT-PROOF AUTHORIZATION DECISION. NO CODEX/PROVIDER INVOCATION PERFORMED. NO NEW LIVE INVOCATION AUTHORIZED BY THIS REVIEW.*
+Date:: 2026-08-30
+Reviewer context:: Same independent reviewer that authored `69bd46e2`. Final bounded re-review, read-only.
+Correction under review:: `4aa0859c` -- `fix(workflow): correct slice 4a dispatch lifecycle`.
+Evidence:: `21b392d7` -- `docs(workflow): record slice 4a dispatch correction evidence`.
+Baseline:: `21b392d7` (HEAD). The previously known unrelated `tools/repo_snapshot_multi.sh` modification was maintainer-authorized as disposable and restored to HEAD (`git restore`) before review; the worktree was clean before review work began. No commit was needed for that restore.
+Scope:: Only S4A-R8, S4A-R9, and *direct* regressions introduced by `4aa0859c`. R1--R7 not reopened (no direct regression). No broad re-review; no Slice-4B design; no live-proof authorization.
+Provider invocation:: *None.*
+
+== Verdict
+
+*(A) ACCEPT -- S4A-R8/R9 CORRECTION VERIFIED.*
+
+`4aa0859c` closes both remaining regressions with a small, truthful change to `run_real_one_hop`'s exception handling and success path, plus two deterministic tests. The dispatch marker now obeys the intended three-state lifecycle, classification is by factual execution state (`adapter.outcome`) rather than exception class, and no direct regression was introduced. The Slice-4A implementation is internally coherent and ready for the maintainer's separate replacement-proof authorization decision. This review does not authorize a live proof.
+
+== S4A-R8 -- pre-spawn marker lifecycle -- CLOSED
+
+*Correction.* The narrow `except Slice4Error: unlink; raise` clause is removed and replaced by a general terminal clause, and the pre-spawn discriminator now guards the `ResultValidationError` branch too:
+
+[source,python]
+----
+except ResultValidationError:
+    if adapter.outcome is None:
+        dispatch_path.unlink(missing_ok=True)
+        raise
+    ... uncertain recovery ...
+except Exception:
+    if adapter.outcome is None:
+        dispatch_path.unlink(missing_ok=True)
+    raise
+----
+
+*Verification against the required invariant* (definitely no real process started -> no marker -> no Hop):
+
+. A deterministic local failure after marker publication but before `_CodexAdapter.invoke()`/`Popen` -- e.g. `assemble_prompt` raising `ValueError("selected prompt component is unavailable...")`, the inner `preflight_hop` raising `VerticalRunError`, or a phase `KeyError` inside `run_one_hop` -- is not a `ResultValidationError`, so it reaches `except Exception`; `adapter.outcome is None` (nothing spawned) -> `dispatch_path.unlink(missing_ok=True)`. Marker removed. *Pass.*
+. The original failure is re-raised unchanged by the bare `raise`. *Pass.*
+. No Hop is charged (`run` is untouched; the function raises). *Pass.*
+. No Git mutation is produced (failure precedes `adapter.invoke`). *Pass.*
+. The fake executable is never invoked. *Pass.*
+. Classification is general -- `except Exception` + `adapter.outcome is None` -- not a `ValueError` special case. *Pass.*
+. After a post-spawn outcome exists (`adapter.outcome is not None`), an unexpected non-`ResultValidationError` exception reaches `except Exception`, the `adapter.outcome is None` guard is false, so the marker is *not* removed and the failure re-raises. A started (possibly accepted) invocation therefore keeps its uncertain anchor for restart reconciliation. *Pass.*
+
+`adapter.outcome` is a truthful discriminator: `invoke_codex` returns a `CodexOutcome` whenever `Popen` succeeded (it catches `TimeoutExpired` internally and never re-raises post-spawn), and every `invoke_codex` raise path (`timeout <= 0`, `validate_checkout`, `Popen` `OSError -> Slice4Error`) is pre-spawn, leaving `adapter.outcome is None`. The launch-failure `Slice4Error` path -- formerly served by the deleted `except Slice4Error` clause -- is now correctly subsumed by `except Exception` (outcome `None` -> unlink -> re-raise), so `test_real_driver_preserves_no_hop_for_unlaunchable_executable` still passes.
+
+*Test.* `test_real_driver_cleans_marker_for_local_prompt_failure_before_spawn` provides `components={"testing": ...}` to a profile whose phase also selects the absent `worker` component, forcing `assemble_prompt` to raise `ValueError` after marker publication. It asserts the raise, `not executions.exists()` (fake never ran), `run.hop_used == 0`, absent `dispatch.json`, and unchanged `PROOF.md`. *CLOSED.*
+
+== S4A-R9 -- success marker retirement -- CLOSED
+
+*Correction.* The success path now retires the marker only after completed state is durable, in exactly the required order (slice4.py:259-261):
+
+[source,python]
+----
+write_run_snapshot(run_root / "run.json", vertical.reduction.run)
+atomic_write_json(run_root / "checkpoint.json", vertical.checkpoint)
+dispatch_path.unlink(missing_ok=True)
+----
+
+The in-progress marker is never removed before the completed Run snapshot and checkpoint are durable. Crash-safe: a crash in the residual gap (completed snapshot written, marker not yet removed) leaves a marker whose Hop already exists in the completed snapshot, which `recover_uncertain_dispatch` matches without double-charging. The uncertain branch intentionally retains `dispatch.json` (the invocation is unresolved and requires explicit reconciliation) and does not unlink.
+
+*Tests.* `test_real_vertical_composition_uses_fake_cli_and_existing_reducer` now asserts `not (... / "dispatch.json").exists()` after a successful reduction. `test_real_driver_recovers_post_spawn_uncertainty_with_external_anchors` still asserts `dispatch.json` is present on the uncertain path. *CLOSED.*
+
+== Three-state marker invariant -- VERIFIED
+
+[cols="1,2,2",options="header"]
+|===
+|State |Committed behavior |Proving test
+
+|PRE-SPAWN LOCAL FAILURE
+|`dispatch.json` ABSENT; Hop charged NO
+|`test_real_driver_cleans_marker_for_local_prompt_failure_before_spawn`; `test_real_driver_preserves_no_hop_for_unlaunchable_executable`
+
+|POST-SPAWN UNCERTAIN
+|`dispatch.json` PRESENT; Hop charged YES; `status=reconcile_required`
+|`test_real_driver_recovers_post_spawn_uncertainty_with_external_anchors`
+
+|SUCCESSFULLY REDUCED
+|`dispatch.json` ABSENT; completed Run/checkpoint durable before retirement
+|`test_real_vertical_composition_uses_fake_cli_and_existing_reducer`
+|===
+
+All three states are committed and deterministically proven.
+
+== Direct regression check
+
+* `except Exception` does not swallow or normalize the failure: the branch performs at most an `unlink` and then bare `raise`, re-raising the current exception unchanged. *No regression.*
+* `KeyboardInterrupt`/`SystemExit`/`BaseException` are not caught by `except Exception` (they derive from `BaseException`), so they propagate unconverted; a mid-run interrupt leaves the marker, which restart reconciles conservatively. *No regression.*
+* Post-spawn unexpected failure preserves the marker (`adapter.outcome is not None`). *No regression.*
+* The success path still returns the same truthful `RealHopRun(vertical, vertical.reduction.run, vertical.checkpoint, adapter.outcome)`. *No regression.*
+* Uncertain recovery still uses `observe_hop` / `recover_uncertain_dispatch` / `require_reconcile` unchanged. *No regression.*
+* No retry path; no result-authority change (`validated_result` gating intact); no external-state-boundary change (`_require_external_state_root` intact); no Slice-4B/bwrap/commit-broker scaffolding. *No regression.*
+
+*NEW MATERIAL DIRECT REGRESSION FOUND: NO.*
+
+Non-blocking observation (not introduced by `4aa0859c`, not reopened): if `child.communicate` were to raise a non-`TimeoutExpired` error *after* a successful `Popen`, `adapter.outcome` would stay `None` despite a started process, and `except Exception` would remove the marker. This is an extreme, pre-existing edge of the accepted `adapter.outcome` discriminator (catastrophic `communicate` failures only) and is out of this bounded scope; it fails toward under-charging only in that rare case and does not affect the reviewed correction.
+
+== First live failure remains factual evidence
+
+Unchanged and unrelitigated: one live invocation consumed; nested-Codex environment non-representative; app-server init failed read-only; no repository mutation; no result; no Git lock; uncertain conservatively charged; `reconcile_required`; no retry. No new live invocation occurred in this correction.
+
+== Lifecycle cleanup check
+
+Not a green-closure review of the FTR workstream. `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains *Open* and active: Slice 4A is now implementation-coherent, but the *disposable happy-path proof itself is still unproven* (it requires a separate maintainer authorization and a non-nested execution host), and Slice 5 / routine use remain unauthorized. Coarse lifecycle truth is therefore unchanged: no FTR status change, backlog include removal, or cold-storage movement is warranted. WFC-LIFE-01/02 closure remains a future obligation.
+
+== Project Memory
+
+No Project Memory update. Per WFC-PM-03, individual bounded re-reviews are not routine PM events, and coarse lifecycle truth has not changed (Slices 1--3 accepted; Slice 4A implementation now coherent but its live proof still unproven and unauthorized). This disposition is durably recorded by this artifact; any PM refresh belongs with the next coarse maintainer outcome (the replacement-proof authorization decision).
+
+== Release-notes checkpoint
+
+No release note required. Internal developer tooling under `scripts/workflow_coordinator/`; no public CLI/YAML, package/import, plugin, demo, spreadsheet, or migration surface changes. Matches the FTR section-14 internal-tooling disposition.
+
+== Validation (read-only; no provider invocation)
+
+[source,text]
+----
+git rev-parse HEAD                                              # 21b392d7 (expected baseline)
+git restore -- tools/repo_snapshot_multi.sh ; git status --short  # clean worktree (authorized restore)
+.venv/bin/pytest -q tests/unit/workflow_coordinator            # 93 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed
+git diff --check                                               # clean
+asciidoctor -o /dev/null <this artifact>                       # renders without error
+----
+
+== Residual risks
+
+* The disposable happy-path proof is still unproven; a new attempt requires a separate maintainer authorization and a *non-nested* execution host (the nested-Codex read-only failure is unresolved for that environment; out of scope here).
+* Option A's full `.git` authority for routine use remains out of scope (a Git-ownership decision, not persistence).
+* The pre-existing `adapter.outcome` discriminator edge (catastrophic post-`Popen` `communicate` failure) remains an accepted non-blocking limitation.
+
+None of these authorizes Slice 4 routine use, Slice 5, or any live invocation.
+
+== Final report
+
+[cols="2,1",options="header"]
+|===
+|Question |Answer
+
+|S4A-R8 CLOSED |YES
+|S4A-R9 CLOSED |YES
+|PRE-SPAWN FAILURE MARKER ABSENT |YES
+|PRE-SPAWN FAILURE NO-HOP |YES
+|POST-SPAWN UNCERTAIN MARKER RETAINED |YES
+|POST-SPAWN UNCERTAIN CHARGED |YES
+|SUCCESS MARKER RETIRED |YES
+|SUCCESS STATE DURABLE BEFORE MARKER RETIREMENT |YES
+|THREE-STATE MARKER INVARIANT VERIFIED |YES
+|DIRECT REGRESSION FOUND |NO
+|FOCUSED TESTS GREEN |YES (93 passed)
+|REAL CODEX/PROVIDER INVOCATIONS PERFORMED |0
+|NEW LIVE INVOCATION AUTHORIZED |NO
+|===
+
+REVIEW VERDICT:: *(A) ACCEPT -- S4A-R8/R9 CORRECTION VERIFIED; SLICE 4A IMPLEMENTATION READY FOR MAINTAINER REPLACEMENT-PROOF AUTHORIZATION DECISION.* This review does not itself authorize a live proof.
+
+READY FOR MAINTAINER REPLACEMENT-PROOF AUTHORIZATION DECISION:: YES.
