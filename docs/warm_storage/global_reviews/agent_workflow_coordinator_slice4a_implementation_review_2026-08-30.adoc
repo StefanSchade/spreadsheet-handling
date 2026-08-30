@@ -1,0 +1,214 @@
+= Agent Workflow Coordinator -- Slice 4A Implementation / Failed-Proof Review
+:toc:
+
+Status:: *IMPLEMENTATION CORRECTION REQUIRED BEFORE ANY NEW DISPOSABLE-PROOF AUTHORIZATION. FAILURE-PATH CONTAINMENT VERIFIED. HAPPY PATH UNPROVEN. NO CODEX/PROVIDER INVOCATION PERFORMED. NO NEW LIVE INVOCATION AUTHORIZED.*
+Date:: 2026-08-30
+Reviewer context:: Independent Slice-4A implementation/proof review, read-only. Broader than the prior bounded architecture/readiness passes, but scoped to Slice 4A and its direct Slice-1..3 interactions.
+Implementation under review:: `60c6bf9f` -- `feat(workflow): implement slice 4 real adapter` (`scripts/workflow_coordinator/slice4.py`, `tests/unit/workflow_coordinator/test_slice4.py`).
+Proof evidence under review:: `18fc1d6d` -- `docs(workflow): record slice 4 disposable proof evidence`.
+Baseline:: `18fc1d6d` (HEAD). Known unrelated worktree modification `tools/repo_snapshot_multi.sh` left untouched and unstaged.
+Authoritative inputs read:: FTR-AGENT-WORKFLOW-COORDINATOR-P5; Slice-4 readiness re-review `2026-08-29`; WFC-PERSIST-02 authority-correction review `2026-08-30`; Slice-4 disposable-proof evidence `2026-08-30`; implementation commit `60c6bf9f`; `adapter.py`, `vertical.py`, `persistence.py`, `evidence.py`, `reducer.py`, `git_facts.py`.
+Provider invocation:: *None.* Codex was not invoked; the consumed one-proof authorization is treated as unavailable.
+
+== Verdict
+
+*(A) IMPLEMENTATION CORRECTION REQUIRED BEFORE ANY NEW PROOF AUTHORIZATION.*
+
+The failed `N=1` attempt correctly demonstrated failure-path containment, and that is recorded below as positive Slice-4 evidence. However, two committed defects are reachable without any live invocation:
+
+* *S4A-R1 (BLOCKING)* -- trusted checkout-association state is written inside the agent-writable workspace before the sole external-boundary check runs, violating WFC-PERSIST-02 "verified fail-closed before the first Run write."
+* *S4A-R2 (IMPORTANT)* -- acceptance is established from mere non-empty transport text, conflating transport presence with validated provider acceptance and bypassing the accepted Slice-3 `validated_result()` authority.
+
+Both are deterministic-code corrections; neither needs a live invocation to close. The read-only-filesystem failure is separately assessed as an *experimental-environment / nested-Codex* limitation (proof-harness error), not a product defect, but it does not rescue the implementation from S4A-R1/R2. Verdict (A) dominates (B): committed implementation must be corrected first; a corrected implementation *and* a non-nested execution environment are both preconditions for any future maintainer-authorized proof, which this review does not grant.
+
+== Findings
+
+Classes: BLOCKING, IMPORTANT, MINOR, WATCH, NON-FINDING.
+
+=== S4A-R1 -- BLOCKING -- external trusted state written before fail-closed boundary validation
+
+*Violated authority.* WFC-PERSIST-02: operational/association state must "have its storage/correlation boundary verified fail-closed *before the first Run write* and each Hop"; the external trusted checkout-associated root "shall be outside the agent-writable workspace." WFC-PERSIST-02 authority-correction review NON-FINDING C/D.
+
+*Mechanism.* The only containment guard is inside `invoke_codex`:
+
+[source,python]
+----
+if repository.resolve() in (state_root.resolve(), *state_root.resolve().parents):
+    raise Slice4Error("trusted state root must be outside agent workspace")
+----
+
+`register_checkout()` performs the *first* trusted writes -- `atomic_write_json(state_root/"checkout-association.json", ...)` and `mkdir(state_root/"checkouts"/<uuid>)` -- with *no* containment check. `validate_checkout()` likewise never checks containment. So when `state_root` lies inside the repository, the association mapping and per-checkout state directory are materialized inside the agent-writable workspace, and only a *later* `invoke_codex` call rejects the configuration -- after the trusted write already happened. The committed test encodes exactly this ordering (`test_real_boundary_rejects_state_inside_agent_workspace` calls `register_checkout(repository / "bad-state", repository)` and relies on it *succeeding* before `invoke_codex` raises), so the defect is asserted as intended behavior.
+
+*Scope of live exposure.* In the consumed proof the maintainer supplied an *external* `state_root` (`wfc-s4-state.NlGwY4`), so no actual in-workspace contamination occurred. The defect is that the code and its test *permit and bless* an in-workspace trusted-state root, defeating the fail-closed-before-first-write invariant that is the entire purpose of the external trusted-state form.
+
+*Smallest correction.* Extract one `_require_external_state_root(state_root, repository)` helper carrying the existing containment predicate and call it *before any write* in `register_checkout()` and at the top of `validate_checkout()` (and keep the `invoke_codex` per-Hop check). Rewrite the test to assert `register_checkout()` itself fails closed for an in-workspace root.
+
+*Live invocation needed to close:* No.
+
+=== S4A-R2 -- IMPORTANT -- acceptance conflated with transport presence; strict validation bypassed
+
+*Violated authority.* WFC-AUTO-02 conservative accounting and the accepted Slice-3 strict `structured_result_v1` / `RoutingResult` validation authority; Slice-4 readiness S4-READY-R4 ("charged only on positive acceptance evidence or genuinely uncertain acceptance"); FTR 11.4 safety acceptance ("structured-result transport ... independently reviewed"). The code's own comment states "Only an independently validated correlated result establishes acceptance."
+
+*Mechanism.*
+
+[source,python]
+----
+result_text = result.read_text(encoding="utf-8") or None
+acceptance = "established" if result_text else "uncertain"
+----
+
+`invoke_codex` never calls `adapter.validated_result()`. Any non-empty transport file -- including malformed JSON, a valid envelope with a *non-correlated* `run_id/hop_id/invocation_id`, or a schema-invalid `result` -- yields `acceptance == "established"`. This (a) contradicts the adjacent comment, (b) conflates "provider/model accepted the invocation" with "a correlated valid result exists," and (c) leaves the strict Slice-3 authority (`validated_result()`, used only in `vertical.py`) entirely out of the real-adapter path. A downstream reducer that treats "established" as "accepted + reducible" would then reduce a malformed or mis-correlated result.
+
+*Note.* The failure path happened to be safe here: the empty result file produced `uncertain`, correctly charged. That is luck of the failure mode, not a proven happy-path guarantee.
+
+*Smallest correction.* Do not derive acceptance from raw text length. Route `result_text` through `validated_result(raw, Invocation(run_id, hop_id, invocation_id))`; establish acceptance only on a schema-valid, identity-correlated result, and keep every other post-spawn state `uncertain`/charged.
+
+*Live invocation needed to close:* No.
+
+=== S4A-R3 -- IMPORTANT -- happy-path vertical integration is uncommitted and unproven
+
+*Violated evidence.* FTR 11.4 intends the proof path `coordinator -> external trusted state -> real Codex -> strict result validation -> Git observation -> evidence -> record_hop -> reduction -> checkpoint`. The evidence doc claims all of these occurred (dispatch marker, `reconcile_required`, `hop_used=1`, HEAD/range observation, lock scan).
+
+*Mechanism.* `slice4.py` is imported only by its own test. It stops at `CodexOutcome`; it does not call `validated_result`, `observe_hop`, `run_evidence`, `record_hop`, `reduce_result`, or `checkpoint_projection`. The failure-path accounting seen in the evidence (`recover_uncertain_dispatch` -> `require_reconcile`) is *reusable Slice-1 code* in `persistence.py`, but the *glue* that composes `invoke_codex` with the strict-validation and reduction chain is not committed anywhere. The happy path (correlated result -> observe -> reduce -> checkpoint) was therefore only manually composed for the one proof and is neither committed nor tested.
+
+*Assessment.* This is not a second parallel coordinator contract -- the reusable pieces are the accepted Slice-1..3 ones, and a thin real boundary is explicitly acceptable. The defect is that the thin boundary is *disconnected*: no committed driver, no deterministic test exercising the composed path with a fake executable emitting a correlated result.
+
+*Smallest correction.* Commit a thin driver composing `invoke_codex -> validated_result -> observe_hop/run_evidence -> record_hop/reduce_result -> checkpoint_projection`, plus a deterministic test using a fake `executable` that writes a correlated valid result to the `--output-last-message` path. Reuse `vertical.run_one_hop` semantics rather than reimplementing reduction.
+
+*Live invocation needed to close:* No (fake executable suffices).
+
+=== S4A-R4 -- IMPORTANT -- deterministic test gaps
+
+*Mechanism.* `test_slice4.py` has three tests and omits the cases that matter for the accepted boundary:
+
+* pre-write rejection -- *absent and inverted*: the existing test blesses in-workspace `register_checkout` (see S4A-R1);
+* malformed/corrupt association *content* -- absent (`validate_checkout` fail-closed is proven only for a *renamed* checkout, not corrupt JSON, missing `schema_version`, wrong types);
+* git-dir / common-dir mismatch -- absent (`_facts` distinguishes `git_dir` from `common_dir` for linked worktrees, but no test exercises a worktree where they differ);
+* non-empty-but-malformed / non-correlated result must not be "established" -- absent (S4A-R2);
+* child exits non-zero without a result -> `uncertain` -- absent (this is the *exact* shape of the consumed live failure and is trivially reproducible with a fake `exit 1` executable);
+* exact command construction (argv order, top-level `--ask-for-approval`, external schema/result paths) -- absent;
+* descendant termination -- only a *direct* child sleeper is covered; grandchild/process-group descendant termination is not proven.
+
+*Smallest correction.* Add the above as deterministic tests (fake executables and temp state roots; no provider). Keep them proportional -- no generic process-supervision framework.
+
+*Live invocation needed to close:* No.
+
+=== S4A-R5 -- MINOR -- missing FTR test marker
+
+*Violated authority.* FTR section 14: "new/modified test files carry `pytest.mark.ftr("FTR-AGENT-WORKFLOW-COORDINATOR-P5")`." Every sibling `tests/unit/workflow_coordinator/*` file sets module-level `pytestmark`; `test_slice4.py` does not.
+
+*Smallest correction.* Add `pytestmark = pytest.mark.ftr("FTR-AGENT-WORKFLOW-COORDINATOR-P5")`.
+
+*Live invocation needed to close:* No.
+
+=== S4A-R6 -- WATCH -- broad transport schema is acceptable only once the authority is wired
+
+The `--output-schema` envelope constrains `schema_version/run_id/hop_id/invocation_id` and requires `result`, but leaves `"result": {"type": "object"}` open, and it does not pin the correlation ids to expected values (they are merely `type: string`). Under the accepted transport-vs-authority separation this breadth is *permissible* -- `validated_result()` (via `routing_result_from_data`) is the strict post-transport authority and re-checks correlation. But that separation only holds if the authority actually runs; today it does not in this path (S4A-R2/R3), so the broad transport schema is currently the *only* constraint and `result` structure/correlation is unenforced. No schema change is required: keep the broad transport schema and wire `validated_result()`. Classification remains WATCH, contingent on S4A-R2/R3.
+
+=== S4A-R7 -- WATCH -- reverse containment direction unchecked
+
+`invoke_codex` rejects `state_root` at/under `repository` but not `repository` strictly under `state_root`. Low risk: agent writes stay confined to the workspace and coordinator files sit outside it; but the shared helper from S4A-R1 could cheaply reject the ambiguous nesting in both directions. Record as watch, not a blocker.
+
+=== NON-FINDING -- process/CLI mechanics are otherwise sound
+
+Top-level `--ask-for-approval never` precedes `exec` (S4-READY-R1 closed); non-TTY stdin via `-` and `communicate(prompt)`; `start_new_session=True` so `os.killpg(child.pid, ...)` targets the process group leader; positive finite deadline enforced; SIGTERM -> 3s grace -> SIGKILL on timeout; `OSError` launch failure mapped to a pre-acceptance `Slice4Error` (No-Hop); diagnostics bounded to 16 KiB tails; canonical path + absolute git-dir + resolved common-dir recorded; opaque UUID carried but never used as sole authority (facts re-validated each Hop); moved checkout fails closed. These match the readiness contract.
+
+== Read-only-filesystem failure -- root-cause assessment (no live invocation)
+
+*Observed.* `Error: failed to initialize in-process app-server client: Read-only file system (os error 30)`, Codex exit 1, before any repository mutation or structured result.
+
+*Environment facts (safe local inspection only).* `HOME=/home/stefan` (writable), `~/.codex` present and writable, `CODEX_HOME` unset, `XDG_RUNTIME_DIR=/run/user/1000`, `XDG_CACHE_HOME` unset. On a *non-nested* host these paths are writable, so the app-server would not hit a read-only filesystem there.
+
+*Most plausible cause.* The failing `app-server` init writes runtime/cache/socket/session state (default `~/.codex` / `XDG_RUNTIME_DIR` / XDG cache). The proof was executed *from inside the implementing Codex agent's own `workspace-write` sandbox*; under that outer sandbox everything outside the writable workspace -- including the inherited `HOME`/`CODEX_HOME`/XDG paths the nested app-server needs -- is read-only. The nested `codex exec` therefore failed at app-server initialization, *before* provider contact. This is consistent with the failure preceding any result, timeout, or Git mutation.
+
+*Classification.* (c) experimental-environment / nested-Codex limitation, compounded by (b) incomplete local preflight -- the coordinator does not preflight app-server writable-home/runtime requirements before spawn. It is *not* (a) an implementation defect of the boundary logic and *not* (d) a plain external CLI bug: the same argv is expected to initialize on a non-nested host.
+
+*Representativeness.* Executing the first proof from inside the implementation agent's Codex session was *NOT* representative of the intended coordinator deployment boundary (a normal host/CI process). The failure is a proof-harness/environment error, distinct from the committed product defects S4A-R1/R2.
+
+*Exactness.* The precise write path cannot be pinned without either another invocation or deeper Codex-internal knowledge; available evidence supports "nested-sandbox read-only inherited runtime/home path" but does not isolate the exact file. *Narrowest next experiment a maintainer could separately authorize:* one disposable `codex ... exec` from a *non-nested* host shell (or a pre-provider app-server writable-home/runtime probe in the target environment). This review authorizes neither.
+
+== Failure-path containment -- positive Slice-4 evidence
+
+Independently corroborated from retained facts and committed code, the failed attempt nevertheless proved the failure-path semantics:
+
+* *Exactly one process* -- `invoke_codex` issues a single `Popen`; there is no loop.
+* *No retry* -- no retry construct exists in `slice4.py`; the evidence records none.
+* *No repository mutation* -- `invoke_codex` writes only under the external `state_root`; final HEAD `b1fdd4f...` unchanged, empty range, empty changed paths.
+* *No structured result* -- empty transport file; validation not attempted.
+* *Uncertain outcome conservatively charged* -- empty result -> `uncertain`; `recover_uncertain_dispatch` (`persistence.py`) charges H001 without replay and enters `require_reconcile`.
+* *reconcile_required + explicit resume* -- checkpoint `status=reconcile_required`, `hop_used=1`, `stop_reason=reconcile_requires_explicit_resume`.
+* *No Git locks* -- broad `.git/**/*.lock` scan found none; none removed.
+* *No autonomous continuation* -- no second invocation; `max_autonomous_hops=1` honored.
+
+These are recorded as *positive* Slice-4 failure-containment evidence. The happy-path proof failing does not make the failure-path semantics a failure.
+
+== Answers to the review's explicit questions
+
+* External-state pre-write authority: *NO* -- S4A-R1.
+* Real Codex process boundary: *SOUND for a normal host process; UNCERTAIN for a nested Codex session* -- mechanics are correct; the consumed run tested a non-representative boundary.
+* Read-only failure root cause: nested-Codex/experimental-environment (inherited read-only runtime/home during app-server init), not a boundary-logic defect.
+* Nested execution representative of intended deployment: *NO.*
+* Result acceptance accounting: *NO* -- S4A-R2 (nonempty text alone establishes acceptance; `validated_result()` not integrated).
+* Structured-result transport: broad `result` schema is acceptable *only* once `validated_result()` is the wired authority -- S4A-R6.
+* Vertical integration: reusable Slice-1..3 code is genuine and not duplicated; the real boundary is *disconnected* and its happy-path glue is uncommitted/untested -- S4A-R3. Not a second parallel contract.
+
+== Scope / human readability
+
+`slice4.py` remains a small concrete boundary and introduces no provider registry, retry framework, event store, generic sandbox, bwrap, commit broker, Slice 4B, or Slice 5 scaffolding. No feature-creep correction is recommended. The prescribed fixes (a shared external-root guard, wiring the existing `validated_result()`, a thin committed driver, proportional tests, the FTR marker) tighten the *existing* boundary rather than generalizing it.
+
+== Lifecycle cleanup check
+
+Not a green-closure review. `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains *Open* and active. Coarse lifecycle truth is unchanged: Slices 1--3 implemented / independently verified / maintainer-accepted; the single authorized disposable proof has been *consumed and failed pre-mutation*; routine real-repository use, Slice 5, autonomous multi-Hop, and DMC Cycle 2 remain unauthorized. No FTR status change, backlog include removal, or cold-storage movement is warranted. WFC-LIFE-01/02 closure remains a future obligation.
+
+== Project Memory
+
+No Project Memory update performed. Per WFC-PM-03, individual reviews are not routine PM events, and coarse lifecycle truth has not changed (Slices 1--3 accepted; Slice 4 one-proof consumed/failed; still unauthorized for routine use). This ACCEPT-as-(A) is durably recorded by this artifact; any PM refresh belongs with the next coarse maintainer outcome.
+
+== Release-notes checkpoint
+
+No release note required. This reviews an unauthorized-slice implementation under `scripts/workflow_coordinator/` (internal developer tooling); no public CLI/YAML, package/import, plugin, demo, spreadsheet, or migration surface changes. Matches the FTR section-14 internal-tooling disposition.
+
+== Validation (read-only; no provider invocation)
+
+[source,text]
+----
+git rev-parse HEAD                                  # 18fc1d6d (expected baseline)
+.venv/bin/pytest -q tests/unit/workflow_coordinator # 85 passed
+git status --short                                  # only known unrelated tools/repo_snapshot_multi.sh (unstaged)
+asciidoctor -o /dev/null <this artifact>            # renders without error
+git diff --check <review commit>                    # no whitespace errors
+----
+
+== Residual risks
+
+* S4A-R1/R2/R3/R4 are open committed defects; all closable without a live invocation.
+* Even after code correction, a new disposable proof must run from a *non-nested* host; the nested-Codex read-only failure is unresolved for the nested environment and its exact write path is unpinned pending a separately authorized narrow experiment.
+* Option A's full `.git` authority for routine use remains out of scope (a Git-ownership decision, not persistence).
+
+None of these authorizes Slice 4, routine use, or any live invocation.
+
+== Final report
+
+[cols="1,3",options="header"]
+|===
+|Question |Answer
+
+|SLICE 4A IMPLEMENTATION SOUND |WITH FINDINGS (S4A-R1 BLOCKING, S4A-R2/R3/R4 IMPORTANT)
+|EXTERNAL STATE PRE-WRITE AUTHORITY SOUND |NO (S4A-R1)
+|REAL CODEX PROCESS BOUNDARY SOUND |UNCERTAIN (sound for a normal host; consumed run non-representative)
+|READ-ONLY FAILURE ROOT CAUSE |Nested-Codex / experimental-environment: read-only inherited runtime/home during app-server init; compounded by missing app-server writable-home preflight. Not a boundary-logic defect.
+|NESTED-CODEX EXECUTION REPRESENTATIVE OF INTENDED DEPLOYMENT |NO
+|RESULT ACCEPTANCE ACCOUNTING SOUND |NO (S4A-R2)
+|STRUCTURED RESULT TRANSPORT SOUND |YES, conditional -- broad `result` schema acceptable only once `validated_result()` is wired (S4A-R6)
+|VERTICAL COORDINATOR INTEGRATION SOUND |NO (S4A-R3; not a second contract, but disconnected/uncommitted happy path)
+|FAILURE-PATH CONTAINMENT VERIFIED |YES
+|LIVE HAPPY PATH PROVEN |NO
+|SECOND INVOCATION PERFORMED |NO
+|NEW LIVE INVOCATION AUTHORIZED BY THIS REVIEW |NO
+|===
+
+FINDINGS:: S4A-R1 (BLOCKING); S4A-R2 (IMPORTANT); S4A-R3 (IMPORTANT); S4A-R4 (IMPORTANT); S4A-R5 (MINOR); S4A-R6 (WATCH); S4A-R7 (WATCH).
+
+REVIEW VERDICT:: *(A) IMPLEMENTATION CORRECTION REQUIRED BEFORE ANY NEW PROOF AUTHORIZATION.* After correction, a new disposable proof additionally requires a non-nested execution environment; that proof remains a separate maintainer decision.
+
+READY FOR MAINTAINER NEXT DECISION:: YES -- correct S4A-R1/R2 (and R3/R4), then decide separately whether to authorize one new disposable proof from a non-nested host.
