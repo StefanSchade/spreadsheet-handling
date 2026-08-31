@@ -1,0 +1,439 @@
+= Agent Workflow Coordinator -- Slice 4A Live Schema-Failure Independent Review
+:toc:
+:toclevels: 3
+
+Status:: *NEW SLICE-4A IMPLEMENTATION DEFECT CONFIRMED (S4A-R10, BLOCKING); BOUNDED
+STRICT STRUCTURED-OUTPUT SCHEMA CORRECTION REQUIRED BEFORE ANY FURTHER LIVE
+AUTHORIZATION. NO LIVE INVOCATION AUTHORIZED OR PERFORMED BY THIS REVIEW.*
+Date:: 2026-08-31
+Reviewer role:: Independent read-only review (no runtime implementation).
+Baseline:: `ae5d36c3` -- `docs(workflow): record slice 4a live schema failure`.
+Authority:: `docs/backlog/FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc`, sections 11.4,
+11.4.1, 11.4.2.
+Retained proof root:: `/home/stefan/wfc-proofs/slice4a-happy-b29a500e` (inspected
+read-only).
+Prior evidence:: `docs/warm_storage/global_reviews/agent_workflow_coordinator_slice4a_live_happy_path_attempt_evidence_2026-08-31.adoc`
+(commit `ae5d36c3`).
+
+== 0. Scope, method, and non-actions
+
+This review determines precisely whether the retained HTTP-400 exposes a new
+Slice-4A implementation defect, a provider/version incompatibility, a proof-harness
+problem, or a combination, and -- if an implementation defect -- defines the
+smallest complete correction required before another live-proof authorization.
+
+Method: reconstruct authority from repository artifacts and Git history;
+compare the provider-facing transport schema actually written by the accepted
+adapter against the internal validation contract; classify the failure; and
+specify (not implement) a bounded one-hop correction with deterministic tests.
+
+Non-actions (all honoured):
+
+* No runtime implementation change.
+* No FTR / architecture / Project Memory change.
+* No Codex/provider invocation, resume, retry, or reproduction.
+* No modification of the retained proof root.
+
+== 1. Reconstructed authority (from artifacts, not conversation)
+
+The Slice-4A implementation is maintainer-accepted (S4A-R1..R9 closed). Section
+11.4.2 authorized *exactly one* disposable `N=1` live happy-path proof through
+`scripts/workflow_coordinator/proof_harness.py`, one Run of `WFC-S4-PROOF`,
+`H001`, `max_autonomous_hops=1`. The one-shot rule makes the authorization
+*consumed* once the real provider boundary is reached, regardless of outcome.
+
+The retained attempt (`RUN-c2fe2ab13f224bbeb37f8cd9519ce0d1`,
+`INV-1c8e44c2a7e444aa9e2ff7dfa2ff2a06`, `H001`) reached the provider boundary:
+retained stdout records `thread.started` then `turn.started`, then a provider
+`error`, then `turn.failed`. Therefore the authorization is consumed and no live
+authorization remains. This review does not weaken, rewrite, or re-open that gate.
+
+Established retained facts (from `proof-summary.json`, checkpoint, run snapshot,
+dispatch marker, and `launch-provenance.json`): one Run, one H001, one invocation;
+`process_returncode=1`; `timed_out=false`; `acceptance=uncertain`;
+`hop_used=1`, budget remaining `0`; `final_run_status=reconcile_required`;
+`stop_reason=reconcile_requires_explicit_resume`; dispatch marker retained;
+`result-message.json` zero bytes (no structured result); Git reality unchanged
+(`initial_head==final_head==2390c6f4...`, `PROOF.md` still pending, clean worktree,
+no remotes, no lock files); host provenance `mosh-server -> bash -> python` with
+`claude_related=false`, `codex_related=false`, `openai_related=false`
+(non-nested host launch *consistent*, within documented bounded scope).
+
+The corrected Slice-4A driver contained the uncertain outcome correctly: one
+conservative Hop charged, independent Git observation, `uncertain_dispatch`
+attribution, no auto-retry, explicit human resume required. The *containment* is
+sound; the failure is upstream of it, at the provider request boundary.
+
+== 2. The actual schema path (transport schema vs internal validation)
+
+The provider-facing schema is constructed inline in `invoke_codex()` at
+`scripts/workflow_coordinator/slice4.py:150-156` and passed to Codex via
+`--output-schema <path>` (`slice4.py:159-162`). It is written to
+`structured-result.schema.json` under the checkout state root.
+
+The exact schema written (verified byte-for-byte against the retained
+`.../trusted-state/checkouts/6f387fb8-.../structured-result.schema.json`) is:
+
+[source,json]
+----
+{"additionalProperties":false,
+ "properties":{
+   "hop_id":{"type":"string"},
+   "invocation_id":{"type":"string"},
+   "result":{"type":"object"},
+   "run_id":{"type":"string"},
+   "schema_version":{"const":1}},
+ "required":["schema_version","run_id","hop_id","invocation_id","result"],
+ "type":"object"}
+----
+
+The retained artifact and the current `slice4.py` source are identical in shape;
+the failure is fully attributable to committed code, not to a one-off local edit.
+
+Two distinct contracts must be separated:
+
+*A. Provider-facing JSON Schema* consumed by Codex Structured Outputs
+(`response_format 'codex_output_schema'`, param `text.format.schema`). This is
+what `--output-schema` supplies. OpenAI strict Structured Outputs requires that
+*every* object node declare `additionalProperties: false` and list *every*
+declared property in `required`.
+
+*B. Coordinator-side Python validation* performed *after* the JSON is received:
+`adapter.validated_result()` (`adapter.py:52-68`) checks the envelope key set,
+`schema_version==1`, and identity correlation, then delegates the inner object to
+`serialization.routing_result_from_data()` (`serialization.py:371-429`), which
+fully validates the `RoutingResult` shape.
+
+The transport schema (A) is sufficient for the envelope but under-specifies the
+inner `result`; the Python validator (B) fully specifies `result`. They are two
+independent hand-written specifications of the same envelope, and they have
+already drifted -- (A) says `result` is any object, (B) requires ten specific
+fields.
+
+== 3. The `result` object -- root cause
+
+The provider rejects `context=('properties','result')` because the `result`
+subschema is exactly `{"type":"object"}`: no `additionalProperties`, no
+`properties`, no `required`. Under strict Structured Outputs this is invalid --
+the outer envelope object satisfies the rule (it has `additionalProperties:false`
+and every property in `required`), so `result` is the first offending node, which
+is precisely the context the provider names.
+
+Crucially, `result` is not merely a strict-flag omission; it does not describe the
+`RoutingResult` shape at all. The provider therefore fails the request *before*
+agent execution: `turn.failed` follows `turn.started` immediately, with no model
+work performed. This is a hard, deterministic, 100%-reproducible block of the
+entire real vertical happy path.
+
+A one-line "add `additionalProperties:false` to `result`" patch is *insufficient
+and actively harmful*: an object schema with `additionalProperties:false` and no
+`properties`/`required` admits only the empty object `{}`. The real agent's valid
+`RoutingResult` (ten populated fields) would then either be rejected by the
+provider (extra properties) or, if it somehow passed, be an empty object that the
+Python validator immediately rejects. The correction therefore requires a
+*complete strict inner result schema* describing the actual `RoutingResult`
+contract.
+
+== 4. Complete strict inner result schema (derived from the accepted contract)
+
+Derived from `RoutingResult` (`model.py:149-160`) and its validator
+`routing_result_from_data()` (`serialization.py:371-429`), plus nested
+`_finding_delta()` (`serialization.py:~340-368`) and the escalation block
+(`serialization.py:388-411`). Enum vocabularies are taken from `model.py`
+(`Outcome`, `FindingState`) and the inline `allowed_kinds` set.
+
+`result` (all ten fields required; strict object):
+
+[source,json]
+----
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","outcome","requested_route","scope_changed",
+               "requires_human","escalation","findings","claimed_commits",
+               "evidence_refs","summary"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "outcome": {"enum": ["completed","changes_required","blocked","failed"]},
+    "requested_route": {"type": "string"},
+    "scope_changed": {"type": "boolean"},
+    "requires_human": {"type": "boolean"},
+    "escalation": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind","question"],
+          "properties": {
+            "kind": {"enum": ["scope","semantic_authority","public_surface",
+                              "trust_boundary","prerequisite","operational"]},
+            "question": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id","invariant","blocking","proposed_state",
+                     "evidence_refs","successor_ref","new_material_evidence"],
+        "properties": {
+          "finding_id": {"type": ["string","null"]},
+          "invariant": {"type": "string"},
+          "blocking": {"type": "boolean"},
+          "proposed_state": {"enum": ["open","resolved","residual","superseded"]},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "successor_ref": {"type": ["string","null"]},
+          "new_material_evidence": {"type": "boolean"}
+        }
+      }
+    },
+    "claimed_commits": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"}
+  }
+}
+----
+
+Every object level (outer envelope, `result`, the escalation object, and each
+`findings` item) must carry `additionalProperties:false` and list all its
+properties in `required`.
+
+== 5. Required / optional / nullable semantics (mismatch call-outs)
+
+Strict Structured Outputs requires every declared property to appear in
+`required`; "optional" is expressed as a nullable union, not by omission from
+`required`. The internal Python contract has three subtle cases that must be
+represented without changing accepted semantics:
+
+* `escalation` -- internal: object *or* `None` (`if data["escalation"] is not
+  None`). Represent as `anyOf[null, strict-object]`. Null maps to internal
+  `None`. Semantics preserved.
+* `FindingDelta.finding_id` and `FindingDelta.successor_ref` -- internal
+  `_optional_string` accepts a string *or* `null` (→ `None`). Represent as
+  `{"type":["string","null"]}`. Semantics preserved.
+* `FindingDelta.new_material_evidence` -- internal
+  `data.get("new_material_evidence", False)` then `_boolean(...)`. It accepts
+  *absence* (default `False`) or a boolean, but *not* `null` (`_boolean(None)`
+  raises). In strict mode a field cannot be absent, so it must be `required` and a
+  plain non-nullable `boolean`. *Do not make it nullable* -- a nullable union
+  would let the provider emit `null`, which the Python validator would then
+  reject, reintroducing an uncertain result. This is a *benign tightening*: the
+  model must state the flag explicitly instead of relying on the Python-side
+  default. Call it out, but it is safe and semantics-consistent (any explicit
+  boolean the model emits is accepted unchanged).
+
+One residual mismatch that must *not* be "fixed" in the provider schema:
+`requested_route`, `summary`, `invariant`, and every string element are validated
+Python-side by `_string` as *non-empty / non-whitespace*. Strict Structured
+Outputs disallows `minLength`, so emptiness cannot be expressed in the
+provider-facing schema. Leave the provider schema as `{"type":"string"}` and let
+the Python validator remain the authority for non-emptiness. The provider schema
+is intentionally a *superset guard*, not a replacement for `routing_result_from_data`.
+
+== 6. Single source of truth
+
+The provider-facing schema (A, `slice4.py`) and the Python validator (B,
+`serialization.py`) are currently duplicated specifications that have already
+drifted; the retained failure is the proof of drift. For V1 the smallest safe
+correction is *option A of the prompt*: explicitly construct one strict
+provider schema that matches the existing `RoutingResult` contract. Do *not*
+build a generalized schema-generation framework or a code generator.
+
+To keep the two specs from silently re-diverging, co-locate the strict schema
+builder next to the validator in `serialization.py` (e.g.
+`routing_result_json_schema()` and `structured_result_envelope_schema()`),
+deriving the required-key lists from the same source the validator uses, and have
+`slice4.py` import and call it instead of the inline dict. A drift-guard test
+(section 10) then pins the schema's `result.required` to the validator's required
+set. This is a bounded consolidation, not new abstraction.
+
+== 7. Correlation envelope integrity
+
+The outer envelope must remain strict and correlated: `schema_version` (`const 1`),
+`run_id`, `hop_id`, `invocation_id`, `result`; `additionalProperties:false`;
+all five `required`. The correction replaces *only* the inner
+`result:{"type":"object"}` node with the full strict `RoutingResult` schema and
+must not touch the envelope keys, their required-ness, or `additionalProperties`.
+
+Run/invocation/hop correlation is enforced Python-side by
+`adapter.validated_result()` (exact five-key envelope set, `schema_version==1`,
+identity tuple `(run_id,hop_id,invocation_id)` equality against the dispatch
+`Invocation`). That correlation is independent of the transport-schema fix and is
+unaffected by it. Correlation envelope remains sound.
+
+== 8. Live-failure classification -- new finding
+
+*S4A-R10 -- BLOCKING.* The accepted real adapter cannot complete any live happy
+path: the provider rejects the response schema with HTTP 400
+`invalid_json_schema` before agent execution (`turn.failed` immediately after
+`turn.started`), deterministically and reproducibly, for every invocation the
+current code can issue. This is not proof-fragility and not inflated severity --
+it is a total block of the real vertical output path (WFC-OUTPUT). It is an
+implementation defect in Slice-4A runtime (`slice4.py` schema construction), not a
+harness defect.
+
+Interaction with prior findings: S4A-R1..R9 remain closed; the deterministic
+proof harness (S4H-R1/R2 closed, S4H-R3/R4/R5 WATCH) is not implicated -- the
+harness faithfully persisted the provider failure, which is exactly what its
+hardening was for. The proof-harness design is vindicated; it surfaced a real
+runtime defect that unit tests missed.
+
+== 9. Models-cache warning -- UNRELATED / WATCH
+
+The stderr tail records, at `19:00:37`, before the turn:
+`failed to load models cache: missing field 'supports_parallel_tool_calls' at
+line 97 column 5`. The stdout then shows `thread.started` and `turn.started`
+*after* it, so the thread and turn nevertheless started; the warning did not
+prevent provider contact. The later HTTP `invalid_json_schema` at the request
+boundary is independently sufficient to explain the terminal failure, and the two
+are causally distinct (a local Codex CLI models-cache parse warning versus a
+server-side request-schema rejection).
+
+This warning concerns the Codex CLI's own on-disk models cache
+(`codex_models_manager`), not any coordinator-owned code or artifact. No
+coordinator code change is justified. Classification: *UNRELATED* observation,
+*WATCH* only -- record it, take no action. Do not scope it into the correction.
+
+== 10. Bounded correction plan (one implementation hop; specify, do not implement)
+
+Goal:: Make the provider-facing structured-output schema a complete, strict
+representation of the `RoutingResult` envelope, from a single canonical builder,
+with deterministic tests that would have caught this exact defect. No provider
+invocation.
+
+Production files likely affected::
+
+* `scripts/workflow_coordinator/serialization.py` -- add two builders returning
+  plain `dict` JSON Schema: `routing_result_json_schema()` (the section-4 `result`
+  schema) and `structured_result_envelope_schema()` (the strict five-key envelope
+  wrapping it). Derive required-key lists from the same constants the validator
+  uses so the two cannot drift silently.
+* `scripts/workflow_coordinator/slice4.py` -- replace the inline `schema_data`
+  dict at lines 150-156 with a call to `structured_result_envelope_schema()`.
+  Nothing else in `invoke_codex()` changes; `--output-schema`/`--output-last-message`
+  wiring and the envelope key set stay identical.
+
+Exact schema semantics required::
+
+* Every object node: `additionalProperties:false` + all properties in `required`.
+* `schema_version`: `const 1` (envelope and result).
+* Enums: `outcome`, `proposed_state`, `escalation.kind` per section 4.
+* Nullables: `escalation` as `anyOf[null,object]`; `finding_id`, `successor_ref`
+  as `["string","null"]`; `new_material_evidence` as required non-nullable
+  `boolean` (section 5).
+* Strings stay `{"type":"string"}`; non-emptiness remains Python-side only
+  (no `minLength`).
+
+Deterministic tests required (all fake/offline; the first is the one that would
+have caught this defect)::
+
+. *Strictness traversal* (in `test_slice4.py` or `test_serialization.py`):
+  recursively walk `structured_result_envelope_schema()`; for every node that is
+  an object schema (has `properties`), assert `additionalProperties is False` and
+  `set(required) == set(properties)`. Recurse through `properties.*`, array
+  `items`, and every `anyOf` branch. Against today's schema this test fails at the
+  `result` node (no `additionalProperties`, empty/absent `properties`/`required`),
+  i.e. it reproduces the provider's complaint deterministically without a network
+  call.
+. *Emitted-file identity*: drive `invoke_codex()` with a fake executable (existing
+  pattern) and assert the on-disk `structured-result.schema.json` equals
+  `structured_result_envelope_schema()` and that its `properties.result` carries
+  `additionalProperties:false` and exactly the ten `RoutingResult` keys in
+  `required`. This pins `slice4.py` to the canonical builder.
+. *Drift guard*: assert the schema's `result.required` set equals the required-key
+  set used by `routing_result_from_data`, and that each `findings` item requires
+  the union of `_finding_delta` required+optional keys.
+. *Positive round-trip*: take the known-good envelope already used by
+  `test_real_vertical_composition_uses_fake_cli_and_existing_reducer`
+  (`test_slice4.py:112`) and assert (a) it passes `validated_result(...)` and
+  (b) it structurally satisfies the built schema via a small explicit local
+  checker.
+
+Structural validation without a dependency:: `jsonschema` is *not* installed in
+`.venv` (confirmed). The correction must therefore validate schema shape with
+explicit assertions / a small recursive checker in tests, not by importing
+`jsonschema`. Do not add a new runtime dependency for this fix.
+
+Retained strict correlation behaviour:: unchanged -- envelope keys, required-ness,
+`additionalProperties:false`, and `adapter.validated_result` identity correlation
+are preserved.
+
+Fake-executable coverage:: all new tests use the existing fake-CLI / fake-executable
+harness; no live Codex/provider call is added or required to test schema shape.
+
+Out of scope for the correction:: a second live proof (still a separate maintainer
+gate), the models-cache warning, S4H WATCH residuals, Slice 4B/5, and any
+authorization-consumption machinery.
+
+== 11. Double-start / authority check (secondary)
+
+Independently supported by retained evidence: read-only enumeration of
+`/home/stefan/wfc-proofs/` shows exactly one `slice4a-happy-b29a500e` root, one
+`repo/`, one `trusted-state/` checkout, one Run ID, and one invocation ID. The
+harness guard `run_disposable_proof()` (`proof_harness.py:180-183`) resolves the
+root and raises `Slice4Error("proof root must be a new path")` *before* creating
+`repo/`, trusted state, Run, or invocation IDs when the root already exists;
+therefore a same-root second start fails locally before the provider boundary.
+Exactly one Run and one invocation; no evidence of a second real provider
+invocation. This review authorizes no further live attempt.
+
+== 12. Lifecycle cleanup check
+
+This is not a green FTR-closure verdict, so no backlog retirement applies. The
+Slice-4A live happy-path proof (section 11.4) remains *required and unproven*. On
+maintainer acceptance of this review, the FTR status/authorization wording and
+Project Memory should later record S4A-R10 and gate the next live authorization on
+the correction landing -- as a *separate* change, not in this read-only review.
+Release notes: none required for this review (internal coordinator tooling, no
+public surface change); the eventual correction is likewise internal-only, but its
+own implementation review must restate that checkpoint.
+
+== 13. Validation performed (read-only)
+
+[source,text]
+----
+.venv/bin/pytest -q tests/unit/workflow_coordinator   # 97 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator  # All checks passed!
+git diff --check                                       # clean (exit 0)
+----
+
+No live Codex/provider invocation was performed.
+
+== 14. Final report
+
+[cols="1,3",options="header"]
+|===
+|Question |Answer
+
+|LIVE FAILURE REPRODUCIBLY EXPLAINED BY RETAINED HTTP 400 |YES
+|PROVIDER-FACING SCHEMA INVALID |YES
+|INTERNAL VALIDATION CONTRACT ITSELF INVALID |NOT IMPLICATED (valid)
+|`result` SCHEMA UNDERSPECIFIED |YES
+|ONE-LINE `additionalProperties` FIX SUFFICIENT |NO
+|COMPLETE STRICT INNER RESULT SCHEMA REQUIRED |YES
+|CORRELATION ENVELOPE REMAINS SOUND |YES
+|NEW FINDING |S4A-R10
+|FINDING SEVERITY |BLOCKING
+|MODELS-CACHE WARNING |UNRELATED (WATCH)
+|SECOND REAL INVOCATION EVIDENCE |NO
+|NEW LIVE INVOCATION AUTHORIZED |NO
+|REAL PROVIDER INVOCATIONS PERFORMED BY THIS REVIEW |0
+|REVIEW VERDICT |A
+|BOUNDED CORRECTION PLAN READY |YES
+|READY FOR MAINTAINER CORRECTION AUTHORIZATION DECISION |YES
+|===
+
+*Verdict A:* NEW SLICE-4A IMPLEMENTATION DEFECT CONFIRMED; BOUNDED SCHEMA
+CORRECTION REQUIRED. The retained HTTP-400 is fully and reproducibly explained by
+committed code: the provider-facing structured-output schema declares
+`result` as an opaque `{"type":"object"}`, which violates strict Structured
+Outputs (`additionalProperties` required and `false` on every object) and does not
+describe the `RoutingResult` contract. A one-line strict-flag patch is
+insufficient; the complete strict inner result schema of section 4 is required,
+built from a single canonical source and guarded by the deterministic tests of
+section 10. The correlation envelope and internal Python validation are sound and
+must be preserved. No further live invocation is authorized.
