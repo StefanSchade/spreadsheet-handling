@@ -1,0 +1,264 @@
+= Agent Workflow Coordinator -- S4A-R10 Bounded Schema-Correction Re-Review
+:toc:
+:toclevels: 3
+
+Status:: *ACCEPT -- S4A-R10 CORRECTION VERIFIED; SLICE-4A READY FOR MAINTAINER
+LIVE-HAPPY-PATH AUTHORIZATION DECISION. NO LIVE INVOCATION AUTHORIZED OR PERFORMED.*
+Date:: 2026-08-31
+Reviewer role:: Independent bounded re-review (no implementation).
+Baseline:: `d1e01b94` -- `docs(workflow): record s4a r10 schema correction`.
+Correction authority:: `80610ad0` -- `docs(workflow): authorize s4a r10 schema correction`.
+Original defect review:: `75c63d4f` -- `docs(workflow): review slice 4a live schema failure`.
+Under review:: `6bfad5bb` (fix), `41ff4e35` (walker-correction test), `d1e01b94`
+(evidence).
+Scope:: S4A-R10 closure plus direct regressions from `6bfad5bb`/`41ff4e35` only.
+No broad Slice-4A re-review; S4A-R1..R9 and S4H-R1..R5 not reopened.
+
+== 0. Correction surface
+
+Diff `80610ad0..d1e01b94` touches exactly:
+`scripts/workflow_coordinator/serialization.py` (shared constants + two schema
+builders), `scripts/workflow_coordinator/slice4.py` (emit canonical envelope),
+`tests/unit/workflow_coordinator/test_slice4.py` (schema tests), and the evidence
+doc. `adapter.py`, `model.py`, `reducer.py`, `vertical.py`, `persistence.py`, and
+`proof_harness.py` are untouched. Correction scope matches the authorization
+(section 11.4.3 / review `75c63d4f` section 10).
+
+== 1. Root-cause closure
+
+The original S4A-R10 defect: the transport schema declared the inner `result` as
+opaque `{"type":"object"}`, which strict Structured Outputs rejects
+(`context=('properties','result')`, HTTP 400 `invalid_json_schema`).
+
+* `slice4.py` no longer hand-builds the transport schema: the inline `schema_data`
+  dict is removed and replaced by `atomic_write_json(schema,
+  structured_result_envelope_schema())` (`slice4.py:151`, import at
+  `slice4.py:25`).
+* The opaque `result:{"type":"object"}` node no longer exists anywhere in the
+  emitted schema.
+* Test `test_invoke_codex_writes_the_canonical_structured_result_schema` drives the
+  real `invoke_codex()` path with a fake executable and asserts the on-disk
+  `structured-result.schema.json` equals `structured_result_envelope_schema()`, so
+  the live path provably emits the canonical schema.
+
+Root cause is closed: the real Slice-4A invocation path now emits the complete
+strict schema. *CLOSED.*
+
+== 2. Complete strict schema
+
+Outer envelope (`structured_result_envelope_schema`): `type=object`,
+`additionalProperties=false`, `required` = all five envelope keys
+(`STRUCTURED_RESULT_ENVELOPE_KEYS`), `schema_version` `const 1`,
+`run_id`/`hop_id`/`invocation_id` remain `{"type":"string"}`, `result` =
+`routing_result_json_schema()`. Correlation fields remain strings. *OK.*
+
+Inner `RoutingResult` (`routing_result_json_schema`): strict object,
+`required` = `ROUTING_RESULT_REQUIRED_KEYS` (all ten), with exactly the ten
+accepted keys (`schema_version`, `outcome`, `requested_route`, `scope_changed`,
+`requires_human`, `escalation`, `findings`, `claimed_commits`, `evidence_refs`,
+`summary`). No omitted keys, no invented keys, all declared keys required.
+`outcome` enum is derived from the actual model vocabulary
+(`[outcome.value for outcome in Outcome]`). *OK.*
+
+== 3. Every nested object is strict
+
+Empirically enumerated the built schema with the corrected walker: exactly four
+object nodes -- envelope, `result`, escalation object, and `FindingDelta` item --
+each with `additionalProperties is False`, an explicit `properties`, an explicit
+`required`, and `set(required) == set(properties)`. Objects are reached via
+`properties` (envelope->result), `anyOf` (`escalation`), and array `items`
+(`findings`). No opaque object remains. *OK.*
+
+Regression detectability (the decisive check): the walker in `6bfad5bb`
+identified objects by `"properties" in schema`. An opaque `{"type":"object"}`
+node has no `properties`, so that walker would silently *skip* it -- the
+strictness assertion would never run on a reintroduced defect and the test would
+falsely pass. `41ff4e35` corrects the walker to detect objects by
+`schema.get("type") == "object"`, so a reintroduced opaque node is now yielded and
+fails the assertion. Verified empirically: mutating `result` back to
+`{"type":"object"}` makes the strictness walk raise (`KeyError` on the absent
+`additionalProperties`). The exact original S4A-R10 defect is now deterministically
+caught without a provider call. *OK.*
+
+== 4. Nullable / required semantics
+
+* `escalation`: `{"anyOf":[{"type":"null"}, <strict {kind,question}>]}` -- null or
+  strict object, matching the validator's `if data["escalation"] is not None`.
+* `finding_id`: `{"type":["string","null"]}`.
+* `successor_ref`: `{"type":["string","null"]}`.
+* `new_material_evidence`: `{"type":"boolean"}` -- required, non-nullable.
+
+The two formerly optional `FindingDelta` provider fields (`successor_ref`,
+`new_material_evidence`) are placed in the provider `required` list (all seven keys
+via `FINDING_DELTA_KEYS`). This is the benign tightening the original review
+explicitly allowed: it does not alter Python-side acceptance, because
+`_finding_delta` still passes `required=FINDING_DELTA_REQUIRED_KEYS` (five keys)
+and `optional=FINDING_DELTA_OPTIONAL_KEYS` (the two). Python continues to accept
+its broader historical input (those two absent); the provider merely requires
+explicit presence. No demand for symmetry is imposed. *PRESERVED.*
+
+== 5. Enum / contract alignment and drift closure
+
+* `outcome` enum == `[o.value for o in Outcome]` (verified equal).
+* `proposed_state` enum == `[s.value for s in FindingState]` (verified equal).
+* escalation `kind` enum == `ESCALATION_KINDS`, the same constant the validator now
+  checks (`if kind not in ESCALATION_KINDS`).
+
+The shared constants `ROUTING_RESULT_REQUIRED_KEYS`, `FINDING_DELTA_REQUIRED_KEYS`,
+`FINDING_DELTA_OPTIONAL_KEYS`, `FINDING_DELTA_KEYS`, `ESCALATION_REQUIRED_KEYS`, and
+`ESCALATION_KINDS` are each defined once and consumed by *both* the validator
+(`routing_result_from_data`, `_finding_delta`) and the schema builders. Their
+contents are byte-identical to the previous inline literals, so the validator's
+behaviour is unchanged while the provider schema is now generated from the same
+source of truth. This materially closes the hand-written-spec drift the original
+review flagged, without introducing a general schema framework or code generator.
+*ALIGNED.*
+
+== 6. Provider-schema compatibility (deterministic, no invocation)
+
+Keywords/shapes used: `type`, nullable `type` unions (`["string","null"]`),
+`object`/`properties`/`required`/`additionalProperties:false`, `array`/`items`,
+`anyOf` (each branch itself strict: `{"type":"null"}` and a strict object),
+`enum`, and `const`. All lie within the strict Structured Outputs subset assumed
+and specified in `75c63d4f`. The root is a strict object with every property
+required.
+
+The retained live failure is itself the strongest local evidence that no
+*envelope-level* incompatibility remains: the provider rejected only
+`('properties','result')` and did not object to the envelope's
+`schema_version:{"const":1}` or its string correlation fields, confirming those
+shapes passed provider validation. With the sole offending node now a complete
+strict object, there is no concrete local evidence of another blocker that would
+merely move the next failure to a later node. Per the review's own guidance, this
+is treated as closure rather than a speculative new live blocker. *NO CONCRETE
+KNOWN BLOCKER.*
+
+== 7. Correlation / internal-validation regression
+
+`adapter.validated_result()` is untouched: it still enforces the exact five-key
+envelope set, `schema_version==1`, and the `(run_id,hop_id,invocation_id)` identity
+correlation against the dispatch `Invocation`, then delegates to
+`routing_result_from_data()` for semantic validation. The provider-facing schema
+remains a pre-transport structural guard; Python remains the post-transport
+semantic and correlation authority. No correlation weakened. *PRESERVED.*
+
+== 8. Test quality
+
+[cols="1,3",options="header"]
+|===
+|Required |Assessment
+
+|A. recursive strictness traversal
+|`test_structured_result_schema_makes_every_object_strict_and_complete` walks the
+built schema, asserts the four expected object nodes are found, and for every
+object node asserts `additionalProperties is False` and
+`set(required)==set(properties)`. Adequate.
+
+|B. result contract drift guard
+|`test_structured_result_schema_tracks_routing_result_validator_contract` pins
+`result.required` to `ROUTING_RESULT_REQUIRED_KEYS`. Adequate.
+
+|C. complete FindingDelta drift guard
+|`test_structured_result_schema_tracks_complete_finding_delta_contract` pins
+`findings.items.required` to `FINDING_DELTA_KEYS` and asserts the nullable/boolean
+property types. Adequate.
+
+|D. emitted-schema identity
+|`test_invoke_codex_writes_the_canonical_structured_result_schema` asserts the
+on-disk schema equals the canonical builder. Adequate.
+
+|E. known-good dual validation
+|`test_known_good_envelope_passes_adapter_validation_and_provider_schema` asserts a
+correlated envelope passes both `validated_result()` and the local provider-schema
+checker `_assert_matches_schema`. Adequate.
+
+|F. fake vertical composition green
+|`test_real_vertical_composition_uses_fake_cli_and_existing_reducer` is unchanged
+and passes. Adequate.
+|===
+
+The `41ff4e35` walker correction is the load-bearing fix for requirement A: without
+it the strictness test could not catch the very defect it exists to prevent
+(verified in section 3). The local `_assert_matches_schema` checker handles
+`const`, `anyOf`, `type` unions, `enum`, strict-object (required present +
+additionalProperties closed), and arrays; it is adequate for the concrete
+known-good subset asserted and correctly does not attempt to be a general JSON
+Schema implementation. *TESTS ADEQUATE.*
+
+== 9. Direct-regression check
+
+No direct regression found:
+
+* Validator semantics unchanged -- constants equal the prior inline literals;
+  `routing_result_from_data`/`_finding_delta` behaviour is identical.
+* `FindingDelta` historical Python input still accepted (optional keys still
+  optional Python-side).
+* Result correlation not weakened (`adapter.py` untouched).
+* Emitted schema equals the canonical builder (test D).
+* Fake real-adapter vertical still green.
+* Dispatch/reconcile and proof-harness code paths untouched.
+
+Full suite: `.venv/bin/pytest -q tests/unit/workflow_coordinator` -> 102 passed;
+`.venv/bin/ruff check ...` -> all checks passed; `git diff --check` -> clean.
+
+== 10. Scope / authority
+
+No provider invocation occurred (all tests use fake executables / pure
+functions); no live authorization introduced; no consumed proof resumed; the
+models-cache `supports_parallel_tool_calls` warning is untouched; S4H-R3/R4/R5
+untouched; no Slice 4B / Slice 5 work. The next live happy-path proof remains a
+separate maintainer gate.
+
+== 11. Lifecycle note (read-only)
+
+This is a bounded correction re-review, not an FTR-closure verdict; no backlog
+retirement applies. On maintainer acceptance, the FTR/Project Memory may record
+S4A-R10 as verified-closed and reduce the next-step gate to the maintainer's
+live-happy-path authorization decision -- as a separate change, not in this
+read-only review. Release notes: none required (internal coordinator tooling, no
+public surface change).
+
+== 12. Final report
+
+[cols="1,2",options="header"]
+|===
+|Question |Answer
+
+|S4A-R10 CLOSED |YES
+|OPAQUE result OBJECT REMOVED |YES
+|ACTUAL SLICE4 PATH EMITS CANONICAL SCHEMA |YES
+|OUTER ENVELOPE STRICT |YES
+|INNER ROUTING RESULT STRICT |YES
+|EVERY OBJECT NODE STRICT |YES
+|OPAQUE-OBJECT REGRESSION DETECTABLE BY TEST |YES
+|ROUTING RESULT KEY CONTRACT ALIGNED |YES
+|FINDING DELTA KEY CONTRACT ALIGNED |YES
+|ESCALATION SEMANTICS PRESERVED |YES
+|FINDING_ID NULLABILITY PRESERVED |YES
+|SUCCESSOR_REF NULLABILITY PRESERVED |YES
+|NEW_MATERIAL_EVIDENCE REQUIRED BOOLEAN |YES
+|ENUM VOCABULARIES ALIGNED WITH VALIDATOR/MODEL |YES
+|PROVIDER-SCHEMA SHAPE HAS ANOTHER CONCRETE KNOWN BLOCKER |NO
+|CORRELATION ENVELOPE PRESERVED |YES
+|PYTHON VALIDATION SEMANTICS REGRESSED |NO
+|STRICTNESS TEST ADEQUATE |YES
+|EMITTED-SCHEMA IDENTITY TEST ADEQUATE |YES
+|KNOWN-GOOD DUAL VALIDATION ADEQUATE |YES
+|DIRECT REGRESSION FOUND |NO
+|MODELS-CACHE WARNING MODIFIED |NO
+|S4H-R3/R4/R5 MODIFIED |NO
+|REAL CODEX/PROVIDER INVOCATIONS PERFORMED |0
+|NEW LIVE INVOCATION AUTHORIZED |NO
+|REVIEW VERDICT |A
+|READY FOR MAINTAINER LIVE-HAPPY-PATH AUTHORIZATION DECISION |YES
+|===
+
+*Verdict A:* ACCEPT -- S4A-R10 correction verified. The opaque `result` node is
+gone; `slice4.py` emits the canonical strict envelope from a single source of
+truth shared with the validator; every object node is strict and complete; the
+review's nullable/required semantics and enum vocabularies are faithfully
+represented; correlation and Python validation are unregressed; and the corrected
+strictness walker deterministically catches the exact original defect. No direct
+regression, no concrete remaining provider-schema blocker, and no scope/authority
+breach. Slice-4A is ready for the maintainer's separate live-happy-path
+authorization decision.
