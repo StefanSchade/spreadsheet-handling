@@ -1,0 +1,279 @@
+= Agent Workflow Coordinator -- Slice 4A-C Correction Bounded Re-Review
+:toc:
+:toclevels: 2
+
+Status:: *BOUNDED INDEPENDENT RE-REVIEW OF THE S4AC CORRECTION. READ-ONLY. NO
+RUNTIME CODE, FTR LIFECYCLE, OR PROJECT MEMORY MODIFIED. NO REAL PROVIDER INVOKED.
+NO LEVEL-3/LEVEL-4 AUTHORIZED.*
+Verdict:: *A -- ACCEPT CORRECTION.*
+Date:: 2026-09-01
+Scope:: Only the findings raised in `5454d6ca`
+(`agent_workflow_coordinator_slice4ac_independent_review_2026-09-01.adoc`):
+S4AC-R1..R5, plus direct-regression surface. Not a new broad review.
+Baseline reviewed:: `da133d91..73e0292a` (correction `5611c713`; evidence
+`73e0292a`).
+Method:: Traced actual control flow in the corrected code; re-ran the original
+R1 failure-injection probe against the corrected tree; ran the suite, focused
+tests, ruff, and `git diff --check`; verified R2 against primary OpenAI
+documentation. No provider called.
+
+== 1. Verdict
+
+*A -- ACCEPT CORRECTION.* The blocking S4AC-R1 and the important S4AC-R2 are both
+CLOSED; S4AC-R3 and S4AC-R5 are CLOSED as local consequences; S4AC-R4 remains a
+DEFERRED WATCH and was not broadened. The correction introduces no direct
+blocking/important regression. Slice 4A-C is technically ready for maintainer
+acceptance and a later, separately authorized Level 3. This review does not itself
+accept 4A-C and does not authorize Level 3.
+
+== 2. S4AC-R1 (BLOCKING) -- CLOSED
+
+The correction replaces the blanket `except Exception: dispatch_path.unlink();
+raise` with an explicit classification:
+
+[source,python]
+----
+    def recover_uncertain(outcome):        # retains marker, charges Hop, reconcile
+        ...
+    try:
+        vertical = run_one_hop(...)
+    except ExecutionResultValidationError as error:
+        return recover_uncertain(error.outcome)   # provider ran, bad result
+    except ExecutionNotStartedError:
+        dispatch_path.unlink(missing_ok=True); raise      # proven pre-execution
+    except CodexCliError as error:
+        dispatch_path.unlink(missing_ok=True); raise Slice4Error(...)   # pre-Popen
+    except Exception:
+        return recover_uncertain(None)            # maybe-executed -> fail closed
+----
+
+The required semantic rule -- *marker deletion only when execution is proven not
+to have begun; otherwise fail closed* -- holds.
+
+=== R1-A -- pre-execution deletion proven safe
+
+Only two exception classes delete the marker, and every current raise site is
+proven pre-execution:
+
+* `ExecutionNotStartedError` -- raised at exactly two sites, both in
+  `vertical.run_one_hop` *before* `adapter.execute()`: `preflight_hop` failure
+  (`vertical.py:99`) and any `assemble_prompt` failure (`vertical.py:104`, a broad
+  `except Exception` wrap that is lexically before the execute call, so nothing has
+  executed). No post-execution site raises it.
+* `CodexCliError` -- raised at exactly three sites in `CodexCliAdapter.execute`,
+  all *before* `subprocess.Popen` succeeds: unsupported result contract
+  (`codex_adapter.py:148`), non-positive timeout (`:150`), and the `OSError` launch
+  wrap (`:161`). Verified from the actual `execute` body: after `Popen` succeeds
+  the only failures are `TimeoutExpired` (handled internally) and any
+  `os.killpg`/`read_text` error, none of which is wrapped as `CodexCliError` --
+  they propagate as generic exceptions and therefore fail closed. No `CodexCliError`
+  can occur after `Popen`.
+
+=== R1-B -- post / may-have-executed fail-closed
+
+* AgentExecutionOutcome validation failures (`candidate_result is None`;
+  `validated_result` rejection) reach `ExecutionResultValidationError` ->
+  `recover_uncertain(error.outcome)` -> marker retained. Unchanged, correct.
+* Arbitrary exceptions after `adapter.execute()` returns
+  (`observe_hop`/`_subject_anomalies`/`run_evidence`/`record_hop`/`reduce_result`/
+  `checkpoint_projection`) reach the generic `except Exception` ->
+  `recover_uncertain(None)` -> marker retained + reconcile. This is the exact fix.
+* An unclassified exception raised *from* `adapter.execute()` where execution
+  cannot be disproved also reaches `recover_uncertain(None)` and fails closed
+  (conservatively charged), rather than being treated as pre-execution. The adapter
+  contract is: raise `CodexCliError`/`ExecutionNotStartedError` only for
+  proven-not-started; anything else is treated as maybe-started. Conservative
+  over-charging is the safe direction (never forgets a Hop, never replays).
+* No absence-of-outcome condition is read as proof of non-execution:
+  `recover_uncertain(None)` retains the marker and charges the Hop.
+
+=== R1-C -- secondary recovery failure preserves no-replay authority
+
+If `recover_uncertain(None)` itself raises (e.g. its `observe_hop` fails), the new
+exception propagates out of `run_real_one_hop`. Crucially, the dispatch marker was
+written before the `try` and is deleted *only* in the ENS/`CodexCliError` branches,
+so it *remains durable* through a secondary recovery failure. Later reconstruction
+sees the marker -> a Hop was dispatched -> it cannot be classified as "never
+dispatched", preserving no-replay authority (WFC-PERSIST-01, WFC-AUTO-02). The
+pre-`try` `run.json` snapshot may then be stale (`hop_used` unchanged), but the
+marker, not the snapshot, is the resume authority -- acceptable per the review
+bound.
+
+=== R1-D -- Hop charging / fact truthfulness
+
+`recover_uncertain_dispatch` (reused unchanged) charges exactly one Hop
+idempotently (skips if the `marker.hop_id` Hop already exists), records
+`role="uncertain_dispatch"`, `invocation_status="acceptance_not_disproved"`,
+`outcome="uncertain"`, and populates `end_head`/`actual_commits` from independent
+Git observation. It fabricates no provider result or acceptance; a later explicit
+reconcile reconstructs truth from Git + dispatch state. Consistent with the
+WFC-AUTO/WFC-FAIL invariants cited in the original S4AC-R1.
+
+=== R1-E -- regression test quality and independent confirmation
+
+* `test_real_driver_retains_dispatch_after_post_execution_mutating_failure`: fake
+  CLI runs exactly once (`executions=="1"`), mutates and commits
+  (`PROOF.md=="after"`, HEAD advanced), then `vertical.observe_hop` is monkeypatched
+  to raise -> marker survives, `hop_used==1`, status `reconcile_required`,
+  `stop_reason=="reconcile_requires_explicit_resume"`, checkpoint persisted, no
+  replay. This test fails against the pre-correction code, so it genuinely guards
+  the original defect class. The monkeypatch targets *only* `vertical.observe_hop`,
+  while recovery uses `slice4`'s own `observe_hop` binding -- this is intentional
+  and valid: it isolates "primary post-execution observation failed, recovery
+  observation still works". It does not accidentally avoid the failure condition
+  (the post-execution exception path is exercised).
+* `test_real_driver_fails_closed_for_unclassified_execution_boundary_exception`:
+  `CodexCliAdapter.execute` monkeypatched to raise `RuntimeError` -> execute called
+  once, status `reconcile_required`, `hop_used==1`, marker retained (R1-B item 3).
+* `test_real_driver_cleans_marker_for_local_prompt_failure_before_spawn`
+  (pre-existing): prompt-component failure now surfaces as
+  `ExecutionNotStartedError` (a `ValueError` subclass, message preserved) -> ENS
+  branch -> marker deleted, `hop_used==0`, fake never ran. Confirms pre-execution
+  deletion still works.
+
+*Independent confirmation:* re-running my original R1 failure-injection probe
+(post-acceptance `observe_hop` raise after a real commit) against the corrected
+tree now reports the provider ran and committed, and `dispatch.json marker
+survived: True` (previously `False`). The defect is closed.
+
+*R1 disposition: CLOSED.*
+
+== 3. S4AC-R2 (IMPORTANT) -- CLOSED
+
+* `const` removed from `_STRICT_KEYS` (`codex_adapter.py:41`).
+* Both `schema_version` nodes now emit `{"type": "integer", "enum": [1]}`
+  (routing-result and envelope).
+* The checker now *rejects* `const`:
+  `test_conformance_rejects_constructs_outside_the_projection_subset` injects
+  `{"type":"integer","const":1}` and asserts "unsupported keywords".
+* `test_schema_version_uses_the_documented_single_value_enum_in_both_envelopes`
+  pins both nodes to the enum form.
+* Python semantic validation independently still requires `schema_version == 1`
+  (`validated_result` and `routing_result_from_data._version`) -- unchanged.
+
+Primary-documentation basis (no provider called): the OpenAI Structured Outputs
+guide demonstrates `enum` as a supported strict keyword with concrete examples and
+supports the `integer` type; it does not document a minimum enum cardinality, and
+it does not list `const`. Therefore a single-value `{"type":"integer","enum":[1]}`
+is a *direct and reasonable consequence of the documented contract* (enum with one
+member), not the prior ambiguity: the projection moved from an *undocumented*
+keyword (`const`) to a *documented-supported* one (`enum`). The generator and
+checker are now anchored on a documented rule, and the injected-`const` rejection
+gives the checker independent bite. The bounded Level-1 claim is justified; the
+only residual (single-value enum minimum is not *explicitly* enumerated) is a
+trivial consequence and is precisely what a later Level-3 smoke would confirm
+empirically, as designed.
+
+*R2 disposition: CLOSED.*
+
+== 4. S4AC-R3 (MINOR) -- CLOSED
+
+`CodexCliAdapter.execute` now rejects any `result_contract !=
+ROUTING_RESULT_ENVELOPE_CONTRACT` as its first statement, before the timeout check
+and before `Popen` (`codex_adapter.py:147-148`), raising `CodexCliError` -- so it is
+also R1-safe (pre-execution; the ENS/`CodexCliError` deletion path is correct for
+it). `invoke_codex` now passes the shared `ROUTING_RESULT_ENVELOPE_CONTRACT`
+constant instead of a bare literal. No registry or multi-contract framework was
+introduced. `test_adapter_rejects_an_unsupported_result_contract_before_launch`
+(executable `"must-not-run"`) proves rejection before launch.
+
+*R3 disposition: CLOSED.*
+
+== 5. S4AC-R5 (MINOR) -- CLOSED
+
+The unreachable `const requires explicit type` guard is removed. Removal follows
+naturally from R2 (`const` is no longer accepted). No replacement dead rule was
+introduced: the `enum`/`integer` `schema_version` node passes the generic
+type/keyword checks cleanly (verified: `type` and `enum` are supported keys,
+`integer` is a supported type, node is neither object nor array).
+
+*R5 disposition: CLOSED.*
+
+== 6. S4AC-R4 (WATCH) -- unchanged
+
+`codex_adapter.py` still imports `atomic_write_json`/`atomic_write_text` from
+`persistence.py`; the dependency was neither broadened nor refactored, and no
+generic IO utility was introduced. Remains *DEFERRED WATCH*, not
+acceptance-blocking.
+
+== 7. Direct-regression surface (bounded)
+
+No direct regression found:
+
+* Semantic `RoutingResult` validation/correlation remains provider-neutral
+  (`validated_result`/`serialization` untouched).
+* Mutable `adapter.outcome` has *not* returned: `CodexCliAdapter` stays `frozen`;
+  `test_codex_argv_is_adapter_owned_and_request_is_provider_neutral` asserts `not
+  hasattr(adapter,"outcome")`.
+* Nonzero-returncode + valid correlated result retains prior established semantics
+  (`execute` still returns `candidate = result.read_text() or None` regardless of
+  returncode; reduction path unchanged).
+* Pre-execution failures do not falsely consume a Hop (ENS/`CodexCliError` ->
+  `hop_used==0`, verified by tests).
+* Post/maybe-execution failures cannot be silently replayed (marker retained ->
+  reconcile).
+* The normal successful N=1 fake path still works
+  (`test_real_vertical_composition_uses_fake_cli_and_existing_reducer` green).
+* The `AgentExecutionPort` boundary is intact; no provider knowledge leaked into
+  `reducer`/`model`/`serialization`.
+
+Incidental (not a finding, not a regression): `VerticalRunError` is now defined but
+no longer raised (both former raise sites became `ExecutionNotStartedError`). It is
+harmless dead code that a future non-scope cleanup may remove; it does not affect
+authority and is out of this bounded scope.
+
+No new findings (no S4AC-R6). No direct blocking/important regression.
+
+== 8. Validation performed (read-only)
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator` -> 112 passed.
+* Focused R1 tests (retain/fail-closed/unlaunchable/prompt-failure/recover) ->
+  passed; `test_codex_adapter_conformance.py` -> 8 passed.
+* `.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator`
+  -> All checks passed.
+* `git diff --check` -> clean.
+* Original R1 failure-injection probe re-run against the corrected tree -> marker
+  retained (was deleted pre-correction).
+* Primary OpenAI Structured Outputs documentation consulted for the `enum`/`integer`
+  basis; no provider API invoked.
+
+== 9. Lifecycle note
+
+Read-only re-review; declares no FTR/BUG workstream green beyond the bounded
+correction acceptance. FTR-AGENT-WORKFLOW-COORDINATOR-P5 remains active/open with
+Slice-4A live happy-path still unproven; no includes moved, no companion artifacts
+relocated, no lifecycle status change. Release notes: the correction touches only
+internal `scripts/workflow_coordinator/` structure and tests, no public
+CLI/YAML/import surface, so no release note is required.
+
+== 10. Final report
+
+----
+VERDICT:                                                A
+S4AC-R1:                                                CLOSED
+PRE-EXECUTION MARKER DELETION PROVEN SAFE:              YES
+ALL CodexCliError CLEANUP PATHS PRE-EXECUTION:          YES
+POST/MAY-HAVE-EXECUTED FAIL-CLOSED:                     YES
+UNCLASSIFIED ADAPTER EXCEPTION FAIL-CLOSED:             YES
+SECONDARY RECOVERY FAILURE PRESERVES NO-REPLAY AUTHORITY: YES
+UNCERTAIN HOP CHARGED TRUTHFULLY:                       YES
+R1 REGRESSION TEST REPRODUCES ORIGINAL DEFECT CLASS:    YES
+S4AC-R2:                                                CLOSED
+INTEGER SINGLE-VALUE ENUM PRIMARY-CONTRACT BASIS SUFFICIENT: YES
+CONST REMOVED FROM CURRENT ACCEPTED SUBSET:             YES
+EXACT EMITTED SCHEMA PASSES INDEPENDENT OFFLINE CHECK:  YES
+S4AC-R3:                                                CLOSED
+S4AC-R4:                                                DEFERRED WATCH
+S4AC-R5:                                                CLOSED
+DIRECT BLOCKING/IMPORTANT REGRESSIONS:                  none
+MUTABLE adapter.outcome RESTORED:                       NO
+SEMANTIC RoutingResult AUTHORITY STILL PROVIDER-NEUTRAL: YES
+UNIT TESTS:                                             112 passed
+FOCUSED R1 TESTS:                                       passed
+CONFORMANCE TESTS:                                      8 passed
+RUFF:                                                   All checks passed
+REAL PROVIDER INVOCATIONS:                              0
+PROJECT MEMORY UPDATED:                                 NO
+READY FOR MAINTAINER 4A-C ACCEPTANCE:                   YES
+LEVEL-3 AUTHORIZED BY THIS REVIEW:                      NO
+----
