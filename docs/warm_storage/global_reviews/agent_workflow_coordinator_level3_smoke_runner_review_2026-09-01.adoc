@@ -1,0 +1,379 @@
+= Agent Workflow Coordinator -- Level-3 Codex Adapter Smoke Runner Review
+:toc:
+:toclevels: 2
+
+Status:: *BOUNDED CORRECTION REQUIRED BEFORE LIVE LEVEL-3. RUNNER NOT YET READY
+FOR MAINTAINER ACCEPTANCE. REAL LEVEL-3 SMOKE NOT EXECUTED. LEVEL-3 INVOCATION
+NOT AUTHORIZED BY THIS REVIEW. LEVEL-4 NOT AUTHORIZED.*
+Date:: 2026-09-01
+Reviewer scope:: Independent, bounded review of the Level-3 Codex adapter smoke
+runner only. No coordinator/provider architecture re-review. No runtime code,
+tests, FTR lifecycle, or Project Memory modified. No real provider invoked.
+Baseline inspected:: implementation `c198d5b3`, evidence `dc5a9e5d`;
+`git diff 3611c5db..dc5a9e5d`.
+
+== 1. Verdict
+
+*B -- BOUNDED CORRECTION REQUIRED.*
+
+The runner exercises exactly the intended adapter boundary, is genuinely
+one-shot, keeps transport and semantic success distinct, uses the production
+schema path and the existing `validated_result()`, and runs on an ordinary
+non-Git workspace. Deterministic tests, ruff, and `git diff --check` all pass.
+
+However two durable-evidence truthfulness defects must be corrected and
+re-reviewed before a live one-shot Level-3 authorization:
+
+* *L3SR-R1 (IMPORTANT)* -- a real provider that has already launched can raise a
+  post-launch `OSError`/`ValueError` that the runner records as
+  "did not execute" (`invocation_attempted=false`,
+  `smoke_status=local_pre_execution_error`). This defeats the stated
+  highest-priority guarantee (failure truthfulness).
+* *L3SR-R3 (IMPORTANT)* -- `real_provider_compatibility_established` is set
+  `true` for any configured executable, including a fake, so the durable summary
+  overclaims what the generic runner can mechanically establish.
+
+Neither defect makes the smoke execute more than once, and neither is a safety
+breach; both are truthfulness-of-durable-evidence defects. Bounded correction is
+sufficient; material revision is not required.
+
+== 2. Boundary exercised
+
+Confirmed from code, not tests. `codex_adapter_smoke.py` imports only
+`adapter` (`ROUTING_RESULT_ENVELOPE_CONTRACT`, `AgentExecutionRequest`,
+`Invocation`, `ResultValidationError`, `validated_result`), `codex_adapter`
+(`CodexCliAdapter`, `CodexCliError`), and `persistence.atomic_write_json`.
+
+The lifecycle path is:
+
+  Invocation -> AgentExecutionRequest -> CodexCliAdapter.execute()
+    -> AgentExecutionOutcome -> validated_result()
+
+It does *not* import or exercise `run_one_hop`/`run_real_one_hop`, the reducer,
+Run/Hop construction or persistence, dispatch/reconcile, Git facts, Git
+mutation, `evidence`, `prompt` assembly, or `proof_harness`. This satisfies the
+FTR Level-3 preparation authorization and stays materially smaller than the
+Level-4 coordinator E2E.
+
+Layering note (non-finding): importing `persistence.atomic_write_json` pulls in
+`persistence`, whose module top imports `reducer` and `model` Run/Hop symbols.
+No lifecycle is *exercised*; this is ordinary reuse of the generic atomic-write
+helper, which the review scope explicitly excludes as a layering defect.
+
+== 3. One-shot / operator safety
+
+* *Fresh-root guard.* `smoke_root.mkdir()` is called without `parents=True`; an
+  existing root raises `FileExistsError` and returns exit 2 *before* the adapter
+  is constructed, before `adapter.execute()`, and before any subprocess launch.
+  `mkdir` is an atomic create, so two concurrent processes cannot both win it.
+  This is a sufficient operator one-shot guard for "the same fixed smoke root
+  cannot accidentally be reused"; no cryptographic/central machinery is needed.
+* *Exactly one invocation.* There is a single `adapter.execute()` call. There is
+  no loop, no retry, no resume, and every failure path returns rather than
+  re-invoking. No failure path can call the adapter a second time.
+* *No partial-setup re-entry.* On the caught-exception path the runner returns
+  after writing the summary; it does not retry with a different root.
+
+WATCH (W3, non-blocking): a non-`FileExistsError` `mkdir` failure (missing
+parent, permission) propagates uncaught with no summary. This is strictly
+pre-execution -- no root, no adapter, no launch -- so truthfulness is preserved
+(there is simply no misleading artifact). Cosmetic only.
+
+== 4. Failure truthfulness (highest priority)
+
+=== L3SR-R1 -- post-launch exceptions misreported as pre-execution (IMPORTANT)
+
+*Invariant.* If the durable summary records `invocation_attempted=false` and
+`smoke_status=local_pre_execution_error`, the provider/process must provably not
+have started.
+
+*Evidence.* The runner catches `(CodexCliError, OSError, ValueError)` around
+`adapter.execute()` (`codex_adapter_smoke.py:113-116`) and, on any of them,
+keeps the `_summary_base` defaults `invocation_attempted=false` /
+`smoke_status="local_pre_execution_error"`.
+
+Inspecting the *actual* `CodexCliAdapter.execute()`:
+
+* The only pre-launch `OSError` -- the `subprocess.Popen` failure -- is converted
+  to `CodexCliError` (`codex_adapter.py:160-161`). So a *raw* `OSError` reaching
+  the runner cannot be the launch failure; it necessarily comes from later code.
+* `os.killpg(child.pid, signal.SIGTERM|SIGKILL)` on the timeout path
+  (`codex_adapter.py:167,171`) raises `ProcessLookupError` (an `OSError`) if the
+  child's process group has already exited -- a launch-then-race, i.e. the
+  provider *did* run (indeed it ran long enough to time out).
+* `result.read_text(encoding="utf-8")` (`codex_adapter.py:173`) runs after the
+  child completes. If the real provider writes non-UTF-8 bytes to the
+  last-message file, this raises `UnicodeDecodeError`, which is a subclass of
+  `ValueError` -- again after the provider ran and produced output.
+
+*Failure.* Both cases are caught by the runner's `except` and produce a durable
+`smoke-summary.json` asserting the provider did not execute, when it did. In a
+one-shot smoke whose entire value is a truthful durable record -- and which
+cannot be re-run against the same root -- this is an epistemically false
+artifact and directly violates the highest-priority guarantee.
+
+*Bounded correction (do not implement).* The adapter already defines
+`ExecutionNotStartedError` (`adapter.py:27`) precisely to mark "the port was not
+entered." The smallest truthful fix is to make the *pre-launch* failures the
+only ones that surface as a not-started class, and to have the runner classify
+as `local_pre_execution_error` only that class -- treating any other exception
+raised at or after the `Popen` boundary as a distinct executed/indeterminate
+outcome (e.g. `invocation_attempted=true`, `smoke_status="post_execution_error"`
+or `transport_failure`). Because the runner cannot distinguish pre- from
+post-launch `OSError`/`ValueError` from the outside, the correction legitimately
+touches the adapter's exception typing (reusing the existing not-started class)
+and/or the runner's classification; it is not an adapter redesign.
+
+*Regression surface.* A new focused test in which the fake executable launches,
+then writes non-UTF-8 bytes to the `--output-last-message` file (and a separate
+test simulating a killpg/`ProcessLookupError` on timeout), asserting the summary
+records execution rather than `local_pre_execution_error`.
+
+== 5. Uncaught post-root failures (durable-evidence gap)
+
+=== L3SR-R2 -- post-execution exceptions escape with no summary (MINOR)
+
+*Invariant.* After the smoke root exists and the provider may have executed, the
+runner should persist a truthful `smoke-summary.json` where feasible.
+
+*Evidence.* The runner writes the summary only at two points: line 115 (caught
+pre/execution exception path) and line 156 (normal terminal path). Between
+successful `adapter.execute()` and line 156, several statements are outside any
+`try`:
+
+* `schema_path.read_bytes()` for the SHA-256 fingerprint
+  (`codex_adapter_smoke.py:129`) can raise `OSError`.
+* `validated_result(...)` catches only `ResultValidationError`
+  (`codex_adapter_smoke.py:135`); any other exception escapes.
+* an unexpected non-`(CodexCliError|OSError|ValueError)` exception from
+  `execute()` (e.g. a bare `RuntimeError`) escapes the R1 `try` entirely.
+
+*Failure.* In each case `run_smoke` raises with the root present and no
+`smoke-summary.json`, even though the provider ran -- avoidable missing evidence,
+distinct from the acceptable unavoidable case where the summary *write itself*
+fails.
+
+*Bounded correction (do not implement).* Emit the summary on a best-effort
+finally/guard covering the post-root region so post-execution outcomes are
+durable wherever the filesystem still permits; do not build a generalized
+failure framework.
+
+*Regression surface.* A test forcing a post-execution error (e.g. unreadable
+schema file) asserting a summary is still written with execution recorded.
+
+== 6. Durable evidence semantics
+
+=== L3SR-R3 -- `real_provider_compatibility_established` overclaims (IMPORTANT)
+
+*Invariant.* A durable field is truthful evidence for what the runner can
+mechanically establish, standalone.
+
+*Evidence.* `real_provider_compatibility_established` is set `true` whenever
+transport succeeded and a correlated candidate validated
+(`codex_adapter_smoke.py:146-148`), independent of `--executable`. The
+deterministic success test asserts it `true` for a *fake* executable
+(`test_codex_adapter_smoke.py:70`). The companion evidence artifact itself
+states the runner "does not establish real Codex/OpenAI compatibility."
+
+*Overclaim.* The generic runner cannot mechanically establish real-provider
+compatibility; the field asserts it anyway, and a fake-executable run leaves a
+durable JSON claiming it. This is option *B* of the review's adversarial
+question: the field is not merely evidence for the configured executable, it
+names a stronger conclusion the runner cannot support.
+
+*Bounded correction (do not implement).* Rename/narrow to a smoke-local success
+fact, e.g. `configured_executable_smoke_succeeded`, and leave real-provider
+compatibility to be inferred by the maintainer lifecycle from the actual
+authorized invocation configuration (`executable=codex`). Do not remove
+executable injection -- deterministic tests require the fake seam. The property
+that matters is truthfulness of the durable record.
+
+*Regression surface.* The existing success test updated to assert the narrowed
+field, plus an assertion that no field claims real-provider compatibility when
+`--executable` is a fake path.
+
+=== L3SR-R4 -- configuration record omits timeout (MINOR)
+
+*Evidence.* `_summary_base` records `executable`, `model`, and
+`reasoning_effort` (`codex_adapter_smoke.py:48-67`) but not `timeout_seconds`,
+though the timeout is a material part of the boundary handed to
+`CodexCliAdapter`. A later reader of the durable summary cannot confirm the
+timeout the smoke actually used.
+
+*Bounded correction (do not implement).* Add `timeout_seconds` to the summary.
+The recorded `executable`/`model`/`reasoning_effort` values are otherwise the
+actual configuration passed to the adapter.
+
+*Operator-contract recommendation.* Because `--executable`, `--model`,
+`--reasoning-effort`, and `--timeout-seconds` are all unconstrained CLI
+overrides, a future authorized smoke could test a materially different boundary
+than intended. The eventual live authorization should pin these -- at minimum
+`executable=codex` and the intended model/reasoning/timeout -- in the prescribed
+operator command rather than leaving them open. No config framework is needed.
+
+== 7. Validation / correlation
+
+* *Correlation.* `run_id=SMOKE-<uuid4>` (smoke-only, not a coordinator Run),
+  `hop_id="H001"` (correlation vocabulary only), `invocation_id=INV-<uuid4>`
+  (fresh). The prompt requests those exact IDs, and `validated_result()`
+  independently re-checks identity (`adapter.py:112-115`).
+* *Semantic validity.* The requested minimal `RoutingResult`
+  (`outcome=completed`, `requested_route=done`, false `scope_changed`/
+  `requires_human`, null escalation, empty findings/commits/evidence) is accepted
+  by the existing `routing_result_from_data` validator (`serialization.py:410`);
+  no smoke-specific semantic contract is invented. Confirmed by the passing
+  success test.
+* *Stricter Level-3 success rule.* Smoke success requires `returncode==0` and
+  `timed_out==false` and a valid correlated candidate
+  (`codex_adapter_smoke.py:145-149`). This is a runner-local transport criterion;
+  it does not touch the coordinator's general rule that a nonzero-returncode
+  candidate may still be semantically meaningful (the adapter and
+  `validated_result()` are unchanged).
+* *Transport vs semantic separation.* The summary records transport facts
+  (`returncode`, `timed_out`, `diagnostics`, `stdout_tail`, `stderr_tail`,
+  `candidate_result_present`) separately from `semantic_validation_succeeded`
+  and `semantic_result_summary`.
+* *Exit statuses.* success 0; existing root 2 (pre-construction); caught
+  pre/execution failure 1; transport failure 1; semantic failure 1; timeout 1
+  (transport). The three exit-1 classes are distinguished in the durable summary
+  via `smoke_status`, which is adequate.
+
+=== 8. Production schema path
+
+Confirmed the runner does not build its own OpenAI schema.
+`CodexCliAdapter.execute()` calls `structured_result_envelope_openai_schema()`
+and writes it to `structured-result.schema.json`, passing it as
+`--output-schema` (`codex_adapter.py:151-153,138-144`). The runner's
+`result_schema_sha256` fingerprints exactly that emitted file
+(`codex_adapter_smoke.py:127-129`), so it is truthful, useful evidence rather
+than decorative metadata. (The `read_bytes()` there is one of the R2 uncaught
+paths.)
+
+=== 9. Non-Git guarantee
+
+From code: the runner runs no git command, performs no git init, calls no
+coordinator Git helper, and the workspace is an ordinary `mkdir` directory. The
+adapter argv contains no git.
+
+WATCH (W1, non-blocking): the adapter argv uses `--sandbox workspace-write` and
+`--ask-for-approval never` (`codex_adapter.py:139-144`); the prompt's "Do no
+repository, shell, tool, or Git work" is a *request*, not an enforced sandbox.
+Requested behavior is not enforced behavior. Blast radius is contained (a
+throwaway, non-Git, `--ephemeral` workspace). Adapter-owned and out of scope to
+change here; recorded so the eventual authorization does not read the prompt as
+a hard sandbox guarantee.
+
+== 7. Tests
+
+The six focused tests pass and adversarially establish: fake success with a
+single execution and an ordinary non-Git workspace (asserts no `.git`);
+existing-root rejection before the fake runs (marker never written, no summary);
+nonzero transport failure that is truthful and not retried; malformed candidate
+as semantic failure; uncorrelated candidate as semantic failure (with the
+production "does not correlate" diagnostic); and a bounded timeout as transport
+failure without retry. The fake executable genuinely exercises the production
+adapter path: it reads the prompt from stdin, parses the correlation IDs, and
+writes to the path given by `--output-last-message`, so the production argv and
+result-carrier handling are under test rather than bypassed.
+
+Coverage gap tied to findings: no test exercises a *post-launch* adapter failure
+(R1) -- non-UTF-8 output file or killpg race -- and none asserts a durable
+summary survives a post-execution error (R2). These are the important failure
+classes to add before a live Level-3 invocation.
+
+== 8. Findings
+
+[cols="1,1,3,2",options="header"]
+|===
+| ID | Severity | Summary | Disposition
+
+| L3SR-R1 | IMPORTANT
+| Post-launch `OSError`/`ValueError` from `execute()` (killpg race;
+  non-UTF-8 last-message `read_text`) is caught and recorded as
+  `invocation_attempted=false` / `local_pre_execution_error`.
+| Correct before live Level-3; re-review.
+
+| L3SR-R3 | IMPORTANT
+| `real_provider_compatibility_established=true` for any configured executable,
+  including a fake; durable summary overclaims.
+| Rename/narrow before live Level-3; re-review.
+
+| L3SR-R2 | MINOR
+| Post-execution exceptions outside the caught set (schema fingerprint read,
+  unexpected `execute()`/`validated_result()` errors) escape with no summary.
+| Best-effort durable summary over the post-root region.
+
+| L3SR-R4 | MINOR
+| Durable summary omits `timeout_seconds`; all four adapter parameters are
+  unconstrained CLI overrides.
+| Record timeout; pin parameters in the live operator command.
+
+| W1 | WATCH
+| Adapter sandbox is `workspace-write` / approval `never`; no-tool/no-Git is
+  requested, not enforced.
+| Note in authorization; contained blast radius.
+
+| W3 | WATCH
+| Non-`FileExistsError` `mkdir` failure propagates uncaught (pre-execution,
+  truthfulness preserved).
+| Cosmetic.
+|===
+
+*Acceptance-question mapping.* Could a defect make the eventual one-shot real
+smoke: execute more than once -- *no*; misreport whether it executed -- *yes
+(R1)*; falsely report compatibility -- *yes (R3)*; lose diagnostically necessary
+evidence -- *partly (R2, R4)*; test a materially different boundary than intended
+-- *only via unconstrained overrides (R4 operator contract)*.
+
+== 9. Non-findings / scope exclusions
+
+Not pursued and not defects for this review: `AgentExecutionPort`/adapter/OpenAI
+schema redesign; provider registry or Claude support; a generic smoke framework;
+the proof harness; Run/Hop/reducer cleanup; Git authority; Slice 4B/5; S4AC-R4;
+`VerticalRunError`; Project Memory. The transitive `persistence -> reducer`
+import (section 2) and the requested-vs-enforced sandbox (W1) are noted but not
+counted as runner defects. No real Codex/OpenAI/Anthropic provider was invoked;
+Level 3 was not executed or authorized; Level 4 was not authorized.
+
+== 10. Required next lifecycle action
+
+. Maintainer/implementer applies the bounded corrections for *L3SR-R1* and
+  *L3SR-R3* (and preferably *L3SR-R2*, *L3SR-R4*) on `main`, in a commit separate
+  from this review artifact, with the regression tests named above.
+. A short follow-up review confirms R1/R3 closed and durable-summary truthfulness
+  restored.
+. Only then may the maintainer separately author the one-shot real Level-3
+  Codex/OpenAI smoke, prescribing the exact command and a fixed fresh smoke-root
+  pattern, e.g.:
++
+[source,text]
+----
+.venv/bin/python scripts/workflow_coordinator/codex_adapter_smoke.py \
+    --smoke-root <FRESH PATH>
+----
++
+with `executable`/`model`/`reasoning-effort`/`timeout-seconds` pinned to the
+intended values. No heredoc, manual JSON, prompt paste, shell pipeline, or Git
+preparation is required by the runner.
+
+== 11. Level-3 success-claim boundary (for the future authorization)
+
+If a separately authorized real execution succeeds, only the following may be
+claimed: the current Codex CLI starts; the current OpenAI/Codex strict
+structured-output schema is accepted; an output carrier is returned; the
+provider-neutral correlation/validation accepts the result; the current adapter
+contract works in one tiny real invocation. It does *not* prove the coordinator
+Run/Hop lifecycle, Git behavior, reconcile, findings convergence, the Slice-4A
+E2E, routine repository use, Slice 4B, or Slice 5. Code and evidence naming must
+not collapse these -- which is exactly why *L3SR-R3* must be corrected first.
+
+== Validation
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator/test_codex_adapter_smoke.py`
+  -- PASS (6).
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator` -- PASS (118).
+* `.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator`
+  -- PASS.
+* `git diff --check` -- clean.
+* No real provider, Codex, OpenAI, Claude, or Anthropic invocation. Level 3 not
+  executed. Level 3 not authorized by this review. Level 4 not authorized.
