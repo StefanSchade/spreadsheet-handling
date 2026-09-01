@@ -1,0 +1,575 @@
+= Agent Workflow Coordinator -- Provider-Boundary Architecture Review
+:toc:
+:toclevels: 3
+
+Status:: *ARCHITECTURE/DESIGN REVIEW ONLY. NO IMPLEMENTATION, NO PROVIDER
+INVOCATION, NO NEW LIVE AUTHORIZATION.* Verdict *A*: an explicit
+provider-neutral execution port, a Codex/OpenAI-specific adapter that owns
+transport-schema projection and CLI mechanics, and an offline provider-conformance
+layer are required before another Slice-4A live E2E proof.
+Date:: 2026-09-01
+Reviewer role:: Independent read-only architecture/design review.
+Baseline:: `455e456e` -- `docs(workflow): record corrected slice 4a live schema failure`.
+Authority:: `docs/backlog/FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc` (sections 11.4,
+11.4.1--11.4.4); accepted design
+`docs/warm_storage/concepts/agent_workflow_coordinator_proposed_architecture_2026-08-25.adoc`.
+Prior evidence/reviews:: `ae5d36c3` (R10 live-failure evidence), `75c63d4f` (R10
+review), `455e456e` (corrected live-failure record + FTR update).
+Method:: Reconstructed from repository artifacts and Git history, not conversation.
+No runtime code, FTR, or Project Memory was modified.
+
+== 1. Executive conclusion
+
+The two live Slice-4A proofs failed for the *same architectural reason expressed
+in two different fields*: the end-to-end coordinator proof is the first place the
+system exercises the OpenAI/Codex *strict Structured Outputs dialect*, so the
+expensive E2E is discovering that dialect one rule at a time.
+
+* Proof 1 (11.4.2, `ae5d36c3`): inner `result` was `{"type":"object"}` -- rejected
+  because strict mode requires `additionalProperties:false` and a complete object.
+  Fixed as S4A-R10 (`6bfad5bb`/`41ff4e35`).
+* Proof 2 (11.4.4, `455e456e`): the corrected schema's `schema_version:{"const":1}`
+  node was rejected because strict mode requires a `type` key on *every* schema
+  node, `const` included. Not yet fixed; maintainer stopped field-level patching.
+
+The dialect rules ("every object strict and complete", "every node typed") are
+*Codex/OpenAI transport facts*, not `RoutingResult` semantics. They currently live
+in the provider-neutral `serialization.py`, and the CLI mechanics that carry them
+live inline in `slice4.py` mixed with coordinator orchestration. The offline test
+suite encodes only the two rules discovered *so far*, so it cannot pre-empt the
+next one. That is the root cause of incremental discovery.
+
+The fix is not "adopt hexagonal architecture." It is a small, concrete relocation
+of responsibility plus one missing test layer:
+
+. lift the OpenAI strict-schema *projection* out of `serialization.py` and behind a
+  Codex adapter, leaving the *canonical semantic contract* in the domain;
+. give the already-existing `Adapter` port enough shape to carry invocation
+  identity, timeout, result contract, and a structured transport outcome (today
+  these bypass the port or are smuggled back by mutation);
+. add an offline provider-conformance layer that encodes the *documented* OpenAI
+  strict subset in full, so the E2E stops being the discovery mechanism;
+. add one tiny separately-authorized real smoke/probe below the coordinator before
+  the next full E2E.
+
+Verdict *A*. This is a bounded, incremental, code-working-at-each-step sub-slice,
+not a redesign. Slice 4B and Slice 5 remain gated behind it.
+
+== 2. Current dependency map
+
+Intra-module import directions (verified from `scripts/workflow_coordinator/`):
+
+[source,text]
+----
+model.py            (leaf; no intra imports)          DOMAIN
+git_facts.py        (leaf; no intra imports)          APP/OBSERVATION
+reducer.py     -> model                               DOMAIN
+evidence.py    -> model                               APP/OBSERVATION
+prompt.py      -> model                               APP (semantic assembly)
+serialization.py -> model                             DOMAIN contract
+                    + routing_result_json_schema()    <-- PROVIDER DIALECT LEAK
+                    + structured_result_envelope_schema()
+adapter.py     -> model, serialization                PORT + result validation
+                    Adapter Protocol: invoke(prompt, repository) -> str
+vertical.py    -> adapter, evidence, git_facts,       APP orchestration (N=1)
+                  model, persistence, prompt, reducer  (provider-neutral)
+persistence.py -> model, reducer, serialization       APP state
+slice4.py      -> adapter, git_facts, model,          MIX: Codex adapter (D)
+                  persistence, prompt, serialization,      + orchestration (B)
+                  vertical
+proof_harness.py (operator/harness; defaults codex)   OPERATOR
+----
+
+Reading of the map:
+
+* The *domain/semantic core* (`model`, `reducer`, and the `RoutingResult`
+  parsing/validation in `serialization`) and the *provider-neutral orchestration*
+  (`vertical`, `git_facts`, `evidence`, `prompt`, `persistence`) are already
+  provider-neutral: no `codex`/`openai`/`gpt-` token appears in them.
+* `vertical.run_one_hop` already consumes the abstract `Adapter` port and never
+  names a provider -- this is the load-bearing seam and it is healthy.
+* Exactly two files carry provider-specific knowledge: `serialization.py` (the
+  strict-dialect *schema projection*) and `slice4.py` (CLI argv/flags/model/
+  sandbox/process-group + the same orchestration `vertical` already does).
+  `proof_harness.py` only *defaults* an executable name; that is an operator
+  concern, acceptable.
+
+The accepted architecture (design doc section 3) already names an "Agent adapter"
+boundary: "Invoke one configured local agent ...; capture output. It is not a
+universal adapter, credential store, or sandbox." The current code has the port
+(`Adapter`) and a concrete implementation (`_CodexAdapter`) but has not finished
+pushing provider dialect and CLI mechanics behind that boundary.
+
+== 3. Concrete coupling findings
+
+Each finding: current owner -> correct owner -> why. These are dependency-direction
+defects that inhibit provider replacement, conformance testing, and a future second
+adapter -- not mere imports.
+
+=== PB-1 (material) -- OpenAI strict-dialect projection sits in the domain serializer
+
+`serialization.py:452 routing_result_json_schema()` and `:497
+structured_result_envelope_schema()` encode OpenAI Structured Outputs *dialect*
+rules: `additionalProperties:false` on every object, `set(required)==set(properties)`,
+enum/`anyOf` shape, and (by omission) the "every node needs `type`" rule that
+11.4.4 hit. These are not `RoutingResult` semantics; they are one provider's
+transport constraints.
+
+* Current owner: `serialization.py` (imports only `model`; otherwise
+  provider-neutral).
+* Correct owner: a Codex/OpenAI transport-projection behind the adapter. The
+  *canonical semantic contract* (required-key sets, nullable rules, enums) stays in
+  the domain and is the single source the projection derives from.
+* Why it matters: a second provider (e.g. Claude) needs a *different* transport
+  representation from the *same* semantic contract. With the projection fused into
+  the domain serializer, adding a provider means editing shared domain code, and
+  the drift-guard tests conflate "the semantic contract" with "OpenAI's dialect."
+  The 11.4.4 failure is precisely a dialect rule the domain serializer got wrong.
+
+=== PB-2 (material) -- `slice4.py` conflates the Codex adapter with coordinator orchestration
+
+`slice4.py` mixes two layers in one file:
+
+* Codex-specific (belongs in an adapter): `invoke_codex()` builds argv
+  (`--ask-for-approval never`, `exec --ephemeral --json --color never --sandbox
+  workspace-write`), pins `--model gpt-5.6-terra` and `model_reasoning_effort`,
+  wires `--output-schema`/`--output-last-message`, launches a process group, and
+  maps timeout/`SIGTERM`/`SIGKILL` and returncode.
+* Provider-neutral (belongs in orchestration/`vertical`): `run_real_one_hop()`
+  does dispatch-marker write, external-trusted-state-root enforcement, checkout
+  association validation, run-snapshot/checkpoint persistence, and
+  `reconcile`/uncertain-recovery -- none of which is Codex-specific and much of
+  which duplicates `vertical.run_one_hop`.
+
+* Correct owners: CLI mechanics -> `CodexCliAdapter`; orchestration ->
+  `vertical`/application layer reused unchanged for any adapter.
+* Why: a second adapter must not reimplement checkout association, reconcile, or
+  persistence, and the Codex CLI contract must be changeable without touching Hop
+  accounting.
+
+=== PB-3 (material) -- the `Adapter` port is too thin, so provider facts bypass it
+
+`adapter.py:26 Adapter.invoke(prompt, repository) -> str` cannot express the facts
+the real path actually needs. Evidence of the mismatch, all in `slice4.py`:
+
+* `invoke_codex` receives `expected: Invocation`, `timeout_seconds`, `state_root`,
+  and `association` *directly*, not through the port.
+* `_CodexAdapter` (a `@dataclass`, not frozen) returns the result *string* but
+  smuggles the structured `CodexOutcome` (returncode, `timed_out`, stdout/stderr
+  tails, `acceptance`) back to the caller by mutating `self.outcome` as a
+  side-channel (`slice4.py:191, 194, 233, 250`). `run_real_one_hop` then reads
+  `adapter.outcome` to build evidence.
+
+* Correct owner: a richer port whose *return type* carries the transport outcome
+  and bounded diagnostics, and whose *request* carries invocation identity, result
+  contract, timeout, and an execution-policy/capability request.
+* Why: the side-channel mutation is the concrete symptom that the port does not
+  model what the coordinator needs; every adapter would have to reinvent the same
+  smuggling. A typed return also lets Level-1 tests assert diagnostics without a
+  process.
+
+=== PB-4 (material) -- offline strictness invariant encodes only rules discovered so far
+
+`tests/unit/workflow_coordinator/test_slice4.py:135
+test_structured_result_schema_makes_every_object_strict_and_complete` walks object
+schemas and asserts only `additionalProperties is False` and
+`set(required)==set(properties)`. It never asserts that *every* schema node
+(including `const`/`enum`/leaf nodes) carries a `type`. That is exactly the rule
+11.4.4 discovered live. Tests are green (72 passed) yet the emitted schema is
+provider-invalid.
+
+* Current owner: a single ad-hoc walker in one test.
+* Correct owner: a named offline *conformance* check that encodes the full
+  *documented* OpenAI strict subset and runs over the adapter's projected schema.
+* Why: this is the mechanism by which the expensive E2E stopped being able to
+  catch dialect errors; encoding the documented subset offline is what ends
+  incremental live discovery.
+
+=== PB-5 (watch) -- `proof_harness.py` defaults a provider executable name
+
+`proof_harness.py:176,263` default `executable="codex"`. This is an operator
+default, not a domain coupling, and is acceptable. Note only: when the adapter
+seam is formalized, the harness should select an *adapter*, not an executable
+string, so provider identity is named in one place.
+
+Non-findings: `vertical`, `reducer`, `model`, `git_facts`, `evidence`, `prompt`,
+`persistence` contain no provider knowledge and need no change. Do not "clean them
+up."
+
+== 4. Proposed port/adapter boundary
+
+Smallest useful provider-neutral execution interface. This is *not* a plugin
+framework, registry, or dynamic discovery. One port, one concrete adapter, typed
+request/response.
+
+[source,python]
+----
+# provider-neutral (application layer) --------------------------------------
+@dataclass(frozen=True)
+class AgentExecutionRequest:
+    invocation: Invocation          # run_id, hop_id, invocation_id (identity)
+    prompt: str                     # already-assembled semantic prompt
+    repository: Path                # agent workspace
+    result_contract: ResultContract # canonical RoutingResult contract handle
+    timeout_seconds: float
+    capabilities: ExecutionPolicy   # writable-workspace? continuing-context? -- request, not flags
+
+@dataclass(frozen=True)
+class AgentExecutionOutcome:
+    disposition: str                # 'established' | 'uncertain' | 'transport_error'
+    result: RoutingResult | None    # semantic result iff Python-validated + correlated
+    transport: TransportOutcome     # returncode|None, timed_out, bounded stdout/stderr tails
+    diagnostics: tuple[str, ...]    # bounded, provider-neutral failure lines
+    provider_ref: str | None        # opaque adapter-owned reference/evidence pointer
+
+class AgentExecutionPort(Protocol):
+    def execute(self, request: AgentExecutionRequest) -> AgentExecutionOutcome: ...
+
+# Codex/OpenAI-specific (adapter layer) -------------------------------------
+class CodexCliAdapter(AgentExecutionPort):
+    # owns: argv/flags, --model, sandbox, --output-schema/--output-last-message,
+    #       process group + timeout mapping, OpenAI strict-schema projection,
+    #       Codex JSONL/stdout interpretation, Codex diagnostics.
+    ...
+----
+
+Boundary rules the port must hold:
+
+* The port MUST NOT expose Codex CLI flags, the model name, `--output-schema`,
+  sandbox flags, or the OpenAI JSON-Schema dialect. Those are adapter-internal.
+* `AgentExecutionOutcome.result` is the *semantic* `RoutingResult`, established
+  only by the existing Python `validated_result` correlation check -- unchanged
+  authority. `transport` carries the provider representation and diagnostics
+  separately; the two must not be merged (they were merged, informally, via
+  `adapter.outcome` today -- PB-3).
+* Migration is behaviour-preserving: today's `_CodexAdapter.invoke` + external
+  `adapter.outcome` read collapses into one typed `execute() -> AgentExecutionOutcome`.
+
+This keeps the port at "what the coordinator needs to dispatch one bounded agent
+Hop and reduce its result," matching design-doc section 3's Agent-adapter boundary,
+and no larger.
+
+== 5. Result-contract ownership
+
+Desired dependency direction (derived from the code, not imposed):
+
+[source,text]
+----
+canonical semantic RoutingResult contract        (domain: serialization/model)
+    |         required-key sets, enums, nullable rules -- ONE source
+    +--> Python validator            routing_result_from_data / validated_result   (domain)
+    +--> OpenAI/Codex strict projection   CodexCliAdapter                           (adapter)
+    +--> future Claude transport projection  ClaudeAdapter                          (adapter)
+----
+
+Where `routing_result_json_schema()` / `structured_result_envelope_schema()` should
+live: *the projection functions belong in the Codex/OpenAI adapter*, deriving their
+required-key lists and enums from the domain contract they already import
+(`FINDING_DELTA_KEYS`, `ROUTING_RESULT_REQUIRED_KEYS`, `FindingState`, `Outcome`,
+`ESCALATION_*`). The review `75c63d4f` section 6 correctly placed them in
+`serialization.py` *as the smallest S4A-R10 correction* -- that was right for that
+bounded hop and must not be criticized retroactively. The long-term correct owner
+is nonetheless the adapter: the strict-dialect facts are provider-specific, and
+11.4.4 is the proof that treating them as domain-level produced a provider-invalid
+artifact that passed domain tests.
+
+Concretely: keep in the domain the *canonical contract* (key sets, enums, nullable
+semantics, the Python validator). Move to the adapter the *strict-schema builder*
+that turns that contract into OpenAI's dialect. The drift-guard test then splits
+into (a) contract<->validator alignment (domain) and (b) projection-conforms-to-
+OpenAI-strict-subset (adapter conformance, section 8).
+
+== 6. Codex adapter responsibilities
+
+`CodexCliAdapter` owns, and is the *only* place that owns:
+
+* the `codex` executable, argv, `exec`/`--ephemeral`/`--json`/`--color`,
+  `--ask-for-approval`, `--sandbox workspace-write`, `--cd`;
+* `--model gpt-5.6-terra` and `model_reasoning_effort` selection;
+* `--output-schema` / `--output-last-message` wiring and reading;
+* the OpenAI strict Structured Outputs projection of the canonical contract;
+* process launch, `start_new_session`, timeout -> `SIGTERM`/`SIGKILL` process-group
+  mapping, returncode capture, bounded stdout/stderr tails;
+* Codex `--json` event-stream / `turn.failed` / HTTP-400 interpretation and
+  provider-diagnostic extraction;
+* Codex/OpenAI acceptance and conformance specifics.
+
+It does NOT own (these stay in the application/vertical layer, reused by any
+adapter): checkout association and external-trusted-state-root enforcement,
+dispatch-marker lifecycle, Git preflight/observation, reconcile/uncertain recovery,
+run-snapshot/checkpoint persistence, Hop accounting, evidence collection,
+prompt assembly, and the semantic `validated_result` correlation gate.
+
+== 7. Future Claude test (architectural probe only -- do not implement)
+
+If a `ClaudeAdapter` were added tomorrow, the following MUST remain untouched
+(today they already carry no provider token, so this is achievable):
+
+* `reducer.py`, `model.py` (Run/Hop/Finding), `persistence.py`, `evidence.py`,
+  `git_facts.py`, `prompt.py` (semantic assembly), `vertical.run_one_hop`, and the
+  Python `RoutingResult` validation/correlation in `adapter.validated_result` /
+  `serialization.routing_result_from_data`.
+
+New provider-specific code that WOULD be added: a `ClaudeAdapter` implementing
+`AgentExecutionPort`, its own transport projection of the *same* canonical
+contract into Claude's tool/output representation, its own CLI/SDK mechanics, and
+its own adapter-level conformance tests.
+
+Current decisions that make a second adapter awkward (all are the section-3
+findings): (a) the strict projection living in `serialization.py` (PB-1) forces a
+second provider to edit shared domain code; (b) the thin port + `adapter.outcome`
+side-channel (PB-3) forces every adapter to reinvent outcome smuggling; (c) the
+orchestration duplicated inside `slice4.py` (PB-2) invites a second copy. Fixing
+PB-1..PB-3 is exactly what makes a second adapter a *new file*, not a *domain edit*.
+
+== 8. Conformance ladder
+
+Design goal: the expensive coordinator E2E must stop being the first place a
+provider dialect rule is exercised. Four levels; each states what it proves and
+what it deliberately does not.
+
+*Level 1 -- pure/offline adapter tests (REQUIRED).* No process, no provider.
+Assert: the OpenAI strict-subset projection of the canonical contract satisfies the
+*full documented* strict rule set -- every object `additionalProperties:false`,
+`required==properties`, and *every schema node carries a `type`* (the PB-4 gap that
+would have caught 11.4.4), across `properties`, array `items`, and `anyOf`; argv
+construction; result parsing; diagnostic extraction; strictness invariants; the
+projection derives from the domain contract (drift guard). Proves: the adapter emits
+a provider-*valid*, contract-*complete* schema and parses results. Does NOT prove:
+the live provider accepts it (documentation may lag the live API).
+
+*Level 2 -- Codex CLI integration against a local stub/mock (PRACTICAL for argv/
+request-shape; UNCERTAIN for full request/response).* The Codex CLI is installed
+locally (`/usr/local/bin/codex`, `codex-cli 0.147.0`), so exercising *argv
+acceptance* and *`--output-schema` file handling* without a model call is
+practical. Driving the CLI's full request/response against a stubbed OpenAI
+endpoint depends on whether `codex-cli` supports a base-URL/endpoint override to a
+local mock; that is UNCERTAIN and must be investigated (not built) before being
+promised. Proves (if achievable): the CLI transmits the schema in the shape the
+provider will see. Does NOT prove: real-provider acceptance semantics.
+
+*Level 3 -- tiny real-provider adapter smoke/probe (RECOMMENDED before Level 4).*
+No coordinator Run, no Git workflow, no findings lifecycle: minimal prompt, the
+real strict envelope schema, one real invocation, assert the provider accepts the
+schema and returns a parseable correlated envelope. Authority/safety boundary: its
+own explicit one-shot maintainer authorization, disposable workspace, no `.git`
+authority needed, bounded evidence -- strictly smaller than a Slice-4A proof.
+Proves: current real Codex/OpenAI schema compatibility. Does NOT prove: the
+coordinator vertical, Git ownership, or reconcile.
+
+*Level 4 -- full coordinator E2E proof (only after Levels 1--3 green).* The
+existing Slice-4A one-shot live happy-path proof. Proves: the whole vertical
+(WFC-AUTO/GIT/OUTPUT/FAIL/SEC) end-to-end. Does NOT prove: anything Levels 1--3
+already isolate -- and must no longer be the place dialect rules are discovered.
+
+== 9. Documented contract vs empirical probe (section 7 of prompt)
+
+Separate three things and stop using live E2E as the exploration tool:
+
+* *Documented contract*: the OpenAI Structured Outputs strict-subset rules
+  (`additionalProperties:false` required and `false`; `required` must list every
+  key; every schema node must have `type`; limited keyword support). These are
+  encodable offline (Level 1) from primary OpenAI documentation and the local
+  `codex --help`/CLI surface -- consult those, do not invoke the provider.
+* *Locally testable contract*: argv/request-shape and schema-file handling via the
+  installed CLI (Level 2, to the extent practical).
+* *Real-provider smoke evidence*: one tiny Level-3 probe to confirm the live API
+  matches the documented contract at a moment in time.
+
+Continued field-by-field E2E trial-and-error is explicitly rejected as the design;
+the maintainer already stopped it. If network access is available, consult only
+primary OpenAI/Codex documentation to seed the Level-1 rule set; do not call the
+provider in this or the implementation work until Level 3 is separately authorized.
+
+== 10. Lifecycle / sub-slice recommendation
+
+Recommend option *B*: a small, explicit intermediate sub-slice before Slice-4A live
+closure. Rationale by the required criteria:
+
+* Authority clarity: the maintainer stopped field-level patching and asked for the
+  boundary to be decided *before* another provider-facing implementation; a named
+  sub-slice gives that decision a home and a consumable authorization, rather than
+  smuggling an architecture change into "4A hardening" (option A) or shipping
+  another provider-invalid schema (option C).
+* Reviewability: the change is a bounded relocation + one test layer; it is
+  independently reviewable against this document.
+* Implementation size: small (sections 4--8; ~ the same code moved, plus
+  conformance tests), and it leaves the code working at each step.
+* Lifecycle semantics: it is a *pre-live-proof gate*, distinct from both the
+  consumed 11.4.2/11.4.4 proof authorizations and from Slice 4B.
+
+Proposed shape (name/position only -- NOT authorized here):
+
+    Slice 4A-C -- provider-boundary / adapter-conformance hardening
+    Position: new section 11.4.5, before any further 11.4.x live happy-path proof.
+
+Reject option A (silent "hardening") because it hides an architectural boundary
+decision the maintainer must ratify. Reject option C (transport-only fix, defer
+architecture) because a `type=integer` field patch would re-enter incremental live
+discovery on the next unseen rule -- exactly what 11.4.4 forbids.
+
+== 11. Slice 4B / Slice 5 ordering
+
+Confirm the maintainer's ordering, with both later slices gated:
+
+    provider boundary + conformance (Slice 4A-C)
+        -> Slice 4A real N=1 happy-path closure (Level 4)
+        -> Slice 4B routine-repository Git authority hardening
+        -> Slice 5 N>1
+
+* Slice 4B SHOULD WAIT: it hardens Git ownership for routine repos; there is no
+  point hardening Git authority for a vertical whose provider output path cannot
+  yet complete once.
+* Slice 5 SHOULD WAIT: N>1 autonomy multiplies every provider-boundary defect;
+  it must not precede a proven single real Hop.
+
+No challenge to the ordering; only the insertion of 4A-C before 4A closure.
+
+== 12. Carve-out implications (stay in-repo now)
+
+Do not move files, split history, or create a package/repo now. Low-cost choices
+that keep a later history-preserving carve-out easy:
+
+* Keep the new port and `AgentExecutionOutcome`/`AgentExecutionRequest` types free
+  of spreadsheet, DMC, and `core`-specific vocabulary (they already would be).
+* Keep the canonical `RoutingResult` contract and the port in modules that do not
+  import spreadsheet-domain code (today `model`/`serialization`/`adapter` import no
+  spreadsheet domain -- preserve that).
+* Name the adapter for its provider (`CodexCliAdapter`), not for this repository,
+  so a carve-out copies "coordinator core + port + adapter" as a unit.
+* Keep `prompt.py` semantic assembly free of spreadsheet specifics (it is).
+
+These are documentation/naming disciplines, not new abstraction; do not
+pre-build a provider-registry or config surface for a hypothetical split.
+
+== 13. Minimum implementation plan (bounded; do NOT implement here)
+
+Incremental, code-working-after-each-step. Challenge to the prompt's six-step
+shape: steps 1--2 should be *one* commit because splitting the port introduction
+from the projection move leaves a half-wired seam; and a code-generator/framework
+is explicitly excluded.
+
+. *Step 1 -- seam + projection move (one behaviour-preserving commit).* Introduce
+  `AgentExecutionPort` and typed request/outcome; convert `_CodexAdapter` into
+  `CodexCliAdapter.execute()` returning `AgentExecutionOutcome` (removing the
+  `adapter.outcome` side-channel, PB-3); move `routing_result_json_schema()` /
+  `structured_result_envelope_schema()` into the adapter, deriving from the domain
+  contract (PB-1); leave `vertical`/orchestration reused unchanged. All existing
+  tests stay green.
+. *Step 2 -- collapse `slice4.py` orchestration onto `vertical`* so the Codex path
+  reuses the provider-neutral Hop path (PB-2), keeping external-state-root/reconcile
+  semantics identical.
+. *Step 3 -- offline conformance layer (Level 1)*: encode the full documented
+  OpenAI strict subset incl. the "every node typed" rule (PB-4); split the
+  drift-guard into contract<->validator and projection<->dialect.
+. *Step 4 -- investigate Level-2 CLI/stub practicality* (base-URL override?);
+  add argv/schema-file tests that are achievable; do not force a stub if the CLI
+  cannot target a local endpoint.
+. *Step 5 -- separately-authorized tiny real Level-3 smoke/probe* (its own one-shot
+  authorization), to confirm live compatibility below the coordinator.
+. *Step 6 -- only then re-authorize the full Slice-4A E2E (Level 4).*
+
+Avoid (explicitly out of scope): generic plugin framework, provider registry,
+dynamic discovery, provider-routing system, premature Claude implementation, new
+package/repository, broad cleanup of the already-neutral modules.
+
+== 14. Risks and rejected alternatives
+
+* *Rejected: one-line `schema_version:{"type":"integer","const":1}` patch.* It would
+  likely pass this node and re-enter live discovery on the next unseen strict rule;
+  it is the exact pattern 11.4.4 forbids and the maintainer stopped. It also leaves
+  PB-1..PB-4 intact.
+* *Rejected: full hexagonal build-out / registry / capability negotiation.* No
+  current change pressure supports it; it violates the human-readability/locality
+  guidance and the "no generic framework" constraint.
+* *Rejected: leave projection in `serialization.py` and only add tests.* Tests alone
+  cannot fix the dependency direction that makes a second adapter a domain edit; and
+  a domain-owned dialect keeps conflating "contract" with "OpenAI's rules."
+* *Risk: Level-2 stub may be impractical.* Mitigated by making Level 1 + Level 3 the
+  required gates and Level 2 best-effort; the ladder does not depend on Level 2.
+* *Risk: documented strict subset may lag the live API.* Mitigated by the Level-3
+  smoke as a dated empirical confirmation; but Level 1 still ends *incremental*
+  discovery of already-documented rules, which is the actual failure mode observed.
+* *Watch: `supports_parallel_tool_calls` models-cache warning* remains
+  UNRELATED/WATCH (per `75c63d4f` section 9); out of scope here.
+
+== 15. Human readability / locality
+
+The recommended design lets a maintainer locally reconstruct, in one place each:
+semantic authority (`model`/`reducer`/`serialization` contract), execution boundary
+(`AgentExecutionPort`), provider-specific behaviour (`CodexCliAdapter`), conformance
+expectations (Level-1 adapter conformance tests), and failure ownership (transport
+diagnostics on `AgentExecutionOutcome`, semantic acceptance on `validated_result`).
+No abstraction is added whose only benefit is fewer lines.
+
+== 16. Maintainer decisions required
+
+. Accept verdict *A* and the option-*B* sub-slice (proposed `Slice 4A-C`, new
+  section 11.4.5) before another live proof? (authorization is a separate act)
+. Ratify the port surface in section 4 (request/outcome fields), specifically
+  whether `capabilities`/`ExecutionPolicy` is in-scope for V1 or deferred.
+. Confirm the projection functions move from `serialization.py` into the Codex
+  adapter (section 5), accepting that `75c63d4f` deliberately placed them in
+  `serialization.py` as the minimal R10 fix.
+. Confirm Level 3 (tiny real smoke) is desired before the next Level-4 E2E, and
+  that it will carry its own one-shot authorization.
+. Confirm Slice 4B and Slice 5 remain gated behind 4A-C + 4A closure.
+
+== 17. Lifecycle cleanup check
+
+This is a read-only architecture review; it declares no FTR/BUG workstream green
+and performs no cleanup. FTR-AGENT-WORKFLOW-COORDINATOR-P5 remains active and
+correctly so: Slice 4A live happy-path is unproven, and this review recommends a
+new pre-closure sub-slice rather than closing anything. No includes should be
+removed from `docs/backlog/_ftrs_open.adoc`; no companion artifacts move to
+`docs/cold_storage/backlog/ftrs_done/`. Residual scope (the provider boundary) is
+the subject of the recommended, not-yet-authorized, sub-slice. Release notes: no
+user-facing/public-surface change occurs in this review; the eventual sub-slice
+touches only internal `scripts/workflow_coordinator/` structure and tests, so a
+release note is not expected unless the port becomes a documented surface -- the
+implementer of 4A-C makes that call at implementation time.
+
+== 18. Validation performed (read-only)
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator` -> 102 passed (green at
+  baseline `455e456e`; confirms PB-4 -- the provider-invalid schema passes the
+  offline suite).
+* `.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator`
+  -> All checks passed.
+* `git diff --check` -> clean.
+* `asciidoctor` render of this artifact -> see commit validation.
+* No provider invocation of any kind.
+
+== 19. Final report
+
+----
+CURRENT DOMAIN/PROVIDER COUPLING MATERIAL:                 YES
+EXPLICIT AgentExecutionPort RECOMMENDED:                   YES
+CODEX-SPECIFIC ADAPTER RECOMMENDED:                        YES
+OPENAI STRICT-SCHEMA PROJECTION BELONGS BEHIND ADAPTER:    YES
+FUTURE CLAUDE ADAPTER CAN SHARE DOMAIN CONTRACT:           YES
+OFFLINE CONFORMANCE LAYER REQUIRED:                        YES
+LOCAL CLI/STUB TEST PRACTICAL:                             UNCERTAIN
+    (Codex CLI 0.147.0 installed; argv/schema-file level practical,
+     full request/response vs local stub depends on base-URL override)
+TINY REAL PROVIDER SMOKE BEFORE E2E RECOMMENDED:           YES
+FULL E2E SHOULD STOP DISCOVERING PROVIDER DIALECT RULES:   YES
+NEW SUB-SLICE RECOMMENDED:                                 YES
+SUB-SLICE NAME / POSITION:
+    Slice 4A-C -- provider-boundary / adapter-conformance hardening;
+    new section 11.4.5, before any further 11.4.x live happy-path proof.
+SLICE 4B SHOULD WAIT:                                      YES
+SLICE 5 SHOULD WAIT:                                       YES
+CURRENT REPOSITORY SHOULD BE SPLIT NOW:                    NO
+DESIGN SHOULD REMAIN CARVE-OUT-FRIENDLY:                   YES
+PROJECT MEMORY UPDATED:                                    NO
+STRATEGIC PM PROMOTION LIKELY AFTER MAINTAINER ACCEPTANCE: YES
+    (an accepted provider-boundary direction is a strategic concern worth
+     promoting; individual slice/proof/review transitions are not)
+REAL PROVIDER INVOCATIONS PERFORMED:                       0
+ARCHITECTURE VERDICT:                                      A
+BOUNDED IMPLEMENTATION PLAN READY:                         YES
+READY FOR MAINTAINER ARCHITECTURE DISPOSITION:             YES
+REVIEW COMMIT:
+    <filled after commit>
+----
