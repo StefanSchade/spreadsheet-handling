@@ -1,0 +1,537 @@
+= Agent Workflow Coordinator -- Slice 4A-C Independent Implementation Review
+:toc:
+:toclevels: 3
+
+Status:: *INDEPENDENT, READ-ONLY, ADVERSARIAL IMPLEMENTATION REVIEW. NO RUNTIME
+CODE, FTR LIFECYCLE, OR PROJECT MEMORY MODIFIED. NO REAL PROVIDER INVOKED. NO
+LEVEL-3/LEVEL-4 AUTHORIZED.*
+Verdict:: *B -- BOUNDED CORRECTION REQUIRED.*
+Date:: 2026-09-01
+Reviewer role:: Independent read-only implementation review of Slice 4A-C.
+Baseline reviewed:: `a9e6d620..e41d50a7` (primary implementation `2a420fd0`;
+evidence `e41d50a7`).
+Authority:: `docs/backlog/FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc` section 11.4.5;
+accepted design
+`docs/warm_storage/concepts/agent_workflow_coordinator_proposed_architecture_2026-08-25.adoc`;
+architecture review
+`docs/warm_storage/global_reviews/agent_workflow_coordinator_provider_boundary_architecture_review_2026-09-01.adoc`
+(verdict A, `55c01bb4`).
+Method:: Behavior reconstructed from code, tests, the FTR, and `git diff
+a9e6d620..e41d50a7`, not from conversation or the implementation-evidence claims.
+One deterministic failure-injection experiment was run against throwaway
+temporary repositories without modifying any committed runtime code.
+
+== 1. Verdict
+
+*B -- BOUNDED CORRECTION REQUIRED.* The provider-boundary architecture direction
+is correctly realized: an explicit provider-neutral `AgentExecutionPort` exists,
+`CodexCliAdapter` is the sole concrete implementation and the only owner of
+Codex/OpenAI transport and dialect knowledge, the mutable `adapter.outcome`
+side-channel is gone from the type surface, the OpenAI strict-schema projection
+has moved out of the domain serializer and derives from canonical contract facts,
+the two historical live defects are caught offline, and the coordinator suite is
+green (108 passed) with no provider invocation.
+
+However, the refactor introduced one concrete, reproducible weakening of the
+uncertain-dispatch / reconcile authority (finding *S4AC-R1*, BLOCKING): removing
+the `adapter.outcome` side-channel also removed the *signal* the old
+general-exception handler used to decide whether the provider boundary had been
+crossed. The new blanket `except Exception: dispatch_path.unlink(); raise` in
+`run_real_one_hop` now deletes the dispatch marker for *any* post-acceptance
+exception -- after the provider has run and possibly committed -- causing the
+coordinator to forget a consumed, repository-mutating Hop. This is exactly the
+class of authority regression the slice was required to avoid. It is bounded and
+correctable without redesign; hence verdict B, not C.
+
+A second, non-blocking conformance-independence gap (*S4AC-R2*, IMPORTANT) is that
+the offline layer treats `const` as a supported OpenAI strict keyword on the
+implementer's own authority; that specific rule could not be confirmed against
+primary OpenAI documentation and primary-adjacent evidence indicates the
+documented single-value idiom is `enum`. This does not block acceptance of the
+boundary but must be resolved (cheaply, offline) before Level 3, because it
+re-creates the "discover one dialect rule live" failure mode 4A-C exists to end.
+
+== 2. Acceptance-criteria audit (FTR 11.4.5)
+
+Each authorization/acceptance item independently verified against code + tests.
+
+[cols="1,4,1",options="header"]
+|===
+|# |11.4.5 criterion |Verdict
+
+|1 |`AgentExecutionPort` provider-neutral, typed request/outcome sufficient for
+the real N=1 path; outcome carries candidate result + bounded transport facts;
+mutable `adapter.outcome` smuggling eliminated.
+|MET (type surface). See S4AC-R1 for the *behavioral* consequence of how the
+side-channel was removed.
+
+|2 |`CodexCliAdapter` behind the port owns executable/argv, model/reasoning,
+sandbox, `--output-schema`/`--output-last-message`, process-group timeout, bounded
+diagnostics, and the OpenAI strict projection.
+|MET. `codex_adapter.py` is the sole owner; no other module carries a
+`codex`/`openai`/`gpt-` token (grep over the seven neutral modules: none).
+
+|3 |Canonical `RoutingResult` contract + Python validation/correlation stay the
+semantic authority; projection derives from it, does not duplicate a second
+contract.
+|MET. `validated_result`/`routing_result_from_data` remain in
+`adapter.py`/`serialization.py`; the projection imports and derives from
+`ROUTING_RESULT_REQUIRED_KEYS`, `FINDING_DELTA_KEYS`, `ESCALATION_*`, `Outcome`,
+`FindingState`.
+
+|4 |Remove provider-specific orchestration duplication in `slice4.py` only where
+the neutral vertical already owns semantics; do not broadly refactor.
+|MET. `run_real_one_hop` now delegates the invocation to `vertical.run_one_hop`
+via the injected `CodexCliAdapter`; the duplicated inline invoke loop is gone.
+See S4AC-R1: the collapse re-shaped the failure-path envelope and dropped a guard.
+
+|5 |Named offline conformance layer encodes strict subset (object strict,
+`required==properties`, explicit `type` on every node incl. const-bearing,
+properties, items, `anyOf` branches); the exact emitted schema passes.
+|PARTIALLY MET. The structural rules (strict/complete/typed) are encoded and the
+*emitted* schema is the one checked. The *supported-keyword set itself* (which
+includes `const`) is the implementer's assumption, not an independently
+documented rule -- S4AC-R2.
+
+|6 |Investigate Level-2 practicality without a provider call; record and stop if
+impractical.
+|MET. Deferral recorded; consistent with local `codex exec --help` (only
+`--output-schema`/`--output-last-message`; no endpoint/base-URL override
+surfaced). See section 9.
+
+|7 (acc.) |No mutable outcome side-channel remains.
+|MET at the type level (`CodexCliAdapter` is `frozen`; test asserts `not
+hasattr(adapter,"outcome")`). But see S4AC-R1: the *authority* the side-channel
+used to carry is no longer reconstructable at the failure boundary.
+
+|8 (acc.) |Provider-neutral N=1 orchestration + existing tests green; no real
+provider invocation; no happy-path claim.
+|MET. 108 passed; ruff clean; `git diff --check` clean; evidence explicitly makes
+no happy-path claim.
+|===
+
+Historical-defect coverage (acceptance item: catch both live defects offline):
+*MET.* `test_conformance_rejects_both_historical_live_defects` rejects the opaque
+`result:{type:object}` ("object must be strict") and the untyped
+`schema_version:{const:1}` ("explicit type"). The corrected projection emits
+`{"type":"integer","const":1}`.
+
+Exact-schema wiring (acceptance item 8 of the prompt): *MET.*
+`CodexCliAdapter.execute` writes `structured_result_envelope_openai_schema()` to
+the `--output-schema` path (`codex_adapter.py:149`);
+`test_invoke_codex_writes_the_canonical_structured_result_schema` asserts the
+emitted file equals that function's output; the conformance test checks the same
+function. Generator and checked artifact are identical.
+
+== 3. Boundary / dependency assessment
+
+Dependency direction is correct in the load-bearing places:
+
+* `vertical.run_one_hop` consumes the abstract `AgentExecutionPort` and names no
+  provider (verified: no provider token in `vertical.py`).
+* `model`, `reducer`, `serialization`, `git_facts`, `evidence`, `prompt`,
+  `persistence` carry no provider token.
+* `CodexCliAdapter` depends inward on `adapter` (port types) and `serialization`
+  (canonical facts) + `model` enums -- correct direction.
+* A hypothetical `ClaudeAdapter` would be a new file implementing
+  `AgentExecutionPort` with its own projection of the same canonical contract; it
+  would require no edit to reducer/persistence/git_facts/prompt/vertical. The
+  architectural-substitution test passes.
+
+One WATCH-level reverse-ish coupling (*S4AC-R4*): `codex_adapter.py:18` imports
+`atomic_write_json`/`atomic_write_text` from `persistence.py`. `persistence.py`
+imports `model`, `reducer`, and `serialization`, so the provider adapter
+transitively depends on the coordinator state/reduction layer merely to reuse two
+generic atomic-file helpers. This is not a correctness defect and does not block
+acceptance (a carve-out copies "core + port + adapter + persistence" as a unit).
+It is noted only because independent adapter testing/extraction would be cleaner
+if the atomic-IO primitives lived in a tiny provider-neutral IO utility rather
+than in the state-persistence module.
+
+== 4. Failure / uncertainty semantics (highest-priority area)
+
+=== S4AC-R1 (BLOCKING) -- post-acceptance exception deletes the dispatch marker
+
+*Invariant violated:* WFC-AUTO-02 ("once the atomic dispatch marker exists,
+acceptance that cannot be disproved is conservatively charged as one Hop and
+never replayed"; "absence of a dispatch marker proves no Hop consumption"),
+WFC-FAIL-01 ("failure/malformed result after adapter acceptance consumes a Hop"),
+WFC-FAIL-04 ("uncertain state enters common `reconcile_required`; it never
+replays automatically").
+
+*Exact code:* `scripts/workflow_coordinator/slice4.py:187-189`
+
+[source,python]
+----
+    except Exception:
+        dispatch_path.unlink(missing_ok=True)
+        raise
+----
+
+Compared with the accepted prior behavior at `a9e6d620`
+(`slice4.py`, general-exception path):
+
+[source,python]
+----
+    except Exception:
+        if adapter.outcome is None:          # provider boundary NOT crossed
+            dispatch_path.unlink(missing_ok=True)
+        raise
+----
+
+The old handler unlinked the marker *only when the provider had produced no
+transport outcome* (`adapter.outcome is None`), i.e. only for genuinely
+pre-acceptance failures; when the provider had run it *retained* the marker,
+preserving the uncertain dispatch for explicit reconcile. The refactor moved the
+transport outcome inside `vertical.run_one_hop`, so `run_real_one_hop` can no
+longer observe whether the boundary was crossed for an *arbitrary* exception. The
+outcome is now re-exposed to the caller *only* via `ExecutionResultValidationError`
+(the two spots in `run_one_hop` that check `candidate_result is None` and
+`validated_result`). Every *other* exception raised after `adapter.execute()`
+returns -- and there are several, none caught inside `run_one_hop` --
+falls through to the blanket `except Exception` and unconditionally deletes the
+marker.
+
+*Post-acceptance raise sites in `vertical.run_one_hop` (all uncaught there,
+all reached only after the provider has run):*
+
+* `observe_hop(...)` -> `git_facts._git(..., check=True)` raises
+  `GitPreflightError` on any failing Git fact command (e.g. a stale
+  `.git/index.lock` left by a `--sandbox workspace-write` child killed on
+  timeout, or a transient Git error);
+* `_subject_anomalies(...)` -> `subprocess.run(("git","show",...), check=True)`
+  raises `CalledProcessError`;
+* `run_evidence(...)`, `record_hop(...)`, `reduce_result(...)`,
+  `checkpoint_projection(...)` -> any unexpected raise.
+
+None of these is `ExecutionResultValidationError` or `CodexCliError`, so each
+reaches `slice4.py:187` and removes the dispatch marker.
+
+*Concrete failure mode (deterministically reproduced):* a fake CLI that commits
+to the agent workspace and emits a valid, correlated envelope was run through
+`run_real_one_hop`; `vertical.observe_hop` was then forced to raise (modelling a
+transient post-commit Git failure) *without modifying any committed runtime
+code*. Result:
+
+----
+raised: RuntimeError: simulated transient git failure after acceptance
+observe_hop invoked (post-acceptance):  1
+provider ran + mutated workspace:        True
+provider created a commit:               True
+dispatch.json marker survived:           False      <-- REGRESSION
+run.json snapshot present:               True   (stale pre-hop snapshot, hop_used unchanged)
+----
+
+The provider consumed a Hop and mutated Git; the marker was deleted and the only
+on-disk `run.json` is the pre-dispatch snapshot (`hop_used` unchanged, HEAD
+pointing at the old base). On a later resume/reconcile the coordinator sees *no
+dispatch marker* -> concludes no Hop was in flight (WFC-AUTO-02) -> the consumed,
+committing Hop is forgotten, is not routed through `reconcile_required`, and can
+be replayed against a now-mutated repository. This is precisely the
+"can the coordinator accidentally forget an uncertain dispatch?" probe -- answer:
+yes.
+
+*Why the existing tests do not catch it:* the only test exercising the general
+`except Exception` path
+(`test_real_driver_cleans_marker_for_local_prompt_failure_before_spawn`) triggers
+a *pre-spawn* prompt-assembly failure and asserts the fake never ran
+(`not executions.exists()`). No test covers a post-acceptance exception, so the
+green suite is consistent with the regression.
+
+*Required correction scope (bounded; do NOT implement here):* restore the
+pre/post-acceptance distinction at the failure boundary. Options, smallest first:
+
+. Make `vertical.run_one_hop` fail closed for its *post-acceptance* region by
+  attaching the transport `AgentExecutionOutcome` to any exception raised after
+  `adapter.execute()` returns (e.g. wrap `observe_hop`/evidence/reduce/checkpoint
+  raises in `ExecutionResultValidationError`, or a sibling carrier), so
+  `run_real_one_hop` routes them to the existing uncertain-recovery /
+  marker-retaining path; and
+. In `run_real_one_hop`, treat an *unclassified* exception as *uncertain*
+  (retain the marker, enter reconcile) rather than deleting it -- deletion must be
+  reserved for exceptions proven to be pre-acceptance (`preflight` ->
+  `Slice4Error`, prompt-assembly `ValueError`, `CodexCliError` launch/timeout<=0).
+
+The `CodexCliError` branch (`slice4.py:184-186`) is *safe*: `CodexCliError` is
+raised by `CodexCliAdapter.execute` only before `Popen` succeeds (timeout<=0, or
+`OSError` on launch), so the process never started and marker removal is correct.
+The regression is solely the blanket `except Exception` branch.
+
+*Direct-regression surface:* `run_real_one_hop` (slice4.py), `run_one_hop`
+(vertical.py); the reconcile/`recover_uncertain_dispatch` path is unchanged and
+should be reused.
+
+=== Other failure paths (verified correct)
+
+* candidate_result absent / malformed / uncorrelated -> `ExecutionResultValidationError`
+  -> `observe_hop` + `recover_uncertain_dispatch` + checkpoint, marker retained,
+  status `reconcile_required`. Covered by
+  `test_real_driver_recovers_post_spawn_uncertainty_with_external_anchors`
+  (marker + run + checkpoint all present; HEAD unchanged; single execution). This
+  path is correct.
+* Unlaunchable executable -> `CodexCliError` -> `Slice4Error`, `hop_used==0`,
+  marker removed. Correct (pre-acceptance).
+* A raise inside the `ExecutionResultValidationError` recovery block (e.g. the
+  re-`observe_hop`) propagates without hitting the sibling `except Exception`,
+  so it retains the marker -- fail-closed-to-human. Acceptable.
+* `KeyboardInterrupt`/`SystemExit` (BaseException) are not caught by `except
+  Exception`, so an operator interrupt mid-Hop retains the marker. Correct.
+
+== 5. Port contract review
+
+`AgentExecutionRequest` (invocation, prompt, repository, `result_contract: str`,
+timeout) and `AgentExecutionOutcome` (candidate_result, returncode, timed_out,
+stdout, stderr, diagnostics) express exactly the cross-boundary facts the current
+path needs and no speculative framework. `capabilities`/`ExecutionPolicy` from the
+architecture sketch was correctly *not* added (single-contract V1). Both types are
+`frozen`. Good.
+
+*S4AC-R3 (MINOR) -- `result_contract` is an unenforced promise.* The port request
+carries `result_contract: str`, but `CodexCliAdapter.execute` never reads it: it
+unconditionally emits `structured_result_envelope_openai_schema()`. Under a
+single-contract V1 this is acceptable, but the field currently makes a semantic
+promise the adapter neither validates nor supports. Additionally the identifier is
+passed two ways: `vertical.py` uses the named constant
+`ROUTING_RESULT_ENVELOPE_CONTRACT`, while `slice4.invoke_codex` passes the bare
+literal `"routing-result-envelope/v1"` (`slice4.py:137`) -- a duplicated
+string that can silently drift. Recommendation (non-blocking): have the adapter
+assert it supports the requested contract (fail closed on anything else) and use
+the shared constant everywhere. This documents the single-contract V1 boundary
+without adding a registry.
+
+== 6. Semantic-result authority (transport vs semantic)
+
+`AgentExecutionOutcome` is correctly pre-semantic: `run_one_hop` still parses,
+validates, and correlates via `validated_result` before any reduction. Transport
+`returncode`/`timed_out`/tails never establish acceptance.
+
+*Nonzero-returncode-with-valid-result disposition (verified):* `CodexCliAdapter`
+returns `candidate = result.read_text() or None` *regardless of returncode*; if
+the result file holds a valid correlated envelope, `run_one_hop` validates and
+reduces it even when `returncode != 0` (transport `diagnostics` are recorded on
+the outcome but do not block). This is **pre-existing intended semantics**, not a
+refactor artifact: at `a9e6d620`, `invoke_codex` set `acceptance="established"`
+from `validated is not None` independent of returncode, and `_CodexAdapter.invoke`
+raised only when the result was absent. The behavior is consistent with WFC-GIT-02
+/ WFC-SEC-02 (transport claims are hints; result validated and Git observed
+independently). No finding.
+
+`test_nonzero_without_result_is_uncertain` (nonzero + no result -> uncertain) and
+`test_nonempty_invalid_result_is_not_established` (nonzero/valid transport but
+malformed/uncorrelated payload -> not established) confirm the split.
+
+== 7. OpenAI conformance audit
+
+Verified against the emitted projection and primary/primary-adjacent OpenAI
+documentation (no provider invoked). The projection's *structural* rules are
+correct for OpenAI strict Structured Outputs:
+
+* root is a single `object` (not `anyOf`) -- OK;
+* every object: `additionalProperties:false` and `required == properties` --
+  encoded and asserted;
+* nullability via `type:["string","null"]` (finding_id, successor_ref) and via
+  `anyOf:[{"type":"null"}, escalation]` (escalation) -- both are documented strict
+  idioms; `anyOf` appears only at non-root nodes -- OK;
+* `enum` on `outcome`, `proposed_state`, `kind` -- OK;
+* every node carries an explicit `type`, including the `anyOf` branches and the
+  `const`-bearing `schema_version` -- the rule 11.4.4 discovered, now enforced.
+
+*S4AC-R2 (IMPORTANT) -- `const` support is assumed, not documented.* The
+conformance layer's supported set `_STRICT_KEYS` (`codex_adapter.py:37`) includes
+`const`, and the projection emits `schema_version:{"type":"integer","const":1}`.
+I could not confirm from primary OpenAI documentation that `const` is in the
+supported strict subset; the reachable primary page defers to a
+"supported-schemas" section that the fetcher could not render, and
+primary-adjacent evidence (OpenAI developer-community threads, and the documented
+examples that pin single values with `enum`) indicates the documented single-value
+idiom is `enum:[value]`, with `const` frequently reported as unsupported/ignored
+in strict mode. Consequences:
+
+* if `const` is not accepted live, `schema_version` is provider-invalid and the
+  *offline layer will not catch it* -- reproducing the exact 11.4.4 failure one
+  rule deeper, which is what 4A-C exists to prevent;
+* the checker and the generator *share* the `const`-is-supported assumption
+  (Section 7 of the prompt): `assert_openai_strict_schema` blesses `const` and
+  `structured_result_envelope_openai_schema` emits `const`, with no independent
+  rule anchoring `const`'s validity. Other rules *are* independently anchored
+  (e.g. `test_conformance_rejects_constructs_outside_the_projection_subset`
+  rejects `oneOf`), so the layer is partly independent -- but not for `const`.
+
+Mitigating context (why IMPORTANT, not BLOCKING): FTR 11.4.5 acceptance item 5
+*explicitly* contemplates "const-bearing nodes" (typed), so the implementer
+followed the authorized design; and I could not obtain the verbatim current
+(2026) supported-keyword list to *prove* `const` is rejected. This is therefore a
+verification/independence gap and a live-compatibility risk, not a proven live
+defect. Required correction scope (cheap, offline, before Level 3): either (a)
+cite the primary OpenAI rule that lists `const` as supported and record it as the
+anchor for `_STRICT_KEYS`, or (b) switch the projection to the documented
+`enum:[1]` idiom for `schema_version` and drop `const` from the supported set.
+Until one is done, the evidence phrase "FULL DOCUMENTED STRICT SUBSET ... CHECKED
+OFFLINE" is not justified for the `const` rule specifically.
+
+*S4AC-R5 (MINOR) -- dead const guard.* `codex_adapter.py:63-64`
+(`if "const" in node and "type" not in node: raise ... "const requires explicit
+type"`) is unreachable: line 59 already raises when `type` is absent, so by line
+63 `type` is always present. Harmless, but it misleads a reader into thinking
+`const` gets a dedicated rule; remove it or fold the intent into the generic typed
+check.
+
+== 8. Test-quality assessment
+
+The offline suite fails for meaningful mutations, not merely generator/checker
+symmetry:
+
+* opaque result object -> "object must be strict" (historical defect 1);
+* untyped `schema_version` const -> "explicit type" (historical defect 2);
+* nested missing `type` on `findings.items.invariant` -> "invariant: explicit
+  type";
+* missing `type` on a nullable `anyOf` branch -> "anyOf[0]: explicit type";
+* `oneOf` present -> "unsupported keywords" (an independently-stated rule, not
+  symmetry);
+* `required != properties` and `additionalProperties != false` -> rejected;
+* projection-derives-from-contract drift guard: `required` sets equal
+  `ROUTING_RESULT_REQUIRED_KEYS` / `FINDING_DELTA_KEYS`.
+
+Independence: most rules are restated independently of the generator; the notable
+exception is `const` (S4AC-R2), where checker and generator share one unverified
+assumption. Recommendation: anchor `_STRICT_KEYS`'s membership (especially
+`const`) to a cited primary rule, or narrow it to the `enum` idiom.
+
+== 9. Level-2 disposition
+
+*Deferral justified.* Local inspection of `codex exec --help` shows only
+`--output-schema <FILE>` and `-o/--output-last-message <FILE>` for the
+schema/result mechanism and surfaces no documented local Responses endpoint /
+base-URL override or request-shape hook. FTR 11.4.5 makes Level 2 "best effort
+only", and the ladder's required gates are Level 1 (present) and a separately
+authorized Level 3. Building an undocumented stub path would exceed the slice.
+Accept the deferral; no stub machinery should be invented.
+
+== 10. Findings
+
+[cols="1,1,4",options="header"]
+|===
+|ID |Severity |Summary
+
+|S4AC-R1 |BLOCKING |`run_real_one_hop`'s blanket `except Exception:
+dispatch_path.unlink()` deletes the dispatch marker for any post-acceptance
+exception (observe_hop / subject / evidence / reduce / checkpoint), after the
+provider has run and possibly committed, forgetting a consumed uncertain Hop.
+Regression vs the prior `if adapter.outcome is None` guard, whose signal the
+side-channel removal eliminated. Reproduced deterministically. Bounded fix in
+`vertical.py`/`slice4.py`: fail closed to marker-retaining reconcile for
+unclassified/post-acceptance exceptions.
+
+|S4AC-R2 |IMPORTANT |Offline conformance treats `const` as a supported OpenAI
+strict keyword without a primary-documented anchor; checker and generator share
+the assumption. If `const` is live-invalid (`enum:[value]` is the documented
+idiom), the offline layer cannot catch it -- the 11.4.4 failure mode. Resolve
+offline before Level 3 by citing the primary rule or switching to `enum:[1]`.
+
+|S4AC-R3 |MINOR |`AgentExecutionRequest.result_contract` is never read by the
+adapter (unenforced promise) and is passed as a bare literal in
+`slice4.invoke_codex` vs the `ROUTING_RESULT_ENVELOPE_CONTRACT` constant
+elsewhere. Have the adapter assert the contract it supports; use the shared
+constant.
+
+|S4AC-R4 |WATCH |`codex_adapter.py` imports generic atomic-IO helpers from
+`persistence.py`, transitively coupling the provider adapter to the
+state/reduction layer. Not a correctness defect; a small IO-utility relocation
+would improve independent adapter testing/extraction.
+
+|S4AC-R5 |MINOR |Dead `const requires explicit type` guard at
+`codex_adapter.py:63-64` (unreachable after the generic typed check). Remove.
+|===
+
+== 11. Non-findings / rejected scope expansion
+
+* Nonzero returncode + valid correlated result is accepted/reduced: verified
+  *pre-existing intended* transport-vs-semantic behavior, not a refactor artifact
+  (section 6). No finding.
+* Provider-neutral modules (`model`, `reducer`, `serialization`, `git_facts`,
+  `evidence`, `prompt`, `persistence`, `vertical`) carry no provider token and
+  need no change. Not "cleaned up".
+* `proof_harness.py` defaulting `executable="codex"` is an operator default
+  (architecture review PB-5, WATCH); acceptable, out of scope here.
+* No demand for a provider registry, `ExecutionPolicy`/capabilities, dynamic
+  discovery, plugin surface, Claude adapter, repo/package carve-out, Slice 4B,
+  Slice 5, DMC work, or the `supports_parallel_tool_calls` warning -- all
+  explicitly out of scope, and none is required by current correctness.
+* Naming (`AgentExecutionRequest`/`Outcome`, `ExecutionResultValidationError`,
+  `CodexCliAdapter`) is clear and reconstructable; no finding.
+* `VerticalRun.execution_outcome: object` is weakly typed although
+  `AgentExecutionOutcome` is importable in `vertical.py`; this is a readability
+  nit only (a maintainer must open `run_one_hop` to learn the concrete type). Not
+  raised as a numbered finding; recommend tightening to `AgentExecutionOutcome`
+  opportunistically when S4AC-R1 is corrected in the same file.
+* No real provider invocation occurred at any point in this review (0).
+
+== 12. Required next lifecycle action
+
+. Correct *S4AC-R1* (BLOCKING) within the bounded scope in section 4, and
+  *S4AC-R2* (IMPORTANT) offline within the scope in section 7; add a regression
+  test for a post-acceptance exception that asserts the dispatch marker survives
+  and status becomes `reconcile_required`. S4AC-R3/R4/R5 may be folded into the
+  same correction hop or explicitly deferred as WATCH.
+. Re-review the correction independently against this artifact.
+. Only then may the maintainer separately authorize Level 3 (tiny real
+  smoke) -- which this review does *not* authorize. Level 4, Slice 4B, and Slice 5
+  remain gated in that order.
+
+FTR-AGENT-WORKFLOW-COORDINATOR-P5 remains active and open; Slice 4A-C is not
+accepted by this review (verdict B). No FTR lifecycle status change, no includes
+moved, no companion artifacts relocated. Release notes: 4A-C touches only internal
+`scripts/workflow_coordinator/` structure and tests with no public/CLI/YAML/import
+surface change, so no release note is required; the correction hop should restate
+this if scope stays internal.
+
+== 13. Validation performed (read-only)
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator` -> 108 passed.
+* `.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator`
+  -> All checks passed.
+* `git diff --check` -> clean.
+* Deterministic failure-injection probe (throwaway temp repos, no committed-code
+  change): post-acceptance `observe_hop` raise -> dispatch marker deleted while a
+  provider commit stood -> S4AC-R1 confirmed.
+* Primary-doc lookups limited to OpenAI Structured Outputs documentation; the
+  supported-keyword subsection could not be rendered, leaving `const` support
+  unconfirmed (basis for S4AC-R2). No provider API called.
+
+== 14. Final report
+
+----
+VERDICT:                                                   B
+AgentExecutionPort GENUINELY PROVIDER-NEUTRAL:             YES
+CODEX-SPECIFIC RESPONSIBILITIES CORRECTLY OWNED:           YES
+MUTABLE OUTCOME SIDE-CHANNEL REMOVED WITHOUT AUTHORITY LOSS: NO
+    (type surface removed; the failure-boundary authority it
+     carried was lost -- S4AC-R1)
+UNCERTAIN-DISPATCH / RECONCILE SEMANTICS PRESERVED:        NO  (S4AC-R1)
+POST-EXECUTION EXCEPTION MARKER HANDLING SAFE:             NO
+    blanket `except Exception: unlink()` deletes the dispatch marker
+    for post-acceptance failures (observe_hop/evidence/reduce/checkpoint)
+    after the provider ran and possibly committed -- reproduced.
+SEMANTIC RoutingResult AUTHORITY REMAINS PROVIDER-NEUTRAL: YES
+NONZERO-RETURNCODE SEMANTICS:
+    valid correlated result is accepted/reduced regardless of returncode;
+    verified PRE-EXISTING intended transport-vs-semantic behavior, not a
+    refactor artifact.
+RESULT-CONTRACT PORT SEMANTICS SOUND:                      MINOR ISSUE (S4AC-R3)
+OPENAI PROJECTION MATCHES CURRENT DOCUMENTED SUBSET USED:  NO / UNCONFIRMED
+    structural rules match; `const` support not documented-verifiable (S4AC-R2)
+BOTH HISTORICAL LIVE DEFECTS CAUGHT OFFLINE:               YES
+CONFORMANCE CHECK INDEPENDENT ENOUGH TO BE MEANINGFUL:     PARTIALLY
+    (most rules independently restated; `const` is shared-assumption -- S4AC-R2)
+LEVEL-2 DEFERRAL JUSTIFIED:                                YES
+BLOCKING FINDINGS:                                         S4AC-R1
+IMPORTANT FINDINGS:                                        S4AC-R2
+MINOR/WATCH FINDINGS:                                      S4AC-R3, S4AC-R4, S4AC-R5
+REAL PROVIDER INVOCATIONS:                                 0
+PROJECT MEMORY UPDATED:                                    NO
+RUNTIME CODE CHANGED:                                      NO
+READY FOR MAINTAINER 4A-C ACCEPTANCE:                      NO
+    (bounded correction of S4AC-R1 + S4AC-R2 required, then re-review)
+READY FOR LEVEL-3 AUTHORIZATION:                           NO
+    (review itself never authorizes it)
+----
