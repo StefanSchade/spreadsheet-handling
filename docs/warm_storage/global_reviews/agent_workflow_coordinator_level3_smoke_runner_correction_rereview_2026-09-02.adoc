@@ -1,0 +1,274 @@
+= Agent Workflow Coordinator -- Level-3 Smoke Runner Correction Re-Review
+:toc:
+:toclevels: 2
+
+Status:: *CORRECTION ACCEPTED. R1/R2/R3/R4 CLOSED. NO BLOCKING/IMPORTANT
+REGRESSION. RUNNER TECHNICALLY READY FOR MAINTAINER ACCEPTANCE. REAL LEVEL-3
+SMOKE NOT EXECUTED. LEVEL-3 NOT AUTHORIZED BY THIS REVIEW. LEVEL-4 NOT
+AUTHORIZED.*
+Date:: 2026-09-02
+Scope:: One bounded re-review of the findings raised in `17b63af0`. No broad
+runner or coordinator re-review. No runtime code, tests, FTR lifecycle, or
+Project Memory modified. No real provider invoked.
+Inputs:: original review `17b63af0`; correction authorization `69854f14`;
+correction implementation `f0d79ea7`; correction evidence `6137a56f`;
+`git diff 69854f14..6137a56f`.
+
+== 1. Verdict
+
+*A -- ACCEPT CORRECTION.*
+
+L3SR-R1 and L3SR-R3 (IMPORTANT) are CLOSED; L3SR-R2 and L3SR-R4 (MINOR) are
+CLOSED; W1 and W3 remain DEFERRED WATCH; no direct blocking or important
+regression was introduced. Deterministic tests, ruff, and `git diff --check`
+pass. The runner is technically ready for maintainer acceptance and a later,
+separately authorized, one-shot real Level-3 Codex/OpenAI smoke. This review
+does not itself accept the runner or authorize Level 3 or Level 4.
+
+One non-blocking residual WATCH observation is recorded under R2 (base-default
+transport fields in the `post_execution_error` path); it is strictly better than
+the pre-correction behavior and is not a regression.
+
+== 2. L3SR-R1 -- CLOSED (IMPORTANT)
+
+=== R1-A -- exception type soundness
+
+`CodexCliError` now derives from the provider-neutral `ExecutionNotStartedError`
+(`codex_adapter.py:34-35`; `ExecutionNotStartedError(ValueError)` at
+`adapter.py:27`). Every `CodexCliError` raise site is genuinely pre-launch:
+
+* unsupported result contract (`codex_adapter.py:149`);
+* non-positive timeout (`codex_adapter.py:151`);
+* the `except (OSError, ValueError)` wrapper (`codex_adapter.py:161-162`) around
+  a `try` block that now contains *only* schema/result path construction,
+  `atomic_write_json`/`atomic_write_text` setup, and `subprocess.Popen(...)`
+  (`codex_adapter.py:152-160`).
+
+The critical invariant holds. The setup writes are pre-launch. For
+`subprocess.Popen.__init__` on POSIX: if `execve` in the child fails, the error
+is relayed on the exec-status pipe and `__init__` raises `OSError`
+(`FileNotFoundError`/`PermissionError`/...) *before returning*, and the target
+provider program never executed; if `execve` succeeds the pipe closes empty and
+`__init__` returns normally. A `ValueError` from `Popen` is invalid-argument and
+strictly pre-fork. Therefore every `OSError`/`ValueError` caught by this block
+implies the provider process did not begin -- the semantic claim behind
+`ExecutionNotStartedError` is justified for the one-shot evidence purpose. A
+forked child that fails `exec` ran no provider code, so classifying it as
+not-started is correct; no lower-level process-state framework is needed.
+
+Crucially, `child.communicate(...)`, `os.killpg(...)`, and
+`result.read_text(...)` are all *outside* this wrapper, so no post-launch
+failure can be retyped as `CodexCliError`/`ExecutionNotStartedError`.
+
+=== R1-B -- post-launch failure classification
+
+The runner now catches `ExecutionNotStartedError` first
+(`codex_adapter_smoke.py:134-137` -> `local_pre_execution_error`,
+`invocation_attempted=false`) and any other exception second
+(`codex_adapter_smoke.py:138-142` -> `post_execution_error`,
+`invocation_attempted=true`). Because `CodexCliError` is an
+`ExecutionNotStartedError`, the ordering is correct. The old
+`except (CodexCliError, OSError, ValueError)` catch is gone; no generic
+`OSError`/`ValueError` catch around `execute()` remains.
+
+Verified:
+
+* *Non-UTF-8 `--output-last-message`* -> `result.read_text(encoding="utf-8")`
+  raises `UnicodeDecodeError` (a `ValueError`), propagates raw (outside the
+  pre-launch wrapper), hits `except Exception` -> `post_execution_error`,
+  `invocation_attempted=true`. Covered by
+  `test_post_launch_decode_failure_is_not_reported_as_not_attempted`, which
+  launches once (marker written) and writes `b"\xff"` through the production
+  result path.
+* *Timeout-cleanup `os.killpg` `ProcessLookupError`* (an `OSError`) -> same
+  classification. Confirmed by a deterministic monkeypatch probe forcing
+  `codex_adapter.os.killpg` to raise `ProcessLookupError` under a 0.05s timeout:
+  `smoke_status=post_execution_error`, `invocation_attempted=true`, exit 1, with
+  the killpg message in `diagnostics`.
+* *Arbitrary `RuntimeError` from the execution path* -> `post_execution_error`,
+  `invocation_attempted=true`. Covered by
+  `test_unexpected_execution_exception_writes_indeterminate_summary`.
+
+=== R1-C -- pre-execution cases
+
+All remain truthfully `invocation_attempted=false` /
+`local_pre_execution_error`: unsupported contract, non-positive timeout,
+schema/result setup failure before `Popen`, and unlaunchable executable (`Popen`
+`FileNotFoundError` -> `CodexCliError`). Confirmed by
+`test_missing_executable_is_proven_pre_launch_failure`. Workspace/result-dir
+creation failure before adapter construction is handled earlier
+(`codex_adapter_smoke.py:110-116`, `except OSError` -> exit 1 with the base
+`local_pre_execution_error` summary, `invocation_attempted=false`), which is
+still truthfully pre-execution. No Hop/Run semantics are involved.
+
+=== R1-D -- test quality
+
+The three new tests genuinely establish both sides of the launch boundary: the
+decode-failure fake launches once and fails only after producing output through
+the real `--output-last-message` path; the missing-executable case proves the
+pre-launch side; the monkeypatched adapter proves an unexpected post-launch
+exception is recorded as attempted. Adequate; exhaustive testing not required.
+
+*R1 disposition: CLOSED.*
+
+== 3. L3SR-R2 -- CLOSED (MINOR)
+
+`_write_summary_best_effort` (`codex_adapter_smoke.py:73-78`) wraps
+`atomic_write_json` in a guard so recording failure evidence cannot itself raise,
+and it is used on every post-root failure path (workspace setup 115,
+pre-execution 136, post-execution 141, post-outcome processing 186). The
+post-outcome region -- schema fingerprint read (`156`), unexpected
+`validated_result` exceptions beyond `ResultValidationError`, and any other
+processing error -- is now inside a `try` whose `except Exception`
+(`codex_adapter_smoke.py:183-187`) sets `post_execution_error` and writes a
+durable summary. The previously avoidable "root exists, provider may have run, no
+`smoke-summary.json`" gap is closed.
+
+Truthfulness checks: the original failure is not disguised as success (any
+exception forces `post_execution_error` and exit 1); a summary-write failure is
+swallowed rather than misrepresented (best-effort by design, the acceptable
+unavoidable case); the terminal success write (`188`) is intentionally not
+best-effort, which is correct -- if final persistence fails there is nothing
+truthful left to persist. Universal crash-proof persistence is not demanded.
+
+Non-blocking residual (WATCH, not a regression): on the `post_execution_error`
+path the transport fields keep their `_summary_base` defaults -- `returncode`
+`null` (honest unknown), but `timed_out=false` and
+`candidate_result_present=false` asserted as known-false though unknown. In the
+narrow killpg-on-timeout race the probe showed `timed_out=false` even though the
+run actually timed out. This is subordinate to the dominant
+`smoke_status=post_execution_error` signal and the `null` returncode, and it is
+strictly better than the pre-correction false `local_pre_execution_error`. It
+does not reopen R2 and, per the best-effort-semantics guidance, does not warrant
+a generalized nullable evidence model. Recorded only as a watch item for a future
+optional tightening (e.g. omit or null unknown transport fields when no outcome
+exists).
+
+*R2 disposition: CLOSED (one non-blocking residual WATCH).*
+
+== 4. L3SR-R3 -- CLOSED (IMPORTANT)
+
+`real_provider_compatibility_established` is absent from runtime summary
+generation; the only source reference is a test asserting its absence
+(`test_codex_adapter_smoke.py:72`) plus a stale bytecode cache. The replacement
+`configured_executable_smoke_succeeded` (`codex_adapter_smoke.py:69`) defaults
+`false` and is set `true` only on transport success plus a valid correlated
+candidate (`175`). It is mechanically true -- it claims only that the *configured*
+executable produced a transport-success + semantically-valid correlated result,
+which is honestly true even for the deterministic fake. Failures leave it
+`false`. No runner-generated durable field asserts real-provider compatibility;
+the maintainer lifecycle must infer real Codex/OpenAI compatibility only from one
+successful runner result plus a pinned real live configuration plus a separately
+authorized invocation.
+
+*R3 disposition: CLOSED.*
+
+== 5. L3SR-R4 -- CLOSED (MINOR)
+
+`_summary_base` now records `timeout_seconds` (`codex_adapter_smoke.py:59`)
+alongside `executable`, `model`, and `reasoning_effort`, threaded from the
+`run_smoke` parameter (`104`) that is the same value handed to the
+`AgentExecutionRequest` (`131`). The value is the float actually used
+(`--timeout-seconds type=float`; the success test asserts `timeout_seconds == 1`
+for `timeout_seconds=1`). Configuration record is truthful. No config framework
+introduced.
+
+*Operator-contract recommendation carried forward (unchanged):* the four
+parameters remain unconstrained CLI overrides; the eventual live authorization
+should pin `executable=codex`, model, reasoning effort, and timeout in the
+prescribed one-shot command.
+
+*R4 disposition: CLOSED.*
+
+== 6. W1 / W3 -- DEFERRED WATCH
+
+* *W1* -- no sandbox redesign occurred; the adapter argv is unchanged
+  (`--sandbox workspace-write`, `--ask-for-approval never`). No-tool/no-Git
+  remains requested prompt behavior, not enforced. Remains DEFERRED WATCH; not an
+  acceptance blocker.
+* *W3* -- `smoke_root.mkdir()` still catches only `FileExistsError`
+  (`codex_adapter_smoke.py:91-94`); a non-`FileExistsError` root-creation failure
+  still propagates uncaught, strictly pre-execution with no misleading summary.
+  Unchanged; the new `except OSError` at `113-116` covers only the *workspace/
+  result* sub-directory creation, an improvement, still pre-execution. Remains
+  DEFERRED WATCH; no cleanup requested.
+
+== 7. Direct regression review
+
+Reviewed only direct regressions from `f0d79ea7`.
+
+* *Slice-4 exception ordering (primary risk).* In `run_real_one_hop`
+  (`slice4.py:188-195`) the handler order is now `ExecutionResultValidationError`
+  -> `CodexCliError` -> `ExecutionNotStartedError` -> `Exception`. Because
+  `CodexCliError` is now a subclass of `ExecutionNotStartedError`, placing
+  `CodexCliError` first is *required and correct*: it preserves the prior
+  `CodexCliError -> Slice4Error` translation (with `dispatch_path.unlink`), while
+  other `ExecutionNotStartedError` still re-raises, and post-launch failures fall
+  to `except Exception -> recover_uncertain(None)` (conservative uncertain
+  dispatch retained). Had the old order been kept, `CodexCliError` would have been
+  swallowed by the `ExecutionNotStartedError` branch -- the reorder prevents that.
+  No regression; the fix is exactly the necessary one.
+* `CodexCliError` remains a `RuntimeError` (multiple inheritance), so any
+  `except RuntimeError`/`Slice4Error` expectations elsewhere still hold.
+* No raw post-launch `ValueError`/`OSError` is retyped as pre-execution in either
+  the adapter or slice4 (`except ExecutionNotStartedError` matches only instances
+  of that class, not arbitrary `ValueError`).
+* `AgentExecutionPort`, semantic validation/correlation, and transport-vs-semantic
+  separation are unchanged.
+* The runner still executes the adapter exactly once; no retry/resume; no
+  Git/Run/Hop/reducer usage introduced (imports unchanged plus
+  `ExecutionNotStartedError`).
+* Success criterion unchanged: `returncode == 0` and not `timed_out` and a valid
+  correlated result (`codex_adapter_smoke.py:172-176`).
+
+No direct blocking or important regression. No new L3SR-R5+ finding warranted
+(the R2 residual is a pre-existing default, not a regression).
+
+== 8. Validation
+
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator/test_codex_adapter_smoke.py`
+  -- PASS (9).
+* `.venv/bin/pytest -q tests/unit/workflow_coordinator` -- PASS (121).
+* `.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator`
+  -- PASS.
+* `git diff --check` -- clean.
+* Deterministic `ProcessLookupError`-on-timeout monkeypatch probe -- confirmed
+  `post_execution_error` / `invocation_attempted=true` (no runtime/test code
+  added).
+* No real provider, Codex, OpenAI, Claude, or Anthropic invocation. Level 3 not
+  executed. Level 3 not authorized by this review. Level 4 not authorized.
+
+== 9. Disposition summary
+
+[cols="1,2",options="header"]
+|===
+| Finding | Disposition
+| L3SR-R1 | CLOSED
+| L3SR-R2 | CLOSED (one non-blocking residual WATCH)
+| L3SR-R3 | CLOSED
+| L3SR-R4 | CLOSED
+| W1 | DEFERRED WATCH
+| W3 | DEFERRED WATCH
+|===
+
+== 10. Required next lifecycle action
+
+. Maintainer may accept the runner (this review confirms technical readiness but
+  does not itself accept it).
+. The maintainer separately authors the one-shot real Level-3 Codex/OpenAI smoke,
+  prescribing the exact command and a fixed fresh smoke-root pattern, e.g.:
++
+[source,text]
+----
+.venv/bin/python scripts/workflow_coordinator/codex_adapter_smoke.py \
+    --smoke-root <FRESH PATH>
+----
++
+with `executable`/`model`/`reasoning-effort`/`timeout-seconds` pinned to the
+intended values (R4 operator contract). No heredoc, manual JSON, prompt paste,
+shell pipeline, or Git preparation is required.
+. Level-3 success-claim boundary from the original review section 11 is
+  unchanged: a successful real smoke proves only the current adapter/schema/
+  correlation contract at one tiny invocation, not the Run/Hop lifecycle, Git,
+  reconcile, findings convergence, Slice-4A E2E, routine repository use, Slice 4B,
+  or Slice 5.
