@@ -1,0 +1,240 @@
+= Agent Workflow Coordinator -- Slice-4B Git-Authority Correction Re-Review
+Bounded correction re-review, 2026-09-03
+:toc: macro
+:toclevels: 2
+
+toc::[]
+
+== 1. Verdict
+
+*VERDICT: A -- ACCEPT CORRECTED SLICE 4B.*
+
+The bounded correction closes the primary finding `S4B-R1` and reduces `S4B-R2`
+to a closed residual, and introduces no BLOCKING/IMPORTANT direct regression. Every
+Git subprocess that `trusted_commit` itself starts now routes through a fixed
+trusted execution policy that resolves hooks to a non-existent path, strips
+inherited Git routing/configuration controls, disables signing and fsmonitor,
+suppresses external diff, and refuses any effective clean/process filter before
+staging. The authority model is unchanged: `CommitIntent` is still `paths + subject`
+only, no argv/shell/config-mutation/reset/push surface is added, and repository
+configuration is overridden only command-locally.
+
+This re-review is bounded to the disposition of `S4B-R1`/`S4B-R2` and direct
+regressions of their fix. It does not reopen the accepted Slice-4B design.
+`S4B-R3`, `S4B-R4`, `S4B-R5`, `L4-R1`, and `L4-R2` are carried unchanged. Routine
+repository use and any live provider execution remain *NOT AUTHORIZED*; provider
+structured-output conformance must still be refreshed before a later live proof.
+This review authorizes nothing.
+
+== 2. Correction range
+
+Range `20aa0b5b..33a0d2a7`:
+
+* `b67a2361` -- `fix(workflow): neutralize trusted git execution hooks`
+  (`scripts/workflow_coordinator/git_facts.py`, `test_slice4b_git_authority.py`).
+* `33a0d2a7` -- `docs(workflow): record slice 4b authority correction`
+  (evidence note + FTR status line).
+
+The evidence note was read but not treated as proof; the disposition below is from
+independent code inspection, the focused suite (142 coordinator unit tests pass),
+and local read-only Git experiments.
+
+== 3. S4B-R1 disposition -- CLOSED
+
+*Every trusted subprocess uses the trusted policy.* `trusted_commit`
+(`git_facts.py:432-509`) now issues all of its Git calls through `_trusted_git` /
+`_trusted_git_succeeds` (identity, filter probe, repository observation, staged and
+worktree-path reads, `add`, pre-commit `rev-parse`, `commit`, post-commit
+`_observe_hop`, and the `show` subject read). `_observe_hop` receives the trusted
+`git_command`/`git_succeeds` injectors, so its `cat-file`, `merge-base`,
+`rev-list`, and `diff` calls also run under the policy. No ordinary `_git` or raw
+`subprocess.run` remains reachable from inside `trusted_commit`: the three residual
+raw `subprocess.run` calls in the file are all inside `preflight_state_root`
+(read-only `check-ignore`/`ls-files`/`diff --quiet`), which executes no hook and is
+not on the trusted-commit path.
+
+*Hook resolution is command-local and override-proof.* `_run_git(..., trusted=True)`
+prepends `-c core.hooksPath=<os.devnull> -c commit.gpgSign=false -c
+core.fsmonitor=false` *before* the subcommand (`git_facts.py:78-99`). `/dev/null`
+is a non-directory, so no `<hooksPath>/pre-commit` can exist or be created.
+
+Verified Git semantics (local experiments):
+
+* command-line `-c core.hooksPath=/dev/null` overrides a *repository-local*
+  `core.hooksPath=.githooks`: the worktree hook does not execute on `git commit`;
+* it also overrides a `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`
+  injection of `core.hooksPath`; and independently, the trusted environment strips
+  those variables, so the injection is neutralized twice over.
+
+`--no-verify` on the trusted `commit` is genuine defense-in-depth, not the sole
+protection: the hooks-path pin already prevents `pre-commit`/`prepare-commit-msg`/
+`commit-msg`/`post-commit` discovery regardless of `--no-verify`.
+
+*Reproduction of the prior path.* `test_trusted_commit_neutralizes_agent_authored_worktree_hook`
+materially reconstructs the S4B-R1 execution path -- worktree-relative
+`core.hooksPath`, an agent-authored `pre-commit` inside the authorized scope, the
+hook *included in the commit intent*, and an ordinary commit that *succeeds* -- and
+asserts the side-effect file is absent. My own independent experiment reproduced
+the same outcome. Agent-written, in-scope hook content can no longer execute with
+Coordinator privileges during the trusted commit.
+
+*S4B-R1 = CLOSED. Hook execution surface: NEUTRALIZED.*
+
+== 4. S4B-R2 disposition -- CLOSED
+
+`_trusted_git_environment()` (`git_facts.py:102-105`) returns the process
+environment with every variable whose name begins `GIT_` removed, and
+`_run_git`/`subprocess.run` pass it as a full `env=` replacement with `shell=False`.
+This removes `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_GLOBAL`,
+and signing/hook-related `GIT_*` controls from the trusted operation, while keeping
+ordinary settings (`PATH`, `HOME`) so Git still functions.
+
+`test_trusted_commit_strips_inherited_git_config_hook_injection` deterministically
+exercises the prior concern (a `GIT_CONFIG_*`-injected `core.hooksPath`) and proves
+the injected hook does not become effective; my experiment confirmed it.
+
+Sufficiency for the bounded threat model: the remaining `-c` pins and the filter
+refusal also neutralize *non-`GIT_`* operator config that could otherwise carry
+external execution -- global/local `core.hooksPath` (overridden), `commit.gpgSign`
+/`gpg.program` (signing forced off, so the program is never invoked),
+`core.fsmonitor` (forced off), `diff.external`/textconv (`--no-ext-diff` plus
+`--name-only`), and `filter.*.clean`/`*.process` (refused, section 5). Git aliases
+cannot shadow the literal built-in subcommands used here. No concrete
+agent-reachable *or* operator-config external-execution path remains through the
+commands `trusted_commit` invokes; removing the `GIT_`-prefixed variables is
+sufficient for this bounded boundary. I do not demand general process-environment
+sanitization, as no further concrete path exists.
+
+*S4B-R2 = CLOSED. Inherited Git config/routing: NEUTRALIZED.*
+
+== 5. Clean / process filter analysis -- FAIL-CLOSED BEFORE STAGING
+
+`_configured_external_filters` (`git_facts.py:411-429`) runs, under the trusted
+policy, `git config --null --name-only --get-regexp
+'^filter\..*\.(clean|process)$'` and `trusted_commit` refuses (before any `add`) if
+the result is non-empty (`git_facts.py:452-456`). This is the correct, conservative
+policy: a worktree `.gitattributes` can only *select* a named filter, while the
+executable command lives in Git configuration; refusing on any effective
+clean/process filter configuration prevents agent-authored attributes from
+activating an operator-configured process, without needing to reason about which
+paths the filter would touch.
+
+Narrow false-negative check on the query:
+
+* the regex anchors `^filter\.` and `\.(clean|process)$` with `.*` spanning the
+  subsection, so dotted filter names (`filter.a.b.clean`) still match;
+* Git canonicalizes the section (`filter`) and final variable (`clean`/`process`)
+  to lower case, so mixed-case declarations are still matched;
+* `--get-regexp` reads all config files (system/global/local/worktree); `GIT_CONFIG_*`
+  is stripped and no `-c` adds a filter, so the effective set is exactly the file
+  configuration;
+* `smudge` is correctly *not* checked -- it runs on checkout, which `trusted_commit`
+  never performs; only `clean`/`process` can run at `git add`.
+
+`test_trusted_commit_refuses_configured_clean_filter_before_staging` proves a
+configured `filter.agent.clean` selected by an agent-authored `.gitattributes`
+raises `TrustedCommitError` with HEAD unchanged and the filter command not executed;
+my experiment confirmed the detection. *Clean/process filter execution:
+FAIL-CLOSED BEFORE STAGING.*
+
+== 6. Direct regression analysis -- none material
+
+The refactor introduced `_run_git`, `_trusted_git`, `_git_succeeds`,
+`_trusted_git_succeeds`, and injected `git_command`/`git_succeeds` into
+`_observe_hop`/`_observe_repository`. Verified no regression of the accepted
+invariants:
+
+* *Repository identity* still validated: `_repository_identity(..., git_command=
+  _trusted_git)` compared to `expected_repository.resolve()`
+  (`test_head_and_registered_repository_preconditions_refuse_before_commit` passes).
+* *HEAD precondition* preserved (initial `facts.head != base_head` and pre-commit
+  `rev-parse HEAD != base_head`).
+* *Exact dirty-path comparison* preserved via trusted `_changed_worktree_paths`
+  (unrelated-dirty and staging-failure tests pass; the latter now monkeypatches
+  `_trusted_git` and still asserts `awaiting_human`, unchanged HEAD, preserved file).
+* *Factual derivation* preserved: actual commit hash/path set/subject come from Git
+  via `_trusted_git`; `max_commits=1`, non-merge, dirty-state, and
+  `claims_existing_commits=False` semantics are unchanged in `_observe_hop`.
+* *Public read-only API unchanged*: `observe_repository`/`observe_hop` wrappers keep
+  ordinary `_git`/`_git_succeeds` (non-trusted) so preflight and Option-A paths are
+  behaviourally identical; `--no-ext-diff` on read-only `diff --name-only` does not
+  change the returned names.
+* *No new external execution*: the added filter probe is a read-only `git config`
+  query under the trusted policy; no config is persistently written anywhere
+  (only command-local `-c`).
+* *Trusted API not broadened*: `CommitIntent` remains `paths + subject`; no argv,
+  shell, generic Git command, reset/clean/restore, or push/fetch/pull surface.
+
+Post-commit observation uses the *same* trusted execution policy, so verification
+cannot reactivate the forbidden surface. Full coordinator unit suite: 142 passed.
+
+== 7. Remaining watches
+
+* *S4B-R3 (WATCH)* -- unchanged. `registered_checkout_validator` is still optional
+  at `run_one_hop`; the sole production caller `run_real_one_hop` wires it. The
+  correction does not touch this layering.
+* *S4B-R4 (WATCH)* -- unchanged. Commit permission is still decided independently of
+  route/finding validity; the implicit single-writer commit-window invariant is
+  unchanged.
+* *S4B-R5 (WATCH)* -- unchanged and explicitly preserved: `commit_intent` altered the
+  strict provider structured-output schema (required-nullable field), so old
+  `result-message.json` artifacts no longer parse and *provider structured-output
+  conformance must be refreshed before any later live proof*. No provider refresh
+  was performed in this hop.
+* *L4-R1 (WATCH)* / *L4-R2 (MINOR)* -- unchanged; the correction adds no
+  resume/reconstruction reader and does not alter `changed_paths` range semantics.
+
+== 8. Readiness
+
+* *S4B-R1:* CLOSED. *S4B-R2:* CLOSED. No new BLOCKING/IMPORTANT direct regression.
+* The bounded Slice-4B authority boundary is now internally consistent with its own
+  authority limits (no hook control, no external-program execution reachable from
+  agent-controlled worktree/attribute state).
+* *Ready for maintainer Slice-4B acceptance:* YES (bounded N=1 model; corrected
+  external-execution surface).
+* *Ready for provider-conformance refresh:* YES (the separate lifecycle step gated
+  by S4B-R5, before any live proof).
+* *Routine repository use:* NOT AUTHORIZED. *Live proof:* NOT AUTHORIZED. This
+  review authorizes neither.
+
+== 9. Validation
+
+* `.venv/bin/python -m pytest tests/unit/workflow_coordinator/` -> 142 passed,
+  including the three new regression tests (hook neutralization, `GIT_CONFIG_*`
+  injection neutralization, configured clean-filter refusal).
+* Independent local read-only Git experiments confirmed: command-line
+  `-c core.hooksPath=/dev/null` overrides repo-local and `GIT_CONFIG_*`-injected
+  `core.hooksPath`; the trusted environment strips `GIT_CONFIG_*`; the
+  `filter.*.(clean|process)` regexp query detects a configured clean filter.
+* `git diff --check` -> clean.
+* No provider/Codex invocation; `proof_harness.py` was not run against a provider.
+* AsciiDoc rendered with `asciidoctor` to the fixed prompt path.
+
+== 10. Final report
+
+----
+VERDICT: A
+S4B-R1: CLOSED
+HOOK EXECUTION SURFACE: NEUTRALIZED
+S4B-R2: CLOSED
+INHERITED GIT CONFIG/ROUTING: NEUTRALIZED
+CLEAN/PROCESS FILTER EXECUTION: FAIL-CLOSED BEFORE STAGING
+TRUSTED POST-COMMIT OBSERVATION USES SAME EXECUTION POLICY: YES
+REPOSITORY CONFIG PERSISTENTLY MODIFIED: NO
+TRUSTED API BROADENED: NO
+NEW BLOCKING/IMPORTANT DIRECT REGRESSIONS: none
+S4B-R3: WATCH
+S4B-R4: WATCH
+S4B-R5: WATCH
+PROVIDER CONFORMANCE REFRESH STILL REQUIRED BEFORE LIVE PROOF: YES
+L4-R1: WATCH
+L4-R2: MINOR
+REAL CODEX/PROVIDER INVOCATIONS: 0
+READY FOR MAINTAINER SLICE-4B ACCEPTANCE: YES
+READY FOR PROVIDER-CONFORMANCE REFRESH: YES
+ROUTINE REPOSITORY USE AUTHORIZED: NO
+LIVE PROOF AUTHORIZED: NO
+PROJECT MEMORY UPDATED: NO
+REVIEW COMMIT: <this commit>
+----
