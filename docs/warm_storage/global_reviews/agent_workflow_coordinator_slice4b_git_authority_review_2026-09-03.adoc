@@ -1,0 +1,436 @@
+= Agent Workflow Coordinator -- Slice-4B Git-Authority Boundary Review
+Independent adversarial review, 2026-09-03
+:toc: macro
+:toclevels: 2
+
+toc::[]
+
+== 1. Verdict
+
+*VERDICT: B -- BOUNDED CORRECTION REQUIRED (before routine-repository use or any
+live proof against a repository whose Git configuration the Coordinator does not
+control).*
+
+The Slice-4B authority *model* is sound for its bounded `N=1` disposable-proof
+target: the agent owns semantic worktree mutation plus a bounded, non-authoritative
+commit *intent*; the trusted Coordinator alone owns one ordinary mechanical commit
+over an explicit, scope-checked path set; the intent is distinct from a
+`claimed_commits` assertion; the boundary exposes no agent-selected argv, no Git
+revision syntax, no shell, and no reset/rebase/merge/push/config/remote surface;
+`--` guards both write commands against option injection; and every postcondition
+is re-derived from actual Git reality. All 80 focused tests pass.
+
+The correction is *not* in the authority model. It is that the trusted write
+invocation does not yet neutralize Git's own external-execution surface. `git
+commit` executes repository hooks, and both `git add` and `git commit` inherit the
+Coordinator's full process environment. Under a worktree-relative `core.hooksPath`
+whose directory is inside the phase's authorized scope, *agent-authored hook
+content executes with Coordinator privileges during the otherwise-narrow commit* --
+a materially broader privileged action than "one ordinary local commit," and one
+the FTR authority limits explicitly forbid ("hook control"). This is *latent, not
+active*: the reviewed `core` repository sets no `core.hooksPath`, and the
+empirically observed real-Codex boundary makes the default `.git/hooks` directory
+read-only to the agent, so the finding is unreachable for the currently authorized
+default-config disposable proof. It becomes reachable exactly at the routine
+valuable-repository target that Slice 4B does not authorize. Because the boundary's
+whole purpose is the property this defeats, and the mitigation is cheap and local,
+it is recorded as an IMPORTANT correction gated to routine/non-disposable use
+rather than carried as a WATCH.
+
+This verdict does not lower the disposition because a live proof has not run; it is
+driven solely by the hook/environment external-execution surface. It does not
+reopen the design (verdict C is not warranted). Routine repository use and any live
+provider execution remain *NOT AUTHORIZED*; this review authorizes nothing.
+
+== 2. Authority model reconstructed (from code and tests, not the evidence note)
+
+Independent reconstruction of `c323eaa5..e4e476b2`:
+
+* *Agent surface.* The agent mutates authorized worktree files and returns a
+  `RoutingResult` carrying an optional `commit_intent = {paths, subject}`
+  (`model.py` `CommitIntent`). It never runs Git in the Slice-4B path: the
+  deterministic `WorktreeOnlyAdapter` only writes files, and the proof-harness
+  fake now returns intent instead of `git add`/`git commit`
+  (`proof_harness.py`, `test_proof_harness.py`, `test_slice4.py`).
+* *Coordinator surface.* `vertical.run_one_hop` reduces the validated result. When
+  `commit_intent` is present *and* the result disposition permits it, it calls the
+  single trusted write surface `git_facts.trusted_commit(...)`; otherwise it falls
+  back to the pre-existing observe-only `observe_hop(...)`.
+* *Trust anchor.* The sole production caller is `slice4.run_real_one_hop`, which
+  validates the registered external checkout association (`validate_checkout(...)
+  == association`) at preflight and passes a `require_registered_checkout`
+  callback that re-validates that association *immediately before* the trusted
+  commit (`vertical.py:123-124`, `slice4.py:180-191`).
+* *Fail-closed reduction.* Any `trusted_commit` refusal/failure is folded into
+  `MechanicalFacts.repository_anomaly` as `trusted_commit:<reason>`
+  (`vertical.py:159-165`) and preempts through the existing
+  `reducer.reduce_result` mechanical-error gate (`reducer.py:258-268`) to
+  `awaiting_human`, before any Finding or route authority -- identical ordering to
+  the Level-4-reviewed behaviour.
+
+The property under review -- "agent-controlled data/worktree state cannot cause the
+trusted Coordinator to perform materially broader privileged actions than the one
+authorized commit" -- holds for every data path *inside* the boundary. It is
+qualified only by Git's own external-execution mechanisms (section 5).
+
+== 3. Commit-intent contract
+
+*Distinct from claimed_commits: YES.* `CommitIntent` names neither a Git command
+nor a pre-existing commit hash. `claimed_commits` remains an agent assertion about
+already-existing commits; a Coordinator-created commit is observed Git reality.
+The post-commit observation opts out of claim comparison narrowly and only on the
+Coordinator-created path (`observe_hop(..., claims_existing_commits=False)` inside
+`trusted_commit`, `git_facts.py:358-364`). Everywhere else the default
+`claims_existing_commits=True` is retained, including the vertical fallback and the
+still-exercised historical Option-A path
+(`test_slice4.py` retains `claimed_commits=[commit], commit_intent=None`), so
+historical agent-owned-commit anomaly detection is not weakened and Option A gains
+no new authority.
+
+*No authoritative hash from the model.* The intent carries only `paths` and
+`subject`. The authoritative commit hash is `delta.end_head`, taken from Git after
+the commit (`git_facts.py:365-375`).
+
+*Only one intent; no argv surface.* The schema exposes exactly `{paths, subject}`
+with `additionalProperties: false`
+(`serialization.COMMIT_INTENT_REQUIRED_KEYS`, `codex_adapter.routing_result_openai_schema`).
+`test_serialization.py` proves an injected `argv` key is rejected as an unknown
+field. Empty `paths` is rejected (`serialization.py:418-419`).
+
+*Bypass check.* An agent that both creates its own commit and supplies
+`commit_intent` does not bypass claim-mismatch: `trusted_commit` requires
+`HEAD == base_head` and refuses ("unexpected HEAD movement"); the vertical then
+falls back to `observe_hop` with default claim semantics, so an unclaimed
+agent-made commit still surfaces `claim_mismatch`/anomaly. Double fail-closed.
+
+*Correlation.* The intent is carried inside the existing structured-result
+envelope validated against `Invocation(run_id, hop_id, invocation_id)`; no separate
+correlation channel is introduced.
+
+Schema-evolution assessment is in section 8. *Required-nullable `commit_intent`* is
+the correct strict evolution for this project's fail-closed serialization style
+(every field explicit; `escalation` is already required-nullable).
+
+== 4. Trusted Git write surface (`trusted_commit`, `git_facts.py:305-375`)
+
+Line-by-line, before any mutation:
+
+* registered work-tree identity via `rev-parse --show-toplevel`, compared to
+  `expected_repository` (rejects sub-directory and non-repository inputs);
+* `HEAD == base_head` (rejects concurrent/agent HEAD movement);
+* no unresolved submodules;
+* subject postcondition *before* mutation (`commit_subject_error`: single line,
+  Conventional-Commit prefix, WorkItem and Hop identity tokens with boundary
+  guards);
+* explicit-path validation (`_validated_intent_paths`): each path normalized,
+  repository-relative, non-absolute, no empty/`.`/`..` parts, no backslash, no
+  ambiguous normalization, no duplicates, and inside the authorized scope; the
+  bare-root `.` intent path is rejected (the `e4e476b2` correction), while scope
+  entries may be `.`;
+* no pre-existing staged state;
+* the *exact* set of non-ignored dirty worktree paths (`git diff --name-only HEAD`
+  plus `ls-files --others --exclude-standard`) must equal the intent set --
+  unexpected dirty paths and missing mutations both fail closed.
+
+Mutation is limited to `git add -- <paths>` and one `git commit -m <subject> --`.
+Both use `--`, so an intent path such as `-rf` (which passes normalization but is
+rejected by scope unless scope is root) cannot become an option. After the commit
+the boundary independently re-observes Git and requires exactly one non-merge
+`base..HEAD` commit equal to the new HEAD, a committed path set equal to the intent,
+the exact requested subject, and zero anomalies; otherwise it raises with the
+factual delta attached.
+
+*Arbitrary Git/shell surface exposed: NO.* No agent string reaches argv except the
+`--`-guarded explicit paths and the validated `-m <subject>`; no revision syntax,
+option injection, shell, or repository escape path was found by reasoning from the
+`subprocess` argument construction.
+
+Path-model spot checks: deletions and new files appear in the dirty set and are
+staged by explicit `add --`; a *directory* intent path fails as "no worktree
+mutation" (the dirty set lists files, not directories); rename appears as
+delete+untracked-new and both must be intended; symlinks are ordinary paths within
+the boundary. `src//a.py` and `src/../a.py` are rejected (ambiguous/escape), as
+`test_slice4b_git_authority.py` parametrizes.
+
+== 5. Git external-execution / config analysis (the primary finding)
+
+This is where the property is qualified. `git commit` runs repository hooks and
+`git add`/`git commit` honour repository/worktree configuration.
+
+*Verified Git semantics (local read-only experiments):*
+
+. A worktree-relative `core.hooksPath = .githooks` causes `.githooks/pre-commit`
+  to *execute on an ordinary `git commit`* (observed side effect written to disk).
+  `git commit --no-verify` suppresses `pre-commit`/`commit-msg`. `trusted_commit`
+  passes neither `--no-verify` nor a `core.hooksPath` override, so it does not
+  neutralize hooks.
+. A clean filter (`git add` arbitrary execution) requires a *config-defined*
+  `filter.<name>.clean`; a `.gitattributes` file that only *assigns* `filter=...`
+  runs nothing without that config. An agent that can write `.gitattributes` but
+  not `.git/config` therefore cannot define a clean-filter command. Not
+  agent-reachable via worktree alone.
+. `commit.gpgSign` / `gpg.program` are config, not worktree state.
+
+*Reachability under the Slice-4B threat model.* The dirty-path equality check means
+an agent-modified hook file executes only if it is *in the authorized scope and in
+the intent* (an unexpected dirty hook fails closed before any `git` write, so it
+never runs). The default hooks directory `.git/hooks` is not agent-reachable under
+the empirically observed read-only-`.git` boundary. Hence the concrete hostile path
+is: maintainer sets a *worktree-relative* `core.hooksPath`, and the phase's
+`authorized_scope` includes that directory; the agent then rewrites the in-scope
+hook and includes it in the intent; the Coordinator's `git commit` executes it
+outside the agent sandbox with Coordinator privileges.
+
+*Assessment.* Content tampering by such a hook is *detected* post-hoc (the
+post-commit path/subject observation fails closed), but arbitrary *code execution*
+and its non-Git side effects are not preventable after the fact. This is
+`S4B-R1` (IMPORTANT). It is latent for the currently authorized target -- the
+reviewed `core` repo sets no `core.hooksPath`, `commit.gpgSign`, or `gpg.program`,
+and the disposable proof uses default config -- but it defeats the exact property
+the boundary exists to guarantee, and the FTR authority limits name "hook control"
+as forbidden. Narrowest mitigation (do *not* implement in this review): run the two
+trusted write commands with hooks neutralized and configuration pinned, e.g.
+`git -c core.hooksPath=/dev/null ... commit --no-verify`, and document that an
+agent-writable hook path must never appear in an authorized scope. Distinguish
+clearly: a *maintainer-controlled* `.git/hooks` or config hook is trusted Git
+policy the operator owns; an *agent-writable worktree-controlled* hook is the
+surface that must be closed.
+
+== 6. Checkout trust and environment analysis
+
+*Trust anchor (section 5 of the prompt): correct composition, with a WATCH.* In
+`trusted_commit` the identity check `identity != expected_repository.resolve()` is
+non-authoritative on the production path because `vertical.run_one_hop` passes
+`expected_repository=repository`; it still rejects sub-directory and
+non-repository inputs, but the real trust guarantee is the
+`registered_checkout_validator` callback, which `run_real_one_hop` wires to the
+external checkout association and re-validates immediately before the commit. The
+sole production caller always wires it. However `registered_checkout_validator`
+*defaults to `None`* on `run_one_hop`, so the trusted write is reachable by any
+future direct caller that supplies a `commit_intent` without the association check
+(the Slice-4B unit tests do exactly this against throwaway fixtures). Correct
+today; `S4B-R3` (WATCH) records the API footgun.
+
+*Environment inheritance: WATCH.* `git_facts._git` (and the sibling `subprocess.run`
+calls) pass no `env=`, inheriting the Coordinator's full environment. Operator-set
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, or `GIT_CONFIG_COUNT` /
+`GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` (the last can inject `core.hooksPath`,
+filters, or signing config) could redirect or broaden the commit; signing/SSH
+variables likewise. This is *operator/environment misconfiguration, not hostile
+agent influence*: the agent runs in a child sandbox and cannot set the parent's
+environment. The registered-checkout identity check catches gross `GIT_DIR`/
+`GIT_WORK_TREE` redirection but not `GIT_CONFIG_*` hook/filter injection. Recorded
+as `S4B-R2` (WATCH); fold explicit Git-environment pinning into the same hardening
+pass as `S4B-R1` before routine valuable-repository use. No agent-reachable path,
+so not a blocker on its own.
+
+== 7. Concurrency and partial-failure containment
+
+*Concurrency / TOCTOU: SOUND FOR THE CURRENT MODEL.* Between the dirty-path
+observation, `git add`, and `git commit`, `trusted_commit` re-checks
+`staged == paths` and re-checks `HEAD == base_head`; the post-commit observation
+fails closed on any residual dirty tracked/untracked state, so an unrelated
+concurrent write is caught. The one race not excluded by re-observation is
+*same-path content substitution* (a concurrent writer overwrites an already-intended
+in-scope file between validation and staging: the path set still matches, so the
+Coordinator could commit content it did not validate). This is excluded by the
+explicit `N=1` single-checkout ownership invariant -- the agent subprocess has
+returned and its result is validated before `trusted_commit` runs, so no authorized
+concurrent writer exists in the commit window. No filesystem locking is demanded;
+the ownership invariant, not locking, is the guarantee. `S4B-R4` (WATCH) notes that
+this invariant is implicit and should be stated explicitly if Slice 5 introduces
+overlapping writers.
+
+*Partial-failure containment: SOUND.* No `reset`, `restore`, `clean`, retry, or
+automatic repair exists anywhere; actual Git state is always preserved and
+re-observed. Failure taxonomy:
+
+* staging failure / commit failure -> `TrustedCommitError` without a delta ->
+  vertical falls back to `observe_hop`, recording true Git reality; no false
+  completion (`test_deterministic_staging_failure_...` proves HEAD unchanged, file
+  preserved, truthful `trusted_commit:staging failed:` reason);
+* post-commit observation mismatch -> `TrustedCommitError(delta=...)` *with* the
+  factual delta; a real commit therefore exists only when the delta is present;
+* a *transient* post-commit observation error (e.g. `observe_hop` raising a plain
+  `GitPreflightError`, which is not caught by `except TrustedCommitError`) is
+  caught by the vertical's `except Exception`, and the fallback `observe_hop` still
+  records the created commit from `base..HEAD` while the run stops for human. The
+  commit is never lost or misrepresented; the reducer state does not report false
+  completion. Acceptable, if slightly indirect.
+
+This relates to L4-R1: a `trusted_commit` failure remains a mechanical-preemption
+fact string in `run.json`; the correlated raw result stays durable in Slice-4
+state. Slice 4B adds a Coordinator-owned commit but *no* new resume/reconstruction
+reader of `run.json` alone, so it creates no concrete new reason to promote L4-R1
+now.
+
+== 8. Schema / compatibility analysis
+
+`schema_version` remains `1` while a new *required* (nullable) `commit_intent` field
+is added to `RoutingResult`, and the OpenAI/Codex projection now lists it in
+`required` as `anyOf(null, {paths, subject})`. `serialization._fields` rejects both
+missing and unknown keys, so:
+
+* an *old* persisted `result-message.json` (schema_version 1, no `commit_intent`)
+  now fails to parse ("missing fields: commit_intent");
+* the live structured-output contract changed versus the Level-3-proven contract
+  (a new required, if nullable, field the provider must emit).
+
+Disposition among the prompt's options: *A with a bounded rider (`S4B-R5`, WATCH),
+tending to D before live use* -- not B/C for the schema itself. Rationale: V1
+machine-written transient Run state is intentionally strict and mutable at this
+project stage (WFC-ODI-01), and no *authorized* path re-parses an old result
+message -- the Level-4 authorization is consumed, no resume is authorized, and
+within a single run the writer and reader share one code version, so there is no
+same-version runtime defect. Required-nullable is the correct strict evolution.
+Two carried obligations before any live proof: (i) note that pre-existing
+`result-message.json` artifacts are no longer parseable (no migration framework is
+warranted, but the incompatibility must be acknowledged rather than discovered);
+and (ii) refresh the provider structured-output conformance evidence, since the
+Level-3-proven schema no longer matches -- a bounded conformance step, not a new
+architecture. Neither blocks the maintainer's bounded Slice-4B disposition; both
+belong to the separate live-proof lifecycle.
+
+== 9. Tests
+
+The real-temporary-Git suite exercises the material authority invariants, not raw
+count: worktree-only-agent happy path with authoritative post-commit
+hash/subject/path facts and an empty remote; exact scope; path escape/ambiguity/
+duplication; the `.` rejection (`e4e476b2`); invalid and identity-lacking subjects
+before mutation; unrelated tracked *and* untracked dirty state failing closed
+without cleaning; an explicit new file; HEAD and repository preconditions;
+deterministic staging failure with truthful reporting and no reset; observation-only
+clean vs dirty-without-intent; and a failed (`blocked`) result with intent never
+synthesizing a commit. Serialization proves intent is strict data with no `argv`
+surface. The historical Option-A commit path is retained and still routes through
+observe-only claim semantics. All 80 focused tests pass.
+
+*Test gap (non-blocking).* No test asserts the section-5 hook/environment behaviour
+(neither that a maintainer `.git/hooks` hook is tolerated as trusted policy, nor
+that an agent-writable in-scope hook is refused). When `S4B-R1`/`S4B-R2` are
+corrected, add a hook-neutralization test at the trusted-commit boundary; it guards
+a material authority invariant and is the one worth adding.
+
+== 10. Findings
+
+[cols="1,1,4",options="header"]
+|===
+|ID |Severity |Finding
+
+|S4B-R1 |IMPORTANT
+|*Trusted commit does not neutralize Git's hook execution surface.* Violated
+invariant: "no privileged action broader than one ordinary commit" / FTR
+"must not expose hook control." Path: maintainer sets a worktree-relative
+`core.hooksPath` and the phase `authorized_scope` includes that directory; the
+agent rewrites the in-scope hook and includes it in the intent; the Coordinator's
+`git commit` (`git_facts.py:354`) executes it with Coordinator privilege outside
+the sandbox. Evidence: local experiment (worktree hook runs on commit;
+`--no-verify` suppresses it) and the absence of any hook override in
+`trusted_commit`. Latent, not active in `core` (no `core.hooksPath`; default
+`.git/hooks` is read-only to the real agent). Correction direction: run the trusted
+`add`/`commit` with hooks disabled and config pinned
+(`git -c core.hooksPath=/dev/null commit --no-verify`), and forbid agent-writable
+hook paths in an authorized scope. Close before routine/non-disposable use.
+
+|S4B-R2 |WATCH
+|*`git` invocations inherit the Coordinator environment.* `git_facts._git` and the
+sibling `subprocess.run` calls pass no `env=`; operator-set `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE`, or `GIT_CONFIG_*` could redirect/broaden the
+commit or inject hook/filter/signing config. Operator misconfiguration, not
+agent-reachable. Fold explicit Git-env pinning into the `S4B-R1` hardening pass.
+
+|S4B-R3 |WATCH
+|*Trusted-write association validator is optional at `run_one_hop`.* With
+`expected_repository=repository` the low-level identity check is non-authoritative;
+the real anchor is `registered_checkout_validator`, which defaults to `None`.
+Correct composition today (only `run_real_one_hop` reaches the real path and always
+wires it); a footgun for any future direct caller of `run_one_hop` supplying a
+`commit_intent`.
+
+|S4B-R4 |WATCH
+|*Commit permission is decided independently of route/finding validity, and the
+single-writer commit-window invariant is implicit.* A commit can be created before
+the reducer rejects the result on other mechanical grounds (unknown route, invalid
+finding delta); there is no false completion (the run stops `awaiting_human` and the
+commit is legitimate in-scope work), but the ordering and the `N=1` no-concurrent-
+writer assumption should be stated explicitly before multi-Hop (Slice 5).
+
+|S4B-R5 |WATCH
+|*`schema_version` stays 1 while a new required-nullable field is added.* Correct
+strict evolution; no same-version runtime defect; but old `result-message.json`
+artifacts no longer parse and the Level-3-proven provider schema changed.
+Acknowledge the old-artifact incompatibility and refresh provider conformance
+before a live proof.
+|===
+
+No BLOCKING findings. No independent Coordinator correctness defect was found in the
+data paths inside the boundary.
+
+== 11. Residuals
+
+* L4-R1 remains *WATCH*: unchanged by Slice 4B. `trusted_commit` failures reduce
+  through the same mechanical-preemption gate; no new resume/reconstruction reader
+  of `run.json` alone was added, so no promotion is forced now. Revisit when a
+  resume path that reads the authoritative ledger without the raw result message is
+  introduced.
+* L4-R2 remains *MINOR*: `GitDelta.changed_paths` keeps committed `base..HEAD`
+  range semantics. Slice 4B does not make the name materially more misleading; on
+  the trusted happy path the committed range and the intent path set coincide by
+  construction. No correction required.
+
+== 12. Readiness disposition
+
+* *Slice-4B authority model:* sound for the bounded `N=1` disposable-proof target.
+* *Bounded correction (verdict B):* close `S4B-R1` (hook neutralization) and fold in
+  `S4B-R2` (Git-environment pinning) before the boundary executes against any
+  repository whose configuration the Coordinator does not control, i.e. before
+  routine valuable-repository use or a live proof on a non-disposable repository.
+* *Agent direct `.git` write required:* NO -- the successful workflow depends only
+  on Coordinator-owned commit; the fake agent never touches Git.
+* *Production sandbox weakened:* NO -- Slice 4B changes no sandbox setting; it does
+  not itself prove OS-level `.git` isolation (that is the sandbox's job, observed
+  empirically at Level 4) and does not claim to.
+* *Routine repository use:* NOT AUTHORIZED. *Live proof:* separate lifecycle; this
+  review authorizes nothing.
+
+== 13. Validation
+
+* `.venv/bin/python -m pytest` on the six touched suites
+  (`test_slice4b_git_authority`, `test_serialization`, `test_slice4`,
+  `test_slice3_vertical`, `test_proof_harness`, `test_codex_adapter_smoke`) -> 80
+  passed.
+* `git diff --check` on the review commit -> clean.
+* Local read-only Git experiments only (worktree-`hooksPath` hook execution;
+  clean-filter config requirement). *No provider/Codex invocation; `proof_harness.py`
+  was not run against a provider.*
+* AsciiDoc rendered with `asciidoctor` to the fixed prompt path under
+  `docs/warm_storage/global_reviews/`.
+
+== 14. Final report
+
+----
+VERDICT: B
+SLICE 4B AUTHORITY MODEL: SOUND (for the bounded N=1 disposable-proof target)
+COMMIT INTENT DISTINCT FROM CLAIMED COMMITS: YES
+ARBITRARY GIT/SHELL SURFACE EXPOSED: NO
+EXPLICIT PATH BOUNDARY: SOUND
+REGISTERED CHECKOUT TRUST: WATCH (S4B-R3; correct composition, optional validator footgun)
+GIT HOOK / EXTERNAL-EXECUTION SURFACE: ISSUE (S4B-R1, IMPORTANT; latent/config-gated)
+INHERITED GIT ENVIRONMENT: WATCH (S4B-R2; operator misconfiguration, not agent-reachable)
+SCHEMA_VERSION=1 COMPATIBILITY: WATCH (S4B-R5; strict evolution correct; old artifacts + provider conformance)
+CONCURRENCY / TOCTOU: SOUND FOR CURRENT MODEL
+PARTIAL FAILURE CONTAINMENT: SOUND
+ACTUAL GIT POST-OBSERVATION: SOUND
+AGENT DIRECT .git WRITE REQUIRED: NO
+PRODUCTION SANDBOX WEAKENED: NO
+L4-R1: WATCH
+L4-R2: MINOR
+BLOCKING/IMPORTANT FINDINGS: S4B-R1 (IMPORTANT)
+MINOR/WATCH: S4B-R2, S4B-R3, S4B-R4, S4B-R5 (WATCH); L4-R2 (MINOR)
+READY FOR MAINTAINER SLICE-4B DISPOSITION: YES (bounded N=1 model; with S4B-R1 correction gated to routine/non-disposable use)
+READY FOR LIVE PROOF CONSIDERATION: NO (close S4B-R1/S4B-R2 and refresh provider conformance first; technical readiness only)
+ROUTINE REPOSITORY USE AUTHORIZED: NO
+REAL CODEX/PROVIDER INVOCATIONS IN REVIEW: 0
+PROJECT MEMORY UPDATED: NO
+REVIEW COMMIT: <this commit>
+----
