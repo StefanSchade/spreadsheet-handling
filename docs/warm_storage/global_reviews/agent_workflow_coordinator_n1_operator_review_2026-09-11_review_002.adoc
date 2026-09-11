@@ -1,0 +1,235 @@
+= Bounded Re-Review (002) -- Declarative N=1 Workflow-Coordinator Operator
+:toc:
+:toclevels: 3
+
+Re-review target:: `5ec5a7d5bdf4144d72a76fda951013cdb5effb45`
+  -- `fix(workflow): correct N=1 operator attempt accounting`.
+Prior review:: `92094d87e5afe2b196989d0c60e0711b22f3d15f`, artifact
+  `agent_workflow_coordinator_n1_operator_review_2026-09-11.adoc`
+  (verdict B). This artifact does not repeat that review's architectural
+  analysis; previously accepted properties remain accepted.
+Correction evidence:: `agent_workflow_coordinator_n1_operator_correction_2026-09-11.adoc`.
+Scope:: B1, B2, B3, and direct regressions introduced by their correction only.
+Real provider invocations during re-review:: *0* (local fake executables in
+  disposable temporary Git repositories).
+
+== Verdict
+
+*A -- DECLARATIVE N=1 OPERATOR ACCEPTED.*
+
+*READY FOR ONE SEPARATELY AUTHORIZED REAL N=1 OPERATOR DOGFOOD: YES.*
+
+B1, B2, and B3 are resolved and no direct material regression was introduced.
+This acceptance authorizes only consideration/execution of one separately
+maintainer-authorized N=1 dogfood WorkItem. It does not authorize routine
+unattended use, N>1, Slice 5, supervisor, resume automation, child Runs,
+higher-order loops, or automatic DMC progression.
+
+== Required explicit answers
+
+[cols="3,2",options="header"]
+|===
+|Property |Answer
+
+|B1 STATUS |RESOLVED
+|B2 STATUS |RESOLVED
+|B3 STATUS |RESOLVED
+|POST-PROVIDER EXIT CLASSIFICATION SOUND |YES
+|PRE-ATTEMPT EXIT-2 CLASSIFICATION SOUND |YES
+|ATTEMPT-ROOT FAILURE SUMMARY SOUND |YES
+|PROVIDER EXECUTED MORE THAN ONCE IN ANY PROBE |NO
+|N>1 BRANCH ACTUALLY EXERCISED |YES
+|B3 ACCEPTANCE BRANCHES DIRECTLY COVERED |YES
+|DIRECT MATERIAL REGRESSION |NO
+|SECOND COORDINATOR CREATED |NO
+|REAL PROVIDER INVOCATIONS DURING RE-REVIEW |0
+|N=1 OPERATOR ACCEPTED |YES
+|READY FOR REAL N=1 OPERATOR DOGFOOD |YES
+|===
+
+== B1 -- attempt accounting / exit status / summary (RESOLVED)
+
+`operator.py::main` now splits into two regions:
+
+* a *pre-attempt* region (argument parse, `_preflight`, Run construction, fresh
+  state-root creation, plan write) whose handler returns `2`
+  (`SystemExit` from argparse maps to `0` for `--help`, else `2`; any other
+  exception returns `2`);
+* an *attempt* region beginning at `register_checkout`, wrapped in
+  `except Exception`, which returns `1` and writes a best-effort failure summary
+  -- no reclassification by exception type after that boundary.
+
+Answers to the required questions:
+
+. *Original defect eliminated?* Yes. The provider-capable path is entirely
+  inside the attempt region, whose handler returns `1`, so a post-dispatch
+  failure can no longer be reported as `exit 2`.
+. *Can any post-provider failure still escape to exit 2?* No. `exit 2` is only
+  reachable from the pre-attempt region, which ends before `register_checkout`
+  and therefore before any provider-capable step. The attempt region catches
+  `Exception` (deliberately not `BaseException`).
+. *Can any post-attempt exception bypass best-effort summary?* No.
+  `_write_failure_summary` runs in the attempt handler for every failure,
+  including a failure of the success-path summary write itself.
+. *Does `_write_failure_summary` preserve only operator-known facts?* Yes. It
+  records Run identity/status/budget/anomalies from the known Run
+  (`real.run` when available, else the pre-attempt `run`), provider transport
+  facts only if an outcome exists, empty `commits`/`changed_paths` (no
+  fabrication), and `final_head`/`worktree_clean` only when a fresh
+  `observe_repository` succeeds. When observation fails it omits those keys
+  rather than inventing Git facts.
+. *Can summary writing obscure the original failure?* No. The original error is
+  always printed and `exit 1` returned; `_write_failure_summary` suppresses its
+  own exceptions and cannot replace the failure with a false success
+  (`operator_status: failed`).
+. *Second recovery/state machine?* No. It writes one JSON view of known facts;
+  it does not reduce, charge Hops, or reconcile. Authoritative recovery remains
+  in `run_real_one_hop` (`recover_uncertain`).
+. *Authoritative `RealHopRun` preferred?* Yes.
+  `known_run = real.run if real is not None else run` and the success path uses
+  `real.run`/`real.outcome`.
+. *Opposite bug (pre-provider reported as exit 1)?* A genuinely pre-provider
+  failure inside the attempt region -- `register_checkout` config rejection or a
+  `CodexCliError`/preflight failure inside `run_real_one_hop` (which unlinks the
+  dispatch marker) -- now returns `1` rather than `2`. This is the deliberate
+  conservative boundary the prior review prescribed ("from `register_checkout`
+  onward -> exit 1"). It never *under*-reports consumption: `exit 1` directs the
+  operator to inspect the attempt root, where the absence of a dispatch marker
+  proves no Hop was consumed. It does not materially misrepresent
+  provider/attempt semantics and is not a rejection reason.
+
+=== B1 regression test + independent probe
+
+The committed regression test
+`test_post_provider_summary_failure_is_attempt_failure_with_evidence` runs a
+fake provider that returns a completed envelope, monkeypatches `_summary` to
+raise post-provider, and asserts: exit `1`; `operator-plan.json` present;
+`operator-summary.json` present with `operator_status: failed` and the original
+error; `counter == "1"` (exactly one invocation). Inspected -- it genuinely
+forces a post-provider failure and checks evidence, not just a pass.
+
+I also re-ran the review-001 adversarial probe unchanged (fake writes a
+malformed result then orphans HEAD via `symbolic-ref` post-dispatch, forcing a
+*real* Git-observation failure inside recovery, not a monkeypatch):
+
+----
+EXIT CODE: 1                (was 2 pre-fix)
+provider ran (counter): 1
+plan exists: True
+summary exists: True        (was False pre-fix)
+operator_status: failed | hop_used: 0 | has final_head: False
+----
+
+The consumed-provider attempt now yields `exit 1` with a failure summary, and
+the unobservable `final_head` is correctly omitted rather than fabricated.
+
+Existing classifications remain intact: malformed/uncorrelated result ->
+`exit 1` with summary and one charge; completed clean Run -> `exit 0`; genuine
+pre-attempt rejection (head mismatch, existing root, dirty worktree, unknown
+fields, N>1, missing component, `profile_ref` mismatch) -> `exit 2`.
+
+*POST-PROVIDER EXIT CLASSIFICATION SOUND: YES. PRE-ATTEMPT EXIT-2 CLASSIFICATION
+SOUND: YES. ATTEMPT-ROOT FAILURE SUMMARY SOUND: YES.*
+
+== B2 -- genuine N>1 branch (RESOLVED)
+
+`test_n_greater_than_one_rejects_pinned_clean_input_before_execution` now:
+
+* rewrites `work.yml` to `max_autonomous_hops: 2` and *commits* it;
+* asserts the `--expected-head` argument equals that commit SHA;
+* runs from a clean worktree (so preflight's clean/HEAD checks pass and the
+  pinned read returns the committed `2`);
+* reaches the explicit guard and asserts the specific
+  `max_autonomous_hops == 1` diagnostic on stderr with `exit 2`;
+* asserts `not counter.exists()` (fake executed zero times).
+
+An independent probe confirmed the pinned input drives the rejection: with a
+committed N=2 and clean worktree the guard fires, whereas the prior test's
+uncommitted edit only tripped the dirty-worktree preflight.
+
+*N>1 REJECTION BRANCH ACTUALLY EXERCISED: YES.*
+
+== B3 -- coverage strengthening (RESOLVED)
+
+Direct coverage now genuinely exercises each branch:
+
+* *`DurableArtifact.REQUIRED`* -- zero declarations reject (`exit 2`); an
+  in-scope `PROOF.md` declaration passes preflight and reaches the fake provider
+  (`exit 1` via the malformed fake).
+* *`DurableArtifact.OPTIONAL`* -- zero declarations accepted and reach the
+  provider; a valid in-scope declaration accepted and reaches the provider. The
+  test asserts `counter == "3"`, proving only the `required`-with-zero case was
+  rejected pre-provider and the other three reached execution.
+* *missing selected component* -- empty manifest yields
+  `selected component ID is absent from manifest: worker` with `exit 2` and no
+  invocation.
+* *`WorkItem.profile_ref` mismatch* -- a committed clean `profile_ref: other.yml`
+  yields the specific `profile_ref does not identify the supplied profile path`
+  diagnostic with `exit 2` and no invocation.
+* *pinned content authority* -- `test_pinned_text_reads_committed_revision_not_worktree_content`
+  commits new `task.txt` content, then asserts `_pinned_text(repo, baseline,
+  "task.txt")` returns the *baseline* content while the worktree holds the later
+  content -- demonstrating the read is from the named committed revision.
+
+*B3 ACCEPTANCE BRANCHES DIRECTLY COVERED: YES.* No additional coverage
+requirements are invented; the correction exposed no new material gap.
+
+== Direct regression check
+
+Because `main` was restructured, the specific regression surface was inspected:
+
+* *hidden retry / second `run_real_one_hop`* -- none; a single call remains, and
+  the attempt handler does not re-invoke;
+* *provider invocation before plan persistence* -- unchanged; the plan is
+  written in the pre-attempt region before `register_checkout`/`run_real_one_hop`;
+* *one-shot state-root semantics* -- unchanged (`state_root.exists()` still
+  rejects in `_preflight`);
+* *`KeyboardInterrupt`/`SystemExit` in the attempt region* -- not caught
+  (`except Exception`); the pre-attempt `SystemExit` handler only maps argparse
+  exits and is materially correct;
+* *false success after summary failure* -- impossible; the success path returns
+  `0` only for a completed clean Run, and a success-path summary write failure
+  falls to the attempt handler and returns `1`;
+* *summary overwriting authoritative Run state* -- no; only
+  `operator-summary.json` is written by the operator, never `run.json`;
+* *new authority/recovery semantics, altered serialization/config contract,
+  changed N=1 scope* -- none; `serialization.py` is untouched by this commit and
+  the composition boundary is unchanged.
+
+*DIRECT MATERIAL REGRESSION: NO. SECOND COORDINATOR CREATED: NO.*
+
+== WATCH items (unchanged)
+
+WATCH-1 (`ls-tree`/pathspec over-rejection), WATCH-2 (`changed_paths`
+reconstructed from live HEAD), WATCH-3 (harmless `invocation_id` cleanup -- the
+success path still sets `summary["invocation_id"]` explicitly), and WATCH-4
+(documentation/release revisit if the CLI becomes supported public tooling)
+remain non-blocking and were not worsened by this correction. They are preserved
+without re-analysis. One deliberate observation: the conservative attempt
+boundary begins at `register_checkout` (section B1 answer 8); this is the
+prescribed and accepted boundary, not a new WATCH.
+
+== Validation
+
+All from the repository root with `.venv`:
+
+* `pytest -q tests/unit/workflow_coordinator/test_operator.py` -- 10 passed;
+* `pytest -q tests/unit/workflow_coordinator` -- 152 passed;
+* `pytest -q tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py`
+  -- 11 passed;
+* `ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator` --
+  all checks passed;
+* `git diff --check <prior>..<target>` -- clean;
+* `git status --short` -- clean.
+
+Adversarial probes (disposable temporary Git repositories, local fake
+executables, no real provider): the B1 real-Git-failure probe and the B2 pinned
+N=2 probe reproduced above. Probe scripts were temporary and are not committed.
+
+== Disposition
+
+B1 RESOLVED, B2 RESOLVED, B3 RESOLVED; no direct material regression. The
+declarative N=1 operator is accepted and ready for one separately authorized
+real N=1 operator dogfood. This review implements no findings and moves no FTR
+lifecycle state; `FTR-AGENT-WORKFLOW-COORDINATOR-P5` remains Open/active with the
+dogfood and deferred slices as tracked residual scope.
