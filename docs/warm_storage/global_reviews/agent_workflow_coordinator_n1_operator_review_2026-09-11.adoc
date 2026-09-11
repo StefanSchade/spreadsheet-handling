@@ -1,0 +1,431 @@
+= Independent Adversarial Review -- Declarative N=1 Workflow-Coordinator Operator
+:toc:
+:toclevels: 3
+
+Review target:: `ac4c6baa6869ce4b28e97ed3a846bec8c3cf7f3a`
+  -- `feat(workflow): add declarative N=1 coordinator operator`.
+Baseline:: `0b183375763f98d54d15596d0820731b452bcef0`.
+Review type:: Independent adversarial implementation review; behavior
+  established from current code, the FTR authority, the Git diff, and executable
+  tests/probes -- not from the implementation report, test names, or a green
+  suite.
+Real provider invocations during review:: *0* (all probes used local fake
+  executables in disposable temporary Git repositories).
+
+== Verdict
+
+*B -- bounded correction required before real dogfood.*
+
+The commit is genuinely a small composition layer over the accepted Coordinator
+mechanics: it creates no second Coordinator, does not weaken authority
+boundaries, pins all semantic inputs to the expected HEAD, enforces N=1, and has
+no hidden retry. However, the operator's shell contract is not honored on the
+uncertain post-dispatch boundary: a failure that occurs *after* the dispatch
+marker is written and the provider may have executed can be reported as
+`exit 2` (the reserved pre-provider classification) and can leave a valid
+attempt root without an `operator-summary.json`. Per the review charter this is
+a material one-shot / provider-consumption accounting defect. It is a localized
+bug in `operator.py::main`, not an architectural or authority defect, so a
+bounded correction is sufficient.
+
+A second, test-integrity blocker: the dedicated `max_autonomous_hops != 1`
+rejection test does not exercise that branch (it is rejected earlier for a dirty
+worktree, and the pinned input still reads `1`). The N=1 acceptance property
+therefore exists only in a non-exercising test.
+
+== Required explicit answers
+
+[cols="3,1",options="header"]
+|===
+|Property |Answer
+
+|OPERATOR IS ONLY A COMPOSITION LAYER |YES
+|EXISTING YAML AUTHORITIES REUSED |YES
+|COMPONENT MANIFEST FAIL-CLOSED |YES
+|INPUTS PINNED TO EXPECTED HEAD |YES
+|N=1 ENFORCED |YES (code correct; branch not exercised by its test)
+|HIDDEN RETRY |NO
+|EXIT 0/1/2 SEMANTICS CORRECT |NO
+|POST-DISPATCH FAILURE ACCOUNTING SOUND |NO
+|VALID ATTEMPT ROOT EVIDENCE COMPLETE |NO
+|DURABLE-ARTIFACT POLICY CORRECT |YES
+|TESTS ACTUALLY EXERCISE ACCEPTANCE BRANCHES |NO
+|SECOND COORDINATOR CREATED |NO
+|REAL PROVIDER INVOCATIONS DURING REVIEW |0
+|READY FOR REAL N=1 OPERATOR DOGFOOD |NO
+|===
+
+== 1. Diff / architectural boundary
+
+Inspected `git diff <baseline>..<target>`. The change adds only:
+
+* `scripts/workflow_coordinator/operator.py` (new, 204 lines);
+* `scripts/workflow_coordinator/serialization.py` (+`PromptComponentReference`
+  and `component_manifest_from_yaml`);
+* `tests/unit/workflow_coordinator/test_operator.py` (new);
+* the implementation-evidence note.
+
+`operator.py` composes existing mechanics without re-implementing them:
+`new_run`, `register_checkout`, `run_real_one_hop`, the strict
+`work_item_from_yaml` / `workflow_profile_from_yaml` /
+`repository_policy_from_yaml` serializers, `PromptComponent` prompt material,
+`CodexCliAdapter` (via `run_real_one_hop`), the reducer, the trusted Git
+boundary (`trusted_commit`), result correlation (`validated_result`), and the
+reconcile/recover mechanics (`recover_uncertain_dispatch`). No `N>1`,
+supervisor, retry, resume, child-Run, provider-routing, workflow-DSL,
+graph-engine, or alternate state machine is introduced. There is no hidden
+DMC-specific generic primitive; the only DMC references are in historical
+launcher evidence, not in the new code.
+
+*SECOND COORDINATOR CREATED: NO.*
+
+== 2. Strict configuration / manifest
+
+`component_manifest_from_yaml` was exercised independently. It rejects, fail
+closed, every probed hostile input:
+
+* `schema_version` constrained to `1` (`_version`); `schema_version: 2` rejects;
+* top-level unknown fields reject (`_fields(required={schema_version,components})`);
+* component-entry unknown fields reject (e.g. `exec: true`);
+* duplicate YAML keys reject through `_StrictLoader._construct_unique_mapping`;
+* empty component IDs reject (`_string` non-empty);
+* absolute paths reject; `..` traversal rejects; backslash rejects;
+* normalization ambiguity (`a/`, `a//b`) rejects via `as_posix() != value`.
+
+The manifest carries only `path` per component -- no executable, includes, or
+template semantics entered it. The operator genuinely reuses the three existing
+strict YAML authorities for WorkItem, Profile, and RepositoryPolicy and
+establishes no parallel human-authored config surface. *Fail-closed: YES.*
+
+== 3. Pinned input authority
+
+Every semantic input (WorkItem YAML, Profile YAML, RepositoryPolicy YAML,
+component manifest, task text, and each selected component text) is read through
+`_pinned_text(repository, expected_head, path)`, which runs
+`git show <rev>:<path>` after confirming the path is tracked at that revision.
+
+`_preflight` checks, before any pinned read: repository is the Git top-level
+(`repository_identity`); `--expected-head` is a full 40-hex SHA; current HEAD
+equals expected HEAD; the worktree is clean with resolved submodules; the state
+root does not already exist. Inputs are therefore read from the pinned Git
+object, never from mutable worktree content.
+
+The tracked-file check
+`git ls-tree -r --name-only <rev> -- <path>` followed by exact equality to
+`[path]` is sound for this V1 contract: a directory or missing path yields a
+different listing and rejects; glob-magic or `core.quotePath`-quoted names yield
+a listing that is not byte-equal to the argument and therefore *over*-reject
+(fail-closed), never falsely accept. See WATCH-1.
+
+*INPUTS PINNED TO EXPECTED HEAD: YES.*
+
+== 4. Cross-input authority
+
+Fail-closed behavior verified:
+
+* `WorkItem.profile_ref` must equal the supplied `--profile` path (explicit check);
+* `max_autonomous_hops != 1` rejects (code correct; see B2 for its test);
+* absent initial phase rejects (operator check plus `new_run`);
+* selected component missing from manifest rejects
+  (`reference is None -> OperatorPreflightError`);
+* invalid YAML / unknown fields reject via the reused serializers;
+* non-existent / already-existing state root rejects;
+* non-positive timeout rejects.
+
+`new_run` additionally owns `initial_phase in profile.phases` and
+`work_item.repository in policy.scope`. The lower accepted layers
+(`trusted_commit`, `observe_hop`) remain authoritative for path-scope
+enforcement, so the operator does not duplicate that validation. No important
+WorkItem/Profile/Policy relationship is silently assumed that an accepted lower
+layer does not already own.
+
+== 5. N=1 / one-shot semantics
+
+Established from behavior and probes:
+
+* a fresh root is required (`state_root.exists() -> reject`);
+* exactly one provider-capable invocation can occur -- the fake-success and
+  malformed-result tests both observe the fake executable running exactly once
+  (`counter == "1"`);
+* no hidden retry: a single `run_real_one_hop` call, `plan.retry == False`, and
+  the malformed path returns `reconcile_required` without re-invoking;
+* no second Hop, no automatic resume;
+* invocation identity is generated once
+  (`invocation_id = "INV-" + uuid4`), propagated to the plan, dispatch marker,
+  prompt, and correlation check;
+* `H001` remains runtime-derived (`f"H{run.hop_used + 1:03d}"` inside
+  `run_real_one_hop`/`run_one_hop`); the operator never overrides it.
+
+*N=1 ENFORCED: YES. HIDDEN RETRY: NO.*
+
+== 6. Exit-status semantics -- adversarial check (BLOCKING B1)
+
+Intended shell contract: `0` = mechanically completed clean N=1 Run; `1` =
+provider-capable execution attempted but did not reach clean completed success;
+`2` = local configuration/preflight failure *before* provider execution.
+
+`operator.py::main` wraps the entire body -- preflight, root creation, plan
+write, `register_checkout`, `run_real_one_hop`, summary write, and the final
+`return 0 ... else 1` -- in one `try`, whose handler is:
+
+[source,python]
+----
+except (OperatorPreflightError, Slice4Error, GitPreflightError, ValueError):
+    print(f"OPERATOR ERROR: {error}", file=sys.stderr)
+    return 2
+----
+
+The common post-provider failure modes are correctly funneled to `exit 1`:
+`run_real_one_hop` catches `ExecutionResultValidationError` and broad `Exception`
+from `run_one_hop` and returns a recovered `reconcile_required` `RealHopRun`
+(confirmed: malformed result gives `exit 1` and a written summary). `CodexCliError`
+is a genuine pre-launch failure (`CodexCliError(ExecutionNotStartedError)`;
+raised only for bad contract, non-positive timeout, or `Popen` `OSError`), so
+mapping it to `exit 2` is correct. `ExecutionNotStartedError` (preflight/prompt)
+is a `ValueError` subclass and is likewise correctly caught as `exit 2`.
+
+The defect: exceptions raised *after* the dispatch marker exists and the provider
+may have run are also `GitPreflightError`, `OperatorPreflightError`, or
+`ValueError`, and are therefore caught by the same `exit 2` handler. Concretely:
+
+* `recover_uncertain` (invoked strictly after `write_dispatch_marker`) calls
+  `observe_hop` (raises `GitPreflightError` on any nonzero Git observation or an
+  unresolvable HEAD) and `recover_uncertain_dispatch` (raises `ReductionError`,
+  a `ValueError`);
+* `_summary` and the final `observe_repository` in `main` call the operator
+  `_git` helper (which converts every Git failure into `OperatorPreflightError`)
+  and `observe_repository` (`GitPreflightError`).
+
+Deterministic probe (fake provider that runs, writes a malformed result, then
+points HEAD at an unborn branch post-dispatch):
+
+----
+EXIT CODE: 2
+provider actually ran (counter): 1
+attempt root exists: True
+operator-plan.json exists: True
+operator-summary.json exists: False
+----
+
+The provider was invoked and a Hop was conservatively charged, yet the operator
+reported `exit 2` -- "local configuration/preflight failure before provider
+execution". This is a wrong provider-consumption classification and a
+misrepresentation of post-dispatch state.
+
+*EXIT 0/1/2 SEMANTICS CORRECT: NO. POST-DISPATCH FAILURE ACCOUNTING SOUND: NO.*
+
+Severity:: Blocking for a real dogfood (the charter names "wrong
+provider-consumption classification" and "loss/misrepresentation of
+post-dispatch state" as blocking). The trigger is narrow -- it requires a Git
+observation failure or an unresolvable HEAD after the marker -- but that is
+exactly the uncertain post-dispatch region where one-shot accounting must be
+exact.
+
+Violated contract/invariant:: WFC-AUTO-02/03 (accurate Hop-consumption
+reporting), WFC-OBS-01 (durable checkpoint/summary on every stop), and the
+operator's own `0/1/2` shell contract.
+
+Smallest bounded correction:: In `main`, distinguish the pre-provider region
+from the post-attempt-root region. Once the attempt root and dispatch have
+become possible (i.e. from `register_checkout` / `run_real_one_hop` onward),
+any exception -- including `GitPreflightError` / `ValueError` raised by recovery
+or summary -- must be reported as `exit 1` (uncertain / not-clean-completed),
+never `exit 2`, and must still emit a best-effort `operator-summary.json`.
+`exit 2` should remain reachable only from the pre-provider preflight.
+
+Expected file scope:: `scripts/workflow_coordinator/operator.py` only.
+
+== 7. Durable operator evidence (BLOCKING B1, same root cause)
+
+`operator-plan.json` truthfully records launch intent and pinned inputs
+(repository, expected baseline, input paths, per-component path+digest, durable
+artifacts, state root, run/invocation IDs, executable, timeout,
+`max_autonomous_hops: 1`, `retry: false`). `operator-summary.json` on the
+success and recover paths records outcome without duplicating authoritative Run
+state.
+
+The gap: the normal summary is written only after `run_real_one_hop` returns
+successfully. Every exception after `state_root.mkdir` skips it. The probe above
+shows a *consumed-provider* attempt root left with `operator-plan.json` but no
+`operator-summary.json`. Historical commissioning launchers always recorded an
+`operator-summary.json` (including `run_status=reconcile_required` for the
+2026-09-07 Run), so an attempt root that consumed a Hop but has no operator
+summary regresses the established observability expectation (WFC-OBS-01).
+
+*VALID ATTEMPT ROOT EVIDENCE COMPLETE: NO.* The correction is the same as B1:
+emit a best-effort summary on the post-attempt-root failure path. Pre-provider
+configuration failures that create no attempt root correctly need no summary and
+are out of scope for this finding.
+
+== 8. Summary facts
+
+On the success/recover paths the summary fields (`run_id`, `invocation_id`,
+`checkout_id`, `baseline_head`, `final_head`, `run_status`, `hop_used`,
+`hop_limit`, `stop_reason`, `human_question`, `anomalies`, `provider`,
+`commits`, `worktree_clean`) are factual and derived from Run state and
+independent Git observation.
+
+Two observations:
+
+* `changed_paths` is derived from `git diff baseline_head..<live HEAD>` rather
+  than from the recorded Hop delta. For the strict N=1 contract (single Hop whose
+  base is the baseline) this equals the Hop scope, so it is *correct for N=1*.
+  It reconstructs from the freshly observed HEAD rather than the authoritative
+  recorded `actual_commits`; this is a minor observability note only (WATCH-2)
+  and would misrepresent scope only under N>1, which is out of scope.
+* `_summary` first reads `getattr(outcome, "invocation_id", None)` --
+  `AgentExecutionOutcome` has no such attribute, so this always yields `None` and
+  is immediately overwritten by `summary["invocation_id"] = invocation_id` in
+  `main`. Classification: *harmless redundancy / cleanup only* (WATCH-3).
+
+== 9. Durable-artifact policy
+
+Behavior confirmed against the reused `DurableArtifact` enum and the phase
+`authorized_scope`:
+
+* `none` rejects any `--durable-artifact` (exercised by the test);
+* `required` needs at least one declaration
+  (`REQUIRED and not durable_artifacts -> reject`);
+* `optional` supports zero and declared paths;
+* every declared path must be within the initial-phase `authorized_scope`
+  (`_within_scope`) and duplicates reject;
+* the final existing Coordinator post-Hop validation
+  (`_durable_artifact_anomalies` in `vertical.py` and `trusted_commit` scope
+  enforcement) remains authoritative; the operator only pre-screens declarations
+  and does not invent semantic artifact authority.
+
+*DURABLE-ARTIFACT POLICY CORRECT: YES.* (Test coverage for `required` and
+`optional` is missing -- see B3.)
+
+== 10. Test quality (BLOCKING B2; important B3)
+
+*B2 -- the N>1 test does not exercise the intended branch.*
+`test_n_greater_than_one_and_durable_none_reject_without_execution` edits the
+tracked `work.yml` in the worktree to `max_autonomous_hops: 2` and asserts
+`main(...) == 2`. Because `_preflight` checks clean worktree *before* reading any
+pinned input, the rejection is the dirty-worktree preflight, and the pinned
+`git show HEAD:work.yml` still reads `max_autonomous_hops: 1`. Deterministic
+probe output:
+
+----
+OPERATOR ERROR: worktree preconditions fail: repository must be clean ...
+pinned HEAD:work.yml max line = ['max_autonomous_hops: 1']
+TEST-AS-WRITTEN exit: 2   (claims to prove N>1 rejection)
+CLEAN worktree, pinned N=1 exit: 1   (operator accepts and runs the fake)
+----
+
+The `if work_item.max_autonomous_hops != 1` branch has zero coverage. The N=1
+acceptance property exists only in a non-exercising test, which the charter
+treats as blocking.
+
+Smallest valid arrangement:: commit a fixture `work_n2.yml` (or a second commit)
+with `max_autonomous_hops: 2` and a matching `profile_ref`, pass that commit as
+`--expected-head` with a clean worktree, and assert the operator rejects with the
+`max_autonomous_hops == 1` diagnostic (not the dirty-worktree diagnostic).
+
+Expected file scope:: `tests/unit/workflow_coordinator/test_operator.py` only.
+
+*B3 -- acceptance branches without direct coverage.* Genuinely exercised:
+strict manifest, head-mismatch/existing-root rejection, dirty-worktree +
+no-execution, `durable none` rejecting declarations, malformed/uncorrelated
+result -> `exit 1` + summary + one charge, and the fake-success one-Hop happy
+path with trusted commit. Not directly exercised: `durable required` (needs
+>=1), `durable optional` (zero and declared), missing selected component,
+`WorkItem.profile_ref` mismatch, and pinned-content-versus-worktree-content
+(only implied by the dirty-rejection test). Recommend adding these small
+deterministic cases. Non-blocking but should accompany the B1/B2 correction.
+
+== 11. Tests run during review
+
+All from the repository root with `.venv`:
+
+* `pytest -q tests/unit/workflow_coordinator/test_operator.py` -- 5 passed;
+* `pytest -q tests/unit/workflow_coordinator` -- 147 passed;
+* `pytest -q tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py`
+  -- 11 passed;
+* `ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator` --
+  all checks passed;
+* `git diff --check <baseline>..<target>` -- clean.
+
+Adversarial probes (disposable temporary Git repositories, local fake
+executables, no real provider): the N>1 branch probe and the post-dispatch
+exit-status probe reproduced in sections 6 and 10. Probe scripts were temporary
+and are not committed.
+
+== 12. Release / public surface
+
+The change is repository-local developer tooling under
+`scripts/workflow_coordinator/` (FTR section 2.1 placement). It adds no
+user-facing behavior, no public CLI/YAML/configuration surface, no package /
+import / plugin surface, no demo behavior, and changes no *Known limitations*.
+The "no release note" disposition is therefore consistent with the
+release-notes checkpoint and repository policy. WATCH-4: it is now a real
+operator CLI; if it is later promoted to a documented, supported entry point, a
+developer-guide / tooling note (not a product release note) would be warranted.
+No release note is created by this review.
+
+== 13. Findings summary
+
+[cols="1,1,4,1",options="header"]
+|===
+|ID |Severity |Finding |Scope
+
+|B1 |Blocking
+|Post-dispatch failures (recovery/summary `GitPreflightError` / `ValueError`) are
+reported as `exit 2` and skip `operator-summary.json`, misclassifying consumed
+provider execution and losing attempt-root evidence.
+|`operator.py`
+
+|B2 |Blocking (test integrity)
+|The `max_autonomous_hops != 1` rejection test proves dirty-worktree rejection,
+not N>1 rejection; the branch has zero coverage.
+|`test_operator.py`
+
+|B3 |Important
+|No direct coverage for `durable required` / `optional`, missing selected
+component, `profile_ref` mismatch, or pinned-vs-worktree content.
+|`test_operator.py`
+
+|WATCH-1 |Watch
+|`ls-tree` equality check does not disable pathspec magic / `core.quotePath`;
+edge cases only over-reject (fail-closed).
+|`operator.py`
+
+|WATCH-2 |Watch
+|`changed_paths` reconstructs from live HEAD, not the recorded Hop delta; correct
+for N=1, would matter under N>1.
+|`operator.py`
+
+|WATCH-3 |Cleanup
+|`_summary` reads a non-existent `outcome.invocation_id` (always `None`), then
+overwrites it; harmless redundancy.
+|`operator.py`
+
+|WATCH-4 |Watch
+|"No release note" is correct now; revisit if the operator becomes a documented
+supported entry point.
+|docs
+|===
+
+== 14. Lifecycle cleanup check
+
+This review does *not* declare `FTR-AGENT-WORKFLOW-COORDINATOR-P5` green or
+`Done`. The generic N=1 operator is one accepted engineering step toward a later,
+separately authorized real N=1 dogfood; routine use, DMC dogfooding, Slice 5, and
+N>1 remain unauthorized. Therefore:
+
+* FTR status stays *Open / active*; no change to `Done`/`Superseded`;
+* no include is removed from `docs/backlog/_ftrs_open.adoc`;
+* no companion artifact moves to `docs/cold_storage/backlog/ftrs_done/`;
+* residual scope exists (the dogfood and the deferred slices) and is already
+  tracked by the FTR;
+* no follow-up FTR is needed for the residual scope;
+* no lifecycle cleanup is performed or required by this change.
+
+== 15. Disposition
+
+Accept the architecture and composition boundary. Before the one separately
+authorized real N=1 dogfood, apply the bounded corrections B1 and B2 (and,
+recommended, B3), all confined to `operator.py` and `test_operator.py`. No
+production Coordinator mechanics, authority boundaries, serializers, or existing
+tests require change. This review implements no findings.
