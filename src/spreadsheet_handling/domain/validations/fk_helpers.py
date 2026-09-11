@@ -30,6 +30,7 @@ import pandas as pd
 from ...frame_keys import iter_data_frames
 from ...core.fk import normalize_sheet_key
 from ...core.indexing import has_level0, level0_series
+from ...core.scalar_values import is_missing_carrier
 from ..transformations.fk_helpers import (
     derived_helper_columns_by_sheet,
     missing_fk_policy_error,
@@ -142,9 +143,7 @@ def check_helper_values(
     target_value_maps = _build_target_value_maps(frames, expected_by_sheet)
 
     def _norm(v: Any) -> str | None:
-        if v is None:
-            return None
-        if isinstance(v, float) and pd.isna(v):
+        if is_missing_carrier(v):
             return None
         return str(v).strip()
 
@@ -207,9 +206,7 @@ def check_unresolvable_fks(
     target_id_sets = _build_target_id_sets(frames, expected_by_sheet)
 
     def _norm(v: Any) -> str | None:
-        if v is None:
-            return None
-        if isinstance(v, float) and pd.isna(v):
+        if is_missing_carrier(v):
             return None
         return str(v).strip()
 
@@ -231,7 +228,7 @@ def check_unresolvable_fks(
 
             missing = sorted({
                 str(v) for v in fk_series.dropna().unique()
-                if _norm(v) not in target_ids
+                if not is_missing_carrier(v) and _norm(v) not in target_ids
             })
             if missing:
                 findings.append(Finding(

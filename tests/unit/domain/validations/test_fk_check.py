@@ -14,7 +14,6 @@ import pandas as pd
 from spreadsheet_handling.domain.fk_relations import infer_fk_relations
 from spreadsheet_handling.domain.helper_policies import configure_fk_helpers
 from spreadsheet_handling.domain.validations.fk_helpers import (
-    FKFinding,
     check_duplicate_ids,
     check_missing_helpers,
     check_unexpected_helpers,
@@ -101,6 +100,28 @@ class TestUnresolvableFks:
         assert findings[0].category == "unresolvable_fk"
         assert "99" in findings[0].detail
 
+    @pytest.mark.parametrize(
+        "missing_fk",
+        [None, "", float("nan"), pd.NA, pd.NaT],
+        ids=["none", "empty-string", "float-nan", "pandas-na", "nat"],
+    )
+    def test_ignores_supported_missing_source_fk_carriers(self, missing_fk):
+        b = pd.DataFrame({"id": [1], "name": ["alpha"]})
+        a = pd.DataFrame({"id": [10], "id_(B)": [missing_fk]})
+        frames = infer_fk_relations({"A": a, "B": b})
+
+        assert check_unresolvable_fks(frames, DEFAULTS) == []
+
+    def test_literal_nan_string_remains_an_unresolvable_fk(self):
+        b = pd.DataFrame({"id": [1], "name": ["alpha"]})
+        a = pd.DataFrame({"id": [10], "id_(B)": ["nan"]})
+        frames = infer_fk_relations({"A": a, "B": b})
+
+        findings = check_unresolvable_fks(frames, DEFAULTS)
+        assert len(findings) == 1
+        assert findings[0].category == "unresolvable_fk"
+        assert "nan" in findings[0].detail
+
     def test_reports_unresolvable_fk_only_once_for_multi_helpers(self):
         b = pd.DataFrame({"id": [1], "name": ["alpha"], "category": ["x"]})
         a = pd.DataFrame({"id": [10], "id_(B)": [99]})
@@ -172,6 +193,20 @@ class TestHelperValues:
         assert len(findings) == 1
         assert findings[0].category == "value_mismatch"
         assert "1 row(s)" in findings[0].detail
+
+    @pytest.mark.parametrize(
+        "missing_fk",
+        [None, "", float("nan"), pd.NA, pd.NaT],
+        ids=["none", "empty-string", "float-nan", "pandas-na", "nat"],
+    )
+    def test_ignores_helper_value_for_supported_missing_source_fk(self, missing_fk):
+        b = pd.DataFrame({"id": [1], "name": ["alpha"]})
+        a = pd.DataFrame(
+            {"id": [10], "id_(B)": [missing_fk], "_B_name": ["WRONG"]}
+        )
+        frames = infer_fk_relations({"A": a, "B": b})
+
+        assert check_helper_values(frames, DEFAULTS) == []
 
     def test_detects_wrong_value_for_second_helper_field(self):
         frames = _two_sheet_frames_multi_helper(category_values=["WRONG", "y"])
