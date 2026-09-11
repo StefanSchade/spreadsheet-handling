@@ -1,0 +1,171 @@
+= Agent Workflow Coordinator -- Action Authority Hardening
+:toc:
+:toclevels: 3
+:sectnums:
+
+Status:: *IMPLEMENTED -- DETERMINISTIC HARDENING; INDEPENDENT REVIEW REQUIRED
+BEFORE THIS IS CONSIDERED ACCEPTED.*
+
+FTR:: `FTR-AGENT-WORKFLOW-COORDINATOR-P5` (section 11.4.7, "Action authority").
+
+Classification:: *COORDINATOR MECHANICS / ORCHESTRATION-AUTHORITY CONTRACT.*
+
+== Empirical trigger
+
+Preparing the first declarative generic-operator N=1 WorkItem exposed a repeated
+ambiguity in the meaning of `WorkflowProfile.Phase.authorized_actions` and
+`RepositoryPolicy.actions`.  The prepared WorkItem initially used
+`authorized_actions: [edit]` and `actions: [edit]`, even though a successful
+result was explicitly required to return a `CommitIntent` that the trusted
+Coordinator would materialize as a Git commit.  Strict serialization and operator
+preflight accepted that configuration; a human review corrected both to `[edit,
+commit]` before the real Run, which then completed successfully.
+
+The confusion is plausible because the accepted Slice-4B model forbids the agent
+from running `git add` / `git commit`; the token `commit` inside an action list is
+easy to misread as "the agent may execute git commit", so agents omit it.
+Repository examples also gave mixed signals: accepted launchers used `("edit",
+"commit")`, while generic serializer/operator fixtures used `edit`-only shapes.
+This hardening removes the ambiguity at the model + validation boundary rather than
+in one prompt.
+
+== Reconstructed meaning of `edit` and `commit`
+
+`authorized_actions` / `policy.actions` describe permitted *workflow
+effects/capabilities*, not shell commands exposed to the agent.
+
+* `edit` -- the semantic worker may mutate authorized worktree content, bounded by
+  `authorized_scope`.
+* `commit` -- a successful invocation may return a `CommitIntent` and the trusted
+  Coordinator may materialize that intent as one bounded ordinary local Git commit.
+
+`commit` does *not* grant the agent permission to run `git add` / `git commit`,
+does not grant arbitrary or `push`/`fetch`/`rebase`/`reset`/`config`/`hook` Git
+authority, and does not weaken the sandbox.  This matches the accepted Slice-4B
+authority model (agent owns semantic worktree mutation + bounded `CommitIntent`;
+trusted Coordinator owns the mechanical Git commit).
+
+== Action vocabulary decision
+
+Action values remain an *open descriptive vocabulary*, validated only as non-empty
+strings.  The FTR does not define a closed enum, and legitimate non-mutating
+phases use other tokens (for example `review`).  No enum was introduced.  Only two
+tokens (`edit`, `commit`) are reserved with normative Coordinator meaning; they are
+defined once, as `EDIT_ACTION` / `COMMIT_ACTION` in
+`scripts/workflow_coordinator/model.py`, and reused by serialization and the
+runtime commit boundary so there is no competing terminology system.
+
+== Phase-vs-policy authority relationship
+
+The accepted relationship is narrowing: every profile phase's `authorized_actions`
+must be a subset of `RepositoryPolicy.actions`.  A profile phase may not grant an
+effect the repository policy does not permit (WFC-POLICY-03: "No layer may
+silently grant authority owned by another").
+
+`RepositoryPolicy` is intentionally *not* carried into the runtime commit boundary
+(`vertical.run_one_hop` receives `run`, `profile`, and the repository, not the
+policy object).  Rather than duplicate policy state into that boundary, the subset
+invariant is established earlier, at operator preflight.  Combined with the runtime
+requirement that `commit` be present in the current phase, `commit` authority
+transitively implies policy `commit` authority for the operator path.
+
+== `edit` / `commit` relation
+
+For the accepted N=1 path, `edit` implies `commit`.  A Hop begins at a clean
+observed HEAD; the agent never commits; and any tracked/untracked change surviving
+the Hop boundary without a commit is a repository anomaly that fails closed.  The
+only way an authorized worktree mutation lands durably and the Hop ends clean is a
+`CommitIntent` materialized by the trusted Coordinator, which requires `commit`
+authority.  A phase that authorizes `edit` but withholds `commit` can therefore
+only ever fail closed and is statically incoherent.  Equivalently, a phase with
+`durable_artifact: required` must authorize `commit`, because a required durable
+artifact is committed by a successful mutating Hop (WFC-OUTPUT-04).  This is not
+assumed; it is derived from the accepted no-agent-commit model and the clean-Hop
+boundary.
+
+== Exact static checks
+
+Strict serialization (`workflow_profile_from_yaml`, per phase)::
+* if `edit` in `authorized_actions` and `commit` not in `authorized_actions` ->
+  `ValidationError`;
+* if `durable_artifact == required` and `commit` not in `authorized_actions` ->
+  `ValidationError`.
+
+Operator preflight (`operator._preflight`, cross-input, before provider
+execution)::
+* for every profile phase, `authorized_actions - policy.actions` must be empty,
+  else `OperatorPreflightError`.
+
+== Exact runtime checks
+
+Runtime commit boundary (`vertical.run_one_hop`)::
+* when `result.commit_intent is not None` and `commit` is not in the current
+  phase's `authorized_actions`, the Coordinator refuses before `trusted_commit()`
+  mutates Git.  The refusal is recorded as a repository anomaly and enters ordinary
+  mechanical preemption (human stop).  Any worktree mutation the agent already made
+  is left observable (not committed, not reverted); HEAD does not move.
+
+== Why agent Git authority remains unchanged
+
+No agent `git add` / `git commit` capability was added; the trusted-commit surface
+(`git_facts.trusted_commit`) is unchanged; no new Git capability, push/fetch/reset/
+rebase/config/hook authority, or sandbox change was introduced.  The hardening only
+constrains when a *Coordinator-owned* commit may occur.
+
+== Regression proving the WI02 confusion can no longer silently commit
+
+The historical bad shape (`authorized_actions: [edit]`, `policy actions: [edit]`,
+required durable artifact, non-null `CommitIntent`) is now rejected two ways:
+
+* *Statically* -- `workflow_profile_from_yaml` rejects the `edit`-without-`commit`
+  phase before any Run, so an operator preflight over that profile never reaches
+  provider execution (provider invocation count remains zero).
+* *At runtime* -- even a phase constructed in-process to bypass serialization
+  (required durable artifact, `authorized_actions: ("edit",)`, non-null
+  `CommitIntent`) fails closed: HEAD does not move and the Run stops for human
+  authority.
+
+== Residual limitation
+
+Static rejection keys on the `edit` action and the `durable_artifact: required`
+declaration, not on natural-language task text.  A phase that declares neither
+`edit` nor a required durable artifact, yet whose task text nonetheless instructs
+the agent to mutate and return a `CommitIntent`, is not statically rejected;
+mandatory runtime fail-closed commit-authority refusal covers that case.  No
+attempt is made to infer commit intent from task prose.
+
+== Tests / validation
+
+Focused tests added or updated::
+* `tests/unit/workflow_coordinator/test_serialization.py` -- `edit`-without-`commit`
+  rejected; `required`-durable-without-`commit` rejected; non-mutating observation
+  phase accepted.
+* `tests/unit/workflow_coordinator/test_operator.py` -- phase actions exceeding
+  repository policy rejected before provider execution (no provider run); the
+  fake-success operator fixture now uses `[edit, commit]`.
+* `tests/unit/workflow_coordinator/test_slice4b_git_authority.py` -- `CommitIntent`
+  without phase `commit` authority never mutates Git (real temp-Git HEAD assertion);
+  the WI02-shaped required-durable `edit`-only phase cannot reach a trusted commit.
+* `tests/utils/workflow_coordinator.py` -- the canonical mutating fixture now
+  declares `[edit, commit]` so tests teach the real distinction.
+
+Validation commands::
+[source,console]
+----
+.venv/bin/python -m pytest -q tests/unit/workflow_coordinator
+.venv/bin/python -m pytest -q \
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator \
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py
+git diff --check
+----
+
+No real provider was invoked.
+
+== Independent review
+
+An independent review is required before this hardening is considered accepted:
+it changes the normative meaning of an authority-bearing profile/policy field and
+adds fail-closed rejection at three boundaries.  The commit-ownership and
+agent-Git-authority invariants are unchanged, but the new normative contract and
+its enforcement placement warrant independent confirmation.
