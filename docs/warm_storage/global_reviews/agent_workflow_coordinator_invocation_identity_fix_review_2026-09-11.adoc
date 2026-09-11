@@ -1,0 +1,225 @@
+= Review: Workflow Coordinator Invocation-Identity Fix
+:toc: macro
+:reviewer: AI review agent (Opus 4.8)
+:review-date: 2026-09-11
+:commit: e33fbe7c5b029b06d5c995f7faadafd2e4a6d64c
+:ftr: FTR-AGENT-WORKFLOW-COORDINATOR-P5
+
+toc::[]
+
+== Scope
+
+Bounded, independent correctness review of exactly one commit:
+
+[source,text]
+----
+e33fbe7c fix(workflow): project invocation identity into hop prompt
+----
+
+Files inspected:
+
+* `scripts/workflow_coordinator/prompt.py`
+* `scripts/workflow_coordinator/vertical.py`
+* `scripts/workflow_coordinator/adapter.py`
+* `scripts/workflow_coordinator/codex_adapter_smoke.py` (Slice-4 live-adapter path)
+* `tests/unit/workflow_coordinator/test_slice3_vertical.py`
+* `tests/unit/workflow_coordinator/test_slice4.py`
+* `tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py`
+
+Out of scope by instruction: Slice 5, multi-Hop design, DMC work, general
+refactoring.
+
+== Incident and required invariant
+
+The first real DMC dogfood Run failed `reconcile_required` even though the
+provider succeeded, the agent returned a valid structured result and
+`CommitIntent`, and `run_id`/`hop_id` correlated. The single differing field was
+`invocation_id`: the exact expected `invocation_id` had never been *projected
+into the Hop prompt*, so the agent could not echo it, and strict fail-closed
+correlation correctly rejected the result.
+
+Required invariant: exactly ONE Invocation identity per Hop, used identically
+for (1) generated prompt identity, (2) `AgentExecutionRequest`, and (3)
+structured-result correlation; all of `run_id`, `hop_id`, `invocation_id` must
+be visible to the agent; strict correlation must not be weakened.
+
+== What the fix does
+
+* `vertical.run_one_hop` now constructs a single
+  `invocation = Invocation(run.run_id, hop_id, invocation_id)`
+  (`vertical.py:96`) and threads that one object into prompt assembly, dispatch,
+  and validation.
+* `prompt._header` gained an `invocation: Invocation` parameter and now emits
+  `run_id`, `hop_id`, and a new `invocation_id` line sourced from that object;
+  `assemble_prompt` grew a keyword-only `invocation` parameter.
+* Tests were updated to pass the invocation and to assert the projected /
+  dispatched / validated identity coincide, plus a new `invocation_id` mismatch
+  rejection case.
+
+== Findings against the review questions
+
+[cols="1,4",options="header"]
+|===
+| Question | Result
+
+| 1. Exactly one authoritative Invocation for the Hop?
+| *Yes.* `vertical.py:96` constructs it once. The pre-fix code constructed
+  `Invocation(...)` twice (once for the request, once for `validated_result`)
+  *and* independently re-derived `hop_id` inside `_header`
+  (`hop_id=H{run.hop_used + 1:03d}`). The fix collapses all three derivations to
+  one object, removing two duplicate identity-derivation sites.
+
+| 2. Same Invocation for prompt / dispatch / validation?
+| *Yes.* The identical `invocation` binding flows to
+  `assemble_prompt(..., invocation=invocation, ...)`,
+  `AgentExecutionRequest(invocation, ...)`, and
+  `validated_result(outcome.candidate_result, invocation)`
+  (`vertical.py:98,101,111`).
+
+| 3. Prompt exposes all required correlation fields exactly?
+| *Yes.* `_header` emits `run_id={invocation.run_id}`,
+  `hop_id={invocation.hop_id}`, `invocation_id={invocation.invocation_id}` as
+  exact `key=value` lines. `work_item_id` remains sourced from the Run (it is a
+  separate identity dimension, not part of `Invocation`), and `base_head` from
+  `run.current_head`. Since `invocation.run_id == run.run_id`, the `run_id`
+  source change is value-preserving.
+
+| 4. Any alternate path deriving a different identity?
+| *No, within the Hop path.* `run_one_hop` no longer re-derives identity in the
+  header. `invocation_id` is *minted by the caller* and merely bound here, so
+  this function allocates no identity of its own. The only other production
+  `Invocation` construction is in `codex_adapter_smoke.run_smoke`, a separate
+  one-shot live-adapter harness that already threads a single invocation through
+  `_prompt(invocation)`, dispatch, and `validated_result(..., invocation)` --
+  the same single-source discipline, independently. No back-edge path can inject
+  a divergent identity.
+
+| 5. Prompt failure stays "execution not started"?
+| *Yes.* `assemble_prompt` is wrapped in `try/except -> ExecutionNotStartedError`
+  and runs *before* `adapter.execute`. The `Invocation` is a frozen value
+  constructed with no side effects and no counter/registry mutation, so a prompt
+  failure neither consumes nor ambiguously starts an invocation.
+
+| 6. Mismatched `invocation_id` still fails closed?
+| *Yes.* `validated_result` is untouched; it still requires the exact envelope
+  field set and compares the full `(run_id, hop_id, invocation_id)` tuple,
+  raising `ResultValidationError` on any mismatch. Strict correlation is not
+  weakened. A new test case `envelope(invocation_id="INV-2")` asserts rejection.
+
+| 7. Do regression tests reproduce the real defect class?
+| *Yes -- with deterministic evidence (see below).* The new
+  `test_one_invocation_identity_is_projected_dispatched_and_validated` uses a
+  `CapturingAdapter` and asserts (a) `adapter.request.invocation == invocation()`
+  (dispatched identity) and (b) every dispatched identity field appears as
+  `name=value` in the actual prompt, then requires the Run to reach `completed`
+  (which requires validation to accept). This closes the prompt = dispatch =
+  validate triangle by value, which is exactly the contract strict correlation
+  enforces -- not a mere "the word invocation_id appears" check.
+
+| 8. All `assemble_prompt` call sites adjusted coherently?
+| *Yes.* The only production call site is `vertical.py:98`. All four test call
+  sites were updated to pass `invocation=invocation()`. No other call sites
+  exist (`grep` confirmed).
+
+| 9. Accidental collateral change to Git authority / budgeting / retry-resume /
+  provider / structured-result semantics?
+| *No.* The diff touches only prompt-header content, the threading of one object,
+  and tests. `git_facts`, `reducer`, `record_hop`, budgeting, `adapter.execute`,
+  and `validated_result` are all untouched. The full unit suite, the Slice-4
+  suite, and the semantic-invariant replay suite pass unchanged.
+|===
+
+== Deterministic regression evidence
+
+The new tests were run against the *pre-fix* implementation
+(`e33fbe7c^`) in an isolated worktree by copying only the post-fix test file
+onto the old source. The identity regression test failed with precisely the
+incident signature:
+
+[source,text]
+----
+assert 'invocation_id=INV-1' in adapter.request.prompt
+E  AssertionError: assert 'invocation_id=INV-1' in
+   '[identity]\nwork_item_id=WI-1\nrun_id=RUN-1\nhop_id=H001\nbase_head=...'
+----
+
+Note the pre-fix prompt contains `run_id=RUN-1` and `hop_id=H001` but *no*
+`invocation_id` line -- an exact match for the dogfood failure mode (run_id and
+hop_id correlated; invocation_id never projected). On the fixed implementation
+the same test passes. This is genuine reproduce-then-fix evidence, not a
+tautological assertion.
+
+== Architecture check: `prompt.py` importing `Invocation` from `adapter.py`
+
+Import graph (intra-package), confirmed by inspection:
+
+[source,text]
+----
+model.py    -> (no intra-package imports; leaf)
+adapter.py  -> model, serialization
+prompt.py   -> adapter (Invocation only), model
+vertical.py -> adapter, prompt, model, ...
+----
+
+`adapter.py` does *not* import `prompt.py` or `vertical.py`, so the new
+`prompt -> adapter` edge introduces *no import cycle* today, and there is no
+reuse, testing, or authority problem: tests import `Invocation` cleanly and the
+identity type is single-sourced.
+
+*Observation (watch-only, not a blocker):* `Invocation` is a pure frozen
+identity value `(run_id, hop_id, invocation_id)` with no execution-port
+behavior. Its natural home is `model.py`, the leaf that *both* `prompt` and
+`adapter` already depend on. Placing it in `adapter.py` makes the prompt-
+assembly layer depend on the execution-port layer solely to *name* an identity,
+which is a mild layering inversion and a latent cycle risk *iff* `adapter.py`
+were ever to reference a `prompt` type (e.g. typing against `PromptPackage`). It
+does not today. Per the review's own guidance, relocation is not demanded for
+purity; recorded here as a low-priority maintainability note. Recommended (not
+required): move `Invocation` to `model.py` when this area is next touched.
+
+== Validation commands
+
+[source,text]
+----
+.venv/bin/python -m pytest tests/unit/workflow_coordinator/ -q
+  -> 144 passed
+
+.venv/bin/python -m pytest \
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py \
+  tests/unit/workflow_coordinator/test_slice4.py -q
+  -> passed
+
+# Reproduce-then-fix proof (isolated worktree at e33fbe7c^ + post-fix tests):
+#   test_one_invocation_identity_is_projected_dispatched_and_validated
+#   FAILS on pre-fix impl: 'invocation_id=INV-1' not in prompt
+#   PASSES on fixed impl.
+----
+
+== Release-notes checkpoint
+
+The change is internal Workflow Coordinator scaffolding under
+`scripts/workflow_coordinator/` and does not alter the public spreadsheet
+library surface (CLI, YAML, package/import, demo, or migration semantics). No
+release note is required for the public library. The implementing FTR
+(`FTR-AGENT-WORKFLOW-COORDINATOR-P5`) checklist owns any coordinator-internal
+changelog obligation; this read-only review does not edit release notes.
+
+== Lifecycle cleanup check
+
+This review evaluates a single fix commit, not a final green verdict for
+`FTR-AGENT-WORKFLOW-COORDINATOR-P5`; no lifecycle status transition,
+`_ftrs_open.adoc` include removal, or cold-storage move is triggered by this
+review. No action required here.
+
+== Verdict
+
+*A -- correct and ready.*
+
+The required invariant is established: exactly one `Invocation` is authoritative
+per Hop and is used identically for prompt projection, dispatch, and strict
+result correlation; all correlation fields are now visible to the agent; strict
+fail-closed correlation is preserved unchanged. The real dogfood failure mode
+*is* covered by deterministic regression evidence (the new identity test fails
+on the pre-fix implementation for the exact missing-`invocation_id`-in-prompt
+reason and passes on the fix). The only recorded item is a watch-only layering
+note (`Invocation` placement), which is not a blocker.
