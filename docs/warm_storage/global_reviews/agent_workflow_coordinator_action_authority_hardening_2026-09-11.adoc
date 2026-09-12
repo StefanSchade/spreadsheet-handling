@@ -3,8 +3,19 @@
 :toclevels: 3
 :sectnums:
 
-Status:: *IMPLEMENTED -- DETERMINISTIC HARDENING; INDEPENDENT REVIEW REQUIRED
-BEFORE THIS IS CONSIDERED ACCEPTED.*
+Status:: *IMPLEMENTED -- DETERMINISTIC HARDENING; AAH-R1 BOUNDED CORRECTION
+APPLIED (2026-09-11); DELTA RE-REVIEW REQUIRED BEFORE THIS IS CONSIDERED
+ACCEPTED.*
+
+AAH-R1 correction (2026-09-11):: Independent Review 001
+(`agent_workflow_coordinator_action_authority_hardening_2026-09-11_review_001.adoc`,
+verdict *B -- bounded correction required*) found that `commit` silently granted
+the missing semantic `edit` authority: a `commit`-only phase paired with a
+`commit`-only policy passed serialization and operator preflight, and the runtime
+boundary checked only `commit`, so an agent-created worktree mutation could be
+landed without any `edit` grant. This document has been corrected below to record
+the bounded fix and to repair the overclaim Review 001 identified. Review 001 is
+immutable review evidence and is not modified.
 
 FTR:: `FTR-AGENT-WORKFLOW-COORDINATOR-P5` (section 11.4.7, "Action authority").
 
@@ -83,13 +94,25 @@ artifact is committed by a successful mutating Hop (WFC-OUTPUT-04).  This is not
 assumed; it is derived from the accepted no-agent-commit model and the clean-Hop
 boundary.
 
+The converse is *not* true (AAH-R1).  `commit` does *not* imply `edit` and cannot
+substitute for it.  A trusted commit lands *agent-created semantic worktree
+mutation*, which is exactly the effect `edit` authorizes; `commit` authorizes only
+the Coordinator's mechanical landing.  A trusted commit of such mutation therefore
+requires *both* grants.  A `commit`-only phase is as incoherent as an `edit`-only
+phase: it can only ever land a mutation for which it holds no `edit` authority, and
+is rejected.  A `durable_artifact: required` phase requires both `edit` (to produce
+the artifact) and `commit` (to land it).
+
 == Exact static checks
 
 Strict serialization (`workflow_profile_from_yaml`, per phase)::
 * if `edit` in `authorized_actions` and `commit` not in `authorized_actions` ->
   `ValidationError`;
-* if `durable_artifact == required` and `commit` not in `authorized_actions` ->
-  `ValidationError`.
+* if `commit` in `authorized_actions` and `edit` not in `authorized_actions` ->
+  `ValidationError` (AAH-R1: `commit` cannot substitute for `edit`);
+* if `durable_artifact == required` and either `edit` or `commit` is absent from
+  `authorized_actions` -> `ValidationError` (AAH-R1: a required durable artifact
+  requires both).
 
 Operator preflight (`operator._preflight`, cross-input, before provider
 execution)::
@@ -99,11 +122,13 @@ execution)::
 == Exact runtime checks
 
 Runtime commit boundary (`vertical.run_one_hop`)::
-* when `result.commit_intent is not None` and `commit` is not in the current
-  phase's `authorized_actions`, the Coordinator refuses before `trusted_commit()`
-  mutates Git.  The refusal is recorded as a repository anomaly and enters ordinary
-  mechanical preemption (human stop).  Any worktree mutation the agent already made
-  is left observable (not committed, not reverted); HEAD does not move.
+* when `result.commit_intent is not None`, the Coordinator requires *both* `edit`
+  and `commit` in the current phase's `authorized_actions` before `trusted_commit()`
+  may mutate Git (AAH-R1).  If either is absent, it refuses before Git is touched;
+  the refusal names the missing action(s), is recorded as a repository anomaly, and
+  enters ordinary mechanical preemption (human stop).  Any worktree mutation the
+  agent already made is left observable (not committed, not reverted); HEAD does not
+  move.
 
 == Why agent Git authority remains unchanged
 
@@ -112,10 +137,12 @@ No agent `git add` / `git commit` capability was added; the trusted-commit surfa
 rebase/config/hook authority, or sandbox change was introduced.  The hardening only
 constrains when a *Coordinator-owned* commit may occur.
 
-== Regression proving the WI02 confusion can no longer silently commit
+== Regression proving neither half of the pair can silently commit
 
-The historical bad shape (`authorized_actions: [edit]`, `policy actions: [edit]`,
-required durable artifact, non-null `CommitIntent`) is now rejected two ways:
+Both incoherent half-grants are rejected two ways.
+
+The historical WI02 shape (`authorized_actions: [edit]`, `policy actions: [edit]`,
+required durable artifact, non-null `CommitIntent`) is rejected:
 
 * *Statically* -- `workflow_profile_from_yaml` rejects the `edit`-without-`commit`
   phase before any Run, so an operator preflight over that profile never reaches
@@ -125,29 +152,57 @@ required durable artifact, non-null `CommitIntent`) is now rejected two ways:
   `CommitIntent`) fails closed: HEAD does not move and the Run stops for human
   authority.
 
+The AAH-R1 shape (`authorized_actions: [commit]`, `policy actions: [commit]`,
+`durable_artifact: none`, non-null `CommitIntent`) is likewise rejected:
+
+* *Statically* -- `workflow_profile_from_yaml` rejects the `commit`-without-`edit`
+  phase before any Run; an independent normal-operator reproducer supplied a
+  matching `commit`-only policy and a fake executable, and the operator returned a
+  preflight/configuration failure with the fake executable never invoked and HEAD
+  unchanged.
+* *At runtime* -- a phase constructed in-process with `authorized_actions:
+  ("commit",)` and a non-null `CommitIntent` fails closed before `trusted_commit()`:
+  HEAD does not move, the agent's dirty mutation is left observable, the Run stops
+  for human authority, and the diagnostic names the missing `edit` action.
+
 == Residual limitation
 
-Static rejection keys on the `edit` action and the `durable_artifact: required`
-declaration, not on natural-language task text.  A phase that declares neither
-`edit` nor a required durable artifact, yet whose task text nonetheless instructs
-the agent to mutate and return a `CommitIntent`, is not statically rejected;
-mandatory runtime fail-closed commit-authority refusal covers that case.  No
-attempt is made to infer commit intent from task prose.
+Static rejection keys on the `edit` / `commit` action tokens and the
+`durable_artifact: required` declaration, not on natural-language task text.  A
+phase that declares neither `edit` nor `commit` nor a required durable artifact,
+yet whose task text nonetheless instructs the agent to mutate and return a
+`CommitIntent`, is not statically rejected; mandatory runtime fail-closed
+commit-authority refusal (which now requires *both* `edit` and `commit`) covers
+that case.  No attempt is made to infer commit intent from task prose.
+
+A separate footgun remains as *WATCH-1* (Review 001): lower-layer composition APIs
+(`new_run` + `run_one_hop`) do not retain or enforce `RepositoryPolicy.actions`, so
+a hypothetical future *supported* caller that skips operator preflight could bypass
+the phase-⊆-policy subset check.  This is out of scope for the AAH-R1 correction:
+the accepted declarative operator performs the cross-input check, the fixed proof
+harness has matching hard-coded grants, and the lower functions are trusted
+composition/test seams rather than a supported authority ingress.  Policy state was
+deliberately not moved into the runtime commit boundary.
 
 == Tests / validation
 
 Focused tests added or updated::
 * `tests/unit/workflow_coordinator/test_serialization.py` -- `edit`-without-`commit`
-  rejected; `required`-durable-without-`commit` rejected; non-mutating observation
-  phase accepted.
+  rejected; `commit`-without-`edit` rejected (AAH-R1); `required`-durable with only
+  `[edit]`, with only `[commit]`, or with neither rejected; `required`-durable with
+  `[edit, commit]` accepted; non-mutating `[review]` observation phase accepted.
 * `tests/unit/workflow_coordinator/test_operator.py` -- phase actions exceeding
   repository policy rejected before provider execution (no provider run); the
-  fake-success operator fixture now uses `[edit, commit]`.
+  `commit`-only phase + `commit`-only policy reproducer rejected before provider
+  with zero fake invocations and unchanged HEAD (AAH-R1); the fake-success operator
+  fixture uses `[edit, commit]`.
 * `tests/unit/workflow_coordinator/test_slice4b_git_authority.py` -- `CommitIntent`
-  without phase `commit` authority never mutates Git (real temp-Git HEAD assertion);
-  the WI02-shaped required-durable `edit`-only phase cannot reach a trusted commit.
-* `tests/utils/workflow_coordinator.py` -- the canonical mutating fixture now
-  declares `[edit, commit]` so tests teach the real distinction.
+  without phase `commit` authority never mutates Git; `CommitIntent` without phase
+  `edit` authority never mutates Git and the diagnostic names the missing `edit`
+  action (AAH-R1); the WI02-shaped required-durable `edit`-only phase cannot reach a
+  trusted commit (all real temp-Git HEAD assertions).
+* `tests/utils/workflow_coordinator.py` -- the canonical mutating fixture declares
+  `[edit, commit]` so tests teach the real distinction.
 
 Validation commands::
 [source,console]
@@ -164,8 +219,13 @@ No real provider was invoked.
 
 == Independent review
 
-An independent review is required before this hardening is considered accepted:
-it changes the normative meaning of an authority-bearing profile/policy field and
-adds fail-closed rejection at three boundaries.  The commit-ownership and
-agent-Git-authority invariants are unchanged, but the new normative contract and
-its enforcement placement warrant independent confirmation.
+Independent Review 001 returned verdict *B -- bounded correction required* and
+raised the blocking finding AAH-R1 (`commit` silently granting missing `edit`
+authority).  The bounded correction recorded above closes AAH-R1 at the same two
+layers the original hardening used (strict phase coherence and the runtime commit
+boundary) without redesigning the action model, closing the open vocabulary,
+broadening Git authority, moving policy state into the runtime boundary, or
+implementing WATCH-1.  A delta re-review is required before this hardening is
+considered accepted: it now requires both `edit` and `commit` for any trusted
+commit, and the change warrants independent confirmation that both halves of the
+capability pair are enforced and that no authority was broadened.
