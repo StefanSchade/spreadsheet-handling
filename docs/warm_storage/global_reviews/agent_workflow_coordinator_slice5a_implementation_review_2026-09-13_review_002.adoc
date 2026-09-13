@@ -1,0 +1,373 @@
+= Agent Workflow Coordinator -- Slice-5A Bounded Correction Delta Re-Review (002)
+:toc:
+:toclevels: 3
+
+Status:: *BOUNDED DELTA RE-REVIEW.*
+Date:: 2026-09-13.
+Reviewer role:: Independent implementation reviewer (read-only except this
+artifact and its review commit).
+Baseline review::
+`docs/warm_storage/global_reviews/agent_workflow_coordinator_slice5a_implementation_review_2026-09-13.adoc`
+(commit `2a224928`, prior verdict B).
+Prior implementation:: `ed33fbb2`.
+Correction under review:: `59d8a8f21a2d15646dd0ff86f845a9a0a06dbbd5` --
+_fix(workflow): correct slice 5a continuation evidence_.
+Normative contract:: `FTR-AGENT-WORKFLOW-COORDINATOR-P5.adoc` section 11.5.1.
+Implementer claims treated as evidence to verify, not as fact.
+
+== 1. Verdict
+
+*VERDICT: A -- ACCEPT SLICE-5A BOUNDED CORRECTION; IMPLEMENTATION ACCEPTED.*
+
+The correction closes F1 (BLOCKING), F2 (IMPORTANT), F3 (IMPORTANT), and F4
+(MINOR), fixes a latent governing-input keying defect that would otherwise have
+blocked every supported N=2 continuation, and introduces no regression into the
+previously sound Slice-5A areas. Real-provider invocations remain zero. One new
+low-severity, non-blocking WATCH is recorded (WATCH-6); it reflects
+pre-existing, non-regressive publication-fault behavior and does not affect
+acceptance.
+
+Acceptance of the Slice-5A *implementation* is *not* authorization of live
+`N>1` execution, which remains a separate explicit maintainer decision.
+
+== 2. Delta reviewed
+
+`git diff 2a224928..59d8a8f2` touched exactly the three expected files:
+`scripts/workflow_coordinator/operator.py`,
+`tests/unit/workflow_coordinator/test_operator.py`, and the implementer
+evidence artifact. No unrelated file changed. No FTR, no slice4/vertical/prompt
+runtime change; the correction is localized to the operator and its tests.
+
+Validation (all pass, read-only):
+
+[source,console]
+----
+.venv/bin/pytest -q tests/unit/workflow_coordinator                        # 181 passed
+.venv/bin/pytest -q .../test_workflow_coordinator_replays.py               # 11 passed
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator \
+    .../test_workflow_coordinator_replays.py                               # All checks passed
+git diff --check 2a224928..59d8a8f2                                        # clean
+----
+
+Two temporary deterministic probes (fake local executable, no provider)
+confirmed the N=1 and N=2 post-provider accounting behavior below; neither was
+committed.
+
+== 3. F1 closure -- post-provider failure accounting
+
+*CLOSED.* `main()` replaces the always-`None` `real` sentinel with
+`latest_run`/`latest_invocation_id`/`latest_outcome` plus a `remember_progress`
+callback threaded into `run_serial_hops` as `progress=` (`operator.py:388-406`).
+`run_serial_hops` invokes `progress(run, invocation_id, outcome)` *immediately
+after* `run = first.run` and again after `run = second.run`, before any evidence
+publication, gate logic, H002, or summary construction (`operator.py:241-249,
+280-288`). The exception handler now reports `latest_run`,
+`invocation_id=latest_invocation_id or "not_dispatched"`, and
+`outcome=latest_outcome` (`operator.py:417-423`); `_best_effort_failure_summary`
+and `_summary` both gained `current_head`.
+
+Verification against the seven F1 requirements:
+
+. After H001 returns, the authoritative Run/invocation/outcome are captured
+  before any later operation -- YES (`progress` precedes evidence append/publish
+  and the gate).
+. Same after H002 -- YES.
+. A failure in execution-evidence publication, inter-Hop continuation,
+  `stop_continuation` persistence, H002 execution, final summary construction,
+  or final Git observation cannot regress to the pre-H001 Run -- YES, because
+  `latest_run` already holds the last completed-Hop Run at each of those points.
+. The failure summary truthfully reports `run_status`, `hop_used`,
+  `current_head`, `final_head` (via best-effort `observe_repository`), the actual
+  latest invocation ID, transport outcome, and consumed-attempt semantics -- YES.
+. A post-provider failure is not represented as `hop_used=0` / `ready` /
+  `unknown`/`not_dispatched` when an attempt occurred -- YES (probes below).
+. The strengthened N=1 regression test genuinely reproduces the former F1
+  failure: `test_post_provider_summary_failure_is_attempt_failure_with_evidence`
+  now asserts `run_status=="completed"`, `hop_used==1`,
+  `invocation_id.startswith("INV-")`, and `current_head==final_head==HEAD`. All
+  four assertions fail against the pre-correction code (which produced
+  `ready`/`0`/`"unknown"`), so the test exercises the exact defect, not a nearby
+  branch.
+. N=2 post-Hop failure proof -- adequate. `progress` fires identically after
+  H001 and H002; the N=1 `main()` test proves the except branch consumes
+  `latest_*`; the mechanism is symmetric. Confirmed by probe (below). No extra
+  symmetry-only test is required.
+
+*Probe (N=1, `_summary` forced to raise after a charged completed Hop):*
+persisted `operator-summary.json` = `run_status='completed'`, `hop_used=1`,
+`invocation_id='INV-...'`, `current_head==final_head==HEAD`. (Pre-correction:
+`ready`/`0`/`'unknown'`.)
+
+*Probe (N=2, both Hops complete, `_summary` forced to raise):* persisted summary
+= `run_status='completed'`, `hop_used=2`, `hop_limit=2`,
+`current_head==final_head==B` (the post-H001 commit), `invocation_id` = the H002
+`INV-`. The post-provider failure is truthful for N=2.
+
+F1 CLOSED:: YES.
+POST-PROVIDER FAILURE ACCOUNTING SOUND:: YES (with WATCH-6 below).
+
+== 4. F2 closure -- actual per-invocation execution binding
+
+*CLOSED.* New `_execution_binding(adapter, *, executable)` resolves the concrete
+binding per invocation (`operator.py:199-209`): for a `CodexCliAdapter` (or the
+default constructed when `adapter is None`) it reads the instance's real
+`executable`, `model`, and `reasoning_effort`; for any other (fake/local)
+adapter it records `model=None`, `reasoning=None`. `_execution_evidence` merges
+`**binding` and adds `context="fresh"` and `timeout_seconds`
+(`operator.py:212-220`). `_execution_binding` is called separately before H001
+and before H002 (`operator.py:237, 276`).
+
+. Supported `CodexCliAdapter` path records adapter kind, executable, model,
+  reasoning, fresh context, and timeout -- YES.
+. `gpt-5.6-terra`/`medium` are read from the `CodexCliAdapter` dataclass
+  defaults (`codex_adapter.py:143-144`), not re-declared in `operator.py`; the
+  test asserts the literals but the production path cannot silently drift from
+  the adapter -- YES.
+. No execution occurs during binding resolution: `CodexCliAdapter` is a frozen
+  dataclass whose constructor only sets fields; process spawn happens only in
+  `.execute()`. `_execution_binding(None, ...)` instantiates but never executes
+  -- YES.
+. Fake/local adapter truthfully records null model/reasoning -- YES, asserted by
+  `test_n2_serial_driver...` (`all(model is None and reasoning is None)`).
+. Per-invocation resolution, not Run-pinned -- YES (two call sites).
+. No ModelSelector/ProviderRegistry/quota/fallback/diversity/speculative
+  framework -- YES; `_execution_binding` only reads attributes.
+. The binding test invokes no provider -- YES; it calls `_execution_binding`
+  only.
+
+F2 CLOSED:: YES.
+ACTUAL CODEX BINDING DURABLY OBSERVABLE:: YES.
+REAL PROVIDER NEEDED FOR THIS PROOF:: NO.
+
+== 5. F3 closure -- false-continuation acceptance matrix
+
+*CLOSED.* New deterministic tests cover the previously unproven inter-Hop cases,
+and a new `main()` N=2 integration test proves the supported completed path.
+
+* *Case 5 (human/escalation):* `test_n2_h001_rejections_charge_once_and_never_
+  dispatch_h002[human]` -- H001 result `requires_human=True` + escalation ->
+  one request, `hop_used==1`, `status != ready`, no H002. PROVEN.
+* *Case 6 (malformed / uncorrelated / uncertain):* same parametrized test ids
+  `malformed` (candidate `"{"`) and `uncorrelated` (`invocation_id="INV-wrong"`)
+  -> conservative accounting, one request, `hop_used==1`, non-ready; the
+  assertion permits a retained marker only for `reconcile_required`. PROVEN.
+* *Case 7 (unknown route):* id `unknown-route` -> one request, non-ready, no
+  H002. PROVEN.
+* *Case 8 (invalid Finding delta):* id `invalid-finding` (unknown finding id) ->
+  one request, non-ready (uncertain/reconcile), no H002. PROVEN (no-H002
+  property; disposition is conservative).
+* *Case 9 (trusted commit B then route rejection) -- the mandated case:*
+  `test_trusted_h001_commit_remains_factual_when_route_is_rejected`. The
+  `CommitThenReject` adapter emits a valid *completed* H001 result with a real
+  `commit_intent` (so `trusted_commit` materializes commit B) and only then
+  overrides `requested_route="unknown"`, which the reducer rejects *after* the
+  commit. Assertions: exactly one request; `final.hop_used==1`;
+  `final.current_head != baseline == final.baseline_head`;
+  `final.current_head == git rev-parse HEAD` (B is the real repository HEAD, no
+  reset/rollback); `final.status != ready`; no dispatch marker; no H002. This is
+  a genuine post-commit semantic rejection, not a pre-commit reject or a bare
+  worktree mutation. PROVEN.
+* *Case 10 (dirty worktree between Hops):* `test_dirty_worktree_between_hops_
+  stops_after_h001` injects an untracked file via the `progress` hook exactly
+  after H001 completes (`observed.hop_used==1`) and before the continuation
+  gate; the gate's `validate_checkout`/`preflight_hop` then fails ->
+  `awaiting_human`, `stop_reason=="inter_hop_git_validation_failed"`, one
+  request, no H002. PROVEN.
+* *Case 15 (fault after run.json, before checkpoint/marker retirement):*
+  `test_h001_checkpoint_publication_fault_retains_marker_and_never_dispatches_
+  h002` monkeypatches `slice4.atomic_write_json` to raise on `checkpoint.json`.
+  Result: `run.json` exists, `dispatch.json` retained, `checkpoint.json` absent,
+  one request, no H002; the raised `OSError` prevents automatic continuation and
+  leaves the marker for fail-closed `reconcile_required` recovery. PROVEN.
+
+Assertions are strong enough to prove no H002 (`len(adapter.requests)==1` and
+`hop_used==1`; H002 would add a request). Tests pass *after* H001 (they charge
+one attempt), not before it, and drive `run_serial_hops`/`main`, not a bypassing
+lower-level path.
+
+*Supported `main()` N=2 integration:*
+`test_main_runs_supported_n2_path_with_fake_local_executable` enters through the
+canonical operator ingress with `max_autonomous_hops: 2`; H001 makes the trusted
+commit; H002 runs; final `run_status=="completed"`, `hop_used==2`,
+`hops==["H001","H002"]`, `execution_evidence` length 2 (two invocations); no
+H003 (budget exhausted at 2); fake local executable only. It exercises the
+`CodexCliAdapter` subprocess path with a fake `codex` binary -- no real
+provider. This test *requires* the governing-input path fix (section 7) to reach
+completion.
+
+F3 CLOSED:: YES.
+SUPPORTED MAIN N=2 PATH PROVEN:: YES.
+
+== 6. F4 / evidence migration
+
+*CLOSED.* `_execution_evidence` now records
+`candidate_result_present = outcome.candidate_result is not None`
+(`operator.py:217`), derived from the actual `AgentExecutionOutcome`. It is
+truthful for both the fake/local path (`test_n2_serial_driver...` asserts
+`candidate_result_present is True`) and the Codex path (same field, same
+derivation). No second evidence architecture was introduced; the per-invocation
+`execution_evidence[]` remains the single bounded projection, now with the
+previously-dropped fact restored. `_summary` also gained top-level
+`current_head`. The prior MINOR is resolved.
+
+F4 CLOSED:: YES.
+
+== 7. Governing-input path correction
+
+*SOUND -- and a necessary latent-bug fix.* The prior code built
+`governing = {path: _governing_digest(text) for path, text in texts.items()}`,
+but `texts` is keyed by *logical names* (`work_item`, `profile`, `policy`,
+`components`, `task`), so the five YAML digests were keyed by non-path labels.
+`_governing_inputs_unchanged` then called `_pinned_text(repository, B,
+"work_item", ...)`, which cannot resolve a file literally named `work_item` at B
+-> `OperatorPreflightError` -> `False` -> `stop_continuation`. The prior
+happy-path N=2 test passed `governing={}` directly to `run_serial_hops`, so this
+defect was latent and would have stopped *every* supported `main()` N=2
+continuation with a spurious `governing_input_changed`.
+
+The correction keys by `input_paths[name]` (`operator.py:162-165`), so every
+governing entry is now the actual validated repository-relative path. Verified:
+
+* every YAML input (WorkItem, profile, policy, component manifest, task) plus
+  every selected component path is included;
+* H002 re-reads exactly those original paths at B via `_pinned_text`;
+* no logical label can be interpreted as a path;
+* duplicate physical paths (e.g. a component whose path equals an input path)
+  collapse to one dict entry with an identical digest read at the same HEAD --
+  no unsafe result;
+* the content-identity guarantee is unchanged (SHA-256 over pinned content); the
+  governing-drift test still proves `awaiting_human` on real drift.
+
+This is why the new `main()` N=2 test can complete: H001 mutates only the
+payload `PROOF.md` (not a governing input), so the corrected governing check
+passes and H002 proceeds.
+
+GOVERNING-INPUT PATH IDENTITY CORRECTION SOUND:: YES.
+
+== 8. Regression check -- previously sound 5A areas
+
+The delta is confined to the operator's evidence/accounting plumbing and its
+governing-dict keys. `slice4.py`, `vertical.py`, `prompt.py`, `git_facts.py`,
+`model.py`, and the reducer are unchanged. Spot-verified unaffected:
+
+* authority ingress, action domination, phase-scope domination, canonical path
+  normalization -- unchanged (`_preflight` action/scope loop and `_relative_path`
+  untouched);
+* `max N=2` rollout and `>2` preflight rejection -- unchanged;
+* no-H003 -- unchanged (`hop_limit==2`, `record_hop` budget guard,
+  `dispatch_eligible`); the N=2 completed test terminates at `hop_used==2`;
+* two-layer eligibility -- unchanged;
+* governing-input content identity -- improved (section 7), not regressed;
+* publication ordering -- unchanged (case-15 test still proves
+  run.json -> checkpoint -> marker);
+* fresh H002 context -- unchanged (`_h1_context` + phase-B header);
+* no retry/resume/fallback -- unchanged (no resume path; no loop past H002);
+* Slice 5B--5F and DMC boundaries -- untouched; no scaffolding added.
+
+PREVIOUSLY SOUND 5A AREAS REGRESSED:: NO.
+
+== 9. WATCH disposition
+
+* *WATCH-3* (outer gate does not itself compare the exact original checkout
+  association): unchanged, still non-blocking. The delta did not touch the gate's
+  checkout logic; inner H002 boundary still enforces equality.
+* *WATCH-4* (marker/publication predicates partly inferred through Run status):
+  unchanged, still non-blocking.
+* *WATCH-5* (low-level happy fixture ends `awaiting_human_budget`, not
+  `completed`): historically unchanged, but its practical significance is now
+  reduced -- the new `main()` N=2 integration test provides a genuine
+  `completed`/`hop_used==2` supported-path proof. Recorded, not rewritten.
+* *WATCH-6 (NEW, low, non-blocking):* if the H001/H002 publication region
+  *inside* `run_real_one_hop` raises (e.g. an `OSError` writing
+  `checkpoint.json`) so the function does not return, `progress` is not called
+  for that Hop, and `main()`'s best-effort `operator-summary.json` reports the
+  pre-Hop Run (`hop_used` one less, `invocation_id="not_dispatched"`). This is
+  identical in `hop_used` terms to the accepted pre-Slice-5A behavior (it is not
+  a new regression), and the durable authorities remain truthful: the reduced
+  `run.json` (already written) plus the retained dispatch marker drive
+  fail-closed `reconcile_required` recovery, as case 15 proves. Non-blocking; a
+  future hardening could have the boundary surface progress before its own
+  publication, but the contract's recovery model already covers this fault
+  class.
+
+== 10. Findings
+
+No new BLOCKING, IMPORTANT, or MINOR finding. F1--F4 are closed. One new WATCH:
+
+[discrete]
+=== WATCH-6 -- publication-region crash inside the boundary reports pre-Hop summary
+
+ID:: WATCH-6
+SEVERITY:: WATCH
+PRIOR FINDING / CONTRACT CLAUSE:: Related to F1; 11.5.1 attempt consumption and
+publication/recovery semantics.
+DELTA EVIDENCE:: `progress` is called only after `run_real_one_hop` returns
+(`operator.py:241, 280`); a raise during its internal run.json/checkpoint
+publication skips `progress`, leaving `latest_run` at the pre-Hop value.
+REPRODUCER OR PROOF:: `test_h001_checkpoint_publication_fault...` shows
+`run_real_one_hop` raising with the reduced `run.json` written and the marker
+retained; `main()` would then emit a best-effort summary with the pre-Hop
+`hop_used` and `invocation_id="not_dispatched"`.
+WHY IT REMAINS / NEW REGRESSION:: Not a new regression -- `hop_used` behavior
+matches the accepted pre-Slice-5A baseline; durable `run.json` + retained marker
+remain the truthful recovery authority.
+SMALLEST CORRECTION:: Optional -- have the boundary report progress before its
+own publication step, or reconstruct latest state from the on-disk `run.json` in
+the failure handler. Not required for acceptance.
+REAL PROVIDER REQUIRED:: No.
+RE-REVIEW REQUIRED:: No.
+
+== 11. Explicit answers
+
+[cols="3,2",options="header"]
+|===
+| Question | Answer
+| F1 CLOSED | YES
+| F2 CLOSED | YES
+| F3 CLOSED | YES
+| F4 CLOSED | YES
+| POST-PROVIDER FAILURE ACCOUNTING SOUND | YES (WATCH-6 non-blocking)
+| CODEX BINDING EVIDENCE SOUND | YES
+| LOCAL FAKE BINDING EVIDENCE SOUND | YES
+| MATRIX 5 | PROVEN
+| MATRIX 6 | PROVEN
+| MATRIX 7 | PROVEN
+| MATRIX 8 | PROVEN (no-H002; conservative disposition)
+| MATRIX 9 | PROVEN (trusted commit B materialized, then rejected)
+| MATRIX 10 | PROVEN
+| MATRIX 15 | PROVEN
+| SUPPORTED MAIN N=2 PATH PROVEN | YES
+| GOVERNING-INPUT PATH IDENTITY SOUND | YES
+| N=1 FUNCTIONAL BEHAVIOR PRESERVED | YES
+| N=1 EVIDENCE NOW SOUND | YES
+| N=2 HAPPY PATH SOUND | YES (driver and `main()`)
+| H003 IMPOSSIBLE | YES
+| PREVIOUSLY SOUND 5A AREAS REGRESSED | NO
+| WATCH-3 | UNCHANGED, non-blocking
+| WATCH-4 | UNCHANGED, non-blocking
+| WATCH-5 | UNCHANGED; practical significance reduced by the new completed N=2 test
+| REAL PROVIDER INVOCATIONS | 0
+| SLICE 5B-5F IMPLEMENTED | NO
+| DMC WORK IMPLEMENTED | NO
+| READY FOR MAINTAINER SLICE-5A ACCEPTANCE | YES
+| READY FOR LIVE N>1 AUTHORIZATION | NO (separate explicit maintainer gate)
+|===
+
+== 12. Final disposition
+
+The bounded correction fully closes F1--F4, repairs a latent governing-input
+keying defect that would have blocked the supported N=2 path, adds the missing
+false-continuation matrix coverage (including the contract-mandated
+trusted-commit-B case) and a supported `main()` N=2 completed-path test, and
+introduces no regression. Real-provider invocations are zero.
+
+*Lifecycle cleanup check:* This re-review accepts the Slice-5A implementation but
+does not close the FTR workstream. FTR-AGENT-WORKFLOW-COORDINATOR-P5 remains
+active: Slices 5B--5F are open, and live `N>1` execution / real-provider proof /
+DMC dogfood remain unauthorized. No backlog status change, include removal, or
+artifact relocation is due from this review. No release-notes action is
+required now: Slice 5A remains gated to fake/local proof and is not yet a
+user-facing released capability; a release note (or a documented justification)
+becomes the implementer's responsibility if/when live `N>1` is separately
+authorized and shipped. Live `N>1` authorization is explicitly withheld and
+remains a separate maintainer decision.
