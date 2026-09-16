@@ -1,0 +1,906 @@
+= Trusted Ingress -- Assurance Motivation, Product Responsibility, and Universal Re-establishment Review
+:toc:
+:toclevels: 2
+
+Status:: *INDEPENDENT, NON-AUTHORIZING STATIC ARCHITECTURE REVIEW.* Review evidence only; not architecture authority and not implementation authorization.
+Date:: 2026-09-16.
+Reviewed HEAD:: `83df05473fc15f9ecf3ff440012287619ac09b74` (`docs(security): review trusted ingress parser boundary`), clean worktree, branch `main`.
+Review target:: The Trusted Ingress / managed-execution assurance model as implemented at HEAD: initial establishment, per-step certification and re-establishment, controlled-role lifecycle, sink authorization, executable-binding authenticity, and less-trusted description authorization. The pre-ingress parser boundary was reviewed separately on 2026-09-15 and is not re-reviewed here.
+Reviewer role:: Skeptical architecture reviewer, adversarial toward both under-protection and over-engineering. Read-only except this artifact and its commit.
+Method constraint:: *Static analysis and existing repository evidence only.* No new probe, malformed-input generator, hostile plugin, stress case, benchmark, or security test script was created or executed. Where a claim would need one, it is marked *UNVERIFIED / REQUIRES FOLLOW-UP* (section 19).
+Provider/model invocations through the repository Coordinator during this review:: *0.*
+Runtime / test / FTR-lifecycle / ADR / roadmap / Project-Memory / AI-info / release-note / authoritative-architecture changes:: *none.*
+
+== 1. Executive summary
+
+The managed-execution model has a sound skeleton: one macro seam (`orchestrate`), one initial establishment pass, a closed fail-closed default for anything not recognized, role authorization checked against the exact sink kind before any saver runs, and an operator-owned, deny-by-default description policy that a less-trusted description cannot widen. Those parts are cheap, mechanically concrete, and each traces to a real actor and failure story.
+
+The certification layer built on top of that skeleton is not proportionate to what it delivers. Five registered step names (four exact bound target families, out of 43 registered steps) can be "certified"; for those, and only those, the framework skips post-step validation and instead *predicts* the resulting role state from the step's configuration. Nothing inspects what the certified step actually returned. The design documents nonetheless state that a certified grouped transition "separately proves" contained-cell conformance and that "every non-role cell remains Scalar"; no code establishes either. Meanwhile the other 38 registered step kinds, every plugin, and every caller-built step already trigger a full O(cells) ordinary re-establishment after each execution. The performance rationale recorded for selective certification ("re-establishing after every one of a long 44-step built-in pipeline can multiply full-workbook traversal") therefore describes a future that was never built: the preserving-certificate set is empty and no family has been audited. Today the architecture pays universal-validation cost on 38 of 43 step kinds and carries the full certification apparatus for the remaining five.
+
+The certification apparatus is also larger than its enforcement. The five-valued transition-effect vocabulary, the `pending_cleanup` markers, the projection/exit representation (`projection.py`), the manifest sink-consume representation, the disjoint-introduction helper, and the preserving-certificate set are read only by tests; the managed pipeline never consults any of them. They exist because the design document required them to be represented, not because runtime logic needs them.
+
+One gap in the re-establishment mechanism itself was found: after an uncertified return, only ordinary DataFrame/`ExactTable` cells are re-admitted. The `_meta` substrate is skipped entirely, although the normative text promises "a fresh Ingress-Conformant Domain Payload pass", which by its own definition includes `_meta`.
+
+Universal post-step validation with narrowly declared exceptions is recommended as the target shape. It replaces "prove exactly what this bound call will do" with "declare where non-ordinary state is allowed, then check the actual result everywhere". It closes the prediction gap, removes most of the closed-vocabulary mirroring, and turns certification into what it actually is: an authorization to create or move an exact exception to ordinary state. It should be adopted after one small benchmark, because the incremental cost over today's behavior is bounded to four step kinds and the cost driver (a per-cell Python loop) is already paid on every other step.
+
+Findings by severity: BLOCKING 0; IMPORTANT 6 (TIA-01 to TIA-06); MINOR 5 (TIA-07 to TIA-11); INFO/WATCH 4 (TIW-1 to TIW-4).
+
+== 2. Verdict
+
+*B -- DIRECTION SOUND; BOUNDED SIMPLIFICATION / CLARIFICATION REQUIRED.*
+
+Answers to the primary review question:
+
+. *Concrete failure modes.* Initial establishment, uncertified re-establishment, sink authorization, and description authorization each protect a nameable actor and failure (section 6). The certified path protects nothing after execution; its rationale is that the transition "is reviewed", which is a process claim, not a mechanism.
+. *Correct boundary.* Yes for payload conformance, description authority, and sink capability. Plugin side effects are correctly assigned to deployment/runtime isolation by the normative text and are not claimed by Trusted Ingress.
+. *Circular governance.* Partially present. The authenticity and deep-freeze rules exist so certificates mean what later code assumes; later code then assumes more (post-state) than any certificate proves. The effect vocabulary and exit representations exist because the FTR said they must be represented, and nothing consumes them.
+. *Proportionate.* No, for the certification layer. The skeleton is proportionate.
+. *Simpler possible.* Yes. Universal post-step validation with declared exceptions (sections 8, 9, 17).
+
+*Universal post-step validation: RECOMMENDED, subject to one bounded measurement before it is made the default on large-workbook paths* (section 11).
+
+*Current plugin/code-selection authority separation: PROFESSIONALLY DEFENSIBLE* (section 12), with one operator-policy foot-gun (TIA-09) and one wiring gap (TIW-1).
+
+== 3. Current assurance architecture reconstructed from code
+
+All statements below were read from source at the reviewed HEAD, not from documentation.
+
+=== 3.1 Macro seam and initial establishment
+
+`application/orchestrator.py::orchestrate` is the only place `establish_initial_state`, `run_managed_steps`, and `finalize_managed_state` are called. `run_app`, `sheets-run`, `run_schema_maintenance`, and the compatibility shim delegate to it (guarded by `tests/architecture/test_execution_state_not_wired.py`). `run_pipeline` is called by the managed pipeline one step at a time and has no ingress logic of its own.
+
+`establish_initial_state` runs `domain.ingress.run_domain_ingress`, which applies three rules in order: `ordinary_structural_admission` (E2 carriers and physical columns, then E1 scalar classification of every DataFrame cell via `frame.iat[r, c]` and every `ExactTable.data` cell; `_meta` skipped), `legend_blocks_shape` (authoring delegate), and `metadata_substrate` (E3 recursive `_meta` grammar with path-active cycle detection). It returns `ManagedExecutionState()` with zero roles.
+
+=== 3.2 Per-step classification and transition
+
+`managed_pipeline.execute_managed_step` tries four classifiers in order: `classify_formula_helper_step`, `classify_grouped_producer_step`, `classify_expand_grouped_step`, `classify_artifact_manifest_step`. Each first requires `type(step.fn) is BoundFramesTargetCall` and `step.fn.target is <exact imported callable>` (`resolve_trusted_call`), then reads `step.fn.kwargs` (deep-frozen at construction) against a closed key vocabulary (9, 16, 10, 14, and 6 keys respectively) and closed value shapes (`snapshot_scalar`, `snapshot_string_sequence`). Any unknown key, unsupported value shape, or policy-resolved option yields `Uncertified`.
+
+For a certified step the handler checks footprint collision against live roles (`proves_disjoint` on frame names only), executes the step once through `run_pipeline`, and returns the executed frames together with a *predicted* new `ManagedExecutionState` computed purely from the certificate. No function in `managed_pipeline.py` inspects the returned frames after a certified step. The only pre-execution inspection of live payload is in `_handle_expand_grouped` for the nested formula case (`type(frames.get(certificate.matrix)) is GroupedMatrix`, then `dynamic_column_labels`).
+
+For every other step (`_fallback_uncertified`) the handler executes the step, then calls `domain.ingress.structural_admission.admit_ordinary_frames` on the result and resets the state to zero roles. `admit_ordinary_frames` skips the `_meta` entry (`_dispatch_payload_entries`: `if frame_name == "_meta": continue`); neither the legend delegate nor `admit_metadata_substrate` runs on an uncertified return.
+
+Of the 43 registry entries classified in `description_authorization._REGISTERED_STEP_CLASSIFICATIONS`, five names (`add_lookup_helpers` in formula mode only, `contract_grouped_xref`, `reconstruct_grouped_matrix`, `expand_grouped_xref`, `write_artifact_manifest`; four classifier families) can be certified. The other 38, plus `plugin`, plus any caller-built `BoundStep`, always take the uncertified path.
+
+=== 3.3 Final cleanup and sink authorization
+
+`_finalize_and_persist` runs `execute_final_domain_cleanup`, then `finalize_managed_state`, which terminates roles whose frame was removed (set difference on frame names) and authorizes each survivor against `out.kind`: `LookupFormulaSpecRole`, `GroupedMatrixRole`, `GroupedMatrixFormulaRole` require `xlsx`/`ods`; the nested role additionally rejects a rename of its referenced lookup sheet (`_meta.workbook_view.sheets`); `ArtifactManifestSourceFramesRole` requires `sink_kind == "artifact_manifest_writer"`, a string that is never a router kind, so in managed flow that role can only exit through whole-frame cleanup. The decision uses `state.roles` only; the actual payload is not read except for `_meta.workbook_view`.
+
+The XLSX/ODS renderers then act on actual cell values (`isinstance(value, LookupFormulaSpec)`), independent of the predicted state.
+
+=== 3.4 Executable binding authenticity and frozen configuration
+
+`pipeline/types.py::BoundFramesTargetCall` is a frozen, slotted dataclass whose `__post_init__` deep-freezes `kwargs` (`dict`/`MappingProxyType` to owned `MappingProxyType`, `list`/`tuple` to `tuple`, other leaves by reference) and whose `__call__` thaws a fresh copy per invocation. `make_frames_target_step` is the only production constructor. `resolve_trusted_call` accepts exact type and target identity only. Docstrings record three earlier mechanisms found insufficient (a sentinel marker, an unfrozen class, a frozen class with a second construction path); git history shows four correction commits on 2026-08-15/17 closing "certification seams".
+
+=== 3.5 Description authorization
+
+`pipeline/description_authorization.py::LessTrustedDescriptionAuthorization.from_mapping` is the only constructor; it accepts exactly `registered_steps` (a mapping of registered names to per-classification constraints) and `plugin_targets` (canonical `module:attribute` strings). `build_steps_from_config` snapshots the description into exact built-ins (rejecting cycles, non-builtin types, deep nesting), then for each step: rejects reserved policy keys inside the description, authorizes `plugin` only if its canonical target is in the operator set, rejects colon-style factories and unknown/unclassified registered names, and applies root-contained writer and manifest constraints. Only after authorization does `_build_trusted_steps_from_config` import and bind. `dotted_paths` blocks one framework namespace (`spreadsheet_handling.domain.ingress`) from any configuration addressing. `run_app` applies authorization to `AppConfig.pipeline` only; `AppConfig.io` is trusted operator input. `sheets-run` exposes no authorization transport.
+
+=== 3.6 Representation not consumed by enforcement
+
+The following exports of `pipeline.execution_state` have zero call sites in `src/` outside the package itself and are exercised only by unit tests: `terminate_grouped_matrix_at_projection`, `locate_nested_formula_cells`, `relocate_nested_formula_at_projection`, `consume_formula_at_capable_adapter`, `ExactTableCellLocation`, `ProjectedFormulaLocation`, `consume_manifest_at_sink`, `disjoint_grouped_introduction`, `PreservingCertificate`, `PRESERVING_CERTIFICATES` (empty). The `effect` field of every role descriptor and the `pending_cleanup` flag are written by the handlers and read by no enforcement code (`grep` over `managed_pipeline.py`: no `.effect`, no `pending_cleanup`).
+
+=== 3.7 Volume
+
+[cols="3,1",options="header"]
+|===
+| Artifact | Lines
+
+| Runtime: `execution_state/*` (1835), `managed_pipeline.py` (399), `description_authorization.py` (674), `domain/ingress/*` (1026), `pipeline/types.py` (247)
+| 4181
+
+| Tests for the above (execution_state units, E5 lifecycle, description authorization, guards)
+| 3768
+
+| `FTR-TRUSTED-INGRESS-P4A*` design, reviews, and evidence in cold storage (27 files)
+| 26544
+
+| Normative text: `architectural_layers.adoc` trust sections (approx. 560 of 1009) plus the Developer Guide extension chapter (236)
+| approx. 800
+|===
+
+== 4. Assurance-motivation classification table
+
+Primary motivation codes: A adversarial security; B defensive programming / robustness; C abstraction / contract soundness; D operational containment.
+
+[cols="2,1,3,3",options="header"]
+|===
+| Mechanism | Primary | Why that owner | Assessment
+
+| Initial Trusted Ingress establishment (E1-E3 at `establish_initial_state`)
+| B (secondary A for `_meta` structure)
+| Loader output is level-2/3 input; the failure is a non-scalar or malformed carrier reaching Domain code that assumes the six-category language.
+| Justified. Concrete actor, concrete consequence, single seam.
+
+| Re-establishment after uncertified/plugin return
+| B
+| Trusted-but-fallible code returns a non-ordinary value; later built-ins and sinks assume ordinary state.
+| Justified in principle; incomplete in mechanism (`_meta` skipped, TIA-01).
+
+| `BoundFramesTargetCall` exact-target authenticity
+| C
+| Certificates are issued from `step.fn.kwargs`; without authenticity a certificate could describe one behavior while `fn` performs another.
+| Sound and cheap. Its *security* framing is overstated: the only actor able to forge a `BoundStep` is a trusted programmatic caller (TIA-07).
+
+| Frozen / effective configuration snapshot
+| C (secondary B: alias mutation bug class)
+| Same as above: the classifier must read what executes.
+| Sound and cheap. Under universal validation its load-bearing role shrinks to "the declared exception locations are read from what executes".
+
+| Classifier closed vocabularies and fail-closed `Uncertified`
+| C
+| Certification predicts post-state; an unreviewed option could change post-state, so unknown options must not be certified.
+| Justified *only because* post-state is predicted, not inspected. It duplicates each family's option schema inside the classifier and turns any new family option into a confusing managed-flow failure (TIA-05).
+
+| Controlled-role certificates and `ManagedExecutionState`
+| C
+| Framework-managed flow must know which locations are legitimately non-ordinary so that (a) sinks can be authorized and (b) ordinary validation can be skipped there.
+| Necessary in some form. The current form records predicted state and never reconciles it with actual state (TIA-02, TIA-03).
+
+| Controlled-role composition / carry / relocation / termination
+| C
+| Two roles coexisting need a rule; the nested formula-in-grouped case is a real maintained flow.
+| The frame-name disjointness proof and the nested composition are used. Relocation and termination *representations* (projection exits, effect vocabulary) are not consumed by enforcement (TIA-04).
+
+| Final sink authorization
+| B (secondary C)
+| A FormulaSpec or GroupedMatrix at a JSON/CSV sink is a real, previously observed failure class (renderer/backend receives a value it cannot serialize or silently stringifies).
+| Justified; small. Operates on predicted state (TIA-03).
+
+| Description authorization for less-trusted descriptions
+| A
+| A less-trusted YAML author must not select arbitrary Python or filesystem targets.
+| Justified, deny-by-default, activation-ordered, independent of the description. One foot-gun (TIA-09); no shipped CLI transport (TIW-1).
+
+| Plugin target authorization / allowlisting
+| A
+| Same actor; module import is capability activation.
+| Justified. Exact canonical identity; import after allow.
+
+| `_meta` ownership / aliasing rules (no role lives in `_meta`; `proves_disjoint` on frame names)
+| C
+| Makes frame-name disjointness a sufficient proof.
+| True today and cheap. Becomes unnecessary if post-step validation checks actual locations.
+
+| Uncertified default for every registered built-in, plugin, and caller-built step
+| B
+| Registry membership proves nothing about output.
+| Justified and already the dominant path (38 of 43 registered kinds).
+|===
+
+== 5. Product-responsibility gradient
+
+The framework can truthfully claim the following per case. "Returned state" means the Frames mapping handed back to the macro after a step; it never means side effects.
+
+[cols="2,3,3,2",options="header"]
+|===
+| Case | What the framework guarantees | What it does not guarantee | Owner of the remainder
+
+| 1. Built-in / reviewed framework steps
+| Initial ordinary conformance; after each *uncertified* built-in, ordinary conformance of the returned payload cells (not `_meta`); after a *certified* built-in, nothing about the returned payload beyond what the step's own tests establish; sink authorization on predicted roles; typed rejection before any saver.
+| Business correctness; `_meta` conformance after any built-in that returns from the uncertified path; contained-cell conformance of a `GroupedMatrix`; that predicted and actual role state agree.
+| Framework maintainers (tests, postcondition validation).
+
+| 2. Operator-allowlisted plugins (less-trusted description)
+| Everything in case 1 plus: only exactly allowlisted canonical targets are imported or bound; registered resource steps are root-contained; the description cannot name, disable, or widen the policy; returned payload cells are re-admitted.
+| Anything the plugin does before returning: filesystem, network, credentials, subprocess, global process mutation, in-place mutation of frames it received (a plugin that mutates and returns the same dict is re-validated, but earlier aliases are not restored).
+| Operator (allowlist curation) and deployment/runtime isolation.
+
+| 3. Arbitrary user-selected same-process plugins (trusted description, the `sheets-run` default)
+| Initial conformance and post-return re-admission of payload cells; typed rejection of a non-ordinary return.
+| Everything in case 2's second column, plus: the author chose the code, so "allowlist" is vacuous.
+| Deployment/runtime isolation entirely.
+
+| 4. Deliberately hostile same-process Python
+| Nothing beyond fail-closed behavior on ordinary paths. `BoundFramesTargetCall` explicitly disclaims `object.__setattr__`, `__code__` patching, `ctypes`, interpreter compromise.
+| Confidentiality, integrity, availability, authority.
+| Process/container/OS isolation. Out of scope by ADR-DOMAIN-BOUNDARY-ROBUSTNESS and ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY Decision 1.
+|===
+
+*The principle "a less-trusted description must not be able to disable or widen the policy that constrains its own plugin/code-selection authority" holds at HEAD:*
+
+* the policy value is constructed only through `from_mapping` by the trusted caller, before any description is read; the description is never consulted to build it;
+* `_RESERVED_DESCRIPTION_KEYS` rejects `description_authority`, `description_authorization`, `description_policy` inside any step;
+* the effective policy is copied into an immutable `_EffectiveAuthorization` before the loop; `_authorize_step_spec` only reads it;
+* plugin identity is compared after canonicalization on both sides, so alias spellings cannot bypass;
+* colon-style factories and unknown names are rejected regardless of policy; registry membership without classification is rejected;
+* `AppConfig.io` is outside the mechanism and documented as operator-owned. A whole `AppConfig` authored by the less-trusted party is therefore *not* a supported less-trusted input; the operator must own I/O descriptors. This is documented (`interfaces_and_gates.adoc`) and is a correct boundary, not a gap.
+
+*Boundary once arbitrary same-process plugin execution is authorized (cases 2-3):* re-establishment constrains only the returned domain state. `admit_ordinary_frames` reads cells; it cannot observe or undo `open()`, `socket`, `subprocess`, environment reads, `sys.modules` edits, or monkeypatching performed inside the callable. The normative text already says this ("Re-establishment proves nothing about side effects", "Security trust is not a correctness assumption"). The responsibilities that therefore belong to deployment/runtime isolation, not Trusted Ingress, are: host confidentiality; credential and secret reachability; filesystem and network reachability; process isolation between pipeline runs; resource ceilings for plugin CPU/memory; and rollback of partial external effects after a failed run. No documentation inspected claims otherwise (section 14 lists the two places where wording is broader than the mechanism, both about payload, not side effects).
+
+== 6. Concrete actor / failure-story catalogue
+
+Each row answers: who, what fails, observable consequence, preventing invariant, correct owner, simpler alternative, complexity added, when unnecessary.
+
+[cols="1,2,2,2,2",options="header"]
+|===
+| Mechanism | Actor and failure | Consequence if absent | Invariant and owner | Simpler alternative / complexity / when unnecessary
+
+| Initial establishment
+| A partner exports YAML with `!!binary` cells, a stale sidecar carries a `set`, an XLSX hidden sheet carries legacy `literal_eval` tuples. Or a maintainer's loader regression hands out `numpy.timedelta64`.
+| A transformation calls `.sort()`/`==`/`hash` on an unsupported carrier and raises deep inside Domain with a payload-echoing message, or a sink stringifies silently.
+| Every ordinary cell is one of six categories; `_meta` is a closed acyclic tree. Owner: the macro seam, once per load.
+| None simpler. Complexity: one O(cells) pass. Unnecessary only for a caller who already guarantees it (`run_pipeline`, by contract).
+
+| Re-establishment after uncertified return
+| A plugin, or 38 of 43 built-ins, returns frames with an object cell, a `GroupedMatrix` copied from a previous run, a tuple report cell.
+| Same as above, one step later; or a FormulaSpec reaches a CSV sink.
+| Every inter-step boundary carries ordinary payload (roles ended). Owner: macro seam.
+| None simpler for payload. Complexity: O(cells) per step. Unnecessary when a step provably returns its input untouched, which the frames model cannot prove (in-place mutation is possible), so never elided without a measured reason.
+
+| `_meta` re-establishment after uncertified return (absent today)
+| `configure_workbook_view` (uncertified built-in) or a plugin returns `_meta` containing a cycle, non-string keys, or a DataFrame leaf.
+| `project_meta_to_persistable_contract`, `json.dumps` in the XLSX meta blob, or `yaml.safe_dump` fails late, recurses, or writes garbage; the documented "fresh Ingress-Conformant pass" is false.
+| `_meta` satisfies E3 after every step. Owner: macro seam.
+| Call `run_domain_ingress` (or its `_meta` rules) in the fallback. Complexity: O(meta nodes) per step, usually tiny. Unnecessary never, given 38 uncertified built-ins write `_meta`.
+
+| Binding authenticity
+| A maintainer hand-builds a `BoundStep` in a test or an integration with a config that looks like `add_lookup_helpers` formula mode but an `fn` that does something else; or a wrapper re-labels `config["target"]`.
+| A certificate is issued for behavior that never runs; predicted role state is wrong; a sink is authorized for a value that is not there, or an actual FormulaSpec is not authorized.
+| The inspected target and kwargs are what executes. Owner: the binder.
+| Simpler: none needed if post-state is inspected (a wrong prediction is caught). Complexity: ~120 lines, cheap. Unnecessary once validation is universal, except as the source of the declared exception locations.
+
+| Frozen configuration
+| A caller keeps the dict it passed to `make_frames_target_step`, mutates it after classification; a nested list alias changes `helpers.fields`.
+| Certificate names column A; step writes FormulaSpec to column B.
+| Classifier and `__call__` read one immutable snapshot. Owner: binder.
+| Same as above. Complexity: ~80 lines. Unnecessary once post-state is inspected; still a good robustness default.
+
+| Closed option vocabulary
+| Maintainer adds `sort_dynamic_columns` to `contract_grouped_xref`; user sets it.
+| Today: step is `Uncertified`, executes, produces a `GroupedMatrix`, re-establishment rejects it with `unsupported_top_level_carrier` naming the output frame, no hint that the classifier is the cause (TIA-05).
+| Prediction is only valid for reviewed configuration. Owner: classifier.
+| Simpler: read only the keys that determine exception locations; let validation catch a wrong location. Complexity: five vocabularies, ~55 keys mirrored. Unnecessary once post-state is inspected.
+
+| Predicted `ManagedExecutionState`
+| `enrich_lookup` formula mode gains a bug that also writes a FormulaSpec into the join-key column; or `contract_grouped_xref` leaves a non-scalar in a contained cell.
+| Undetected. Predicted state says "roles at declared columns only"; the XLSX renderer renders whatever FormulaSpec it finds; a JSON sink writes `repr`. The claim "every non-role cell remains Scalar" (FTR 17.B) is not established.
+| Actual state agrees with declared state. Owner: macro seam after each step.
+| Local postcondition validation over the transition's written frames. Complexity: O(cells of written frames). Unnecessary never.
+
+| Sink authorization
+| A pipeline ends with a FormulaSpec role and `json_dir` output.
+| Pre-E5 behavior: backend receives an object cell; either exception with payload echo or stringified formula object persisted.
+| No controlled role reaches an incapable sink. Owner: macro seam before save.
+| Keep. Complexity: ~40 lines. Unnecessary never while roles exist.
+
+| Description authorization and plugin allowlist
+| A tenant-supplied YAML names `plugin: dotted: os:system` or `step: mypkg.evil:factory`, or `apply_overrides` with `overrides_path: /etc/passwd`.
+| Import executes arbitrary code; file read before any check.
+| Only operator-allowlisted canonical targets are imported; resource selectors are root-contained; denial precedes activation. Owner: step builder.
+| Keep. Complexity: 674 lines, of which about half is resource-selector containment. Unnecessary only when all descriptions are trusted (today's CLI default).
+
+| Effect vocabulary, `pending_cleanup`, projection/exit representation, preserving certificates
+| No actor. Nothing reads them.
+| None.
+| None enforced.
+| Delete or demote to diagnostics. Complexity: ~500 lines plus tests plus prose.
+|===
+
+Rules whose current justification is flagged:
+
+* *Circular:* "certified transitions must be certified for the exact configuration" is used to justify the closed vocabularies, and the vocabularies are used to justify calling the outcome "certified". The only external anchor is that post-state is predicted; remove the prediction and the loop dissolves.
+* *Terminology-driven:* the five-effect vocabulary ("must not collapse into a boolean") and the relocation/termination representations. They describe lifecycle prose faithfully; no runtime decision depends on them.
+* *Historical residue:* the performance rationale for selective certification assumed a future with many preserving certificates; the set is empty and no audit is scheduled.
+* *Stronger than the product responsibility:* framing binding authenticity as protection against forgery. The only forger is a trusted programmatic caller.
+* *Redundant with another boundary:* for capable sinks (XLSX/ODS), role authorization is redundant with the renderer's own `isinstance` dispatch; it matters only at incapable sinks, where ordinary re-establishment would already have rejected the value if the producing step had been uncertified.
+* *Disproportionately complex:* the extension checklist for a new role (12 items, including a composition proof against every existing role and an "uncertified-return behavior" item the role cannot vary) relative to the three roles that exist.
+
+== 7. Anti-accretion assessment and proposed stop criteria
+
+=== 7.1 Is the feedback loop present?
+
+Yes, in bounded but observable form. The sequence in this area was:
+
+. E4 design requires an exact producer-transition *representation* (rule).
+. Representation needs certificates, roles, effects, footprints (abstractions: 9 dataclasses, 1 enum, 4 classifiers, 2 vocabularies).
+. Certificates must be sound, so binding authenticity and freezing are added; four correction commits (2026-08-15 `acd3f770`, `e15f4663`; 2026-08-17 `4dabbed5`, `eae9ab41`) each close a "seam" in the previous soundness fix (soundness rules).
+. Each fix produces evidence sections 40-44 and 48 in the FTR, a review artifact, and a docstring paragraph recording the superseded mechanism (governance artifacts).
+. The Developer Guide then requires every future role to prove twelve properties, and every registered step to be classified on four independent axes (review obligations).
+. The documentation-condensation FTR produced 48 "condensed invariants" and a technical-debt item for a navigation index over them (further rules about the rules).
+
+The ratio of design/evidence prose to runtime code is about 6:1, and to tests about 7:1. The proportion is not itself a defect, but two symptoms are: representation with no consumer (section 3.6), and a performance rationale that was never revisited once the preserving set stayed empty.
+
+=== 7.2 Candidate principle: "a new risk does not automatically imply a new rule in this subsystem"
+
+Endorsed. Applied to the material reviewed: the plugin side-effect risk was correctly *not* absorbed (it is a deployment responsibility); the parser resource risk was correctly kept out of `run_domain_ingress` by the 2026-09-15 review; the "forged BoundStep" risk *was* absorbed although its actor is a trusted programmatic caller whose product responsibility is already "caller-precondition surface". The test that should have been applied: does this actor sit inside the subsystem's responsibility at all? For a hand-built `BoundStep`, the documented answer is no.
+
+=== 7.3 Proposed stop criteria
+
+A new assurance mechanism in Trusted Ingress / managed execution requires *all* of:
+
+. *An external anchor*: a named actor outside the governance model (a less-trusted description author, a plugin, a fallible built-in, a loader) and a failure story with an observable consequence outside the model (wrong file, crash with payload echo, silent corruption, capability activation).
+. *A boundary check*: the actor's failure is within this subsystem's product responsibility per section 5; if it belongs to deployment isolation, family validation, or the parser boundary, it is recorded there instead.
+. *A mechanism, not a representation*: the rule is enforced by runtime code that has a consumer; a dataclass field, enum, or helper that no enforcement path reads is not accepted as "the rule".
+. *A cost statement*: complexity class and, where it is O(cells) or O(meta paths), either a measurement or an explicit "unmeasured, accepted" note.
+. *A removal condition*: the sentence "this mechanism becomes unnecessary when ..." must be writable. If it cannot be written, the mechanism is suspect.
+
+"Existing governance says so", "the contract requires it", "certified transitions must be certified", and "represent the FTR's vocabulary" satisfy none of these and must not generate new mechanism, abstraction, artifact, or review obligation.
+
+=== 7.4 Documentation quality rule: unpacking compact terms
+
+Chain required: term, mechanism, concrete invariant, actor + failure story, observable consequence.
+
+[cols="1,2,2,1",options="header"]
+|===
+| Term | Mechanism at HEAD | Actor + failure + consequence | Unpacks losslessly?
+
+| Certified transformation
+| One of four exact bound targets whose kwargs match a closed vocabulary; the macro predicts the role state and skips post-step validation.
+| No actor is protected *by* certification; certification is a *permission* to skip validation and to publish predicted roles. Its practical meaning is "recognized bound call; result assumed correct".
+| No. The word implies verification that does not occur. Rename or re-define (section 9).
+
+| Executable binding authority
+| `type(step.fn) is BoundFramesTargetCall and step.fn.target is <callable>`, kwargs frozen at construction.
+| Trusted caller builds a mismatched `BoundStep`; certificate describes behavior that does not run; wrong sink decision.
+| Yes, though the actor is inside the trusted base; the "authority" word overstates a robustness check.
+
+| Effective configuration snapshot
+| `BoundFramesTargetCall.kwargs` after deep freeze; thawed per call.
+| Caller mutates a retained dict after classification; certificate and execution diverge.
+| Yes.
+
+| Controlled execution state
+| `ManagedExecutionState.roles`: predicted tuple of role descriptors plus the last formula certificate.
+| Sink receives a value it cannot serialize; nested composition attempted without provenance.
+| Partly. The invariant "actual state matches declared state" is stated in prose (FTR 17.B) but not mechanized. Unpacks to a *claim*, not an invariant.
+
+| Trusted / uncertified producer
+| Uncertified is every step not matching the four classifiers; "trusted producer" does not exist in code (only "trusted description" and "trusted call").
+| Uncertified: any step; consequence: full O(cells) payload re-admission, roles ended.
+| "Uncertified" yes. "Trusted producer" is prose-only and should not be used; the FTR itself says custom output is not "automatically untrusted".
+
+| Re-establishment
+| `admit_ordinary_frames` over DataFrame/`ExactTable` cells; `_meta` skipped.
+| Plugin returns a non-ordinary value; later built-in or sink misbehaves.
+| Partly. The documented meaning includes `_meta`; the mechanism does not (TIA-01).
+
+| Transition effect (INTRODUCE / COPY_DERIVE / RELOCATE / CONSUME_TERMINATE / PENDING_CLEANUP)
+| Enum value stored on role descriptors; never read by enforcement.
+| None.
+| No. Ceremonial.
+
+| Disjoint role product / footprint / locality proof
+| `proves_disjoint`: the new certificate's declared frame names do not include an existing role's frame.
+| Second grouped introduction overwrites the frame that carries a live role; predicted state stale.
+| Yes, but only because roles live in whole frames or columns of one frame; a location-level post-step check would make it unnecessary.
+|===
+
+== 8. Universal post-step re-establishment assessment
+
+=== 8.1 Candidate
+
+After every framework-managed step, validate the returned execution state before the next step, cleanup, or persistence; for ordinary state, apply ordinary Trusted Ingress conformance.
+
+=== 8.2 What it changes relative to HEAD
+
+At HEAD, post-step validation already runs after every step except the four certified kinds. Universal validation therefore changes behavior only for those four kinds and for `_meta` (which is currently never re-validated after any step). It replaces the question "could this transformation produce something ingress-invalid?" (which the closed vocabularies try to answer statically and incompletely) with "did it?" (answered mechanically).
+
+=== 8.3 What it must not do
+
+It cannot simply apply ordinary conformance after the four certified kinds: their whole purpose is to produce non-ordinary values (`LookupFormulaSpec` cells, a `GroupedMatrix` carrier, `list[str]` manifest cells). Section 9 supplies the exception rule.
+
+=== 8.4 Does it yield the simpler invariant "every inter-step boundary carries validated execution state"?
+
+Yes, provided the validation is role-aware at declared locations (section 9). The invariant then reads: after every step, every location is ordinary except the declared exception locations, which satisfy their role's exact shape; and `ManagedExecutionState` is exactly the set of declared exceptions that validation confirmed. That single sentence replaces: the preserving-certificate concept, the "conformance interval" prose, the transparent/aware consumer taxonomy, the effect vocabulary, and most of FTR sections 12 and 17.B.
+
+=== 8.5 Assessment
+
+Recommended. It closes TIA-01, TIA-02, and TIA-03 with one mechanism; it removes the justification for the closed vocabularies (TIA-05) and for most of the ceremonial representation (TIA-04); it makes the certification machinery reducible (section 10.7). Its cost is bounded (section 11) and must be measured once before it is made the default for large-workbook paths; the measurement is the only reason not to adopt it immediately.
+
+== 9. Controlled-role exception assessment
+
+=== 9.1 The stronger candidate
+
+After every step:
+
+* ordinary locations: ordinary Trusted Ingress validation (E1/E2 cells, E3 `_meta`);
+* explicitly declared `ControlledRole` locations: exact role-specific postcondition validation;
+* all other locations: must remain ordinary;
+* `ManagedExecutionState` must agree with the actual returned state.
+
+=== 9.2 Feasibility against the three current roles
+
+[cols="1,3,2",options="header"]
+|===
+| Role | Local postcondition that can be checked mechanically | Cost
+
+| `LookupFormulaSpec` at `frame/column`
+| `frames[frame]` is a DataFrame; column exists; every cell of that column is `type(cell) is LookupFormulaSpec` (or Missing if the family allows); every other column of the frame passes E1.
+| O(cells of `frame`).
+
+| `GroupedMatrix` at `frame`
+| `type(frames[frame]) is GroupedMatrix`; `matrix.frame` passes E2/E1 on every cell except, for the nested composition, the dynamic (non-row-key) columns positionally named by `matrix.header.columns`, whose cells must be `LookupFormulaSpec`.
+| O(cells of the contained frame). The dynamic-column dispatch already exists (`dynamic_column_labels`).
+
+| `ArtifactManifestSourceFrames` at `frame.source_frames`
+| `frames[frame]` is a DataFrame with `MANIFEST_COLUMNS`; every `source_frames` cell is `type(x) is list` with all-`str` members; every other cell passes E1.
+| O(cells of `frame`).
+|===
+
+Every role's location is a whole frame or one column of one frame, so validation is *local to the transition's written frames* plus a full ordinary pass on everything else. Nothing requires a location grammar more general than `(frame)` or `(frame, column)`.
+
+=== 9.3 Declared footprint and locality
+
+The declared footprint (`writes`) already names the frames a transition may change. Under the candidate, validation of *written* frames is role-aware; validation of *all other* frames is ordinary. Whether the "all other frames" pass can be elided for a certified step (because the transition declares it did not write them) is exactly the measured-elision question of section 11; the frames model permits in-place mutation, so elision is a performance decision, not a soundness one.
+
+=== 9.4 Does this reframe certification more accurately?
+
+Yes. At HEAD "certified" practically means: *recognized exact bound call; role state predicted; no post-check*. The proposed definition, "a certified transition is not generally trusted or assumed correct; it is a transition authorized to create, preserve, relocate, or terminate an exact exception to ordinary Domain state", is more accurate because:
+
+* it names the only thing certification actually contributes (permission for a specific non-ordinary location), and
+* it stops implying a verified postcondition that the mechanism does not produce.
+
+Under that definition the classifier's job is to produce the *declared exception set* (frame, column, role kind) from what executes; it no longer needs to mirror every family option, because a wrong or incomplete declaration is caught by the universal check. The `Uncertified` outcome then means "no exceptions declared", not "behavior unknown".
+
+== 10. Certification versus observed-postcondition analysis
+
+For each certified transition: pre-execution facts proven mechanically; post-execution facts predicted; post-execution facts actually inspected.
+
+[cols="2,3,3,2",options="header"]
+|===
+| Transition | Pre-execution facts proven | Post-execution facts predicted (not checked) | Post-execution facts inspected
+
+| Formula-helper introduction (`enrich_lookup`, `helper_value_mode="formula"`)
+| Exact target identity; kwargs frozen; `missing == "empty"`; inline join keys; `helpers.fields` is a non-empty `tuple[str]`; footprint disjoint from live role frames.
+| A `LookupFormulaSpecRole` exists at `output/field` for each field; all other cells of `output` are Scalar; no other frame changed; `_meta.derived` provenance is well-formed.
+| None.
+
+| Grouped producer introduction (`contract_grouped_xref` / `reconstruct_grouped_matrix`)
+| Exact target; closed vocabulary; `dense_axes` absent; `row_keys` string sequence; footprint disjoint.
+| `frames[output]` is a `GroupedMatrix`; contained cells are Scalar ("separately proves ordinary Scalar conformance of the contained DataFrame", FTR 12; "every location outside an explicitly authorized nested role independently satisfy ordinary authority", FTR 17.B); `source` dropped iff `drop_source`.
+| None. No code in `grouped_xref/` or `managed_pipeline.py` classifies contained cells.
+
+| Formula-to-grouped composition
+| The last formula certificate's `output == relation`, `value in fields`, `source_key in row_keys`, `output != formula.output`; footprint disjoint from remaining roles.
+| Nested dynamic cells carry FormulaSpec; every retained helper column still carries FormulaSpec; `pending_cleanup` set iff `drop_source`.
+| None.
+
+| Grouped expansion (`expand_grouped_xref`), nested case
+| Exact target; closed vocabulary; a grouped role exists at `matrix`; `type(frames[matrix]) is GroupedMatrix` (live check); restored dynamic labels read from the live header when `drop_source`.
+| `output/value` carries FormulaSpec; restored flat columns carry FormulaSpec; outer role terminated iff `drop_source`.
+| Pre-execution only (carrier type, header labels).
+
+| Grouped expansion, ordinary case
+| As above minus the live check.
+| `output` ordinary; role retained iff not `drop_source`.
+| None.
+
+| Artifact-manifest role introduction
+| Exact target; closed vocabulary; `output` non-empty string; footprint disjoint.
+| `frames[output].source_frames` cells are one-level `list[str]`; other cells Scalar; if configured, the manifest file was written under the authorized root.
+| None.
+
+| Controlled-role sink exits
+| Predicted role set after set-difference on removed frames; sink kind string; `_meta.workbook_view.sheets` renames.
+| That a role at `frame/column` corresponds to an actual value there; that no FormulaSpec exists outside declared roles.
+| `_meta.workbook_view` only.
+|===
+
+=== 10.1 Can an ordinary implementation bug make the returned payload diverge from `ManagedExecutionState`?
+
+Yes, in both directions, with no mechanism to detect it:
+
+* *Role declared, value absent*: e.g. a future `enrich_lookup` change that skips fields already present. Consequence: spurious `UnauthorizedControlledRoleAtSinkError` at a JSON sink (fails closed, misleading).
+* *Value present, role undeclared*: e.g. a `contract_grouped_xref` bug leaving a tuple in a contained cell, or a formula-mode change that also writes a FormulaSpec into the key column. Consequence at XLSX/ODS: rendered anyway (renderer dispatches on actual type). Consequence at JSON/CSV: backend serializes an object repr or raises inside the writer, after the framework said the state was authorized.
+
+=== 10.2 Can later logic grant authority on predicted rather than actual state?
+
+Yes: `_authorize_role_for_sink` reads `state.roles` only. It never asks whether the frame it authorizes still contains the role, nor whether any *other* frame contains a role-shaped value. The nested-formula rename check is likewise about a predicted `lookup_sheet`.
+
+=== 10.3 Does current code detect such divergence?
+
+No, except the pre-execution carrier-type check in the nested expansion path. Tests assert outcomes of the maintained flows, not agreement between predicted and actual state after each certified step.
+
+=== 10.4 Would local postcondition validation close the gap?
+
+Yes. Section 9.2 gives a mechanical, O(cells of written frames) check for every role. It converts FTR 17.B from a claim into an invariant.
+
+=== 10.5 Full ordinary re-establishment or local?
+
+Local validation of the written frames closes the *role* gap. Full ordinary validation of the other frames closes the *in-place mutation* gap (a certified target that mutates a frame it did not declare). Whether the second is needed as a default is the measured question in section 11; soundness argues for full validation, since the frames model cannot prove non-mutation.
+
+=== 10.6 Can certification machinery be reduced if validation becomes universal?
+
+Yes, substantially:
+
+* keep: `BoundFramesTargetCall` (binder), `resolve_trusted_call`, the four target identities, the fields that determine exception locations (`output`, `helpers.fields`, `value`, `row_keys`, `matrix`, `drop_source`, manifest `output`), `proves_disjoint` (or replace it with the post-step check), the three role descriptors reduced to `(kind, frame, column?)`, `finalize_managed_state` sink capability check;
+* remove: closed vocabularies as *rejection* criteria (`only_known_keys`, `_unsupported_grouped_option`), `TransitionEffect`, `pending_cleanup`, `preserving.py`, `projection.py`, `consume_manifest_at_sink`, `disjoint_grouped_introduction`, `last_formula_certificate` (composition can be recognized from the actual value: a `GroupedMatrix` whose dynamic cells are FormulaSpec cells derived from a frame that carries a formula role);
+* narrow: the classifier contract from "prove behavior" to "declare exceptions".
+
+Estimated reduction: roughly 700-900 of 1835 lines in `execution_state/`, a comparable share of its tests, and the corresponding prose. Not measured; estimate from the call-site grep in section 3.6.
+
+== 11. Performance / cost assessment
+
+=== 11.1 Cost drivers (inferred from source; no benchmark exists in the repository)
+
+[cols="2,1,3",options="header"]
+|===
+| Validation | Class | Notes
+
+| `_dispatch_payload_entries`, frame-name checks
+| O(frames)
+| Negligible.
+
+| `ensure_unique_physical_column_labels`
+| O(columns) per frame
+| Negligible.
+
+| `_admit_dataframe_cells`: `frame.iat[r, c]` then `scalar_category`
+| O(cells), per-cell Python overhead: one `iat` (pandas scalar access, relatively expensive), `is_missing_carrier` (up to five `issubclass` checks, `pd.isna` for numerics), then up to seven more `issubclass` checks
+| The dominant driver. Runs once at load and once after every uncertified step. String-substrate loaders produce object-dtype `str` columns, so dtype-based short-circuits help only numeric/boolean/datetime columns.
+
+| `_admit_exact_table_cells`
+| O(cells)
+| Same per-cell cost, tuple iteration instead of `iat`.
+
+| `admit_metadata_substrate`
+| O(paths) in the `_meta` DAG; exponential on shared-alias DAGs (2026-09-15 review, H4)
+| Small in practice; the alias amplifier is a pre-existing defect, not introduced by universal validation, but universal validation would repeat it per step.
+
+| Role-specific postconditions (proposed)
+| O(cells of written frames)
+| Same per-cell cost as E1 on those frames.
+|===
+
+=== 11.2 Could repeated full-payload validation become material?
+
+Inferred: yes for large workbooks with many steps. If one E1 pass costs on the order of a microsecond-scale Python loop per cell, a 10-million-cell workbook (the ODS default ceiling) costs seconds to tens of seconds per pass, and a 20-step pipeline multiplies that. *Measured: nothing.* The existing tests run 392 cases in 0.78 s on fixtures of a few cells, which says nothing about scale.
+
+The decisive observation is that at HEAD this cost is *already* paid after 38 of 43 registered step kinds and after every plugin. Universal validation adds at most four step kinds per pipeline plus `_meta`. The performance argument in the FTR review ("a long 44-step built-in pipeline") describes a state that would only exist after a family-hardening audit that has not been scheduled.
+
+=== 11.3 Smallest later benchmark (REQUIRES FOLLOW-UP)
+
+One script, CI-excluded, no adversarial content:
+
+. Build one DataFrame of 1,000,000 object-dtype `str` cells and one of 1,000,000 `float64` cells.
+. Time `admit_ordinary_frames` once on each (establishes the per-cell constant and the dtype sensitivity).
+. Time `orchestrate` with a 10-step pipeline of `identity` steps on the string frame, discard sink (establishes the per-step multiplier at HEAD, which already re-validates after `identity`).
+. Optional: time a column-level variant that checks `set(map(type, column.values))` before falling back to per-cell (establishes whether a vectorized admission path changes the decision).
+
+Decision rule: if one pass at 1e6 cells is below about 1 s, universal validation is adopted without elision; otherwise elision is permitted only for transitions with a declared footprint *and* a measured saving above a stated threshold.
+
+=== 11.4 Candidate policy
+
+"Begin with universal post-step validation when operationally acceptable; permit validation elision only where measured cost justifies it and an equivalent invariant-preservation argument exists." *Endorsed.* Performance speculation has so far been the sole reason for the certification layer's existence as a validation bypass, and it was never measured. The policy inverts the burden correctly.
+
+== 12. Plugin / code-selection authority assessment
+
+=== 12.1 Findings on the principle
+
+The principle "less-trusted YAML/config cannot grant itself broader plugin authority" is satisfied at HEAD (evidence in section 5). The operator control may be deny-all (`from_mapping({})`), an allowlist, or a broader grant, and in each case it is constructed independently of the description.
+
+=== 12.2 Activation ordering
+
+`_authorize_step_spec` runs before `_build_trusted_steps_from_config([authorized])` for each step (guarded by `test_all_configuration_dotted_activation_sites_are_bounded_and_known`, which also pins the only three `resolve_configuration_callable` call sites). `canonicalize_configuration_callable` performs no import. Module import is therefore after allow, as ADR Decision 4 requires.
+
+=== 12.3 Foot-gun (TIA-09)
+
+Only `spreadsheet_handling.domain.ingress` is blocked from configuration addressing. An operator who allowlists a framework-internal callable as a *plugin* target (for example `spreadsheet_handling.domain.yaml_overrides:load_and_apply_overrides` or `spreadsheet_handling.domain.artifact_manifest:write_artifact_manifest`) hands the description the *unconstrained* argument contract of that callable, bypassing the registered-step resource classification (`overrides_path` denial, output-root containment). This is not the description widening its own authority; it is the operator widening it unknowingly, because the same capability has two spellings with different policies. Smallest fix: refuse `spreadsheet_handling.*` targets in `plugin_targets` (or document loudly that plugin allowlisting of framework callables is a full-trust grant).
+
+=== 12.4 Wiring gap (TIW-1)
+
+`sheets-run` has no transport for `description_authorization`; the CLI default is a trusted description. The mechanism therefore protects programmatic embedders only. This is documented and is not a defect, but the professional claim "less-trusted YAML is supported" must be scoped to `run_app`/`build_steps_from_config` until a CLI transport exists.
+
+=== 12.5 Residual responsibilities of deployment / runtime isolation
+
+Everything an authorized plugin does before returning: filesystem, network, credentials, subprocess, environment, `sys.modules`, monkeypatching, resource consumption, in-place mutation of aliases it received. The framework can and should keep saying it does not contain these.
+
+== 13. Existing guarantees that remain valid
+
+* Every framework-managed external route passes initial E1-E3 establishment before any configured step, cleanup, or saver (2026-09-15 review, reconfirmed by reading `orchestrate`).
+* After any uncertified step (38 of 43 registered kinds, every plugin, every caller-built step), every ordinary DataFrame/`ExactTable` cell of the returned payload is one of the six categories, and every previously live controlled role has ended; a surviving `GroupedMatrix`, FormulaSpec, or manifest list cell is rejected before the next step.
+* A controlled role recorded in `ManagedExecutionState` cannot reach an incapable sink kind; rejection happens before the saver runs and before any output path is created (tests assert `not output_dir.exists()`).
+* A `BoundStep` built by `make_frames_target_step` executes exactly the target and kwargs its `fn` describes; no post-construction mutation of the supported container structure is possible.
+* A less-trusted description cannot name unlisted plugin targets, colon-style factories, unknown or unclassified registered steps, external override paths, or output locations outside an authorized exact root; denial precedes import, binding, and resource activation; the description cannot carry or override policy.
+* Diagnostics inside `domain.ingress` and `execution_state` never render a rejected value.
+* The normative threat model correctly disclaims sandboxing, side-effect containment, symlink races beyond the reviewed selectors, and hostile same-process Python.
+
+== 14. Existing claims that should be narrowed or clarified
+
+. `architectural_layers.adoc`, "Re-establishment after an uncertified return": "the framework MUST perform a fresh Ingress-Conformant Domain Payload pass over the returned candidate". Ingress-Conformant Domain Payload is defined two paragraphs earlier to include the `_meta` substrate. The mechanism re-admits payload cells only. Either the code or the sentence must change (TIA-01).
+. FTR section 12, exact grouped producer row: "after both the existing grouped pair proof and separate contained-DataFrame conformance check"; and section 17.B: "its contained physical columns and every location outside an explicitly authorized nested role independently satisfy ordinary authority", proof class "PROVEN BY EXACT CONTROLLED TRANSITION". No such check exists (TIA-02). The FTR is archived evidence, but `architectural_layers.adoc` inherits the claim in "Composition" ("every other location inside the GroupedMatrix remains ordinary Scalar").
+. FTR section 17.B, FormulaSpec row: "Every non-role cell remains Scalar". Not established after the certified step (TIA-02).
+. `release_notes.adoc`, E5 entry: "now enforces the complete Trusted Ingress E1-E4 contract end to end". Accurate for uncertified returns' payload cells; overstated for `_meta` after any step and for certified returns.
+. The term "certified" wherever it appears in normative text should be glossed as "recognized exact bound call authorized to declare an exception; result not inspected" until section 9's model is adopted, at which point it should be re-defined as in section 9.4.
+. `04_trusted_ingress_extension.adoc`: the twelve-item new-role checklist should be reduced to the four facts a role-aware post-step check needs (kind, introducing target, location grammar, cell/carrier shape) plus sink capability, once section 17 is adopted.
+
+== 15. Mechanisms that appear necessary
+
+* Initial establishment at the single macro seam (E1, E2, E3, the legend delegate).
+* Post-step re-establishment of ordinary state, extended to `_meta`.
+* A declared-exception set (`ManagedExecutionState` reduced to `(kind, frame, column?)` tuples) with role-specific postcondition validation at those locations.
+* The `BoundFramesTargetCall` binder and `resolve_trusted_call`, as the source from which exception locations are read.
+* Sink capability authorization on the declared-and-validated exception set.
+* `LessTrustedDescriptionAuthorization` with its activation ordering, reserved-key rejection, canonical plugin identity, and exact-root writer containment.
+* The architecture guards pinning the single seam and the three activation sites.
+
+== 16. Mechanisms that appear redundant, over-engineered, or insufficiently justified
+
+* Closed option vocabularies as *rejection* criteria in all four classifiers (TIA-05).
+* `TransitionEffect`, `effect` fields, `pending_cleanup` flags (TIA-04).
+* `projection.py` in its entirety: `terminate_grouped_matrix_at_projection`, `locate_nested_formula_cells`, `relocate_nested_formula_at_projection`, `consume_formula_at_capable_adapter`, `ExactTableCellLocation`, `ProjectedFormulaLocation` (TIA-04).
+* `consume_manifest_at_sink` and `MANIFEST_ADAPTER_SINK_KIND` as a sink kind that no router produces (TIA-04).
+* `disjoint_grouped_introduction` (duplicate of `_footprint_collides`) (TIA-04).
+* `preserving.py`, an empty set with a dataclass and a docstring (TIA-04).
+* `last_formula_certificate` as a memory of a prior step, once composition is recognized from actual state (section 10.6).
+* The "conformance interval" and "caller obligation" prose in FTR 12, which describes what the model cannot know rather than what it enforces.
+* The framing of binding authenticity as protection against forgery by a trusted caller (TIA-07).
+
+== 17. Smallest coherent target architecture
+
+[source,text]
+----
+load
+  -> establish(frames): E2/E1 cells, legend delegate, E3 _meta   [unchanged]
+  -> exceptions = {}
+
+for each step:
+  exceptions_declared = declare_exceptions(step)
+      # from BoundFramesTargetCall target identity + location-determining
+      # kwargs only; {} for anything unrecognized
+  frames = run_pipeline(frames, (step,))
+  exceptions = validate_state(frames, prior=exceptions, declared=exceptions_declared)
+      # every frame: ordinary E2/E1, _meta: E3,
+      # EXCEPT at declared locations: role-specific shape
+      # (FormulaSpec column; GroupedMatrix carrier whose contained cells
+      #  are ordinary except nested dynamic cells; manifest list[str] column)
+      # prior exceptions not re-declared by a recognized step: must now be
+      # ordinary (i.e. roles end on unrecognized steps, as today)
+      # returns the confirmed exception set; raises otherwise
+
+final cleanup
+  -> exceptions minus removed frames
+  -> for each exception kind: sink_kind must be capable      [unchanged]
+  -> persistence boundary, save                              [unchanged]
+----
+
+Properties:
+
+* one invariant at every inter-step boundary: ordinary everywhere except confirmed, declared exceptions;
+* certification means only "may declare exceptions";
+* a wrong declaration, a family bug, an in-place mutation, or a malformed `_meta` is caught mechanically after the step that caused it, with the step name in the diagnostic;
+* the nested formula-in-grouped composition is confirmed by inspecting the produced carrier, so no certificate memory is needed;
+* elision (skipping the ordinary pass on undeclared frames after a recognized step) is a later, measured optimization, not a soundness prerequisite;
+* description authorization, sink capability, and the binder are unchanged.
+
+== 18. Explicit NON-GOALS / guarantees the framework should not claim
+
+. *Business correctness.* Ingress-conformant data may be semantically wrong; conformance says nothing about keys, references, geometry, or meaning.
+. *Plugin side effects.* Re-establishment inspects the returned mapping only. Filesystem, network, credential, subprocess, environment, module, and global-state effects are neither observed nor undone.
+. *Controlled-role correctness.* Role-specific postcondition validation confirms shape at declared locations; it does not confirm that a formula references the right sheet, that a grouped header pairs correctly, or that manifest paths are meaningful.
+. *Parser / resource / execution containment.* Pre-ingress parser bounds, alias amplification, and process resource ceilings are separate boundaries (2026-09-15 review).
+. *Arbitrary authorized same-process code execution.* Once an operator allowlists or trusts a plugin, the framework contains nothing about that code; host confidentiality, integrity, credentials, reachability, and isolation are deployment/runtime responsibilities.
+. *Forgery resistance against trusted callers.* A programmatic caller who builds a `BoundStep` is inside the trust base; binding authenticity is a robustness check, not a security boundary.
+. *A Python sandbox, in any form.*
+
+== 19. Follow-up work
+
+*Architecture / documentation*
+
+* Narrow the re-establishment sentence or extend the mechanism (TIA-01); choose one.
+* Remove or qualify the contained-cell and "every non-role cell remains Scalar" claims until validated mechanically (TIA-02).
+* Re-define "certified" per section 9.4; record the stop criteria of section 7.3 in the owning Technical Model section, not as a new document.
+* Reduce the Developer Guide new-role checklist to the facts a post-step check needs.
+* Scope the "less-trusted YAML" claim to the programmatic surfaces until a CLI transport exists (TIW-1).
+
+*Implementation* (each its own bounded FTR; none authorized by this review)
+
+* Include `_meta` rules in post-step re-establishment (smallest change: call `run_domain_ingress` in `_fallback_uncertified`).
+* Add role-aware post-step validation after the four certified kinds (section 9.2).
+* After both land: delete the representation-only modules and fields listed in section 16; relax the closed vocabularies to location-determining keys.
+* Consider blocking `spreadsheet_handling.*` from `plugin_targets` (TIA-09).
+
+*Tests*
+
+* Existing: no test asserts agreement between `ManagedExecutionState` and actual payload after a certified step; no test returns malformed `_meta` from an uncertified step. Both are ordinary integration tests, not adversarial probes, and should accompany the implementation items above.
+* Architecture guard: a call-site guard that every `execution_state` export has a consumer in `src/`, so representation cannot silently outlive enforcement again.
+
+*Empirical benchmarking* (REQUIRES FOLLOW-UP; none performed here)
+
+* Section 11.3: per-cell admission constant at 1e6 cells (object `str` and `float64`); per-step multiplier through `orchestrate`; optional vectorized variant. This single measurement decides whether elision is ever needed.
+* Section 11.1: `_meta` alias-DAG amplification per step (H4 from the 2026-09-15 review) if `_meta` re-validation is adopted; fix the memoization first.
+
+*Deployment / operations*
+
+* State, in operator-facing documentation, that authorized plugins run with the full process authority and that isolation (container, user, network policy, credential scoping) is the deployment's responsibility.
+* Provide a CLI transport for `description_authorization` or explicitly declare `sheets-run` trusted-description-only in user-facing docs.
+
+== 20. Top durable conclusions
+
+. *Validate results, not intentions.* A mechanism that predicts post-state from configuration and never inspects the result is a claim, not an invariant; every soundness rule added to make the prediction trustworthy (authenticity, freezing, closed vocabularies) is cheaper to replace with one post-step check than to keep proving.
+. *Certification is permission, not proof.* The only durable meaning of a certified transition is "authorized to create, preserve, relocate, or terminate an exact exception to ordinary state at a declared location".
+. *The dominant path is already universal.* Selective certification saves validation on four step kinds; its complexity was justified by a future that never arrived. Measure before keeping any bypass.
+. *A representation without a consumer is governance debt.* Effects, exit relocations, preserving certificates, and pending-cleanup markers describe the design; nothing enforces them. The stop criterion "mechanism, not representation" would have prevented them.
+. *Trust classes must not be collapsed.* Security claims (description/plugin authority: sound), robustness claims (ingress, re-establishment: sound but incomplete for `_meta`), contract-soundness claims (certification: overstated), and operational claims (isolation: correctly disclaimed) each need their own actor and failure story.
+. *The less-trusted description boundary is the one place where deny-by-default against an external actor matters, and it is done correctly.* Keep it independent of everything else.
+
+== 21. Findings
+
+Severity vocabulary: BLOCKING, IMPORTANT, MINOR, INFO/WATCH. Motivation codes as in section 4.
+
+=== TIA-01 -- IMPORTANT -- Re-establishment after an uncertified return skips `_meta` entirely
+
+Current mechanism:: `managed_pipeline._fallback_uncertified` calls `structural_admission.admit_ordinary_frames`, whose dispatcher skips the `_meta` key; neither `legend_blocks_shape` nor `admit_metadata_substrate` runs.
+Motivation classification:: C (the documented contract promises a full Ingress-Conformant pass); secondary B.
+Actor:: Any of the 38 uncertified registered built-ins (including every `configure_*` step, which exist to write `_meta`), any plugin, any caller-built step.
+Failure story:: A step returns `_meta` that is not an exact `dict`, contains a cycle, non-string keys, a DataFrame leaf, or a delegate root in authoring shape. The next step, `project_meta_to_persistable_contract`, the XLSX meta-blob `json.dumps`, or `yaml.safe_dump` consumes it.
+Evidence:: `structural_admission.py::_dispatch_payload_entries` (`if frame_name == "_meta": continue`); `managed_pipeline.py::_fallback_uncertified`; `architectural_layers.adoc` "Re-establishment after an uncertified return"; FTR 17.C ("Success proves the same facts as section 17.A", which include `_meta`). `bootstrap_meta` and `apply_overrides` re-run `run_domain_ingress` internally, so `_meta` producers are inconsistent with one another. No test returns malformed `_meta` from a step.
+Consequence:: Late, untyped failure or silent malformed persistence; documented guarantee false.
+Ownership/boundary:: Macro seam (`managed_pipeline`).
+Smallest corrective action:: Call `run_domain_ingress` (or the two `_meta` rules) in the fallback; or narrow the normative sentence to payload cells.
+Implementation required:: Yes (small) or documentation change.
+Empirical follow-up:: Only the H4 alias-amplification measurement if `_meta` re-validation is adopted.
+
+=== TIA-02 -- IMPORTANT -- Certified transitions publish predicted state; documented post-conditions are not established by any code
+
+Current mechanism:: `_handle_formula_helper`, `_handle_grouped_producer`, `_handle_expand_grouped`, `_handle_artifact_manifest` return `executed` frames unchanged and a state computed from the certificate alone.
+Motivation classification:: C.
+Actor:: Framework maintainers; ordinary bugs in `enrich_lookup`, `contract_grouped_xref`, `reconstruct_grouped_matrix`, `expand_grouped_xref`, `write_artifact_manifest`, or in a future refactor of any of them.
+Failure story:: Section 10.1. A certified step leaves a non-scalar in an undeclared location, writes a FormulaSpec to an extra column, or fails to place a declared role.
+Evidence:: No `admit_*`/`scalar_category` call in `managed_pipeline.py` after a certified step; none in `grouped_xref/` or `artifact_manifest.py`; FTR 12 and 17.B claim otherwise; `architectural_layers.adoc` "Composition" repeats the claim.
+Consequence:: Predicted-state authority granted for actual state never checked; silent corruption at JSON/CSV sinks; false documented proof class.
+Ownership/boundary:: Macro seam.
+Smallest corrective action:: Role-aware post-step validation of the transition's written frames (section 9.2); until then, remove the proof-class claims.
+Implementation required:: Yes.
+Empirical follow-up:: Section 11.3 benchmark to decide whether undeclared frames are also validated by default.
+
+=== TIA-03 -- IMPORTANT -- Sink authorization decides on predicted roles, not on the payload being persisted
+
+Current mechanism:: `finalize_managed_state` authorizes `state.roles` against `sink_kind`; the renderers and backends act on actual cell types.
+Motivation classification:: C; secondary B.
+Actor:: Same as TIA-02.
+Failure story:: A FormulaSpec present outside any declared role reaches a JSON sink authorized as "no roles"; or a declared role whose value is absent triggers a spurious rejection.
+Evidence:: `_authorize_role_for_sink` signature and body; `openpyxl_renderer.py` L190 and `odf_renderer.py` L569 (`isinstance(value, LookupFormulaSpec)`).
+Consequence:: The sink gate is a predicate on bookkeeping; its real protection at incapable sinks derives from ordinary re-establishment, which only runs after uncertified steps.
+Ownership/boundary:: Macro seam.
+Smallest corrective action:: Subsumed by TIA-02: once post-step validation confirms the exception set, the sink gate operates on confirmed state. No separate mechanism.
+Implementation required:: Yes, via TIA-02.
+Empirical follow-up:: No.
+
+=== TIA-04 -- IMPORTANT -- Roughly a third of `execution_state` is representation with no enforcement consumer
+
+Current mechanism:: `projection.py` (221 lines), `preserving.py` (48), `consume_manifest_at_sink`, `disjoint_grouped_introduction`, `TransitionEffect` and every `effect` field, `pending_cleanup`, `ExactTableCellLocation`, `ProjectedFormulaLocation`.
+Motivation classification:: None reconstructible beyond "the FTR requires the representation"; terminology-driven.
+Actor:: None protected. Affected actor: maintainers and reviewers who must reason about a lifecycle algebra that runtime never consults.
+Failure story:: A future change alters `expand_grouped_xref`'s relocation behavior; `projection.py` and its tests continue to pass because nothing wires them; reviewers cite them as evidence of enforced behavior.
+Evidence:: Section 3.6 call-site grep: zero `src/` consumers outside the package for all listed symbols; `managed_pipeline.py` reads neither `.effect` nor `pending_cleanup`.
+Consequence:: Maintenance cost, false sense of enforcement, review load, documentation volume.
+Ownership/boundary:: `pipeline.execution_state`.
+Smallest corrective action:: Delete after TIA-02 lands (the actual-state check makes relocation representation unnecessary); or, if a diagnostic audit trail is wanted, keep one string field and drop the enum and helpers.
+Implementation required:: Yes (deletion).
+Empirical follow-up:: No.
+
+=== TIA-05 -- IMPORTANT -- Closed option vocabularies mirror family schemas and convert any new family option into a misdiagnosed managed-flow failure
+
+Current mechanism:: `_KNOWN_OPTION_KEYS` (9), `_CONTRACT_KNOWN_KEYS` (16), `_RECONSTRUCT_KNOWN_KEYS` (10), `_EXPAND_KNOWN_KEYS` (14), manifest keys (6); `only_known_keys` and `_unsupported_grouped_option` make any other key or shape `Uncertified`.
+Motivation classification:: C, justified only by the absence of post-step inspection.
+Actor:: Framework maintainer extending a family; pipeline author using the new option.
+Failure story:: Section 6 "Closed option vocabulary" row. The step runs, produces its `GroupedMatrix`, and ordinary re-establishment rejects it as `unsupported_top_level_carrier`; nothing names the classifier.
+Evidence:: `grouped_matrix.py` and `formula_helper.py`; `_fallback_uncertified`; `OrdinaryStructureAdmissionError` message format.
+Consequence:: Fail-closed but with a misleading diagnostic; hidden coupling between five classifier modules and their families; every family option change is a Trusted Ingress change.
+Ownership/boundary:: Classifiers.
+Smallest corrective action:: After TIA-02, restrict classifier reads to location-determining keys and stop rejecting unknown keys; a wrong location is then caught by validation. In the interim, make the uncertified-rejection diagnostic name the step and state that it was not certified.
+Implementation required:: Yes.
+Empirical follow-up:: No.
+
+=== TIA-06 -- IMPORTANT -- Selective certification buys no measurable performance today and was justified by an unmeasured, unscheduled future
+
+Current mechanism:: The uncertified default re-validates after 38 of 43 registered kinds and every plugin; the preserving set is empty; no family audit is scheduled (`roadmap_domain_hardening_sequence.adoc` records Phase E complete; `technical_debt.adoc` has no family-hardening item).
+Motivation classification:: Historical residue.
+Actor:: Project (maintenance cost) rather than a runtime actor.
+Failure story:: The FTR review's "Performance sanity" ("re-establishing after every one of a long 44-step built-in pipeline ... is unattractive"; "no benchmark is needed to decide the contract") became the reason to build prediction instead of validation; the optimization it anticipated was never built.
+Evidence:: `preserving.py` (empty); `_REGISTERED_STEP_CLASSIFICATIONS` (38 never certifiable); FTR review lines 1019-1027; no benchmark in `tests/`, `scripts/`, `tools/`.
+Consequence:: Full certification complexity, near-universal validation cost, and the gaps of TIA-02/03.
+Ownership/boundary:: Architecture.
+Smallest corrective action:: Adopt section 17; run the section 11.3 benchmark once; permit elision only with a measured reason.
+Implementation required:: Yes (as the sum of TIA-02, 04, 05).
+Empirical follow-up:: Yes (section 11.3).
+
+=== TIA-07 -- MINOR -- Binding authenticity is framed as forgery resistance; its actor is inside the trust base
+
+Current mechanism:: Exact-type and identity checks; docstrings describe "forged" `BoundStep`s and superseded mechanisms at length.
+Motivation classification:: Documented as A/C; actual B/C.
+Actor:: Trusted programmatic caller or test author who hand-builds a `BoundStep`.
+Failure story:: Mislabeled step certified; wrong predicted state (only material while TIA-02 stands).
+Evidence:: `types.py` docstring "Normal-construction threat boundary"; `interfaces_and_gates.adoc` lists direct `BoundStep` composition as trusted by design.
+Consequence:: Prose overstates a security property; three superseded mechanisms and four correction commits for a robustness check.
+Ownership/boundary:: Binder.
+Smallest corrective action:: Keep the mechanism; reclassify its motivation in docstrings and the Technical Model as robustness against accidental mismatch; trim the mechanism-history narrative to one sentence with a git pointer.
+Implementation required:: No (documentation).
+Empirical follow-up:: No.
+
+=== TIA-08 -- MINOR -- The frames model cannot prove non-mutation, so "footprint" elision is unsound by construction and must stay a measured optimization
+
+Current mechanism:: `TransitionFootprint` names declared frames; `proves_disjoint` treats non-mention as non-interference; the FTR calls out-of-band mutation a "caller obligation".
+Motivation classification:: C.
+Actor:: A certified target that mutates a frame it did not declare (e.g. shared DataFrame alias between `relation` and another frame).
+Failure story:: Role at frame X survives although X was mutated in place through an alias.
+Evidence:: `vocabulary.py::proves_disjoint` docstring; FTR 12 "conformance interval" paragraph.
+Consequence:: Predicted role validity depends on a convention.
+Ownership/boundary:: Macro seam.
+Smallest corrective action:: Under section 17, validate all frames by default; elide only with measurement (section 11.4).
+Implementation required:: Via TIA-02.
+Empirical follow-up:: Yes (section 11.3).
+
+=== TIA-09 -- MINOR -- Operator allowlisting of a framework-internal callable as a plugin bypasses registered-step resource classification
+
+Current mechanism:: Only `spreadsheet_handling.domain.ingress` is blocked; any other framework callable is a valid `plugin_targets` entry.
+Motivation classification:: A (operator policy foot-gun).
+Actor:: Operator writing an allowlist; less-trusted description author supplying arguments.
+Failure story:: Operator allowlists `spreadsheet_handling.domain.yaml_overrides:load_and_apply_overrides` intending "the overrides step"; description passes `overrides_path` to an arbitrary file; the registered form would have denied it.
+Evidence:: `dotted_paths._FRAMEWORK_INTERNAL_CONFIGURATION_NAMESPACES`; `_authorize_plugin` (no argument inspection by design); E5 test uses a framework callable as a plugin target in trusted mode.
+Consequence:: Two spellings of one capability with different policies.
+Ownership/boundary:: Description authorization.
+Smallest corrective action:: Reject `spreadsheet_handling.*` in `plugin_targets`, or document that plugin allowlisting of framework callables is a full-argument-contract grant.
+Implementation required:: Small, or documentation.
+Empirical follow-up:: No.
+
+=== TIA-10 -- MINOR -- Uncertified-return rejection diagnostics do not say which step produced the candidate
+
+Current mechanism:: `OrdinaryStructureAdmissionError` names carrier role, frame ordinal/name, row, column; `_fallback_uncertified` does not wrap it with the step name.
+Motivation classification:: B.
+Actor:: Pipeline author debugging a rejection after a plugin or an unexpectedly uncertified built-in.
+Failure story:: TIA-05's scenario; the error points at a frame, not at the step or at the certification miss.
+Evidence:: `managed_pipeline.py::_fallback_uncertified`; `structural_admission.py::_safe_admission_message`.
+Consequence:: Fail-closed with poor locality.
+Ownership/boundary:: Macro seam.
+Smallest corrective action:: Wrap or annotate with `step.name` and an "executed as uncertified" marker; no payload echo.
+Implementation required:: Yes (small).
+Empirical follow-up:: No.
+
+=== TIA-11 -- MINOR -- Compact terms carry meanings the mechanism does not deliver
+
+Current mechanism:: Section 7.4 table.
+Motivation classification:: Documentation quality.
+Actor:: Readers, reviewers, future maintainers.
+Failure story:: A reviewer reads "certified" and "PROVEN BY EXACT CONTROLLED TRANSITION" and concludes the post-state is checked.
+Evidence:: Section 7.4; FTR 17.B; `architectural_layers.adoc` "Controlled Execution State".
+Consequence:: Governance decisions made on a false model of the runtime.
+Ownership/boundary:: Technical Model.
+Smallest corrective action:: Section 14 items 5-6.
+Implementation required:: No.
+Empirical follow-up:: No.
+
+=== INFO / WATCH
+
+* *TIW-1* -- `sheets-run` has no `description_authorization` transport; the less-trusted description boundary protects only programmatic embedders today. Documented; watch that user-facing text does not overstate it.
+* *TIW-2* -- The manifest role's only managed exit is whole-frame cleanup, because `MANIFEST_ADAPTER_SINK_KIND` is not a router kind and the manifest file is written *inside* the step. The sink gate therefore guards persistence of the report frame, not the manifest write. Correct but easy to misread; resolve by TIA-04 deletion and one sentence in the role description.
+* *TIW-3* -- `run_schema_maintenance` builds a private step that always takes the uncertified path; it inherits TIA-01 (its `_meta` is not re-validated after the rename step). No separate action.
+* *TIW-4* -- `_extract_sheet_renames` reads `_meta.workbook_view` with `isinstance`/`.get()` after final cleanup. Safe preparation work on already-admitted `_meta` at HEAD; becomes safe by construction once TIA-01 is closed.
+
+== 22. UNVERIFIED / REQUIRES FOLLOW-UP
+
+None of the following was measured or probed in this session; each is stated from source reading only.
+
+. Per-cell cost of `admit_ordinary_frames` at 1e6 cells for object-`str` and `float64` columns (section 11.3, steps 1-2).
+. Per-step multiplier through `orchestrate` with `identity` steps at 1e6 cells (section 11.3, step 3).
+. Whether a column-level type-set check materially reduces the per-cell constant (section 11.3, step 4).
+. `_meta` alias-DAG amplification per step if `_meta` re-validation is adopted (inherits H4 from the 2026-09-15 review).
+. That an actual divergence between predicted and actual role state can be produced by an ordinary bug in a maintained family today (stated as possible by construction; no maintained defect was found, and none was sought by probing).
+. The line-count reduction estimate in section 10.6 (derived from call-site grep, not from an implemented removal).
+
+== 23. Validation performed for this artifact
+
+[source,text]
+----
+.venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/unit/pipeline/execution_state \
+  tests/integration/pipeline/test_trusted_ingress_e5_managed_lifecycle.py \
+  tests/unit/pipeline/test_description_authorization.py \
+  tests/unit/pipeline/test_description_authorization_resources.py \
+  tests/integration/pipeline/test_description_authorization_managed.py \
+  tests/architecture/dependency_guards/test_description_authorization_boundary.py \
+  tests/architecture/test_execution_state_not_wired.py \
+  tests/unit/domain/ingress \
+  tests/unit/pipeline/test_programmatic_surface_contract.py
+  -> 392 passed in 0.78s (existing tests only; nothing added or modified)
+asciidoctor --failure-level WARN -o /dev/null <this file>
+git diff --check
+git status --porcelain  (only this artifact)
+----
+
+No runtime code, test, FTR, ADR, roadmap, Project Memory, AI-info, release-note, or authoritative architecture file was modified. No probe, hostile plugin, malformed-input generator, or benchmark was created or executed. Provider/model invocations through the repository Coordinator: 0.
+
+== 24. Lifecycle note
+
+This is a global architecture review, not an FTR implementation review; no FTR status change, backlog include change, or cold-storage move follows from it. The follow-ups in section 19 are candidates for separately authorized FTRs and are not authorized here.
