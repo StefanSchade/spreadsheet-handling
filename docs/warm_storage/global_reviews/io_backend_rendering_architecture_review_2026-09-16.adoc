@@ -1,0 +1,598 @@
+= IO Backend Adapters and Rendering Layer -- Independent Architecture Review
+:toc:
+:toclevels: 2
+
+Status:: *NON-AUTHORIZING INDEPENDENT REVIEW.* No production change, FTR change, implementation authorization, or release disposition follows from this artifact alone. Review evidence and recommendations only.
+Date:: 2026-09-16.
+Reviewed HEAD:: `764452d407f20a312849f9b89644ecfad597f216` (`docs(project): capture 2026-09-16 handoff`), branch `main`, clean worktree (verified with `git status --short`: no entries).
+Review target:: The IO backend adapters (`src/spreadsheet_handling/io_backends/`) and the rendering layer (`src/spreadsheet_handling/rendering/`), followed through their real callers: `application/orchestrator.py`, `application/managed_pipeline.py`, `pipeline/persistence_boundary.py`, `pipeline/execution_state/projection.py`, `core/formulas.py`, `core/exact_table.py`, `core/scalar_values.py`, and `domain/ingress/`. The prompt names `src/spreadsheet_handling/io/`; the package is `io_backends/` at HEAD.
+Orientation inputs (non-normative):: `docs/warm_storage/project_handoff_2026-09-16.adoc`; the two Trusted Ingress reviews of 2026-09-15/16 were read only for the ingress/sink boundary they establish. None of their conclusions was inherited without re-verification against current source.
+Reviewer role:: Skeptical architecture reviewer, adversarial toward both under-protection and over-engineering. Read-only except this artifact and its commit.
+Method constraint:: Static source, test, documentation, and Git-history analysis. Existing ordinary deterministic tests were run once (section 20). No hostile file, malformed-input campaign, stress case, benchmark, dependency experiment, or new probe script was created or executed. Dependency behaviour is cited from the installed library source (openpyxl 3.1.5, pandas 3.0.2, odfpy as installed in `.venv`) and marked *UNVERIFIED / REQUIRES FOLLOW-UP* wherever runtime confirmation would need a probe.
+Provider/model invocations through the repository Coordinator during this review:: *0.*
+Runtime / test / FTR / ADR / Project-Memory / guide / backlog / release-note changes:: *none.*
+
+== 1. Executive summary
+
+The spreadsheet write chain -- `compose_workbook` -> IR passes -> `build_render_plan` -> format renderer -- is a sound and proportionate design for the demonstrated requirement: two spreadsheet renderers (openpyxl for XLSX, odfpy for ODS) execute one backend-neutral `RenderPlan`, the parity tests prove that the same plan yields the same parsed result on both, and architecture guards keep raw formula syntax inside the two adapters. The non-spreadsheet sinks (JSON, YAML, XML, CSV directories, `discard`) correctly bypass that chain. Designed today from the same requirements, substantially the same shape would be built.
+
+The defects are not in that shape. They sit at the two places the chain touches the outside world:
+
+* *The XLSX sink activates a capability nobody authorized.* Every ordinary payload string longer than one character that starts with `=` is bound by openpyxl as a formula cell (`openpyxl/cell/cell.py` lines 198-199). Trusted Ingress explicitly keeps formula-looking strings as ordinary Strings; `ADR-TRUSTED-RUNTIME-AND-POLICY-AUTHORITY` Decision 5 assigns "security-sensitive interpretation" to the sink; the XLSX renderer implements no policy at all. ODS writes the same string inertly. The project's own XLSX reader (`data_only=True`) then returns the formula's cached value -- empty for a freshly written file -- so the value is silently lost or, after an application recalculation, silently replaced. This is a known, documented, unowned gap; it is the one finding here with an adversarial story, and its correction is a few lines in one file.
+* *Persistence has no durability model and one ingress-accepted value that the XLSX sink cannot serialize.* All sinks open their target for writing in place (`ZipFile(..., "w")`, `open(..., "w")`); a serialization error after that point leaves a truncated artifact where the previous good one was. A timezone-aware `DateTime` -- accepted by ingress by documented decision -- is exactly such a value for XLSX: openpyxl raises during `wb.save`, not at assignment. Directory sinks are overlay writers: a frame dropped or renamed by the pipeline leaves its stale file behind, and the next reimport of that directory reads it back as a live frame.
+
+Beyond those, the subsystem carries a measurable amount of accretion that the current runtime no longer consumes: three empty "export marker" cells written by `MetaPass` and a two-layer strip helper that exists only to remove them again; the canonical `_meta` dict serialized to a JSON blob in the composer and re-parsed by three passes in the same process, with the blob-decoding rule (JSON first, `ast.literal_eval` fallback) copied five times; four passes that each copy one options key into a dunder key for the plan builder to read back; a parse-side `WorkbookIR` that reconstructs validations, named ranges, freeze and filter hints that no production consumer reads; a legacy `_p1_validations` path with no producer; a parsed-but-ignored `excel:` configuration section; a `BackendBase` class hierarchy whose default `write_multi` silently overwrites one path per sheet and which the router does not use. None of this causes an observable failure today; all of it is deletable with existing tests as the safety net.
+
+Findings by severity: BLOCKING 0; IMPORTANT 3 (IOR-01 to IOR-03); MINOR 11 (IOR-04 to IOR-14); INFO/WATCH 8 (IOW-1 to IOW-8).
+
+== 2. Verdict summary
+
+*B -- DIRECTION SOUND; BOUNDED CORRECTION AND BOUNDED SIMPLIFICATION REQUIRED.*
+
+The full verdict, the separation of defects / justified complexity / removable complexity / unknowns / optional improvements, and the top-3 lists are in section 18.
+
+== 3. Part A -- Actual architecture map
+
+=== 3.1 Sink and backend families at HEAD
+
+From `io_backends/router.py` (`LOADERS` lines 35-46, `SAVERS` 48-60, `BACKENDS` 62-70), the supported kinds are:
+
+[cols="1,2,2,2",options="header"]
+|===
+| Family | Router kinds (saver / loader) | Implementation | Uses rendering chain
+
+| XLSX | `xlsx` | `xlsx/xlsx_backend.py` -> `spreadsheet_contract` -> `openpyxl_renderer.py` / `openpyxl_parser.py` + `parser_interpretation.py` | yes
+| ODS | `ods`, `calc` (alias) | `ods/ods_backend.py` -> `spreadsheet_contract` -> `odf_renderer.py` / `odf_parser.py` + `parser_interpretation.py` | yes
+| JSON directory | `json_dir`, `json` (alias) | `json_backend.py` (one `.json` per frame, `_meta.yaml` sidecar) | no
+| YAML directory | `yaml_dir`, `yaml` (alias) | `yaml_backend.py` (one `.yml` per frame; reads `_meta.yaml`/`.yml`, never writes it) | no
+| XML directory | `xml_dir`, `xml` (alias) | `xml_backend.py` (one `.xml` per frame, no `_meta`) | no
+| CSV directory | `csv_dir` | `csv_backend.py` (one `.csv` per frame, no `_meta`) | no
+| Discard | `discard` (saver only) | `discard_backend.py` | no
+| Artifact manifest | not a router sink; `artifact_manifest_writer` is the sink kind used by the controlled manifest role (`execution_state/artifact_manifest.py` line 52) | `domain/artifact_manifest.py` writes JSON/YAML records from a pipeline step | no
+|===
+
+`BACKENDS` additionally exposes `excel` and `csv`/`json`/`xml` class factories through `make_backend`; `excel` has no saver or loader entry, and `get_saver("excel")` fails while `make_backend("excel")` succeeds.
+
+=== 3.2 Write path (Domain state -> durable artifact)
+
+[source,text]
+----
+orchestrate()                                        application/orchestrator.py:156-185
+  load (router loader)                               :161
+  establish_initial_state  (Trusted Ingress E1-E3)   managed_pipeline.py:131-143
+  run_managed_steps        (E4/E5 role tracking)     managed_pipeline.py:308-314
+  _finalize_and_persist                              orchestrator.py:68-94
+     execute_final_domain_cleanup
+     finalize_managed_state  -> _authorize_role_for_sink(sink_kind)   managed_pipeline.py:352-399
+     project_meta_to_persistable_contract(_meta)     persistence_boundary.py:130-158
+  _save_frames -> SAVERS[kind](frames, path, options)                orchestrator.py:61-65
+      |
+      +-- spreadsheet kinds (xlsx / ods|calc)
+      |     save_xlsx / save_ods                      xlsx_backend.py:91-120, ods_backend.py:84-109
+      |       coerce non-carrier values to DataFrame; keep DataFrame|GroupedMatrix (is_render_carrier)
+      |     ExcelBackend/OdsBackend.write_multi       :32-46 / :32-43
+      |       Path(path).with_suffix(".xlsx"|".ods"); parent.mkdir
+      |       build_spreadsheet_render_plan(frames, meta)             spreadsheet_contract.py:32-41
+      |         select_render_frames   (workbook_view)               rendering/frame_selection.py
+      |         compose_workbook       Frames -> WorkbookIR          rendering/composer/layout_composer.py:286-379
+      |         apply_render_passes    11 IRPass objects             rendering/passes/__init__.py:36-49
+      |         build_render_plan      WorkbookIR -> RenderPlan      rendering/flow.py:227-371
+      |       render_workbook(plan, path)
+      |         XLSX: openpyxl Workbook built in memory; wb.save(path)          openpyxl_renderer.py:383-393
+      |         ODS : plan -> _BufferedSheet grid -> odfpy DOM; doc.save(path)  odf_renderer.py:658-700
+      |
+      +-- json_dir  : mkdir; per frame json.dump(records); _meta -> _meta.yaml    json_backend.py:219-270
+      +-- yaml_dir  : mkdir; per frame yaml.safe_dump(records); _meta skipped     yaml_backend.py:145-176
+      +-- xml_dir   : mkdir; per frame ElementTree.write; _meta skipped           xml_backend.py:144-187
+      +-- csv_dir   : mkdir; per frame CSVBackend.write; _meta skipped            csv_backend.py:110-122
+      +-- discard   : no effect                                                   discard_backend.py:11-18
+----
+
+Irreversible capability activation occurs in exactly two places: `openpyxl.Workbook.cell(value=...)` (formula binding at assignment, file effect at `wb.save`) and `odfpy.TableCell(formula=...)` (only for `LookupFormulaSpec`, `odf_renderer.py` lines 569-584). Filesystem effect occurs at `wb.save`/`doc.save`/`open(..., "w")`; there is no earlier point of no return.
+
+=== 3.3 Read path (durable artifact -> Domain state)
+
+[source,text]
+----
+LOADERS[kind](path, options, header_levels)
+  xlsx / ods : read_spreadsheet_frames(path, parser)        spreadsheet_contract.py:44-50
+     parse_workbook -> WorkbookIR                           openpyxl_parser.py:31-127 / odf_parser.py:1034-1172
+        visible sheets -> SheetIR{tables[TableBlock], validations, named_ranges, meta{__*}}
+        hidden "_meta" -> SheetIR.meta{workbook_meta_blob, version, exported_at, author, _hidden}
+        presentation families re-embedded into the blob (carrier authoritative)  presentation_meta.py
+     workbookir_to_frames(ir) -> {sheet: DataFrame|ExactTable, "_meta": dict}   workbook_projection.py:157-207
+        consumes ONLY tables[0].{kind, header_grid, headers, header_rows, data} and hidden _meta
+  json_dir : pandas.read_json(dtype=str) + _meta.yaml sidecar                    json_backend.py:195-217
+  yaml_dir : yaml.safe_load per file (native types), reserved _meta sidecar      yaml_backend.py:107-142
+  xml_dir  : ElementTree.parse, flattened dotted keys, strings                   xml_backend.py:126-142
+  csv_dir  : pandas.read_csv(dtype=str, header=0)                                csv_backend.py:67-97
+then establish_initial_state (ingress) in orchestrate
+----
+
+=== 3.4 Layer ownership
+
+[cols="2,3,3",options="header"]
+|===
+| Layer | Owns | Must not own (and, at HEAD, does not)
+
+| Orchestrator / managed pipeline | sink selection by kind; role authorization against sink kind; `_meta` persistable projection; order load -> ingress -> steps -> cleanup -> authorize -> project -> save | any format semantics. *Observed leak:* the sink-capability set `FORMULA_CAPABLE_SINK_KINDS` is a name list maintained apart from the router (IOR-04).
+| `spreadsheet_contract` | the one generic facade `Frames + meta -> RenderPlan` and `WorkbookIR -> Frames`; `is_render_carrier` | format code; it imports none.
+| `rendering.frame_selection` | `workbook_view` sheet selection/rename; rewrites `LookupFormulaSpec.lookup_sheet` for renamed sheets | persistence.
+| `rendering.composer` | geometry (one table per sheet at A1), header grid and merges from `MultiIndex`, legend tables, stashing canonical meta as the hidden-sheet blob | format syntax. *Observed:* `df.values.tolist()` materializes data with numpy type widening (IOR-11).
+| `rendering.passes` | derive render-driving annotations from canonical meta and sheet options | persistence, format syntax. *Observed:* re-parse the JSON blob per pass (IOR-08); write three empty marker cells (IOR-07).
+| `rendering.flow` | `WorkbookIR -> RenderPlan` | format syntax; it emits none.
+| `rendering.plan` | frozen op vocabulary with construction-time canonical-vocabulary checks for alignment ops | executing anything.
+| XLSX / ODS renderers | execute `RenderPlan` ops in format syntax; formula syntax for `LookupFormulaSpec`; validation syntax for `ListLiteralFormulaSpec`; missing-carrier and scalar typing at the cell | semantic decisions. *Observed:* both re-derive lookup addressing context (IOR-09); XLSX makes an unowned semantic decision on `=`-strings by delegating to openpyxl defaults (IOR-01).
+| XLSX / ODS parsers + `parser_interpretation` | carrier -> `WorkbookIR`; table discovery; presentation extraction; hidden-meta recovery | Domain interpretation. *Observed:* both interpret canonical meta (`OPTION_HINT_KEYS`, legend `resolved` hints) on read, which ADR-006 forbids only for the write side.
+| `workbook_projection` | `WorkbookIR -> Frames`; blob unwrap; marker strip; legend `resolved` strip | format code; it imports none.
+| Directory backends | records <-> files; missing normalization; temporal encoding (JSON/YAML); `_meta` sidecar (JSON write, JSON/YAML read) | rendering; they import none.
+| `persistence_boundary` | prune runtime-only `_meta` and Resolution facets | payload columns (ADR-DOMAIN-OWNS-VALIDATION-WRITERS-STAY-DUMB); it prunes none.
+|===
+
+== 4. Part B -- Responsibility boundaries
+
+Questionable boundaries, each judged for observable effect:
+
+. *Sink capability owned by nobody.* Ingress: "formula-looking strings remain plain strings" (`core/scalar_values.py` lines 21-23). ADR Decision 5 and `architectural_layers.adoc` lines 349-359: "Security-sensitive interpretation belongs to the sink". XLSX renderer: `ws.cell(row, column, value=val)` with no string handling (`openpyxl_renderer.py` lines 225-238, 271-273, 245-247). *Observable failure:* yes (IOR-01).
+. *Sink-capability vocabulary parallel to the router.* `projection.py` line 46 `frozenset({"xlsx", "ods"})` versus router `SAVERS` keys incl. `calc`. *Observable failure:* spurious rejection of `output.kind: calc` for formula helpers (IOR-04).
+. *Persistence encoding used as in-process transport.* `compose_workbook` writes `json.dumps(workbook_meta)` into `hidden_sheets["_meta"].meta["workbook_meta_blob"]` (`layout_composer.py` lines 372-376); `apply_all` re-seeds it if missing (`passes/__init__.py` lines 38-45); `StylePass`, `ValidationPass`, `ProtectionPass` each call `_workbook_meta(doc)` which `json.loads` it again (`passes/_base.py` lines 114-133). Aesthetic plus duplicated decoding rule; no failure (IOR-08).
+. *Options copied through four trivial passes.* `ColumnWidthPass`, `TextOrientationPass`, `HorizontalAlignmentPass`, `VerticalAlignmentPass` each copy `options[<family>]` to `meta["__<family>"]` for `flow.py` to read. No failure; derived-state symmetry (section 13).
+. *Format-independent formula addressing done twice at format level.* `_collect_formula_context` (XLSX, lines 93-109) and `_collect_sheets` headers/data_bounds (ODS, lines 340-376), plus verbatim copies of `_header_col`/`_data_bounds`. No failure today; divergence risk (IOR-09).
+. *Parse-side meta interpretation in adapters.* Both `parser_interpretation.py` modules carry an identical `OPTION_HINT_KEYS` tuple and `build_sheet_meta_hints`; both parsers read `legend_blocks[*].resolved`. Duplicated, not wrong; the projection later discards `options` anyway (only tests read them).
+. *Path rewriting in the adapter entry.* `Path(path).with_suffix(".xlsx")` (`xlsx_backend.py` line 38; `ods_backend.py` line 38; again in `odf_renderer.py` line 700). *Observable:* yes for operator paths whose last segment contains a dot (IOR-05).
+. *Value coercion in the router-facing savers.* `save_xlsx`/`save_ods` coerce any non-carrier frame value with `pd.DataFrame(obj)` (lines 118 / 107). Reachable only outside `orchestrate` (ingress admits only DataFrame/`ExactTable`), except `ExactTable`, which ingress admits and every saver rejects (IOR-12).
+. *Domain semantics in directory writers.* JSON and XML drop columns whose first header segment starts with `_` in the MultiIndex branch only (`json_backend.py` line 135, `xml_backend.py` lines 167-168, 176). Flat-header JSON keeps helper columns; flat XML drops them. Cleanup is a Domain step by ADR; this residual writer-side filter is inconsistent across the two branches and the two formats. No test asserts it; INFO in section 15.
+
+No backend owns "substantially more than IO adaptation". The ODS renderer's `_BufferedSheet` grid is a legitimate format necessity (ODS is row-major XML; the plan is op-major).
+
+== 5. Part C -- Sink semantics matrix
+
+"Inert" below means the value is stored as text and no consumer application evaluates it; "active" means the file carries a formula the consumer evaluates.
+
+[cols="1,3,3,3,3",options="header"]
+|===
+| Aspect | XLSX (`openpyxl_renderer.py`) | ODS (`odf_renderer.py`) | JSON dir | YAML dir / XML dir / CSV dir
+
+| Ordinary scalars accepted
+| anything openpyxl binds: `str`, `bool`, `int`/`float` (incl. numpy), `datetime`/`date`/`time`/`timedelta`, `None`; NaN/inf -> empty (`compat/strings.py` 15-16); other objects -> `ValueError` at assignment (before any file exists)
+| `bool` -> boolean cell; `int`/`float` -> float cell; missing carrier -> empty; *everything else* -> `str(value)` string cell (lines 585-609): dates, tz-aware datetimes and arbitrary objects are silently stringified
+| `str`/number/`bool`/`None` native; `date`/`datetime`/`Timestamp` -> `{"$date"}`/`{"$datetime"}` envelopes; NaT -> `""`; other objects -> `TypeError` mid-file (line 62-64)
+| YAML: native scalars; `Timestamp` -> microsecond `datetime`; NaT -> `null`; other objects -> PyYAML `RepresenterError` mid-file. XML/CSV: `str(value)` for everything (silent stringification)
+
+| Controlled values
+| `LookupFormulaSpec` -> `=XLOOKUP(...)` (182-198); `ListLiteralFormulaSpec` only inside data validations; `GroupedMatrix` -> exact table via composer
+| `LookupFormulaSpec` -> `of:=COM.MICROSOFT.XLOOKUP(...)` string-typed formula cell with empty cached value (569-584); same validation/grouped handling
+| `FormulaSpec` -> `TypeError` (fail closed, but after the file was opened); `GroupedMatrix` -> `AttributeError`
+| YAML: `RepresenterError` / `AttributeError`; XML and CSV: `FormulaSpec` becomes its dataclass `repr` text -- *silent degradation*. All three are reachable only through the caller-precondition direct API; `orchestrate` rejects the roles before the saver runs.
+
+| Ordinary strings beginning with `=`
+| *active formula cell* (openpyxl `_bind_value`, len > 1); applies to data cells, header cells (`SetHeader`), and hidden-meta values (`WriteMeta`)
+| inert (`valuetype="string"`, no `table:formula`)
+| inert JSON string
+| inert in the file. CSV opened directly in a spreadsheet application is the classic CSV-injection surface, but that is reader-side interpretation of a text format, not a framework capability.
+
+| Links / external references
+| only via the accidental `=HYPERLINK(...)`/external-reference string path above; no hyperlink op exists in `RenderPlan`
+| none (formulas limited to the single translated function)
+| none | none
+
+| Type preservation on write / read
+| write typed (bool, number, date); read `str(cell.value)` for every cell (`parser_interpretation.py` 174-176) -- string substrate by ADR; tz-aware datetime -> `TypeError` *during save* (IOR-02)
+| write bool/float typed, everything else text; read `_cell_text` first -> string substrate; bool reads back as `"TRUE"`/`"FALSE"` while XLSX reads `"True"`/`"False"` (IOR-11)
+| write native; read `dtype=str` (everything string), `$date` envelopes come back as Python-repr strings (documented Option B)
+| YAML: write native, read *native* (int/bool/date/datetime) -- the only directory loader that does not stringify; XML/CSV: write text, read text
+
+| Missing representation
+| `None`/NaN/`""` -> empty cell -> `""` on read (proven by `tests/roundtrip/test_pathological_cell_contracts.py`)
+| carrier check `_is_missing_carrier` -> empty cell -> `""` on read
+| `""` (write) / `""` (read)
+| YAML `null`; XML element omitted; CSV empty field
+
+| Metadata survival
+| canonical `_meta` as JSON blob in hidden `_meta` sheet + three empty marker cells; four presentation families re-embedded from the carrier on read
+| same hidden-table carrier; freeze written to `settings.xml`, read as hint only
+| `_meta.yaml` sidecar written and read
+| YAML: `_meta.yaml` read, never written; XML, CSV: `_meta` dropped entirely
+
+| Structure lost
+| dtypes, `MultiIndex` level names, column order beyond position, any formatting outside the four families, non-list validations, protection password hashed; named ranges written (3 per table) are not consumed on read
+| as XLSX plus sheet protection and cell locks (silently skipped, documented gap), typed dates
+| `MultiIndex` header -> nested objects; `_`-prefixed first segments dropped (MultiIndex branch only)
+| YAML: `MultiIndex` columns not representable (tuple keys); XML: tag sanitization is lossy (`" "`, `/`, `.` -> `_`); CSV: N header rows written but `read_multi` reads `header=0` only -- multi-level headers do not round-trip through `csv_dir`
+
+| Roundtrip guarantee actually proven
+| data as strings + canonical `_meta` + four presentation families (`test_ods_xlsx_parity.py`, `test_parse_ir_roundtrip.py`, presentation tests)
+| same, minus freeze/protection
+| records + sidecar (`test_meta_persistence.py`)
+| YAML: records only (`test_yaml_roundtrip.py`); XML/CSV: records only, single-level headers
+
+| Failure for unsupported values
+| `ValueError` before any file effect for unbindable objects; `TypeError` after the target was truncated for tz-aware datetimes
+| never fails; stringifies
+| `TypeError` after target truncated
+| YAML: error after target truncated; XML/CSV: never fails
+|===
+
+`discard` accepts everything and writes nothing. The artifact-manifest writer accepts only its own controlled role and writes JSON/YAML records with path containment (`domain/artifact_manifest.py` lines 247-260); it is not a general sink.
+
+== 6. Part D -- Formula / controlled-role / capability activation
+
+*Types that can reach sinks.* Two controlled value classes exist (`core/formulas.py`): `ListLiteralFormulaSpec` (validation intent; never a cell value) and `LookupFormulaSpec` (cell value). `GroupedMatrix` is a controlled structural carrier that the composer projects to an exact table; `ExactTable` is an ordinary structural carrier by ingress definition (`structural_admission.py` lines 138-140) but no sink accepts it (IOR-12).
+
+*Where authorization is expressed and where it acts.* `finalize_managed_state` (`managed_pipeline.py` 378-399) authorizes each *tracked role* against `sink_kind` using the name set `FORMULA_CAPABLE_SINK_KINDS` and `MANIFEST_ADAPTER_SINK_KIND`. It acts on predicted role state, not on the frames (the assurance review's TIA-02/03; not re-litigated here). The renderers act on *actual values*: `isinstance(value, LookupFormulaSpec)` at the cell (`openpyxl_renderer.py` 190, `odf_renderer.py` 569). The renderer has no knowledge of authorization and is not expected to (ADR "writers stay dumb"). The uncertified fallback re-establishes ordinary conformance, which rejects any surviving `LookupFormulaSpec` (`managed_pipeline.py` 168-180). The composite is therefore closed for `FormulaSpec` values *inside `orchestrate`*: a spec reaches a renderer only if a certificate placed it and the sink kind is in the set. Outside `orchestrate` (direct `save_xlsx`), any spec renders; this is the documented caller-precondition surface (`interfaces_and_gates.adoc` lines 119-127, `BackendBase` docstring).
+
+*Do unsupported sinks fail closed?* Inside `orchestrate`: yes, before the saver runs, with a typed error naming role kind, frame, and sink (`test_trusted_ingress_e5_managed_lifecycle.py` lines 348-360 prove `json_dir` rejection and that no output directory is created). Outside: JSON/YAML fail with untyped errors after truncating the target; XML/CSV silently stringify the dataclass (matrix).
+
+*Can ordinary strings cross into active formula semantics?* Yes, on XLSX only (IOR-01). The chain of individually correct decisions: ingress correctly refuses to police sink syntax; the composer passes the string; the plan carries it as data; openpyxl's default binding turns it into a formula; the renderer never intervenes. The read side (`load_workbook(data_only=True)`, `openpyxl_parser.py` line 48) then returns the cached value, which for an openpyxl-written file is `None` -> `""`. So `"=1+1"` in a JSON input becomes an empty string after one XLSX roundtrip through the project alone, and becomes `"2"` after a roundtrip through Excel/LibreOffice. The `_meta` hidden sheet is also written cell-by-cell with `str(v)` (`_write_meta`, 241-250); the JSON blob starts with `{` and is safe, but the three marker cells and any other kv value are subject to the same binding.
+
+*Can controlled values degrade and regain capability?* Degrade: yes by design on reload -- a written formula reads back as its cached value (`""` for project-written files on both formats) and re-enters the Domain as an ordinary Missing/String. Regain: only through the IOR-01 path, and only if the degraded text itself starts with `=`, which a cached value does not. `FormulaSpec` stringified by CSV/XML yields `LookupFormulaSpec(...)` text, which cannot regain capability.
+
+*Escaping at the correct layer.* Formula and validation syntax lives only in the two adapters and is guarded (`tests/architecture/formula_boundary/test_raw_formula_boundary_guards.py`). Within XLSX, sheet-name quoting is inconsistent: `_quote_xlsx_sheet_name` doubles apostrophes for lookup formulas, `_define_named_range` (253-259) does not (IOR-10). Within ODS, `_quote_sheet_name` is used consistently.
+
+*External references.* No op emits them. The only path is the accidental string path in IOR-01. `LookupFormulaSpec.lookup_sheet` is a *frame* name rewritten to the physical sheet by `frame_selection` and re-checked by `reject_referenced_lookup_sheet_rename` before the renderer; the renderers raise `KeyError` if the referenced sheet or column is absent from the plan (`_header_col`/`_data_bounds`), which is fail-closed before file effect on XLSX (context is collected before `wb.save`) and before file effect on ODS (raised inside `_build_table`, before `doc.save`).
+
+*Relation to Trusted Ingress.* Nothing here requires expanding ingress. Decision 5 already assigns the `=` question to the sink. The correction belongs in `openpyxl_renderer.py`, not in `scalar_values.py` or `structural_admission.py`.
+
+== 7. Part E -- Roundtrip and semantic truthfulness
+
+What "roundtrip" means in this project, per the evidence:
+
+[cols="2,1,4",options="header"]
+|===
+| Fidelity kind | Claimed / proven | Evidence and asymmetries
+
+| Byte fidelity | not claimed, not present | every writer re-serializes; `exported_at`-style markers are empty so files are at least deterministic given equal input
+| Application fidelity | best-effort; one opt-in LibreOffice interop test | `test_ods_libreoffice_interop.py` (self-skipping; `soffice` was present in this run); XLSX has no application-side check
+| Structural fidelity | proven for one anchored table per sheet, multi-row headers via merges or exact grid, legend tables via `resolved` hints | `test_parse_ir_roundtrip.py`, `test_legend_blocks.py`, GX-3a/GX-4 exact tests. Named-range table discovery ("Scenario B") and the `*.xlsx.meta.json` sidecar described in `roundtrip_spreadsheet_layout.adoc` are *not implemented* (no `meta.json`/`sh_meta` reference in `src`)
+| Scalar/type fidelity | deliberately not claimed for spreadsheets (string substrate, ADR + release notes 838-852) | asymmetries not covered by the ADR: bool spelling differs across XLSX/ODS; mixed int/float frames widen ints (IOR-11); `yaml_dir` reads native types while JSON/CSV/XML read strings; `=`-strings vanish on XLSX (IOR-01)
+| Semantic Domain fidelity | proven for FK helper carriers and empty/NaN/"nan" contracts on both spreadsheet backends | `tests/roundtrip/test_pathological_cell_contracts.py`; `test_cleanup_invariants.py`
+| Controlled-role fidelity | not claimed; formulas become cached values on reload | design intent; `data_only=True`; ODS reads `_cell_text` first
+| Metadata fidelity | proven for canonical `_meta` through XLSX/ODS/JSON; second-roundtrip convergence proven | `test_meta_persistence.py`, `test_metadata_convergence.py`. Not persisted at all by YAML/XML/CSV sinks (documented in release notes for YAML; persistence-boundary docstring says otherwise, IOW-4)
+| Presentation fidelity | proven for four families (column widths, text orientation, horizontal/vertical alignment) with carrier authority; freeze hint-only on ODS; protection XLSX-only | presentation tests; `test_ods_xlsx_parity.py` 493-525 encode the accepted gaps explicitly (good practice)
+|===
+
+Deliberate and documented lossy behaviour: string substrate; freeze/protection gaps; YAML `_meta` omission; JSON temporal envelopes not decoded on read. Accidental or overclaimed: the `=`-string loss on XLSX; the overlay semantics of directory sinks (a "roundtrip" of a directory can add frames that the pipeline never produced, IOR-03); multi-level headers through `csv_dir`; the concept document's named-range layout mode and sidecar; the composer's numeric widening.
+
+Tests named "roundtrip" mostly prove string-equal data plus equal `_meta` after one write/read on a fresh temporary directory or file. They do not prove second-run behaviour into an existing directory, and they never write a `=`-prefixed string, a tz-aware datetime to XLSX, or a boolean through both spreadsheet backends.
+
+== 8. Part F -- Filesystem / durability / failure semantics
+
+*What the product claims.* Nothing. No document in `docs/` claims atomic, transactional, or crash-safe output (search terms: atomic, durable, temp file, partial artifact; only unrelated hits). This section therefore records behaviour.
+
+[cols="2,4",options="header"]
+|===
+| Aspect | Behaviour at HEAD
+
+| Target path authority | Spreadsheet: operator path rewritten by `with_suffix` (IOR-05). Directory sinks: path used verbatim as a directory. `IODesc.path` is stripped and lowercased only for `kind`, not the path.
+| Overwrite | Always, silently. Single files are truncated at open (`ZipFile(filename, "w")`, `openpyxl/writer/excel.py` 291; `zipfile.ZipFile(outputfile, "w")`, `odf/opendocument.py` 595; `open(p, "w")` in the directory writers).
+| Directory creation | `parent.mkdir(parents=True, exist_ok=True)` for spreadsheets; `out_dir.mkdir(parents=True, exist_ok=True)` for directories.
+| Symlinks | not handled; a symlinked target or directory is followed. Read-side member symlinks were H5 of the parser review; not re-reviewed.
+| Temp-file / atomic replace | none anywhere.
+| Partial artifacts | XLSX: openpyxl streams worksheets into the zip during `save`; an exception after the first entry leaves a truncated zip at the target (IOR-02 is a concrete trigger). ODS: odfpy builds the DOM first and serializes in `__zipwrite`; a serialization error would also truncate, but no concrete trigger was found because the renderer stringifies everything. JSON/YAML: `json.dump`/`yaml.safe_dump` stream to the open file; an unsupported value raises mid-stream, leaving a truncated file.
+| Multi-file output | files written in frame order; no removal of files not produced in this run (IOR-03); no manifest of what was written; a failure at file N leaves files 1..N-1 new, N truncated, N+1.. from the previous run.
+| Manifest/resource consistency | not applicable to router sinks; the artifact-manifest step writes its own records with containment checks.
+| Cleanup on failure | none.
+| Ordering | authorization and `_meta` projection strictly precede any filesystem effect (`_finalize_and_persist` before `_save_frames`). Within the XLSX renderer, every plan op executes before `wb.save`, so op-level errors (`KeyError` for a missing lookup column, openpyxl `ValueError` for an unbindable object or an invalid sheet title) are raised with *no* file effect. Save-time errors (tz-aware datetime) are the exception.
+| Crash/interruption | a `KeyboardInterrupt` during `save` leaves a truncated artifact; the CLI's clean exit does not restore anything.
+|===
+
+Assessment: the implementation is consistent with the (absent) claim. The one place where the absence of a claim hurts is IOR-02, because the framework *accepted* the value at ingress and then destroys the previous artifact while failing to write the new one.
+
+== 9. Part G -- Error model and fail-closed behaviour
+
+[cols="2,4",options="header"]
+|===
+| Situation | Behaviour
+
+| Unknown sink/loader kind | `ValueError("Unknown saver kind")` from the router, re-wrapped by the orchestrator as `Unsupported output kind`, before load for the loader and before any effect for the saver. Truthful and early.
+| `calc` alias with a formula role | rejected as unauthorized although the sink is the ODS renderer (IOR-04); fail-closed but false.
+| Unavailable optional dependency | openpyxl/odfpy imported lazily through `_lazy_callable` (`router.py` 20-25); an `ImportError` surfaces at first use with the original message; `tests/unit/io_backends/test_lazy_optional_imports.py` covers registration.
+| Malformed configuration | `IODesc` requires `kind` and `path`; `path` passed as a dict is detected in JSON/XML writers with a helpful message; YAML sidecar ambiguity and non-mapping roots raise `ValueError` at the backend boundary.
+| Controlled value at incapable sink (managed path) | typed `UnauthorizedControlledRoleAtSinkError` before any saver runs; no partial output (tested).
+| Controlled value at incapable sink (direct path) | JSON `TypeError`, YAML `RepresenterError` after truncating the target; XML/CSV silent stringification (matrix). Documented as caller-precondition; the silent branch is still a semantic failure converted into apparently successful output, but only on the unmanaged surface.
+| `ExactTable` frame at any sink | no sink handles it; the spreadsheet savers call `pd.DataFrame(ExactTable)`, the directory writers call DataFrame methods on it; the resulting exception is a pandas/attribute error with no framework diagnostic (IOR-12; exact exception text UNVERIFIED).
+| Unbindable object at XLSX | openpyxl `ValueError("Cannot convert ... to Excel")` at assignment, before file effect. Fail-closed; message leaks `repr(value)`, which the Domain-boundary robustness rules avoid elsewhere but is acceptable for a trusted-runtime sink.
+| tz-aware datetime at XLSX | `TypeError` during `wb.save`; partial artifact (IOR-02).
+| Missing lookup sheet/column for a formula | `KeyError` with the column and sheet names, before file effect on both renderers.
+| Legacy blob decoding | five independent JSON-first/`literal_eval`-fallback decoders (IOR-08); each silently falls back to raw kv on total failure (`_read_meta_sheet` line 157, `_read_meta_payload` 863) -- a corrupt blob degrades to a kv dict rather than raising. Documented as legacy tolerance (ADR-META-BLOB-SERIALIZATION).
+| Broad exception handling | `_is_missing_carrier` swallows `TypeError`/`ValueError` from `pd.isna` (bounded); `_column_width_value`, `_text_orientation_ops` and siblings in `flow.py` skip malformed entries silently (presentation metadata is best-effort by policy). No `except Exception: pass` in the reviewed scope.
+| Cleanup failures | not applicable; nothing cleans up.
+|===
+
+== 10. Part H -- Performance / resource model (static)
+
+No measurement exists anywhere in the repository for the write path; the parser-side limits census (`FTR-XLSX-PARSER-RESOURCE-LIMITS-P4A`) is read-side only. Observed cost shapes:
+
+* *Composer:* `df.values.tolist()` -- one full materialization per frame, plus a second copy in `build_render_plan` (`tuple(tuple(row) ...)`), plus (ODS) a third copy into `_BufferedSheet.cells`. O(cells) x 3 on ODS, x 2 on XLSX. Not a problem at demonstrated scale; not justified by anything either.
+* *Passes:* three passes each `json.loads` the full canonical meta (`_workbook_meta`); O(|meta| x 3) redundant parsing.
+* *XLSX renderer:* sparse, O(populated cells + ops). `ApplyColumnStyle` and `ApplyCellLock` are O(rows) per helper column.
+* *ODS renderer:* emits a `TableCell` element for every position in the `max_row x max_col` rectangle (`_build_table` 540-612), with no `number-columns-repeated` compression. A wide legend placed `right_of_table` on a tall sheet produces `rows x (table_cols + gap + legend_cols)` elements in odfpy's DOM. O(R x C) memory and file size regardless of sparsity (IOW-2).
+* *XLSX parser:* `_cell_value` (`parser_interpretation.py` 255-267) resolves a merged cell by materializing every coordinate of every merged range on each call -- O(#merges x area) per merged-cell read; header extraction calls it per header cell. Quadratic in merged-header area (IOW-3). The three presentation extractors each iterate the full used rectangle (parser review H1).
+* *ODS parser:* bounded by `ParserLimits`; the four presentation extractors each walk the table DOM once (four passes over the same rows).
+* *Multi-backend duplicated work:* none at runtime; a pipeline writes one sink.
+
+No current architectural complexity is justified by performance. The only performance-motivated code is the parser-side repeat handling, which is essential and separately reviewed.
+
+== 11. Part I -- Anti-accretion / derived-authority review
+
+Diagnostic question applied throughout: *are we enforcing an invariant on authoritative state, or building machinery to keep a derived description synchronized?*
+
+[cols="3,1,3,2",options="header"]
+|===
+| Candidate | Class (this review only) | Current consumers / what breaks if removed | Deletion provable statically?
+
+| `WorkbookIR` + `RenderPlan` two-stage IR (ADR-003/006) | USEFUL ABSTRACTION | two renderers, two parsers, parity tests, formula-boundary guard | not applicable (keep)
+| `SpreadsheetParser`/`SpreadsheetRenderer` protocols and `spreadsheet_contract` facade | USEFUL ABSTRACTION | both backends; guard tests `test_ir_call_chain.py`, `test_adapter_contract_boundary_guards.py` | keep
+| `presentation_meta.apply_cell_addressed_presentation_meta` | USEFUL ABSTRACTION | 2 parsers x 4 families | keep
+| `ParserLimits` | ESSENTIAL (ODS), partially applied (XLSX) | ODS parser | keep
+| `ExactTable` carrier | ESSENTIAL for grouped exact roundtrip | projection + reconstruction step | keep; add sink handling or rejection (IOR-12)
+| Legend `resolved` persisted in the blob | USEFUL (parser hint) with duplicated strip | both parsers consume it; `persistence_boundary` and `workbook_projection` both strip it | keep one strip
+| `MetaPass` marker cells `version`/`exported_at`/`author` + `_CARRIER_LAYER_MARKER_KEYS` strip | HISTORICAL ACCRETION / DERIVED-AUTHORITY SMELL | producer: `meta_pass.py` 21-22; consumers: none (only the strip and its tests `test_workbook_meta_blob_carrier.py` 204-303) | yes: grep shows no reader of the three keys
+| `workbook_meta_blob` as in-process transport for passes (`_workbook_meta`, `apply_all` re-seed) | DERIVED-AUTHORITY SMELL | three passes | yes; pass the dict; keep the blob as persistence encoding only
+| Five blob decoders (JSON-first, `literal_eval` fallback) | HISTORICAL ACCRETION (duplication) | `_base._workbook_meta`, `flow._dump_workbook_meta_blob`, `workbook_projection._try_parse_blob`, `openpyxl_parser._read_meta_sheet`, `odf_parser._read_meta_payload` | yes; one helper in `workbook_projection` already exists
+| Four copy-only passes (column width, text orientation, H/V alignment) and their `__*` dunder keys | DERIVED-AUTHORITY SMELL (symmetry for neatness) | `flow.py` reads the dunder keys; unit tests per pass | yes; `flow.py` can read `options` directly
+| Parse-side `SheetIR.meta["__column_widths"]` etc. | DERIVED-AUTHORITY SMELL (parallel representation) | no production reader; the blob re-embedding is the authoritative path; tests read them | yes
+| Parse-side `validations`, `named_ranges`, `__freeze`, `__autofilter_ref`, `options` on `SheetIR` | SPECULATIVE (no production consumer) | `workbookir_to_frames` ignores them; parity/IR tests use them as an oracle; capability profile lists them as read expectations | yes for production; tests would need rewriting (IOR-14)
+| `_p1_validations` legacy path in `ValidationPass` | HISTORICAL ACCRETION | producer: none in `src`; one test | yes
+| `StyleSpec`/`SheetIR.styles`, `TableBlock.header_cols`, `TableBlock.title`, `DataValidationSpec.kind`/`AddValidation.kind` (always `"list"`, ignored by both renderers), `DefineSheet.order` | SPECULATIVE / HISTORICAL | no readers | yes
+| `FORMULA_CAPABLE_SINK_KINDS` name set | DERIVED-AUTHORITY SMELL | `_authorize_role_for_sink` | replace with capability derived from the resolved saver (IOR-04)
+| `BackendBase` hierarchy, `BackendOptions`, `coerce_backend_options`, `make_backend`/`BACKENDS` | HISTORICAL ACCRETION (router uses plain functions) | `make_backend` public export; tests; `exact_header_depths` option plumbing | partially; `write`/`read` single-sheet API has one CSV consumer; default `write_multi` is a trap (IOR-13)
+| `ExcelOptions` / `AppConfig.excel` | HISTORICAL ACCRETION (dead) | parsed by `load_app_config`, never applied (`runner.py` 45-76) | yes
+| `DeprecatedAdapterError` | HISTORICAL ACCRETION | never raised in `src` | yes
+| `rendering/header_grid.py` re-export shim | HISTORICAL ACCRETION | no `src` importer (reconstruction imports `core.header_grid`) | yes
+| `write_xlsx`, `default_p1_passes`, `apply_ir_passes` | HISTORICAL (test shims / no callers) | tests only | yes
+| Router aliases `json`, `yaml`, `xml`, `calc`, `excel` | HISTORICAL | `calc` used by one end-to-end test and one unit test; others unused | partially (IOR-04 makes `calc` a liability)
+| Lookup formula addressing context per renderer | USEFUL abstraction at the wrong layer | both renderers | move to `flow.py` (IOR-09)
+|===
+
+*If designed today from demonstrated requirements, which abstractions would probably not be introduced?* The `BackendBase` class hierarchy (a `save(frames, path, options)` / `load(path, options)` function pair per format is what the router actually uses); `BackendOptions` as a dataclass that is then bypassed with `extra`; the eleven-object pass framework for what are mostly one-key copies (three passes -- style, validation, protection -- carry real derivation logic and would survive as functions); the hidden-sheet kv layout with marker cells (a single blob cell suffices); the parse-side reconstruction of validations and named ranges into IR; the `kind` vocabulary on validations; the sink-capability name set; the `excel:` config section.
+
+== 12. Part J -- Complexity compression opportunities
+
+Each item names the invariant that must remain, the evidence that currently proves it, the risk, and the tests required.
+
+. *Make the XLSX sink inert for ordinary strings (IOR-01).* Invariant: only `FormulaSpec` produces formula cells. Evidence today: none for strings; E5 test proves `FormulaSpec` formulas exist. Change: in `openpyxl_renderer.py`, after assigning a `str` value from `WriteDataBlock`/`SetHeader`/`WriteMeta`, force `cell.data_type = "s"` (openpyxl then writes `t="inlineStr"`), or equivalently guard `_xlsx_cell_value`. Risk: low; openpyxl's `data_type` is a public attribute. New tests: write `"=1+1"` and `"=HYPERLINK(...)"`-shaped strings; reload with `data_only=False` and assert `data_type == "s"` and value preserved; assert the parity test's XLSX/ODS equality for such strings. Must not expand into: ingress content filtering, a formula allowlist, ODS changes, or a policy object.
+. *Fail before file effect for tz-aware datetimes on XLSX (IOR-02).* Invariant: a value ingress accepts either serializes or is rejected with a framework diagnostic before the target is touched. Change: in `_xlsx_cell_value` (or a pre-save scan of `WriteDataBlock` data) raise a typed error for `tzinfo is not None`, or convert under a decided policy. Risk: low. Tests: one aware-datetime frame to XLSX asserting no file is created and the error type. Must not expand into: a Domain-wide timezone canonicalization decision (explicitly deferred by the value-model FTR).
+. *Directory sinks: decide overlay vs replace and say so (IOR-03).* Invariant: the set of frames read back from a directory equals the set written by the last run. Evidence: none today. Smallest change: document overlay semantics in the user guide and release notes; optionally remove `*.{json,yml,xml,csv}` and the sidecar before writing, or write into a temporary sibling directory and swap. Risk: removing files in an operator-named directory is itself destructive; documentation first. Tests: second run into the same directory with one frame removed.
+. *Derive sink capability from the resolved saver (IOR-04).* Invariant: a formula role is authorized iff the selected saver executes `RenderPlan`. Change: resolve the saver once in the orchestrator and consult a capability attribute on the saver module/function (or a router-level `SPREADSHEET_KINDS` derived from `SAVERS`), removing the parallel name set. Tests: `calc` accepted; `json_dir` rejected (existing).
+. *Stop writing marker cells; keep the strip for one release (IOR-07).* Invariant: readback of canonical meta equals persisted canonical meta. Evidence: `test_workbook_meta_blob_carrier.py`. Risk: none.
+. *Pass the canonical dict to passes; decode the blob in one place (IOR-08).* Invariant: passes see the same canonical meta the composer stashed. Change: `build_spreadsheet_render_plan` passes `meta_dict` to `apply_all`; `_workbook_meta` reads it; the five decoders collapse to `workbook_projection._try_parse_blob`. Risk: low; ADR-META-BLOB unchanged.
+. *Collapse the four copy passes into `flow.py` reading `options` (section 11).* Invariant: same `RenderPlan` for the same input. Evidence: existing plan-level unit tests. Risk: low.
+. *Resolve lookup addressing once in `flow.py` (IOR-09).* Invariant: same formula text as today on both formats. Change: emit a resolved op carrying source column index, lookup sheet, key/value column indices and data bounds; renderers keep only syntax. Evidence: `test_xlsx_formula_translation.py`, `test_ods_formula_translation.py`. Risk: medium (touches both renderers); do together, or not at all.
+. *Delete dead surfaces (IOR-13).* `_p1_validations`, `StyleSpec`/`styles`, `header_cols`, `title`, validation `kind`, `DefineSheet.order`, `ExcelOptions`/`excel:` (or wire it), `DeprecatedAdapterError`, `header_grid.py` shim, `write_xlsx`, `default_p1_passes`, `apply_ir_passes`, `BackendBase.write/read` (keep CSV's as a module function). Invariant: none affected. Tests: remove the ones that only exist to prove the dead code works.
+. *Read side: keep table + hidden-meta reconstruction, drop or quarantine the rest (IOR-14).* Invariant: `workbookir_to_frames` output unchanged. Change: either delete parse-side validation/named-range/freeze/filter reconstruction and the corresponding IR fields, moving the parity oracle to frames + `_meta`, or keep them and re-label the capability profile's "read expectation" column as diagnostics. Risk: medium for tests, none for runtime.
+
+Not proposed: a transactional writer layer; a typed IR substrate; merging the two renderers; a generic egress engine; any change to Trusted Ingress.
+
+== 13. Part K -- Motivation classification
+
+[cols="1,1,1,3",options="header"]
+|===
+| Finding | Primary | Secondary | Actor / failure story in one line
+
+| IOR-01 | A | B, C | less-trusted payload author places `=...` text; XLSX consumer evaluates it; project reload silently loses it
+| IOR-02 | B | D | operator's YAML has an offset datetime; XLSX export fails mid-save and destroys the previous workbook
+| IOR-03 | D | C | operator re-runs into the same output directory after renaming a frame; stale file reappears as data on reimport
+| IOR-04 | C | -- | operator selects `calc`; formula helpers are rejected although the ODS renderer would consume them
+| IOR-05 | C | D | operator names `report.2026-09`; artifact lands at `report.xlsx`
+| IOR-06 | D | -- | any save-time error or interrupt leaves a truncated artifact (behaviour record; no claim broken)
+| IOR-07 | C | -- | maintainer must keep a strip helper synchronized with markers nothing reads
+| IOR-08 | C | -- | five decoders drift; a pass sees different meta from the parser
+| IOR-09 | C | -- | one renderer's addressing fix is not applied to the other
+| IOR-10 | B | -- | sheet named `O'Brien` or `2024`; workbook needs repair in Excel (UNVERIFIED in-application)
+| IOR-11 | B | C | YAML input with an int and a float column reads back `"3.0"` instead of `"3"`; a boolean reads back `True` on XLSX and `TRUE` on ODS (UNVERIFIED by test)
+| IOR-12 | C | B | operator enables exact-header reads without the reconstruction step; save fails with a pandas error
+| IOR-13 | C | -- | `make_backend("csv").write_multi` silently keeps only the last sheet; `excel:` config silently ignored
+| IOR-14 | C | -- | capability profile promises read reconstruction nothing consumes
+|===
+
+== 14. Part L -- Product responsibility
+
+* *Framework-managed built-in renderers/backends (xlsx, ods, json_dir, yaml_dir, xml_dir, csv_dir, discard):* the framework owns everything in section 5 for values that passed ingress. IOR-01 and IOR-02 are framework-activated failures on framework-accepted values and are not dismissible as external.
+* *Operator-selected formats and paths:* the operator owns the choice of sink and target path, including the consequences of writing into an existing directory (IOR-03) -- but only once the behaviour is stated. Today it is not.
+* *Custom/plugin backends:* none exist; `SAVERS`/`LOADERS` are module constants with no registration API. No plugin surface to secure.
+* *Caller-provided direct API (`make_backend`, `save_xlsx`, `BackendBase`):* documented caller-precondition surface (`interfaces_and_gates.adoc`). The silent stringification of `FormulaSpec` by XML/CSV and the CSV `write_multi` trap live here; they are contract defects, not security defects.
+* *External spreadsheet applications:* Excel's Protected View, DDE prompts, and LibreOffice's macro/link security are the reader's controls. The framework's responsibility ends at not *emitting* an active formula it was not asked to emit. CSV opened in a spreadsheet application is reader-side interpretation of text and out of scope.
+* *Dependencies:* openpyxl's `=`-prefix binding and tz rejection, odfpy's in-place zip writing, pandas' `values` widening are dependency behaviours; the framework wraps them and therefore owns the wrapping decision, not the library.
+
+== 15. Part M -- Documentation / claim audit
+
+[cols="3,1,3",options="header"]
+|===
+| Claim (location) | Rating | Smallest truthful wording / note
+
+| "Round-trip is guaranteed for data + metadata (style is normalized)" (`roundtrip_spreadsheet_layout.adoc`, lead) | TOO STRONG | "Round-trip preserves table data as text and canonical `_meta` for XLSX, ODS and JSON directories; YAML/XML/CSV directories persist data only; presentation is limited to the four documented families."
+| "Scenario B -- Named ranges: each table is a named range; multiple tables per sheet are supported" and "a sidecar file `*.xlsx.meta.json` can carry the same info" (same doc) | STALE | not implemented; parsers discover tables by anchor/heuristic and legend `resolved` hints only. Mark as historical intent.
+| "You may modify cell values and keep formula columns" (same doc) | TOO STRONG | formula columns read back as their cached values; project-written formulas read back empty.
+| "Visible spreadsheet payload is a string substrate ... type information ... is not preserved" (release notes 838-852; ADR) | DEFENSIBLE | add: ordinary strings beginning with `=` are currently written as formula cells by the XLSX backend and do not survive reload (until IOR-01 is corrected).
+| Decision 5: "Security-sensitive interpretation of an accepted value belongs to the sink that grants the corresponding capability" (ADR, layers doc 349-359) | DEFENSIBLE | the assigned owner (XLSX renderer) currently implements no interpretation policy; the ADR says so ("does not adopt a fix"). Not a documentation defect; a code gap (IOR-01).
+| "Structured persistence (json_dir, yaml_dir, xml_dir, csv_dir) consists of the same persistable meta projection without layout artifacts" (`persistence_boundary.py` docstring 26-33) | TOO STRONG / MISLEADING | only `json_dir` persists `_meta`; yaml/xml/csv drop it.
+| "A file literally named `_meta.yaml` is *not* treated as structured metadata by this backend" (`trusted_ingress_and_runtime_security.adoc` 325-334) | STALE | Option A reserved-sidecar handling exists since the E3 census (release notes 442-455).
+| Capability profile: named ranges "Read expectation: Reconstruct supported named cell ranges into `NamedRange` -- direct"; list validations "Reconstruct ... into `DataValidationSpec` -- direct" | TOO STRONG as a product claim | reconstruction exists in IR but no production consumer; "diagnostic reconstruction into IR; not projected to frames".
+| Capability profile "Safe naming subset ... start with a letter or underscore" | TOO STRONG | `_safe_name` does not enforce it (IOR-10).
+| ADR-006 pass order "MetaPass -> ... -> ColumnWidthPass -> NamedRangePass" | STALE (minor) | three alignment/orientation passes are missing from the list.
+| ADR-006 "adapters ... are not the place where canonical meta is reinterpreted into visible behavior" | DEFENSIBLE for write | parsers do interpret canonical meta on read (`OPTION_HINT_KEYS`, legend hints); the ADR is silent on read.
+| `orchestrate` docstring: "authorizes every surviving controlled role against the exact output sink kind before saving" | DEFENSIBLE | with the `calc` caveat (IOR-04).
+| README: "round-tripping tabular data between JSON, CSV, and Excel/ODS workbooks while preserving relationships" | DEFENSIBLE (vague) | "preserving FK relationships and canonical metadata; values as text" would be exact.
+| User guide workflow: "plain tabular roundtrip" `yaml_dir -> yaml_dir` | TOO WEAK / MISLEADING by omission | state that `yaml_dir` output does not persist `_meta`.
+| `csv_backend.py` docstring "Header mit N Ebenen werden als N Zeilen geschrieben" | TOO STRONG for roundtrip | written yes; `read_multi` reads one header row.
+| ADR-VISIBLE-CELL-TYPING: "the IR's `table.data` is `list[list[str]]` in practice" | DEFENSIBLE on read | on write it carries native scalars and `FormulaSpec`.
+|===
+
+== 16. Part N -- Findings
+
+=== 16.1 IMPORTANT
+
+==== IOR-01 -- XLSX sink turns ordinary `=`-prefixed strings into active formula cells; no sink policy exists; project reload loses the value
+
+* *Severity / motivation:* IMPORTANT; A (adversarial), secondary B (accidental text such as `=see note`), C (ODS/XLSX parity contract).
+* *Evidence:* `openpyxl_renderer.py` `_write_data_block` 225-238, `_execute_render_op` `SetHeader` 271-273, `_write_meta` 245-247 assign raw values; openpyxl 3.1.5 `cell/cell.py` 198-199 sets `data_type = 'f'` for `len(value) > 1 and value.startswith("=")`; `openpyxl_parser.py` 48 `load_workbook(..., data_only=True)`; `odf_renderer.py` 602-609 writes the same value as a string cell; `scalar_values.py` 21-23; ADR Decision 5; `architectural_layers.adoc` 349-359; concept reviews 001-003 recorded the reproduction.
+* *Mechanism:* ingress admits the string; composer/plan carry it; openpyxl binds it as a formula; the file carries `<f>`; the consumer evaluates it; the project's own parser returns the cached value (`None` -> `""`).
+* *Actor / failure story:* a partner-supplied JSON directory contains `"note": "=HYPERLINK(\"https://...\",\"click\")"` or a DDE-style string; the operator exports to XLSX and opens it. Accidental variant: a legitimate `"=1+1"` text disappears after one export/reimport cycle through the project alone.
+* *Observable consequence:* capability activation in the reader; silent data loss or substitution on reimport; XLSX/ODS parity broken for such strings.
+* *Affected:* XLSX only (data cells, header cells, hidden-meta kv values).
+* *Smallest correction:* in `openpyxl_renderer.py`, treat every non-`FormulaSpec` `str` as text (`cell.data_type = "s"` after assignment, or pre-check in `_xlsx_cell_value`/`_write`); add the tests in section 12 item 1; add one release-note line.
+* *Must not expand into:* ingress content filtering; a formula allowlist; ODS changes; an operator policy object (the ADR's "effective operator policy" can arrive later without blocking the inert default).
+* *Readiness:* implementation-ready. Application-side display of `inlineStr` cells starting with `=` as text is expected but *UNVERIFIED* in Excel/LibreOffice.
+
+==== IOR-02 -- Ingress-accepted timezone-aware DateTime fails inside `wb.save` on XLSX, leaving a truncated artifact
+
+* *Severity / motivation:* IMPORTANT; B (robustness), secondary D (durability).
+* *Evidence:* `scalar_values.py` 56-60 (aware `datetime`/`Timestamp` classify as DateTime, never stripped); `structural_admission.py` admits it; JSON/YAML tests prove aware values are written (`test_json_roundtrip.py` 89-129, `test_yaml_roundtrip.py` 92-111); no XLSX/ODS test uses a tz-aware value; openpyxl `cell/_writer.py` 28-31 raises `TypeError` for `tzinfo is not None` during cell serialization, which runs inside `save` after `ZipFile(filename, "w")` (`writer/excel.py` 291); `openpyxl_renderer.py` 393.
+* *Mechanism:* the value binds fine at assignment (`_bind_value` checks only the type), so no early failure; the error occurs while streaming the worksheet into the already-truncated zip.
+* *Actor / failure story:* an operator's `yaml_dir` input has `updated: 2026-09-16T10:00:00+02:00` (PyYAML yields an aware datetime); the pipeline exports to XLSX over last week's workbook; the run fails and the previous workbook is gone.
+* *Observable consequence:* uncaught `TypeError` from a dependency; a 0-byte or partial `.xlsx` at the operator's path.
+* *Affected:* XLSX. ODS stringifies (asymmetry, not failure).
+* *Smallest correction:* reject (typed error, before any file effect) or convert tz-aware values in `_xlsx_cell_value`; add one test.
+* *Must not expand into:* a Domain timezone canonicalization policy (deferred by the value-model FTR); a general pre-save validation framework.
+* *Readiness:* implementation-ready for the reject variant. The exact runtime failure was derived from dependency source and is *UNVERIFIED* by execution.
+
+==== IOR-03 -- Directory sinks are overlay writers; stale frames and sidecars silently re-enter the next roundtrip
+
+* *Severity / motivation:* IMPORTANT; D (operational), secondary C (roundtrip contract).
+* *Evidence:* `json_backend.py` 227-270, `yaml_backend.py` 155-176, `xml_backend.py` 149-187, `csv_backend.py` 115-122: `mkdir(exist_ok=True)` then per-frame writes; no listing, no deletion; JSON writes `_meta.yaml` only when `_meta` is a dict (265-270) and never removes an existing one; loaders glob the directory (`json_backend.py` 204, `yaml_backend.py` 129-140, `xml_backend.py` 133, `csv_backend.py` 76). No document describes directory output as overlay or replace (search in section 8).
+* *Mechanism:* run 1 writes `a.json`, `b.json`; run 2's pipeline drops or renames `b`; `b.json` persists; run 3 loads `b` as a frame.
+* *Actor / failure story:* the documented workflow (`--out-path build/output`, repeated) after a frame rename in `_meta.workbook_view` or a `pipeline_cleanup` drop.
+* *Observable consequence:* a frame the pipeline removed re-appears with stale content; FK validation may then report phantom references; no error.
+* *Affected:* json_dir, yaml_dir, xml_dir, csv_dir.
+* *Smallest correction:* state the overlay semantics in the user guide and release notes; optionally add an opt-in replace mode (remove known-extension files and the sidecar before writing).
+* *Must not expand into:* a transactional output layer; deleting unknown files in operator directories by default.
+* *Readiness:* documentation is implementation-ready; a replace mode needs a small design decision (opt-in vs default).
+
+=== 16.2 MINOR
+
+==== IOR-04 -- Sink capability inferred from a name set parallel to the router; `calc` alias rejected for formula roles
+Motivation C. Evidence: `projection.py` 46; `router.py` 52, 66; `managed_pipeline.py` 353-357; `test_cli_orchestrator_end_to_end.py` 137-143 uses `calc` as a sink. Consequence: `UnauthorizedControlledRoleAtSinkError` for a capable sink; `excel` is a backend alias without a saver. Correction: derive capability from the resolved saver (section 12 item 4). Implementation-ready.
+
+==== IOR-05 -- Operator output path rewritten by `with_suffix`
+Motivation C/D. Evidence: `xlsx_backend.py` 38, `ods_backend.py` 38, `odf_renderer.py` 700. `Path("report.2026-09").with_suffix(".xlsx")` is `report.xlsx`. Consequence: artifact at a path the operator did not name; possible overwrite of an unrelated file. Correction: append the suffix only when absent (`path + ".xlsx"` when `suffix.lower() != ".xlsx"`), or honour the path verbatim and document. Implementation-ready; `test_ir_call_chain.py` expects `book.xlsx` for `book.xlsx` and is unaffected.
+
+==== IOR-06 -- No atomic placement on any sink; serialization errors truncate the previous artifact
+Motivation D. Evidence: section 8. No claim is broken. Record as behaviour; if a durability claim is ever wanted, single-file sinks can write to a sibling temporary file and `os.replace`. Not proposed as required work; IOR-02 is the concrete trigger worth fixing at its source.
+
+==== IOR-07 -- `MetaPass` marker cells with no consumer and a two-layer strip to undo them
+Motivation C. Evidence: `meta_pass.py` 15-22; `workbook_projection.py` 29-36, 94-97; `layout_composer.py` 306 (canonicalize on write); tests `test_workbook_meta_blob_carrier.py` 204-303; `BUG-XLSX-WORKBOOK-VIEW-CANONICAL-META-LOSS-P4A`. Correction: stop writing the markers; keep the strip for legacy files. Implementation-ready.
+
+==== IOR-08 -- Canonical meta round-trips through a JSON string inside one process; blob decoding duplicated five times
+Motivation C. Evidence: `layout_composer.py` 372-376; `passes/__init__.py` 38-45; `passes/_base.py` 114-133; `flow.py` 41-53; `workbook_projection.py` 39-59; `openpyxl_parser.py` 143-157; `odf_parser.py` 847-863. Correction: section 12 item 6. Implementation-ready.
+
+==== IOR-09 -- Lookup-formula addressing context and helpers duplicated per renderer
+Motivation C. Evidence: `openpyxl_renderer.py` 93-140 vs `odf_renderer.py` 261-282, 340-376, 666-671; identical `_header_col`/`_data_bounds`; also `_is_empty_header_segment` (json/xml), `_column_letters` (odf parser/renderer), `OPTION_HINT_KEYS` + `build_sheet_meta_hints` (both `parser_interpretation.py`). Correction: section 12 item 8 for the formula context; trivial de-duplication for the rest. Requires a small design step (resolved-op shape).
+
+==== IOR-10 -- XLSX naming constraints unenforced and inconsistently escaped
+Motivation B. Evidence: `_define_named_range` 253-259 interpolates `'{op.sheet}'!` without doubling apostrophes while `_quote_xlsx_sheet_name` 112-113 does; `named_range_pass.py` `_safe_name` 10-11 strips only underscores so a sheet `2024` yields `2024_2024_table`; openpyxl `defined_name.py` validates only reserved names; `workbook/child.py` 98-99 only warns for titles over 31 characters; capability profile promises a letter/underscore-leading subset. Consequence: Excel repair prompt or dropped names (*UNVERIFIED in-application*). Correction: reuse `_quote_xlsx_sheet_name` in `_define_named_range`; prefix `_safe_name` output with `_` when it starts with a digit; decide whether >31-char frame names are an error. Implementation-ready for the first two.
+
+==== IOR-11 -- Composer materialization widens numeric types; boolean spelling differs across spreadsheet backends
+Motivation B/C. Evidence: `layout_composer.py` 353 `df.values.tolist()` (pandas interleaves mixed `int64`/`float64` columns to `float64`; the presence of an object column prevents it); XLSX reads bools as Python `bool` (`worksheet/_reader.py` 228-229) then `str()` -> `True`; ODS renderer writes `P(text="TRUE")` (587-594) and the parser reads `_cell_text` first (86-89) -> `TRUE`. Realistic path: `yaml_dir` input (native types). Both effects are statically derived and *UNVERIFIED by test*; the parity fixtures contain neither bools nor mixed numeric columns. Correction: build `data` per row from an object-dtype view (`df.to_numpy(dtype=object).tolist()` or `itertuples`) to stop widening; decide one boolean spelling for the ODS display text (`str(value)` would match XLSX). Implementation-ready after one confirming test each.
+
+==== IOR-12 -- `ExactTable` is an ingress-accepted top-level carrier that no sink handles
+Motivation C/B. Evidence: `structural_admission.py` 138-140; `spreadsheet_contract.is_render_carrier` 53-61 (DataFrame, GroupedMatrix only); `xlsx_backend.py` 118 / `ods_backend.py` 107 coerce with `pd.DataFrame(obj)`; directory writers call DataFrame methods. Consequence: a pipeline that reads with `exact_header_depths` and omits the reconstruction step fails at save with a pandas/attribute error and no framework diagnostic (exact text *UNVERIFIED*). Correction: reject `ExactTable` at the saver entry with a typed message naming the reconstruction step, or render it through the exact `TableBlock` branch that `GroupedMatrix` already uses. Implementation-ready.
+
+==== IOR-13 -- Dead and misleading surfaces
+Motivation C. Table:
+
+[cols="2,3,2",options="header"]
+|===
+| Surface | Evidence | Note
+| `BackendBase.write_multi` default | `base.py` 78-85 writes every sheet to the same `path`; `CSVBackend` does not override it | `make_backend("csv").write_multi(frames, p)` silently keeps the last sheet
+| `ExcelOptions` / `AppConfig.excel` | `config.py` 8-13, 31, 56; `runner.py` never reads `app.excel` | `excel:` YAML section parsed and ignored
+| `_p1_validations` | `validation_pass.py` 20-34; no producer in `src`; one test | legacy path
+| `StyleSpec`, `SheetIR.styles`, `TableBlock.header_cols`, `TableBlock.title`, `DataValidationSpec.kind`, `AddValidation.kind`, `DefineSheet.order` | no readers (grep, section 11) | vocabulary without consumers
+| `DeprecatedAdapterError` | never raised | exported error type
+| `rendering/header_grid.py` | no `src` importer | re-export shim
+| `write_xlsx`, `default_p1_passes`, `apply_ir_passes` | tests / no callers | shims
+| CSV `read_multi` ignores `header_levels` | `csv_backend.py` 84-93 `header=0` then pads | multi-level headers written by `write` are not read back
+| JSON/XML `_`-prefixed column drop in the MultiIndex branch only | `json_backend.py` 135; `xml_backend.py` 167-168 vs 176 | writer-side Domain filter, inconsistent across branches and formats; contradicts ADR "writers stay dumb"
+|===
+Correction: delete or wire; one small change each. Implementation-ready.
+
+==== IOR-14 -- Parse-side IR reconstruction without a production consumer, documented as read expectation
+Motivation C. Evidence: `workbookir_to_frames` 157-207 consumes tables and hidden meta only; `_extract_validations`, `_extract_named_ranges`, `_extract_freeze`, autofilter refs, `options` on both parsers; capability profile read-expectation column. Correction: section 12 item 10. Needs a decision (diagnostic vs delete), then test rewrite.
+
+=== 16.3 INFO / WATCH
+
+* *IOW-1* Excel limits a list-literal validation formula to 255 characters; `_xlsx_validation_formula` (84-90) does not check length; only a count warning at 50 tokens exists (`_base.py` 12, 167-174). Consequence in Excel *UNVERIFIED*.
+* *IOW-2* ODS renderer emits a `TableCell` for every position of the `max_row x max_col` rectangle (540-612); no repeat compression. Watch for wide sparse sheets; no measurement.
+* *IOW-3* XLSX parser `_cell_value` merged-range resolution materializes all coordinates per call (255-267); quadratic in merged-header area. Adjacent to parser-review H1.
+* *IOW-4* Stale wording: `persistence_boundary.py` docstring 26-33 (all directory sinks "persist" meta); trusted-ingress concept YAML row 325-334 (pre-Option-A behaviour).
+* *IOW-5* `options.protection.password` is persisted in clear text in the hidden `_meta` blob and JSON sidecar. Sheet protection is not a confidentiality control (any workbook holder can bypass it), so this is hygiene, not exposure; document it where `protection` is described.
+* *IOW-6* The multi-header join token `" / "` is format semantics implemented in four places (`layout_composer.py` 95, both `parser_interpretation.py` joins, `workbook_projection.py` 191-193 split). A leaf label containing `" / "` mis-splits on reload.
+* *IOW-7* Legend `resolved` is stripped in `persistence_boundary._project_legend_blocks` and again in `workbook_projection._strip_legend_resolved`; one owner would do.
+* *IOW-8* JSON `_meta.yaml` sidecar and YAML `_meta.yaml` input share a file name but not a writer: a `json_dir -> yaml_dir -> json_dir` chain drops `_meta` at the middle hop with no warning.
+
+== 17. Part O -- Required explicit answers
+
+. *Is the rendering/backend responsibility split sound?* Yes for the compose -> passes -> plan -> render chain and for keeping directory sinks outside it. Two misplacements: format-independent formula addressing is resolved inside each renderer (IOR-09), and the persistence encoding of `_meta` is used as in-process transport (IOR-08).
+. *Does any backend activate capabilities not authorized at the sink boundary?* Yes: XLSX activates formula cells for ordinary `=`-prefixed strings that no layer authorized (IOR-01). `FormulaSpec` activation is authorized inside `orchestrate` and is a documented caller precondition outside it.
+. *Are ordinary strings and controlled/formula values kept semantically distinct all the way to persistence?* In the framework's own types, yes (`FormulaSpec` vs `str` through IR and plan). At the XLSX file boundary, no (IOR-01). At the ODS boundary, yes. In CSV/XML direct writes, `FormulaSpec` collapses into text (unmanaged surface).
+. *Are non-spreadsheet sinks fail-closed for unsupported controlled values?* Through `orchestrate`: yes, typed and before any file effect. Directly: JSON/YAML fail after truncating the target; XML/CSV do not fail.
+. *Are roundtrip claims stronger than tests/implementation justify?* Yes in `roundtrip_spreadsheet_layout.adoc` (guarantee wording, named-range mode, sidecar, formula columns) and in the capability profile's read expectations. The release-note limitation and the parity tests are truthful.
+. *Are output formats silently lossy in ways the contract obscures?* Yes: `=`-strings on XLSX (IOR-01); overlay directories (IOR-03); `_meta` dropped by yaml/xml/csv (documented for YAML only in release notes; contradicted by a docstring); csv multi-level headers; numeric widening and boolean spelling (IOR-11).
+. *Does filesystem persistence have a coherent failure/durability model?* No model is claimed; behaviour is uniformly in-place, non-atomic, overlay for directories. Coherent by absence; IOR-02 is the one case where an accepted value converts that absence into artifact loss.
+. *Duplicated or misplaced format semantics across rendering and backends?* Duplicated: lookup context, blob decoders, `" / "` token, option hint keys, small helpers. Misplaced: none in the renderers beyond the accidental openpyxl default; the composer's `values.tolist()` widening is a Domain-side type decision made in rendering.
+. *Derived-state / synchronization machinery like the anti-accretion pattern?* Yes, in small form: marker cells plus strip (IOR-07); blob re-seed plus re-parse (IOR-08); copy passes plus dunder keys; parse-side dunder hints parallel to the blob; sink-capability name set parallel to the router (IOR-04); legend `resolved` stripped twice (IOW-7). None is large; all are deletable.
+. *Which abstractions would not be introduced today?* Section 11, last paragraph: `BackendBase`/`BackendOptions`, the copy passes, marker cells, parse-side validation/named-range IR, validation `kind`, the capability name set, `excel:` config.
+. *Complexity justified mainly by unmeasured performance or speculative flexibility?* No performance-motivated complexity exists on the write path. Speculative: `DataValidationSpec.kind`, `StyleSpec`, `header_cols`, parse-side reconstruction, `WriteMeta.sheet`'s "other carriers remain possible" comment.
+. *Cross-layer defects previous local reviews could have missed?* IOR-01 (each layer correct, composite wrong; already recorded as evidence in the trust ADR but never assigned a fix) and IOR-02 (ingress vocabulary wider than the XLSX sink's; each layer documented its own decision). IOR-12 is the same shape for `ExactTable`.
+. *Justified action:* (a) bounded fixes -- IOR-01, IOR-02, IOR-04, IOR-05, IOR-10, IOR-12, plus documentation for IOR-03; (b) bounded simplification -- IOR-07, IOR-08, IOR-09, IOR-13, IOR-14 and the copy passes; (c) no deeper architecture review is needed; (d) not applicable.
+
+== 18. Part P -- Review verdict
+
+*B -- DIRECTION SOUND; BOUNDED CORRECTION AND BOUNDED SIMPLIFICATION REQUIRED.*
+
+*Current defects:* IOR-01 (unowned XLSX formula activation), IOR-02 (accepted value breaks XLSX save with artifact loss), IOR-03 (undocumented overlay directories), IOR-04 (alias not capability-mapped), IOR-05 (path rewrite), IOR-10 (naming), IOR-12 (`ExactTable` at sinks).
+
+*Justified complexity:* the IR/plan two-stage chain; the protocol-guarded contract facade; the exact-table/`GroupedMatrix` branch; carrier-authoritative presentation meta with its shared helper; the legend `resolved` parser hint; `ParserLimits`; the parity test policy of encoding accepted gaps explicitly.
+
+*Removable complexity:* marker cells + strip; blob-as-transport and its five decoders; four copy passes; parse-side IR beyond tables and hidden meta; the dead surfaces in IOR-13; the capability name set; duplicated addressing helpers.
+
+*Empirical unknowns:* section 19.
+
+*Future optional improvements:* single-file atomic placement if a durability claim is ever wanted; replace mode for directory sinks; ODS repeat compression if wide sparse sheets appear; one boolean spelling across spreadsheet backends.
+
+*Top 3 durable architectural conclusions:*
+
+. The rendering chain's abstraction cost is earned by two real renderers and a parity oracle; keep `RenderPlan` as the only thing an adapter executes and do not add a third representation between IR and file.
+. Sink capability is activated at exactly two library calls; the sink that owns a capability must implement its inert default in code, not in an ADR. Assigning ownership in documentation while the code delegates to a library default is the cross-layer gap this subsystem actually had.
+. The ingress vocabulary and each sink's serializable vocabulary must be compared explicitly per sink; where they differ (tz-aware DateTime, `ExactTable`), the sink must reject before the target is opened. This is a per-sink table, not a framework.
+
+*Top 3 implementation follow-ups:* IOR-01 inert-string default in the XLSX renderer with tests; IOR-02 pre-save rejection of tz-aware datetimes on XLSX; IOR-03 documentation of overlay semantics (plus IOR-04 and IOR-05 as one-line fixes in the same slice).
+
+*Top 3 things NOT to build:* a transactional or manifest-tracked output layer; a typed IR substrate or per-cell type hints to "fix" IOR-11; an ingress-side content filter or formula allowlist in response to IOR-01.
+
+*Is another Frontier review justified?* No. The remaining work is bounded implementation with existing tests as the safety net. One narrow follow-up review after the sink-boundary slice lands is sufficient and does not need Frontier capacity: "Do all XLSX write paths (data, header, hidden-meta, validation literal) now emit inert text for non-`FormulaSpec` strings, and does the XLSX/ODS parity oracle include `=`-prefixed strings, booleans, and tz-aware datetimes?"
+
+*Lifecycle cleanup check:* not applicable; this review closes no FTR or BUG workstream.
+
+== 19. UNVERIFIED / REQUIRES FOLLOW-UP
+
+* IOR-01: Excel/LibreOffice display of `inlineStr` cells whose text starts with `=` after the proposed correction (expected inert).
+* IOR-02: the save-time `TypeError` and the truncated artifact were derived from openpyxl 3.1.5 source; not executed.
+* IOR-10: Excel's behaviour for defined names starting with a digit and for unescaped apostrophes in named-range references.
+* IOR-11: numeric widening through `df.values.tolist()` and the `True`/`TRUE` boolean asymmetry; derived from pandas/openpyxl/odfpy source, not tested.
+* IOR-12: the exact exception raised when an `ExactTable` reaches each saver.
+* IOW-1: Excel's handling of list-literal validation formulas over 255 characters.
+* IOW-2/3: no measurement exists for ODS dense emission or XLSX merged-cell lookup cost.
+
+== 20. Validation record
+
+* Repository state: HEAD `764452d407f20a312849f9b89644ecfad597f216`, branch `main`, worktree clean before review; after review exactly one file added (this artifact).
+* Tests executed (ordinary, existing, deterministic; command run once from `core/` with the project `.venv`):
++
+[source,text]
+----
+.venv/bin/pytest tests/unit/io_backends tests/unit/rendering \
+  tests/integration/io_backends tests/integration/roundtrip \
+  tests/integration/spreadsheet_contract tests/roundtrip \
+  tests/architecture/spreadsheet_contract tests/architecture/formula_boundary \
+  tests/architecture/parse_contract \
+  tests/architecture/dependency_guards/test_spreadsheet_boundary_guards.py \
+  tests/architecture/dependency_guards/test_ir_architecture_clarity.py \
+  tests/architecture/dependency_guards/test_adapter_alignment.py \
+  -p no:cacheprovider -rs
+----
+Result: `516 passed in 5.97s`, 0 failed, 0 skipped. `soffice` was present on PATH, so the opt-in `test_ods_libreoffice_interop.py` ran (an existing test invoking a local application; not a provider or model).
+* No new test, probe, benchmark, hostile artifact, or dependency experiment was created. Dependency claims cite `.venv/lib/python3.13/site-packages/openpyxl/{cell/cell.py,cell/_writer.py,writer/excel.py,compat/strings.py,worksheet/_reader.py,workbook/child.py,workbook/defined_name.py}` and `odf/opendocument.py` as installed.
+* AsciiDoc rendering: `asciidoctor --failure-level WARN -o /dev/null <this file>` (result recorded in the commit message and final report).
+* `git diff --check`: run before commit.
+* Provider/model invocations through the repository Coordinator: 0.
