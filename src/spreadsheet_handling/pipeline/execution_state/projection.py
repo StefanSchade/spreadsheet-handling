@@ -26,8 +26,8 @@ Facts from FTR section 10 / Follow-up Review 005 section 5 encoded here:
   rename of that sheet must be representable as an invalid transition E5 can
   reject before renderer entry, rather than surfacing as a late renderer
   failure.
-* Only the maintained FormulaSpec-capable adapters (`xlsx`/`ods`, matching
-  `io_backends.router`'s own kind strings) may consume a FormulaSpec role;
+* Only the FormulaSpec-capable adapters maintained by `io_backends.router`
+  may consume a FormulaSpec role;
   every other sink kind is not authorized to terminate it.
 """
 from __future__ import annotations
@@ -37,14 +37,10 @@ from dataclasses import dataclass
 
 from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
 from spreadsheet_handling.domain.transformations.grouped_xref.model import DynamicColumn
+from spreadsheet_handling.io_backends.router import FORMULA_CAPABLE_SINK_KINDS
 
 from .roles import GroupedMatrixFormulaRole, GroupedMatrixRole, LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, Uncertified
-
-# The maintained sink `kind` strings (matching `io_backends.router.SAVERS`)
-# capable of consuming a FormulaSpec role. Any other kind is not authorized.
-FORMULA_CAPABLE_SINK_KINDS = frozenset({"xlsx", "ods"})
-
 
 def terminate_grouped_matrix_at_projection(
     role: GroupedMatrixRole | GroupedMatrixFormulaRole,
@@ -168,8 +164,8 @@ def consume_formula_at_capable_adapter(
 ) -> LookupFormulaSpecRole | Uncertified:
     """The FormulaSpec role after a capable adapter consumes it: CONSUME/TERMINATE.
 
-    ``sink_kind`` must be one of the maintained FormulaSpec-capable adapter
-    kinds (`FORMULA_CAPABLE_SINK_KINDS`); any other sink is not authorized
+    ``sink_kind`` must be one of the router-maintained FormulaSpec-capable
+    adapter kinds (`FORMULA_CAPABLE_SINK_KINDS`); any other sink is not authorized
     to consume the role, and this returns `Uncertified` rather than silently
     authorizing consumption at an unsupported sink.
     """

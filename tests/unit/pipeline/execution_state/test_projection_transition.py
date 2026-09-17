@@ -169,7 +169,7 @@ def test_capable_adapter_consumes_the_relocated_role() -> None:
     nested = GroupedMatrixFormulaRole(frame="grouped", source=_source_role(), effect=TransitionEffect.COPY_DERIVE)
     location = relocate_nested_formula_at_projection(nested, matrix, render_frame="render_plan")
 
-    for sink_kind in ("xlsx", "ods"):
+    for sink_kind in ("xlsx", "ods", "calc"):
         consumed = consume_formula_at_capable_adapter(location, sink_kind=sink_kind)
         assert consumed == LookupFormulaSpecRole(
             frame="render_plan",

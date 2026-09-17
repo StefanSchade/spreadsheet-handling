@@ -45,12 +45,15 @@ LOADERS: Dict[str, Callable[..., Frames]] = {
     "xml": read_xml_dir,
 }
 
+_ODS_SAVER = _lazy_callable("spreadsheet_handling.io_backends.ods.ods_backend", "save_ods")
+_XLSX_SAVER = _lazy_callable("spreadsheet_handling.io_backends.xlsx.xlsx_backend", "save_xlsx")
+
 SAVERS: Dict[str, Callable[..., None]] = {
     "csv_dir": save_csv_dir,
     "discard": save_discard,
-    "ods": _lazy_callable("spreadsheet_handling.io_backends.ods.ods_backend", "save_ods"),
-    "calc": _lazy_callable("spreadsheet_handling.io_backends.ods.ods_backend", "save_ods"),
-    "xlsx": _lazy_callable("spreadsheet_handling.io_backends.xlsx.xlsx_backend", "save_xlsx"),
+    "ods": _ODS_SAVER,
+    "calc": _ODS_SAVER,
+    "xlsx": _XLSX_SAVER,
     "json_dir": write_json_dir,
     "json": write_json_dir,
     "yaml_dir": save_yaml_dir,
@@ -58,6 +61,11 @@ SAVERS: Dict[str, Callable[..., None]] = {
     "xml_dir": write_xml_dir,
     "xml": write_xml_dir,
 }
+
+_FORMULA_CAPABLE_SAVERS = frozenset({_ODS_SAVER, _XLSX_SAVER})
+FORMULA_CAPABLE_SINK_KINDS = frozenset(
+    kind for kind, saver in SAVERS.items() if saver in _FORMULA_CAPABLE_SAVERS
+)
 
 BACKENDS: Dict[str, BackendSpec] = {
     "xlsx": ("spreadsheet_handling.io_backends.xlsx.xlsx_backend", "ExcelBackend"),
