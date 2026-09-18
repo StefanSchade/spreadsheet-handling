@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from spreadsheet_handling.io_backends.router import get_loader, get_saver
+from spreadsheet_handling.io_backends.router import (
+    get_loader,
+    get_saver,
+    saver_supports_formula_specs,
+)
 
 
 @pytest.mark.parametrize(
@@ -42,3 +46,13 @@ def test_get_loader_raises_value_error_for_unknown_kind() -> None:
 def test_get_saver_raises_value_error_for_unknown_kind() -> None:
     with pytest.raises(ValueError, match="Unknown saver kind: bogus"):
         get_saver("bogus")
+
+
+@pytest.mark.parametrize("kind", ["xlsx", "ods", "calc"])
+def test_formula_capability_follows_registered_saver_identity(kind: str) -> None:
+    assert saver_supports_formula_specs(kind)
+
+
+@pytest.mark.parametrize("kind", ["json", "csv_dir", "yaml_dir", "bogus"])
+def test_formula_capability_is_fail_closed(kind: str) -> None:
+    assert not saver_supports_formula_specs(kind)

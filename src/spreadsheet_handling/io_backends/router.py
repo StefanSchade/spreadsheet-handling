@@ -63,9 +63,6 @@ SAVERS: Dict[str, Callable[..., None]] = {
 }
 
 _FORMULA_CAPABLE_SAVERS = frozenset({_ODS_SAVER, _XLSX_SAVER})
-FORMULA_CAPABLE_SINK_KINDS = frozenset(
-    kind for kind, saver in SAVERS.items() if saver in _FORMULA_CAPABLE_SAVERS
-)
 
 BACKENDS: Dict[str, BackendSpec] = {
     "xlsx": ("spreadsheet_handling.io_backends.xlsx.xlsx_backend", "ExcelBackend"),
@@ -90,6 +87,16 @@ def get_saver(kind: str) -> Callable[..., None]:
     if fn is None:
         raise ValueError(f"Unknown saver kind: {kind}")
     return fn
+
+
+def saver_supports_formula_specs(kind: str) -> bool:
+    """Whether ``kind`` routes to a saver that consumes FormulaSpec cells.
+
+    Capability follows the registered saver identity, so aliases such as
+    ``calc`` automatically receive the same answer as their canonical saver.
+    Unknown kinds are not capable.
+    """
+    return SAVERS.get(kind) in _FORMULA_CAPABLE_SAVERS
 
 
 def get_backend_factory(kind: str) -> BackendFactory:

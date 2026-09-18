@@ -320,11 +320,12 @@ def _grouped_steps(*, drop_source: bool) -> list[BoundStep]:
     )
 
 
-@pytest.mark.parametrize("kind", ["xlsx", "ods"])
+@pytest.mark.parametrize("kind", ["xlsx", "ods", "calc"])
 def test_formula_helper_to_grouped_matrix_reaches_capable_adapter(tmp_path: Path, kind: str) -> None:
     input_dir = tmp_path / "input"
     write_json_dir(_grouped_source_frames(), input_dir)
-    out_path = tmp_path / f"out.{kind}"
+    suffix = ".xlsx" if kind == "xlsx" else ".ods"
+    out_path = tmp_path / f"out{suffix}"
 
     orchestrate(
         input={"kind": "json_dir", "path": str(input_dir)},

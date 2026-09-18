@@ -26,8 +26,8 @@ Facts from FTR section 10 / Follow-up Review 005 section 5 encoded here:
   rename of that sheet must be representable as an invalid transition E5 can
   reject before renderer entry, rather than surfacing as a late renderer
   failure.
-* Only the FormulaSpec-capable adapters maintained by `io_backends.router`
-  may consume a FormulaSpec role;
+* Only an adapter established as FormulaSpec-capable by the higher-level
+  composition boundary may consume a FormulaSpec role;
   every other sink kind is not authorized to terminate it.
 """
 from __future__ import annotations
@@ -37,7 +37,6 @@ from dataclasses import dataclass
 
 from spreadsheet_handling.domain.transformations.grouped_xref import GroupedMatrix
 from spreadsheet_handling.domain.transformations.grouped_xref.model import DynamicColumn
-from spreadsheet_handling.io_backends.router import FORMULA_CAPABLE_SINK_KINDS
 
 from .roles import GroupedMatrixFormulaRole, GroupedMatrixRole, LookupFormulaSpecRole
 from .vocabulary import TransitionEffect, Uncertified
@@ -160,16 +159,16 @@ def relocate_nested_formula_at_projection(
 def consume_formula_at_capable_adapter(
     location: ProjectedFormulaLocation,
     *,
-    sink_kind: str,
+    adapter_supports_formula_specs: bool,
 ) -> LookupFormulaSpecRole | Uncertified:
     """The FormulaSpec role after a capable adapter consumes it: CONSUME/TERMINATE.
 
-    ``sink_kind`` must be one of the router-maintained FormulaSpec-capable
-    adapter kinds (`FORMULA_CAPABLE_SINK_KINDS`); any other sink is not authorized
-    to consume the role, and this returns `Uncertified` rather than silently
-    authorizing consumption at an unsupported sink.
+    Backend knowledge stays outside execution-state: its caller must supply
+    the capability fact established at the application composition boundary.
+    A false or absent capability remains fail-closed and returns `Uncertified`
+    rather than silently authorizing consumption at an unsupported sink.
     """
-    if sink_kind not in FORMULA_CAPABLE_SINK_KINDS:
+    if not adapter_supports_formula_specs:
         return Uncertified(reason="uncovered_configuration", detail="sink_kind")
     role = location.role
     return LookupFormulaSpecRole(
@@ -206,7 +205,6 @@ def reject_referenced_lookup_sheet_rename(
 
 
 __all__ = [
-    "FORMULA_CAPABLE_SINK_KINDS",
     "terminate_grouped_matrix_at_projection",
     "ExactTableCellLocation",
     "locate_nested_formula_cells",

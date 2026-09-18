@@ -141,7 +141,6 @@ from .grouped_matrix import (
 )
 from .preserving import PRESERVING_CERTIFICATES, PreservingCertificate
 from .projection import (
-    FORMULA_CAPABLE_SINK_KINDS,
     ExactTableCellLocation,
     ProjectedFormulaLocation,
     consume_formula_at_capable_adapter,
@@ -211,7 +210,6 @@ __all__ = [
     "artifact_manifest_role",
     "consume_manifest_at_sink",
     # projection / sink
-    "FORMULA_CAPABLE_SINK_KINDS",
     "terminate_grouped_matrix_at_projection",
     "ExactTableCellLocation",
     "locate_nested_formula_cells",

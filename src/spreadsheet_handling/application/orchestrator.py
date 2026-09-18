@@ -12,7 +12,7 @@ from .managed_pipeline import (
     run_managed_steps,
 )
 from ..domain.pipeline_cleanup import execute_final_domain_cleanup
-from ..io_backends.router import get_loader, get_saver
+from ..io_backends.router import get_loader, get_saver, saver_supports_formula_specs
 from ..pipeline.persistence_boundary import project_meta_to_persistable_contract
 from ..pipeline.types import BoundStep, Frames
 
@@ -85,7 +85,13 @@ def _finalize_and_persist(frames: Frames, managed_state: ManagedExecutionState, 
     """
     frames_before_cleanup = frames
     frames = execute_final_domain_cleanup(frames)
-    frames = finalize_managed_state(frames_before_cleanup, frames, managed_state, sink_kind=out.kind)
+    frames = finalize_managed_state(
+        frames_before_cleanup,
+        frames,
+        managed_state,
+        sink_kind=out.kind,
+        formula_sink_capable=saver_supports_formula_specs(out.kind),
+    )
 
     meta = frames.get("_meta")
     if isinstance(meta, dict):

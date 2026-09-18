@@ -169,17 +169,18 @@ def test_capable_adapter_consumes_the_relocated_role() -> None:
     nested = GroupedMatrixFormulaRole(frame="grouped", source=_source_role(), effect=TransitionEffect.COPY_DERIVE)
     location = relocate_nested_formula_at_projection(nested, matrix, render_frame="render_plan")
 
-    for sink_kind in ("xlsx", "ods", "calc"):
-        consumed = consume_formula_at_capable_adapter(location, sink_kind=sink_kind)
-        assert consumed == LookupFormulaSpecRole(
-            frame="render_plan",
-            column="value",
-            source_key_column="row_id",
-            lookup_sheet="lookup_values",
-            lookup_key_column="row_id",
-            missing="empty",
-            effect=TransitionEffect.CONSUME_TERMINATE,
-        )
+    consumed = consume_formula_at_capable_adapter(
+        location, adapter_supports_formula_specs=True
+    )
+    assert consumed == LookupFormulaSpecRole(
+        frame="render_plan",
+        column="value",
+        source_key_column="row_id",
+        lookup_sheet="lookup_values",
+        lookup_key_column="row_id",
+        missing="empty",
+        effect=TransitionEffect.CONSUME_TERMINATE,
+    )
 
 
 def test_unsupported_sink_does_not_silently_certify_formula_consumption() -> None:
@@ -187,9 +188,10 @@ def test_unsupported_sink_does_not_silently_certify_formula_consumption() -> Non
     nested = GroupedMatrixFormulaRole(frame="grouped", source=_source_role(), effect=TransitionEffect.COPY_DERIVE)
     location = relocate_nested_formula_at_projection(nested, matrix, render_frame="render_plan")
 
-    for sink_kind in ("json", "csv", "yaml_dir", "unknown"):
-        result = consume_formula_at_capable_adapter(location, sink_kind=sink_kind)
-        assert result == Uncertified(reason="uncovered_configuration", detail="sink_kind")
+    result = consume_formula_at_capable_adapter(
+        location, adapter_supports_formula_specs=False
+    )
+    assert result == Uncertified(reason="uncovered_configuration", detail="sink_kind")
 
 
 def test_referenced_lookup_sheet_rename_is_rejected() -> None:

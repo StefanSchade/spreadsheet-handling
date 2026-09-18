@@ -52,7 +52,6 @@ from ..pipeline.execution_state import (
     ControlledRole,
     ExpandDropProduct,
     ExpandRetainProduct,
-    FORMULA_CAPABLE_SINK_KINDS,
     FormulaHelperCertificate,
     GroupedMatrixFormulaRole,
     GroupedMatrixRole,
@@ -349,9 +348,15 @@ def _extract_sheet_renames(meta: object) -> dict[str, str]:
     return renames
 
 
-def _authorize_role_for_sink(role: ControlledRole, *, sink_kind: str, meta: object) -> None:
+def _authorize_role_for_sink(
+    role: ControlledRole,
+    *,
+    sink_kind: str,
+    formula_sink_capable: bool,
+    meta: object,
+) -> None:
     if type(role) in (GroupedMatrixRole, GroupedMatrixFormulaRole, LookupFormulaSpecRole):
-        if sink_kind not in FORMULA_CAPABLE_SINK_KINDS:
+        if not formula_sink_capable:
             raise UnauthorizedControlledRoleAtSinkError(
                 role_kind=type(role).__name__, frame=role.frame, sink_kind=sink_kind
             )
@@ -381,6 +386,7 @@ def finalize_managed_state(
     state: ManagedExecutionState,
     *,
     sink_kind: str,
+    formula_sink_capable: bool,
 ) -> Frames:
     """Terminate cleaned-up roles, then authorize every surviving role for
     ``sink_kind`` before the caller may invoke the saver (FTR section 14).
@@ -395,5 +401,10 @@ def finalize_managed_state(
     surviving_roles = terminate_roles_removed_by_cleanup(state.roles, removed_frames=removed_frames)
     meta = frames_after_cleanup.get("_meta") if isinstance(frames_after_cleanup, Mapping) else None
     for role in surviving_roles:
-        _authorize_role_for_sink(role, sink_kind=sink_kind, meta=meta)
+        _authorize_role_for_sink(
+            role,
+            sink_kind=sink_kind,
+            formula_sink_capable=formula_sink_capable,
+            meta=meta,
+        )
     return frames_after_cleanup
