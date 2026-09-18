@@ -1,4 +1,4 @@
-"""Committed-core coherence at the pure A1 admission boundary."""
+"""Committed-core coherence at the production A1/A2 admission boundary."""
 
 from __future__ import annotations
 
@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from scripts.workflow_coordinator.operator import _admit_a1, _selected_ids
+from scripts.workflow_coordinator.evidence import prepare_evidence_commands
+from scripts.workflow_coordinator.operator import (
+    _admit_a1,
+    _selected_evidence_names,
+    _selected_ids,
+)
 from scripts.workflow_coordinator.serialization import (
     component_manifest_from_yaml,
     repository_policy_from_yaml,
@@ -28,7 +33,7 @@ A3_RESERVED_PATH = "scripts/workflow_coordinator/resources/agent_operating_contr
         ("ior04_formula_sink_capability", 8),
     ],
 )
-def test_current_core_consumer_bundle_is_admitted_by_its_v2_policy(
+def test_current_core_consumer_bundle_is_admitted_by_its_v3_policy(
     bundle_name, expected_governing_count
 ):
     bundle = DOGFOOD / bundle_name
@@ -59,5 +64,26 @@ def test_current_core_consumer_bundle_is_admitted_by_its_v2_policy(
     assert {"docs/ai_info", A3_RESERVED_PATH} <= set(policy.governance_paths)
     assert policy.work_item_scope_ceiling == item.scope
     assert policy.max_autonomous_hops == item.max_autonomous_hops
+    assert policy.schema_version == 3
+    assert policy.revision == "r2"
+    assert tuple(policy.evidence_commands) == ("diff_hygiene", "git_version")
+    assert policy.evidence_commands["diff_hygiene"].argv == (
+        "git", "diff", "--check"
+    )
+    assert policy.evidence_commands["diff_hygiene"].timeout_seconds == 30
+    assert policy.evidence_commands["git_version"].argv == ("git", "--version")
+    assert policy.evidence_commands["git_version"].timeout_seconds == 10
+    assert all(
+        phase.evidence == ("diff_hygiene", "git_version")
+        for phase in profile.phases.values()
+    )
 
     _admit_a1(item, profile, policy, governing_paths)
+    selected = _selected_evidence_names(profile, policy)
+    prepared = prepare_evidence_commands(
+        selected, policy.evidence_commands, REPOSITORY
+    )
+    assert selected == ("diff_hygiene", "git_version")
+    assert tuple(command.command_name for command in prepared) == selected
+    assert all(Path(command.admission_resolution.invocation_path).is_absolute() for command in prepared)
+    assert all(command.timeout_seconds <= 900 for command in prepared)
