@@ -1,0 +1,225 @@
+= IOR-04 execution-state boundary correction -- independent review
+
+*Work item:* `IOR-04-FORMULA-SINK-CAPABILITY` (post-gate correction)
+
+*Review base:* `649b58543a0b3e1d4ca578d6ffed443c0ca98b33`
+(`docs(IOR-04-FORMULA-SINK-CAPABILITY): record H002 gate review`)
+
+*Review target:* `da51e7aee75b233de3c73380737de0472dec3736`
+(`fix(pipeline): preserve execution-state backend boundary`)
+
+*Review class:* independent bounded implementation / architecture review; review only
+
+*Verdict:* *A -- ACCEPTED*
+
+*Findings:* BLOCKING 0 · IMPORTANT 0 · MINOR 0 · INFO/WATCH 7
+
+== Purpose and context
+
+`50bcc8dc` (IOR-04 H001) removed the projection-local sink-name set
+`{"xlsx", "ods"}` and derived `FORMULA_CAPABLE_SINK_KINDS` from router saver
+identity, so `calc` inherited ODS capability. To do so,
+`pipeline/execution_state/projection.py` imported
+`spreadsheet_handling.io_backends.router`. That breaks
+`tests/architecture/test_execution_state_not_wired.py::test_execution_state_does_not_import_orchestrator_or_router`,
+which forbids any `execution_state -> io_backends` edge. The H002 gate review
+(`649b5854`) ran only focused tests and accepted it. Full-suite validation
+found the problem after the run.
+
+`da51e7ae` moves the capability query to the application composition boundary.
+The router answers a capability predicate keyed by saver identity, the
+orchestrator evaluates it for the actual output kind, and a backend-neutral
+`bool` is passed down. The earlier IOR-04 commits were read only to understand
+the defect. They are not part of the reviewed diff.
+
+== Architectural assessment
+
+Resulting dependency chain (arrows = imports):
+
+----
+application.orchestrator --> io_backends.router          (pre-existing edge)
+application.orchestrator --> application.managed_pipeline (pre-existing edge)
+application.managed_pipeline --> pipeline.execution_state (pre-existing edge)
+pipeline.execution_state -/-> io_backends                 (restored; guard green)
+----
+
+No new import edge is added. The only import change in production code is that
+`orchestrator.py:15` now also imports `saver_supports_formula_specs` from a
+module it already imported (`get_loader`, `get_saver`). The
+`execution_state -> io_backends.router` edge from `50bcc8dc` is gone.
+
+`io_backends.router.saver_supports_formula_specs` (`router.py:92-99`)::
+Returns `SAVERS.get(kind) in _FORMULA_CAPABLE_SAVERS`. Capability comes from
+saver identity, and the same `SAVERS` dict drives `get_saver`
+(`router.py:85`). `_ODS_SAVER` and `_XLSX_SAVER` are module-level singletons
+(`router.py:48-49`). `ods` and `calc` both hold the same `_ODS_SAVER` object
+(`router.py:54-55`; confirmed at runtime: `SAVERS["ods"] is SAVERS["calc"]`).
+Unknown kinds give `None`, which is not in the set, so the answer is `False`.
+That is the same membership that makes `get_saver` raise. Runtime check over
+every `SAVERS` key plus `bogus`, `XLSX`, `Calc` and `""`: exactly `ods`, `calc`
+and `xlsx` return true. Lookup is case-sensitive, like `get_saver`.
++
+Wrapper identity is stable. `_lazy_callable` builds its closure once when the
+module is imported, and the capable set holds those same objects. Lazy import
+only defers the backend module load and never rebuilds the wrapper.
+
+`application.orchestrator._finalize_and_persist` (`orchestrator.py:88-94`)::
+This is the right seam. The orchestrator already composes backend routing
+(`get_loader`/`get_saver`) with the managed pipeline, and the architecture guard
+names it as the single framework macro seam. The capability is computed from
+`out.kind`. `_save_frames` (`orchestrator.py:60-64`) uses the same `out.kind`
+to pick the saver. `out` is a frozen `IODesc`, and its kind was already
+normalized by `_coerce_io` (`strip().lower()`, `orchestrator.py:39`). Nothing
+between authorization and save can change which sink is used. There is only
+one saver call path in `src/`: `_finalize_and_persist` has one caller and
+`get_saver(` has one call site. So the boolean and the saver actually invoked
+cannot describe different sinks.
+
+`application.managed_pipeline` (`managed_pipeline.py:351-409`)::
+`finalize_managed_state` and `_authorize_role_for_sink` take
+`formula_sink_capable: bool` as a required keyword-only argument with no
+default. A caller that omits it gets a `TypeError` rather than a permissive
+default. `sink_kind` stays for two things: error messages, and the
+`ArtifactManifestSourceFramesRole` check against `MANIFEST_ADAPTER_SINK_KIND`.
+That check is a pre-existing, non-router string and is out of IOR-04 scope. A
+single boolean is enough for the three FormulaSpec-family roles, because before
+the correction they were already gated by one shared membership test. The
+nested-role lookup-sheet rename rejection (`reject_referenced_lookup_sheet_rename`)
+still runs after the capability check. No distinction is collapsed.
+
+`pipeline.execution_state.projection.consume_formula_at_capable_adapter` (`projection.py:159-178`)::
+The parameter is now `adapter_supports_formula_specs: bool`. A true value gives
+the same `LookupFormulaSpecRole(..., effect=CONSUME_TERMINATE)` as before. A
+false value gives the same
+`Uncertified(reason="uncovered_configuration", detail="sink_kind")`. No
+backend vocabulary was moved elsewhere inside the package. A grep for
+`"xlsx"`/`"ods"`/`"calc"` under `execution_state/` finds nothing, and the
+package has no `io_backends`/`application` import, absolute or relative.
+Runtime check: importing `spreadsheet_handling.pipeline.execution_state` in a
+fresh interpreter loads no `io_backends` or `application` module.
+
+Scope::
+Five production files, three test files, and no architecture-guard change
+(`git diff --stat` on `tests/architecture` is empty). Each touched layer is
+needed. The router hosts the authority, the orchestrator translates it,
+managed_pipeline carries it (because it previously imported the removed
+constant from `execution_state`), and projection/`__init__` drop the edge and
+the export.
+
+== Findings
+
+No BLOCKING, IMPORTANT or MINOR findings.
+
+=== INFO/WATCH
+
+W1 -- second registration inside the router (INFO)::
+Making a new saver FormulaSpec-capable takes two edits: `SAVERS` and
+`_FORMULA_CAPABLE_SAVERS`. Both are in `router.py`, a few lines apart. This
+does not bring back the IOR-04 defect. The capability set is keyed by saver
+*object*, not by sink *name*, so an alias registered to an existing capable
+saver inherits capability with no second edit. A forgotten second edit fails
+closed. There is no parallel name vocabulary in another layer.
+
+W2 -- ODS/`calc` integration checks authorization, not rendered formulas (WATCH)::
+`test_formula_helper_to_grouped_matrix_reaches_capable_adapter[calc]`
+(`test_trusted_ingress_e5_managed_lifecycle.py:323-346`) runs through the real
+`orchestrate` path, so `calc` is proven at the actual composition and
+persistence path. Without the capability, `finalize_managed_state` would raise
+before saving. For `ods`/`calc` the test asserts only that the file exists. It
+checks formula-cell content only for `xlsx`. This gap predates the correction
+(`ods` was already parametrized this way) and does not affect the boundary
+repair.
+
+W3 -- wiring is covered in both directions (INFO)::
+If the orchestrator always passed `True`, the existing
+`test_grouped_matrix_role_rejects_unsupported_sink` and
+`test_standalone_formula_helper_role_rejects_unsupported_sink` (`json_dir`)
+would fail. If it always passed `False`, the `xlsx`/`ods`/`calc` integration
+cases would fail. The tests do not pass by bypassing real composition. The
+router unit tests (`test_router.py:51-58`) pin capability for `xlsx`/`ods`/`calc`
+and fail-closed behavior for `json`/`csv_dir`/`yaml_dir`/`bogus`.
+
+W4 -- surface changes are internal (INFO)::
+Removed or changed: `FORMULA_CAPABLE_SINK_KINDS` from
+`pipeline.execution_state` (it existed there since E4); router
+`FORMULA_CAPABLE_SINK_KINDS` (it existed only since `50bcc8dc`); the
+`consume_formula_at_capable_adapter` keyword; and the `finalize_managed_state`
+signature. FTR-TRUSTED-INGRESS-P4A section 46.1 lists `pipeline.execution_state`
+as INTERNAL/IMPORTABLE-ONLY and not part of the promised import surface.
+`managed_pipeline` internals are unexported implementation detail (section
+46.11). No references remain in `src/`, `tests/` or the demo repository (`../demo`).
+Old names appear only in historical review/FTR prose. No configuration or
+user-facing behavior changed, so no release note is needed.
+
+W5 -- the guard only matches absolute imports (WATCH)::
+`test_execution_state_does_not_import_orchestrator_or_router` compares
+`ImportFrom.module` against absolute prefixes. A relative
+`from ...io_backends import router` inside `execution_state/` would not be
+caught. This weakness predates the correction and the correction does not
+exploit it: the runtime `sys.modules` check above and the grep both find no
+such import. It is recorded as a hardening candidate only.
+
+W6 -- mutating `SAVERS` at runtime fails closed (INFO)::
+Replacing a `SAVERS` entry for a capable kind with another callable, for
+example a test spy, makes that kind non-capable. Formula-carrying pipelines
+aimed at it then raise `UnauthorizedControlledRoleAtSinkError`. This is the
+safe direction, and no repository test depends on it.
+
+W7 -- the gate validation set skipped `tests/architecture` (WATCH, process)::
+The H002 gate accepted `50bcc8dc` after running only the focused unit and
+integration suites. The architecture guard that later caught the edge was not
+in the gate's validation set. This is an observation for whoever owns the
+Workflow Coordinator validation profile. This review does not change it.
+
+== Validation performed
+
+All commands were run in `~/repos/spreadsheet-handling/core` on `main` at
+`da51e7ae`, with a clean worktree.
+
+[cols="3,1",options="header"]
+|===
+|Command |Result
+|`.venv/bin/python -m pytest -q tests/unit/io_backends/test_router.py tests/unit/pipeline/execution_state/test_projection_transition.py tests/integration/pipeline/test_trusted_ingress_e5_managed_lifecycle.py`
+|55 passed
+|`.venv/bin/python -m pytest -q tests/architecture/test_execution_state_not_wired.py`
+|6 passed
+|Negative control: the guard test above run in a detached worktree at `649b5854`
+|1 failed (`...io_backends.router` violation), as expected
+|`.venv/bin/python -m pytest -q` (complete suite)
+|3182 passed, 0 failed, 0 errors, exit 0 (about 29 s)
+|`git diff --check 649b5854..da51e7ae`
+|clean (exit 0)
+|Runtime: import `pipeline.execution_state` in a fresh interpreter, inspect `sys.modules`
+|no `io_backends`/`application` modules loaded
+|Runtime: `saver_supports_formula_specs` over all `SAVERS` keys plus `bogus`/`XLSX`/`Calc`/`""`
+|true only for `ods`, `calc`, `xlsx`
+|===
+
+The author's claims (focused 55 passed, architecture 6 passed, full suite
+passed, `diff --check` clean) are independently confirmed.
+
+== Primary question
+
+*Does the correction preserve IOR-04 while restoring the
+execution_state/backend dependency boundary?*
+
+Yes.
+
+* *IOR-04:* `xlsx` and `ods` are capable, and `calc` inherits ODS capability
+  through shared saver identity.
+* *Fail-closed:* incapable and unknown kinds are rejected. This is verified at
+  the router, at the execution-state transition, and end-to-end through
+  `orchestrate`.
+* *No duplicated names:* no parallel sink-name vocabulary exists in any layer.
+* *Boundary:* `pipeline.execution_state` has no `io_backends` dependency again.
+  The backend fact is translated at the orchestrator, which already composes
+  routing with the managed pipeline, and is evaluated for the exact sink kind
+  that is then saved.
+* *Behavior and guards:* no public, API or configuration behavior changed, and
+  no architecture guard was weakened.
+
+== Next action
+
+Treat `IOR-04-FORMULA-SINK-CAPABILITY` as closed at `da51e7ae` together with
+this review. No bounded correction is required. W2, W5 and W7 are optional
+hardening candidates, to be scheduled only through the normal backlog process.
