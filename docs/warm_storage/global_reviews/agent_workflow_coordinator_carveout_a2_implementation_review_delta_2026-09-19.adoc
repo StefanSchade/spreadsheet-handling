@@ -1,0 +1,194 @@
+= Workflow Coordinator Carve-out A2 Implementation Review -- Delta Re-review
+:toc:
+:toclevels: 2
+:sectnums:
+
+Date:: 2026-09-19
+Reviewer role:: Fresh independent bounded delta re-review of the A2 implementation
+correction. Review only; A2-IR-M1 and A2-IR-M2 only. Accepted A1/A2 architecture,
+W1-W8, resolver semantics beyond M1, post-evidence Git truth, policy schema and
+consumer migration are not reopened.
+Repository:: `~/repos/spreadsheet-handling/core`
+Implementation:: `c5360442877c875169594fc751a57ddf37befd17`
+Governing review:: `agent_workflow_coordinator_carveout_a2_implementation_review_2026-09-19.adoc`
+(`fc6d70e1`), verdict *B -- A2 IMPLEMENTATION ACCEPTED AFTER BOUNDED CORRECTION*.
+Corrections under review::
+`981d051083127c307c5362910dd12df98c7d9b6f` (`fix(workflow): enforce A2 evidence invariants`),
+`f1504ac8d9c038286d821ea16edafa622759b5e8` (`fix(workflow): require complete streams for A2 pass fail`).
+Provider-capable Coordinator invocations:: *0*.
+
+== 1. Baseline
+
+Branch `main`, clean worktree, HEAD
+`f1504ac8d9c038286d821ea16edafa622759b5e8`, subject
+`fix(workflow): require complete streams for A2 pass fail`. Matches the expected
+baseline.
+
+== 2. Delta reviewed
+
+`git diff c5360442..f1504ac8`:
+
+* production: `scripts/workflow_coordinator/evidence.py` only (+61/-1) --
+  one guard in `prepare_evidence_commands`, rules appended to `observation_error`;
+* tests: `test_a2_evidence_commands.py` (M1 parametrized refusal, valid
+  production/simulated boundary test), `test_slice5b.py` (13 new cases in the
+  malformed-observation hard-stop test);
+* test util: `simulated_observation` now yields `exit_code=1` for `fail`
+  (required by the new fail rule; otherwise the fixture itself would be malformed).
+
+No other module, profile, policy, schema or document changed. No new validator
+framework, helper module, registry or type-introspection layer was introduced.
+
+== 3. A2-IR-M1 -- runtime timeout guard
+
+`prepare_evidence_commands` (`evidence.py:159-169`) rejects, per selected
+definition and before `resolve_executable`, a `timeout_seconds` that is `bool`,
+non-`int`, or outside `1..COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS`, raising
+`EvidencePreparationError`.
+
+* Constant reuse: imports the existing `model.COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS`
+  (`900`), the same constant `serialization.py:228` uses. No second constant, no
+  policy object.
+* Before execution: the only production caller is `operator._preflight`
+  (`operator.py:338`), which maps the `ValueError` subclass to
+  `OperatorPreflightError`, i.e. pre-Run, pre-dispatch. The proof harness uses the
+  same entry point.
+* Tests: `test_in_memory_timeout_must_match_hard_runtime_invariant` over
+  `0, 901, True, 1.5` (in-memory `EvidenceCommand`, bypassing YAML).
+* Probe (scratch): `0, -5, 901, 10000, True, False, 1.5, "10", None` rejected;
+  `1`, `900` accepted.
+
+Result: *M1 closed.*
+
+== 4. A2-IR-M2 -- observation coherence
+
+Rules in `observation_error` (`evidence.py:357-403`), checked against the brief:
+
+[cols="2,5,1",options="header"]
+|===
+|Rule |Implementation |Status
+
+|pass
+|`exit_code != 0 or signal is not None` -> reject
+|ok
+
+|fail
+|`bool`, non-`int`, `<= 0` exit code or non-null signal -> reject
+|ok
+
+|error
+|falsy `error_class` -> reject
+|ok
+
+|argv tail
+|non-empty `command` requires `command[1:] == authored_argv[1:]`; `argv[0]` not
+compared to authored `argv[0]` (runtime-resolved path accepted)
+|ok
+
+|stream AVAILABLE
+|non-`bool` `int >= 0`; `str` of length 64 over `0-9a-f`; `bool` body_omitted;
+`body_omitted == (count > 0)`
+|ok
+
+|stream UNAVAILABLE
+|all three `None` (chained `is ... is None`)
+|ok
+
+|pass/fail completeness
+|all-null triple rejected for `pass`/`fail` on either stream (`f1504ac8`)
+|ok
+
+|error either form
+|complete or all-null accepted; partial rejected
+|ok
+|===
+
+Second correction `f1504ac8`: the all-null branch now returns an error for
+`status in {"pass", "fail"}` before `continue`; covered by four new cases
+(`pass`/`fail` x `stdout`/`stderr` unavailable). Probe confirms `pass` and `fail`
+with all-null streams are rejected and `error` with all-null streams is accepted.
+
+Routing: `vertical.py:250-276` computes `observation_errors` for every observation
+and lets the first one override `required_evidence_error`; the reducer evaluates
+`required_evidence_error` (`reducer.py:333`) before `required_evidence_failed`
+(`reducer.py:400`). The parametrized test runs with `failure_route=True` and
+asserts a `mechanical_preemption:` stop, `route_key is None` and no applied route,
+so malformed `fail` observations cannot reach the failure route.
+
+Production conformance: real `ProductionEvidenceRunner` observations for pass
+(exit 0), fail (exit 3), timeout (`error`, null streams) and signal (`error`,
+complete streams) all return `None`; the new
+`test_valid_production_and_simulated_observations_pass_boundary_validation` pins
+pass for production and simulated records.
+
+Result: *M2 closed.*
+
+== 5. Regression check (correction-induced only)
+
+* No behaviour change for valid production records (probe + boundary test).
+* `simulated_observation` fail fixture change is the minimal consequence of the
+  fail rule; all existing Coordinator tests pass unchanged otherwise.
+* `not_run` has no new rule; unchanged from the accepted A2 behaviour.
+* No new framework, subsystem or duplicate timeout policy.
+
+None found.
+
+== 6. Findings
+
+[cols="1,1,6",options="header"]
+|===
+|ID |Severity |Observation
+
+|A2-DR-I1
+|INFO (non-gating)
+|The `pass` rule is `exit_code != 0`, so `exit_code=False` or `0.0` in a `pass`
+record is accepted (fail rule is type-strict). Matches the letter of M2
+("`exit_code == 0`") and its "no type introspection beyond these invariants"
+limit; unreachable from `ProductionEvidenceRunner`. No action required.
+
+|A2-DR-I2
+|INFO (non-gating)
+|A `pass`/`fail` record with empty `command` passes the argv-tail rule, which is
+scoped to non-empty `command` as specified. Production emits empty `command` only
+for resolution `error`. No action required.
+|===
+
+Counts: CRITICAL 0, MAJOR 0, MINOR 0, INFO 2.
+
+== 7. Validation
+
+[source,text]
+----
+git rev-parse HEAD / branch / status             -> f1504ac8..., main, clean
+git diff --check c5360442 f1504ac8               -> clean
+.venv/bin/ruff check scripts/workflow_coordinator tests/unit/workflow_coordinator \
+  tests/integration/workflow_coordinator tests/utils/workflow_coordinator.py
+                                                 -> All checks passed
+.venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/workflow_coordinator/test_a2_evidence_commands.py \
+  tests/unit/workflow_coordinator/test_slice5b.py
+                                                 -> 96 collected, exit 0
+.venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/workflow_coordinator tests/integration/workflow_coordinator \
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py
+                                                 -> 348 collected, exit 0
+----
+
+All pytest runs used a scratch `codex`/`claude` shim (exit 97) prepended to
+`PATH`; the shim marker was never written. M1/M2 probes ran as a scratch script
+importing repository code; no repository file other than this artifact was
+created or modified. Provider-capable Coordinator invocations: *0*.
+
+== 8. Verdict
+
+*A -- A2 IMPLEMENTATION CORRECTION ACCEPTED; IMPLEMENTATION-REVIEW LOOP CLOSED*
+
+A2 implementation-review loop is closed.
+A2 is implemented and accepted.
+A3/A4'/extraction remain outside this review.
+
+== 9. Exact next action
+
+Maintainer docs follow-up (not performed here): record A2 as implemented and
+accepted in FTR-AGENT-WORKFLOW-COORDINATOR-P5 section 13.2 and the A2 readiness
+artifact (governing review W8). `FTR-AGENT-WORKFLOW-COORDINATOR-P5` stays open.
