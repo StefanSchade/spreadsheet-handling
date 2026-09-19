@@ -1,0 +1,570 @@
+= Workflow Coordinator Carve-out A2 Implementation Review
+:toc:
+:toclevels: 3
+:sectnums:
+
+Date:: 2026-09-19
+Reviewer role:: Fresh independent adversarial implementation review of carve-out
+A2. Review only; no production code or tests changed.
+Repository:: `~/repos/spreadsheet-handling/core`
+Baseline:: `main` at `c5360442877c875169594fc751a57ddf37befd17`
+(`feat(workflow): implement carve-out A2 evidence commands`), clean.
+Implementation diff:: `bc44a68e..c5360442` (one commit, 24 files, +1349/-234).
+Normative contract:: FTR `FTR-AGENT-WORKFLOW-COORDINATOR-P5` section 13.2 and its
+rows WFC-POLICY-09, WFC-AUTH-08, WFC-SYS-07, WFC-EVID-01..10, WFC-SEC-06.
+Supporting:: `agent_workflow_coordinator_carveout_a2_evidence_command_contract_2026-09-18.adoc`.
+Accepted reviews (loop closed, not reopened)::
+`agent_workflow_coordinator_carveout_a2_contract_review_2026-09-18.adoc`,
+`agent_workflow_coordinator_carveout_a2_contract_review_delta_2026-09-18.adoc`.
+Provider invocations:: *0*. Every Coordinator run used a local fake executable or
+in-process fake adapter; the full suite ran with a failing `codex` shim first on
+`PATH`, which was never called.
+
+== 1. Verdict
+
+*B -- A2 IMPLEMENTATION ACCEPTED AFTER BOUNDED CORRECTION*
+
+Commit `c5360442` implements the A2 trust boundary as contracted: RepositoryPolicy v3
+is the sole command-definition authority, the fixed registry, `evidence_states`,
+`supports()` and the registry-collision path are gone, selected commands are
+coherence-checked and resolved in canonical preflight before any Run side effect,
+execution is `shell=False` / repository-root cwd / `DEVNULL` / exact argv / one
+immutable environment snapshot, no stream body is durable, the exact 25-key record
+is written under execution-evidence and operator-summary v2, and the post-evidence
+Git re-observation preempts terminal success. Consumer migration is exact and A1
+still protects both policies. No authority bypass, side-effect-boundary defect,
+or regression was found; the full core suite passes.
+
+Two bounded precision gaps prevent a clean acceptance: the WFC-EVID-10 runtime
+timeout guard is absent (M1), and the observation-validation seam no longer checks
+outcome/audit coherence (M2). Both are local code+test corrections with no
+architecture, contract, or documentation change.
+
+Finding counts: BLOCKING 0, IMPORTANT 0, MINOR 2, INFO/WATCH 8.
+
+== 2. Changed-file classification
+
+[cols="3,1,4",options="header"]
+|===
+|Path |Class |Assessment
+
+|`scripts/workflow_coordinator/evidence.py`
+|production
+|Registry removed; snapshot, resolver, prepared command, production runner,
+fail-closed default, `observation_error`. See 3.1-3.5, M1, M2.
+
+|`scripts/workflow_coordinator/model.py`
+|production
+|`EvidenceCommand`, `StatFingerprint`, v3 field, 25-field `Observation`,
+`COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS = 900`.
+
+|`scripts/workflow_coordinator/serialization.py`
+|production
+|v1/v2 migration diagnostic, strict `evidence_commands`, sole duplicate-phase-
+reference check.
+
+|`scripts/workflow_coordinator/operator.py`
+|production
+|`_selected_evidence_names`, preparation in `_preflight`, plan facts, v2
+projections, prepared commands threaded through the serial loop.
+
+|`scripts/workflow_coordinator/vertical.py`, `slice4.py`
+|production
+|Prepared-command execution, validation, post-evidence re-observation; fail-closed
+defaults.
+
+|`scripts/workflow_coordinator/persistence.py`
+|production
+|One `observation_to_data` projection for checkpoint and execution evidence.
+
+|`scripts/workflow_coordinator/proof_harness.py`
+|production (closed tool)
+|v3 policy, `git_version -> [git, --version], 10`, shared preparation helper,
+explicit production runner.
+
+|two `docs/ai_info/workflows/dogfood/*/repository_policy.yaml`
+|consumer governance
+|v3/r2, exact argv/timeouts; profiles untouched.
+
+|`tests/**`, `tests/data/.../slice5b_non_dmc.yaml`
+|tests
+|New `test_a2_evidence_commands.py`; atomic fixture migration.
+
+|`docs/release_notes/release_notes.adoc`
+|release notes
+|One bullet under the active unreleased section.
+|===
+
+== 3. Conformance review
+
+=== 3.1 Sole command authority
+
+* `grep` over `*.py`/`*.yaml` finds no `TRUSTED_EVIDENCE`, `TrustedEvidenceRunner`,
+  a `supports()` method or call, `run_evidence`, `expected_provider` or `evidence_states` outside one
+  serialization test that asserts `evidence_states` is now an unknown v3 field.
+* The only definition source reaching execution is
+  `RepositoryPolicy.evidence_commands` from the pinned policy text, through
+  `_selected_evidence_names` (`operator.py:168`) and `prepare_evidence_commands`
+  (`evidence.py:138`). Runtime looks up only the prepared mapping
+  (`vertical.py:246-248`); the policy dict is not consulted after preparation, so a
+  later in-memory or on-disk policy change cannot alter an admitted definition
+  (on-disk change is additionally stopped by the A1 governing-input drift check).
+* `EvidenceRunner` exposes only `observe(PreparedEvidenceCommand)`. A runner never
+  sees a name it could authorize; the slice5b test proves `_preflight` with an
+  injected runner admits a policy-defined `git_version` without consulting the
+  runner (`observe_calls == []`) and rejects an undefined name.
+* Every default is `FAIL_CLOSED_EVIDENCE_RUNNER` (`evidence.py:61`), which raises
+  and executes nothing. Only `main()` (`operator.py:680`) and the proof harness
+  pass `PRODUCTION_EVIDENCE_RUNNER`. Contract-review W4 is satisfied.
+
+Result: *conforms.*
+
+=== 3.2 Pre-Run boundary
+
+`_preflight()` runs A1 admission, then `_selected_evidence_names`, one
+`snapshot_environment()`, then `prepare_evidence_commands`, converting
+`ValueError` (including `EvidencePreparationError`) to `OperatorPreflightError`
+(`operator.py:335-343`). Everything after -- Run UUID, `new_run()`, state-root
+`mkdir`, plan write, checkout registration, adapter, evidence, provider -- follows
+in `main()`.
+
+* Unknown reference: `test_a2_unknown_reference_has_no_run_state_checkout_evidence_adapter_or_provider_effects`
+  proves zero UUID/`new_run`/checkout/adapter/evidence/provider calls and no state
+  root through `main()`.
+* Selected non-resolvable executable through `main()` (review probe E3): exit 2,
+  no state root, fake provider never called.
+* Unused definition with a missing executable through `main()` (probe E4): Run
+  succeeds and the plan lists only the selected command; unused definitions are
+  never resolved (`_selected_evidence_names` feeds preparation).
+* Malformed definitions and timeouts reject in the YAML loader before
+  `_preflight` returns.
+* A resolver `OSError` other than the caught classes escapes as a raw exception but
+  is still mapped by `main()` to exit 2 before any side effect (W1).
+
+Result: *conforms* for canonical preflight.
+
+=== 3.3 Environment and executable resolution
+
+* One snapshot per Run: `dict(os.environ)` copied once, wrapped in
+  `MappingProxyType`, shared by admission, runtime re-resolution and `Popen(env=)`.
+  Absent PATH inserts `os.defpath` with source `os.defpath`; present PATH
+  (including `""`) is preserved with source `inherited`. PATH digest is SHA-256 of
+  UTF-8+`surrogateescape`; probe confirmed against a hand-computed vector including
+  a surrogate-escaped byte.
+* Absolute `argv[0]` bypasses PATH; relative-with-`/` joins repository root;
+  bare names iterate `PATH.split(":")`, so `PATH=""` is exactly one empty entry
+  rooted at the repository, and relative entries root at the repository (tests
+  and probes P4/P4c, including a trailing-colon entry).
+* Regular-file and `os.access(X_OK)` checks after `os.stat` (follows symlinks);
+  directories named like the command are skipped (probe P3).
+* Symlinks: the invocation spelling is executed and recorded, canonical path is
+  `realpath`, fingerprint is the target's (test and probe P6).
+* Runtime re-resolution happens immediately before `Popen`; a replaced executable
+  is recorded, not rejected (probe P5: new inode observed, `fail`), and a vanished
+  or `chmod -x` executable is runtime `error` with `resolution:` class and null
+  streams (test; probe P5b).
+* Two edge-case deviations from strict POSIX semantics are recorded as W1
+  (search aborts on ELOOP/ENAMETOOLONG) and W2 (lexical `..` normalization).
+
+Result: *conforms*, with W1/W2 as watch items.
+
+=== 3.4 Process execution and outcome
+
+* `Popen(executed, shell=False, cwd=<resolved root>, stdin=DEVNULL,
+  env=<snapshot>, stdout=PIPE, stderr=PIPE)`; executed argv is the invocation path
+  plus authored `argv[1:]` unchanged. The literal-metacharacter test proves
+  `$`, `;`, `*`, `$(...)` and a trailing `""` arrive verbatim, cwd and stdin are as
+  contracted, and the snapshot value is visible.
+* `communicate(timeout)`; on timeout the direct child is killed and reaped
+  (`evidence.py:259-275`); the test proves the PID no longer exists. No process
+  group, no retry.
+* Classification: 0 `pass`; positive nonzero `fail`; negative return code `error`
+  with `signal`; resolution, spawn (`OSError`/`ValueError`), timeout and
+  communication failures `error` with stable `error_class`. Runtime `error` hard-
+  stops (existing reducer; tests for `error`, `not_run`, malformed status).
+* Summaries are Coordinator-generated only. The communication-failure summary
+  `communication_error:<class>` is outside the enumerated 13.2 list (W5).
+* No stdout/stderr body, environment value or name is persisted: probe E5 ran a
+  command printing 12 KB plus an inherited secret; no marker or secret occurred
+  in any state-root JSON, while byte counts, digests and `body_omitted=true` were
+  recorded.
+
+Result: *conforms.*
+
+=== 3.5 Observation validation and durable evidence
+
+* Record: `observation_to_data` emits exactly the 25 contracted keys; the old
+  combined `digest` is gone; checkpoint and execution evidence share the one
+  projection. `execution-evidence.json`, `operator-summary.json` and the
+  best-effort failure summary write `schema_version: 2`; there is no v1 reader,
+  migrator or dual shape. The operator plan keeps version 1 and gains the
+  contracted `evidence` facts (selected names in first-reference order, argv
+  digest, authored `argv[0]`, admission paths, fingerprint, timeout, environment
+  policy, PATH source/digest), as 13.2 directs.
+* Stream facts: complete streams give count/SHA-256 and `body_omitted` exactly when
+  non-empty; resolution, spawn, timeout and communication failures give all-null
+  triples; signal termination keeps complete-stream facts.
+* W-D2: `argv_digest` is `authored_argv_digest(definition.argv)` over the authored
+  policy argv (verified against a hand-computed vector, including
+  `ensure_ascii`); executed argv is in `command`. Conforms.
+* W-D3: `provider` and `command_name` are both the command name by construction and
+  `observation_error` requires both to equal the prepared name. Conforms.
+* Validation seam: `observation_error` binds identity/authority (name, argv
+  digest, authored `argv[0]`, timeout) and status vocabulary, but no longer checks
+  outcome/audit coherence (M2).
+* Prior-observation prompt context now carries only provider, status and the
+  Coordinator-generated summary; command output no longer re-enters the next
+  prompt.
+
+Result: *conforms for the production runner; M2 at the validation seam.*
+
+=== 3.6 Post-evidence Git truth (W-D1)
+
+`vertical.py:257-266` performs exactly one `observe_repository()` after all
+evidence attempts and validation and before `record_hop`/`reduce_result`,
+compares HEAD with `delta.end_head` (the trusted pre-evidence Hop end observed by
+`trusted_commit` or `observe_hop`), requires `clean` and no unresolved submodules,
+and appends both anomalies to the existing `MechanicalFacts.repository_anomaly`.
+No reducer fact, Run field, state or ledger was added. The check runs for every
+Hop, including the terminal one.
+
+* Unit tests: injected runner dirties the worktree or commits -> not `completed`,
+  stop reason names the anomaly.
+* Review probes E1/E2 through `main()` with the production runner and real policy
+  commands (`git commit --allow-empty ...`, `sh -c 'echo dirty > PROOF.md'`) on the
+  terminal Hop: exit 1, `awaiting_human`,
+  `mechanical_preemption:post-evidence HEAD differs ...` /
+  `... worktree is not clean ...`; operator summary `final_head != current_head`.
+* Pre-A2 `observe_hop` already classifies any dirty state as an anomaly, so the new
+  cleanliness check introduces no new stop for previously accepted states.
+* A command that makes HEAD unresolvable raises instead of projecting an anomaly;
+  the path fails closed but loses that Hop's durable observations (W3).
+* Invisible ref/config/reflog mutation remains accepted non-scope.
+
+Result: *conforms.*
+
+=== 3.7 Consumer migration, A1 interaction, proof harness
+
+* Exactly the two committed bundles changed, policy files only: `schema_version: 3`,
+  `revision: r2`, `diff_hygiene -> [git, diff, --check], 30` and
+  `git_version -> [git, --version], 10`; profiles unchanged, every phase still
+  `[diff_hygiene, git_version]`; no speculative command.
+* The integration test loads both bundles through the supported loaders, calls
+  production `_admit_a1`, `_selected_evidence_names` and
+  `prepare_evidence_commands`, and asserts v3 definitions, unchanged references,
+  governance containment (`docs/ai_info` and the A3 reserved path), selected
+  bare-`git` resolution to absolute paths and timeout ceilings; no `_preflight`, no
+  execution, no provider. A1 protection holds: policies stay under `docs/ai_info`,
+  inside `governance_paths`, outside every phase scope.
+* Neutral fixture: `fake_check -> [git, --version], 10` (host-resolvable,
+  contract-review W5).
+* Proof harness: v3 `proof-r2` policy with the one contracted definition,
+  shared `prepare_evidence_commands`, explicit production runner; no ingress
+  authority added. Preparation occurs after proof-root/checkout creation but before
+  the provider-capable call, like the harness's existing pre-`try` steps.
+
+Result: *conforms.*
+
+=== 3.8 Acceptance-matrix coverage
+
+[cols="3,2,3",options="header"]
+|===
+|Matrix class |Covered by |Note
+
+|positive schema/admission (named, empty mapping, ordered reference, reuse,
+unused unresolved, real bundles, neutral fixture, bare `git`, `PATH=""`,
+`['x', '']`)
+|`test_a2_evidence_commands.py`, integration, slice5b
+|Reuse proven for selection only; per-phase re-execution confirmed by probe.
+
+|execution (`shell=False`, cwd, `DEVNULL`, literals, snapshot env, pass/fail)
+|literal/taxonomy tests
+|Complete.
+
+|schema/admission negatives incl. v1/v2 and zero-side-effect refusal
+|parametrized schema tests, `test_operator`
+|Resolution refusal wiring through `_preflight` untested (W6c); probe E3 passes.
+
+|runtime `error` (vanish, non-exec, spawn, timeout+reap, signal, infrastructure)
+|dedicated tests
+|Non-executable-after-admission untested (W6b); probe P5b passes.
+
+|shell safety
+|literal test
+|Complete.
+
+|audit (digests, paths, env facts, classification, streams, no body, summary)
+|projection/literal tests
+|Digest tests are self-referential (W6a); review vectors pass.
+
+|Git truth
+|`test_post_evidence_git_reobservation_preempts_normal_completion`
+|Injected runner; `main()` path confirmed by probes E1/E2.
+
+|trust/route boundary
+|slice5b hard-stop and fail-route tests
+|Complete.
+|===
+
+Fixture simplification: `tests/utils` `phase()` now defaults to `evidence=()`, and
+several vertical tests dropped `git_version`. Before A2 these executed real
+`git --version` through the default production runner; that end-to-end coverage
+is retained by `test_operator` (`main()` with `evidence: [local]`) and
+`test_git_facts`. No material prior coverage was lost.
+
+=== 3.9 Scope discipline
+
+No A3, A4', extraction, sandbox, process-group, hermetic-environment,
+compatibility-reader, plugin, provenance-ledger, duration or retry work. The only
+new types are the contracted `EvidenceCommand`, `StatFingerprint`, and the small
+prepared-command/environment/resolution records inside `evidence.py`.
+
+== 4. Adversarial probes
+
+Read-only scratch scripts, not committed.
+
+[cols="3,4",options="header"]
+|===
+|Probe |Result
+
+|P1 ELOOP candidate earlier in PATH; 5000-char `argv[0]`
+|Raw `OSError` from `resolve_executable`/`prepare_evidence_commands`; search does
+not continue (`/bin/sh` resolves the later entry). W1.
+
+|P2 `./link/../tool`, `link` a symlinked directory
+|Coordinator executes/records `<root>/tool`; kernel resolution executes
+`<root>/real/tool`. Records self-consistent. W2.
+
+|P3-P4c directory shadow; `PATH=""`; absent PATH; trailing colon
+|Conform.
+
+|P5/P5b executable replaced / `chmod -x` after admission
+|Replaced: executed, new inode recorded. Non-exec: `error`,
+`resolution:ExecutableResolutionError`, `command=()`, null streams.
+
+|P6 symlink alias with empty later argument
+|Invocation spelling executed, canonical target recorded, `''` preserved,
+`argv_digest` = authored digest != executed-argv digest.
+
+|E1/E2 terminal-Hop evidence commit / dirty worktree via `main()`
+|Exit 1, mechanical preemption, stale `current_head` exposed as anomaly.
+
+|E3/E4 selected missing executable / unused missing definition via `main()`
+|E3 exit 2, no state root, no provider. E4 success, unused not in plan.
+
+|E5 12 KB stdout + inherited secret via `main()`
+|No body or secret in any state-root JSON; counts/digests present.
+
+|E6 `timeout_seconds: 1` over `sleep 5` via `main()`
+|`error`/`timeout`, `timeout after 1s`, null streams, exit 1.
+
+|E7 evidence `git checkout --orphan` via `main()`
+|Post-evidence observation raises; failure summary, exit 1, dispatch marker kept;
+no execution-evidence or checkpoint for the Hop. W3.
+
+|Lower-level `run_one_hop` without prepared commands / with default runner
+|`KeyError` / `RuntimeError` after `adapter.execute`; nothing executes. W4.
+
+|In-memory `EvidenceCommand` timeouts `0, -5, 10000, True, 1.5`
+|All prepared and executed; `0`/`-5` yield `timeout after 0s`/`-5s`. M1.
+
+|15 internally inconsistent observations (e.g. `pass` with exit 1 or null
+streams, `body_omitted` contradicting count, unrelated `command`, string count)
+|All accepted by `observation_error`. M2.
+|===
+
+== 5. Findings
+
+=== A2-IR-M1 (MINOR) -- WFC-EVID-10 runtime timeout guard is absent
+
+Observation:: `COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS` is used only by the
+YAML parser (`serialization.py:228`). `prepare_evidence_commands` and
+`ProductionEvidenceRunner` accept any `EvidenceCommand.timeout_seconds`.
+Evidence:: WFC-EVID-10: "use that one named production constant for schema
+validation and the runtime guard". Probe: in-memory definitions with `0`, `-5`,
+`10000`, `True`, `1.5` are prepared and executed; `0`/`-5` produce a spurious
+`timeout after 0s`/`-5s` error, `10000` runs past the hard maximum, `True`/`1.5`
+are persisted as `timeout_seconds`. The Hop ceiling has the matching runtime guard
+(`run_serial_hops`, `operator.py:521`; A1 review 3.6).
+Risk:: The "hard maximum" is only a schema limit. Positional `RepositoryPolicy`/
+`EvidenceCommand` construction (proof harness, tests, any future non-YAML caller)
+bypasses it. No current canonical path is affected: YAML validates and the proof
+harness hard-codes 10.
+Correction (code + tests):: In `prepare_evidence_commands` (pre-Run), reject a
+boolean, non-integer, or out-of-range `1..COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS`
+timeout with `EvidencePreparationError`; one parametrized test with in-memory
+definitions `0`, `901`, `True`.
+
+=== A2-IR-M2 (MINOR) -- Observation validation lost outcome/audit coherence
+
+Observation:: `observation_error` (`evidence.py:316`) checks identity/authority
+fields, status vocabulary, non-empty summary, `command` item types and
+`artifact_ref`. It does not check outcome versus exit/signal/error facts, the
+stream null-versus-complete invariant, or that the executed argv tail equals the
+authored tail.
+Evidence:: The pre-A2 validator enforced `pass/fail requires digest` and digest
+type; A2 removed `digest` without a successor rule and replaced that test case
+with an argv-digest mismatch. 13.2 assigns `vertical.py` to "validate returned
+observation shape"; WFC-EVID-02/08 define the null-versus-complete stream
+invariant. Probe: 15 inconsistent observations are all accepted and would be
+persisted in checkpoint and execution evidence.
+Risk:: The exact-record invariants hold only by `ProductionEvidenceRunner`
+construction. Any other runner can produce durable records such as `pass` with
+`exit_code: 1` and null streams, `body_omitted` contradicting the count, or a
+`command` unrelated to the authored definition, while the reducer routes on
+`status`. Not reachable through `main()`, which hard-wires the production runner.
+Correction (code + tests), local to `observation_error`::
+. `pass` requires `exit_code == 0`, `fail` requires `exit_code > 0`; both require
+  `signal is None` and complete stream facts (the successor of `pass/fail requires
+  digest`); `error` requires a non-null `error_class`;
+. each stream triple is all-`null` or (non-boolean integer `>= 0`, 64-character
+  lowercase hex, `body_omitted == (count > 0)`);
+. a non-empty `command` has `command[1:] == authored_argv[1:]`;
+. extend the parametrized malformed-observation hard-stop test with one case per
+  rule.
+Keep it a small boundary helper; do not add type introspection beyond these
+record invariants.
+
+=== INFO / WATCH (non-gating)
+
+[cols="1,6",options="header"]
+|===
+|ID |Observation
+
+|A2-IR-W1
+|`resolve_executable` continues only on `FileNotFoundError`, `NotADirectoryError`,
+`PermissionError` and its own error; ELOOP/ENAMETOOLONG abort the PATH search and
+escape `prepare_evidence_commands`/`_preflight` as raw `OSError`. `main()` still
+returns 2 before any side effect. Treating any candidate `OSError` as non-resolving
+and wrapping the final failure would match "searched in order" and the deliberate
+diagnostic; optional, may ride with M1.
+
+|A2-IR-W2
+|`os.path.abspath` normalizes `..` lexically, so `./link/../tool` through a
+symlinked directory executes a different file than kernel resolution would. The
+executed path equals the recorded invocation path and the canonical path is
+truthful, so the audit is not misleading. Dropping normalization would restore
+exact POSIX meaning; watch only.
+
+|A2-IR-W3
+|If an evidence command makes HEAD unresolvable, the post-evidence
+`observe_repository()` raises; `recover_uncertain` also fails; `main()` writes the
+failure summary and returns 1 with the dispatch marker retained. No false success,
+but that Hop's observations are not published and the failure summary reports
+`invocation_id: not_dispatched`, `run_status: ready`. Same family as contract
+review W6, newly reachable only by evidence commands that destroy HEAD. Optional
+hardening: project a re-observation failure as `repository_anomaly`.
+
+|A2-IR-W4
+|`run_one_hop`/`run_real_one_hop`/`run_serial_hops` default to the fail-closed
+runner and no prepared commands; a direct caller that omits them fails with
+`RuntimeError`/`KeyError` only after `adapter.execute`, then enters uncertain-
+dispatch recovery. Nothing executes without preparation; `main()` and the proof
+harness supply both. A pre-dispatch check `phase.evidence <= evidence_commands`
+would move the failure before the adapter; optional.
+
+|A2-IR-W5
+|13.2 enumerates summaries (`exit`, `timeout`, `signal`, `resolution_error`,
+`spawn_error`) but requires infrastructure failure to be a classified `error`; the
+implementation uses `communication_error:<class>`. Coordinator-generated and
+bounded; a contract under-specification, not an implementation defect.
+
+|A2-IR-W6
+|Test precision: (a) argv/PATH digest tests compare the implementation with
+itself; add pinned vectors, preferably with M2; (b) no runtime
+non-executable-after-admission test; (c) resolution refusal is tested at the
+preparation helper, not through `_preflight`; (d) unused-unresolvable definition is
+not tested through `_preflight`; (e) the integration test parametrizes the two
+bundle names instead of asserting the discovered set under
+`docs/ai_info/workflows/dogfood`; (f) Git-truth tests use an injected runner.
+Review probes confirm correct behavior for (a)-(f).
+
+|A2-IR-W7
+|`_prepared_evidence_plan` repeats the literal `coordinator-inherited-environment-v1`
+(`operator.py:488`) instead of `ENVIRONMENT_POLICY`, and duplicates the
+`StatFingerprint` projection of `observation_to_data`. `observation_error` has one
+unreachable second identity check. Cosmetic drift risk.
+
+|A2-IR-W8
+|FTR 13.2 "Status" and "Verdict and next action" and the readiness artifact still
+state that implementation is unauthorized. Maintainer docs follow-up, as for
+A1-IR-W5.
+|===
+
+Non-findings:: The operator plan keeps `schema_version: 1` while gaining the
+`evidence` block, as 13.2 directs; checkpoint has no version and no reader;
+`not_run` diagnostic API was removed, which 13.2 permits ("may retain"); `ruff
+format` is not enforced in this repository (13 of the 19 pre-existing touched
+Python files were already non-compliant before A2), and `ruff check` passes.
+
+== 6. Smallest correction set
+
+[cols="1,4,2",options="header"]
+|===
+|ID |Correction |Requires
+
+|M1
+|Runtime timeout guard in `prepare_evidence_commands` using
+`COORDINATOR_HARD_MAX_EVIDENCE_TIMEOUT_SECONDS`; parametrized in-memory refusal test.
+|code + tests
+
+|M2
+|Outcome/stream/argv-tail coherence rules in `observation_error`; extend the
+malformed-observation hard-stop test.
+|code + tests
+|===
+
+No docs change is required for M1/M2. W1 and W6a may ride along at the
+implementer's discretion; nothing else is requested.
+
+== 7. Validation
+
+[source,text]
+----
+git rev-parse HEAD / branch / status               -> c5360442..., main, clean
+git diff --check bc44a68e..c5360442                -> clean
+.venv/bin/ruff check <changed *.py> and the coordinator package/tests
+                                                   -> All checks passed
+.venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/workflow_coordinator tests/integration/workflow_coordinator
+                                                   -> 318 collected, exit 0
+.venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/architecture/semantic_invariants/test_workflow_coordinator_replays.py \
+  tests/unit/workflow_coordinator/test_proof_harness.py
+                                                   -> exit 0
+PATH=<scratch codex shim, exit 97>:$PATH \
+  .venv/bin/python -m pytest -q -p no:cacheprovider -x tests
+                                                   -> 3284 collected, exit 0;
+                                                      shim marker never written
+asciidoctor --failure-level WARN <this artifact>   -> no warnings
+----
+
+Review probes (section 4) ran as scratch scripts and scratch pytest files that
+import the repository's own fixtures; no repository file was modified.
+Provider-capable Coordinator invocations with a real provider: *0*.
+
+== 8. Release-notes checkpoint
+
+The implementation adds one bullet under the active unreleased section
+(`== unknown -- planned`) describing the v3 policy surface, removal of
+`evidence_states` and the registry, and v1/v2 rejection without migration
+machinery. The Coordinator is internal tooling under `scripts/`; the bullet is
+accurate, correctly placed, and no Known-limitations change is due.
+
+== 9. Lifecycle cleanup check
+
+* `FTR-AGENT-WORKFLOW-COORDINATOR-P5` stays open: A2 is one carve-out; A3, A4' and
+  later work remain. No `Done` status, no `_ftrs_open.adoc` change, no cold-storage
+  move.
+* After the M1/M2 correction is accepted, a maintainer docs follow-up should
+  record A2 as implemented and accepted in FTR 13.2 and the readiness artifact
+  (W8).
+* No residual scope requires a new FTR; W1-W7 are optional or watch-only.
+* No cleanup performed here (read-only review).
+
+== 10. Exact next action
+
+Apply the bounded M1 and M2 corrections (code + tests only) in one commit, then run
+one focused delta re-review of M1/M2. On acceptance, the A2 implementation-review
+loop closes and the maintainer records A2 as complete. A3/A4'/extraction remain
+outside this review.
