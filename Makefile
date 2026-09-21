@@ -49,11 +49,13 @@ DEPS_STAMP   := $(STAMP_DIR)/deps
 DEV_STAMP    := $(STAMP_DIR)/dev
 PROJECT_MEMORY_STAMP := $(STAMP_DIR)/project-memory.ok
 DOMAIN_CONTRACTS_STAMP := $(STAMP_DIR)/domain-contracts.ok
+WFC_STAMP   := $(STAMP_DIR)/workflow-coordinator.ok
 
 DEPS_INPUTS  := pyproject.toml
 DEV_INPUTS   := pyproject.toml
 PROJECT_MEMORY_INPUTS := pyproject.toml
 DOMAIN_CONTRACTS_INPUTS := pyproject.toml
+WFC_INPUTS  := requirements/workflow-coordinator.txt
 
 VERBOSE      ?= TRUE
 LOG_OPTS     ?= -o log_cli=true -o log_cli_level=DEBUG
@@ -130,6 +132,16 @@ deps-dev: venv $(DEV_STAMP) ## Ensure dev deps installed (runs only when pyproje
 
 .PHONY: setup
 setup: $(DEV_STAMP) ## Install dev environment (same as deps-dev, convenience alias)
+
+$(WFC_STAMP): $(WFC_INPUTS) | $(DEV_STAMP)
+	@mkdir -p "$(STAMP_DIR)"
+	@echo "Installing exact Workflow Coordinator tooling pin..."
+	@GIT_SSH_COMMAND='ssh -o BatchMode=yes' GIT_TERMINAL_PROMPT=0 \
+		tools/pip_install_spec.sh -p "$(PYTHON)" -s '-r requirements/workflow-coordinator.txt' $(PIP_VERBOSE_FLAG)
+	@touch "$(WFC_STAMP)"
+
+.PHONY: wfc-setup
+wfc-setup: $(WFC_STAMP) ## Install the opt-in exact Workflow Coordinator tooling pin
 
 .PHONY: clean
 clean: ## Remove caches and build artifacts

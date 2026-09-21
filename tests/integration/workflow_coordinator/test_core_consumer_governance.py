@@ -1,179 +1,295 @@
-"""Committed-core coherence at the production A1/A2 admission boundary."""
+"""Black-box Core consumer acceptance through the installed ``wfc`` CLI."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+import importlib.metadata
+import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
-from scripts.workflow_coordinator.evidence import prepare_evidence_commands
-from scripts.workflow_coordinator.adapter import Invocation
-from scripts.workflow_coordinator.model import new_run
-from scripts.workflow_coordinator.operator import (
-    _admit_a1,
-    _selected_evidence_names,
-    _selected_ids,
-)
-from scripts.workflow_coordinator.serialization import (
-    ValidationError,
-    component_manifest_from_yaml,
-    repository_policy_from_yaml,
-    work_item_from_yaml,
-    workflow_profile_from_yaml,
-)
-from scripts.workflow_coordinator.prompt import (
-    PromptComponent,
-    assemble_prompt,
-    load_agent_operating_contract,
-)
 
 pytestmark = pytest.mark.ftr("FTR-AGENT-WORKFLOW-COORDINATOR-P5")
 
-REPOSITORY = Path(__file__).resolve().parents[3]
-DOGFOOD = REPOSITORY / "docs/ai_info/workflows/dogfood"
-A3_RESERVED_PATH = "scripts/workflow_coordinator/resources/agent_operating_contract_v1.txt"
-
-
-@pytest.mark.parametrize(
-    ("bundle_name", "expected_governing_count"),
-    [
-        ("dmc_fk_c3_wi02", 9),
-        ("ior04_formula_sink_capability", 8),
-    ],
+CORE_ROOT = Path(__file__).resolve().parents[3]
+DOGFOOD_ROOT = CORE_ROOT / "docs/ai_info/workflows/dogfood"
+BUNDLES = ("dmc_fk_c3_wi02", "ior04_formula_sink_capability")
+DMC_ARTIFACT = (
+    "docs/warm_storage/global_reviews/"
+    "domain_fk_reference_helper_family_cycle3_missing_target_id_identity_assessment_2026-09-11.adoc"
 )
-def test_current_core_consumer_bundle_is_admitted_by_its_v3_policy(
-    bundle_name, expected_governing_count
-):
-    bundle = DOGFOOD / bundle_name
-    supplied = {
-        name: bundle / filename
-        for name, filename in (
-            ("work_item", "work_item.yaml"),
-            ("profile", "profile.yaml"),
-            ("policy", "repository_policy.yaml"),
-            ("components", "components.yaml"),
-            ("task", "task.txt"),
-        )
+
+
+def _git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        ("git", "-C", str(repository), *args),
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def _wfc() -> str:
+    try:
+        importlib.metadata.distribution("workflow-coordinator")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("workflow-coordinator distribution is not installed locally")
+    executable = Path(sys.executable).with_name("wfc")
+    assert executable.is_file()
+    return str(executable)
+
+
+def _copy_core_file(repository: Path, relative_path: str) -> None:
+    source = CORE_ROOT / relative_path
+    assert source.is_file(), relative_path
+    destination = repository / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def _seed_repository(tmp_path: Path, bundle_name: str) -> tuple[Path, dict[str, str]]:
+    repository = tmp_path / f"{bundle_name}-consumer-repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", str(repository)), check=True, capture_output=True)
+    _git(repository, "config", "user.email", "core-consumer@example.invalid")
+    _git(repository, "config", "user.name", "Core consumer fixture")
+
+    bundle_relative = f"docs/ai_info/workflows/dogfood/{bundle_name}"
+    paths = {
+        "work_item": f"{bundle_relative}/work_item.yaml",
+        "profile": f"{bundle_relative}/profile.yaml",
+        "policy": f"{bundle_relative}/repository_policy.yaml",
+        "components": f"{bundle_relative}/components.yaml",
+        "task": f"{bundle_relative}/task.txt",
     }
-    texts = {name: path.read_text(encoding="utf-8") for name, path in supplied.items()}
-    item = work_item_from_yaml(texts["work_item"])
-    profile = workflow_profile_from_yaml(texts["profile"])
-    policy = repository_policy_from_yaml(texts["policy"])
-    manifest = component_manifest_from_yaml(texts["components"])
-    selected_component_paths = tuple(
-        manifest[component_id].path for component_id in _selected_ids(profile)
-    )
-    governing_paths = (
-        tuple(path.relative_to(REPOSITORY).as_posix() for path in supplied.values())
-        + selected_component_paths
-    )
+    for path in paths.values():
+        _copy_core_file(repository, path)
 
-    assert len(governing_paths) == expected_governing_count
-    assert {"docs/ai_info", A3_RESERVED_PATH} <= set(policy.governance_paths)
-    assert policy.work_item_scope_ceiling == item.scope
-    assert policy.max_autonomous_hops == item.max_autonomous_hops
-    assert policy.schema_version == 3
-    assert policy.revision == "r2"
-    assert tuple(policy.evidence_commands) == ("diff_hygiene", "git_version")
-    assert policy.evidence_commands["diff_hygiene"].argv == (
-        "git", "diff", "--check"
-    )
-    assert policy.evidence_commands["diff_hygiene"].timeout_seconds == 30
-    assert policy.evidence_commands["git_version"].argv == ("git", "--version")
-    assert policy.evidence_commands["git_version"].timeout_seconds == 10
-    assert all(
-        phase.evidence == ("diff_hygiene", "git_version")
-        for phase in profile.phases.values()
-    )
+    manifest = yaml.safe_load((repository / paths["components"]).read_text(encoding="utf-8"))
+    for reference in manifest["components"].values():
+        _copy_core_file(repository, reference["path"])
 
-    _admit_a1(item, profile, policy, governing_paths)
-    selected = _selected_evidence_names(profile, policy)
-    prepared = prepare_evidence_commands(
-        selected, policy.evidence_commands, REPOSITORY
-    )
-    assert selected == ("diff_hygiene", "git_version")
-    assert tuple(command.command_name for command in prepared) == selected
-    assert all(Path(command.admission_resolution.invocation_path).is_absolute() for command in prepared)
-    assert all(command.timeout_seconds <= 900 for command in prepared)
+    artifact = CORE_ROOT / DMC_ARTIFACT
+    if bundle_name == "dmc_fk_c3_wi02" and artifact.exists():
+        _copy_core_file(repository, DMC_ARTIFACT)
 
-    assert A3_RESERVED_PATH not in governing_paths
-    assert all(reference.path != A3_RESERVED_PATH for reference in manifest.values())
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", f"test: seed real Core {bundle_name} bundle")
+    return repository, paths
 
 
-@pytest.mark.parametrize(
-    "bundle_name",
-    ["dmc_fk_c3_wi02", "ior04_formula_sink_capability"],
-)
-def test_operating_contract_precedes_git_component_in_every_real_consumer_phase(bundle_name):
-    bundle = DOGFOOD / bundle_name
-    texts = {
-        name: (bundle / filename).read_text(encoding="utf-8")
-        for name, filename in (
-            ("work_item", "work_item.yaml"),
-            ("profile", "profile.yaml"),
-            ("policy", "repository_policy.yaml"),
-            ("components", "components.yaml"),
-            ("task", "task.txt"),
-        )
+def _command(
+    repository: Path,
+    state_root: Path,
+    paths: dict[str, str],
+    executable: Path,
+    *,
+    durable_artifact: str | None = None,
+) -> list[str]:
+    command = [
+        _wfc(),
+        "--repository",
+        str(repository),
+        "--state-root",
+        str(state_root),
+        "--expected-head",
+        _git(repository, "rev-parse", "HEAD"),
+        "--work-item",
+        paths["work_item"],
+        "--profile",
+        paths["profile"],
+        "--policy",
+        paths["policy"],
+        "--components",
+        paths["components"],
+        "--task",
+        paths["task"],
+        "--timeout-seconds",
+        "10",
+        "--executable",
+        str(executable),
+    ]
+    if durable_artifact is not None:
+        command.extend(("--durable-artifact", durable_artifact))
+    return command
+
+
+def _run(command: list[str], blocker_dir: Path) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["PATH"] = f"{blocker_dir}{os.pathsep}{environment['PATH']}"
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        env=environment,
+    )
+
+
+@pytest.fixture
+def provider_block(tmp_path: Path) -> tuple[Path, Path]:
+    blocker_dir = tmp_path / "provider-block"
+    sentinel = tmp_path / "provider-invoked"
+    blocker_dir.mkdir()
+    body = f"#!/bin/sh\nprintf invoked > {sentinel!s}\nexit 97\n"
+    for name in ("codex", "claude"):
+        path = blocker_dir / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    yield blocker_dir, sentinel
+    assert not sentinel.exists(), "a real-provider command path was invoked"
+
+
+@pytest.fixture(autouse=True)
+def live_core_remains_read_only() -> None:
+    before_head = _git(CORE_ROOT, "rev-parse", "HEAD")
+    before_status = _git(CORE_ROOT, "status", "--porcelain=v1", "-uall")
+    yield
+    assert _git(CORE_ROOT, "rev-parse", "HEAD") == before_head
+    assert _git(CORE_ROOT, "status", "--porcelain=v1", "-uall") == before_status
+
+
+@pytest.mark.parametrize("bundle_name", BUNDLES)
+def test_real_core_bundle_rejection_has_no_state(
+    tmp_path: Path, provider_block: tuple[Path, Path], bundle_name: str
+) -> None:
+    blocker_dir, _ = provider_block
+    repository, paths = _seed_repository(tmp_path, bundle_name)
+    policy_path = repository / paths["policy"]
+    policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    policy["governance_paths"] = ["intentionally/rejected"]
+    policy_path.write_text(yaml.safe_dump(policy, sort_keys=False), encoding="utf-8")
+    _git(repository, "add", paths["policy"])
+    _git(repository, "commit", "-m", "test: reject governing inputs")
+
+    state_root = tmp_path / f"{bundle_name}-rejected-state"
+    result = _run(_command(repository, state_root, paths, blocker_dir / "codex"), blocker_dir)
+    assert result.returncode == 2, result.stderr
+    assert not state_root.exists()
+
+
+@pytest.mark.parametrize("bundle_name", BUNDLES)
+def test_real_core_bundle_admission_records_governance_and_evidence(
+    tmp_path: Path, provider_block: tuple[Path, Path], bundle_name: str
+) -> None:
+    blocker_dir, _ = provider_block
+    repository, paths = _seed_repository(tmp_path, bundle_name)
+    failing_fake = tmp_path / f"{bundle_name}-admitted-fake"
+    failing_fake.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+    failing_fake.chmod(0o755)
+    state_root = tmp_path / f"{bundle_name}-admitted-state"
+
+    result = _run(
+        _command(
+            repository,
+            state_root,
+            paths,
+            failing_fake,
+            durable_artifact=(
+                DMC_ARTIFACT if bundle_name == "dmc_fk_c3_wi02" else None
+            ),
+        ),
+        blocker_dir,
+    )
+    assert result.returncode == 1, result.stderr
+    plan = json.loads((state_root / "operator-plan.json").read_text(encoding="utf-8"))
+    assert plan["inputs"] == {**paths, "pinned_revision": _git(repository, "rev-parse", "HEAD")}
+    assert set(plan["governing_inputs"]) == set(paths.values()) | {
+        value["path"]
+        for value in yaml.safe_load(
+            (repository / paths["components"]).read_text(encoding="utf-8")
+        )["components"].values()
     }
-    item = work_item_from_yaml(texts["work_item"])
-    profile = workflow_profile_from_yaml(texts["profile"])
-    policy = repository_policy_from_yaml(texts["policy"])
-    manifest = component_manifest_from_yaml(texts["components"])
-    contract = load_agent_operating_contract()
-    loaded_components = {
-        component_id: PromptComponent(
-            component_id,
-            reference.path,
-            "HEAD",
-            (REPOSITORY / reference.path).read_text(encoding="utf-8"),
-        )
-        for component_id, reference in manifest.items()
+    assert all(plan["governing_inputs"].values())
+    assert [item["command_name"] for item in plan["evidence"]["selected_commands"]] == [
+        "diff_hygiene",
+        "git_version",
+    ]
+    assert all(item["argv_digest"] for item in plan["evidence"]["selected_commands"])
+    assert plan["agent_operating_contract"]["sha256"]
+
+
+def test_dmc_bundle_completes_one_truthful_coordinator_owned_hop(
+    tmp_path: Path, provider_block: tuple[Path, Path]
+) -> None:
+    blocker_dir, _ = provider_block
+    repository, paths = _seed_repository(tmp_path, "dmc_fk_c3_wi02")
+    fake = tmp_path / "fake-dmc-agent"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+args = sys.argv[1:]
+repository = pathlib.Path(args[args.index("--cd") + 1])
+output = pathlib.Path(args[args.index("--output-last-message") + 1])
+prompt = sys.stdin.read()
+artifact = repository / """ + repr(DMC_ARTIFACT) + """
+artifact.parent.mkdir(parents=True, exist_ok=True)
+artifact.write_text("= Disposable DMC assessment\\n\\nNO SAFE SLICE SELECTED.\\n", encoding="utf-8")
+
+def fact(name):
+    return prompt.split(name + "=", 1)[1].split("\\n", 1)[0]
+
+output.write_text(json.dumps({
+    "schema_version": 1,
+    "run_id": fact("run_id"),
+    "hop_id": fact("hop_id"),
+    "invocation_id": fact("invocation_id"),
+    "result": {
+        "schema_version": 1,
+        "outcome": "completed",
+        "requested_route": "complete",
+        "scope_changed": False,
+        "requires_human": False,
+        "escalation": None,
+        "findings": [],
+        "claimed_commits": [],
+        "commit_intent": {
+            "paths": [""" + repr(DMC_ARTIFACT) + """],
+            "subject": "docs(domain): DMC-FK-C3-WI02 H001 assess missing target IDs"
+        },
+        "evidence_refs": ["diff_hygiene", "git_version"],
+        "summary": "Disposable Core consumer proof completed."
     }
-    initial = new_run(item, profile, policy, run_id="RUN-A3-CONSUMER", baseline_head="HEAD")
-    for phase_key, phase in profile.phases.items():
-        run = replace(initial, phase=phase_key)
-        package = assemble_prompt(
-            run,
-            phase,
-            loaded_components,
-            agent_operating_contract=contract,
-            invocation=Invocation("RUN-A3-CONSUMER", "H001", f"INV-{phase_key}"),
-            task_payload=texts["task"],
-        )
-        git_component = next(
-            loaded_components[component_id]
-            for component_id in _selected_ids(profile)
-            if loaded_components[component_id].path == "docs/ai_info/git_and_workflow.adoc"
-        )
-        assert package.text.count(contract.text) == 1
-        assert package.text.index(contract.text) < package.text.index(git_component.content)
+}), encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    state_root = tmp_path / "dmc-completed-state"
+    seed_head = _git(repository, "rev-parse", "HEAD")
 
-
-@pytest.mark.parametrize(
-    ("loader", "text"),
-    [
-        (
-            work_item_from_yaml,
-            "schema_version: 1\nwork_item_id: WI\nauthority_source: x\n"
-            "profile_ref: p\nrepository: r\nscope: [x]\ninitial_phase: p\n"
-            "max_autonomous_hops: 1\nagent_operating_contract: replacement\n",
+    result = _run(
+        _command(
+            repository,
+            state_root,
+            paths,
+            fake,
+            durable_artifact=DMC_ARTIFACT,
         ),
-        (
-            repository_policy_from_yaml,
-            "schema_version: 3\npolicy_id: p\nrevision: r\nscope: [r]\n"
-            "governance_paths: [x]\nwork_item_scope_ceiling: [x]\n"
-            "max_autonomous_hops: 1\nactions: []\nevidence_commands: {}\n"
-            "agent_operating_contract: replacement\n",
-        ),
-        (
-            component_manifest_from_yaml,
-            "schema_version: 1\ncomponents: {}\n"
-            "agent_operating_contract: replacement\n",
-        ),
-    ],
-)
-def test_consumer_schemas_reject_operating_contract_selector(loader, text):
-    with pytest.raises(ValidationError, match="unknown"):
-        loader(text)
+        blocker_dir,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((state_root / "operator-summary.json").read_text(encoding="utf-8"))
+    assert summary["run_status"] == "completed"
+    assert summary["hop_used"] == 1
+    assert summary["worktree_clean"] is True
+    assert summary["changed_paths"] == [DMC_ARTIFACT]
+    assert len(summary["commits"]) == 1
+    observations = summary["execution_evidence"][0]["trusted_observations"]
+    assert [(item["command_name"], item["status"]) for item in observations] == [
+        ("diff_hygiene", "pass"),
+        ("git_version", "pass"),
+    ]
+    assert _git(repository, "rev-parse", "HEAD") != seed_head
+    assert _git(repository, "log", "-1", "--format=%s") == (
+        "docs(domain): DMC-FK-C3-WI02 H001 assess missing target IDs"
+    )
+    assert _git(repository, "status", "--porcelain") == ""
