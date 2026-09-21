@@ -74,9 +74,13 @@ def _seed_repository(tmp_path: Path, bundle_name: str) -> tuple[Path, dict[str, 
     for reference in manifest["components"].values():
         _copy_core_file(repository, reference["path"])
 
-    artifact = CORE_ROOT / DMC_ARTIFACT
-    if bundle_name == "dmc_fk_c3_wi02" and artifact.exists():
-        _copy_core_file(repository, DMC_ARTIFACT)
+    if bundle_name == "dmc_fk_c3_wi02":
+        # The DMC Hop must create this durable artifact; the seed must not contain it.
+        assert not (CORE_ROOT / DMC_ARTIFACT).exists(), (
+            "DMC durable artifact unexpectedly exists in live Core; "
+            "this fixture proves creation, not overwrite"
+        )
+        assert not (repository / DMC_ARTIFACT).exists()
 
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", f"test: seed real Core {bundle_name} bundle")

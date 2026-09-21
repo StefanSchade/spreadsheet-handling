@@ -8,6 +8,7 @@ import importlib.metadata
 import json
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -133,7 +134,10 @@ def test_installed_import_and_wfc_entry_point_resolve_outside_core() -> None:
     distribution = _distribution()
     package = importlib.import_module("workflow_coordinator")
     package_path = Path(package.__file__).resolve()
-    assert not package_path.is_relative_to(CORE_ROOT)
+    purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
+    assert package_path.is_relative_to(purelib)
+    assert not package_path.is_relative_to(CORE_ROOT / "scripts")
+    assert not package_path.is_relative_to(CORE_ROOT / "src")
     assert "scripts/workflow_coordinator" not in package_path.as_posix()
 
     entry_points = [
