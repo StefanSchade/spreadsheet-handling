@@ -16,6 +16,8 @@ from typing import Any
 
 import pandas as pd
 
+from spreadsheet_handling.domain.relation_keys import relation_key_identity
+
 Frames = dict[str, Any]
 
 _VALUE_MODES = {"value", "values"}
@@ -69,7 +71,15 @@ def _lookup_frame_has_duplicate_keys(lookup_df: pd.DataFrame, join_keys: list[st
     lookup frame currently looks like, which may differ from enrichment
     time). Private; never exported through the package facade.
     """
-    return bool(lookup_df.duplicated(subset=join_keys, keep=False).any())
+    # pandas duplicate detection can coerce categories and treats Missing as a
+    # value, neither of which implements the Domain relation-key contract.
+    key_values = (lookup_df[key].tolist() for key in join_keys)
+    identities = [
+        relation_key_identity(*components)
+        for components in zip(*key_values, strict=True)
+    ]
+    eligible_identities = [identity for identity in identities if identity is not None]
+    return len(eligible_identities) != len(set(eligible_identities))
 
 
 def _resolve_policy(lookup: str, frames: Frames) -> dict[str, Any] | None:

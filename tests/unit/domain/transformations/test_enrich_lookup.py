@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -349,6 +350,91 @@ def test_enrich_lookup_rejects_duplicate_lookup_keys() -> None:
             output="result",
             on="ID",
             helpers={"fields": ["label"]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_key", "lookup_key", "expected"),
+    [
+        (" 1 ", "1", ""),
+        (1, "1", ""),
+        (1.0, 1, "matched"),
+        (np.int64(1), 1, "matched"),
+        (True, 1, ""),
+        ("", "", ""),
+        (None, None, ""),
+    ],
+)
+def test_enrich_lookup_uses_relation_key_identity(
+    source_key: object, lookup_key: object, expected: str,
+) -> None:
+    source = pd.DataFrame({"id": [source_key]})
+    lookup = pd.DataFrame({"id": [lookup_key], "label": ["matched"]})
+    frames = {"source": source, "lookup": lookup}
+
+    out = enrich_lookup(
+        frames,
+        source="source",
+        lookup="lookup",
+        output="result",
+        key="id",
+        helpers={"fields": ["label"]},
+        missing="empty",
+    )
+
+    assert out["result"].loc[0, "label"] == expected
+    # B-2's existing whole-frame Missing rewrite is intentionally unchanged;
+    # check the caller-owned source carrier rather than expanding this slice.
+    assert source.loc[0, "id"] == source_key
+    assert lookup.loc[0, "id"] == lookup_key
+
+
+def test_enrich_lookup_missing_fail_handles_mixed_pandas_key_dtypes() -> None:
+    frames = {
+        "source": pd.DataFrame({"id": [1]}),
+        "lookup": pd.DataFrame({"id": ["1"], "label": ["matched"]}),
+    }
+
+    with pytest.raises(ValueError, match="no match in lookup"):
+        enrich_lookup(
+            frames,
+            source="source",
+            lookup="lookup",
+            output="result",
+            key="id",
+            helpers={"fields": ["label"]},
+            missing="fail",
+        )
+
+
+@pytest.mark.parametrize(
+    ("keys", "raises"),
+    [
+        ([1, 1.0], True),
+        ([1, "1"], False),
+        ([True, 1], False),
+        ([None, None], False),
+        (["", ""], False),
+    ],
+)
+def test_enrich_lookup_duplicate_keys_use_relation_key_identity(
+    keys: list[object], raises: bool,
+) -> None:
+    frames = {
+        "source": pd.DataFrame({"id": [1]}),
+        "lookup": pd.DataFrame({"id": keys, "label": ["a", "b"]}),
+    }
+
+    if raises:
+        with pytest.raises(ValueError, match="duplicate keys"):
+            enrich_lookup(
+                frames, source="source", lookup="lookup", output="result",
+                key="id", helpers={"fields": ["label"]}, missing="empty",
+            )
+    else:
+        enrich_lookup(
+            frames, source="source", lookup="lookup", output="result",
+            key="id", helpers={"fields": ["label"]}, missing="empty",
         )
 
 

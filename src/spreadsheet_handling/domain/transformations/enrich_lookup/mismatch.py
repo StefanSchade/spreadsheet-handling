@@ -55,6 +55,7 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.core.formulas import LookupFormulaSpec
+from spreadsheet_handling.domain.relation_keys import RelationKeyIdentity, relation_key_identity
 
 from .policy import _lookup_frame_has_duplicate_keys
 from .provenance import InterpretedEnrichLookupProvenance
@@ -196,7 +197,7 @@ def _column_mismatch_indices(
     payload_keys: list[str],
     lookup_key: str,
     lookup_name: str,
-    canonical: dict[tuple[Any, ...], dict[str, Any]],
+    canonical: dict[RelationKeyIdentity, dict[str, Any]],
 ) -> tuple[list[Any], list[Any]]:
     """Per-row, per-cell dispatch: formula cells compare structurally, plain
     scalars compare against the canonical lookup value. Multi-key formula
@@ -207,15 +208,20 @@ def _column_mismatch_indices(
     value_mismatching: list[Any] = []
     formula_mismatching: list[Any] = []
     expected_formula = (lookup_name, payload_keys[0], lookup_key, helper_col)
-    for row_index, row in payload.iterrows():
-        key = tuple(_norm(row[k]) for k in payload_keys if k in payload.columns)
-        if len(key) != len(payload_keys):
+    payload_key_values = (payload[key].tolist() for key in payload_keys)
+    for row_position, (row_index, components) in enumerate(
+        zip(payload.index, zip(*payload_key_values, strict=True), strict=True)
+    ):
+        # String conversion and pandas equality cannot establish relation-key
+        # identity; the owner also excludes Missing payload keys from matching.
+        key = relation_key_identity(*components)
+        if key is None:
             continue
         canonical_row = canonical.get(key)
         if canonical_row is None:
             continue  # unresolved reference is a separate concern (Section 6.2)
 
-        cell = row[helper_col]
+        cell = payload[helper_col].iloc[row_position]
         if isinstance(cell, LookupFormulaSpec):
             actual_formula = (
                 cell.lookup_sheet,
@@ -226,7 +232,9 @@ def _column_mismatch_indices(
             if actual_formula != expected_formula:
                 formula_mismatching.append(row_index)
         else:
-            if _norm(cell) != _norm(canonical_row.get(helper_col)):
+            if _helper_payload_comparison_value(cell) != _helper_payload_comparison_value(
+                canonical_row.get(helper_col)
+            ):
                 value_mismatching.append(row_index)
     return value_mismatching, formula_mismatching
 
@@ -236,15 +244,29 @@ def _canonical_value_map(
     *,
     on_keys: list[str],
     helper_cols: list[str],
-) -> dict[tuple[Any, ...], dict[str, Any]]:
-    canonical: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for _, row in lookup_df.iterrows():
-        key = tuple(_norm(row[k]) for k in on_keys)
-        canonical[key] = {col: row[col] for col in helper_cols if col in lookup_df.columns}
+) -> dict[RelationKeyIdentity, dict[str, Any]]:
+    canonical: dict[RelationKeyIdentity, dict[str, Any]] = {}
+    key_values = (lookup_df[column].tolist() for column in on_keys)
+    for row_position, components in enumerate(zip(*key_values, strict=True)):
+        # Local string tokens would trim and coerce categories; use the shared
+        # owner so mismatch verification agrees with enrichment and duplicates.
+        key = relation_key_identity(*components)
+        if key is None:
+            continue
+        canonical[key] = {
+            col: lookup_df[col].iloc[row_position]
+            for col in helper_cols
+            if col in lookup_df.columns
+        }
     return canonical
 
 
-def _norm(value: Any) -> str | None:
+def _helper_payload_comparison_value(value: Any) -> str | None:
+    """Return Lookup's local display-value comparison representation.
+
+    This deliberately remains distinct from relation-key identity: it compares
+    a materialized helper payload to the lookup field selected by a key.
+    """
     if value is None:
         return None
     try:

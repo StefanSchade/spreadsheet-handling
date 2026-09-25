@@ -737,7 +737,7 @@ def test_symmetric_valid_on_still_passes_and_detects_edit() -> None:
 
 
 @_asym
-def test_asymmetric_null_key_valid_and_edit_detected() -> None:
+def test_asymmetric_null_key_is_not_verified_as_a_relation_key() -> None:
     stories = pd.DataFrame([
         {"id": None, "title": "NullKey"},
         {"id": "s2", "title": "Second"},
@@ -755,9 +755,55 @@ def test_asymmetric_null_key_valid_and_edit_detected() -> None:
     frames = {"_meta": meta, "stories": stories, "matrix": matrix}
     out = apply_derived_column_policy(frames, source="matrix", policy="warn_on_mismatch")
     findings = out["derived_column_findings"]
-    # The null-keyed edited row is detected against the null-keyed canonical row.
-    assert len(findings) == 1
-    assert findings.iloc[0]["rule_type"] == "derived_value_mismatch"
+    # Missing values never participate in relation-key identity, so the
+    # unresolved null-keyed payload row remains unchecked by this evaluator.
+    assert findings.empty
+
+
+@_asym
+def test_asymmetric_mismatch_identity_does_not_coerce_number_to_string() -> None:
+    stories = pd.DataFrame([{"id": "1", "title": "Canonical"}])
+    matrix = pd.DataFrame([{"story_id": 1, "title": "EDITED", "dyn": "a"}])
+    meta = {
+        "derived": {"sheets": {"matrix": {"enrich_lookup": {
+            "lookup": "stories", "source_key": "story_id", "lookup_key": "id",
+            "helper_columns": ["title"],
+        }}}}
+    }
+
+    out = apply_derived_column_policy(
+        {"_meta": meta, "stories": stories, "matrix": matrix},
+        source="matrix",
+        policy="warn_on_mismatch",
+    )
+
+    # Relation-key identity keeps Number and String separate; unresolved
+    # payload rows remain unchecked by Lookup mismatch verification.
+    assert out["derived_column_findings"].empty
+
+
+@_asym
+def test_asymmetric_missing_lookup_keys_are_not_duplicate_keys() -> None:
+    stories = pd.DataFrame([
+        {"id": None, "title": "Missing one"},
+        {"id": None, "title": "Missing two"},
+        {"id": "s2", "title": "Second"},
+    ])
+    matrix = pd.DataFrame([{"story_id": "s2", "title": "Second", "dyn": "b"}])
+    meta = {
+        "derived": {"sheets": {"matrix": {"enrich_lookup": {
+            "lookup": "stories", "source_key": "story_id", "lookup_key": "id",
+            "helper_columns": ["title"],
+        }}}}
+    }
+
+    out = apply_derived_column_policy(
+        {"_meta": meta, "stories": stories, "matrix": matrix},
+        source="matrix",
+        policy="warn_on_mismatch",
+    )
+
+    assert out["derived_column_findings"].empty
 
 
 def _frames_with_duplicate_lookup_keys():

@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.core.formulas import lookup_formula
+from spreadsheet_handling.domain.relation_keys import relation_key_identity
 
 from .policy import (
     _FORMULA_MODES,
@@ -182,10 +183,15 @@ def enrich_lookup(
             source_df, lookup, source_keys, lookup_keys, fields, missing_mode,
         )
     else:
-        helper_cols = _build_helper_projection(
-            lookup_df, source_keys, lookup_keys, projection_fields,
+        temporary_join_key = _temporary_relation_key_column(source_df, lookup_df)
+        source_with_relation_keys = _with_relation_key_identities(
+            source_df, source_keys, temporary_join_key,
         )
-        enriched = source_df.merge(helper_cols, on=source_keys, how="left")
+        helper_cols = _build_helper_projection(
+            lookup_df, source_keys, lookup_keys, projection_fields, temporary_join_key,
+        )
+        enriched = source_with_relation_keys.merge(helper_cols, on=temporary_join_key, how="left")
+        enriched = enriched.drop(columns=temporary_join_key)
 
         if missing_mode == "fail":
             _check_unmatched_rows(enriched, source_df, source_keys, fields, source, lookup)
@@ -428,25 +434,61 @@ def _build_helper_projection(
     source_keys: list[str],
     lookup_keys: list[str],
     fields: list[str] | None,
+    temporary_join_key: str,
 ) -> pd.DataFrame:
-    """Project the join key(s) and helper fields from the lookup frame.
-
-    The projection is keyed by the *lookup*-side key name(s) and renamed to the
-    *source*-side name(s) so the caller can merge on the source key. In the
-    symmetric case the rename is a no-op; in the asymmetric case this keeps the
-    lookup-side key name out of the merged output.
-    """
-    projection_fields = [] if fields is None else fields
-    cols = list(dict.fromkeys(lookup_keys + projection_fields))
-    projection = lookup_df.loc[:, cols].copy()
-    rename = {
-        lookup_name: source_name
-        for lookup_name, source_name in zip(lookup_keys, source_keys)
-        if lookup_name != source_name
-    }
-    if rename:
-        projection = projection.rename(columns=rename)
+    """Project lookup helper fields keyed by private relation-key identities."""
+    # A symmetric legacy request may name the join key as a helper. The source
+    # key is already present in the output, as it was when pandas merged on
+    # that key directly, so do not project it a second time under a suffix.
+    projection_fields = [field for field in (fields or []) if field not in source_keys]
+    projection = lookup_df.loc[:, projection_fields].copy()
+    # pandas merge equality and dtype coercion do not implement the Domain
+    # relation-key contract, so only owner-derived eligible identities join.
+    projection.insert(
+        0,
+        temporary_join_key,
+        _relation_key_identities_for_rows(lookup_df, lookup_keys),
+    )
+    projection = projection.loc[projection[temporary_join_key].notna()].copy()
     return projection
+
+
+def _with_relation_key_identities(
+    source_df: pd.DataFrame,
+    source_keys: list[str],
+    temporary_join_key: str,
+) -> pd.DataFrame:
+    """Copy source rows with their private relation-key merge representation."""
+    source_with_relation_keys = source_df.copy()
+    # pandas merge equality and dtype coercion do not implement the Domain
+    # relation-key contract, so source rows delegate identity to the owner.
+    source_with_relation_keys[temporary_join_key] = [
+        *_relation_key_identities_for_rows(source_df, source_keys),
+    ]
+    return source_with_relation_keys
+
+
+def _relation_key_identities_for_rows(
+    frame: pd.DataFrame,
+    key_columns: list[str],
+) -> list[object | None]:
+    """Return owner identities without ``iterrows`` dtype coercion."""
+    # ``iterrows`` can promote mixed numeric columns before delegation. Read
+    # each column independently so the relation-key owner sees its carrier.
+    key_values = (frame[column].tolist() for column in key_columns)
+    return [relation_key_identity(*components) for components in zip(*key_values, strict=True)]
+
+
+def _temporary_relation_key_column(source_df: pd.DataFrame, lookup_df: pd.DataFrame) -> str:
+    """Choose a private join column that cannot collide with caller data."""
+    base_name = "__relation_key_identity__"
+    occupied = set(source_df.columns) | set(lookup_df.columns)
+    temporary_name = base_name
+    suffix = 1
+    while temporary_name in occupied:
+        temporary_name = f"{base_name}{suffix}"
+        suffix += 1
+    return temporary_name
 
 
 def _build_formula_enrichment(
