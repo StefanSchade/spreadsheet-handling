@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from ....core.fk import _materialize_fk_helpers, build_id_value_maps
+from ....core.fk import _materialize_fk_helpers
 from ....frame_keys import copy_reserved_frames, iter_data_frames
 
 from .formula_provider import build_lookup_formula_value_provider
@@ -26,6 +26,7 @@ from .policy import (
     source_frame_has_column,
 )
 from .provenance import _visible_label, _write_helper_provenance
+from .value_provider import build_relation_key_value_provider
 
 Frames = dict[str, Any]
 
@@ -67,7 +68,8 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
     # Fresh configuration always validates that the target frame exists
     # (configure_fk_helpers / infer_fk_relations), so an absent target can only
     # come from a durable relation replayed in a run that did not load that
-    # frame. Enriching it would crash in build_id_value_maps. Skipping is the
+    # frame. Enriching it would make value-mode target resolution impossible.
+    # Skipping is the
     # safe no-op the functional model prescribes ("target frame essential; no
     # enrichment without it") and is part of the Slice 2 replay-safety control.
     known_names = known_data_frame_names(frames)
@@ -86,11 +88,16 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         source_frame = str(relation["source_frame"])
         relations_by_source.setdefault(source_frame, []).append(relation)
 
-    helper_value_provider = (
-        build_lookup_formula_value_provider(target_lookup_index)
-        if helper_value_mode in _FORMULA_HELPER_MODES
-        else None
-    )
+    if helper_value_mode in _FORMULA_HELPER_MODES:
+        helper_value_provider = build_lookup_formula_value_provider(target_lookup_index)
+    else:
+        # Core materializes columns, but Domain owns key equality: pandas and
+        # legacy string keys cannot preserve category-tagged relation identity.
+        helper_value_provider = build_relation_key_value_provider(
+            frames,
+            target_lookup_index,
+            fields_by_target_sheet,
+        )
 
     fk_defs_by_frame: dict[str, list[Any]] = {}
     for frame_name, df in iter_data_frames(frames):
@@ -104,12 +111,6 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
                 continue
             frame_fk_defs.extend(iter_relation_fk_defs(relation))
         fk_defs_by_frame[frame_name] = frame_fk_defs
-
-    id_maps = build_id_value_maps(
-        frames,
-        target_lookup_index,
-        fields_by_sheet=fields_by_target_sheet,
-    )
 
     out: dict[str, Any] = {}
     copy_reserved_frames(frames, out)
@@ -129,7 +130,7 @@ def enrich_helpers(frames: Frames, defaults: dict[str, Any]) -> Frames:
         result = _materialize_fk_helpers(
             df,
             frame_fk_defs,
-            id_maps,
+            {},
             levels,
             helper_prefix="_",
             helper_value_provider=helper_value_provider,

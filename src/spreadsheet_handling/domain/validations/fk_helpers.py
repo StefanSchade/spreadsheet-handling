@@ -31,6 +31,7 @@ from ...frame_keys import iter_data_frames
 from ...core.fk import normalize_sheet_key
 from ...core.indexing import has_level0, level0_series
 from ...core.scalar_values import is_missing_carrier
+from ..relation_keys import RelationKeyIdentity, relation_key_identity
 from ..transformations.fk_helpers import (
     derived_helper_columns_by_sheet,
     missing_fk_policy_error,
@@ -142,11 +143,6 @@ def check_helper_values(
 
     target_value_maps = _build_target_value_maps(frames, expected_by_sheet)
 
-    def _norm(v: Any) -> str | None:
-        if is_missing_carrier(v):
-            return None
-        return str(v).strip()
-
     for sheet_name, df in iter_data_frames(frames):
         expected = expected_by_sheet.get(sheet_name)
         if not expected:
@@ -170,12 +166,14 @@ def check_helper_values(
             for idx, (fk_val, helper_val) in enumerate(
                 zip(fk_series.tolist(), helper_series.tolist())
             ):
-                nk = _norm(fk_val)
-                if nk is None:
+                # Relation keys need category-aware identity; payload display
+                # comparison remains this validator's separate local contract.
+                relation_key = relation_key_identity(fk_val)
+                if relation_key is None:
                     continue
-                expected_val = target_map.get(nk)
-                actual = _norm(helper_val)
-                exp_norm = _norm(expected_val)
+                expected_val = target_map.get(relation_key)
+                actual = _helper_payload_comparison_value(helper_val)
+                exp_norm = _helper_payload_comparison_value(expected_val)
                 if actual != exp_norm:
                     mismatches.append(idx)
 
@@ -205,11 +203,6 @@ def check_unresolvable_fks(
 
     target_id_sets = _build_target_id_sets(frames, expected_by_sheet)
 
-    def _norm(v: Any) -> str | None:
-        if is_missing_carrier(v):
-            return None
-        return str(v).strip()
-
     for sheet_name, df in iter_data_frames(frames):
         expected = expected_by_sheet.get(sheet_name)
         if not expected:
@@ -226,9 +219,12 @@ def check_unresolvable_fks(
             except KeyError:
                 continue
 
+            # Relation-key identity excludes Missing and blocks pandas/string
+            # coercion, while this validator retains only finding policy.
             missing = sorted({
-                str(v) for v in fk_series.dropna().unique()
-                if not is_missing_carrier(v) and _norm(v) not in target_ids
+                str(value) for value in fk_series.tolist()
+                if (identity := relation_key_identity(value)) is not None
+                and identity not in target_ids
             })
             if missing:
                 findings.append(Finding(
@@ -264,9 +260,18 @@ def check_duplicate_ids(
         id_field = target_id_fields.get(sheet_name, fallback_id_field)
         if not has_level0(df, id_field):
             continue
-        ids = level0_series(df, id_field).astype("string")
-        counts = ids.value_counts(dropna=False)
-        dups = [str(idx) for idx, cnt in counts.items() if cnt > 1 and str(idx) != "nan"]
+        duplicate_values: dict[RelationKeyIdentity, list[Any]] = {}
+        for value in level0_series(df, id_field).tolist():
+            # pandas rendering/string keys collapse categories and Missing;
+            # the shared relation-key owner is the one duplicate identity.
+            identity = relation_key_identity(value)
+            if identity is not None:
+                duplicate_values.setdefault(identity, []).append(value)
+        dups = sorted(
+            str(values[0])
+            for values in duplicate_values.values()
+            if len(values) > 1
+        )
         if dups:
             findings.append(Finding(
                 category="duplicate_id",
@@ -400,7 +405,7 @@ def _expected_helper_columns_by_sheet(
 def _build_target_value_maps(
     frames: Frames,
     expected_by_sheet: dict[str, _ExpectedSheet],
-) -> dict[str, dict[str, dict[str, Any]]]:
+) -> dict[str, dict[str, dict[RelationKeyIdentity, Any]]]:
     needs: dict[str, dict[str, set[str]]] = {}
     for bucket in expected_by_sheet.values():
         for declared in bucket.declared_entries:
@@ -419,7 +424,7 @@ def _build_target_value_maps(
             maps[target_frame] = {}
             continue
         cols = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        target_maps: dict[str, dict[str, Any]] = {}
+        target_maps: dict[str, dict[RelationKeyIdentity, Any]] = {}
         for target_key in sheet_needs["key"]:
             if target_key not in cols:
                 continue
@@ -429,13 +434,13 @@ def _build_target_value_maps(
                     target_maps[field] = {}
                     continue
                 value_series = level0_series(df, field)
-                field_map: dict[str, Any] = {}
+                field_map: dict[RelationKeyIdentity, Any] = {}
                 for raw_key, raw_value in zip(
                     key_series.tolist(), value_series.tolist()
                 ):
-                    normalized_key = _norm_key(raw_key)
-                    if normalized_key is not None:
-                        field_map[normalized_key] = raw_value
+                    relation_key = relation_key_identity(raw_key)
+                    if relation_key is not None:
+                        field_map[relation_key] = raw_value
                 target_maps[field] = field_map
         maps[target_frame] = target_maps
     return maps
@@ -444,14 +449,14 @@ def _build_target_value_maps(
 def _build_target_id_sets(
     frames: Frames,
     expected_by_sheet: dict[str, _ExpectedSheet],
-) -> dict[str, set[str]]:
+) -> dict[str, set[RelationKeyIdentity]]:
     target_keys: dict[str, str] = {}
     for bucket in expected_by_sheet.values():
         for declared in bucket.declared_entries:
             if declared.target_frame and declared.target_key:
                 target_keys.setdefault(declared.target_frame, declared.target_key)
 
-    id_sets: dict[str, set[str]] = {}
+    id_sets: dict[str, set[RelationKeyIdentity]] = {}
     sheet_name_lookup = _sheet_name_lookup(frames)
     for target_frame, target_key in target_keys.items():
         df = _resolve_target_dataframe(frames, target_frame, sheet_name_lookup)
@@ -463,9 +468,12 @@ def _build_target_id_sets(
             id_sets[target_frame] = set()
             continue
         key_series = level0_series(df, target_key)
+        # Target maps use the same owner identity as FK source matching;
+        # local string normalization would create a second relation contract.
         id_sets[target_frame] = {
-            key for key in (_norm_key(value) for value in key_series.tolist())
-            if key is not None
+            identity
+            for value in key_series.tolist()
+            if (identity := relation_key_identity(value)) is not None
         }
     return id_sets
 
@@ -528,9 +536,8 @@ def _resolve_target_dataframe(
     return None
 
 
-def _norm_key(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
+def _helper_payload_comparison_value(value: Any) -> str | None:
+    """Normalize displayed helper payloads, not relation keys."""
+    if is_missing_carrier(value):
         return None
     return str(value).strip()

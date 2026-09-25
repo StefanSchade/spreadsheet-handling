@@ -53,6 +53,15 @@ class TestDuplicateIdsFail:
         out = run_pipeline(frames, [step])
         assert "A" in out
 
+    def test_integral_numeric_carriers_fail_as_one_relation_key(self):
+        frames = {"A": pd.DataFrame([{"id": 1.0}, {"id": 1}])}
+        step = make_validate_step(
+            defaults=DEFAULTS, mode_duplicate_ids="fail", mode_missing_fk="ignore",
+        )
+
+        with pytest.raises(ValueError, match="(?i)duplicate"):
+            run_pipeline(frames, [step])
+
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")
 class TestMissingFkModes:

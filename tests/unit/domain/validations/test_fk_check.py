@@ -9,6 +9,7 @@ seed that policy explicitly via ``infer_fk_relations`` /
 from __future__ import annotations
 
 import pytest
+import numpy as np
 import pandas as pd
 
 from spreadsheet_handling.domain.fk_relations import infer_fk_relations
@@ -82,6 +83,63 @@ class TestDuplicateIds:
         assert findings[0].sheet == "X"
         assert "1" in findings[0].detail
 
+    @pytest.mark.parametrize(
+        ("values", "has_duplicate"),
+        [
+            ([1.0, 1], True),
+            ([np.int64(1), 1], True),
+            ([1, "1"], False),
+            ([True, 1], False),
+            (["nan", "nan"], True),
+            ([None, None], False),
+            (["", ""], False),
+            ([float("nan"), float("nan")], False),
+            ([pd.NA, pd.NA], False),
+            ([pd.NaT, pd.NaT], False),
+        ],
+        ids=[
+            "integral-number",
+            "numpy-integral-number",
+            "number-string",
+            "boolean-number",
+            "literal-nan",
+            "none",
+            "empty",
+            "float-nan",
+            "pandas-na",
+            "nat",
+        ],
+    )
+    def test_uses_relation_key_identity_for_policy_independent_fallback(
+        self,
+        values,
+        has_duplicate,
+    ):
+        frames = {"X": pd.DataFrame({"id": values})}
+
+        findings = check_duplicate_ids(frames, DEFAULTS)
+
+        assert bool(findings) is has_duplicate
+
+    def test_uses_relation_key_identity_for_policy_declared_target_key(self):
+        frames = configure_fk_helpers(
+            {
+                "A": pd.DataFrame({"id": [10], "id_(B)": [1]}),
+                "B": pd.DataFrame({"id": [1.0, 1], "name": ["a", "b"]}),
+            },
+            target="B",
+            key="id",
+            allowed_helpers=["name"],
+            default_helpers=["name"],
+        )
+
+        findings = check_duplicate_ids(frames, DEFAULTS)
+
+        assert any(
+            finding.category == "duplicate_id" and finding.sheet == "B"
+            for finding in findings
+        )
+
 
 # --- check_unresolvable_fks ---
 
@@ -135,6 +193,38 @@ class TestUnresolvableFks:
         findings = check_unresolvable_fks(frames, DEFAULTS)
         assert len(findings) == 1
         assert findings[0].column == "id_(B)"
+
+    @pytest.mark.parametrize(
+        ("source_key", "target_key", "has_finding"),
+        [
+            (" 1 ", "1", True),
+            (1, "1", True),
+            (1.0, 1, False),
+            ("", "", False),
+            (None, None, False),
+        ],
+        ids=["exact-whitespace", "number-string", "integral-number", "empty", "none"],
+    )
+    def test_uses_relation_key_identity_for_resolution(
+        self,
+        source_key,
+        target_key,
+        has_finding,
+    ):
+        frames = configure_fk_helpers(
+            {
+                "A": pd.DataFrame({"id": [10], "id_(B)": [source_key]}),
+                "B": pd.DataFrame({"id": [target_key], "name": ["alpha"]}),
+            },
+            target="B",
+            key="id",
+            allowed_helpers=["name"],
+            default_helpers=["name"],
+        )
+
+        findings = check_unresolvable_fks(frames, DEFAULTS)
+
+        assert bool(findings) is has_finding
 
 
 # --- check_unexpected_helpers ---
@@ -214,6 +304,24 @@ class TestHelperValues:
         category_findings = [f for f in findings if f.column == "_B_category"]
         assert category_findings, findings
         assert category_findings[0].category == "value_mismatch"
+
+    def test_relation_key_lookup_does_not_trim_fk_value(self):
+        frames = configure_fk_helpers(
+            {
+                "A": pd.DataFrame(
+                    {"id": [10], "id_(B)": [" 1 "], "_B_name": ["alpha"]}
+                ),
+                "B": pd.DataFrame({"id": ["1"], "name": ["alpha"]}),
+            },
+            target="B",
+            key="id",
+            allowed_helpers=["name"],
+            default_helpers=["name"],
+        )
+
+        findings = check_helper_values(frames, DEFAULTS)
+
+        assert findings and findings[0].category == "value_mismatch"
 
 
 # --- validate_fk_helpers (combined) ---

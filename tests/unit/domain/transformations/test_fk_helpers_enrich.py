@@ -7,6 +7,7 @@ module seed that policy explicitly before invoking ``make_apply_fks_step``.
 from __future__ import annotations
 
 import pytest
+import numpy as np
 import pandas as pd
 
 from spreadsheet_handling.core.fk import (
@@ -445,3 +446,45 @@ class TestApplyFksStepProvenance:
         sheet_derived = out["_meta"]["derived"]["sheets"]["A"]
         assert sheet_derived["other_derived_key"] == "keep_me"
         assert "helper_columns" in sheet_derived
+
+
+class TestRelationKeyMaterialization:
+    @pytest.mark.parametrize(
+        ("source_key", "target_key", "expected_helper"),
+        [
+            (" 1 ", "1", ""),
+            (1, "1", ""),
+            (1.0, 1, "alpha"),
+            (np.int64(1), 1, "alpha"),
+            ("", "", ""),
+            (None, None, ""),
+        ],
+        ids=[
+            "exact-whitespace",
+            "number-string",
+            "integral-number",
+            "numpy-integral-number",
+            "empty",
+            "none",
+        ],
+    )
+    def test_value_mode_uses_relation_key_identity(
+        self,
+        source_key,
+        target_key,
+        expected_helper,
+    ):
+        frames = configure_fk_helpers(
+            {
+                "A": pd.DataFrame({"id": [10], "id_(B)": [source_key]}),
+                "B": pd.DataFrame({"id": [target_key], "name": ["alpha"]}),
+            },
+            target="B",
+            key="id",
+            allowed_helpers=["name"],
+            default_helpers=["name"],
+        )
+
+        out = make_apply_fks_step(defaults=DEFAULTS).fn(frames)
+
+        assert level0_series(out["A"], "_B_name").tolist() == [expected_helper]
