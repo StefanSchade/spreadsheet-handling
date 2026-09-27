@@ -275,11 +275,11 @@ def _validate_foreign_key(
     # would otherwise collapse distinct String, Number, and Boolean values.
     target_keys = {
         relation_key_identity(*key)
-        for _, key in _row_keys(target, target_columns)
+        for _, key in _relation_key_row_keys(target, target_columns)
         if is_relation_key_eligible(*key)
     }
 
-    for row_index, key in _row_keys(source, columns):
+    for row_index, key in _relation_key_row_keys(source, columns):
         if all(_is_empty_cell(value) for value in key) and allow_empty:
             continue
         if any(_is_empty_cell(value) for value in key):
@@ -608,7 +608,7 @@ def _relation_key_duplicate_findings(
     """Find duplicate eligible keys through the shared relation-key owner."""
     row_identities = [
         (row_index, key, relation_key_identity(*key))
-        for row_index, key in _row_keys(frame, columns)
+        for row_index, key in _relation_key_row_keys(frame, columns)
     ]
     identities = [identity for _, _, identity in row_identities if identity is not None]
     counts = Counter(identities)
@@ -695,6 +695,19 @@ def _row_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple[Any, tuple[
     return [
         (row_index, tuple(_plain_value(row[column]) for column in columns))
         for row_index, row in frame.loc[:, columns].iterrows()
+    ]
+
+
+def _relation_key_row_keys(
+    frame: pd.DataFrame,
+    columns: list[str],
+) -> list[tuple[Any, tuple[Any, ...]]]:
+    """Return original scalar carriers for relation-key identity decisions."""
+    # ``iterrows`` coerces object-dtype datetime64 values through Timestamp,
+    # which can discard precision before the relation-key owner compares them.
+    return [
+        (row_index, tuple(frame[column].iloc[position] for column in columns))
+        for position, row_index in enumerate(frame.index)
     ]
 
 

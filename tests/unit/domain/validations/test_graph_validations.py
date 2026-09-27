@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -214,6 +215,37 @@ def test_graph_endpoints_use_category_aware_relation_identity() -> None:
     assert out["graph_validation_findings"].loc[:, ["row_index", "value"]].to_dict(orient="records") == [
         {"row_index": 1, "value": "1"},
         {"row_index": 2, "value": "True"},
+    ]
+
+
+def test_graph_endpoints_preserve_object_datetime64_picosecond_precision() -> None:
+    frames = {
+        "nodes": pd.DataFrame({"key": pd.Series([np.datetime64(1, "ps")], dtype="object")}),
+        "edges": pd.DataFrame({"key": pd.Series([np.datetime64(2, "ps")], dtype="object")}),
+    }
+
+    out = validate_graph(
+        frames,
+        graph="picosecond_network",
+        nodes=[{"name": "nodes", "frame": "nodes", "key": "key"}],
+        edges=[
+            {
+                "name": "links",
+                "frame": "edges",
+                "source_node": "nodes",
+                "source_column": "key",
+                "target_node": "nodes",
+                "target_column": "key",
+            }
+        ],
+        checks=["endpoints_exist"],
+    )
+
+    assert out["graph_validation_findings"].loc[:, ["row_index", "columns"]].to_dict(
+        orient="records"
+    ) == [
+        {"row_index": 0, "columns": "key"},
+        {"row_index": 0, "columns": "key"},
     ]
 
 

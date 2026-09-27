@@ -102,7 +102,7 @@ def _endpoint_findings(
         edge_frame = _require_frame(frames, edge.frame)
         source_node = nodes[edge.source_node]
         target_node = nodes[edge.target_node]
-        for row_index, key in _row_keys(edge_frame, edge.source_columns):
+        for row_index, key in _relation_key_row_keys(edge_frame, edge.source_columns):
             relation_identity = relation_key_identity(*key)
             if relation_identity is None or relation_identity not in node_keys[edge.source_node]:
                 findings.append(
@@ -116,7 +116,7 @@ def _endpoint_findings(
                         endpoint_role="source",
                     )
                 )
-        for row_index, key in _row_keys(edge_frame, edge.target_columns):
+        for row_index, key in _relation_key_row_keys(edge_frame, edge.target_columns):
             relation_identity = relation_key_identity(*key)
             if relation_identity is None or relation_identity not in node_keys[edge.target_node]:
                 findings.append(
@@ -393,7 +393,7 @@ def _key_set(frame: pd.DataFrame, columns: list[str]) -> set[RelationKeyIdentity
     # would make display formatting, rather than relation semantics, equality.
     return {
         relation_key_identity(*key)
-        for _, key in _row_keys(frame, columns)
+        for _, key in _relation_key_row_keys(frame, columns)
         if is_relation_key_eligible(*key)
     }
 
@@ -402,6 +402,19 @@ def _row_keys(frame: pd.DataFrame, columns: list[str]) -> list[tuple[Any, tuple[
     return [
         (row_index, tuple(_plain_value(row[column]) for column in columns))
         for row_index, row in frame.loc[:, columns].iterrows()
+    ]
+
+
+def _relation_key_row_keys(
+    frame: pd.DataFrame,
+    columns: list[str],
+) -> list[tuple[Any, tuple[Any, ...]]]:
+    """Return original scalar carriers for relation-key identity decisions."""
+    # ``iterrows`` coerces object-dtype datetime64 values through Timestamp,
+    # which can discard precision before the relation-key owner compares them.
+    return [
+        (row_index, tuple(frame[column].iloc[position] for column in columns))
+        for position, row_index in enumerate(frame.index)
     ]
 
 

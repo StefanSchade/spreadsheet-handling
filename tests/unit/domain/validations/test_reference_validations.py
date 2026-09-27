@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -81,6 +82,32 @@ def test_foreign_key_uses_category_aware_relation_identity() -> None:
         {"row_index": 1, "value": "True"},
         {"row_index": 2, "value": " 1 "},
     ]
+
+
+def test_foreign_key_preserves_object_datetime64_picosecond_precision() -> None:
+    frames = {
+        "targets": pd.DataFrame(
+            {"key": pd.Series([np.datetime64(1, "ps")], dtype="object")}
+        ),
+        "sources": pd.DataFrame(
+            {"key": pd.Series([np.datetime64(2, "ps")], dtype="object")}
+        ),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "foreign_key",
+                "frame": "sources",
+                "columns": ["key"],
+                "target": "targets",
+                "target_columns": ["key"],
+            }
+        ],
+    )
+
+    assert out["validation_findings"]["rule_type"].tolist() == ["foreign_key"]
 
 
 def test_unique_detects_arbitrary_duplicate_columns() -> None:
