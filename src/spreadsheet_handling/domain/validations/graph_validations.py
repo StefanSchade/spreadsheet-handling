@@ -10,6 +10,11 @@ from typing import Any
 import pandas as pd
 
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
+from spreadsheet_handling.domain.relation_keys import (
+    RelationKeyIdentity,
+    is_relation_key_eligible,
+    relation_key_identity,
+)
 from spreadsheet_handling.domain.validations.reference_validations import (
     ReferenceFinding,
     findings_to_frame,
@@ -98,7 +103,8 @@ def _endpoint_findings(
         source_node = nodes[edge.source_node]
         target_node = nodes[edge.target_node]
         for row_index, key in _row_keys(edge_frame, edge.source_columns):
-            if any(_is_empty_cell(value) for value in key) or _key_token(key) not in node_keys[edge.source_node]:
+            relation_identity = relation_key_identity(*key)
+            if relation_identity is None or relation_identity not in node_keys[edge.source_node]:
                 findings.append(
                     _endpoint_finding(
                         graph=graph,
@@ -111,7 +117,8 @@ def _endpoint_findings(
                     )
                 )
         for row_index, key in _row_keys(edge_frame, edge.target_columns):
-            if any(_is_empty_cell(value) for value in key) or _key_token(key) not in node_keys[edge.target_node]:
+            relation_identity = relation_key_identity(*key)
+            if relation_identity is None or relation_identity not in node_keys[edge.target_node]:
                 findings.append(
                     _endpoint_finding(
                         graph=graph,
@@ -381,11 +388,13 @@ def _ensure_columns(
         )
 
 
-def _key_set(frame: pd.DataFrame, columns: list[str]) -> set[tuple[str, ...]]:
+def _key_set(frame: pd.DataFrame, columns: list[str]) -> set[RelationKeyIdentity]:
+    # Endpoint membership uses the Domain owner because local string tokens
+    # would make display formatting, rather than relation semantics, equality.
     return {
-        _key_token(key)
+        relation_key_identity(*key)
         for _, key in _row_keys(frame, columns)
-        if not any(_is_empty_cell(value) for value in key)
+        if is_relation_key_eligible(*key)
     }
 
 

@@ -177,3 +177,79 @@ def test_validate_graph_can_run_selected_checks_only() -> None:
     out = validate_graph(frames, checks=["endpoints_exist"], **_operation_graph_rules())
 
     assert out["graph_validation_findings"].empty
+
+
+def test_graph_endpoints_use_category_aware_relation_identity() -> None:
+    frames = {
+        "source_nodes": pd.DataFrame({"key": pd.Series([1], dtype="object")}),
+        "target_nodes": pd.DataFrame({"key": pd.Series([1], dtype="object")}),
+        "edges": pd.DataFrame(
+            {
+                "source_key": pd.Series([1.0, "1", True], dtype="object"),
+                "target_key": pd.Series([1, 1, 1], dtype="object"),
+            }
+        ),
+    }
+
+    out = validate_graph(
+        frames,
+        graph="category_aware_network",
+        nodes=[
+            {"name": "source", "frame": "source_nodes", "key": "key"},
+            {"name": "target", "frame": "target_nodes", "key": "key"},
+        ],
+        edges=[
+            {
+                "name": "links",
+                "frame": "edges",
+                "source_node": "source",
+                "source_column": "source_key",
+                "target_node": "target",
+                "target_column": "target_key",
+            }
+        ],
+        checks=["endpoints_exist"],
+    )
+
+    assert out["graph_validation_findings"].loc[:, ["row_index", "value"]].to_dict(orient="records") == [
+        {"row_index": 1, "value": "1"},
+        {"row_index": 2, "value": "True"},
+    ]
+
+
+def test_default_unique_edge_columns_retain_blank_tuple_identity() -> None:
+    frames = {
+        "nodes": pd.DataFrame([{"key": "node"}]),
+        "edges": pd.DataFrame(
+            [
+                {"source_key": "", "target_key": "node"},
+                {"source_key": "", "target_key": "node"},
+            ]
+        ),
+    }
+
+    out = validate_graph(
+        frames,
+        graph="default_columns_diverge",
+        nodes=[{"name": "nodes", "frame": "nodes", "key": "key"}],
+        edges=[
+            {
+                "name": "links",
+                "frame": "edges",
+                "source_node": "nodes",
+                "source_column": "source_key",
+                "target_node": "nodes",
+                "target_column": "target_key",
+                "unique": True,
+            }
+        ],
+    )
+
+    # Default unique_columns are endpoint columns, but only endpoint resolution
+    # excludes Missing values; generic edge tuples still count blank components.
+    assert out["graph_validation_findings"].loc[:, ["rule_type", "row_index"]].to_dict(orient="records") == [
+        {"rule_type": "graph_endpoint", "row_index": 0},
+        {"rule_type": "graph_endpoint", "row_index": 1},
+        {"rule_type": "graph_unique_edge", "row_index": 0},
+        {"rule_type": "graph_unique_edge", "row_index": 1},
+    ]

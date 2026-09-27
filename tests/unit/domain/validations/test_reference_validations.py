@@ -37,6 +37,52 @@ def test_primary_key_detects_empty_and_duplicate_values_in_warn_mode() -> None:
     assert "reference_findings" not in frames
 
 
+def test_primary_key_relation_identity_intentionally_differs_from_unique_reference() -> None:
+    frames = {
+        "keys": pd.DataFrame({"key": pd.Series([1, "1"], dtype="object")}),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {"type": "primary_key", "frame": "keys", "columns": ["key"]},
+            {"type": "unique_reference", "frame": "keys", "columns": ["key"]},
+        ],
+    )
+
+    # Accepted post-migration divergence: generic tuple uniqueness keeps its
+    # display-token mechanics while primary-key checks use relation identity.
+    assert out["validation_findings"].loc[:, ["rule_type", "row_index"]].to_dict(orient="records") == [
+        {"rule_type": "unique_reference", "row_index": 0},
+        {"rule_type": "unique_reference", "row_index": 1},
+    ]
+
+
+def test_foreign_key_uses_category_aware_relation_identity() -> None:
+    frames = {
+        "targets": pd.DataFrame({"key": pd.Series([1, "1"], dtype="object")}),
+        "sources": pd.DataFrame({"key": pd.Series([1.0, True, " 1 "], dtype="object")}),
+    }
+
+    out = validate_references(
+        frames,
+        rules=[
+            {
+                "type": "foreign_key",
+                "frame": "sources",
+                "columns": ["key"],
+                "target": "targets",
+                "target_columns": ["key"],
+            }
+        ],
+    )
+
+    assert out["validation_findings"].loc[:, ["row_index", "value"]].to_dict(orient="records") == [
+        {"row_index": 1, "value": "True"},
+        {"row_index": 2, "value": " 1 "},
+    ]
+
+
 def test_unique_detects_arbitrary_duplicate_columns() -> None:
     frames = {
         "labels": pd.DataFrame(

@@ -14,6 +14,10 @@ from spreadsheet_handling.core.scalar_values import UnsupportedScalarError, scal
 from spreadsheet_handling.domain._cell_primitives import _is_empty_cell
 from spreadsheet_handling.domain.finding_frame import findings_to_frame as _serialize_findings
 from spreadsheet_handling.domain.finding_frame import row_index_label as _row_index_label
+from spreadsheet_handling.domain.relation_keys import (
+    is_relation_key_eligible,
+    relation_key_identity,
+)
 
 Frames = dict[str, Any]
 
@@ -199,14 +203,11 @@ def _validate_primary_key(
                 )
             )
 
-    complete_frame = frame.loc[
-        [not any(_is_empty_cell(value) for value in key) for _, key in _row_keys(frame, columns)]
-    ]
     findings.extend(
-        _duplicate_findings(
+        _relation_key_duplicate_findings(
             "primary_key",
             frame_name=frame_name,
-            frame=complete_frame,
+            frame=frame,
             columns=columns,
             severity=severity,
             message="Primary key values must be unique.",
@@ -270,10 +271,12 @@ def _validate_foreign_key(
         columns=columns,
     )
     findings.extend(skipped)
+    # Relation-key identity owns category-aware equality; display-shaped tokens
+    # would otherwise collapse distinct String, Number, and Boolean values.
     target_keys = {
-        _key_token(key)
+        relation_key_identity(*key)
         for _, key in _row_keys(target, target_columns)
-        if not any(_is_empty_cell(value) for value in key)
+        if is_relation_key_eligible(*key)
     }
 
     for row_index, key in _row_keys(source, columns):
@@ -294,7 +297,8 @@ def _validate_foreign_key(
                 )
             )
             continue
-        if _key_token(key) not in target_keys:
+        relation_identity = relation_key_identity(*key)
+        if relation_identity is None or relation_identity not in target_keys:
             findings.append(
                 ReferenceFinding(
                     rule_type="foreign_key",
@@ -589,6 +593,37 @@ def _duplicate_findings(
         )
         for row_index, key in row_keys
         if counts[_key_token(key)] > 1
+    ]
+
+
+def _relation_key_duplicate_findings(
+    rule_type: str,
+    *,
+    frame_name: str,
+    frame: pd.DataFrame,
+    columns: list[str],
+    severity: str,
+    message: str,
+) -> list[ReferenceFinding]:
+    """Find duplicate eligible keys through the shared relation-key owner."""
+    row_identities = [
+        (row_index, key, relation_key_identity(*key))
+        for row_index, key in _row_keys(frame, columns)
+    ]
+    identities = [identity for _, _, identity in row_identities if identity is not None]
+    counts = Counter(identities)
+    return [
+        ReferenceFinding(
+            rule_type=rule_type,
+            frame=frame_name,
+            columns=columns,
+            row_index=row_index,
+            value=key,
+            severity=severity,
+            message=message,
+        )
+        for row_index, key, identity in row_identities
+        if identity is not None and counts[identity] > 1
     ]
 
 
