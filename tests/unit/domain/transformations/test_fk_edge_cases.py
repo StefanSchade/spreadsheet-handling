@@ -63,23 +63,37 @@ class TestCustomIdField:
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")
 class TestMixedIdTypes:
-    def test_mixed_int_string_fk_match(self):
+    @staticmethod
+    def _helper_values(target_id, source_id):
         frames = {
-            "Ziel": pd.DataFrame([{"id": "1", "name": "Alpha"}]),
-            "Q": pd.DataFrame([{"id_(Ziel)": 1}]),  # int FK referencing string id
+            "Ziel": pd.DataFrame([{"id": target_id, "name": "Alpha"}]),
+            "Q": pd.DataFrame([{"id_(Ziel)": source_id}]),
         }
         frames = infer_fk_relations(frames)
         defaults = {"id_field": "id", "label_field": "name",
                      "helper_prefix": "_", "detect_fk": True, "levels": 3}
-        step = make_apply_fks_step(defaults=defaults)
-        out = run_pipeline(frames, [step])
+        out = run_pipeline(frames, [make_apply_fks_step(defaults=defaults)])
 
         dfq = out["Q"]
         lvl0 = [c[0] if isinstance(c, tuple) else c for c in dfq.columns]
         helper_cols = [c for c in lvl0 if str(c).startswith("_")]
         assert helper_cols
-        s = level0_series(dfq, helper_cols[0])
-        assert list(s) == ["Alpha"]
+        return list(level0_series(dfq, helper_cols[0]))
+
+    def test_mixed_int_string_fk_does_not_match(self):
+        """Relation-key identity (DMC-RELKEY-C0-S2) keeps Number and String apart.
+
+        Formerly ``test_mixed_int_string_fk_match`` expected int ``1`` to
+        resolve against string ``"1"`` (legacy string coercion). The accepted
+        contract makes scalar category part of identity, so neither direction
+        resolves; the helper stays the plain empty string.
+        """
+        assert self._helper_values(target_id="1", source_id=1) == [""]
+        assert self._helper_values(target_id=1, source_id="1") == [""]
+
+    def test_same_category_fk_still_matches(self):
+        assert self._helper_values(target_id="1", source_id="1") == ["Alpha"]
+        assert self._helper_values(target_id=1, source_id=1) == ["Alpha"]
 
 
 @pytest.mark.ftr("FTR-PREHEX-TEST-CONSOLIDATION-P3C")
