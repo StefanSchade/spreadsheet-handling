@@ -4,9 +4,14 @@ import ast
 import inspect
 import json
 from pathlib import Path
-import tomllib
+import sys
 
 import pytest
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - Python 3.10
+    import tomli as tomllib
 
 from spreadsheet_handling.application import schema_maintenance as schema_maintenance_app
 from spreadsheet_handling.cli.apps import schema_maintain

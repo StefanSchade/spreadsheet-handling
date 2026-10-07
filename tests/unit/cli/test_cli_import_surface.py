@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 
 import spreadsheet_handling.cli as cli
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - Python 3.10
+    import tomli as tomllib
 
 pytestmark = pytest.mark.ftr("FTR-REVIEW-001-QUICK-WINS-P3")
 
@@ -26,8 +32,6 @@ def test_cli_package_exports_only_intentional_mains() -> None:
 
 
 def test_project_scripts_register_current_cli_surface_only() -> None:
-    import tomllib
-
     pyproject_data = tomllib.loads(
         Path("pyproject.toml").read_text(encoding="utf-8")
     )
@@ -51,8 +55,6 @@ def test_sheets_run_entry_point_routes_through_cli_entry() -> None:
     exact target prevents an accidental revert to a `main`-direct
     binding from going unnoticed.
     """
-    import tomllib
-
     pyproject_data = tomllib.loads(
         Path("pyproject.toml").read_text(encoding="utf-8")
     )
