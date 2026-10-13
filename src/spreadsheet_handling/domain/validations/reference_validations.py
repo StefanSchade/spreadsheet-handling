@@ -45,6 +45,8 @@ FINDING_COLUMNS = [
 
 _VALID_MODES = {"warn", "fail", "ignore"}
 _VALID_RULE_TYPES = {
+    "required_columns",
+    "non_empty",
     "unique",
     "primary_key",
     "foreign_key",
@@ -134,7 +136,11 @@ def _validate_rules(
         if not enabled:
             continue
 
-        if rule_type == "unique":
+        if rule_type == "required_columns":
+            findings.extend(_validate_required_columns(frames, rule=rule, severity=severity))
+        elif rule_type == "non_empty":
+            findings.extend(_validate_non_empty(frames, rule=rule, severity=severity))
+        elif rule_type == "unique":
             findings.extend(_validate_unique(frames, rule=rule, severity=severity))
         elif rule_type == "primary_key":
             findings.extend(_validate_primary_key(frames, rule=rule, severity=severity))
@@ -144,6 +150,89 @@ def _validate_rules(
             findings.extend(_validate_unique_reference(frames, rule=rule, severity=severity))
         elif rule_type == "no_helper_columns":
             findings.extend(_validate_no_helper_columns(frames, rule=rule, severity=severity))
+    return findings
+
+
+def _validate_required_columns(
+    frames: Mapping[str, Any],
+    *,
+    rule: Mapping[str, Any],
+    severity: str,
+) -> list[ReferenceFinding]:
+    """Require a frame to carry the configured columns; ``exact`` also rejects others.
+
+    Column order is deliberately not part of the contract.
+    """
+    frame_name, columns = _frame_and_columns(rule)
+    exact = rule.get("exact", False)
+    _ensure_boolean_predicate(exact, "exact")
+    frame = _optional_frame(frames, frame_name)
+    missing = _missing_rule_columns(frame, columns)
+    if frame is None or missing:
+        return [_schema_finding("required_columns", frame_name, columns, missing, severity)]
+    unexpected = [column for column in frame.columns if column not in columns]
+    if not exact or not unexpected:
+        return []
+    return [
+        ReferenceFinding(
+            rule_type="required_columns",
+            frame=frame_name,
+            columns=[str(column) for column in unexpected],
+            row_index=None,
+            value=None,
+            severity=severity,
+            message=f"Unexpected column(s); only {columns!r} are allowed.",
+        )
+    ]
+
+
+def _validate_non_empty(
+    frames: Mapping[str, Any],
+    *,
+    rule: Mapping[str, Any],
+    severity: str,
+) -> list[ReferenceFinding]:
+    """Every configured cell must hold a value: not missing, null or the empty string.
+
+    ``trimmed: true`` additionally rejects text with leading or trailing whitespace.
+    """
+    frame_name, columns = _frame_and_columns(rule)
+    trimmed = rule.get("trimmed", False)
+    _ensure_boolean_predicate(trimmed, "trimmed")
+    frame = _optional_frame(frames, frame_name)
+    missing = _missing_rule_columns(frame, columns)
+    if frame is None or missing:
+        return [_schema_finding("non_empty", frame_name, columns, missing, severity)]
+    frame, skipped = _apply_when(
+        frame, rule=rule, rule_type="non_empty", frame_name=frame_name, columns=columns
+    )
+    findings: list[ReferenceFinding] = list(skipped)
+    for column in columns:
+        for row_index, value in frame[column].items():
+            if _is_empty_cell(value):
+                findings.append(
+                    ReferenceFinding(
+                        rule_type="non_empty",
+                        frame=frame_name,
+                        columns=[column],
+                        row_index=row_index,
+                        value=(None,),
+                        severity=severity,
+                        message="Value must be present and non-empty.",
+                    )
+                )
+            elif trimmed and isinstance(value, str) and value != value.strip():
+                findings.append(
+                    ReferenceFinding(
+                        rule_type="non_empty",
+                        frame=frame_name,
+                        columns=[column],
+                        row_index=row_index,
+                        value=(value,),
+                        severity=severity,
+                        message="Value must not have leading or trailing whitespace.",
+                    )
+                )
     return findings
 
 
