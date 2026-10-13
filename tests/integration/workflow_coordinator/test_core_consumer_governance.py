@@ -19,6 +19,10 @@ pytestmark = pytest.mark.ftr("FTR-AGENT-WORKFLOW-COORDINATOR-P5")
 CORE_ROOT = Path(__file__).resolve().parents[3]
 DOGFOOD_ROOT = CORE_ROOT / "docs/ai_info/workflows/dogfood"
 BUNDLES = ("dmc_fk_c3_wi02", "ior04_formula_sink_capability")
+# Temporary CI-only opt-out for the full Hop test: GitHub runners ship git-lfs
+# with a system-level ``filter.lfs.clean/process`` config, which WFC's trusted
+# commit refuses, so the Hop cannot commit there. Set only in release.yml.
+HOP_OPT_OUT_ENV = "SPREADSHEET_HANDLING_SKIP_WFC_HOP_CONSUMER"
 DMC_ARTIFACT = (
     "docs/warm_storage/global_reviews/"
     "domain_fk_reference_helper_family_cycle3_missing_target_id_identity_assessment_2026-09-11.adoc"
@@ -218,6 +222,10 @@ def test_real_core_bundle_admission_records_governance_and_evidence(
     assert plan["agent_operating_contract"]["sha256"]
 
 
+@pytest.mark.skipif(
+    os.environ.get(HOP_OPT_OUT_ENV) == "1",
+    reason=f"{HOP_OPT_OUT_ENV}=1: temporarily disabled in GitHub CI (git-lfs filter config vs. WFC trusted commit)",
+)
 def test_dmc_bundle_completes_one_truthful_coordinator_owned_hop(
     tmp_path: Path, provider_block: tuple[Path, Path]
 ) -> None:
