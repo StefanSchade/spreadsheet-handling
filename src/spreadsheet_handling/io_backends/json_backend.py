@@ -185,11 +185,20 @@ class JSONBackend(BackendBase):
     `read_multi` (via `read_json_dir`) is deliberately, and for this slice
     permanently, *not* wired to decode it (Option B, accepted contract
     section 27.11) -- reading a file containing a `$date`/`$datetime`
-    envelope back through this backend's own `dtype=str` read contract
+    envelope back through this backend's own string-substrate read contract
     produces a stringified, unparseable Python-repr value, not a native
     `datetime.date`/`datetime.datetime`. A private, symmetric decoder
     (`_json_temporal_object_hook`) exists and is exercised directly as a
     standalone codec by the test suite; it is not called from `read_multi`.
+
+    Read-side value substrate: every cell is read as a visible string with
+    no opportunistic type inference (`convert_dates=False` suppresses
+    pandas' own date-string guessing; no numeric or boolean re-inference is
+    performed). Missing input -- an explicit JSON `null` or a structurally
+    absent field -- normalizes to the canonical Missing representation `""`
+    (`core.scalar_values.is_missing_carrier`), never to the literal strings
+    `"None"` or `"nan"`, which remain available as legitimate domain values
+    (BUG-JSON-INGRESS-MISSING-IDENTITY-P4A).
     """
 
     def read_multi(self, path: str, header_levels: int, options: BackendOptions | None = None) -> Frames:
@@ -202,8 +211,21 @@ class JSONBackend(BackendBase):
         in_dir = Path(path)
         out: Frames = {}
         for p in sorted(in_dir.glob("*.json")):
-            df = pd.read_json(p, dtype=str, convert_dates=False)
+            # `dtype="string"`, not `dtype=str` (BUG-JSON-INGRESS-MISSING-IDENTITY-P4A):
+            # both coerce every non-missing scalar to the same visible string, but
+            # `dtype=str` applies `astype(str)` to the parsed column, which stringifies
+            # a Missing carrier *before* the normalization below can see it -- an
+            # explicit JSON `null` arrived as the literal `"None"` and a structurally
+            # absent field as the literal `"nan"`, both `pandas.notnull`-true and by
+            # then indistinguishable from the legitimate domain strings of the same
+            # spelling. The nullable StringDtype carries Missing through the parse as
+            # `pandas.NA` instead, so the normalization stays able to recognize it.
+            df = pd.read_json(p, dtype="string", convert_dates=False)
             df = df.where(pd.notnull(df), "")  # normalize empties as ""
+            # Reproduce `dtype=str`'s own result dtype now that no Missing remains:
+            # `object` on pandas 2.x, StringDtype on pandas 3.x. Values are already
+            # strings at this point, so this restores the container, not the content.
+            df = df.astype(str)
             out[p.stem] = df
 
         # --- read optional _meta sidecar ------------------------------------

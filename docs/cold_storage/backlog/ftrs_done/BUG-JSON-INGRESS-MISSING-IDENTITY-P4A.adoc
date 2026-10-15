@@ -1,0 +1,234 @@
+===== BUG-JSON-INGRESS-MISSING-IDENTITY-P4A -- JSON ingress loses Missing identity under `dtype=str`
+
+*Status:* Fixed
+*Priority:* P4A
+*Area:* JSON directory ingress / Missing carrier semantics
+(`io_backends/json_backend.py`, `JSONBackend.read_multi` / `read_json_dir`)
+*Release relevance:* Post-`0.2.1`. Reachable only through *externally
+authored* JSON -- `write_json_dir` never emits `null` and never omits a key,
+so no core-produced file triggers it. Manifests only on pandas 2.x (see
+"Why the repository suite did not catch this"). Discovered and reported by
+the external `ba-config` consumer.
+
+==== Summary
+
+`JSONBackend.read_multi` read every cell with:
+
+[source,python]
+----
+df = pd.read_json(p, dtype=str, convert_dates=False)
+df = df.where(pd.notnull(df), "")  # normalize empties as ""
+----
+
+On pandas 2.x, `dtype=str` applies `astype(str)` to the parsed column. That
+runs *before* the backend's own Missing normalization, and `astype(str)`
+stringifies the missing carriers it finds:
+
+* an explicit JSON `null` becomes the literal Python string `"None"`;
+* a structurally absent field becomes the literal Python string `"nan"`.
+
+By the time `df.where(pd.notnull(df), "")` executes, both cells are ordinary
+four- and three-character strings. `pandas.notnull` is `True` for each, so
+the normalization cannot see them, and the intended `""` is never written.
+
+This is semantically wrong against the existing Core value model.
+`core.scalar_values.is_missing_carrier` deliberately recognizes `None`, `""`,
+and NaN/NA/NaT as Missing while deliberately *refusing* to recognize a
+literal string that merely spells `"nan"` -- "actual runtime String ancestry
+is checked before `pandas.isna`". The reader was therefore handing the
+domain a value the value model is contractually obliged to treat as a real
+string. Missing identity was destroyed at the boundary, and no downstream
+layer could recover it.
+
+==== Reproduction (pre-fix, pandas 2.3.3)
+
+Case A -- explicit null:
+
+[source,json]
+----
+[{"id": "a", "value": null}]
+----
+
+Case B -- structurally absent field:
+
+[source,json]
+----
+[{"id": "a"}, {"id": "b", "value": "x"}]
+----
+
+Through the real `read_json_dir` boundary:
+
+[cols="1,2,1,1", options="header"]
+|===
+| Case | Cell | `repr` | `pandas.notnull`
+
+| A | `value` row 0 | `'None'` (`str`, len 4) | `True`
+| B | `value` row 0 | `'nan'` (`str`, len 3)  | `True`
+| B | `value` row 1 | `'x'`                   | `True`
+|===
+
+Both missing cells survive as visible domain text instead of normalizing to
+`""`.
+
+==== Root cause
+
+One line, and specifically the *ordering* it imposes: `dtype=str` is not a
+parser directive that keeps values as text, it is a post-parse `astype(str)`
+coercion. Coercion to `str` is lossy for missing carriers and irreversible,
+because `str(None) == "None"` and `str(float("nan")) == "nan"` collide
+exactly with legitimate domain strings. Any normalization placed *after*
+that coercion is already too late, which is why the existing
+`df.where(pd.notnull(df), "")` line was effectively dead for these two
+inputs.
+
+==== Why the repository suite did not catch this
+
+pandas 3 changed what `dtype=str` means. Under pandas 3.x it resolves to the
+new default `StringDtype`, which preserves missing values as NA through the
+coercion, so `df.where(pd.notnull(df), "")` works and both cases already
+yield `""`. The repository's development virtualenv runs pandas 3.0.2, so
+the defect is invisible to the in-repo suite.
+
+`pyproject.toml` declares `pandas>=2.0`, so pandas 2.x is a supported,
+published configuration. The defect is live for every consumer on that
+floor -- which is how an external consumer found what the local suite could
+not. The regression tests added with this fix assert the contract
+behaviourally, so they are meaningful on both majors and fail on pandas 2.x
+without the fix.
+
+==== Fix
+
+[source,python]
+----
+df = pd.read_json(p, dtype="string", convert_dates=False)
+df = df.where(pd.notnull(df), "")  # normalize empties as ""
+df = df.astype(str)
+----
+
+`dtype="string"` is the nullable `StringDtype`. It applies the same visible
+stringification to every non-missing scalar, but carries Missing through the
+parse as `pandas.NA` instead of flattening it into text. The pre-existing
+normalization line then sees the missing cells it was always meant to see
+and maps them to `""`. The trailing `astype(str)` reproduces `dtype=str`'s
+own *result dtype* once no Missing remains -- `object` on pandas 2.x,
+`StringDtype` on pandas 3.x -- so the frames handed to the pipeline are
+dtype-identical to before on each major. At that point every value is
+already a string, so it restores the container, not the content.
+
+This preserves the deliberate ingress contract rather than weakening it:
+`convert_dates=False` is untouched, no numeric or boolean re-inference is
+introduced, and nothing is parsed that was not parsed before. It is
+explicitly *not* a post-hoc replacement of strings equal to `"None"` or
+`"nan"` -- those remain legitimate, distinguishable domain values.
+
+===== Verified scalar-matrix equivalence
+
+Baseline and fixed implementations were compared cell-by-cell and
+dtype-by-dtype on pandas 2.3.3 and pandas 3.0.2 over: strings, integers,
+negative integers, floats, exponent floats (`1e20`), booleans, empty
+strings, literal `"None"`, literal `"nan"`, literal `"NaN"`, ISO date and
+datetime strings, an integer beyond float64 exactness
+(`9007199254740993`), negative zero, nested-object cells, list cells, unicode,
+mixed-type columns, all-null columns, the non-records
+`{"col": {"row": value}}` orient, and the empty array `[]`.
+
+Every non-missing rendering is byte-identical to the previous behaviour, and
+the result dtype matches the previous behaviour on both majors. The only
+differences are the intended ones:
+
+[cols="2,1,1", options="header"]
+|===
+| Input | Before (pandas 2.x) | After
+
+| explicit `null`           | `"None"` | `""`
+| structurally absent field | `"nan"`  | `""`
+| JSON `NaN` literal        | `"nan"`  | `""`
+|===
+
+The third row is an incidental, correct consequence: the non-standard JSON
+`NaN` literal is a genuine missing carrier, and `""` is both the canonical
+Missing representation and what pandas 3.x already produced for it.
+
+==== Alternatives considered and rejected
+
+* *Post-parse replacement of `"None"` / `"nan"` with `""`.* Rejected on
+  contract grounds, and explicitly out of bounds: it cannot distinguish a
+  destroyed carrier from a legitimate domain string of the same spelling,
+  which is precisely the distinction the Core value model maintains. The
+  regression suite pins this with a column holding `null`, `"None"`,
+  `"nan"`, a real value, and an absent field side by side -- a
+  replacement-based fix passes every single-case test and fails that one.
+
+* *Second un-coerced read to derive a missing mask*
+  (`pd.read_json(p, convert_dates=False).isna()`). Rejected on *evidence*,
+  not taste: probing showed pandas' own JSON parser coerces the literal
+  strings `"nan"` and `"NaN"` to float NaN when not forced to `str` (both
+  columns arrive as `float64`). The mask would therefore mark legitimate
+  domain strings as Missing -- the same corruption as the rejected
+  replacement approach, arrived at indirectly. It also doubles parse cost.
+
+* *Replacing `pd.read_json` with `json.load` plus a hand-written coercion.*
+  Rejected as disproportionate, consistent with the prior analysis in
+  `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 27.2, which examined this
+  exact substitution and found that reproducing `dtype=str`'s
+  int/float/bool stringification by hand is "a materially larger,
+  less-audited surface" than the defect warrants. It would additionally
+  require reimplementing pandas' orient handling; the accepted fix is
+  orient-agnostic because it changes only the dtype argument.
+
+* *Leaving `dtype="string"` in place without the trailing `astype(str)`.*
+  Rejected: on pandas 2.x it would hand downstream steps a `StringDtype`
+  column where an `object` column exists today. That is an observable
+  change, and a `StringDtype` column rejects later assignment of non-string
+  values that the pipeline legitimately writes.
+
+==== Scope boundary
+
+* This BUG owns the *JSON read boundary* only. It is not the ODS renderer
+  defect `BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A`, whose scope is
+  the ODS *write* path (`odf_renderer.py`'s `value in (None, "")` emptiness
+  check) and which does not reach JSON ingress. The two share a theme --
+  a missing carrier becoming literal text -- but neither cause nor site.
+* `write_multi` / `write_json_dir` are unchanged.
+* The `$date` / `$datetime` Option B boundary
+  (`FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` section 27.11) is unchanged:
+  `read_multi` remains unwired from `_json_temporal_object_hook`, and a
+  nested object cell still arrives as a stringified Python repr. Pinned by
+  regression test.
+* No new public capability, config key, or metadata root is introduced, so
+  this is a BUG and not an FTR: the required behaviour is the behaviour the
+  reader was already documented and intended to have.
+
+==== Regression coverage
+
+`tests/integration/io_backends/json/test_json_missing_value_ingress.py`,
+at the real `read_json_dir` boundary over hand-authored JSON:
+
+* (required) explicit `null` becomes `""` and satisfies `is_missing_carrier`.
+* (required) structurally absent field becomes `""` and satisfies
+  `is_missing_carrier`; the sibling record's real value is untouched.
+* (required) an all-`null` column normalizes throughout.
+* (required) literal `"None"` survives as `"None"` and is not Missing.
+* (required) literal `"nan"` and `"NaN"` survive and are not Missing.
+* (required) Missing and its look-alike strings coexist correctly in one
+  column -- the discriminating case against replacement-based fixes.
+* (required) ordinary scalars keep their exact existing string renderings.
+* (required) date-looking strings, including a column *named* `date`, are
+  not inferred as dates.
+* (required) nested payloads still stringify rather than decode (Option B).
+
+Pre-fix on pandas 2.3.3 the four Missing-identity tests fail and the five
+contract-preservation tests pass, which is the intended red/green split:
+the fix changes Missing handling and nothing else.
+
+==== Related backlog items
+
+* `FTR-MINIMAL-INTERNAL-VALUE-MODEL-P4A` -- owns `is_missing_carrier` and the
+  Missing-vs-domain-string distinction this BUG restores at the JSON boundary.
+* `FTR-DATE-TIME-INTERNAL-VALUE-MODEL-P4A` -- section 27.2 analysed replacing
+  the `dtype=str` call and section 27.11 set the Option B read-side boundary;
+  both constrained the fix and both remain intact.
+* `BUG-ODS-MISSING-CARRIER-LITERAL-NAN-RENDERING-P4A` -- same theme at the ODS
+  write boundary; disjoint cause and site (see Scope boundary).
+* `BUG-UNRESOLVED-HELPER-VALUE-NAN-SEMANTICS-P4A` -- earlier missing-carrier
+  normalization work in the FK-helper path.
